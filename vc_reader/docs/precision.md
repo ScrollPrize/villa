@@ -195,7 +195,8 @@ The current CUDA path uploads the resident float32 wave blocks for each request;
 it does not retain a separate device brick cache across renders.
 
 `slice::Cached` uses the same sampling formulas, but fetches
-missing chunks through the shared service with foreground priority. CPU and CUDA
+missing chunks through the shared service with foreground priority, queueing a
+wave's chunks together so they load in parallel. CPU and CUDA
 requests see the same per-wave chunk snapshot, including when the service budget
 is smaller than the working set. Fetch failures throw; absent chunks use the
 array fill value. Registered arrays must not also hold a private memory cache.

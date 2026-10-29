@@ -8,6 +8,7 @@
 #include <limits>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vcr::slice::detail {
@@ -214,31 +215,67 @@ inline void directPoints(Cached& input, const ElementType& type, const float* xy
     }
 }
 
+// Calls visit(lo, hi, cz, cy, cx) for every chunk a block overlaps inside the array,
+// where [lo, hi) (ZYX) is the block's part inside the array.
+template <class Visit>
+void blockChunks(const ArraySpec& spec, const Block& b, Visit&& visit)
+{
+    const auto& shape = spec.shape;
+    const auto& c = spec.chunks;
+    const std::int64_t lo[3] = {std::max<std::int64_t>(0, b.oz), std::max<std::int64_t>(0, b.oy),
+                                std::max<std::int64_t>(0, b.ox)};
+    const std::int64_t hi[3] = {std::min(shape[0], b.oz + b.nz), std::min(shape[1], b.oy + b.ny),
+                                std::min(shape[2], b.ox + b.nx)};
+    if (lo[0] >= hi[0] || lo[1] >= hi[1] || lo[2] >= hi[2])
+        return;
+    for (auto cz = lo[0] / c[0]; cz <= (hi[0] - 1) / c[0]; ++cz)
+        for (auto cy = lo[1] / c[1]; cy <= (hi[1] - 1) / c[1]; ++cy)
+            for (auto cx = lo[2] / c[2]; cx <= (hi[2] - 1) / c[2]; ++cx)
+                visit(lo, hi, cz, cy, cx);
+}
+
+// The chunks the blocks of a wave read, each once.
+template <class Input>
+std::vector<chunks::Key> waveChunks(Input& input, const Wave& wave)
+{
+    std::unordered_set<chunks::Key, chunks::KeyHash> seen;
+    std::vector<chunks::Key> keys;
+    for (const auto& tile : wave.tiles)
+        if (tile.hasBlock)
+            blockChunks(input.array.spec(), tile.block,
+                        [&](const std::int64_t*, const std::int64_t*, std::int64_t cz, std::int64_t cy, std::int64_t cx) {
+                            const chunks::Key key{input.source, input.level, cz, cy, cx};
+                            if (seen.insert(key).second)
+                                keys.push_back(key);
+                        });
+    return keys;
+}
+
 // Assemble service-backed blocks once for both sampling backends. Pin each
 // chunk for the wave so eviction cannot change overlapping tiles mid-request.
+// Blocking reads queue the whole wave first, so its chunks load in parallel.
 template<class Input>
 inline void readBlocks(Input& resident, const ElementType& type, const Wave& wave,
                        std::vector<float>& buffer, std::vector<std::uint8_t>& coverage)
 {
     const auto& spec = resident.array.spec();
-    const auto& shape = spec.shape;
     const auto& c = spec.chunks;
     if (type.itemsize != spec.itemsize)
         throw std::invalid_argument("service sampling element size differs from the array");
     const float fill = float(type.load(spec.fill.data()));
     buffer.assign(std::size_t(wave.elements), fill);
     coverage.assign(std::size_t(wave.elements), 1);
+    if constexpr (std::is_same_v<Input, Cached>) {
+        const auto keys = waveChunks(resident, wave);
+        resident.service.prefetch(keys, {.foreground = true});
+    }
     // A chunk is acquired once per wave, so overlapping tiles see one snapshot.
     std::unordered_map<chunks::Key, chunks::Chunk, chunks::KeyHash> snapshot;
     for (const auto& tile : wave.tiles) {
         if (!tile.hasBlock) continue;
         const auto& b = tile.block;
-        const std::int64_t lo[3] = {std::max<std::int64_t>(0,b.oz), std::max<std::int64_t>(0,b.oy), std::max<std::int64_t>(0,b.ox)};
-        const std::int64_t hi[3] = {std::min(shape[0],b.oz+b.nz), std::min(shape[1],b.oy+b.ny), std::min(shape[2],b.ox+b.nx)};
-        if (lo[0]>=hi[0] || lo[1]>=hi[1] || lo[2]>=hi[2]) continue;
-        for (auto cz=lo[0]/c[0]; cz<=(hi[0]-1)/c[0]; ++cz)
-            for (auto cy=lo[1]/c[1]; cy<=(hi[1]-1)/c[1]; ++cy)
-                for (auto cx=lo[2]/c[2]; cx<=(hi[2]-1)/c[2]; ++cx) {
+        blockChunks(spec, b, [&](const std::int64_t* lo, const std::int64_t* hi, std::int64_t cz, std::int64_t cy,
+                                 std::int64_t cx) {
                     chunks::Key key{resident.source,resident.level,cz,cy,cx};
                     auto [it,fresh]=snapshot.try_emplace(key);
                     if (fresh) {
@@ -249,7 +286,7 @@ inline void readBlocks(Input& resident, const ElementType& type, const Wave& wav
                         }
                     }
                     const auto& chunk=it->second;
-                    if (chunk.status==chunks::Status::Fill) continue;
+                    if (chunk.status==chunks::Status::Fill) return;
                     const bool available=chunk.status==chunks::Status::Data && chunk.bytes &&
                         chunk.bytes->size()==resident.array.chunk_bytes();
                     for (auto z=std::max(lo[0],cz*c[0]); z<std::min(hi[0],(cz+1)*c[0]); ++z)
@@ -264,7 +301,7 @@ inline void readBlocks(Input& resident, const ElementType& type, const Wave& wav
                                     coverage[dst]=0;
                                 }
                             }
-                }
+        });
     }
 }
 

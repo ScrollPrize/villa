@@ -1,18 +1,20 @@
 // Point, plane, band and composite sampling: tiled block reads agree with a direct
 // evaluation over the whole array, interpolation reproduces linear fields, edges
 // read the fill value, nearest half ties round up, and composites reduce as
-// documented. Gradients match the interpolants' derivatives, and service-backed
-// requests (small direct ones and planned ones) match array reads. With CUDA, the
-// device backend matches the CPU.
+// documented. Gradients match the interpolants' derivatives, service-backed
+// requests (small direct ones and planned ones) match array reads, and footprints
+// list the chunks requests read. With CUDA, the device backend matches the CPU.
 #include "vc_reader/slice.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/slice/math.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -358,6 +360,88 @@ void service_matches(vcr::Array& stored, const vcr::Array& uncached, const vcr::
     }
 }
 
+// footprint() lists the chunks a request reads: sampling through a fresh service
+// leaves exactly those resident (small CPU point requests: a subset of them), and
+// after prefetching them the request fetches nothing more.
+void footprints(const vcr::Array& uncached, const vcr::ElementType& type)
+{
+    auto shared = std::shared_ptr<vcr::Array>(const_cast<vcr::Array*>(&uncached), [](vcr::Array*) {});
+    const auto& spec = uncached.spec();
+    std::int64_t grid[3];
+    for (int a = 0; a < 3; ++a)
+        grid[a] = (spec.shape[a] + spec.chunks[a] - 1) / spec.chunks[a];
+    auto b = band_inputs();
+    b.n = b.width * 4;  // four rows: a band through part of the array
+    std::vector<float> many, few;
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<float> d(-2.0f, 14.0f);
+    for (int i = 0; i < 400; ++i)
+        for (int a = 0; a < 3; ++a)
+            many.push_back(d(rng) + (a == 0 ? 20.0f : 0.0f));
+    few.assign(many.begin(), many.begin() + 3 * 20);
+    const std::array<float, 3> origin{30, 2, 3}, u{0.4f, 0.1f, 0.2f}, v{-0.1f, 0.5f, 0.05f};
+    slice::Composite mean;
+
+    struct Request {
+        std::string name;
+        bool exact;
+        std::function<std::vector<vcr::chunks::Key>(slice::Cached&, slice::Order)> footprint;
+        std::function<void(slice::Cached&, slice::Order, std::vector<float>&)> sample;
+    };
+    const std::vector<Request> requests{
+        {"points", true, [&](auto& c, auto o) { return slice::footprint(c, many.data(), many.size() / 3, o); },
+         [&](auto& c, auto o, auto& out) { slice::points(c, type, many.data(), many.size() / 3, o, out.data()); }},
+        {"small points", false, [&](auto& c, auto o) { return slice::footprint(c, few.data(), few.size() / 3, o); },
+         [&](auto& c, auto o, auto& out) { slice::points(c, type, few.data(), few.size() / 3, o, out.data()); }},
+        {"plane", true, [&](auto& c, auto o) { return slice::footprint(c, origin, u, v, 40, 30, o); },
+         [&](auto& c, auto o, auto& out) { slice::plane(c, type, origin, u, v, 40, 30, o, out.data()); }},
+        {"band", true,
+         [&](auto& c, auto o) { return slice::footprint(c, b.base.data(), b.dirs.data(), b.n, b.width, b.offsets, o); },
+         [&](auto& c, auto o, auto& out) {
+             slice::band(c, type, b.base.data(), b.dirs.data(), b.n, b.width, b.offsets, o, out.data());
+         }},
+        {"composite", true,
+         [&](auto& c, auto o) { return slice::footprint(c, b.base.data(), b.dirs.data(), b.n, b.width, b.offsets, o); },
+         [&](auto& c, auto o, auto& out) {
+             slice::composite(c, type, b.base.data(), b.dirs.data(), b.n, b.width, b.offsets, o, mean, out.data());
+         }},
+    };
+    for (const auto& r : requests)
+        for (const auto order : {slice::Order::Nearest, slice::Order::Linear, slice::Order::Cubic}) {
+            const std::string what = r.name + " footprint, order " + std::to_string(int(order));
+            std::vector<float> out(16 * b.n + 3000);
+            vcr::chunks::Service service({.decodedBytes = 64 << 20, .remoteWorkers = 1, .localWorkers = 2});
+            slice::Cached cached{*shared, service, service.addSource({shared})};
+            const auto keys = r.footprint(cached, order);
+            require(!keys.empty() && keys.size() < std::size_t(grid[0] * grid[1] * grid[2]), what + ": a strict subset");
+            for (std::size_t i = 1; i < keys.size(); ++i)
+                require(std::array{keys[i - 1].z, keys[i - 1].y, keys[i - 1].x} <
+                            std::array{keys[i].z, keys[i].y, keys[i].x},
+                        what + ": sorted and unique");
+            r.sample(cached, order, out);
+            std::size_t resident = 0;
+            for (std::int64_t z = 0; z < grid[0]; ++z)
+                for (std::int64_t y = 0; y < grid[1]; ++y)
+                    for (std::int64_t x = 0; x < grid[2]; ++x) {
+                        const vcr::chunks::Key key{cached.source, 0, z, y, x};
+                        const auto status = service.probe(key).status;
+                        if (status != vcr::chunks::Status::Data && status != vcr::chunks::Status::Fill)
+                            continue;
+                        ++resident;
+                        require(std::find(keys.begin(), keys.end(), key) != keys.end(),
+                                what + ": sampling read a chunk outside the footprint");
+                    }
+            require(!r.exact || resident == keys.size(), what + ": sampling read fewer chunks than the footprint");
+
+            vcr::chunks::Service warm({.decodedBytes = 64 << 20, .remoteWorkers = 1, .localWorkers = 2});
+            slice::Cached prefetched{*shared, warm, warm.addSource({shared})};
+            warm.prefetch(r.footprint(prefetched, order), {}, true);
+            const auto fetched = warm.stats().fetched;
+            r.sample(prefetched, order, out);
+            require(warm.stats().fetched == fetched, what + ": sampling fetched after the prefetch");
+        }
+}
+
 #ifdef VC_READER_CUDA
 std::vector<float> download(const vcr::device::Storage& s)
 {
@@ -474,6 +558,7 @@ int main()
         composite(c);
         gradients(c, ref);
         service_matches(*c.array, *c.uncached, c.type);
+        footprints(*c.uncached, c.type);
 #ifdef VC_READER_CUDA
         cuda_matches(c);
 #endif

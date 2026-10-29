@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <span>
+#include <vector>
 
 #ifdef VC_READER_CUDA
 #include "vc_reader/native/cuda_buffer.hpp"
@@ -92,6 +93,23 @@ void gradient(Array& array, const ElementType& type, const float* xyz, std::size
               float* gradient);
 void gradient(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
               float* gradient);
+
+// The chunks the same request reads, as keys of the source's level, sorted and
+// without duplicates: prefetch them (Service::prefetch) to fetch a request before
+// sampling it, or publish them as a view's demand. They are the chunks of the blocks
+// the sampler plans, so they can include chunks next to the exact sample footprints
+// (CPU point requests of at most 64 points read only the exact footprints).
+std::vector<chunks::Key> footprint(Cached& cached, const float* xyz, std::size_t n, Order order);
+std::vector<chunks::Key> footprint(Cached& cached, std::array<float, 3> origin, std::array<float, 3> u,
+                                   std::array<float, 3> v, std::size_t width, std::size_t height, Order order);
+// Bands and composites of the band.
+std::vector<chunks::Key> footprint(Cached& cached, const float* base, const float* dirs, std::size_t n,
+                                   std::size_t width, std::span<const float> offsets, Order order);
+std::vector<chunks::Key> footprint(Resident& resident, const float* xyz, std::size_t n, Order order);
+std::vector<chunks::Key> footprint(Resident& resident, std::array<float, 3> origin, std::array<float, 3> u,
+                                   std::array<float, 3> v, std::size_t width, std::size_t height, Order order);
+std::vector<chunks::Key> footprint(Resident& resident, const float* base, const float* dirs, std::size_t n,
+                                   std::size_t width, std::span<const float> offsets, Order order);
 
 // Resident overloads return one validity byte per output (1 = all required
 // chunks available). Invalid outputs are NaN, including incomplete composites.

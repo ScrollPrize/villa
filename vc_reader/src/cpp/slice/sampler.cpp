@@ -80,6 +80,30 @@ void check(Order order)
         throw std::invalid_argument("interpolation order must be nearest, linear or cubic");
 }
 
+Source pointSource(const float* xyz, std::size_t n)
+{
+    Source s;
+    s.kind = Source::Points;
+    s.xyz = xyz;
+    s.n = std::int64_t(n);
+    return s;
+}
+
+Source planeSource(std::array<float, 3> origin, std::array<float, 3> u, std::array<float, 3> v, std::size_t width,
+                   std::size_t height)
+{
+    Source s;
+    s.kind = Source::Plane;
+    for (int a = 0; a < 3; ++a) {
+        s.origin[a] = origin[a];
+        s.u[a] = u[a];
+        s.v[a] = v[a];
+    }
+    s.n = std::int64_t(width * height);
+    s.width = std::int64_t(width);
+    return s;
+}
+
 template <class Input>
 void store(Input& input, const ElementType& type, const Source& src, Order order, float* out, std::uint8_t* valid)
 {
@@ -99,11 +123,7 @@ template <class Input>
 void pointsImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
            std::uint8_t* valid)
 {
-    Source s;
-    s.kind = Source::Points;
-    s.xyz = xyz;
-    s.n = std::int64_t(n);
-    store(input, type, s, order, out, valid);
+    store(input, type, pointSource(xyz, n), order, out, valid);
 }
 
 template <class Input>
@@ -117,11 +137,7 @@ void gradientImpl(Input& input, const ElementType& type, const float* xyz, std::
             return;
         }
     }
-    Source s;
-    s.kind = Source::Points;
-    s.xyz = xyz;
-    s.n = std::int64_t(n);
-    run(input, type, s, order, [&](std::int64_t p, auto&&, auto&&, auto&& sampleGradient) {
+    run(input, type, pointSource(xyz, n), order, [&](std::int64_t p, auto&&, auto&&, auto&& sampleGradient) {
         out[p] = sampleGradient(0, gradient + 3 * p);
     });
 }
@@ -130,18 +146,9 @@ template <class Input>
 void planeImpl(Input& input, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
            std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out, std::uint8_t* valid)
 {
-    Source s;
-    s.kind = Source::Plane;
-    for (int a = 0; a < 3; ++a) {
-        s.origin[a] = origin[a];
-        s.u[a] = u[a];
-        s.v[a] = v[a];
-    }
-    s.n = std::int64_t(width * height);
-    s.width = std::int64_t(width);
     if (width == 0)
         return;
-    store(input, type, s, order, out, valid);
+    store(input, type, planeSource(origin, u, v, width, height), order, out, valid);
 }
 
 template <class Input>
@@ -180,6 +187,45 @@ void compositeImpl(Input& input, const ElementType& type, const float* base, con
         out[p] = available ? r.result() : std::numeric_limits<float>::quiet_NaN();
     });
 }
+
+template <class Input>
+std::vector<chunks::Key> footprintImpl(Input& input, const Source& src, Order order)
+{
+    check(order);
+    std::vector<chunks::Key> keys;
+    if (src.n == 0)
+        return keys;
+    plan(src, input.array.spec().shape, int(order), [&](const Wave& wave) {
+        const auto chunks = waveChunks(input, wave);
+        keys.insert(keys.end(), chunks.begin(), chunks.end());
+    });
+    const auto zyx = [](const chunks::Key& k) { return std::array{k.z, k.y, k.x}; };
+    std::sort(keys.begin(), keys.end(), [&](const auto& a, const auto& b) { return zyx(a) < zyx(b); });
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+std::vector<chunks::Key> footprint(Cached& cached, const float* xyz, std::size_t n, Order order)
+{ return footprintImpl(cached, pointSource(xyz, n), order); }
+
+std::vector<chunks::Key> footprint(Cached& cached, std::array<float, 3> origin, std::array<float, 3> u,
+                                   std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
+{ return footprintImpl(cached, planeSource(origin, u, v, width, height), order); }
+
+std::vector<chunks::Key> footprint(Cached& cached, const float* base, const float* dirs, std::size_t n,
+                                   std::size_t width, std::span<const float> offsets, Order order)
+{ return footprintImpl(cached, checkedBand(base, dirs, n, width, offsets.data(), offsets.size()), order); }
+
+std::vector<chunks::Key> footprint(Resident& resident, const float* xyz, std::size_t n, Order order)
+{ return footprintImpl(resident, pointSource(xyz, n), order); }
+
+std::vector<chunks::Key> footprint(Resident& resident, std::array<float, 3> origin, std::array<float, 3> u,
+                                   std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
+{ return footprintImpl(resident, planeSource(origin, u, v, width, height), order); }
+
+std::vector<chunks::Key> footprint(Resident& resident, const float* base, const float* dirs, std::size_t n,
+                                   std::size_t width, std::span<const float> offsets, Order order)
+{ return footprintImpl(resident, checkedBand(base, dirs, n, width, offsets.data(), offsets.size()), order); }
 
 void points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
 { pointsImpl(array, type, xyz, n, order, out, nullptr); }
@@ -325,10 +371,7 @@ template <class Input>
 device::Storage pointsImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order,
            device::Storage* valid)
 {
-    Source host;
-    host.kind = Source::Points;
-    host.xyz = xyz;
-    host.n = std::int64_t(n);
+    const Source host = pointSource(xyz, n);
     int dev = 0;
     device::check(cudaGetDevice(&dev));
     const auto coordinates = upload(xyz, n * 3 * sizeof(float), dev);
@@ -343,10 +386,7 @@ device::Storage gradientImpl(Input& input, const ElementType& type, const float*
 {
     if (!gradient)
         throw std::invalid_argument("gradient sampling needs a gradient output");
-    Source host;
-    host.kind = Source::Points;
-    host.xyz = xyz;
-    host.n = std::int64_t(n);
+    const Source host = pointSource(xyz, n);
     int dev = 0;
     device::check(cudaGetDevice(&dev));
     const auto coordinates = upload(xyz, n * 3 * sizeof(float), dev);
@@ -360,15 +400,7 @@ device::Storage planeImpl(Input& input, const ElementType& type, std::array<floa
                       std::array<float, 3> v, std::size_t width, std::size_t height, Order order,
            device::Storage* valid)
 {
-    Source host;
-    host.kind = Source::Plane;
-    for (int a = 0; a < 3; ++a) {
-        host.origin[a] = origin[a];
-        host.u[a] = u[a];
-        host.v[a] = v[a];
-    }
-    host.n = std::int64_t(width * height);
-    host.width = std::int64_t(width);
+    const Source host = planeSource(origin, u, v, width, height);
     if (width == 0) {
         int dev = 0;
         device::check(cudaGetDevice(&dev));
