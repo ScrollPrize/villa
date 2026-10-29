@@ -181,6 +181,16 @@ ribbon seams, mesh holes, OpenGL rendering and queued scene replacement. The
 canvas test requires a window system; OpenGL-specific tests report a skip when
 the required context is unavailable.
 
+On a headless Linux host with Xvfb, xauth, the Qt xcb runtime and Mesa already
+installed, run the rendering tests with a virtual X display (the Qt offscreen
+platform does not support `QOpenGLWidget`):
+
+```sh
+QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 \
+  xvfb-run -a -s '-screen 0 1280x1024x24' \
+  ctest --test-dir build --output-on-failure -R '^fiber_3d_(volume|surface|canvas)$'
+```
+
 Real-data review should include Paris 4 and PHerc1447 fibers imported into an object store, including a complete
 collection, a dense local region and a long fiber crossing storage blocks:
 
