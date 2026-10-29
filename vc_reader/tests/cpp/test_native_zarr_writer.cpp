@@ -1,12 +1,14 @@
 // Native Zarr writes: every codec round-trips through the reader, empty chunks are
 // skipped, regions are read-modified-written, and attributes and metadata are kept.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/slice.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -43,7 +45,7 @@ std::vector<uint8_t> read(vcr::Array& array, const vcr::Index& start, const vcr:
     return out;
 }
 
-void codecs(const fs::path& root)
+void codecs(const fs::path& root, int version)
 {
     struct Case {
         std::string compressor, dtype;
@@ -56,6 +58,7 @@ void codecs(const fs::path& root)
     };
     for (const auto& c : cases) {
         vcr::zarr::CreateOptions options;
+        options.version = version;
         options.chunks = c.chunks;
         options.shape = {c.chunks[0], c.chunks[1], 2 * c.chunks[2]};
         options.dtype = c.dtype;
@@ -73,6 +76,19 @@ void codecs(const fs::path& root)
                 std::memcpy(chunk.data() + i, &v, 4);
             }
         writer.writeChunk({0, 0, 0}, chunk.data(), chunk.size());
+        const float xyz[]{0, 0, 0};
+        float cpu;
+        vcr::slice::points(writer.reader(), meta.type, xyz, 1, vcr::slice::Order::Nearest, &cpu);
+        require(cpu == float(meta.type.load(chunk.data())), "CPU samples written array");
+#ifdef VC_READER_CUDA
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0) {
+            const auto device = vcr::slice::cuda::points(writer.reader(), meta.type, xyz, 1, vcr::slice::Order::Nearest);
+            float gpu;
+            vcr::device::check(cudaMemcpy(&gpu, device->ptr, sizeof(float), cudaMemcpyDeviceToHost));
+            require(gpu == cpu, "CUDA samples written array");
+        }
+#endif
         // The second chunk is never written: it reads as fill.
         auto reopened = vcr::zarr::openArray((root / c.compressor).string(), {});
         const auto all = read(*reopened.array, {0, 0, 0}, meta.shape, meta.itemsize());
@@ -87,9 +103,10 @@ void codecs(const fs::path& root)
     }
 }
 
-void editing(const fs::path& root)
+void editing(const fs::path& root, int version)
 {
     vcr::zarr::CreateOptions options;
+    options.version = version;
     options.shape = {5, 6, 7};  // edge chunks are partial
     options.chunks = {2, 4, 4};
     options.dtype = "<u2";
@@ -97,7 +114,8 @@ void editing(const fs::path& root)
     options.fillValue = 9;
     options.separator = "/";
     auto w = vcr::zarr::Writer::create(root / "group" / "edit", options);
-    require(fs::exists(root / "group" / ".zgroup"), "parent group marker");
+    require(fs::exists(root / "group" / (version == 3 ? "zarr.json" : ".zgroup")), "parent group marker");
+    require(vcr::zarr::Group::open((root / "group").string(), {}).version() == version, "parent group version");
 
     // A region straddling chunks; partially covered chunks keep their other values.
     std::vector<uint16_t> full(5 * 6 * 7);
@@ -134,6 +152,11 @@ void editing(const fs::path& root)
 
     auto reopened = vcr::zarr::Writer::open(root / "group" / "edit");
     require(reopened.meta().separator == "/" && reopened.meta().codec() == "zstd", "reopened metadata");
+    must_fail([&] { reopened.writeChunkSkipEmpty({1, 1, 1}, nullptr, 0); }, "empty buffer is not a fill chunk");
+    require(reopened.chunkExists({1, 1, 1}), "invalid skip-empty leaves stored data intact");
+    auto differentFormat = options;
+    differentFormat.version = version == 2 ? 3 : 2;
+    must_fail([&] { vcr::zarr::Writer::create(reopened.path(), differentFormat); }, "format replacement refused");
 
     vcr::zarr::CreateOptions bad = options;
     bad.compressor = "volcomp";
@@ -141,12 +164,58 @@ void editing(const fs::path& root)
     bad.compressor = "c3d";
     must_fail([&] { vcr::zarr::Writer::create(root / "bad", bad); }, "unknown compressor refused");
     require(!fs::exists(root / "bad" / ".zarray"), "refused arrays write no metadata");
+    require(!fs::exists(root / "bad" / "zarr.json"), "refused v3 arrays write no metadata");
 }
 
-void mutableChunks(const fs::path& root)
+void v3Metadata(const fs::path& root)
+{
+    vcr::zarr::CreateOptions options;
+    options.version = 3;
+    options.shape = {3, 4};
+    options.chunks = {2, 2};
+    options.dtype = ">u2";
+    options.fillValue = 513;
+    options.compressor = "none";
+    auto w = vcr::zarr::Writer::create(root / "v3-metadata" / "0", options);
+    require(w.meta().v3->prefix == "c." && w.chunkPath({1, 1}).filename() == "c.1.1", "default dot keys");
+    std::vector<uint8_t> chunk{0, 3, 1, 4, 2, 5, 3, 6};
+    w.writeChunk({0, 0}, chunk.data(), chunk.size());
+    require(read(w.reader(), {0, 0}, {2, 2}, 2) == chunk, "big endian bytes round trip");
+    require(read(w.reader(), {2, 2}, {1, 1}, 2) == std::vector<uint8_t>{2, 1}, "big endian fill");
+    vcr::zarr::writeAttributes(w.path(), {{"units", "labels"}});
+    const auto before = w.meta().v3->metadata;
+    const auto disk = Json::parse(std::ifstream(w.path() / "zarr.json"));
+    require(disk.at("data_type") == "uint16" && disk.at("codecs")[0]["configuration"]["endian"] == "big",
+            "v3 datatype and bytes endian");
+    auto expected = before;
+    expected["attributes"] = {{"units", "labels"}};
+    require(disk == expected && !fs::exists(w.path() / ".zattrs"), "attributes preserve v3 metadata");
+    must_fail([&] { vcr::zarr::writeAttributes(w.path(), Json::array()); }, "nonobject attributes refused");
+
+    // Edit an existing array using v2 chunk key encoding within a v3 node.
+    expected["chunk_key_encoding"]["name"] = "v2";
+    vcr::zarr::atomicWrite(w.path() / "zarr.json", expected.dump());
+    auto v2keys = vcr::zarr::Writer::open(w.path());
+    require(v2keys.chunkPath({0, 0}).filename() == "0.0", "v3 node with v2 keys");
+    v2keys.writeChunk({0, 0}, chunk.data(), chunk.size());
+    require(read(v2keys.reader(), {0, 0}, {2, 2}, 2) == chunk, "v2-key v3 readback");
+
+    expected["codecs"].push_back({{"name", "zstd"}, {"configuration", {{"level", 5}, {"checksum", true}}}});
+    vcr::zarr::atomicWrite(w.path() / "zarr.json", expected.dump());
+    auto checksum = vcr::zarr::Writer::open(w.path());
+    checksum.writeChunk({0, 0}, chunk.data(), chunk.size());
+    std::ifstream encoded(checksum.chunkPath({0, 0}), std::ios::binary);
+    std::array<uint8_t, 5> header{};
+    encoded.read(reinterpret_cast<char*>(header.data()), header.size());
+    require((header[4] & 4) != 0, "zstd writer honors frame checksum metadata");
+    require(read(checksum.reader(), {0, 0}, {2, 2}, 2) == chunk, "checksummed zstd readback");
+}
+
+void mutableChunks(const fs::path& root, int version)
 {
     for (const auto* codec : {"none", "gzip"}) {
         vcr::zarr::CreateOptions options;
+        options.version = version;
         options.shape = {3, 3, 3};
         options.chunks = {2, 2, 2};
         options.dtype = "<u2";
@@ -201,6 +270,10 @@ void mutableChunks(const fs::path& root)
         writer.setFillValue(1027);
         auto expected = before;
         expected["fill_value"] = 1027;
+        if (version == 3) {
+            expected["_vc_reader_v3"]["metadata"]["fill_value"] = 1027;
+            expected["_vc_reader_v3"]["metadata"]["attributes"] = {{"purpose", "labels"}};
+        }
         auto reopened = vcr::zarr::openArray(path.string(), {});
         require(writer.meta().raw == expected && reopened.meta.raw == expected,
                 "fill update preserves all other array metadata");
@@ -230,9 +303,13 @@ int main()
     } cleanup{root};
     try {
         fs::create_directories(root);
-        codecs(root);
-        editing(root);
-        mutableChunks(root);
+        for (int version : {2, 3}) {
+            const auto dir = root / std::to_string(version);
+            codecs(dir, version);
+            editing(dir, version);
+            mutableChunks(dir, version);
+        }
+        v3Metadata(root);
         std::cout << "every codec round-trips; skip-empty, regions, attributes and validation passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

@@ -238,16 +238,18 @@ struct CreateOptions {
     int level = -1;
     std::string separator = ".";
     Json fillValue = 0;
+    int version = 2;               // Zarr format 2 or 3
 };
 
-// A local Zarr v2 array opened for writing. Chunk files are replaced atomically,
+// A local Zarr v2/v3 array opened for writing. Chunk files are replaced atomically,
 // so concurrent writers of different chunks need no coordination, and readers
 // never see a partial chunk. Thread-safe for distinct chunks.
 class Writer {
 public:
-    // Writes <path>/.zarray (replacing any metadata there) and the parent's .zgroup when absent.
+    // Writes array metadata and a matching parent group marker when absent.
+    // Refuses to replace a node of a different Zarr format.
     static Writer create(const std::filesystem::path& path, const CreateOptions& options);
-    // An existing local v2 array.
+    // An existing local array.
     static Writer open(const std::filesystem::path& path);
     Writer(Writer&&) noexcept;
     Writer& operator=(Writer&&) noexcept;
@@ -281,7 +283,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// .zattrs of a local group or array (an empty object when absent), and writing it.
+// Attributes of a local v2/v3 group or array (an empty object when absent).
 Json readAttributes(const std::filesystem::path& node);
 void writeAttributes(const std::filesystem::path& node, const Json& attributes);
 

@@ -1,6 +1,7 @@
-// Writing local Zarr v2 arrays: metadata, encoded chunk files and regions.
+// Writing local Zarr arrays: metadata, encoded chunk files and regions.
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/codecs.hpp"
+#include "format.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -30,6 +31,7 @@ EncodeOptions encodeOptions(const Json& compressor)
     o.shuffle = compressor.value("shuffle", o.shuffle);
     o.blocksize = compressor.value("blocksize", o.blocksize);
     o.q = compressor.value("q", o.q);
+    o.checksum = compressor.value("checksum", false);
     return o;
 }
 
@@ -51,6 +53,50 @@ Json compressorConfig(const CreateOptions& options)
         return {{"id", "volcomp"}, {"q", level >= 0 ? double(level) : 8.0}};
     throw std::invalid_argument("cannot write Zarr chunks compressed with '" + id + "'");
 }
+
+Json v3Metadata(const ArrayMeta& meta)
+{
+    std::string dtype;
+    for (const auto& [name, typestr] : detail::v3Types)
+        if (typestr.substr(1) == meta.dtype.substr(1))
+            dtype = name;
+    if (dtype.empty())
+        throw std::invalid_argument("unsupported Zarr v3 dtype " + meta.dtype);
+    Json codecs = Json::array({{{"name", "bytes"},
+                               {"configuration", {{"endian", meta.dtype[0] == '>' ? "big" : "little"}}}}});
+    if (!meta.compressor.is_null()) {
+        const auto id = meta.compressor.at("id").get<std::string>();
+        auto config = meta.compressor;
+        config.erase("id");
+        if (id == "blosc") {
+            config["typesize"] = meta.itemsize();
+            config["shuffle"] = std::array{"noshuffle", "shuffle", "bitshuffle"}.at(config.at("shuffle").get<int>());
+        }
+        if (id == "zstd")
+            config["checksum"] = false;
+        std::string name;
+        for (const auto& [candidate, v2] : detail::v3Compressors)
+            if (id == v2)
+                name = candidate;
+        if (name.empty())
+            throw std::invalid_argument("unsupported Zarr v3 compressor " + id);
+        codecs.push_back({{"name", name}, {"configuration", config}});
+    }
+    return {{"zarr_format", 3}, {"node_type", "array"}, {"shape", meta.shape}, {"data_type", dtype},
+            {"chunk_grid", {{"name", "regular"}, {"configuration", {{"chunk_shape", meta.chunks}}}}},
+            {"chunk_key_encoding", {{"name", "default"}, {"configuration", {{"separator", meta.separator}}}}},
+            {"fill_value", meta.raw.at("fill_value")}, {"codecs", codecs}, {"attributes", Json::object()}};
+}
+
+Json storedMetadata(const ArrayMeta& meta)
+{
+    return meta.v3 ? meta.v3->metadata : meta.raw;
+}
+
+fs::path metadataPath(const fs::path& path, const ArrayMeta& meta)
+{
+    return path / (meta.v3 ? "zarr.json" : ".zarray");
+}
 }  // namespace
 
 struct Writer::Impl {
@@ -68,6 +114,17 @@ Writer::~Writer() = default;
 
 Writer Writer::create(const fs::path& path, const CreateOptions& options)
 {
+    if (options.version != 2 && options.version != 3)
+        throw std::invalid_argument("Zarr version must be 2 or 3");
+    if (fs::exists(path / ".zgroup") ||
+        (options.version == 3 && fs::exists(path / ".zarray")) ||
+        (options.version == 2 && fs::exists(path / "zarr.json")))
+        throw std::invalid_argument("cannot replace a group or change the Zarr format at " + path.string());
+    if (options.version == 3 && fs::exists(path / "zarr.json")) {
+        std::ifstream in(path / "zarr.json");
+        if (Json::parse(in).value("node_type", "") != "array")
+            throw std::invalid_argument("cannot replace a group with an array at " + path.string());
+    }
     Json zarray{{"zarr_format", 2},
                 {"shape", options.shape},
                 {"chunks", options.chunks},
@@ -77,18 +134,24 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options)
                 {"filters", nullptr},
                 {"order", "C"},
                 {"dimension_separator", options.separator}};
-    const auto meta = parseArrayMeta(zarray);  // validates before anything is written
+    auto meta = parseArrayMeta(zarray);  // validates before anything is written
     const auto codec = parse_codec(meta.codec());
     if (codec == Codec::Volcomp && (meta.itemsize() != 1 || meta.chunks != Index{128, 128, 128}))
         throw std::invalid_argument("volcomp requires uint8 data and 128^3 chunks");
     if (codec == Codec::Delta3d && (meta.chunks.size() != 3 || meta.type.kind != 'u' || meta.itemsize() > 2))
         throw std::invalid_argument("vc-delta3d requires 3-D uint8 or uint16 chunks");
+    if (options.version == 3) {
+        zarray = v3Metadata(meta);
+        meta = parseArrayMeta(zarray);
+    }
     fs::create_directories(path);
-    atomicWrite(path / ".zarray", zarray.dump(2) + "\n");
+    atomicWrite(metadataPath(path, meta), zarray.dump(2) + "\n");
     std::error_code ec;
     if (path.has_parent_path() && !fs::exists(path.parent_path() / ".zgroup", ec) &&
         !fs::exists(path.parent_path() / "zarr.json", ec))
-        atomicWrite(path.parent_path() / ".zgroup", "{\"zarr_format\": 2}\n");
+        atomicWrite(path.parent_path() / (meta.v3 ? "zarr.json" : ".zgroup"),
+                    meta.v3 ? "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {}}\n"
+                            : "{\"zarr_format\": 2}\n");
     return open(path);
 }
 
@@ -96,10 +159,14 @@ Writer Writer::open(const fs::path& path)
 {
     std::ifstream in(path / ".zarray");
     if (!in)
-        throw std::runtime_error("no Zarr v2 array to write at " + path.string());
+        in.open(path / "zarr.json");
+    if (!in)
+        throw std::runtime_error("no Zarr array to write at " + path.string());
     auto impl = std::make_unique<Impl>();
     impl->path = path;
     impl->meta = parseArrayMeta(Json::parse(in));
+    if (impl->meta.v3 && !impl->meta.v3->shards.empty())
+        throw std::invalid_argument("writing indexed shards is not supported");
     impl->codec = parse_codec(impl->meta.codec());
     impl->encode = encodeOptions(impl->meta.compressor);
     OpenOptions options;
@@ -116,7 +183,12 @@ Array& Writer::reader() { return *impl_->reader; }
 
 void Writer::setFillValue(const Json& value)
 {
-    auto raw = impl_->meta.raw;
+    // Fetch the current v3 attributes as another writer may have updated them.
+    auto raw = storedMetadata(impl_->meta);
+    if (impl_->meta.v3) {
+        std::ifstream in(metadataPath(impl_->path, impl_->meta));
+        raw = Json::parse(in);
+    }
     raw["fill_value"] = value;
     auto meta = parseArrayMeta(raw);
     OpenOptions options;
@@ -125,7 +197,7 @@ void Writer::setFillValue(const Json& value)
     ArrayHints hints;
     hints.metadata = raw;
     auto opened = openArray(impl_->path.string(), options, hints);
-    atomicWrite(impl_->path / ".zarray", raw.dump(2) + "\n");
+    atomicWrite(metadataPath(impl_->path, meta), raw.dump(2) + "\n");
     impl_->meta = std::move(meta);
     impl_->reader = std::move(opened.array);
 }
@@ -135,7 +207,7 @@ fs::path Writer::chunkPath(const Index& chunk) const
     const auto& meta = impl_->meta;
     if (chunk.size() != meta.shape.size())
         throw std::invalid_argument("chunk index rank does not match the array");
-    std::string key;
+    std::string key = meta.v3 ? meta.v3->prefix : "";
     for (std::size_t i = 0; i < chunk.size(); ++i) {
         const auto grid = (meta.shape[i] + meta.chunks[i] - 1) / meta.chunks[i];
         if (chunk[i] < 0 || chunk[i] >= std::max<std::int64_t>(grid, 1))
@@ -166,6 +238,8 @@ void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_
 
 bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size)
 {
+    if (size != impl_->meta.chunkBytes())
+        throw std::invalid_argument("wrong chunk data size");
     const auto& fill = impl_->meta.fill;
     bool allFill = size % fill.size() == 0;
     for (std::size_t i = 0; allFill && i < size; i += fill.size())
@@ -240,12 +314,24 @@ void Writer::writeRegion(const Index& start, const Index& shape, const std::uint
 
 Json readAttributes(const fs::path& node)
 {
+    std::ifstream v3(node / "zarr.json");
+    if (v3)
+        return Json::parse(v3).value("attributes", Json::object());
     std::ifstream in(node / ".zattrs");
     return in ? Json::parse(in) : Json::object();
 }
 
 void writeAttributes(const fs::path& node, const Json& attributes)
 {
+    if (!attributes.is_object())
+        throw std::invalid_argument("Zarr attributes must be an object");
+    std::ifstream in(node / "zarr.json");
+    if (in) {
+        auto metadata = Json::parse(in);
+        metadata["attributes"] = attributes;
+        atomicWrite(node / "zarr.json", metadata.dump(2) + "\n");
+        return;
+    }
     atomicWrite(node / ".zattrs", attributes.dump(2) + "\n");
 }
 

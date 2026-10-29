@@ -50,7 +50,7 @@ already link them. The Python extensions link those same CUDA libraries.
 | Header | API | CPU and CUDA coverage |
 | --- | --- | --- |
 | `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
-| `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
+| `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2/v3 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/slice.hpp` | `vcr::slice`: sample points, planes, bands of layers and their composites (mean, max, min, median, minabs, alpha, Beer-Lambert) with nearest, linear or cubic interpolation | CPU and `slice::cuda` (device float32 outputs) |
 | `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
@@ -113,6 +113,15 @@ discovery, VC3D leases and offline metadata. `OpenOptions::metadata` replaces
 metadata requests (for example with a caller's metadata cache), and
 `vc3dVolumeDir` names a VC3D cache directory directly. Writers encode every
 supported codec except LZW and replace chunk files atomically.
+
+`CreateOptions::version` defaults to 2; set it to 3 for `zarr.json` metadata
+and default `c/…` or `c.…` chunk keys, selected by `separator`. `Writer::open`
+also edits v3 arrays with v2 chunk key encoding. `readAttributes` and
+`writeAttributes` handle both formats; v3 attributes are stored inside
+`zarr.json`, preserving its other fields. A writer cannot change a node's
+Zarr format in place. Chunk data uses the byte order declared by `dtype`.
+`setFillValue` updates absent-chunk fill without rewriting stored chunks;
+independently opened arrays must be reopened after metadata changes.
 
 ## Transform pipelines and replay
 

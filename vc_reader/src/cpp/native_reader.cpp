@@ -1,6 +1,7 @@
 #include "vc_reader/reader.hpp"
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
+#include "zarr/format.hpp"
 #include "vc_reader/native/array.hpp"
 #include "vc_reader/native/sheet_normal/normal.hpp"
 
@@ -20,11 +21,7 @@ std::string normalizeZarrMetadata(const std::string& text)
         !d.value("storage_transformers", Json::array()).empty()) {
         throw std::invalid_argument("unsupported Zarr v3 array");
     }
-    const std::map<std::string, std::string> types{
-        {"bool", "|b1"}, {"uint8", "|u1"}, {"uint16", "<u2"}, {"uint32", "<u4"},
-        {"uint64", "<u8"}, {"int8", "|i1"}, {"int16", "<i2"}, {"int32", "<i4"},
-        {"int64", "<i8"}, {"float16", "<f2"}, {"float32", "<f4"}, {"float64", "<f8"}};
-    auto dtype = types.at(d.at("data_type").get<std::string>());
+    auto dtype = zarr::detail::v3Types.at(d.at("data_type").get<std::string>());
     const auto& grid = d.at("chunk_grid");
     if (grid.at("name") != "regular")
         throw std::invalid_argument("Zarr v3 requires regular chunks");
@@ -80,9 +77,7 @@ std::string normalizeZarrMetadata(const std::string& text)
             throw std::invalid_argument("invalid Zarr dimensions");
     }
     // v3 compressor names -> v2 compressor ids.
-    const std::map<std::string, std::string> compressors{
-        {"blosc", "blosc"}, {"zstd", "zstd"}, {"gzip", "gzip"}, {"numcodecs.zlib", "zlib"}, {"numcodecs.lz4", "lz4"},
-        {"volcomp", "volcomp"}};
+    const auto& compressors = zarr::detail::v3Compressors;
     if (codecs.empty() || codecs.size() > 2 || codecs[0].at("name") != "bytes" ||
         (codecs.size() == 2 && !compressors.contains(codecs[1].at("name").get<std::string>()))) {
         throw std::invalid_argument("unsupported Zarr v3 codec pipeline");
@@ -97,6 +92,10 @@ std::string normalizeZarrMetadata(const std::string& text)
     if (codecs.size() == 2) {
         compressor = codecs[1].value("configuration", Json::object());
         compressor["id"] = compressors.at(codecs[1].at("name").get<std::string>());
+        if (compressor["id"] == "blosc" && compressor.contains("shuffle") && compressor["shuffle"].is_string()) {
+            const std::map<std::string, int> shuffles{{"noshuffle", 0}, {"shuffle", 1}, {"bitshuffle", 2}};
+            compressor["shuffle"] = shuffles.at(compressor["shuffle"].get<std::string>());
+        }
     }
     return Json{
         {"zarr_format", 2}, {"shape", shape}, {"chunks", chunks}, {"dtype", dtype},

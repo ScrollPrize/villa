@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <climits>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -173,6 +174,7 @@ struct EncodeOptions {
     int shuffle = 1;            // blosc
     int blocksize = 0;          // blosc
     float q = 8.0f;             // volcomp quantiser step (0: lossless)
+    bool checksum = false;     // zstd frame checksum
 };
 
 // Encodes one decoded chunk of `itemsize`-byte elements and C-order `shape`.
@@ -195,7 +197,19 @@ inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, con
     }
     case Codec::Zstd: {
         out.resize(ZSTD_compressBound(n));
-        const auto written = ZSTD_compress(out.data(), out.size(), src, n, o.level < 0 ? 3 : o.level);
+        std::size_t written;
+        if (o.checksum) {
+            std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(), ZSTD_freeCCtx);
+            if (!context)
+                throw std::runtime_error("zstd context allocation failed");
+            const auto level = ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel, o.level < 0 ? 3 : o.level);
+            const auto checksum = ZSTD_CCtx_setParameter(context.get(), ZSTD_c_checksumFlag, 1);
+            if (ZSTD_isError(level) || ZSTD_isError(checksum))
+                throw std::invalid_argument("invalid zstd encoding parameters");
+            written = ZSTD_compress2(context.get(), out.data(), out.size(), src, n);
+        } else {
+            written = ZSTD_compress(out.data(), out.size(), src, n, o.level < 0 ? 3 : o.level);
+        }
         if (ZSTD_isError(written))
             throw std::runtime_error(std::string("zstd encode failed: ") + ZSTD_getErrorName(written));
         out.resize(written);
