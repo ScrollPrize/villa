@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 namespace vcr::slice::detail {
@@ -131,6 +132,63 @@ inline void readBlocks(Array& array, const ElementType& type, const Wave& wave, 
     }
     if (!starts.empty())
         array.read_many_float(starts, sizes, outs, type, false);
+}
+
+inline Array& arrayOf(Array& array) { return array; }
+inline Array& arrayOf(Resident& resident) { return resident.array; }
+
+// The same wave layout as blocking reads, populated exclusively from resident
+// decoded chunks. Pin each probe result while copying; eviction may proceed.
+inline void readBlocks(Resident& resident, const ElementType& type, const Wave& wave,
+                       std::vector<float>& buffer, std::vector<std::uint8_t>& coverage)
+{
+    const auto& spec = resident.array.spec();
+    const auto& shape = spec.shape;
+    const auto& c = spec.chunks;
+    if (type.itemsize != spec.itemsize)
+        throw std::invalid_argument("resident sampling element size differs from the array");
+    const float fill = float(type.load(spec.fill.data()));
+    buffer.assign(std::size_t(wave.elements), fill);
+    coverage.assign(std::size_t(wave.elements), 1);
+    // A chunk is probed once per wave, so overlapping tiles see one snapshot.
+    std::unordered_map<chunks::Key, chunks::Chunk, chunks::KeyHash> snapshot;
+    for (const auto& tile : wave.tiles) {
+        if (!tile.hasBlock) continue;
+        const auto& b = tile.block;
+        const std::int64_t lo[3] = {std::max<std::int64_t>(0,b.oz), std::max<std::int64_t>(0,b.oy), std::max<std::int64_t>(0,b.ox)};
+        const std::int64_t hi[3] = {std::min(shape[0],b.oz+b.nz), std::min(shape[1],b.oy+b.ny), std::min(shape[2],b.ox+b.nx)};
+        if (lo[0]>=hi[0] || lo[1]>=hi[1] || lo[2]>=hi[2]) continue;
+        for (auto cz=lo[0]/c[0]; cz<=(hi[0]-1)/c[0]; ++cz)
+            for (auto cy=lo[1]/c[1]; cy<=(hi[1]-1)/c[1]; ++cy)
+                for (auto cx=lo[2]/c[2]; cx<=(hi[2]-1)/c[2]; ++cx) {
+                    chunks::Key key{resident.source,resident.level,cz,cy,cx};
+                    auto [it,fresh]=snapshot.try_emplace(key);
+                    if (fresh) it->second=resident.service.probe(key);
+                    const auto& chunk=it->second;
+                    if (chunk.status==chunks::Status::Fill) continue;
+                    const bool available=chunk.status==chunks::Status::Data && chunk.bytes &&
+                        chunk.bytes->size()==resident.array.chunk_bytes();
+                    for (auto z=std::max(lo[0],cz*c[0]); z<std::min(hi[0],(cz+1)*c[0]); ++z)
+                        for (auto y=std::max(lo[1],cy*c[1]); y<std::min(hi[1],(cy+1)*c[1]); ++y)
+                            for (auto x=std::max(lo[2],cx*c[2]); x<std::min(hi[2],(cx+1)*c[2]); ++x) {
+                                const auto dst=b.offset+((z-b.oz)*b.ny+(y-b.oy))*b.nx+(x-b.ox);
+                                if (available) {
+                                    const auto src=((z-cz*c[0])*c[1]+(y-cy*c[1]))*c[2]+(x-cx*c[2]);
+                                    buffer[dst]=float(type.load(chunk.bytes->data()+src*type.itemsize));
+                                } else {
+                                    buffer[dst]=std::numeric_limits<float>::quiet_NaN();
+                                    coverage[dst]=0;
+                                }
+                            }
+                }
+    }
+}
+
+inline void readBlocks(Array& array, const ElementType& type, const Wave& wave,
+                       std::vector<float>& buffer, std::vector<std::uint8_t>& coverage)
+{
+    coverage.clear();
+    readBlocks(array,type,wave,buffer);
 }
 
 inline Source checkedBand(const float* base, const float* dirs, std::size_t n, std::size_t width,

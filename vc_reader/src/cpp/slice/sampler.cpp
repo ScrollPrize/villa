@@ -26,16 +26,18 @@ CompositeConfig config(const Composite& c)
 
 // Runs every wave of the request; unit(tile, data, p, sample) handles pixel p, where
 // sample(k) is the value of its k-th sample.
-template <class Unit>
-void run(Array& array, const ElementType& type, const Source& src, Order order, Unit&& unit)
+template <class Input, class Unit>
+void run(Input& input, const ElementType& type, const Source& src, Order order, Unit&& unit)
 {
+    auto& array = arrayOf(input);
     const int o = int(order);
     const auto& shape = array.spec().shape;
     const float fill = float(type.load(array.spec().fill.data()));
     const std::int64_t W = src.width > 0 ? src.width : std::max<std::int64_t>(src.n, 1);
     std::vector<float> buffer;
+    std::vector<std::uint8_t> coverage;
     plan(src, shape, o, [&](const Wave& wave) {
-        readBlocks(array, type, wave, buffer);
+        readBlocks(input, type, wave, buffer, coverage);
         array.parallel_for(wave.tiles.size(), [&](std::size_t i) {
             const Tile& t = wave.tiles[i];
             for (std::int64_t yy = t.y0; yy < t.y0 + t.h; ++yy)
@@ -50,6 +52,11 @@ void run(Array& array, const ElementType& type, const Source& src, Order order, 
                         if (!t.hasBlock || outside(x, y, z, shape[0], shape[1], shape[2], o))
                             return fill;
                         return sample(buffer.data(), t.block, x, y, z, o);
+                    }, [&](int k) {
+                        float x,y,z;
+                        if (!src.point(p,k,x,y,z)) return false;
+                        return !t.hasBlock || outside(x,y,z,shape[0],shape[1],shape[2],o) ||
+                            covered(coverage.empty() ? nullptr : coverage.data(),t.block,x,y,z,o);
                     });
                 }
         });
@@ -62,27 +69,35 @@ void check(Order order)
         throw std::invalid_argument("interpolation order must be nearest, linear or cubic");
 }
 
-void store(Array& array, const ElementType& type, const Source& src, Order order, float* out)
+template <class Input>
+void store(Input& input, const ElementType& type, const Source& src, Order order, float* out, std::uint8_t* valid)
 {
     check(order);
-    run(array, type, src, order, [&](std::int64_t p, auto&& sample) {
-        for (int k = 0; k < src.K; ++k)
-            out[std::size_t(k) * std::size_t(src.n) + std::size_t(p)] = sample(k);
+    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered) {
+        for (int k = 0; k < src.K; ++k) {
+            const auto i=std::size_t(k)*std::size_t(src.n)+std::size_t(p);
+            const bool available=covered(k);
+            out[i]=available ? sample(k) : std::numeric_limits<float>::quiet_NaN();
+            if (valid) valid[i]=available;
+        }
     });
 }
 }  // namespace
 
-void points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
+template <class Input>
+void pointsImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+           std::uint8_t* valid)
 {
     Source s;
     s.kind = Source::Points;
     s.xyz = xyz;
     s.n = std::int64_t(n);
-    store(array, type, s, order, out);
+    store(input, type, s, order, out, valid);
 }
 
-void plane(Array& array, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
-           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out)
+template <class Input>
+void planeImpl(Input& input, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out, std::uint8_t* valid)
 {
     Source s;
     s.kind = Source::Plane;
@@ -95,27 +110,31 @@ void plane(Array& array, const ElementType& type, std::array<float, 3> origin, s
     s.width = std::int64_t(width);
     if (width == 0)
         return;
-    store(array, type, s, order, out);
+    store(input, type, s, order, out, valid);
 }
 
-void band(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
-          std::size_t width, std::span<const float> offsets, Order order, float* out)
+template <class Input>
+void bandImpl(Input& input, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out, std::uint8_t* valid)
 {
-    store(array, type, checkedBand(base, dirs, n, width, offsets.data(), offsets.size()), order, out);
+    store(input, type, checkedBand(base, dirs, n, width, offsets.data(), offsets.size()), order, out, valid);
 }
 
-void composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
-               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out)
+template <class Input>
+void compositeImpl(Input& input, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out,
+           std::uint8_t* valid)
 {
     check(order);
     const auto src = checkedBand(base, dirs, n, width, offsets.data(), offsets.size());
     if (method.method == Composite::Method::Median && offsets.size() > slice::kMaxMedianLayers)
         throw std::invalid_argument("median composites take at most 256 layers");
     const auto c = config(method);
-    run(array, type, src, order, [&](std::int64_t p, auto&& sample) {
+    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered) {
         Reducer r(c);
         float x, y, z;
         if (!src.point(p, 0, x, y, z)) {  // no surface at this pixel
+            if (valid) valid[p]=0;
             out[p] = std::numeric_limits<float>::quiet_NaN();
             return;
         }
@@ -124,9 +143,44 @@ void composite(Array& array, const ElementType& type, const float* base, const f
             if (!std::isnan(v))
                 r.add(v);
         }
-        out[p] = r.result();
+        bool available=true;
+        for (int k=0; k<src.K; ++k) available=covered(k) && available;
+        if (valid) valid[p]=available;
+        out[p] = available ? r.result() : std::numeric_limits<float>::quiet_NaN();
     });
 }
+
+void points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
+{ pointsImpl(array, type, xyz, n, order, out, nullptr); }
+
+void plane(Array& array, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out)
+{ planeImpl(array, type, origin, u, v, width, height, order, out, nullptr); }
+
+void band(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out)
+{ bandImpl(array, type, base, dirs, n, width, offsets, order, out, nullptr); }
+
+void composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out)
+{ compositeImpl(array, type, base, dirs, n, width, offsets, order, method, out, nullptr); }
+
+void points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+           std::uint8_t* valid)
+{ pointsImpl(resident, type, xyz, n, order, out, valid); }
+
+void plane(Resident& resident, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out, std::uint8_t* valid)
+{ planeImpl(resident, type, origin, u, v, width, height, order, out, valid); }
+
+void band(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out, std::uint8_t* valid)
+{ bandImpl(resident, type, base, dirs, n, width, offsets, order, out, valid); }
+
+void composite(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out,
+           std::uint8_t* valid)
+{ compositeImpl(resident, type, base, dirs, n, width, offsets, order, method, out, valid); }
 
 #ifdef VC_READER_CUDA
 namespace cuda {
@@ -143,24 +197,30 @@ device::Storage upload(const void* data, std::size_t bytes, int dev)
 
 // Plans on the host, reads each wave's blocks through the array's caches, and
 // samples them on the device. `deviceSource` holds device copies of the inputs.
-device::Storage run(Array& array, const ElementType& type, const Source& hostSource, const Source& deviceSource,
-                    Order order, bool composite, const CompositeConfig& config, std::size_t outputs)
+template <class Input>
+device::Storage run(Input& input, const ElementType& type, const Source& hostSource, const Source& deviceSource,
+                    Order order, bool composite, const CompositeConfig& config, std::size_t outputs,
+           device::Storage* valid)
 {
     check(order);
     int dev = 0;
     device::check(cudaGetDevice(&dev));
+    auto& array = arrayOf(input);
     auto out = device::allocate(outputs * sizeof(float), dev);
+    device::Storage validity;
+    if (valid) { validity=device::allocate(outputs,dev); *valid=validity; }
     const auto& shape = array.spec().shape;
     const std::int64_t extent[3] = {shape.size() > 0 ? shape[0] : 0, shape.size() > 1 ? shape[1] : 0,
                                     shape.size() > 2 ? shape[2] : 0};
     const float fill = float(type.load(array.spec().fill.data()));
     const std::int64_t W = hostSource.width > 0 ? hostSource.width : std::max<std::int64_t>(hostSource.n, 1);
     std::vector<float> buffer;
-    device::Storage blocks, tiles;
+    std::vector<std::uint8_t> coverage;
+    device::Storage blocks, tiles, coverageDevice;
     plan(hostSource, shape, int(order), [&](const Wave& wave) {
-        readBlocks(array, type, wave, buffer);
-        // The previous wave's copies finish before its buffers are reused.
+        // Finish the previous wave before reusing its host and device buffers.
         device::complete();
+        readBlocks(input, type, wave, buffer, coverage);
         if (!blocks || blocks->bytes < buffer.size() * sizeof(float))
             blocks = device::allocate(buffer.size() * sizeof(float), dev);
         if (!tiles || tiles->bytes < wave.tiles.size() * sizeof(Tile))
@@ -170,9 +230,12 @@ device::Storage run(Array& array, const ElementType& type, const Source& hostSou
                                           cudaMemcpyHostToDevice, device::stream()));
         device::check(cudaMemcpyAsync(tiles->ptr, wave.tiles.data(), wave.tiles.size() * sizeof(Tile),
                                       cudaMemcpyHostToDevice, device::stream()));
+        if (!coverage.empty()) coverageDevice=upload(coverage.data(),coverage.size(),dev);
         launch(deviceSource, static_cast<const Tile*>(tiles->ptr), wave.tiles.size(),
                static_cast<const float*>(blocks ? blocks->ptr : nullptr), W, extent, int(order), fill, composite, config,
-               static_cast<float*>(out->ptr), device::stream());
+               static_cast<float*>(out->ptr), device::stream(),
+               coverage.empty() ? nullptr : static_cast<const std::uint8_t*>(coverageDevice->ptr),
+               validity ? static_cast<std::uint8_t*>(validity->ptr) : nullptr);
     });
     device::complete();
     return out;
@@ -195,7 +258,9 @@ Source bandSources(const float* base, const float* dirs, std::size_t n, std::siz
 }
 }  // namespace
 
-device::Storage points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order)
+template <class Input>
+device::Storage pointsImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order,
+           device::Storage* valid)
 {
     Source host;
     host.kind = Source::Points;
@@ -206,11 +271,13 @@ device::Storage points(Array& array, const ElementType& type, const float* xyz, 
     const auto coordinates = upload(xyz, n * 3 * sizeof(float), dev);
     Source deviceSource = host;
     deviceSource.xyz = static_cast<const float*>(coordinates->ptr);
-    return run(array, type, host, deviceSource, order, false, {}, n);
+    return run(input, type, host, deviceSource, order, false, {}, n, valid);
 }
 
-device::Storage plane(Array& array, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
-                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
+template <class Input>
+device::Storage planeImpl(Input& input, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order,
+           device::Storage* valid)
 {
     Source host;
     host.kind = Source::Plane;
@@ -224,30 +291,67 @@ device::Storage plane(Array& array, const ElementType& type, std::array<float, 3
     if (width == 0) {
         int dev = 0;
         device::check(cudaGetDevice(&dev));
+        if (valid) *valid=device::allocate(0,dev);
         return device::allocate(0, dev);
     }
-    return run(array, type, host, host, order, false, {}, width * height);
+    return run(input, type, host, host, order, false, {}, width * height, valid);
 }
 
-device::Storage band(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
-                     std::size_t width, std::span<const float> offsets, Order order)
+template <class Input>
+device::Storage bandImpl(Input& input, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order, device::Storage* valid)
 {
     Source deviceSource;
     std::vector<device::Storage> keep;
     const auto host = bandSources(base, dirs, n, width, offsets, deviceSource, keep);
-    return run(array, type, host, deviceSource, order, false, {}, n * offsets.size());
+    return run(input, type, host, deviceSource, order, false, {}, n * offsets.size(), valid);
 }
 
-device::Storage composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
-                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method)
+template <class Input>
+device::Storage compositeImpl(Input& input, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method,
+           device::Storage* valid)
 {
     if (method.method == Composite::Method::Median && offsets.size() > slice::kMaxMedianLayers)
         throw std::invalid_argument("median composites take at most 256 layers");
     Source deviceSource;
     std::vector<device::Storage> keep;
     const auto host = bandSources(base, dirs, n, width, offsets, deviceSource, keep);
-    return run(array, type, host, deviceSource, order, true, config(method), n);
+    return run(input, type, host, deviceSource, order, true, config(method), n, valid);
 }
+device::Storage points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order)
+{ return pointsImpl(array, type, xyz, n, order, nullptr); }
+
+device::Storage plane(Array& array, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
+{ return planeImpl(array, type, origin, u, v, width, height, order, nullptr); }
+
+device::Storage band(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order)
+{ return bandImpl(array, type, base, dirs, n, width, offsets, order, nullptr); }
+
+device::Storage composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method)
+{ return compositeImpl(array, type, base, dirs, n, width, offsets, order, method, nullptr); }
+
+device::Storage points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order,
+           device::Storage* valid)
+{ return pointsImpl(resident, type, xyz, n, order, valid); }
+
+device::Storage plane(Resident& resident, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order,
+           device::Storage* valid)
+{ return planeImpl(resident, type, origin, u, v, width, height, order, valid); }
+
+device::Storage band(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order, device::Storage* valid)
+{ return bandImpl(resident, type, base, dirs, n, width, offsets, order, valid); }
+
+device::Storage composite(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method,
+           device::Storage* valid)
+{ return compositeImpl(resident, type, base, dirs, n, width, offsets, order, method, valid); }
+
 }  // namespace cuda
 #endif
 

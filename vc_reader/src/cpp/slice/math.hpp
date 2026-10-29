@@ -85,6 +85,19 @@ VCR_SLICE_HD float at(const float* data, const Block& b, std::int64_t z, std::in
     return data[b.offset + ((z - b.oz) * b.ny + (y - b.oy)) * b.nx + (x - b.ox)];
 }
 
+// Coverage is independent of numerical values (a stored NaN is still resident).
+VCR_SLICE_HD bool covered(const std::uint8_t* mask, const Block& b, float x, float y, float z, int order)
+{
+    if (!mask) return true;
+    std::int64_t z0,z1,y0,y1,x0,x1;
+    footprint(z,order,z0,z1); footprint(y,order,y0,y1); footprint(x,order,x0,x1);
+    for (auto iz=z0; iz<=z1; ++iz)
+        for (auto iy=y0; iy<=y1; ++iy)
+            for (auto ix=x0; ix<=x1; ++ix)
+                if (!mask[b.offset+((iz-b.oz)*b.ny+(iy-b.oy))*b.nx+(ix-b.ox)]) return false;
+    return true;
+}
+
 // Samples the block at XYZ (voxel i at coordinate i). The block holds the point's
 // whole neighbourhood. Nearest rounds ties to even.
 VCR_SLICE_HD float sample(const float* data, const Block& b, float x, float y, float z, int order)
@@ -252,7 +265,7 @@ struct Reducer {
 // (composite false) or reduces them (composite true). Pointers are device memory.
 void launch(const Source& source, const Tile* tiles, std::size_t count, const float* blocks, std::int64_t width,
             const std::int64_t shape[3], int order, float fill, bool composite, const CompositeConfig& config, float* out,
-            cudaStream_t stream);
+            cudaStream_t stream, const std::uint8_t* coverage = nullptr, std::uint8_t* valid = nullptr);
 #endif
 
 }  // namespace vcr::slice::detail

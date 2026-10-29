@@ -8,7 +8,7 @@ namespace vcr::slice::detail {
 namespace {
 __global__ void sampleTiles(Source source, const Tile* tiles, const float* blocks, std::int64_t width,
                             std::int64_t sz, std::int64_t sy, std::int64_t sx, int order, float fill, bool composite,
-                            CompositeConfig config, float* out)
+                            CompositeConfig config, float* out, const std::uint8_t* coverage, std::uint8_t* valid)
 {
     const Tile t = tiles[blockIdx.x];
     const std::int64_t count = t.w * t.h;
@@ -24,13 +24,23 @@ __global__ void sampleTiles(Source source, const Tile* tiles, const float* block
                 return fill;
             return sample(blocks, t.block, x, y, z, order);
         };
+        auto available = [&](int k) {
+            float x,y,z;
+            if (!source.point(p,k,x,y,z)) return false;
+            return !t.hasBlock || outside(x,y,z,sz,sy,sx,order) || covered(coverage,t.block,x,y,z,order);
+        };
         if (!composite) {
-            for (int k = 0; k < source.K; ++k)
-                out[std::int64_t(k) * source.n + p] = value(k);
+            for (int k = 0; k < source.K; ++k) {
+                const auto i=std::int64_t(k)*source.n+p;
+                const bool ok=available(k);
+                out[i]=ok ? value(k) : NAN;
+                if (valid) valid[i]=ok;
+            }
             continue;
         }
         float x, y, z;
         if (!source.point(p, 0, x, y, z)) {
+            if (valid) valid[p]=0;
             out[p] = NAN;
             continue;
         }
@@ -40,19 +50,22 @@ __global__ void sampleTiles(Source source, const Tile* tiles, const float* block
             if (!isnan(v))
                 r.add(v);
         }
-        out[p] = r.result();
+        bool ok=true;
+        for (int k=0; k<source.K; ++k) ok=available(k) && ok;
+        if (valid) valid[p]=ok;
+        out[p]=ok ? r.result() : NAN;
     }
 }
 }  // namespace
 
 void launch(const Source& source, const Tile* tiles, std::size_t count, const float* blocks, std::int64_t width,
             const std::int64_t shape[3], int order, float fill, bool composite, const CompositeConfig& config, float* out,
-            cudaStream_t stream)
+            cudaStream_t stream, const std::uint8_t* coverage, std::uint8_t* valid)
 {
     if (!count)
         return;
     sampleTiles<<<unsigned(count), 128, 0, stream>>>(source, tiles, blocks, width, shape[0], shape[1], shape[2], order,
-                                                     fill, composite, config, out);
+                                                     fill, composite, config, out, coverage, valid);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess)
         throw std::runtime_error(std::string("CUDA sampling launch: ") + cudaGetErrorString(error));

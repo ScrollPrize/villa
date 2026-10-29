@@ -156,3 +156,23 @@ Precision tests cover float32/float64 transforms, CPU/CUDA agreement, replay,
 derived fields, resize ties, coordinate cancellation, normalization cancellation, overflow
 fallbacks and integer component indices. Loader tests cover the public batch
 API, stream lifetime, spawned workers, and backward execution.
+
+
+## Resident sampling coverage
+
+`slice::Resident` overloads use the blocking sampler's float32 conversion,
+interpolation and reduction formulas on CPU and CUDA. They probe the chunk
+service without I/O, queueing or LRU promotion. Each wave pins a single snapshot
+of every chunk it touches; later ready callbacks can trigger a fresh render.
+
+Validity is separate from the sampled value: a stored NaN is available, while an
+unavailable, queued or failed chunk invalidates the entire interpolation
+footprint, even at zero-weight neighbours. Out-of-array neighbours and known
+all-fill chunks are available. Incomplete bands expose validity per layer;
+composites require every layer's footprint, including layers beyond alpha early
+termination, so partial data cannot masquerade as a complete composite. Invalid
+outputs are NaN. A viewer uses the byte mask to fill uncovered pixels from its
+next coarser level. CUDA validity buffers reside on the same device as values.
+
+The current CUDA path uploads the resident float32 wave blocks for each request;
+it does not retain a separate device brick cache across renders.

@@ -8,6 +8,7 @@
 // composite formulas.
 
 #include "vc_reader/native/array.hpp"
+#include "vc_reader/chunks.hpp"
 #include "vc_reader/native/element_type.hpp"
 
 #include <array>
@@ -36,6 +37,17 @@ struct Composite {
 // Median keeps every layer of a pixel; other methods stream.
 inline constexpr std::size_t kMaxMedianLayers = 256;
 
+// A non-blocking snapshot source. `array` must be the registered source's level.
+// Sampling probes only: no fetches, queue changes or LRU promotion. Callers publish
+// view demand separately. Missing/error chunks invalidate any touching footprint;
+// known fill and out-of-array neighbours are available. Ready callbacks trigger retries.
+struct Resident {
+    Array& array;
+    chunks::Service& service;
+    chunks::SourceId source;
+    std::int32_t level = 0;
+};
+
 // `type` says how the array's elements read as numbers.
 void points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out);
 // out[row * width + col] at origin + col * u + row * v.
@@ -49,6 +61,24 @@ void band(Array& array, const ElementType& type, const float* base, const float*
 void composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out);
 
+// Resident overloads return one validity byte per output (1 = all required
+// chunks available). Invalid outputs are NaN, including incomplete composites.
+// `type` says how the array's elements read as numbers.
+void points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+           std::uint8_t* valid = nullptr);
+// out[row * width + col] at origin + col * u + row * v.
+void plane(Resident& resident, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out,
+           std::uint8_t* valid = nullptr);
+// out[k * n + p] at base[p] + dirs[p] * offsets[k]. `width` > 0 says the n
+// pixels form a row-major image that wide, which keeps reads compact.
+void band(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out, std::uint8_t* valid = nullptr);
+// out[p]: the composite of pixel p's band, in offsets order.
+void composite(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out,
+           std::uint8_t* valid = nullptr);
+
 #ifdef VC_READER_CUDA
 // The same requests computed on the calling thread's CUDA device and stream.
 // Inputs are host memory; outputs are float32 device buffers laid out as above
@@ -61,6 +91,16 @@ device::Storage band(Array& array, const ElementType& type, const float* base, c
                      std::size_t width, std::span<const float> offsets, Order order);
 device::Storage composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                           std::size_t width, std::span<const float> offsets, Order order, const Composite& method);
+device::Storage points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order,
+           device::Storage* valid = nullptr);
+device::Storage plane(Resident& resident, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order,
+           device::Storage* valid = nullptr);
+device::Storage band(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order, device::Storage* valid = nullptr);
+device::Storage composite(Resident& resident, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method,
+           device::Storage* valid = nullptr);
 }  // namespace cuda
 #endif
 
