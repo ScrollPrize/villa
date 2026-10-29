@@ -1,6 +1,7 @@
 #pragma once
 #include <cmath>
 #include <cstdint>
+#include "../rounding.hpp"
 #ifdef __CUDACC__
 #define VCR_GEOMETRY_HD __host__ __device__
 #else
@@ -22,7 +23,7 @@ VCR_GEOMETRY_HD inline float clamp(float v){return fminf(1,fmaxf(0,v));}
 VCR_GEOMETRY_HD inline bool finite(V v){return std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z);}
 VCR_GEOMETRY_HD inline V closest_segment(V p,V a,V b,float& t){V d=b-a;float n=dot(d,d);t=n>0?clamp(dot(p-a,d)/n):0;return a+d*t;}
 VCR_GEOMETRY_HD inline std::int64_t nearest(float q,std::int64_t base){
-    float f=floorf(q);auto n=base+std::int64_t(f);float r=q-f;
-    return n+(r>.5f || (r==.5f && n%2!=0));
+    float f=floorf(q);
+    return base+std::int64_t(f)+nearest_rounds_up(q-f);
 }
 }

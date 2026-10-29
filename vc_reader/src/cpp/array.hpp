@@ -358,7 +358,7 @@ public:
             read_points_as<0>(PointCoordinates{coords, ndim()}, n, out);
     }
 
-    // Element nearest to each real-valued point (voxel i at coordinate i, ties to even),
+    // Element nearest to each real-valued point (voxel i at coordinate i, ties up),
     // written as stored. Points outside the array, and non-finite ones, read as fill.
     void sample_nearest(const double* coords, std::size_t n, std::uint8_t* out)
     {
@@ -938,8 +938,8 @@ private:
                         } else if constexpr (std::is_same_v<Coord,float>) {
                             const float low = std::floor(c[i]), f = c[i]-low;
                             const auto integer = base+static_cast<std::int64_t>(low);
-                            idx[i] = integer+(f > .5f || (f == .5f && (integer & 1)));
-                        } else idx[i] = base+static_cast<std::int64_t>(std::nearbyint(c[i]));
+                            idx[i] = integer+nearest_rounds_up(f);
+                        } else idx[i] = base+nearest_index(c[i]);
                     }
                     at = idx;
                 } else {

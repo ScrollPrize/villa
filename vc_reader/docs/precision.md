@@ -46,6 +46,23 @@ and Catmull-Rom cubic values, and composites agree. Coordinates and interpolatio
 float32; integer and float64 sources are converted to float32 when read. Sources
 whose values exceed float32's 24-bit integer range lose low bits.
 
+## Tie rules
+
+`src/cpp/rounding.hpp` holds the only two tie rules, shared by CPU and CUDA, and
+`tests/test_rounding_rules.py` rejects other rounding primitives in native sources.
+
+- **Spatial ties** (the voxel nearest a coordinate) round up: `nearest_index` /
+  `nearest_rounds_up`. Every nearest-neighbour path uses it: slices, `Array` and
+  `ZarrReader.sample` points, the CUDA reader, surface and aligned label sampling and
+  spatial transforms. Integer shifts and crop origins then cannot change which voxel
+  wins, and zoomed nearest planes give every voxel equal width. This is SciPy's
+  `map_coordinates(order=0)` rule; NumPy `rint` and Torch `grid_sample` nearest round
+  half-voxel ties to even and so differ from vc_reader exactly at those ties.
+- **Value ties** (rounding numbers: sizes from scale factors, counts, quantized
+  intensities) round to even, as `np.rint`/`np.round` and `torch.round` do:
+  `round_half_even`. The SciPy Gaussian radius `int(truncate * sigma + .5)` is kept
+  as SciPy defines it.
+
 ## Where wider arithmetic remains
 
 | Location / operation | Numerical reason |

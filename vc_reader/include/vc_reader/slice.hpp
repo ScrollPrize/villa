@@ -3,7 +3,7 @@
 // per-pixel directions, and composites of those bands. Coordinates are XYZ in the
 // array's voxel grid (voxel i at coordinate i; the array is stored ZYX). Values are
 // float32: points none of whose neighbours lie in the array read as the fill value,
-// non-finite points give NaN. Nearest rounds ties to even; cubic is Catmull-Rom.
+// non-finite points give NaN. Nearest rounds half ties up; cubic is Catmull-Rom.
 // CPU and CUDA backends share one implementation of the interpolation and
 // composite formulas.
 

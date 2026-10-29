@@ -1,11 +1,12 @@
 // Point, plane, band and composite sampling: tiled block reads agree with a direct
 // evaluation over the whole array, interpolation reproduces linear fields, edges
-// read the fill value, and composites reduce as documented. With CUDA, the device
-// backend matches the CPU.
+// read the fill value, nearest half ties round up, and composites reduce as
+// documented. With CUDA, the device backend matches the CPU.
 #include "vc_reader/slice.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/slice/math.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -123,6 +124,34 @@ void plane(Case c, const Reference& ref)
         }
         check_close(got, want, "oblique plane, order " + std::to_string(int(order)));
     }
+}
+
+// Exact half-voxel ties round up, checked against fixed indices rather than the
+// shared formula. A plane at half-voxel steps gives every voxel two pixels.
+struct Ties {
+    std::vector<float> xyz{0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, -0.5f, 0.0f, 0.0f,
+                           X - 0.5f, 0.0f, 0.0f, 10.49f, 10.5f, 10.51f};
+    std::vector<float> points{field(3, 2, 1), field(6, 5, 4), field(0, 0, 0), kFill, field(11, 11, 10)};
+    static constexpr std::size_t w = 2 * X - 2, h = 20;  // the last column is x = X - 1.5
+    std::array<float, 3> origin{0, 0, 7}, u{0.5f, 0, 0}, v{0, 0.5f, 0};
+    std::vector<float> plane;
+    Ties()
+    {
+        for (std::size_t j = 0; j < h; ++j)
+            for (std::size_t i = 0; i < w; ++i)
+                plane.push_back(field(7, int(j + 1) / 2, int(i + 1) / 2));
+    }
+};
+
+void nearest_ties(Case c)
+{
+    const Ties t;
+    std::vector<float> got(t.points.size());
+    slice::points(*c.array, c.type, t.xyz.data(), got.size(), slice::Order::Nearest, got.data());
+    check_close(got, t.points, "nearest half ties");
+    got.resize(t.w * t.h);
+    slice::plane(*c.array, c.type, t.origin, t.u, t.v, t.w, t.h, slice::Order::Nearest, got.data());
+    check_close(got, t.plane, "nearest 2x plane");
 }
 
 struct Band {
@@ -263,6 +292,11 @@ void cuda_matches(Case c)
                                                order)),
                     layers, "CUDA band");
     }
+    const Ties t;
+    check_close(download(slice::cuda::points(*c.array, c.type, t.xyz.data(), t.points.size(), slice::Order::Nearest)),
+                t.points, "CUDA nearest half ties");
+    check_close(download(slice::cuda::plane(*c.array, c.type, t.origin, t.u, t.v, t.w, t.h, slice::Order::Nearest)),
+                t.plane, "CUDA nearest 2x plane");
     using M = slice::Composite::Method;
     for (const auto method : {M::Mean, M::Max, M::Min, M::Median, M::MinAbs, M::Alpha, M::BeerLambert}) {
         slice::Composite cfg;
@@ -314,6 +348,7 @@ int main()
         const Case c{opened.array.get(), opened.meta.type};
         points(c, ref);
         plane(c, ref);
+        nearest_ties(c);
         band(c, ref);
         composite(c);
 #ifdef VC_READER_CUDA

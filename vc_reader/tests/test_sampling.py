@@ -1,5 +1,6 @@
 """Independent small-array and analytic checks for aligned CPU/CUDA reads."""
 import itertools
+import math
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -50,7 +51,7 @@ def reference(values, pull, start, shape, order, fill=0, plane=False):
         neighbours = []
         if supported:
             if not order:
-                at = tuple(round(v) for v in q)
+                at = tuple(math.floor(v) + (v-math.floor(v) >= .5) for v in q)  # spatial ties round up
                 neighbours = [(at, 1.)]
             else:
                 lo = tuple(int(np.floor(v)) for v in q)
@@ -239,7 +240,8 @@ class SamplingTests(unittest.TestCase):
         for backend in self.backends():
             with open_sample(self.ref, {'label': source}, backend=backend) as reader:
                 result = reader.read((0, 0, origin), (1, 1, 5))
-                np.testing.assert_array_equal(host(result['label'].data).ravel(), np.array([2**60, 2**60, 2**60+2, 2**60+2, 2**60+9], dtype='uint64'))
+                # Pixel coordinates -0.5 .. 3.5 are half ties, which round up.
+                np.testing.assert_array_equal(host(result['label'].data).ravel(), np.array([2**60, 2**60+1, 2**60+2, 2**60+3, 2**60+9], dtype='uint64'))
                 np.testing.assert_array_equal(host(result['label'].valid).ravel(), [True, True, True, True, False])
 
     def test_fields_frames_order_normals_and_metadata(self):
@@ -435,7 +437,7 @@ class SamplingTests(unittest.TestCase):
         for backend in self.backends():
             with open_sample(self.ref, {'label': source}, backend=backend) as reader:
                 result = reader.read((0, 0, base), (1, 1, 5))
-                np.testing.assert_array_equal(host(result['label'].data).ravel(), values[[0, 2, 2, 4, 4]])
+                np.testing.assert_array_equal(host(result['label'].data).ravel(), values[[1, 2, 3, 4, 5]])  # x + .5 ties round up
             with open_sample(self.ref, {'label': block_source}, backend=backend) as reader:
                 result = reader.read((0, 0, 0), (2, 3, 129))
                 np.testing.assert_array_equal(host(result['label'].data), expected)

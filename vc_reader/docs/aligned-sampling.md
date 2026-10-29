@@ -66,7 +66,7 @@ level request needs a catalog to resolve its actual storage grid.
 
 ## Sampling rules
 
-- Labels and discrete masks use nearest neighbor, ties to even, and exact
+- Labels and discrete masks use nearest neighbor, half-voxel ties rounding up, and exact
   stored integer copies, including uint64 values above `2**53`. Encodings run
   in the source reader before sampling. CPU categorical results retain their
   declared dtype; CUDA arrays use native byte order with the same integer type.

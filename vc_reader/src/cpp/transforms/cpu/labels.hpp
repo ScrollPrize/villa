@@ -228,7 +228,7 @@ inline void apply(const DeepSupervision& t, Sample& s, const Parameters&) {
     auto out = s.at(t.on); require(!t.scales.empty(), "deep supervision requires scales");
     for (auto scale : t.scales) {
         auto shape = out.array.spatial(); if (scale.size() == 1) scale.resize(shape.size(), scale[0]); require(scale.size() == shape.size(), "invalid deep-supervision scale dimensions");
-        for (std::size_t a = 0; a < shape.size(); ++a) { require(std::isfinite(scale[a]) && scale[a] > 0 && scale[a] <= 1, "deep-supervision scales must be in (0, 1]"); shape[a] = std::max<std::size_t>(1, std::size_t(round_even(shape[a] * scale[a]))); }
+        for (std::size_t a = 0; a < shape.size(); ++a) { require(std::isfinite(scale[a]) && scale[a] > 0 && scale[a] <= 1, "deep-supervision scales must be in (0, 1]"); shape[a] = std::max<std::size_t>(1, std::size_t(round_half_even(shape[a] * scale[a]))); }
         out.pyramid.push_back(resize_array(out.array, shape, true));
     }
     out.source = t.on; s[t.output.empty() ? t.on : t.output] = std::move(out);

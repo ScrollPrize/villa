@@ -74,14 +74,14 @@ inline ChannelPlan channel_parameters(const BlankRectangle& t, const Array& a, R
 inline ChannelPlan channel_parameters(const SliceIllumination& t, const Array& a, Random& r) {
     auto dim = a.shape.size() - 1, d = std::size_t(axis(t.axis, dim)), n = a.shape[d + 1];
     ChannelPlan p; p.values = {double(d)}; p.field.assign(n, 1);
-    for (int count = int(std::round(draw(t.defects, r))); count > 0; --count) {
+    for (int count = int(round_half_even(draw(t.defects, r))); count > 0; --count) {
         double width = draw(t.width, r), reduction = draw(t.reduction, r), pos = double(r.index(n));
         require(width > 0, "illumination defect width must be positive");
         for (std::size_t i = 0; i < n; ++i) p.field[i] *= 1 - std::exp(-.5 * std::pow((i - pos) / width, 2)) * (1 - reduction);
     }
     for (auto& v : p.field) v = std::clamp(v, .1f, 1.f);
     double bp = draw(t.base_p, r); probability(bp);
-    auto count = std::size_t(std::round(bp * n));
+    auto count = std::size_t(round_half_even(bp * n));
     std::vector<double> weights(n); for (std::size_t i = 0; i < n; ++i) weights[i] = 2 - p.field[i];
     for (std::size_t j = 0; j < count; ++j) {
         double threshold = r.uniform() * std::accumulate(weights.begin(), weights.end(), 0.);
@@ -270,7 +270,7 @@ inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& co
             values[code] = T(std::lerp(low, high, double(code) / (limit - 1)));
         codes.resize(v.size());
         for (std::size_t i = 0; i < v.size(); ++i)
-            codes[i] = std::uint8_t(std::clamp(std::floor((double(v[i]) - low) / range * (limit - 1) + .5), 0., double(limit - 1)));
+            codes[i] = std::uint8_t(std::clamp(round_half_even((double(v[i]) - low) / range * (limit - 1)), 0., double(limit - 1)));
         // Monotone quantization commutes with rank selection: the result is
         // the quantized exact median, within range/510 plus output rounding.
     }

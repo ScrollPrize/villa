@@ -484,7 +484,7 @@ class ZarrReader:
         Interpolation and boundaries follow :meth:`sample`: uint8 CT with
         uint8/float32 output uses local float32 geometry and arithmetic.
         Explicit float64 output retains the legacy float64 reference path;
-        order 0 rounds ties to even and returns the stored dtype. Missing
+        order 0 rounds half-voxel ties up and returns the stored dtype. Missing
         chunks and outside neighbours use the source's ``fill_value``.
         Explicit ``dtype`` also permits float32/float64 conversion for order 0.
         ``out`` must be writable, aligned, C-contiguous and have the requested
@@ -610,7 +610,7 @@ class ZarrReader:
         ``fill_value``, as in ``scipy.ndimage.map_coordinates(mode="grid-constant",
         cval=fill_value)``. Points with a non-finite coordinate give NaN.
 
-        ``order=0``: the nearest element (halves round to even, like ``np.rint``),
+        ``order=0``: the nearest element (half-voxel ties round up, as SciPy's ``order=0``),
         exactly as stored, in the array's dtype; outside points read as ``fill_value``.
 
         The neighbours are read in C++, each chunk once per batch of points.

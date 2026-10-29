@@ -34,7 +34,7 @@ inline Point matvec(const Matrix& m, Point v, std::size_t d) {
 }
 inline std::int64_t nearest_index(double q, int mode) {
     auto lo = std::int64_t(std::floor(q)); auto fraction = q - lo;
-    return mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (mode == 1 || lo % 2 != 0)));
+    return mode == 2 ? lo : lo + nearest_rounds_up(fraction);
 }
 template<std::size_t D = 0, bool Validity = false, class Real, class F> Real linear_value(const Grid& g, std::array<Real,3> q, bool border, double fill, F&& get) {
     std::int64_t lo[3]; Real fraction[3]; const auto d = D ? D : g.shape.size();
@@ -512,7 +512,7 @@ inline void apply(const LowResolution&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; Shape shape = a.spatial(); auto n = product(shape); Shape one_shape{1}; one_shape.insert(one_shape.end(), shape.begin(), shape.end());
         Array one(one_shape, a.kind, a.bytes, static_cast<const char*>(std::as_const(a).data()) + c.channel * n * a.bytes);
-        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_even(shape[j] * c.values[j])));
+        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_half_even(shape[j] * c.values[j])));
         if (shape == a.spatial()) continue;
         auto restored = resize_array(one, a.spatial(), false, false, &shape);
         if (a.shape[0]==1) a=std::move(restored);
@@ -524,7 +524,7 @@ inline Parameters sample(const ThickSlice& t, const Sample& s, Random& r) {
     auto shape = sample_shape(s); auto allowed = t.axes.empty() ? axes(shape.size()) : t.axes;
     auto a = std::size_t(axis(allowed[r.index(allowed.size())], shape.size()));
     double scale = draw(t.scale, r); require(scale > 0 && scale <= 1, "thick-slice scale must be in (0, 1]");
-    shape[a] = std::max<std::size_t>(1, std::size_t(round_even(shape[a] * scale))); Parameters p; p.shape = shape; return p;
+    shape[a] = std::max<std::size_t>(1, std::size_t(round_half_even(shape[a] * scale))); Parameters p; p.shape = shape; return p;
 }
 template<class Resize>
 inline void apply_resolution(const ThickSlice& t, Sample& s, const Parameters& p, Resize&& resize) {

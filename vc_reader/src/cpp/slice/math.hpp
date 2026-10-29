@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include "../rounding.hpp"
 #ifdef VC_READER_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -55,7 +56,7 @@ VCR_SLICE_HD float cubicWeight(float t)
 VCR_SLICE_HD void footprint(float c, int order, std::int64_t& first, std::int64_t& last)
 {
     if (order == 0) {
-        first = last = std::int64_t(rintf(c));
+        first = last = nearest_index(c);
         return;
     }
     const std::int64_t f = std::int64_t(floorf(c));
@@ -99,11 +100,11 @@ VCR_SLICE_HD bool covered(const std::uint8_t* mask, const Block& b, float x, flo
 }
 
 // Samples the block at XYZ (voxel i at coordinate i). The block holds the point's
-// whole neighbourhood. Nearest rounds ties to even.
+// whole neighbourhood. Nearest uses the spatial tie rule (rounding.hpp).
 VCR_SLICE_HD float sample(const float* data, const Block& b, float x, float y, float z, int order)
 {
     if (order == 0)
-        return at(data, b, std::int64_t(rintf(z)), std::int64_t(rintf(y)), std::int64_t(rintf(x)));
+        return at(data, b, nearest_index(z), nearest_index(y), nearest_index(x));
     const float fz = floorf(z), fy = floorf(y), fx = floorf(x);
     const std::int64_t iz = std::int64_t(fz), iy = std::int64_t(fy), ix = std::int64_t(fx);
     const float tz = z - fz, ty = y - fy, tx = x - fx;

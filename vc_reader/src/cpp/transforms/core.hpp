@@ -17,6 +17,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include "../rounding.hpp"
 
 // Helpers shared by CPU and CUDA implementations.
 #ifdef __CUDACC__
@@ -330,10 +331,6 @@ inline std::size_t reflect(std::int64_t i, std::size_t n) {
     auto p = static_cast<std::int64_t>(2 * n); i = (i % p + p) % p;
     return static_cast<std::size_t>(i < static_cast<std::int64_t>(n) ? i : p - 1 - i);
 }
-inline double round_even(double v) {
-    double lo = std::floor(v), fraction = v - lo;
-    return lo + (fraction > .5 || (fraction == .5 && std::fmod(lo, 2.) != 0));
-}
 // Convolution boundaries: reflect repeats the edge sample (SciPy "reflect"),
 // mirror does not (Torch "reflect"), nearest replicates it (SciPy "nearest").
 // Zero pads with zeros (Torch conv padding); only structure tensors use it.
@@ -371,7 +368,7 @@ inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_w
     require(sigma > 0 && std::isfinite(sigma) && truncate > 0 && std::isfinite(truncate) && sigma * truncate < 100000, "invalid Gaussian sigma");
     int radius = int(sigma * truncate + .5);
     if (full_width) {
-        double extent = sigma * truncate + .5; int size = int(round_even(extent));
+        double extent = sigma * truncate + .5; int size = int(round_half_even(extent));
         if (size % 2 == 0) size += extent - size >= 0 ? 1 : -1;
         radius = std::max(0, (size - 1) / 2);
     }
@@ -458,7 +455,7 @@ struct Parameters {
     std::shared_ptr<void> device_field;
     // Exact integer crop offsets computed from foreground on the device.
     std::shared_ptr<void> device_offset;
-    int nearest_mode = 0; // 0: ties-to-even, 1: half-up resize, 2: floor resize
+    int nearest_mode = 0; // 0: nearest (spatial ties round up), 2: floor (legacy resize)
 };
 template<class F>
 Parameters sample_channels(const Sample& sample, const ChannelOptions& options, Random& r, F&& sample_one) {

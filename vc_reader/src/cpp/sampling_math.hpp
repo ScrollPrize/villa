@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "rounding.hpp"
 #ifdef __CUDACC__
 #define VCR_SAMPLE_HD __host__ __device__
 #else

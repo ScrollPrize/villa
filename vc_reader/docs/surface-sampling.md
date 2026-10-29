@@ -144,7 +144,7 @@ contribute nothing. A patch without valid nondegenerate geometry raises
 
 For each contributing triangle/voxel, the closest surface point to the voxel
 center supplies barycentric UV coordinates. Labels use nearest-neighbor
-sampling with ties-to-even and exact integer comparisons, including multichannel
+sampling with half-voxel ties rounding up and exact integer comparisons, including multichannel
 values. Invalid label support contributes no label validity, but geometric
 coverage remains true where the surface intersects a voxel. Overlapping contributions
 select the smallest physical distance, then the stable triangle ID; each named

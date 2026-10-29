@@ -171,7 +171,7 @@ def test_sparse_voxels_rounding_batches_and_dense(backend):
     v = VoxelSet(upload(p,backend),(4,4,5),batch_ids=upload(ids,backend),batches=2)
     dense = host(v.to_dense())
     expected = np.zeros((2,4,4,5),np.uint8)
-    expected[0,0,0,0]=expected[1,0,0,0]=expected[1,2,2,4]=1
+    expected[0,0,0,0]=expected[1,0,0,0]=expected[1,2,3,4]=1  # spatial half ties round up: 1.5,2.5,3.5 -> 2,3,4
     np.testing.assert_array_equal(dense,expected)
     r = host(v.contains(upload(p,backend),batch_ids=upload(ids,backend)))
     np.testing.assert_array_equal(r,[True,True,True,True,False,False,False,False])

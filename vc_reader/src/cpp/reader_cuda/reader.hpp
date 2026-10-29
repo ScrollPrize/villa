@@ -345,7 +345,7 @@ public:
                     const float bounded=std::clamp(c,float(-g.base[a]-2),float(source_.shape[a]-g.base[a]+2));
                     const auto low=std::floor(bounded);
                     auto at=g.base[a]+std::int64_t(low);
-                    if (!order) { const float f=bounded-low; at+=(f>.5f || (f==.5f && (at&1))); }
+                    if (!order) at+=nearest_rounds_up(bounded-low);
                     lo[a]=std::min(lo[a],std::max<std::int64_t>(0,at));
                     hi[a]=std::max(hi[a],std::min(source_.shape[a],at+1+(order && bounded!=low)));
                 }
@@ -526,7 +526,7 @@ private:
                 for (int a=0;a<3;++a) {
                     if (!(c[a]>Coord(-1-base[a]) && c[a]<Coord(source_.shape[a]-base[a])+(order ? 0.f : 1.f))) { outside=true; break; }
                     const Coord low=std::floor(c[a]); frac[a]=c[a]-low; at[a]=base[a]+std::int64_t(low);
-                    if (!order) at[a]+=(frac[a]>.5f || (frac[a]==.5f && (at[a]&1)));
+                    if (!order) at[a]+=nearest_rounds_up(frac[a]);
                 }
                 if (outside) continue;
                 bool whole=true;
