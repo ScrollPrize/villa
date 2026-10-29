@@ -52,15 +52,12 @@ void testResample()
                 const double gx = raster.x0 + i * raster.sx, gy = raster.y0 + j * raster.sy;
                 require(near(q[0], float(2 * gx)) && near(q[1], float(3 * gy)) && near(q[2], 10.0f),
                         "flat surface position");
-                // Linear mode: vertex normals exist off the border only.
-                const long ix = std::lround(gx), iy = std::lround(gy);
-                const bool border = ix == 0 || iy == 0 || ix == cols - 1 || iy == rows - 1;
-                if (mode == vcr::grid::Interpolation::Smooth || !border)
-                    require(near(std::abs(m[2]), 1.0f) && near(m[0], 0.0f) && near(m[1], 0.0f), "flat surface normal");
+                // The patch normal: column direction x row direction = +z here.
+                require(near(m[2], 1.0f) && near(m[0], 0.0f) && near(m[1], 0.0f), "flat surface normal");
             }
     }
 
-    // Outside the grid, and on a missing vertex's cells, there is no point.
+    // Outside the grid, and on the cells of a missing vertex, there is no point.
     std::vector<float> holed = xyz;
     float* hole = &holed[(std::size_t(2) * std::size_t(cols) + std::size_t(3)) * 3];
     hole[0] = hole[1] = hole[2] = -1.0f;
@@ -69,32 +66,53 @@ void testResample()
     float out[15];
     vcr::grid::Surface nearest(hv);
     nearest.resample(probe, out, nullptr);
-    require(std::isnan(out[0]) && std::isnan(out[3]), "pixels nearest the missing vertex have no point");
-    // A missing vertex never enters a position: at grid x 3.5 and 3.75 on row 2 only
-    // vertex (2, 4) of the cell is present and has weight, so the position is its own.
-    require(near(out[6], 8.0f) && near(out[7], 6.0f) && near(out[9], 8.0f) && near(out[12], 8.0f),
-            "positions next to a missing vertex blend only present vertices");
+    for (int i = 0; i < 4; ++i)  // x 3.0 .. 3.75: the cell (3..4, 2..3) holds the missing vertex
+        require(std::isnan(out[3 * i]), "a cell with a missing vertex has no point");
+    require(near(out[12], 8.0f) && near(out[13], 6.0f), "the next cell is a patch");
     for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
         vcr::grid::Surface s(hv, {mode});
-        const vcr::grid::Raster cell{2.0, 1.0, 0.1, 0.1, 21, 21};  // the four cells around the hole
-        std::vector<float> q(21 * 21 * 3);
+        const vcr::grid::Raster cell{1.0, 0.0, 0.1, 0.1, 41, 41};  // the cells around the hole
+        std::vector<float> q(41 * 41 * 3);
         s.resample(cell, q.data(), nullptr);
-        for (std::size_t i = 0; i < q.size(); i += 3)
-            require(std::isnan(q[i]) || (q[i] >= 3.999f && q[i] <= 8.001f && q[i + 1] >= 2.999f && near(q[i + 2], 10.0f)),
-                    "no position is pulled toward the missing vertex's sentinel");
+        std::size_t points = 0;
+        for (std::size_t i = 0; i < q.size(); i += 3) {
+            points += !std::isnan(q[i]);
+            require(std::isnan(q[i]) || (q[i] >= 1.999f && q[i] <= 10.001f && q[i + 1] >= -0.001f && near(q[i + 2], 10.0f)),
+                    "positions are made of present vertices only");
+        }
+        require(points > 0, "cells away from the hole are patches");
     }
-    vcr::grid::Surface strict(hv, {vcr::grid::Interpolation::Linear, true});
-    strict.resample(probe, out, nullptr);
-    require(std::isnan(out[6]) && near(out[12], 8.0f), "strict: only cells with a missing vertex have no point");
     const vcr::grid::Raster outside{-3.0, 1.0, 1.0, 1.0, 2, 1};
     nearest.resample(outside, out, nullptr);
     require(std::isnan(out[0]) && std::isnan(out[3]), "outside the grid");
 
+    // Anisotropic spacing: the sheet z = x (in vertex units) with voxels twice as long
+    // in z is z = 2x physically, so its unit physical normal is (-2, 0, 1) / sqrt(5), and
+    // one physical unit along it moves (-2, 0, 0.5) / sqrt(5) in vertex units.
+    {
+        std::vector<float> tilted(5 * 5 * 3);
+        for (int r = 0; r < 5; ++r)
+            for (int c = 0; c < 5; ++c) {
+                float* q = &tilted[(std::size_t(r) * 5 + std::size_t(c)) * 3];
+                q[0] = float(c);
+                q[1] = float(r);
+                q[2] = float(c);
+            }
+        vcr::grid::SurfaceOptions options;
+        options.spacing = {1, 1, 2};
+        vcr::grid::Surface sheet({tilted.data(), 5, 5, 15}, options);
+        float p[3], n[3];
+        sheet.resample({1.5, 2.5, 1, 1, 1, 1}, p, n);
+        const float k = 1.0f / std::sqrt(5.0f);
+        require(near(p[0], 1.5f) && near(p[1], 2.5f) && near(p[2], 1.5f), "anisotropic position");
+        require(near(n[0], -2 * k) && near(n[1], 0) && near(n[2], 0.5f * k), "anisotropic normal step");
+    }
+
     // Two pieces: no point between them, positions inside each from that piece.
-    vcr::grid::Surface pieces(v, {vcr::grid::Interpolation::Linear, false, {{0, 4}, {4, 8}}});
-    const vcr::grid::Raster across{3.0, 1.0, 0.5, 1.0, 3, 1};  // grid x 3.0, 3.5, 4.0
+    vcr::grid::Surface pieces(v, {vcr::grid::Interpolation::Linear, {{0, 4}, {4, 8}}});
+    const vcr::grid::Raster across{2.5, 1.0, 1.0, 1.0, 3, 1};  // grid x 2.5, 3.5 (the seam cell), 4.5
     pieces.resample(across, out, nullptr);
-    require(near(out[0], 6.0f) && std::isnan(out[3]) && near(out[6], 8.0f), "pieces are not interpolated across");
+    require(near(out[0], 5.0f) && std::isnan(out[3]) && near(out[6], 9.0f), "pieces are not interpolated across");
 }
 
 }  // namespace

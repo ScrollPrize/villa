@@ -111,31 +111,5 @@ template<class T> VCR_SURFACE_HD void raster(const Raster& g,const float* triang
         coverage[i]=true;
     }
 }
-struct Interpolation {
-    int height=0,width=0; float physical[12]{},destination[12]{},orientation=1,offset=0;
-};
-VCR_SURFACE_HD inline void interpolate(const Interpolation& g,const float* xyz,const bool* mask,
-    const float* queries,const float* normals,float* output,bool* valid,std::size_t i){
-    float x=queries[2*i],y=queries[2*i+1];valid[i]=false;
-    for(int a=0;a<3;++a)output[3*i+a]=NAN;
-    if(!std::isfinite(x)||!std::isfinite(y)||x<0||y<0||x>g.width-1||y>g.height-1||g.width<2||g.height<2)return;
-    int col=int(fminf(floorf(x),g.width-2)),row=int(fminf(floorf(y),g.height-2));
-    float u=x-col,v=y-row;int at[4]{row*g.width+col,row*g.width+col+1,(row+1)*g.width+col,(row+1)*g.width+col+1};
-    V p[4];for(int k=0;k<4;++k){if(!mask[at[k]])return;p[k]=vector(xyz+3*at[k]);}
-    V point=(p[0]*(1-u)+p[1]*u)*(1-v)+(p[2]*(1-u)+p[3]*u)*v;
-    V du=linear(g.physical,(p[1]-p[0])*(1-v)+(p[3]-p[2])*v);
-    V dv=linear(g.physical,(p[2]-p[0])*(1-u)+(p[3]-p[1])*u);
-    V normal=cross(du,dv)*g.orientation;
-    if(normals){
-        V n[4];for(int k=0;k<4;++k)n[k]=vector(normals+3*at[k]);
-        normal=(n[0]*(1-u)+n[1]*u)*(1-v)+(n[2]*(1-u)+n[3]*u)*v;
-    }
-    float scale=fmaxf(fabsf(normal.x),fmaxf(fabsf(normal.y),fabsf(normal.z)));
-    if(!(scale>0)||!std::isfinite(normal.x)||!std::isfinite(normal.y)||!std::isfinite(normal.z))return;
-    normal=normal*(1/scale);normal=normal*(1/sqrtf(dot(normal,normal)));
-    point=transform(g.destination,transform(g.physical,point)+normal*g.offset);
-    if(!std::isfinite(point.x)||!std::isfinite(point.y)||!std::isfinite(point.z))return;
-    output[3*i]=point.x;output[3*i+1]=point.y;output[3*i+2]=point.z;valid[i]=true;
-}
 }
 #undef VCR_SURFACE_HD

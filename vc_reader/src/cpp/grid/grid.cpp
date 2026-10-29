@@ -2,7 +2,9 @@
 #include "vc_reader/grid.hpp"
 
 #include "../array.hpp"
-#include "../rounding.hpp"
+#include "points.hpp"
+#include "../sample_point.hpp"
+#include "level_map.hpp"
 #include "../composite/reducer.hpp"
 #include "../thread_pool.hpp"
 
@@ -22,44 +24,6 @@ namespace {
 
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 
-struct Vec {
-    float x = 0, y = 0, z = 0;
-};
-inline Vec operator+(Vec a, Vec b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-inline Vec operator-(Vec a, Vec b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-inline Vec operator*(Vec a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-inline bool finite(Vec a) { return std::isfinite(a.x) && std::isfinite(a.y) && std::isfinite(a.z); }
-inline Vec nanVec() { return {kNaN, kNaN, kNaN}; }
-
-// A unit normal of the cross product, or NaN when it has no direction.
-inline Vec unitCross(Vec u, Vec v)
-{
-    const Vec n{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
-    const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
-    if (len2 == 0.0f || len2 != len2)
-        return nanVec();
-    const float inv = 1.0f / std::sqrt(len2);
-    return {n.x * inv, n.y * inv, n.z * inv};
-}
-
-inline Vec bilerp(Vec p00, Vec p01, Vec p10, Vec p11, float wx, float wy)
-{
-    const float iwx = 1.0f - wx, iwy = 1.0f - wy;
-    return (p00 * iwx + p01 * wx) * iwy + (p10 * iwx + p11 * wx) * wy;
-}
-
-// Cubic Hermite basis for a unit cell: p weights endpoint values, m endpoint
-// derivatives; the d* fields are their derivatives with respect to t.
-struct Hermite {
-    float p0, m0, p1, m1, dp0, dm0, dp1, dm1;
-};
-inline Hermite hermite(float t)
-{
-    const float t2 = t * t, t3 = t2 * t;
-    return {2.f * t3 - 3.f * t2 + 1.f, t3 - 2.f * t2 + t, -2.f * t3 + 3.f * t2, t3 - t2,
-            6.f * t2 - 6.f * t,       3.f * t2 - 4.f * t + 1.f, -6.f * t2 + 6.f * t, 3.f * t2 - 2.f * t};
-}
-
 ThreadPool& resamplePool()
 {
     static ThreadPool pool(std::max(1u, std::thread::hardware_concurrency()));
@@ -68,286 +32,143 @@ ThreadPool& resamplePool()
 
 }  // namespace
 
+// A surface's vertices with what grid::point needs: which vertices are present, the
+// piece of each column, and (smooth mode) the Hermite derivatives of every vertex.
 struct Surface::Impl {
     Vertices v;
     SurfaceOptions options;
-    std::vector<std::pair<int, int>> pieces;  // column ranges, clamped; one for the whole grid without components
-    bool replicate = true;                    // a one-piece grid replicates its border vertices
+    std::vector<std::uint8_t> present;  // per vertex (bool-sized)
+    std::vector<int> piece;             // per column; empty: one piece
+    std::vector<float> du, dv, duv;     // per vertex, smooth mode
+    std::vector<float> packed;          // the vertices without row padding, when stride != cols * 3
 
-    std::once_flag validOnce, normalsOnce, derivativesOnce;
-    std::vector<std::uint8_t> valid;          // per vertex
-    std::vector<Vec> normals;                 // per vertex (Linear)
-    std::vector<Vec> du, dv, duv;             // per vertex (Smooth)
-
-    Vec at(int r, int c) const
-    {
-        const float* p = v.xyz + std::size_t(r) * v.stride + std::size_t(c) * 3;
-        return {p[0], p[1], p[2]};
-    }
+    const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
     std::size_t index(int r, int c) const { return std::size_t(r) * std::size_t(v.cols) + std::size_t(c); }
+    geometry::V at(int r, int c) const { return geometry::vector(xyz() + 3 * index(r, c)); }
 
-    void buildValid()
+    GridView view() const
     {
-        valid.assign(std::size_t(v.rows) * std::size_t(v.cols), 0);
-        for (int r = 0; r < v.rows; ++r)
-            for (int c = 0; c < v.cols; ++c) {
-                const Vec p = at(r, c);
-                const bool nan = p.x != p.x || p.y != p.y || p.z != p.z;
-                const bool sentinel = p.x == -1.f && p.y == -1.f && p.z == -1.f;
-                valid[index(r, c)] = nan || sentinel ? 0 : 255;
-            }
+        GridView g;
+        g.xyz = xyz();
+        g.present = reinterpret_cast<const bool*>(present.data());
+        g.piece = piece.empty() ? nullptr : piece.data();
+        if (options.interpolation == Interpolation::Smooth) {
+            g.du = du.data();
+            g.dv = dv.data();
+            g.duv = duv.data();
+        }
+        return g;
+    }
+    // Vertex coordinates to physical space (spacing) and back.
+    PointMap map() const
+    {
+        PointMap g;
+        g.height = v.rows;
+        g.width = v.cols;
+        for (int a = 0; a < 3; ++a) {
+            g.physical[a * 5] = options.spacing[std::size_t(a)];
+            g.destination[a * 5] = 1.0f / options.spacing[std::size_t(a)];
+        }
+        return g;
     }
 
-    // A stored point a normal may difference: finite, no -1 coordinate, z above 0.
-    static bool stored(Vec p)
-    {
-        return finite(p) && p.x != -1.f && p.y != -1.f && p.z != -1.f && p.z > 0;
-    }
-
-    // Central-difference vertex normals; NaN on the border and where a neighbour is missing.
-    void buildNormals()
-    {
-        normals.assign(std::size_t(v.rows) * std::size_t(v.cols), nanVec());
-        for (int r = 1; r < v.rows - 1; ++r)
-            for (int c = 1; c < v.cols - 1; ++c) {
-                if (at(r, c).x == -1.f)
-                    continue;
-                const Vec xl = at(r, c - 1), xr = at(r, c + 1), yu = at(r - 1, c), yd = at(r + 1, c);
-                if (!stored(xl) || !stored(xr) || !stored(yu) || !stored(yd))
-                    continue;
-                normals[index(r, c)] = unitCross(xr - xl, yd - yu);
-            }
-    }
-
-    // Per-vertex derivatives of the Hermite patches: centred differences inside,
-    // one-sided at borders and holes, never across a piece's columns.
+    // Per-vertex Hermite derivatives: centred differences inside, one-sided at borders
+    // and holes, never across a piece's columns.
     void buildDerivatives()
     {
-        std::call_once(validOnce, [this] { buildValid(); });
         const int rows = v.rows, cols = v.cols;
-        const std::size_t n = std::size_t(rows) * std::size_t(cols);
-        du.assign(n, Vec{});
-        dv.assign(n, Vec{});
-        duv.assign(n, Vec{});
-        std::vector<int> begin(std::size_t(cols), 0), end(std::size_t(cols), cols);
-        if (!options.components.empty()) {
-            std::fill(begin.begin(), begin.end(), -1);
-            std::fill(end.begin(), end.end(), -1);
-            for (const auto& [first, last] : pieces)
-                for (int c = first; c < last; ++c) {
-                    begin[std::size_t(c)] = first;
-                    end[std::size_t(c)] = last;
-                }
-        }
-        const auto ok = [&](int r, int c) {
-            return r >= 0 && r < rows && c >= 0 && c < cols && begin[std::size_t(c)] >= 0 && valid[index(r, c)];
-        };
+        const std::size_t n = std::size_t(rows) * std::size_t(cols) * 3;
+        du.assign(n, 0.0f);
+        dv.assign(n, 0.0f);
+        duv.assign(n, 0.0f);
+        const auto ok = [&](int r, int c) { return r >= 0 && r < rows && c >= 0 && c < cols && present[index(r, c)]; };
+        const auto same = [&](int c, int d) { return piece.empty() || piece[std::size_t(c)] == piece[std::size_t(d)]; };
+        const auto put = [&](std::vector<float>& d, int r, int c, geometry::V value) { geometry::store(&d[3 * index(r, c)], value); };
+        const auto get = [&](const std::vector<float>& d, int r, int c) { return geometry::vector(&d[3 * index(r, c)]); };
         for (int r = 0; r < rows; ++r)
             for (int c = 0; c < cols; ++c) {
                 if (!ok(r, c))
                     continue;
-                const Vec p = at(r, c);
-                const bool left = c > begin[std::size_t(c)] && ok(r, c - 1);
-                const bool right = c + 1 < end[std::size_t(c)] && ok(r, c + 1);
-                Vec& u = du[index(r, c)];
+                const auto p = at(r, c);
+                const bool left = ok(r, c - 1) && same(c - 1, c), right = ok(r, c + 1) && same(c, c + 1);
                 if (left && right)
-                    u = (at(r, c + 1) - at(r, c - 1)) * 0.5f;
+                    put(du, r, c, (at(r, c + 1) - at(r, c - 1)) * 0.5f);
                 else if (right)
-                    u = at(r, c + 1) - p;
+                    put(du, r, c, at(r, c + 1) - p);
                 else if (left)
-                    u = p - at(r, c - 1);
+                    put(du, r, c, p - at(r, c - 1));
                 const bool up = ok(r - 1, c), down = ok(r + 1, c);
-                Vec& w = dv[index(r, c)];
                 if (up && down)
-                    w = (at(r + 1, c) - at(r - 1, c)) * 0.5f;
+                    put(dv, r, c, (at(r + 1, c) - at(r - 1, c)) * 0.5f);
                 else if (down)
-                    w = at(r + 1, c) - p;
+                    put(dv, r, c, at(r + 1, c) - p);
                 else if (up)
-                    w = p - at(r - 1, c);
+                    put(dv, r, c, p - at(r - 1, c));
             }
         for (int r = 0; r < rows; ++r)
             for (int c = 0; c < cols; ++c) {
                 if (!ok(r, c))
                     continue;
-                const bool left = c > begin[std::size_t(c)] && ok(r, c - 1);
-                const bool right = c + 1 < end[std::size_t(c)] && ok(r, c + 1);
+                const bool left = ok(r, c - 1) && same(c - 1, c), right = ok(r, c + 1) && same(c, c + 1);
                 const bool up = ok(r - 1, c), down = ok(r + 1, c);
                 if (left && right && up && down && ok(r - 1, c - 1) && ok(r - 1, c + 1) && ok(r + 1, c - 1) &&
                     ok(r + 1, c + 1)) {
-                    duv[index(r, c)] =
-                        (at(r + 1, c + 1) - at(r + 1, c - 1) - at(r - 1, c + 1) + at(r - 1, c - 1)) * 0.25f;
+                    put(duv, r, c, (at(r + 1, c + 1) - at(r + 1, c - 1) - at(r - 1, c + 1) + at(r - 1, c - 1)) * 0.25f);
                     continue;
                 }
-                Vec sum{};
+                geometry::V sum{0, 0, 0};
                 int count = 0;
                 if (up && down) {
-                    sum = sum + (du[index(r + 1, c)] - du[index(r - 1, c)]) * 0.5f;
+                    sum = sum + (get(du, r + 1, c) - get(du, r - 1, c)) * 0.5f;
                     ++count;
                 } else if (down) {
-                    sum = sum + (du[index(r + 1, c)] - du[index(r, c)]);
+                    sum = sum + (get(du, r + 1, c) - get(du, r, c));
                     ++count;
                 } else if (up) {
-                    sum = sum + (du[index(r, c)] - du[index(r - 1, c)]);
+                    sum = sum + (get(du, r, c) - get(du, r - 1, c));
                     ++count;
                 }
                 if (left && right) {
-                    sum = sum + (dv[index(r, c + 1)] - dv[index(r, c - 1)]) * 0.5f;
+                    sum = sum + (get(dv, r, c + 1) - get(dv, r, c - 1)) * 0.5f;
                     ++count;
                 } else if (right) {
-                    sum = sum + (dv[index(r, c + 1)] - dv[index(r, c)]);
+                    sum = sum + (get(dv, r, c + 1) - get(dv, r, c));
                     ++count;
                 } else if (left) {
-                    sum = sum + (dv[index(r, c)] - dv[index(r, c - 1)]);
+                    sum = sum + (get(dv, r, c) - get(dv, r, c - 1));
                     ++count;
                 }
                 if (count)
-                    duv[index(r, c)] = sum * (1.0f / float(count));
+                    put(duv, r, c, sum * (1.0f / float(count)));
             }
     }
 
-    void prepare(bool wantNormals)
+    // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into
+    // w x h outputs. Pixel (i, j) sits at grid position (x0 + i sx, y0 + j sy), computed
+    // in double as the CUDA sampler does.
+    void resampleRect(const Raster& raster, int i0, int j0, int w, int h, float* xyz, float* nrm) const
     {
-        std::call_once(validOnce, [this] { buildValid(); });
-        if (options.interpolation == Interpolation::Smooth)
-            std::call_once(derivativesOnce, [this] { buildDerivatives(); });
-        else if (wantNormals)
-            std::call_once(normalsOnce, [this] { buildNormals(); });
-    }
-
-    // Whether the pixel at grid position (gx, gy) lies on piece [c0, c1): the
-    // validity rule of the piece's vertices, outside the piece never.
-    bool onPiece(int c0, int c1, double gx, double gy) const
-    {
-        const int sc = c1 - c0, sr = v.rows;
-        const double fx = gx - c0;
-        if (options.strictQuads) {
-            if (sc < 2 || sr < 2 || fx < 0.0 || fx > double(sc - 1) || gy < 0.0 || gy > double(sr - 1))
-                return false;
-            const int col = std::min(int(std::floor(fx)), sc - 2) + c0;
-            const int row = std::min(int(std::floor(gy)), sr - 2);
-            return valid[index(row, col)] && valid[index(row, col + 1)] && valid[index(row + 1, col)] &&
-                   valid[index(row + 1, col + 1)];
-        }
-        const long ix = std::lround(fx), iy = std::lround(gy);
-        return ix >= 0 && ix < sc && iy >= 0 && iy < sr && valid[index(int(iy), int(ix) + c0)];
-    }
-
-    // Position (and normal) of piece [c0, c1) at grid position (gx, gy); NaN outside a
-    // piece with constant borders.
-    void evaluate(int c0, int c1, double gx, double gy, bool wantNormal, Vec& p, Vec& n) const
-    {
-        const int sc = c1 - c0, sr = v.rows;
-        double fx = gx - c0, fy = gy;
-        const double xmax = double(sc - 1), ymax = double(sr - 1);
-        if (replicate) {
-            fx = std::clamp(fx, 0.0, xmax);
-            fy = std::clamp(fy, 0.0, ymax);
-        } else if (fx < 0.0 || fx > xmax || fy < 0.0 || fy > ymax) {
-            p = n = nanVec();
-            return;
-        }
-        n = nanVec();
-        if (options.interpolation == Interpolation::Smooth) {
-            int x0 = int(fx), y0 = int(fy);
-            if (sc >= 2 && x0 >= sc - 1)
-                x0 = sc - 2;
-            if (sr >= 2 && y0 >= sr - 1)
-                y0 = sr - 2;
-            const int x1 = std::min(x0 + 1, sc - 1), y1 = std::min(y0 + 1, sr - 1);
-            const float wx = float(fx - x0), wy = float(fy - y0);
-            const int a0 = x0 + c0, a1 = x1 + c0;
-            const bool complete = sc >= 2 && sr >= 2 && valid[index(y0, a0)] && valid[index(y0, a1)] &&
-                                  valid[index(y1, a0)] && valid[index(y1, a1)];
-            if (!complete) {
-                p = blendPresent(y0, a0, y1, a1, wx, wy);
-                return;
-            }
-            const Hermite bx = hermite(wx), by = hermite(wy);
-            const auto D = [&](const std::vector<Vec>& d, int r, int c) { return d[index(r, c)]; };
-            const Vec p00 = at(y0, a0), p01 = at(y0, a1), p10 = at(y1, a0), p11 = at(y1, a1);
-            const Vec q0 = p00 * bx.p0 + D(du, y0, a0) * bx.m0 + p01 * bx.p1 + D(du, y0, a1) * bx.m1;
-            const Vec q1 = p10 * bx.p0 + D(du, y1, a0) * bx.m0 + p11 * bx.p1 + D(du, y1, a1) * bx.m1;
-            const Vec r0 = D(dv, y0, a0) * bx.p0 + D(duv, y0, a0) * bx.m0 + D(dv, y0, a1) * bx.p1 + D(duv, y0, a1) * bx.m1;
-            const Vec r1 = D(dv, y1, a0) * bx.p0 + D(duv, y1, a0) * bx.m0 + D(dv, y1, a1) * bx.p1 + D(duv, y1, a1) * bx.m1;
-            p = q0 * by.p0 + r0 * by.m0 + q1 * by.p1 + r1 * by.m1;
-            if (wantNormal) {
-                const Vec q0u = p00 * bx.dp0 + D(du, y0, a0) * bx.dm0 + p01 * bx.dp1 + D(du, y0, a1) * bx.dm1;
-                const Vec q1u = p10 * bx.dp0 + D(du, y1, a0) * bx.dm0 + p11 * bx.dp1 + D(du, y1, a1) * bx.dm1;
-                const Vec r0u = D(dv, y0, a0) * bx.dp0 + D(duv, y0, a0) * bx.dm0 + D(dv, y0, a1) * bx.dp1 +
-                                D(duv, y0, a1) * bx.dm1;
-                const Vec r1u = D(dv, y1, a0) * bx.dp0 + D(duv, y1, a0) * bx.dm0 + D(dv, y1, a1) * bx.dp1 +
-                                D(duv, y1, a1) * bx.dm1;
-                const Vec pu = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
-                const Vec pv = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
-                n = unitCross(pu, pv);
-            }
-            return;
-        }
-        const int x0 = int(fx), y0 = int(fy);
-        const int x1 = std::min(x0 + 1, sc - 1), y1 = std::min(y0 + 1, sr - 1);
-        p = blendPresent(y0, x0 + c0, y1, x1 + c0, float(fx - x0), float(fy - y0));
-    }
-
-    // The bilinear blend of a cell's corners; with a missing corner, of the present
-    // ones only, their weights renormalised (a missing vertex's coordinates never
-    // enter a position). NaN when no present corner has weight.
-    Vec blendPresent(int y0, int x0, int y1, int x1, float wx, float wy) const
-    {
-        const bool v00 = valid[index(y0, x0)], v01 = valid[index(y0, x1)];
-        const bool v10 = valid[index(y1, x0)], v11 = valid[index(y1, x1)];
-        if (v00 && v01 && v10 && v11)
-            return bilerp(at(y0, x0), at(y0, x1), at(y1, x0), at(y1, x1), wx, wy);
-        const float w[4]{(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy};
-        const bool ok[4]{v00, v01, v10, v11};
-        const Vec c[4]{at(y0, x0), at(y0, x1), at(y1, x0), at(y1, x1)};
-        Vec sum{};
-        float total = 0;
-        for (int k = 0; k < 4; ++k)
-            if (ok[k] && w[k] > 0) {
-                sum = sum + c[k] * w[k];
-                total += w[k];
-            }
-        return total > 0 ? sum * (1.0f / total) : nanVec();
-    }
-
-    // Positions and normals of the raster rows [j0, j1), into out rows starting at j0.
-    void resampleRows(const Raster& raster, int j0, int j1, float* xyz, float* nrm) const
-    {
-        const bool wantNormals = nrm != nullptr;
-        const bool smooth = options.interpolation == Interpolation::Smooth;
-        for (int j = j0; j < j1; ++j) {
-            const double gy = raster.y0 + double(j) * raster.sy;
-            for (int i = 0; i < raster.width; ++i) {
-                const double gx = raster.x0 + double(i) * raster.sx;
-                Vec p = nanVec(), n = nanVec();
-                bool on = false;
-                for (const auto& [c0, c1] : pieces) {  // later pieces win where they overlap
-                    if (!onPiece(c0, c1, gx, gy))
-                        continue;
-                    Vec pp, pn;
-                    evaluate(c0, c1, gx, gy, wantNormals && smooth, pp, pn);
-                    p = pp;
-                    n = pn;
-                    on = true;
+        const PointMap g = map();
+        const GridView grid = view();
+        for (int j = 0; j < h; ++j) {
+            const float y = float(raster.y0 + double(j0 + j) * raster.sy);
+            for (int i = 0; i < w; ++i) {
+                const std::size_t o = (std::size_t(j) * std::size_t(w) + std::size_t(i)) * 3;
+                float step[3];
+                if (!point(g, grid, float(raster.x0 + double(i0 + i) * raster.sx), y, xyz + o, nullptr, step)) {
+                    xyz[o] = xyz[o + 1] = xyz[o + 2] = kNaN;
+                    step[0] = step[1] = step[2] = kNaN;
                 }
-                if (on && finite(p) && wantNormals && !smooth) {  // the nearest vertex's normal
-                    const long ix = std::lround(gx), iy = std::lround(gy);
-                    n = ix >= 0 && ix < v.cols && iy >= 0 && iy < v.rows ? normals[index(int(iy), int(ix))] : nanVec();
-                }
-                if (!on || !finite(p))
-                    p = n = nanVec();
-                const std::size_t o = (std::size_t(j - j0) * std::size_t(raster.width) + std::size_t(i)) * 3;
-                xyz[o] = p.x;
-                xyz[o + 1] = p.y;
-                xyz[o + 2] = p.z;
-                if (wantNormals) {
-                    nrm[o] = n.x;
-                    nrm[o + 1] = n.y;
-                    nrm[o + 2] = n.z;
-                }
+                if (nrm)
+                    std::copy_n(step, 3, nrm + o);
             }
         }
     }
+};
+
+// The samplers' access to a surface's derived data.
+struct SurfaceAccess {
+    static const Surface::Impl& of(const Surface& surface) { return *surface.impl_; }
 };
 
 Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_unique<Impl>())
@@ -355,18 +176,36 @@ Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_un
     if (vertices.rows < 0 || vertices.cols < 0 || (vertices.rows && vertices.cols && !vertices.xyz) ||
         vertices.stride < std::size_t(vertices.cols) * 3)
         throw std::invalid_argument("invalid surface vertices");
-    impl_->v = vertices;
-    impl_->options = std::move(options);
-    if (impl_->options.components.empty()) {
-        impl_->pieces = {{0, vertices.cols}};
-    } else {
-        impl_->replicate = false;
-        for (const auto& [first, last] : impl_->options.components) {
-            const int c0 = std::clamp(first, 0, vertices.cols), c1 = std::clamp(last, 0, vertices.cols);
-            if (c1 > c0)
-                impl_->pieces.emplace_back(c0, c1);
-        }
+    auto& s = *impl_;
+    s.v = vertices;
+    s.options = std::move(options);
+    const std::size_t rows = std::size_t(vertices.rows), cols = std::size_t(vertices.cols);
+    if (vertices.stride != cols * 3) {
+        s.packed.resize(rows * cols * 3);
+        for (std::size_t r = 0; r < rows; ++r)
+            std::copy_n(vertices.xyz + r * vertices.stride, cols * 3, s.packed.data() + r * cols * 3);
     }
+    // A vertex is missing when a coordinate is NaN or all three are -1.
+    s.present.resize(rows * cols);
+    for (std::size_t k = 0; k < rows * cols; ++k) {
+        const float* p = s.xyz() + 3 * k;
+        const bool nan = p[0] != p[0] || p[1] != p[1] || p[2] != p[2];
+        s.present[k] = !(nan || (p[0] == -1.f && p[1] == -1.f && p[2] == -1.f));
+    }
+    if (!s.options.components.empty()) {  // unlisted columns belong to no piece
+        s.piece.assign(cols, -1);
+        int id = 0;
+        for (const auto& [first, last] : s.options.components) {
+            for (int c = std::max(first, 0); c < std::min(last, vertices.cols); ++c)
+                s.piece[std::size_t(c)] = id;
+            ++id;
+        }
+        for (std::size_t c = 0; c < cols; ++c)
+            if (s.piece[c] < 0)
+                s.piece[c] = -1 - int(c);  // a piece of its own: no patch spans it
+    }
+    if (s.options.interpolation == Interpolation::Smooth)
+        s.buildDerivatives();
 }
 
 Surface::~Surface() = default;
@@ -377,172 +216,86 @@ void Surface::resample(const Raster& raster, float* xyz, float* normals) const
 {
     if (raster.width < 0 || raster.height < 0)
         throw std::invalid_argument("invalid raster");
-    impl_->prepare(normals != nullptr);
     std::vector<float> scratch;
     if (!xyz) {
         scratch.resize(std::size_t(raster.width) * std::size_t(raster.height) * 3);
         xyz = scratch.data();
     }
-    if (impl_->v.rows == 0 || impl_->v.cols == 0 || impl_->pieces.empty()) {
-        const std::size_t n = std::size_t(raster.width) * std::size_t(raster.height) * 3;
-        std::fill_n(xyz, n, kNaN);
-        if (normals)
-            std::fill_n(normals, n, kNaN);
-        return;
-    }
-    // Even parts of the rows: plain work division.
     const std::size_t rows = std::size_t(raster.height);
     const std::size_t parts = std::clamp<std::size_t>(rows * std::size_t(raster.width) / 65536, 1, 64);
     resamplePool().parallel_for(parts, [&](std::size_t k) {
         const int j0 = int(rows * k / parts), j1 = int(rows * (k + 1) / parts);
         const std::size_t o = std::size_t(j0) * std::size_t(raster.width) * 3;
-        impl_->resampleRows(raster, j0, j1, xyz + o, normals ? normals + o : nullptr);
+        impl_->resampleRect(raster, 0, j0, raster.width, j1 - j0, xyz + o, normals ? normals + o : nullptr);
     });
 }
 
 namespace {
 
-// One level as the tile loop reads it: its array, its chunk grid, and a few
-// recently used chunks (a pixel's samples and its neighbours' mostly share one).
+// A level's voxels through a few recently used chunks, for sampling::point: a tile's
+// samples mostly share a chunk with the previous one. Cache-only lookups use
+// Array::cached_chunk (memory and disk caches); others Array::chunk.
 template <class Load>
-struct LevelReader {
+struct ChunkLookup {
     Array* array;
-    Load load;
-    float fill;
-    std::array<double, 3> scale, offset;
-    std::array<std::int64_t, 3> shape, chunks, grid, stride;  // stride: bytes per step in a chunk
-    std::array<int, 3> shift;  // log2 of a power-of-two chunk edge, or -1
+    Load loader;
     bool cachedOnly;
+    float fill;
+    std::int64_t shape[3], block[3], stride[3], grid[3];
+    int shift[3];
 
     struct Slot {
-        std::array<std::int64_t, 3> index{-1, -1, -1};
+        std::int64_t key = -1;
         bool available = false;
-        ChunkPtr chunk;  // null: not stored (reads as fill)
+        ChunkPtr chunk;  // null: not stored (fill)
     };
     std::array<Slot, 8> slots{};
     std::size_t last = 0, next = 0;
 
-    LevelReader(const Level& L, Load l, bool cached) : array(L.array), load(l), scale(L.scale), offset(L.offset), cachedOnly(cached)
+    ChunkLookup(const Level& L, Load l, bool cached) : array(L.array), loader(l), cachedOnly(cached)
     {
         const auto& spec = array->spec();
         fill = float(L.type.load(spec.fill.data()));
         for (std::size_t a = 0; a < 3; ++a) {
             shape[a] = spec.shape[a];
-            chunks[a] = spec.chunks[a];
-            grid[a] = (shape[a] + chunks[a] - 1) / chunks[a];
-            shift[a] = std::has_single_bit(std::uint64_t(chunks[a])) ? std::countr_zero(std::uint64_t(chunks[a])) : -1;
+            block[a] = spec.chunks[a];
+            grid[a] = (shape[a] + block[a] - 1) / block[a];
+            shift[a] = std::has_single_bit(std::uint64_t(block[a])) ? std::countr_zero(std::uint64_t(block[a])) : -1;
         }
-        stride = {chunks[1] * chunks[2] * std::int64_t(spec.itemsize), chunks[2] * std::int64_t(spec.itemsize),
-                  std::int64_t(spec.itemsize)};
+        stride[2] = std::int64_t(spec.itemsize);
+        stride[1] = block[2] * stride[2];
+        stride[0] = block[1] * stride[1];
     }
+    std::int64_t chunkOf(std::int64_t v, int a) const { return shift[a] >= 0 ? v >> shift[a] : v / block[a]; }
+    float load(const unsigned char* p) const { return float(loader(p)); }
 
-    std::int64_t chunkIndex(std::int64_t v, std::size_t a) const { return shift[a] >= 0 ? v >> shift[a] : v / chunks[a]; }
-
-    // The chunk with chunk-grid index c, or null when it is not available (cache-only
-    // reads of a chunk only the source has).
-    const Slot* chunk(const std::array<std::int64_t, 3>& c)
+    const unsigned char* voxel(const std::int64_t* v, bool& available)
     {
-        if (slots[last].index == c)
-            return slots[last].available ? &slots[last] : nullptr;
-        for (std::size_t k = 0; k < slots.size(); ++k)
-            if (slots[k].index == c) {
-                last = k;
-                return slots[k].available ? &slots[k] : nullptr;
-            }
-        Slot& slot = slots[next];
-        last = next;
-        next = (next + 1) % slots.size();
-        slot.index = c;
-        const Index idx{c[0], c[1], c[2]};
-        if (cachedOnly) {
-            auto [found, data] = array->cached_chunk(idx);
-            slot.available = found;
-            slot.chunk = std::move(data);
-        } else {
-            slot.available = true;
-            slot.chunk = array->chunk(idx);
-        }
-        return slot.available ? &slot : nullptr;
-    }
-
-    // Byte offset of voxel v in its chunk, whose first voxel is `base`.
-    std::int64_t at(const std::int64_t* v, const std::array<std::int64_t, 3>& base) const
-    {
-        return (v[0] - base[0]) * stride[0] + (v[1] - base[1]) * stride[1] + (v[2] - base[2]) * stride[2];
-    }
-    float voxel(const Slot& slot, std::int64_t byte) const
-    {
-        return slot.chunk ? float(load(slot.chunk->data() + byte)) : fill;
-    }
-    bool inside(const std::int64_t* v) const
-    {
-        return v[0] >= 0 && v[1] >= 0 && v[2] >= 0 && v[0] < shape[0] && v[1] < shape[1] && v[2] < shape[2];
-    }
-    // The value of voxel v (inside the array) through the chunk memo; false when unavailable.
-    bool read(const std::int64_t* v, float& value)
-    {
-        const std::array<std::int64_t, 3> c{chunkIndex(v[0], 0), chunkIndex(v[1], 1), chunkIndex(v[2], 2)};
-        const Slot* slot = chunk(c);
-        if (!slot)
-            return false;
-        value = voxel(*slot, at(v, {c[0] * chunks[0], c[1] * chunks[1], c[2] * chunks[2]}));
-        return true;
-    }
-
-    // The value at the XYZ point p: nearest (order 0) or trilinear; voxels outside the
-    // array read as fill. False when a chunk it needs is not available.
-    bool sample(const float* p, int order, float& value)
-    {
-        double c[3];
-        for (std::size_t a = 0; a < 3; ++a)
-            c[a] = scale[a] * double(p[2 - a]) + offset[a];
-        if (order == 0) {
-            std::int64_t v[3];
-            for (std::size_t a = 0; a < 3; ++a)
-                v[a] = nearest_index(c[a]);
-            if (!inside(v)) {
-                value = fill;
-                return true;
-            }
-            return read(v, value);
-        }
-        std::int64_t lo[3];
-        float f[3];
-        for (std::size_t a = 0; a < 3; ++a) {
-            const double low = std::floor(c[a]);
-            lo[a] = std::int64_t(low);
-            f[a] = float(c[a] - low);
-        }
-        float corner[8];
-        // Usually the whole cell lies in one chunk inside the array: one lookup, strides.
-        const std::array<std::int64_t, 3> c0{chunkIndex(lo[0], 0), chunkIndex(lo[1], 1), chunkIndex(lo[2], 2)};
-        const std::int64_t hi[3]{lo[0] + 1, lo[1] + 1, lo[2] + 1};
-        if (inside(lo) && inside(hi) && chunkIndex(hi[0], 0) == c0[0] && chunkIndex(hi[1], 1) == c0[1] &&
-            chunkIndex(hi[2], 2) == c0[2]) {
-            const Slot* slot = chunk(c0);
-            if (!slot)
-                return false;
-            if (!slot->chunk) {
-                value = fill;
-                return true;
-            }
-            const std::uint8_t* d = slot->chunk->data() + at(lo, {c0[0] * chunks[0], c0[1] * chunks[1], c0[2] * chunks[2]});
-            for (int k = 0; k < 8; ++k)
-                corner[k] = float(load(d + (k >> 2 & 1) * stride[0] + (k >> 1 & 1) * stride[1] + (k & 1) * stride[2]));
-        } else {
-            for (int k = 0; k < 8; ++k) {
-                const std::int64_t v[3]{lo[0] + (k >> 2 & 1), lo[1] + (k >> 1 & 1), lo[2] + (k & 1)};
-                if (!inside(v))
-                    corner[k] = fill;
-                else if (!read(v, corner[k]))
-                    return false;
+        const std::int64_t c[3]{chunkOf(v[0], 0), chunkOf(v[1], 1), chunkOf(v[2], 2)};
+        const std::int64_t key = (c[0] * grid[1] + c[1]) * grid[2] + c[2];
+        Slot* slot = slots[last].key == key ? &slots[last] : nullptr;
+        for (std::size_t k = 0; !slot && k < slots.size(); ++k)
+            if (slots[k].key == key)
+                slot = &slots[last = k];
+        if (!slot) {
+            slot = &slots[last = next];
+            next = (next + 1) % slots.size();
+            slot->key = key;
+            const Index idx{c[0], c[1], c[2]};
+            if (cachedOnly) {
+                auto [found, data] = array->cached_chunk(idx);
+                slot->available = found;
+                slot->chunk = std::move(data);
+            } else {
+                slot->available = true;
+                slot->chunk = array->chunk(idx);
             }
         }
-        const float x00 = corner[0] + f[2] * (corner[1] - corner[0]), x01 = corner[2] + f[2] * (corner[3] - corner[2]);
-        const float x10 = corner[4] + f[2] * (corner[5] - corner[4]), x11 = corner[6] + f[2] * (corner[7] - corner[6]);
-        const float y0 = x00 + f[1] * (x01 - x00), y1 = x10 + f[1] * (x11 - x10);
-        value = y0 + f[0] * (y1 - y0);
-        return true;
+        available = slot->available;
+        if (!available || !slot->chunk)
+            return nullptr;
+        return slot->chunk->data() + (v[0] - c[0] * block[0]) * stride[0] + (v[1] - c[1] * block[1]) * stride[1] +
+               (v[2] - c[2] * block[2]) * stride[2];
     }
 };
 
@@ -553,13 +306,16 @@ constexpr int kTile = 64;
 
 // Samples a raster tile by tile, each tile on one thread of the first level's pool:
 // the tile's points, then per pixel its layers, each from the first level holding
-// it, reduced and written once.
+// it, reduced and written once. Level indices are taken about `centre`.
 template <class Load>
-Result sampleTiles(int width, int height, const Request& request, const TilePoints& points, Load load)
+Result sampleTiles(int width, int height, const Request& request, const TilePoints& points, const float* centre, Load load)
 {
     const std::size_t pixels = std::size_t(width) * std::size_t(height);
     const std::size_t layers = request.offsets.size();
     const bool needNormals = std::any_of(request.offsets.begin(), request.offsets.end(), [](float w) { return w != 0; });
+    std::vector<LevelMap> maps;
+    for (const auto& L : request.levels)
+        maps.push_back(levelMap(L.scale, L.offset, centre));
     Result result;
     result.width = width;
     result.height = height;
@@ -578,10 +334,10 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
             if (!any)
                 return;
         }
-        std::vector<LevelReader<Load>> readers;
-        readers.reserve(request.levels.size());
+        std::vector<ChunkLookup<Load>> lookups;
+        lookups.reserve(request.levels.size());
         for (const auto& L : request.levels)
-            readers.emplace_back(L, load, request.cachedOnly);
+            lookups.emplace_back(L, load, request.cachedOnly);
         std::vector<float> xyz(std::size_t(w) * h * 3), nrm(needNormals ? xyz.size() : 0);
         points(i0, j0, w, h, xyz.data(), needNormals ? nrm.data() : nullptr);
         for (int j = 0; j < h; ++j)
@@ -604,9 +360,13 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                         continue;  // no point in this layer
                     float value = kNaN;
                     std::size_t li = 0;
-                    while (li < readers.size() && !readers[li].sample(at, request.order, value))
-                        ++li;
-                    if (li == readers.size()) {
+                    for (; li < lookups.size(); ++li) {
+                        float c[3];
+                        levelIndex(maps[li], at, c);
+                        if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
+                            break;
+                    }
+                    if (li == lookups.size()) {
                         missing = true;
                         continue;
                     }
@@ -648,14 +408,31 @@ void checkRequest(const Request& request, int width, int height)
 }
 
 // The tile loop with the levels' element load chosen once.
-Result sampleRaster(int width, int height, const Request& request, const TilePoints& points)
+Result sampleRaster(int width, int height, const Request& request, const TilePoints& points, const float* centre)
 {
     checkRequest(request, width, height);
     Result result;
     request.levels.front().type.visit_load([&](auto load) {
-        result = sampleTiles(width, height, request, points, load);
+        result = sampleTiles(width, height, request, points, centre, load);
     });
     return result;
+}
+
+// The point at a surface raster's middle pixel (NaN where the surface has none there).
+std::array<float, 3> centreOf(const Surface& surface, const Raster& raster)
+{
+    std::array<float, 3> centre{kNaN, kNaN, kNaN};
+    if (raster.width > 0 && raster.height > 0)
+        SurfaceAccess::of(surface).resampleRect(raster, raster.width / 2, raster.height / 2, 1, 1, centre.data(), nullptr);
+    return centre;
+}
+
+std::array<float, 3> centreOf(const Plane& plane)
+{
+    std::array<float, 3> centre;
+    for (std::size_t a = 0; a < 3; ++a)
+        centre[a] = plane.origin[a] + plane.dx[a] * float(plane.width / 2) + plane.dy[a] * float(plane.height / 2);
+    return centre;
 }
 
 }  // namespace
@@ -663,24 +440,16 @@ Result sampleRaster(int width, int height, const Request& request, const TilePoi
 Result sample(const Surface& surface, const Raster& raster, const Request& request)
 {
     checkRequest(request, raster.width, raster.height);
-    const bool needNormals = std::any_of(request.offsets.begin(), request.offsets.end(), [](float w) { return w != 0; });
-    auto& impl = *surface.impl_;
-    impl.prepare(needNormals);
-    const bool empty = impl.v.rows == 0 || impl.v.cols == 0 || impl.pieces.empty();
+    const auto& impl = SurfaceAccess::of(surface);
+    const auto centre = centreOf(surface, raster);
     return sampleRaster(raster.width, raster.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
-        if (empty) {
-            std::fill_n(xyz, std::size_t(w) * h * 3, kNaN);
-            if (nrm)
-                std::fill_n(nrm, std::size_t(w) * h * 3, kNaN);
-            return;
-        }
-        const Raster tile{raster.x0 + double(i0) * raster.sx, raster.y0 + double(j0) * raster.sy, raster.sx, raster.sy, w, h};
-        impl.resampleRows(tile, 0, h, xyz, nrm);
-    });
+        impl.resampleRect(raster, i0, j0, w, h, xyz, nrm);
+    }, centre.data());
 }
 
 Result sample(const Plane& plane, const Request& request)
 {
+    const auto centre = centreOf(plane);
     return sampleRaster(plane.width, plane.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
         for (int j = 0; j < h; ++j)
             for (int i = 0; i < w; ++i) {
@@ -691,7 +460,180 @@ Result sample(const Plane& plane, const Request& request)
                         nrm[(std::size_t(j) * w + i) * 3 + a] = plane.normal[a];
                 }
             }
-    });
+    }, centre.data());
 }
 
 }  // namespace vcr::grid
+
+#ifdef VC_READER_CUDA
+#include "../reader_cuda/reader.hpp"
+#include "cuda.hpp"
+
+namespace vcr::grid::cuda {
+
+namespace {
+
+// f() with every reader's resident bricks pinned (locks taken in address order).
+template <class F>
+void withResident(const std::vector<reader_cuda::Reader*>& readers, std::size_t i, std::vector<reader_cuda::Source>& sources,
+                  const std::vector<reader_cuda::Reader*>& order, F&& f)
+{
+    if (i == order.size()) {
+        f();
+        return;
+    }
+    order[i]->with_resident([&](const reader_cuda::Source& source) {
+        for (std::size_t k = 0; k < readers.size(); ++k)
+            if (readers[k] == order[i])
+                sources[k] = source;
+        withResident(readers, i + 1, sources, order, f);
+    });
+}
+
+device::Storage upload(const void* data, std::size_t bytes, int deviceId)
+{
+    auto storage = device::allocate(std::max<std::size_t>(bytes, 16), deviceId);
+    if (bytes)
+        device::check(cudaMemcpyAsync(storage->ptr, data, bytes, cudaMemcpyHostToDevice, device::stream()));
+    return storage;
+}
+
+// Samples a raster on the readers' device. `base` carries the points: a plane, or a
+// surface grid (device copies of its vertex data, kept alive by `keep`) with raster.
+Result sampleDevice(int width, int height, const Request& request, const std::vector<reader_cuda::Reader*>& readers,
+                    cuda_detail::Params base, const float* centre)
+{
+    checkRequest(request, width, height);
+    if (readers.size() != request.levels.size())
+        throw std::invalid_argument("one CUDA reader per request level");
+    for (auto* r : readers)
+        if (!r || r->device_id() != readers.front()->device_id())
+            throw std::invalid_argument("CUDA readers must share one device");
+    const int deviceId = readers.front()->device_id();
+    device::Guard guard(deviceId);
+    const std::size_t pixels = std::size_t(width) * std::size_t(height);
+    const std::size_t layers = request.offsets.size();
+    Result result;
+    result.width = width;
+    result.height = height;
+    result.layers = int(layers);
+    result.values.resize(request.composite ? pixels : pixels * layers);
+    result.level.resize(pixels);
+    if (!pixels)
+        return result;
+
+    const auto offsets = upload(request.offsets.data(), layers * sizeof(float), deviceId);
+    const auto mask = request.pixels ? upload(request.pixels, pixels, deviceId) : device::Storage{};
+    const auto values = device::allocate(result.values.size() * sizeof(float), deviceId);
+    const auto levels = device::allocate(pixels, deviceId);
+    std::vector<cuda_detail::DeviceLevel> host(readers.size());
+    for (std::size_t li = 0; li < readers.size(); ++li)
+        host[li].map = levelMap(request.levels[li].scale, request.levels[li].offset, centre);
+    // Blocking requests note the first level's lacking bricks, one bit each.
+    std::size_t words = 0;
+    device::Storage lacking;
+    std::vector<reader_cuda::Reader*> order = readers;
+    std::sort(order.begin(), order.end());
+    order.erase(std::unique(order.begin(), order.end()), order.end());
+    std::vector<reader_cuda::Source> sources(readers.size());
+    const auto pass = [&] {
+        withResident(readers, 0, sources, order, [&] {
+            for (std::size_t li = 0; li < readers.size(); ++li)
+                host[li].source = sources[li];
+            if (!request.cachedOnly) {
+                if (!lacking) {
+                    const auto& g = sources.front().grid;
+                    words = std::size_t(g[0] * g[1] * g[2] + 31) / 32;
+                    lacking = device::allocate(words * 4 + 4, deviceId);
+                }
+                device::check(cudaMemsetAsync(lacking->ptr, 0, words * 4 + 4, device::stream()));
+            }
+            const auto table = upload(host.data(), host.size() * sizeof(cuda_detail::DeviceLevel), deviceId);
+            cuda_detail::Params P = base;
+            P.width = width;
+            P.height = height;
+            P.layers = unsigned(layers);
+            P.offsets = static_cast<const float*>(offsets->ptr);
+            P.order = request.order;
+            P.pixels = mask ? static_cast<const std::uint8_t*>(mask->ptr) : nullptr;
+            P.reduce = request.composite.has_value();
+            if (request.composite)
+                P.composite = *request.composite;
+            P.levels = static_cast<const cuda_detail::DeviceLevel*>(table->ptr);
+            P.levelCount = int(readers.size());
+            P.values = static_cast<float*>(values->ptr);
+            P.level = static_cast<std::int8_t*>(levels->ptr);
+            P.lacking = lacking ? static_cast<unsigned*>(lacking->ptr) : nullptr;
+            cuda_detail::launch(P);
+            device::complete();
+        });
+    };
+    pass();
+    if (lacking) {  // load what the first level lacked, then sample again
+        std::vector<unsigned> bits(words);
+        device::check(cudaMemcpy(bits.data(), lacking->ptr, words * 4, cudaMemcpyDeviceToHost));
+        std::vector<std::int64_t> keys;
+        for (std::size_t w = 0; w < bits.size(); ++w)
+            for (unsigned b = bits[w]; b; b &= b - 1)
+                keys.push_back(std::int64_t(w * 32 + std::size_t(std::countr_zero(b))));
+        if (!keys.empty()) {
+            readers.front()->load_bricks(keys);
+            pass();
+        }
+    }
+    device::check(cudaMemcpy(result.values.data(), values->ptr, result.values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    device::check(cudaMemcpy(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost));
+    return result;
+}
+
+}  // namespace
+
+Result sample(const Surface& surface, const Raster& raster, const Request& request,
+              const std::vector<reader_cuda::Reader*>& readers)
+{
+    checkRequest(request, raster.width, raster.height);
+    if (readers.empty())
+        throw std::invalid_argument("one CUDA reader per request level");
+    device::Guard guard(readers.front()->device_id());
+    const int id = readers.front()->device_id();
+    const auto& impl = SurfaceAccess::of(surface);
+    const std::size_t vertices = std::size_t(impl.v.rows) * std::size_t(impl.v.cols);
+    const GridView host = impl.view();
+    const auto xyz = upload(host.xyz, vertices * 12, id);
+    const auto present = upload(host.present, vertices, id);
+    const auto piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
+    const bool smooth = host.du != nullptr;
+    const auto du = upload(host.du, smooth ? vertices * 12 : 0, id), dv = upload(host.dv, smooth ? vertices * 12 : 0, id),
+               duv = upload(host.duv, smooth ? vertices * 12 : 0, id);
+    cuda_detail::Params base;
+    base.x0 = raster.x0;
+    base.y0 = raster.y0;
+    base.sx = raster.sx;
+    base.sy = raster.sy;
+    base.map = impl.map();
+    base.grid.xyz = static_cast<const float*>(xyz->ptr);
+    base.grid.present = static_cast<const bool*>(present->ptr);
+    base.grid.piece = host.piece ? static_cast<const int*>(piece->ptr) : nullptr;
+    if (smooth) {
+        base.grid.du = static_cast<const float*>(du->ptr);
+        base.grid.dv = static_cast<const float*>(dv->ptr);
+        base.grid.duv = static_cast<const float*>(duv->ptr);
+    }
+    const auto centre = centreOf(surface, raster);
+    return sampleDevice(raster.width, raster.height, request, readers, base, centre.data());
+}
+
+Result sample(const Plane& plane, const Request& request, const std::vector<reader_cuda::Reader*>& readers)
+{
+    cuda_detail::Params base;
+    base.plane = true;
+    std::copy(plane.origin.begin(), plane.origin.end(), base.origin);
+    std::copy(plane.dx.begin(), plane.dx.end(), base.dx);
+    std::copy(plane.dy.begin(), plane.dy.end(), base.dy);
+    std::copy(plane.normal.begin(), plane.normal.end(), base.normal);
+    const auto centre = centreOf(plane);
+    return sampleDevice(plane.width, plane.height, request, readers, base, centre.data());
+}
+
+}  // namespace vcr::grid::cuda
+#endif

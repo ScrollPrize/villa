@@ -1,5 +1,9 @@
 #pragma once
 #include "plan.hpp"
+#include "../grid/points.hpp"
+#ifdef VC_READER_CUDA
+#include "../grid/cuda.hpp"
+#endif
 namespace vcr::surface {
 using Floats=nb::ndarray<float,nb::c_contig,nb::device::cpu>;
 using Integers=nb::ndarray<std::int64_t,nb::c_contig,nb::device::cpu>;
@@ -38,20 +42,26 @@ inline void bind(nb::module_& m){
                 reinterpret_cast<bool*>(conflict.data()),reinterpret_cast<float*>(distance.data()),reinterpret_cast<std::int64_t*>(winner.data()),reinterpret_cast<float*>(uv.data()),reinterpret_cast<bool*>(geometry.data()),i);
         });
       });
-    m.def("_surface_interpolate",[](Floats xyz,Bytes mask,Floats queries,Floats normals,Floats output,Bytes valid,
+    m.def("_grid_points",[](Floats xyz,Bytes mask,Floats queries,Floats normals,Floats output,Bytes valid,
          std::array<float,12> physical,std::array<float,12> destination,float orientation,float offset,int device){
         if(xyz.ndim()!=3||xyz.shape(2)!=3||queries.ndim()!=2||queries.shape(1)!=2||
            mask.size()!=xyz.shape(0)*xyz.shape(1)||output.size()!=queries.shape(0)*3||valid.size()!=queries.shape(0)||
            (normals.size()&&normals.size()!=xyz.size()))throw nb::value_error("surface interpolation shape mismatch");
-        Interpolation g;g.height=int(xyz.shape(0));g.width=int(xyz.shape(1));g.orientation=orientation;g.offset=offset;
+        grid::PointMap g;g.height=int(xyz.shape(0));g.width=int(xyz.shape(1));g.orientation=orientation;g.offset=offset;
         std::copy(physical.begin(),physical.end(),g.physical);std::copy(destination.begin(),destination.end(),g.destination);
+        const auto* present=reinterpret_cast<const bool*>(mask.data());
+        const float* vertexNormals=normals.size()?normals.data():nullptr;
+        auto* out=output.data();auto* ok=reinterpret_cast<bool*>(valid.data());
         nb::gil_scoped_release release;
-        if(device<0){for(std::size_t i=0;i<valid.size();++i)interpolate(g,xyz.data(),reinterpret_cast<bool*>(mask.data()),queries.data(),
-            normals.size()?normals.data():nullptr,output.data(),reinterpret_cast<bool*>(valid.data()),i);}
-        else{
+        if(device<0){
+            grid::GridView view;view.xyz=xyz.data();view.present=present;view.normals=vertexNormals;
+            for(std::size_t i=0;i<valid.size();++i){
+                ok[i]=grid::point(g,view,queries.data()[2*i],queries.data()[2*i+1],out+3*i,nullptr);
+                if(!ok[i])out[3*i]=out[3*i+1]=out[3*i+2]=NAN;
+            }
+        }else{
 #ifdef VC_READER_CUDA
-            interpolate_cuda(g,xyz.data(),reinterpret_cast<bool*>(mask.data()),queries.data(),normals.size()?normals.data():nullptr,
-                             output.data(),reinterpret_cast<bool*>(valid.data()),valid.size(),device);
+            grid::cuda_detail::points(g,xyz.data(),present,vertexNormals,queries.data(),out,ok,valid.size(),device);
 #else
             throw std::runtime_error("CUDA surface sampling requires a CUDA build");
 #endif

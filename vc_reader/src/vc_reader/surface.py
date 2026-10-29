@@ -253,7 +253,7 @@ class Geometry:
                 if self.owner.backend == 'cuda':
                     self.owner._surface_metrics['geometry_upload_bytes'] += xyz.nbytes+valid.nbytes+local_queries.nbytes+normals.nbytes
                     self.owner._surface_metrics['geometry_download_bytes'] += values.nbytes+good.nbytes
-                _reader._surface_interpolate(xyz,valid.view(np.uint8).ravel(),local_queries,normals,values,good.view(np.uint8),
+                _reader._grid_points(xyz,valid.view(np.uint8).ravel(),local_queries,normals,values,good.view(np.uint8),
                                              _matrix(_scale(spacing)),_matrix(tile_destination),self.orientation,offset,
                                              self.owner.device if self.owner.backend=='cuda' else -1)
                 output[depth,at],support[depth,at] = values,good

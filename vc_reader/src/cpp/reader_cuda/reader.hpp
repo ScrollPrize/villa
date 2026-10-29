@@ -308,6 +308,25 @@ public:
         cudaEventSynchronize(last_); cudaEventDestroy(last_); cudaSetDevice(previous);
     }
     int device_id() const { return device_; }
+    // Runs f(source) with the table of resident bricks, under this reader's lock, on its
+    // device and the current stream: bricks f's device work reads stay resident while
+    // f runs, so f completes that work before returning (e.g. device::complete()).
+    template<class F> void with_resident(F&& f) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
+        f(resident_source());
+        mark();
+    }
+    // Makes the bricks with these keys (see Source: z-major brick-grid indices)
+    // resident, reading them from the array. Throws when they exceed the cache budget.
+    void load_bricks(const std::vector<std::int64_t>& keys) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
+        std::set<std::int64_t> needed;
+        const std::int64_t total=source_.grid[0]*source_.grid[1]*source_.grid[2];
+        for (auto key:keys) if (key>=0 && key<total) needed.insert(key);
+        if (needed.size()>capacity_) throw std::invalid_argument("request exceeds CUDA brick-cache budget; increase cache_bytes");
+        guarded([&] { upload(admit(needed),[](std::size_t) {}); });
+        mark();
+    }
     void clear() {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; resident_dirty_=true; device::complete();

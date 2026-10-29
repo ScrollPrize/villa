@@ -1,7 +1,7 @@
 #pragma once
 // Surfaces stored as grids of vertices (VC's tifxyz), and sampling volumes along
 // them and along planes: positions and normals interpolated from the vertices at
-// every pixel of a raster, offset along the normal into layers, sampled from a
+// every pixel of a raster (grid::point, src/cpp/grid/points.hpp), offset along the normal into layers, sampled from a
 // pyramid with fallback between levels, optionally from the caches alone, and
 // optionally reduced to one value per pixel. Rasters are sampled in tiles, each on
 // one thread, which reads the chunks its samples need and writes final pixels.
@@ -34,18 +34,21 @@ struct Vertices {
 // A missing vertex never enters a position: in a cell with missing corners, the
 // present corners are blended with renormalised bilinear weights.
 enum class Interpolation {
-    Linear,  // bilinear positions; each pixel takes its nearest vertex's normal
-    Smooth,  // bicubic Hermite patches over complete cells (others: the blend above, no normal)
+    Linear,  // bilinear patches
+    Smooth,  // bicubic Hermite patches (C1 across cells), from per-vertex derivatives
 };
 
+// A cell of the grid is a surface patch when its four vertices are present and in one
+// piece; elsewhere there is no point. Normals are the patch's (its derivatives' cross
+// product, column direction x row direction).
 struct SurfaceOptions {
     Interpolation interpolation = Interpolation::Linear;
-    // A pixel lies on the surface when all four vertices of its grid cell exist
-    // (strict), or when its nearest vertex exists.
-    bool strictQuads = false;
     // Column ranges [first, last) of separate pieces, never interpolated across;
     // empty: the grid is one piece.
     std::vector<std::pair<int, int>> components;
+    // The physical size of one unit of vertex coordinates, per axis (XYZ): normals are
+    // taken in physical space and layer offsets are physical lengths along them.
+    std::array<float, 3> spacing{1, 1, 1};
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx, row y0 + j * sy.
@@ -56,8 +59,7 @@ struct Raster {
 
 // The vertices of a surface (a view, not a copy: they must outlive the Surface and
 // not change while it is used; build a new Surface after an edit) and what
-// interpolating them needs (validity, vertex normals, Hermite derivatives), each
-// derived once on first use.
+// interpolating them needs (vertex presence, pieces, Hermite derivatives).
 class Surface {
 public:
     explicit Surface(Vertices vertices, SurfaceOptions options = {});
@@ -68,15 +70,17 @@ public:
     const Vertices& vertices() const;
     const SurfaceOptions& options() const;
 
-    // Positions and unit normals at every pixel of `raster`, row-major, three floats
-    // each; NaN where the surface has no point (normals: or no normal). Either
-    // output may be null.
+    // Positions and normals at every pixel of `raster`, row-major, three floats each;
+    // NaN where the surface has no point. A normal is the move in vertex coordinates
+    // per unit of physical offset along the unit physical normal (the unit normal when
+    // spacing is 1). Either output may be null.
     void resample(const Raster& raster, float* xyz, float* normals) const;
 
-private:
     struct Impl;
+
+private:
     std::unique_ptr<Impl> impl_;
-    friend struct Result sample(const Surface&, const struct Raster&, const struct Request&);
+    friend struct SurfaceAccess;
 };
 
 // A plane raster: pixel (i, j) sits at origin + i * dx + j * dy, with normal `normal`.
@@ -130,3 +134,19 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
 Result sample(const Plane& plane, const Request& request);
 
 }  // namespace vcr::grid
+
+#ifdef VC_READER_CUDA
+namespace vcr::reader_cuda {
+class Reader;
+}
+namespace vcr::grid::cuda {
+// The same requests sampled on a GPU: readers[i] is the CUDA reader (uint8 3-D CT)
+// of request.levels[i].array, and every sample reads its level's resident bricks.
+// Cache-only requests read those alone; blocking ones first make the bricks the
+// first level lacks resident (from the array), then sample again. A surface's
+// positions and normals are resampled on the CPU and uploaded.
+Result sample(const Surface& surface, const Raster& raster, const Request& request,
+              const std::vector<reader_cuda::Reader*>& readers);
+Result sample(const Plane& plane, const Request& request, const std::vector<reader_cuda::Reader*>& readers);
+}  // namespace vcr::grid::cuda
+#endif
