@@ -101,8 +101,8 @@ Names below are proposed additions, not existing options:
 
 | Config | Meaning |
 | --- | --- |
-| `object_store_path` | Input DB; required for CLI patch/fiber/PCL ingestion |
-| `object_store_author` | Author for automatic refresh writes |
+| `object_store_path` | Input DB; required for CLI patch/fiber/PCL ingestion (set by `fit_spiral.py --object-store`, 2026-10-29) |
+| `object_store_author` | Author for automatic refresh writes (`--object-store-author`) |
 | `object_store_refresh_links = true` | Refresh PCL-patch, fiber-patch, and patch-overlap links |
 | `object_store_approved_links_only = false` | If true, consume only currently approved, applicable relationships |
 | `fit_volume_uuid` | Optional reference volume identity; inferred from selected objects when unambiguous, otherwise required |

@@ -107,6 +107,17 @@ def add_common_arguments(
     """Register operational arguments shared by the single and sweep runners."""
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument(
+        "--object-store",
+        required=True,
+        type=Path,
+        help="object store (.vcobj) the fit reads its inputs from",
+    )
+    parser.add_argument(
+        "--object-store-author",
+        default=None,
+        help="author of the links the fit's startup refresh writes",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
@@ -329,12 +340,18 @@ def downstream_environment(
     return env
 
 
-def fit_command(dataset: Path, gpu_ids: tuple[int, ...] | None) -> list[str]:
+def fit_command(
+    args: argparse.Namespace, gpu_ids: tuple[int, ...] | None
+) -> list[str]:
     script_args = [
         str(SPIRAL_DIR / "fit_spiral.py"),
         "--dataset",
-        str(dataset),
+        str(args.dataset),
+        "--object-store",
+        str(args.object_store),
     ]
+    if args.object_store_author is not None:
+        script_args += ["--object-store-author", args.object_store_author]
     if gpu_ids is not None and len(gpu_ids) > 1:
         return [
             sys.executable,
@@ -637,7 +654,7 @@ def run_pipeline(
         output.mkdir(parents=True, exist_ok=False)
 
     gpu_ids = getattr(args, "gpus", None)
-    fit_cmd = fit_command(args.dataset, gpu_ids)
+    fit_cmd = fit_command(args, gpu_ids)
     subprocess.run(
         fit_cmd,
         check=True,
@@ -980,7 +997,7 @@ def _run_resumable_pipeline(
 
         def fit() -> None:
             subprocess.run(
-                fit_command(args.dataset, gpu_ids), check=True,
+                fit_command(args, gpu_ids), check=True,
                 env=fit_environment(
                     overrides, output, args.num_threads, wandb_project=project,
                     wandb_entity=entity, wandb_enabled=not args.no_wandb,

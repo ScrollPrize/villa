@@ -9,6 +9,7 @@ from runners import run_sweep
 def _sweep_args(tmp_path: Path, *extra: str):
     return run_sweep.build_parser().parse_args([
         "--dataset", str(tmp_path / "dataset"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),
         "--config-folder", str(tmp_path / "configs"),

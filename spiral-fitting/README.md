@@ -225,18 +225,20 @@ to update a store; edit objects through the store's API instead.
 
 ### Running a fit
 
-The command-line fit requires `object_store_path`:
+The command-line fit reads its inputs from the store named by `--object-store`
+(required; the config keys `object_store_path` and `object_store_author` are
+set from the command line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name them):
 
 ```sh
-FIT_SPIRAL_CONFIG_OVERRIDES='{"object_store_path": "dataset.vcobj",
-  "object_store_author": "me", "z_begin": 9000, "z_end": 9100}' \
-  python fit_spiral.py --dataset dataset/
+FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
+  python fit_spiral.py --dataset dataset/ --object-store dataset.vcobj \
+  --object-store-author me
 ```
 
 At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
 off select none), validates every selected object's frame, then refreshes the
-PCL-patch, fiber-patch and patch-overlap links as `object_store_author`,
+PCL-patch, fiber-patch and patch-overlap links as `--object-store-author`,
 writing them back to the store. Detectors whose object kinds are not all
 selected are skipped. Every detector failure is reported together and stops
 the fit before training (detectors that already committed are named; a rerun

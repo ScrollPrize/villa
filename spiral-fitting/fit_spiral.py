@@ -4328,6 +4328,14 @@ if __name__ == '__main__':
         help='Explicit scroll specification file '
              '(default: <dataset>/spiral-scroll.json)')
     parser.add_argument(
+        '--object-store', required=True, metavar='STORE',
+        help='Object store (.vcobj) the fit reads patch, PCL and fiber '
+             'inputs from, and writes refreshed links to')
+    parser.add_argument(
+        '--object-store-author', default=None, metavar='NAME',
+        help='Author of the links the startup refresh writes (required '
+             'unless refresh_links is off)')
+    parser.add_argument(
         '--cache', default=None,
         help='Directory for derived host caches, shared with the interactive '
              'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
@@ -4349,12 +4357,17 @@ if __name__ == '__main__':
         # A winding count in spiral-scroll.json replaces the generic default;
         # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
-        config.update(get_env_config_overrides())
-        if not config['object_store_path']:
+        overrides = get_env_config_overrides()
+        # The store is named on the command line only, as the service's
+        # binding owns it there.
+        owned = sorted({'object_store_path', 'object_store_author'} & set(overrides))
+        if owned:
             raise SystemExit(
-                'the command-line fit reads patches, fibers and point '
-                'collections from an object store: set object_store_path '
-                '(FIT_SPIRAL_CONFIG_OVERRIDES)')
+                f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
+                'use --object-store / --object-store-author')
+        config.update(overrides)
+        config['object_store_path'] = cli_args.object_store
+        config['object_store_author'] = cli_args.object_store_author
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',

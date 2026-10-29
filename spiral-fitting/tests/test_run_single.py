@@ -145,6 +145,7 @@ def test_fit_environment_can_disable_wandb(tmp_path, monkeypatch):
 def test_parser_accepts_config_and_wandb_options(tmp_path):
     args = run_single.build_parser().parse_args([
         "--dataset", str(tmp_path / "dataset"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config", str(tmp_path / "config.json"),
         "--wandb-group", "experiment-1",
@@ -236,6 +237,7 @@ def test_parser_no_longer_accepts_overrides(tmp_path):
     with pytest.raises(SystemExit):
         run_single.build_parser().parse_args([
             "--dataset", str(tmp_path / "dataset"),
+            "--object-store", str(tmp_path / "inputs.vcobj"),
             "--ink-volume", str(tmp_path / "ink"),
             "--overrides", str(tmp_path / "config.json"),
         ])
@@ -275,6 +277,7 @@ def test_run_id_rejects_unsafe_values(value):
 def _runner_args(tmp_path, *extra):
     return run_single.build_parser().parse_args([
         "--dataset", str(tmp_path / "dataset"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),
         *extra,
@@ -505,6 +508,9 @@ def test_one_gpu_pins_entire_pipeline_without_distributed_launch(
 
     assert calls[0][0][:2] == [
         run_single.sys.executable, str(run_single.SPIRAL_DIR / "fit_spiral.py")]
+    fit = calls[0][0]
+    assert fit[fit.index("--object-store") + 1] == str(tmp_path / "inputs.vcobj")
+    assert "--object-store-author" not in fit
     assert all(env["CUDA_VISIBLE_DEVICES"] == "3" for _command, env in calls)
 
 
