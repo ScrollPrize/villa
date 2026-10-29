@@ -340,8 +340,14 @@ struct Service::Impl : std::enable_shared_from_this<Service::Impl> {
 
     bool admitted(const Pool& p) const { return &p == &local || p.active < admission; }
 
+    // The service whose worker runs on this thread, if any. Loaders (e.g. computed
+    // arrays) may read other chunks of the service; such nested waits run the load
+    // themselves instead of queueing behind workers that may all be waiting.
+    static inline thread_local const Impl* worker = nullptr;
+
     void work(Pool& p)
     {
+        worker = this;
         std::unique_lock lock(mutex);
         while (true) {
             p.cv.wait(lock, [&] { return stopping || (!p.empty() && admitted(p)); });
@@ -351,73 +357,101 @@ struct Service::Impl : std::enable_shared_from_this<Service::Impl> {
             if (!key)
                 continue;
             ++p.active;
-            Source& src = sources.at(key->source);
-            ++src.running;
-            auto arrays = src.levels;
-            auto loader = src.loader;
-            const auto fill = arrays.empty() ? src.fill : arrays[std::size_t(key->level)]->spec().fill;
-            const bool detect = src.options.detectFill;
-            std::vector<std::function<void(const Key&, bool)>> fetchListeners;
-            if (src.remote)
-                for (const auto& [_, f] : src.fetching)
-                    fetchListeners.push_back(f);
-            lock.unlock();
-
-            for (const auto& f : fetchListeners)
-                try { f(*key, true); } catch (...) {}
-            Chunk chunk;
-            try {
-                ChunkPtr bytes = loader ? loader(key->level, key->z, key->y, key->x)
-                                        : arrays[std::size_t(key->level)]->chunk({key->z, key->y, key->x});
-                if (!bytes) {
-                    chunk.status = Status::Fill;
-                } else if (detect && !fill.empty() && allFill(*bytes, fill)) {
-                    chunk.status = Status::Fill;
-                } else {
-                    chunk.status = Status::Data;
-                    chunk.bytes = std::move(bytes);
-                }
-            } catch (const std::exception& e) {
-                chunk.status = Status::Error;
-                chunk.error = e.what();
-            } catch (...) {
-                chunk.status = Status::Error;
-                chunk.error = "chunk loader threw a non-standard exception";
-            }
-            for (const auto& f : fetchListeners)
-                try { f(*key, false); } catch (...) {}
-
-            lock.lock();
-            --p.active;
-            std::vector<std::function<void(const Key&)>> readyListeners;
-            auto s = sources.find(key->source);
-            auto t = tasks.find(*key);
-            if (s != sources.end()) {
-                --s->second.running;
-                if (t != tasks.end() && !t->second.invalidated)
-                    insert(*key, chunk, s->second.options.preferSelfEviction);
-                for (const auto& [_, f] : s->second.ready)
-                    readyListeners.push_back(f);
-                chunk.status == Status::Error ? ++failed : ++fetched;
-            }
-            if (t != tasks.end()) {
-                t->second.completion->done = true;
-                t->second.completion->result = chunk;
-                if (s != sources.end())
-                    --s->second.unresolved[std::size_t(key->level)];
-                bySeq.erase(t->second.seq);
-                for (const auto& [view, _] : t->second.views)
-                    if (auto v = viewKeys.find(view); v != viewKeys.end())
-                        v->second.erase(*key);
-                tasks.erase(t);
-            }
-            resolved.notify_all();
+            execute(*key, lock, &p);
             p.cv.notify_one();
-            lock.unlock();
-            for (const auto& f : readyListeners)
-                try { f(*key); } catch (...) {}
-            lock.lock();
         }
+    }
+
+    // Loads a task marked running and resolves it. Unlocks while loading and
+    // notifying listeners; returns locked. `p`: the pool whose admission it holds.
+    void execute(const Key key, std::unique_lock<std::mutex>& lock, Pool* p)
+    {
+        Source& src = sources.at(key.source);
+        ++src.running;
+        auto arrays = src.levels;
+        auto loader = src.loader;
+        const auto fill = arrays.empty() ? src.fill : arrays[std::size_t(key.level)]->spec().fill;
+        const bool detect = src.options.detectFill;
+        std::vector<std::function<void(const Key&, bool)>> fetchListeners;
+        if (src.remote)
+            for (const auto& [_, f] : src.fetching)
+                fetchListeners.push_back(f);
+        lock.unlock();
+
+        for (const auto& f : fetchListeners)
+            try { f(key, true); } catch (...) {}
+        Chunk chunk;
+        try {
+            ChunkPtr bytes = loader ? loader(key.level, key.z, key.y, key.x)
+                                    : arrays[std::size_t(key.level)]->chunk({key.z, key.y, key.x});
+            if (!bytes) {
+                chunk.status = Status::Fill;
+            } else if (detect && !fill.empty() && allFill(*bytes, fill)) {
+                chunk.status = Status::Fill;
+            } else {
+                chunk.status = Status::Data;
+                chunk.bytes = std::move(bytes);
+            }
+        } catch (const std::exception& e) {
+            chunk.status = Status::Error;
+            chunk.error = e.what();
+        } catch (...) {
+            chunk.status = Status::Error;
+            chunk.error = "chunk loader threw a non-standard exception";
+        }
+        for (const auto& f : fetchListeners)
+            try { f(key, false); } catch (...) {}
+
+        lock.lock();
+        if (p)
+            --p->active;
+        std::vector<std::function<void(const Key&)>> readyListeners;
+        auto s = sources.find(key.source);
+        auto t = tasks.find(key);
+        if (s != sources.end()) {
+            --s->second.running;
+            if (t != tasks.end() && !t->second.invalidated)
+                insert(key, chunk, s->second.options.preferSelfEviction);
+            for (const auto& [_, f] : s->second.ready)
+                readyListeners.push_back(f);
+            chunk.status == Status::Error ? ++failed : ++fetched;
+        }
+        if (t != tasks.end()) {
+            t->second.completion->done = true;
+            t->second.completion->result = chunk;
+            if (s != sources.end())
+                --s->second.unresolved[std::size_t(key.level)];
+            bySeq.erase(t->second.seq);
+            for (const auto& [view, _] : t->second.views)
+                if (auto v = viewKeys.find(view); v != viewKeys.end())
+                    v->second.erase(key);
+            tasks.erase(t);
+        }
+        resolved.notify_all();
+        lock.unlock();
+        for (const auto& f : readyListeners)
+            try { f(key); } catch (...) {}
+        lock.lock();
+    }
+
+    // Waits for a demanded task; on one of this service's workers, a task nobody
+    // runs yet is loaded on this thread.
+    Chunk await(Task& t, std::unique_lock<std::mutex>& lock)
+    {
+        const Key key = t.key;
+        ++t.waiters;
+        auto completion = t.completion;
+        if (worker == this && !t.running) {
+            unqueue(t);
+            t.running = true;
+            execute(key, lock, nullptr);
+        }
+        resolved.wait(lock, [&] { return completion->done || stopping; });
+        if (auto it = tasks.find(key); it != tasks.end() && it->second.completion == completion)
+            --it->second.waiters;
+        if (!completion->done)
+            return Chunk{Status::Error, nullptr, "chunk service stopped"};
+        return completion->result;
     }
 
     static bool allFill(const std::vector<std::uint8_t>& bytes, const std::vector<std::uint8_t>& fill)
@@ -597,15 +631,72 @@ Chunk Service::get(const Key& key, const Demand& d)
         I.touch(*e, key);
         return I.result(*e);
     }
-    Impl::Task& t = I.demand(key, src, d.view ? Demand{0, true, d.priority} : d);
-    ++t.waiters;
-    auto completion = t.completion;
-    I.resolved.wait(lock, [&] { return completion->done || I.stopping; });
-    if (auto it = I.tasks.find(key); it != I.tasks.end() && it->second.completion == completion)
-        --it->second.waiters;
-    if (!completion->done)
-        return Chunk{Status::Error, nullptr, "chunk service stopped"};
-    return completion->result;
+    return I.await(I.demand(key, src, d.view ? Demand{0, true, d.priority} : d), lock);
+}
+
+void Service::read(SourceId source, std::int32_t level, const Index& start, const Index& size, std::uint8_t* out,
+                   const Demand& demand)
+{
+    std::shared_ptr<Array> array;
+    {
+        std::lock_guard lock(impl_->mutex);
+        auto& src = impl_->source(Key{source, level});
+        if (src.levels.empty())
+            throw std::invalid_argument("region reads need a source of arrays");
+        array = src.levels[std::size_t(level)];
+    }
+    const auto& spec = array->spec();
+    if (start.size() != 3 || size.size() != 3)
+        throw std::invalid_argument("region reads are three-dimensional");
+    const std::size_t isz = spec.itemsize;
+    std::int64_t lo[3], hi[3];
+    bool empty = false, clipped = false;
+    for (int a = 0; a < 3; ++a) {
+        if (size[a] < 0)
+            throw std::invalid_argument("negative region size");
+        lo[a] = std::max<std::int64_t>(start[a], 0);
+        hi[a] = std::min(start[a] + size[a], spec.shape[a]);
+        empty |= hi[a] <= lo[a];
+        clipped |= lo[a] != start[a] || hi[a] != start[a] + size[a];
+    }
+    const std::int64_t total = size[0] * size[1] * size[2];
+    if (empty || clipped)
+        for (std::int64_t i = 0; i < total; ++i)
+            std::memcpy(out + std::size_t(i) * isz, spec.fill.data(), isz);
+    if (empty)
+        return;
+    const auto& c = spec.chunks;
+    std::vector<Key> keys;
+    for (auto z = lo[0] / c[0]; z <= (hi[0] - 1) / c[0]; ++z)
+        for (auto y = lo[1] / c[1]; y <= (hi[1] - 1) / c[1]; ++y)
+            for (auto x = lo[2] / c[2]; x <= (hi[2] - 1) / c[2]; ++x)
+                keys.push_back(Key{source, level, z, y, x});
+    if (keys.size() > 1)
+        prefetch(keys, demand.view ? Demand{0, false, demand.priority} : demand);
+    for (const auto& key : keys) {
+        const Chunk chunk = get(key, demand);
+        if (chunk.status == Status::Error)
+            throw std::runtime_error("chunk read failed: " + chunk.error);
+        if (chunk.status == Status::Data && (!chunk.bytes || chunk.bytes->size() != array->chunk_bytes()))
+            throw std::runtime_error("chunk read returned the wrong number of bytes");
+        const std::int64_t base[3] = {key.z * c[0], key.y * c[1], key.x * c[2]};
+        const std::int64_t a[3] = {std::max(lo[0], base[0]), std::max(lo[1], base[1]), std::max(lo[2], base[2])};
+        const std::int64_t b[3] = {std::min(hi[0], base[0] + c[0]), std::min(hi[1], base[1] + c[1]),
+                                   std::min(hi[2], base[2] + c[2])};
+        const std::size_t row = std::size_t(b[2] - a[2]) * isz;
+        for (auto z = a[0]; z < b[0]; ++z)
+            for (auto y = a[1]; y < b[1]; ++y) {
+                std::uint8_t* dst = out + std::size_t(((z - start[0]) * size[1] + (y - start[1])) * size[2] +
+                                                      (a[2] - start[2])) * isz;
+                if (chunk.status == Status::Data) {
+                    const auto offset = ((z - base[0]) * c[1] + (y - base[1])) * c[2] + (a[2] - base[2]);
+                    std::memcpy(dst, chunk.bytes->data() + std::size_t(offset) * isz, row);
+                } else {
+                    for (std::size_t i = 0; i < row; i += isz)
+                        std::memcpy(dst + i, spec.fill.data(), isz);
+                }
+            }
+    }
 }
 
 void Service::prefetch(std::span<const Key> keys, const Demand& d, bool wait)

@@ -49,6 +49,7 @@ struct Chunk {
 };
 
 // Loads one record of a keyed source; nullptr when it does not exist. Throws on failure.
+// Loaders (and computed arrays) may get or read other chunks of their service.
 using Loader = std::function<ChunkPtr(std::int32_t level, std::int64_t z, std::int64_t y, std::int64_t x)>;
 
 struct SourceOptions {
@@ -119,8 +120,16 @@ public:
     Chunk probe(const Key& key);
     // The chunk if resident (promoted in LRU order); otherwise queues it for `demand`.
     Chunk request(const Key& key, const Demand& demand = {});
-    // Waits for the chunk, fetching it with foreground priority when needed.
+    // Waits for the chunk, fetching it with foreground priority when needed. Called
+    // from a loader on one of the service's workers, it loads a chunk no worker has
+    // started on the calling thread, so loaders that read other sources cannot
+    // exhaust the workers.
     Chunk get(const Key& key, const Demand& demand = {.foreground = true});
+    // Copies the region [start, start + size) (ZYX) of a level of a source of arrays
+    // into `out` as stored elements, C order, getting every chunk it touches.
+    // Outside the array and unstored chunks read as the fill value; throws on fetch errors.
+    void read(SourceId source, std::int32_t level, const Index& start, const Index& size, std::uint8_t* out,
+              const Demand& demand = {.foreground = true});
     void prefetch(std::span<const Key> keys, const Demand& demand = {}, bool wait = false);
 
     // Replaces everything `view` asked for at an older version with `samples`.

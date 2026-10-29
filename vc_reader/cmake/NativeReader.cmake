@@ -34,6 +34,7 @@ endif()
 target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/chunks/service.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/computed.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/meta.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/access.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/layers.cpp"

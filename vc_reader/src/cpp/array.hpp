@@ -161,6 +161,11 @@ struct LayerSpec {
     bool allow_lossy = false;
 };
 
+// Fills `out` (one decoded chunk, C order, padding included at the array edge)
+// with the chunk at a chunk-grid index; returns false when the whole chunk is the
+// fill value. Called concurrently for distinct chunks, at most once per chunk at a time.
+using ChunkCompute = std::function<bool(const Index& chunk, std::uint8_t* out)>;
+
 struct ArraySpec {
     Index shape, chunks;
     std::size_t itemsize = 1;
@@ -182,11 +187,12 @@ struct ArraySpec {
     std::size_t max_pending_write_bytes = 1ull << 30;  // reads wait beyond this much unwritten data
     std::shared_ptr<DiskCache> disk_cache;
     HttpOptions http;
+    ChunkCompute compute;            // the chunk source of a computed array (no remote or store)
 };
 
 struct Stats {
     std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
-        remote_missing{0}, remote_bytes{0}, write_errors{0};
+        remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0};
 };
 
 class Array {
@@ -218,6 +224,8 @@ public:
             source_ = std::make_unique<ZarrStorage>(spec_.source_root, spec_.source_prefix, spec_.separator,
                 spec_.shard_chunks, spec_.shard_index_end, spec_.shard_index_crc, chunk_bytes_, http_.get(),
                 stats_.remote_fetches, stats_.remote_bytes);
+        if (spec_.compute && (!spec_.remote_url.empty() || !spec_.source_root.empty()))
+            throw std::invalid_argument("a computed array has no remote or stored source");
         if (spec_.write_layer >= 0 && codecs_.at(spec_.write_layer) == Codec::Delta3d && nd != 3)
             throw std::invalid_argument("Delta3D caches hold 3-D chunks only");
         if (spec_.write_layer >= 0)
@@ -487,9 +495,9 @@ public:
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        if (!http_ && !source_)
+        if (!http_ && !source_ && !spec_.compute)
             return nullptr;
-        ChunkPtr chunk = fetch(k);
+        ChunkPtr chunk = fetch(idx, k);
         if (cache_)
             cache_->put(ck, chunk);
         return chunk;
@@ -1405,18 +1413,18 @@ private:
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        if (!http_ && !source_) {
+        if (!http_ && !source_ && !spec_.compute) {
             fill_pieces(w, out_strides, op, output);
             return;
         }
-        ChunkPtr chunk = fetch(k);
+        ChunkPtr chunk = fetch(w.idx, k);
         if (cache_)
             cache_->put(ck, chunk);
         apply(chunk, w, out_strides, op, output);
     }
 
-    // Fetches a chunk from the remote once, however many reads want it at the same time.
-    ChunkPtr fetch(const std::string& k)
+    // Fetches (or computes) a chunk once, however many reads want it at the same time.
+    ChunkPtr fetch(const Index& idx, const std::string& k)
     {
         std::shared_future<ChunkPtr> future;
         std::promise<ChunkPtr> promise;
@@ -1435,7 +1443,7 @@ private:
         if (!owner)
             return future.get();
         try {
-            ChunkPtr chunk = fetch_now(k);
+            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
             promise.set_value(chunk);
             std::lock_guard lock(inflight_mutex_);
             inflight_.erase(k);
@@ -1485,6 +1493,21 @@ private:
             writes_->submit(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
         }
         return chunk;
+    }
+
+    ChunkPtr compute_now(const Index& idx, const std::string& k)
+    {
+        auto chunk = std::make_shared<Chunk>(chunk_bytes_);
+        ++stats_.computed;
+        if (!spec_.compute(idx, chunk->data())) {
+            if (writes_ && !write_disabled_.load())
+                writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
+            return nullptr;
+        }
+        ChunkPtr out = std::move(chunk);
+        if (writes_ && !write_disabled_.load())
+            writes_->submit(k, out, out->size(), [this, k, out] { store(k, *out, *out); });
+        return out;
     }
 
     // Writes a fetched chunk to the write layer in that layer's format.
