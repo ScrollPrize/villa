@@ -320,26 +320,15 @@ def main(channel, new_sha, repo, probe_only=False):
         return
     release = gh(repo, f"releases/tags/{channel}", allow_404=True)
     if release is None:
-        # A crash after PATCH but before rolling-tag movement is resumable: the
-        # archived release still has its *original* ID and six original assets.
-        archive_ref = staged_archive(channel, old_sha, old_oid)
-        archived = gh(repo, f"releases/tags/{archive_ref}", allow_404=True)
-        if (archived is None or archived.get("tag_name") != archive_ref
-                or not isinstance(archived.get("id"), int)
-                or archived.get("target_commitish") != "main"):
-            raise ArchiveError("no matching archived release with safe main target; manual recovery")
-        rid_text = str(archived["id"])
-        six = verify_release_origin(archived, channel, old_sha)
-        git("fetch", "--no-tags", "origin", "refs/tags/" + archive_ref)
-        if git("rev-parse", "FETCH_HEAD") != old_oid:
-            raise ArchiveError("archive lost exact original annotated tag object")
-        annotated(old_oid, old_sha)
-        if remote_object(channel) != old_oid:
-            raise ArchiveError("rolling ref raced during archive recovery")
-        print(json.dumps({"status":"ALREADY_ARCHIVED_ZERO_COPY", "archive":archive_ref,
-                          "channel":channel, "release_id":int(rid_text), "asset_ids":sorted(six),
-                          "old_tag_object":old_oid},sort_keys=True))
-        return
+        # PATCH may have succeeded before the process stopped, but the old
+        # rolling tag has no receipt binding THIS release's original asset IDs.
+        # A fresh GET cannot distinguish intact assets from deleted/reuploaded
+        # replacements. Do not adopt those IDs into a new enduring receipt.
+        # Automatic release-only repair remains available above when the new
+        # rolling tag already carries its predecessor's exact identity receipt.
+        raise ArchiveError("rolling release missing before tag promotion; "
+                           "original asset IDs cannot be proven from archive metadata alone; "
+                           "maintainer recovery required")
     # A preflight may probe recovery, but MUST NEVER PATCH if the rolling
     # release reappears between the initial 404 and this independent read.
     # The ordinary publication path retains its existing explicit PATCH.
