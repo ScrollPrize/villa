@@ -359,13 +359,6 @@ utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog,
     return metadata;
 }
 
-bool sameLocation(const std::string& a,
-                  const std::string& b,
-                  const fs::path& projectDirectory)
-{
-    return sameAttachmentLocation(a, b, projectDirectory);
-}
-
 std::string validateLocation(Category category, const std::string& location)
 {
     if (location.empty()) return "Location is empty.";

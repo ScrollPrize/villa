@@ -61,7 +61,7 @@ async def vc3d_export_segment_obj(
     segment_id: the segment to convert.
     obj_name: file name of the OBJ, ending in ".obj" and without folders. The
     tool writes it into the surface's artifact folder in the object store
-    (default name: the converter's).
+    (default name: <surface name>.obj).
     normalize_uv: scale UVs to [0,1]. align_grid: flatten Z per row.
     omp_threads: threads for the converter (>= 1; default: the runner's).
     wait: block until the job finishes (30-minute cap) and return the

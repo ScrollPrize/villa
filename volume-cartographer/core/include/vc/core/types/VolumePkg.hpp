@@ -71,15 +71,6 @@ struct AnnotationVolume : vc::objects::VolumeVoxels {
     std::optional<double> voxelSizeUm;
 };
 
-// True when two entry locations name the same resource, by the rule the
-// project uses to deduplicate attachments: local paths compare after
-// resolving relative ones against `projectDirectory` and normalizing them
-// (and through links when both exist); remote locators compare by source URL
-// and base scale level. A local and a remote location never match.
-bool sameLocation(const std::string& a,
-                  const std::string& b,
-                  const std::filesystem::path& projectDirectory);
-
 }
 
 // Resources opened from a standalone .vcproj workspace document.

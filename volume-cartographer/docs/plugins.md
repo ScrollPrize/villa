@@ -69,7 +69,7 @@ manifest, so a typo shows up in Plugin Folders instead of at run time.
 | --- | --- | --- |
 | `{volume}` | path of the current volume (its remote location for a remote volume) | an open volume |
 | `{volume_id}` | current volume id | an open volume |
-| `{segment}` | tifxyz folder of the active segment in the object store | an active segment |
+| `{segment}` | tifxyz folder of the active segment; only segments loaded from a folder (such as Spiral patches) have one, segments opened from a store do not | an active segment loaded from a folder |
 | `{segment_id}` | active segment id | an active segment |
 | `{point}` | focus point as `x,y,z` in full-resolution voxels; also `{point_x}`, `{point_y}`, `{point_z}` | a focus point |
 | `{region}` | enabled focus region as `x0,y0,z0,x1,y1,z1` | Focus bounds enabled |
@@ -126,6 +126,10 @@ It cannot check what the program itself does once started.
 - `vc-tifxyz2obj.json`: villa's `vc_tifxyz2obj` on the active segment (`file`).
 - `vc-render-layers.json`: villa's `vc_render_tifxyz` with the Render segment
   defaults, for local volumes (`none`).
+
+The first two need `{segment}`, so they run only on a segment loaded from a
+folder; for a segment opened from a store, use Convert to OBJ and Render
+segment instead.
 - `points-at-focus.json` with `points_at_focus.py`: a format example that
   writes seven points around the focus point (`points`).
 
