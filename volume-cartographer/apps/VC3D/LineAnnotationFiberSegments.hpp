@@ -1,4 +1,5 @@
 #pragma once
+#include "LineAnnotationPolylineIndices.hpp"
 
 #include <cstddef>
 #include <atomic>
@@ -569,9 +570,6 @@ void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls
 // linePoints, in strictly increasing line order. Returns each control's line
 // index, or nullopt on the first violation. Split/merge planning and the
 // save-path geometry guard share this single implementation.
-[[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
-    const std::vector<cv::Vec3d>& controlPoints,
-    const std::vector<cv::Vec3d>& linePoints);
 
 // The controlled span of a fiber: linePoints from the first control's line
 // index to the last control's (inclusive), mapped with the ordered scan above.
