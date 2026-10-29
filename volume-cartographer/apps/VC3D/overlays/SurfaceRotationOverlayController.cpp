@@ -684,6 +684,9 @@ void SurfaceRotationOverlayController::applyRotation()
                                          tr("Failed to save the transformed surface to the object store."));
                     return;
                 }
+                // The saved surface is the segment now: the next Rotate/Flip and other
+                // readers of the active surface continue from it, not from the source.
+                self->_state->setActiveSurface(self->_state->activeSurfaceId(), result.surface);
                 self->showActive(result.surface);
 
                 self->_rotateActive = false;
