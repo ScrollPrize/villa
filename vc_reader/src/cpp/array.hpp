@@ -385,6 +385,25 @@ public:
         sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out);
     }
 
+    // sample_nearest and sample_linear from memory alone: no disk, remote or compute
+    // I/O, so they never wait for a fetch. A point that needs a chunk that is neither in
+    // the memory cache nor a queued cache write gets missing[p] = 1 and its output is
+    // left as it was; every other point is sampled as by the blocking call, with
+    // missing[p] = 0 (points outside the array read as fill without any chunk).
+    void sample_nearest_cached(const double* coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing)
+    {
+        if (ndim() == 3)
+            read_points_as<3>(PointCoordinates{coords, ndim()}, n, out, missing);
+        else
+            read_points_as<0>(PointCoordinates{coords, ndim()}, n, out, missing);
+    }
+
+    void sample_linear_cached(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
+                              std::uint8_t* missing)
+    {
+        sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out, missing);
+    }
+
     void read_affine(const AffineCoordinates& grid, std::size_t n, int order,
                      const ElementType& type, bool out64, std::uint8_t* out,
                      bool float_output = false)
@@ -409,16 +428,16 @@ public:
 
     template <class Coordinates>
     void sample_linear_coordinates(const Coordinates& coords, std::size_t n, const ElementType& type,
-                                   bool out64, void* out)
+                                   bool out64, void* out, std::uint8_t* missing = nullptr)
     {
         if (spec_.shape.size() > kMaxSampleDims)
             throw std::invalid_argument("sample() supports at most 16 dimensions");
         // The element loads, chosen once: native-order numbers inline, the rest through `type`.
         const auto dispatch = [&](auto load) {
             if (ndim() == 3)
-                sample_linear_as<3>(coords, n, type, out64, out, load);
+                sample_linear_as<3>(coords, n, type, out64, out, load, missing);
             else
-                sample_linear_as<0>(coords, n, type, out64, out, load);
+                sample_linear_as<0>(coords, n, type, out64, out, load, missing);
         };
         type.visit_load([&](auto load) {
             dispatch([load](const std::uint8_t* p) { return static_cast<double>(load(p)); });
@@ -603,13 +622,15 @@ private:
         // `data` holds the chunk's bytes from byte offset `origin` on.
         std::function<void(const std::uint8_t* data, std::int64_t origin, const Work&)> read;
         std::function<void(const Work&)> fill;  // the chunk is not stored
+        // Set for reads from memory alone: the chunk is not in memory, and is not read.
+        std::function<void(const Work&)> miss;
     };
 
     // Resolves every chunk in parallel, in the order given.
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
              const BoxOutput* output = nullptr, bool stream = false)
     {
-        if (spec_.hint && (!cache_ || stream))
+        if (spec_.hint && (!cache_ || stream) && !(op && op->miss))
             pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
         pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
     }
@@ -897,7 +918,7 @@ private:
     // Reads one element per located point into out[tag] (see plan_points for `locate`, which
     // only emits elements here: planning a point costs less than recomputing it).
     template <std::size_t N, class Locate>
-    void gather_points(std::size_t n, std::uint8_t* out, Locate&& locate)
+    void gather_points(std::size_t n, std::uint8_t* out, std::uint8_t* missing, Locate&& locate)
     {
         std::vector<Point> points;
         std::vector<Run> runs;
@@ -922,19 +943,28 @@ private:
             for (const Point& pt : w.points)
                 std::memcpy(out + pt.tag * isz, spec_.fill.data(), isz);
         };
+        if (missing)
+            op.miss = [&](const Work& w) {
+                for (const Point& pt : w.points)
+                    missing[pt.tag] = 1;
+                for (const Run& r : w.runs)
+                    std::fill_n(missing + r.first, r.count, std::uint8_t{1});
+            };
         run(work, {}, &op);
     }
 
     // Keep the common 3-D loop bounds visible to the compiler, sharing the same
     // planner and bounds/rounding rules with the arbitrary-rank path.
     template <std::size_t N, class Coordinates>
-    void read_points_as(const Coordinates& coords, std::size_t n, std::uint8_t* out)
+    void read_points_as(const Coordinates& coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing = nullptr)
     {
         using Coord = typename Coordinates::value_type;
         const std::size_t nd = N ? N : ndim();
+        if (missing)
+            std::fill_n(missing, n, std::uint8_t{0});
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
-            gather_points<N>(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emitter) {
+            gather_points<N>(m, out, missing, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emitter) {
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 const std::int64_t* at;
@@ -994,7 +1024,7 @@ private:
     // planning segment) and are interpolated after.
     template <std::size_t N, class Load, class Coordinates>
     void sample_linear_as(const Coordinates& coords, std::size_t n, const ElementType& type, bool out64, void* out,
-                          Load load)
+                          Load load, std::uint8_t* missing = nullptr)
     {
         using Coord = typename Coordinates::value_type;
         using Real = decltype(load(static_cast<const std::uint8_t*>(nullptr)));
@@ -1021,8 +1051,11 @@ private:
         std::vector<Splits> split;
         std::vector<std::uint64_t> base;  // segment -> its first slot in raw
         std::vector<std::uint8_t> raw;
+        std::vector<std::uint8_t> raw_missing;  // memory-only reads: split neighbours not in memory
         std::vector<Point> points;
         std::vector<Run> runs;
+        if (missing)
+            std::fill_n(missing, n, std::uint8_t{0});
         // A point whose neighbours all lie in the chunk at `at`'s; `at` is the near corner.
         const auto value = [&](const Cell<N,Real>& cell, const std::uint8_t* at) {
             if (nd == 3 && cell.k == 3)
@@ -1156,11 +1189,32 @@ private:
                         store(p, sampling::interpolate(cell, [&](std::size_t) { return fill; }));
                     }
             };
+            if (missing) {
+                raw_missing.assign(slotCount, 0);
+                op.miss = [&](const Work& w) {
+                    for (const Point& pt : w.points) {
+                        if (pt.tag & kSplit)
+                            raw_missing[base[(pt.tag & ~kSplit) >> kSegmentShift] + (pt.tag & kSlotMask)] = 1;
+                        else
+                            missing[pt.tag] = 1;
+                    }
+                    for (const Run& r : w.runs)
+                        std::fill_n(missing + r.first, r.count, std::uint8_t{1});
+                };
+            }
             run(work, {}, &op);
             pool_.parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N,Real> cell;
                 Coord coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
+                    if (missing) {
+                        cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);
+                        const auto* flags = raw_missing.data() + base[s] + sp.first;
+                        if (std::any_of(flags, flags + (std::size_t{1} << cell.k), [](std::uint8_t f) { return f; })) {
+                            missing[sp.p] = 1;
+                            continue;
+                        }
+                    }
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
                     cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);
                     store(sp.p, sampling::interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
@@ -1389,6 +1443,10 @@ private:
                 apply(chunk, w, out_strides, op, output);
                 return;
             }
+        }
+        if (op && op->miss) {
+            op->miss(w);
+            return;
         }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
