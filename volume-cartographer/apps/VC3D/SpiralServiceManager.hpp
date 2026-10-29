@@ -80,6 +80,13 @@ public:
             return advertised() && serviceUuid == localUuid
                 && (!hosted() || serviceHubIdentity == localHubIdentity);
         }
+        // Which stores are bound, without sync progress (positions, pending
+        // edits, conflicts), which every hub sync updates.
+        QStringList identity() const
+        {
+            return {serviceUuid, serviceHubIdentity, localUuid, localPath, localHubIdentity,
+                    matches() ? QStringLiteral("matches") : QString()};
+        }
     };
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
@@ -312,6 +319,7 @@ private:
     // The resident session's state and input generation, as last reported.
     QString _sessionState;
     qint64 _inputGeneration = 0;
+    qint64 _forwardSyncPosition = -1;  // the fitted position a sync was last asked to reach
     std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
     // Each update's callbacks carry its serial; abandoning one (the
     // connection changed under it) bumps the serial, so the late callbacks

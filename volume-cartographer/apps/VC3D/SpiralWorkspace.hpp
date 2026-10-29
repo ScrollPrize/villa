@@ -305,6 +305,8 @@ private:
     QString _inputManifestPath;
     QString _inputDigest;
     quint64 _fitInputGeneration = 0;
+    // The store binding the fit inputs were last read against.
+    QStringList _fitInputBinding;
     std::shared_ptr<vc3d::spiral::FitInputs> _fitInputs;
     // Record UUIDs of the fitted objects and relationships, and of the other
     // surfaces, collections and fibers changed since the fit's inputs loaded.

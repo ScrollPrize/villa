@@ -1502,12 +1502,17 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     _inputGeneration = status.value(QStringLiteral("input_generation")).toInteger();
     // The display follows the fitted position: a replica behind it pulls
     // forward (bringing the service's links); one ahead shows later edits
-    // as stale through the input freshness.
+    // as stale through the input freshness. One sync is asked for per fitted
+    // position; the session's periodic sync retries one that failed (an
+    // unreachable hub), rather than every status poll.
     const qint64 fitted = status.value(QStringLiteral("input_position")).toObject()
                               .value(QStringLiteral("sequence")).toInteger(-1);
-    if (fitted > _storeBinding.localPosition && _storeBinding.matches() && !_inputUpdateActive)
-        if (const auto session = _storeSession.lock(); session && _storeAttachment)
+    if (fitted > _storeBinding.localPosition && fitted != _forwardSyncPosition
+        && _storeBinding.matches() && !_inputUpdateActive)
+        if (const auto session = _storeSession.lock(); session && _storeAttachment) {
+            _forwardSyncPosition = fitted;
             session->syncHub(*_storeAttachment);
+        }
     if (!active) {
         _synchronizedSessionId.clear();
         _installedPreviewSession.clear();

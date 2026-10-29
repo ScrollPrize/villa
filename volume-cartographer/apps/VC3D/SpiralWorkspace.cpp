@@ -646,9 +646,13 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _fitInputReload->setSingleShot(true);
     _fitInputReload->setInterval(500);
     connect(_fitInputReload, &QTimer::timeout, this, &SpiralWorkspace::loadFitInputChanges);
-    // The inputs can be displayed only from the store the service read.
-    connect(_service, &SpiralServiceManager::storeBindingChanged, this,
-            [this]() { if (!_inputManifestPath.isEmpty()) loadFitInputs(); });
+    // The inputs can be displayed only from the store the service read. A
+    // sync's pulls arrive as commits (noteStoreChanges); only a different
+    // binding needs a full read.
+    connect(_service, &SpiralServiceManager::storeBindingChanged, this, [this]() {
+        if (!_inputManifestPath.isEmpty() && _service->storeBinding().identity() != _fitInputBinding)
+            loadFitInputs();
+    });
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
@@ -2123,6 +2127,7 @@ void SpiralWorkspace::loadFitInputs()
         return;
     }
     const auto& binding = _service->storeBinding();
+    _fitInputBinding = binding.identity();
     const auto session = _state->objectStoreSession();
     const auto attachment = _state->objectStoreAttachment();
     if (!binding.matches() || !session || !attachment) {
