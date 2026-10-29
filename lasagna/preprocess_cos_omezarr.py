@@ -1882,7 +1882,9 @@ def run_preprocess_3d(
 			other_oz1 * effective_other_sd,
 		),
 	}
-	if pred_dt_zarr is not None and dt_lv_arr is not None:
+	def compute_external_distance_transform():
+		if pred_dt_zarr is None or dt_lv_arr is None:
+			return
 		base_z0 = cos_oz0 * effective_cos_sd
 		base_z1 = cos_oz1 * effective_cos_sd
 		if crop_xyzwhd is not None:
@@ -1911,6 +1913,10 @@ def run_preprocess_3d(
 			n_levels=n_levels,
 			progress=_progress,
 		)
+	# Packed publication needs every channel ready; legacy retains its original
+	# neural inference -> external distance transform -> pyramid ordering.
+	if output_format == "compact":
+		compute_external_distance_transform()
 	_t_inference_start = time.time()
 	try:
 		run_tiled_inference_3d(
@@ -1966,6 +1972,8 @@ def run_preprocess_3d(
 			torch.cuda.empty_cache()
 
 
+	if output_format == "legacy":
+		compute_external_distance_transform()
 	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
 	if output_format == "compact":
 		output_adapter.build_pyramids(workers=os.cpu_count() or 1)

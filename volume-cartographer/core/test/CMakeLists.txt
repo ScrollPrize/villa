@@ -64,6 +64,12 @@ function(vc_add_test)
     vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
+vc_add_test(NAME test_sampling_wait_profile)
+add_test(NAME test_sampling_wait_profile_enabled
+    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
+        $<TARGET_FILE:test_sampling_wait_profile>)
+vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
+
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
@@ -277,7 +283,7 @@ vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tra
 vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer zstd::libzstd)
 vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
@@ -522,6 +528,10 @@ if(VC_RUN_RENDER_BENCHMARKS)
 endif()
 
 
+add_executable(bench_fiber_seed_grid bench_fiber_seed_grid.cpp)
+add_executable(bench_fiber_sampling_overhead bench_fiber_sampling_overhead.cpp)
+target_link_libraries(bench_fiber_sampling_overhead PRIVATE vc_fiber_tracer)
+target_link_libraries(bench_fiber_seed_grid PRIVATE vc_fiber_tracer)
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
 # triggers a violation that the matching sanitizer must report; ctest
@@ -748,6 +758,12 @@ vc_add_test(NAME test_vcdataset)
 vc_add_test(NAME test_zarr)
 
 vc_add_test(NAME test_chunk_cache)
+vc_add_test(NAME test_channel_read_hints)
+vc_add_test(NAME test_chunk_load_queue)
+add_executable(bench_chunk_cache_contention bench_chunk_cache_contention.cpp)
+target_link_libraries(bench_chunk_cache_contention PRIVATE vc_core)
+add_executable(bench_parallel_chunk_read bench_parallel_chunk_read.cpp)
+target_link_libraries(bench_parallel_chunk_read PRIVATE vc_core)
 
 vc_add_test(NAME test_volume_extras)
 

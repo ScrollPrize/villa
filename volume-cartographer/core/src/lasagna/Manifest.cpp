@@ -341,4 +341,23 @@ bool lasagnaChannelShapeCompatible(
     return true;
 }
 
+LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
+{
+    auto result=source;
+    result.groups.clear();
+    for(const auto* name:{"nx","ny","grad_mag"}) {
+        const std::string original=std::string("sheet_")+name;
+        const auto* group=source.groupForChannel(original);
+        if(!group)throw std::invalid_argument("missing predicted normal channel "+original);
+        auto alias=*group;
+        alias.name=name;
+        for(auto& channel:alias.channels)
+            channel=channel==original?name:"unused_fiber_normal_"+channel;
+        result.groups.push_back(std::move(alias));
+    }
+    result.raw["grad_mag_encode_scale"]=1.0;
+    result.raw["grad_mag_factor"]=1.0;
+    return result;
+}
+
 } // namespace vc::lasagna
