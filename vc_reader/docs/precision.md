@@ -38,6 +38,14 @@ constant field. That exceptional scan allocates no dense field. Axis means use
 double for accumulation and cancellation; stored coefficients and evaluated
 weights remain float32. LocalContrast also retains double weighted accumulation.
 
+Point, plane, band and composite sampling (`vc_reader/slice.hpp`) reads each tile's
+neighbourhood as one dense float32 block through the array's caches and interpolates
+it with one formula shared by CPU and CUDA (`slice/math.hpp`). Both backends evaluate
+it unfused (`-ffp-contract=off` and `--fmad=false`), so nearest-voxel ties, linear
+and Catmull-Rom cubic values, and composites agree. Coordinates and interpolation are
+float32; integer and float64 sources are converted to float32 when read. Sources
+whose values exceed float32's 24-bit integer range lose low bits.
+
 ## Where wider arithmetic remains
 
 | Location / operation | Numerical reason |

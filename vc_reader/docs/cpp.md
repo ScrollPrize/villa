@@ -51,6 +51,7 @@ already link them. The Python extensions link those same CUDA libraries.
 | --- | --- | --- |
 | `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
 | `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
+| `vc_reader/slice.hpp` | `vcr::slice`: sample points, planes, bands of layers and their composites (mean, max, min, median, minabs, alpha, Beer-Lambert) with nearest, linear or cubic interpolation | CPU and `slice::cuda` (device float32 outputs) |
 | `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `surface::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surfaces, curves and voxel membership |
