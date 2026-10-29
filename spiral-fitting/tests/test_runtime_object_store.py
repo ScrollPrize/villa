@@ -302,7 +302,8 @@ def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
 def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
     from config import OBJECT_STORE_PCL_KEYS, Config, rebuild_stage
     keys = sorted(OBJECT_STORE_PCL_KEYS) + ['input_use_pcl_relative',
-                                            'input_use_pcl_same_winding']
+                                            'input_use_pcl_same_winding',
+                                            'patch_loss_z_margin']
     for key in keys:
         assert rebuild_stage({key}) == 'all', key
     state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})

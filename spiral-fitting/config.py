@@ -48,11 +48,14 @@ _NULL_TYPES = {
 }
 
 # Settings host preparation consumes irreversibly: patch materialization
-# erodes patches before they reach the resident pools, and the dense-spacing
-# mode decides which dense stores are opened. Nothing retained by a resident
-# session can re-derive their effect, so they demand a full rebuild.
+# erodes patches before they reach the resident pools, the patch-loss z
+# margin decides which attachments materialization keeps (and is recorded in
+# the input manifest), and the dense-spacing mode decides which dense stores
+# are opened. Nothing retained by a resident session can re-derive their
+# effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
+    "patch_loss_z_margin",
     "dense_spacing_mode",
 }
 

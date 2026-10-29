@@ -96,7 +96,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("patch_"):
             expected = (
                 "new_fit"
-                if key == "patch_erode_patches"
+                if key in ("patch_erode_patches", "patch_loss_z_margin")
                 else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):

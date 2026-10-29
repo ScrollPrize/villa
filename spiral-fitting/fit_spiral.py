@@ -942,6 +942,7 @@ def realign_optimizer_lr_schedule(
 _OBJECT_STORE_FROZEN_KEYS = OBJECT_STORE_PCL_KEYS | {
     'input_use_pcl_relative',
     'input_use_pcl_same_winding',
+    'patch_loss_z_margin',
 }
 
 
@@ -3415,11 +3416,7 @@ class FitContext:
                     [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
                     + list(self.unattached_strip_sampling_groups),
                     self.config)
-            if 'patch_loss_z_margin' in changed:
-                self.patch_sampling_probabilities = \
-                    self._prepare_patch_sampling_cache(self.verified_patches_list)
-                self.patch_atlas.rebuild_sampling_atlas()
-            elif 'patch_sampling_area_exponent' in changed:
+            if 'patch_sampling_area_exponent' in changed:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
 
@@ -3510,10 +3507,7 @@ class FitContext:
                 'pcl_vertical_fiber_radial_offset_voxels',
         }:
             self._refill_vertical_fiber_radial_offsets()
-        if 'patch_loss_z_margin' in changed:
-            self._build_theta_crossing_map()
-            self.dt_target_cache_manager.reset()
-        elif 'theta_crossing_map_update_interval' in changed:
+        if 'theta_crossing_map_update_interval' in changed:
             # refresh_if_due observes the changed interval on the next step and
             # resets its cadence without rebuilding immutable topology.
             self.theta_crossing_map.invalidate()
