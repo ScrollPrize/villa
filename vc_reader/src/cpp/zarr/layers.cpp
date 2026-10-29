@@ -221,7 +221,7 @@ std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string
         return std::nullopt;
     }
     const bool delta3d = readText(volumeDir / kDelta3dMarker) == std::string(kDelta3dMarkerContents);
-    const auto root = volumeDir / levelKey;
+    const auto root = fs::weakly_canonical(volumeDir / levelKey);
     auto stored = readJson(root / ".zarray");
     if (!stored && writable) {
         // VC3D publishes each level's metadata when it first touches the level; do the same.
@@ -502,7 +502,7 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
         roots.push_back(ec ? r : canonical);
     }
     Layers out;
-    const bool vc3dWritable = options.writable && !options.maxBytes;
+    const bool vc3dWritable = options.writable;
     if (options.vc3dVolumeDir && options.levelKey) {
         std::error_code ec;
         if (fs::is_directory(*options.vc3dVolumeDir, ec))
@@ -519,6 +519,16 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
     }
     if (!options.writable)
         return out;
+    // Keep writing the selected VC3D format when a byte limit is configured.
+    // Its budget spans the volume directories under the same cache root.
+    if (!out.layers.empty() && out.layers.front().kind.starts_with("vc3d-")) {
+        const auto root=fs::path(out.layers.front().root).parent_path().parent_path();
+        std::error_code ec;
+        if (options.maxBytes || fs::is_regular_file(root / ".vc_reader_cache.sqlite3",ec))
+            out.layers.front().budgetRoot=root.string();
+        out.writer=0;
+        return out;
+    }
     std::optional<fs::path> configured;
     for (const auto& root : roots) {
         std::error_code ec;

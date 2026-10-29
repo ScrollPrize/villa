@@ -44,11 +44,12 @@ public:
                  "CREATE TRIGGER IF NOT EXISTS resize_chunk AFTER UPDATE OF size ON chunks BEGIN "
                  "UPDATE budget SET total=total+new.size-old.size WHERE id=1; END;");
             exec("CREATE TABLE IF NOT EXISTS file_headers(path TEXT PRIMARY KEY, etag TEXT, modified TEXT);");
+            exec("CREATE TABLE IF NOT EXISTS adopted_namespaces(path TEXT PRIMARY KEY);");
             exec("CREATE TABLE IF NOT EXISTS downloads(path TEXT PRIMARY KEY, size INTEGER NOT NULL);");
             transaction([&] {
                 // Reconcile after a crash or writes by an unbounded reader.
                 // Only numeric chunk files in the decoded-cache namespaces
-                // count. Metadata, markers, VC3D caches and other files stay.
+                // count, plus explicitly adopted VC3D arrays. Metadata and markers stay.
                 exec("DELETE FROM chunks; UPDATE budget SET total=0,clock=0 WHERE id=1;");
                 using Entry = std::tuple<std::filesystem::file_time_type, std::string, std::int64_t>;
                 std::vector<Entry> files;
@@ -57,6 +58,15 @@ public:
                     if (!std::filesystem::is_directory(base) || std::filesystem::is_symlink(base))
                         continue;
                     scan(base, files);
+                }
+                {
+                    Statement adopted(db_, "SELECT path FROM adopted_namespaces");
+                    while (adopted.step()) {
+                        const std::string path=reinterpret_cast<const char*>(sqlite3_column_text(adopted.get(),0));
+                        check_path(path);
+                        if (std::filesystem::is_directory(path) && !std::filesystem::is_symlink(path))
+                            scan(path,files);
+                    }
                 }
                 const auto encoded = root_ / "encoded";
                 if (std::filesystem::is_directory(encoded)) {
@@ -87,6 +97,28 @@ public:
     ~DiskCache() { sqlite3_close(db_); }
     DiskCache(const DiskCache&) = delete;
     DiskCache& operator=(const DiskCache&) = delete;
+
+    // Adopt existing array chunks under a cache namespace once, preserving metadata.
+    // Persist its namespace so crash reconciliation also counts these chunks.
+    void adopt_chunks(const std::string& path)
+    {
+        const auto canonical=std::filesystem::weakly_canonical(path).string();
+        check_path(canonical);
+        std::lock_guard lock(mutex_);
+        transaction([&] {
+            Statement known(db_, "SELECT 1 FROM adopted_namespaces WHERE path=?");
+            known.text(1,canonical);
+            if (known.step()) return;
+            using Entry=std::tuple<std::filesystem::file_time_type,std::string,std::int64_t>;
+            std::vector<Entry> files;
+            scan(canonical,files);
+            std::sort(files.begin(),files.end());
+            for (const auto& [time,file,size] : files) record(file,size);
+            Statement adopted(db_, "INSERT INTO adopted_namespaces(path) VALUES(?)");
+            adopted.text(1,canonical); adopted.step();
+            evict();
+        });
+    }
 
     void set_max_bytes(std::int64_t bytes)
     {

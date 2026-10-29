@@ -131,7 +131,7 @@ struct CacheLayer {
     std::string emptyRoot;     // vc3d-delta3d: where missing-chunk markers live
     bool allowLossy = false;
     std::shared_ptr<Vc3dLease> lease;
-    std::string budgetRoot;    // the selected decoded writer when a byte limit applies
+    std::string budgetRoot;    // the selected writer's shared cache root when a byte limit applies
     LayerSpec spec() const;
 };
 

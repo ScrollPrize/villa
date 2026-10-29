@@ -223,6 +223,23 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
     }
     require(fs::exists(vdir / "0/0.1.0") && fs::exists(vdir / "0/1.1.1.empty"), "VC3D mirror appended in its format");
 
+    // A bounded mirror stays the write layer and adopts pre-existing chunks.
+    vc3dOptions.cacheMaxBytes=32;
+    {
+        auto a=vcr::zarr::Group::open(groupUrl,vc3dOptions).array("0");
+        require(a.writer==0 && a.layers[0].kind=="vc3d-mirror" && !a.layers[0].budgetRoot.empty(),
+                "bounded VC3D cache remains the writer");
+        expect_volume(read_all(*a.array),v,"bounded mirror read");
+        a.array->flush();
+        require(a.array->last_write_error().empty(),"bounded mirror writes succeed");
+        std::uintmax_t bytes=0;
+        for(const auto& file:fs::directory_iterator(vdir/"0"))
+            if(file.is_regular_file() && file.path().filename().string().find_first_not_of("0123456789.")==std::string::npos)
+                bytes+=file.file_size();
+        require(bytes<=32,"existing and newly fetched mirror chunks share the byte budget");
+        require(fs::exists(vdir/"0/.zarray") && fs::exists(vdir/"0/1.1.1.empty"),"budget preserves metadata and fill markers");
+    }
+
     // An owner-named VC3D directory is used as given (VC3D names caches by volume ID).
     const auto named = root / "named" / "my-volume";
     fs::create_directories(named);
@@ -236,6 +253,40 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
         a.array->flush();
     }
     require(fs::exists(named / "0/.zarray") && fs::exists(named / "0/0.0.0"), "owner-named cache filled");
+
+    // Budgeted Delta3D caches keep their format and reuse both data and fill.
+    const auto delta=root/"delta-cache"/"my-volume";
+    write_text(delta/".vc_delta3d_cache","D3D1\n");
+    vcr::zarr::OpenOptions deltaOptions;
+    deltaOptions.vc3dVolumeDir=delta;
+    deltaOptions.cacheMaxBytes=8192;
+    {
+        auto a=vcr::zarr::Group::open(groupUrl,deltaOptions).array("0");
+        require(a.layers[0].kind=="vc3d-delta3d" && a.writer==0,"bounded Delta3D writer");
+        expect_volume(read_all(*a.array),v,"bounded Delta3D read");
+        a.array->flush();
+        require(a.array->last_write_error().empty(),"bounded Delta3D writes succeed");
+    }
+    {
+        auto a=vcr::zarr::Group::open(groupUrl,deltaOptions).array("0");
+        expect_volume(read_all(*a.array),v,"reused Delta3D read");
+        require(a.array->stats().remote_fetches==0,"Delta3D data and fill reuse without downloading");
+    }
+    require(fs::exists(delta/".zattrs") && fs::exists(delta/".zgroup"),"VC3D group metadata mirrored");
+    deltaOptions.offline=true;
+    {
+        auto g=vcr::zarr::Group::open(groupUrl,deltaOptions);
+        require(g.levels()==std::vector<std::string>{"0","1"},"named cache offline multiscales metadata");
+        auto a=g.array("0");
+        expect_volume(read_all(*a.array),v,"offline named Delta3D cache");
+        require(a.array->stats().remote_fetches==0,"offline named cache never downloads");
+    }
+    deltaOptions.offline=false;
+    deltaOptions.cacheMaxBytes=0;
+    {
+        auto a=vcr::zarr::Group::open(groupUrl,deltaOptions).array("0");
+        require(!fs::exists(delta/"0/0.0.0") && fs::exists(delta/"0/.zarray"),"Delta3D budget eviction preserves metadata");
+    }
 
     // A changed source refuses a stale decoded cache instead of mixing arrays.
     write_text(group / "0/.zarray", R"({"zarr_format":2,"shape":[4,4,6],"chunks":[2,2,2],"dtype":"<u2",)"

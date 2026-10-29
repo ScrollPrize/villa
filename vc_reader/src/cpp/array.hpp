@@ -1452,7 +1452,7 @@ private:
         try {
             const std::string path = l.root + "/" + k;
             if (l.kind == "vc3d-mirror") {
-                atomic_write(path, payload.data(), payload.size());  // the source's bytes, verbatim
+                store_bytes(path, payload.data(), payload.size());  // the source's bytes, verbatim
             } else if (codecs_[spec_.write_layer] == Codec::Delta3d) {  // compressed decoded / VC3D Delta3D
                 const std::array<int, 3> shape{static_cast<int>(spec_.chunks[0]), static_cast<int>(spec_.chunks[1]),
                                                static_cast<int>(spec_.chunks[2])};

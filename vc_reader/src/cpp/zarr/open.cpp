@@ -58,7 +58,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         throw std::invalid_argument("offline reads of a remote array need cache directories");
     if (options.cacheMaxBytes && *options.cacheMaxBytes < 0)
         throw std::invalid_argument("cache_max_bytes must be nonnegative");
-    if (options.cacheMaxBytes && remote && options.cacheDirs.empty())
+    if (options.cacheMaxBytes && remote && options.cacheDirs.empty() && !options.vc3dVolumeDir)
         throw std::invalid_argument("cache_max_bytes requires cache directories");
 
     std::optional<std::string> group = hints.group, levelKey = hints.levelKey;
@@ -158,8 +158,12 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     }
     spec.threads = options.threads ? options.threads
                                    : remote ? 32 : std::min<std::size_t>(16, std::max(4u, std::thread::hardware_concurrency()));
-    if (out.writer >= 0 && !out.layers[out.writer].budgetRoot.empty())
-        spec.disk_cache = diskBudget(out.layers[out.writer].budgetRoot, options.cacheMaxBytes);
+    if (out.writer >= 0 && !out.layers[out.writer].budgetRoot.empty()) {
+        const auto& writer=out.layers[out.writer];
+        spec.disk_cache = diskBudget(writer.budgetRoot, options.cacheMaxBytes);
+        if (writer.kind.starts_with("vc3d-"))
+            spec.disk_cache->adopt_chunks(writer.budgetRoot);
+    }
     out.array = std::make_unique<Array>(std::move(spec), options.memoryCache);
     return out;
 }
@@ -179,9 +183,11 @@ Group Group::open(const std::string& input, OpenOptions options)
     const auto location = stripSlashes(input);
     const bool remote = isRemote(location);
     if (options.offline && remote) {
-        if (options.cacheDirs.empty())
+        if (options.cacheDirs.empty() && !options.vc3dVolumeDir)
             throw std::invalid_argument("offline reads of a remote group need cache directories");
-        const auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(location));
+        auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(location));
+        if (options.vc3dVolumeDir && fs::is_directory(*options.vc3dVolumeDir))
+            dirs.insert(dirs.begin(),*options.vc3dVolumeDir);
         if (dirs.empty())
             throw CacheMiss(location + " is not in the disk caches (offline)");
         Json attrs = Json::object();
@@ -216,23 +222,36 @@ Group Group::open(const std::string& input, OpenOptions options)
         throw std::runtime_error("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
     }
     Json attrs = zattrs ? Json::parse(*zattrs) : Json::object();
-    if (remote && options.cacheWrites && !options.cacheDirs.empty()) {
-        // Keep the group's metadata next to its arrays' decoded caches, for opening offline.
-        const auto rootDir = std::find_if(options.cacheDirs.begin(), options.cacheDirs.end(),
-                                          [](const std::string& d) { return d != "vc3d"; });
-        if (rootDir != options.cacheDirs.end()) {
-            const auto target = decodedCachePath(cacheRoots({*rootDir}).front(), options.access.cacheUrl(location));
+    if (remote && options.cacheWrites) {
+        const auto url=options.access.cacheUrl(location);
+        auto targets=cachedNodeDirs(options.cacheDirs,url);
+        if (options.vc3dVolumeDir) targets.push_back(*options.vc3dVolumeDir);
+        std::optional<fs::path> decoded;
+        const auto rootDir=std::find_if(options.cacheDirs.begin(),options.cacheDirs.end(),
+                                        [](const std::string& d){return d!="vc3d";});
+        if (rootDir!=options.cacheDirs.end()) {
+            decoded=decodedCachePath(cacheRoots({*rootDir}).front(),url);
+            if (std::find(targets.begin(),targets.end(),*decoded)==targets.end()) targets.push_back(*decoded);
+        }
+        for (const auto& target:targets) {
             try {
-                for (const auto& [name, data] : {std::pair{".zgroup", zgroup}, std::pair{".zattrs", zattrs}}) {
-                    if (!data)
-                        continue;
-                    std::ifstream existing(target / name, std::ios::binary);
-                    const std::string current((std::istreambuf_iterator<char>(existing)), {});
-                    if (!existing || current != *data)
-                        atomicWrite(target / name, *data);
+                // Mirror metadata obeys the same shared replacement lease as chunks.
+                std::unique_ptr<Vc3dLease> lease;
+                bool isDecoded=false;
+                for (const auto& root:cacheRoots(options.cacheDirs))
+                    isDecoded |= target==decodedCachePath(root,url);
+                if (!isDecoded) {
+                    lease=std::make_unique<Vc3dLease>(target);
+                    if (!lease->acquire()) continue;
+                }
+                for (const auto& [name,data]:{std::pair{".zgroup",zgroup},std::pair{".zattrs",zattrs}}) {
+                    if (!data) continue;
+                    std::ifstream existing(target/name,std::ios::binary);
+                    const std::string current((std::istreambuf_iterator<char>(existing)),{});
+                    if (!existing || current!=*data) atomicWrite(target/name,*data);
                 }
             } catch (const std::exception&) {
-                // A read-only cache directory: the group still opens online.
+                // Read-only caches still allow online opens.
             }
         }
     }
