@@ -101,11 +101,12 @@ private:
     void syncTrackSamplingControlsFromAdvanced();
     void updateTrackSamplingUi();
     void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
+    void syncOutwardSense(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
-    void applyScrollSpec(const QJsonObject& spec);
+    void resetScrollSummaries();
     // The scroll the session fits and its project volume (its request's
     // "scroll" and "project").
     void applySessionScroll(const QJsonObject& request);
@@ -158,6 +159,7 @@ private:
     // Read-only reports of what spiral-scroll.json specifies.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
+    QComboBox* _outwardSense = nullptr;
     // The checkpoint the resident fit was built from, reported by the service
     // and carried back in later rebuild requests.
     QString _sessionCheckpoint;

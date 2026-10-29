@@ -252,12 +252,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // spiral-scroll.json in the dataset root) is the only source of these, and
     // the service rejects a request that restates them. They are still shown,
     // because a fit's meaning depends on them.
-    _scrollSummary = new QLabel(tr("No scroll specification loaded"), pathsContents);
+    _scrollSummary = new QLabel(tr("From the project's fit volume when a fit is built"), pathsContents);
     _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
     _scrollSummary->setWordWrap(true);
     _scrollSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
     pathsForm->addRow(tr("Scroll"), _scrollSummary);
     describe(QStringLiteral("scroll_summary"), {_scrollSummary});
+    // A fit setting (spiral_outward_sense): needed where the fit volume's
+    // orientation is not in the catalog, refused where it disagrees with it.
+    _outwardSense = new QComboBox(pathsContents);
+    _outwardSense->setObjectName(QStringLiteral("spiralOutwardSense"));
+    _outwardSense->addItem(tr("From the volume's orientation"), QString());
+    _outwardSense->addItem(tr("Clockwise (CW)"), QStringLiteral("CW"));
+    _outwardSense->addItem(tr("Anticlockwise (ACW)"), QStringLiteral("ACW"));
+    pathsForm->addRow(tr("Outward sense"), _outwardSense);
+    describe(QStringLiteral("outward_sense"), {_outwardSense});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
 
     // Patches, point collections and fibers come from the object store the
@@ -368,13 +377,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     lasagnaSection->contentLayout()->addWidget(lasagnaContents);
     addPathRow(lasagnaForm, "normal_x", tr("Normal X"), true);
     addPathRow(lasagnaForm, "normal_y", tr("Normal Y"), true);
-    addPathRow(lasagnaForm, "surf_sdt", tr("Surface SDT"), true);
     addPathRow(lasagnaForm, "gradient_magnitude", tr("Gradient magnitude"), true);
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
-    // Also owned by spiral-scroll.json: the zarr level and coordinate scale
-    // describe how the dataset's Lasagna stores were written, so they are
-    // reported rather than chosen.
-    _lasagnaSummary = new QLabel(tr("No scroll specification loaded"), lasagnaContents);
+    // The project's selected Lasagna dataset: its array and the arrays'
+    // scale relative to the fit volume are reported rather than chosen.
+    _lasagnaSummary = new QLabel(tr("No fit built yet"), lasagnaContents);
     _lasagnaSummary->setObjectName(QStringLiteral("spiralLasagnaSummary"));
     _lasagnaSummary->setWordWrap(true);
     _lasagnaSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -388,12 +395,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* outputForm = new QFormLayout(outputContents);
     outputGroup->contentLayout()->addWidget(outputContents);
     addPathRow(outputForm, "output_directory", tr("Output directory"), true);
-    addPathRow(outputForm, "scroll_zarr", tr("Scroll/render Zarr"), true);
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
-    // The scroll's name and voxel resolution are not here: spiral-scroll.json
-    // in the dataset root is their only source, and the service rejects a
-    // request that restates them.
+    // The scroll's name and voxel resolution are not here: the project's fit
+    // volume is their only source, and the service rejects a request that
+    // restates them.
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
@@ -956,7 +962,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _editingAccessError.clear();
                     // A new connection may be to another dataset entirely, so
                     // the previous scroll specification stops being true here.
-                    applyScrollSpec({});
+                    resetScrollSummaries();
                     _hasSession = false;
                     _loadedSessionRequest = {};
                     _attachedAdvancedConfig = {};
@@ -971,9 +977,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::datasetResolved, this,
             [this](const QJsonObject&) { refreshCheckpointChoices(); });
     connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
-        // The scroll specification belongs to the dataset, not to a session, so
-        // it is reported whether or not one is attached.
-        applyScrollSpec(value.value(QStringLiteral("scroll_spec")).toObject());
         // A service-owned dataset advertisement describes what a future load
         // would use. Once attached, the resident session's canonical request
         // is authoritative and may intentionally differ.
@@ -1381,6 +1384,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](bool) { refreshReloadRequired(); });
     connect(_verticalFiberOffsetEnabled, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
+    connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int) { refreshReloadRequired(); });
     connect(_verticalFiberOffsetVoxels, qOverload<double>(&QDoubleSpinBox::valueChanged),
             this, [this](double) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
@@ -1941,25 +1946,12 @@ void SpiralPanel::updatePositionSummary()
     _positionSummary->setVisible(!lines.isEmpty());
 }
 
-void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
+void SpiralPanel::resetScrollSummaries()
 {
-    if (spec.isEmpty()) {
-        // An invalid specification is a missing_required condition the
-        // service reports; the panel says so where the values would be.
-        const QString unavailable = tr("No valid spiral-scroll.json in the dataset root");
-        _scrollSummary->setText(unavailable);
-        _lasagnaSummary->setText(unavailable);
-        return;
-    }
-    // The dataset's optional specification states the Lasagna layout; the
-    // scroll's facts come from the project's fit volume (applySessionScroll).
-    if (!_hasSession)
-        _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
-    _lasagnaSummary->setText(
-        tr("normals in zarr group %1, SDT in %2, coordinate scale %3")
-            .arg(spec.value(QStringLiteral("normal_zarr_group")).toString(QStringLiteral("4")))
-            .arg(spec.value(QStringLiteral("surf_sdt_zarr_group")).toString())
-            .arg(spec.value(QStringLiteral("lasagna_scale")).toInt(4)));
+    // The project's fit volume and Lasagna dataset give these once a fit is
+    // built (applySessionScroll).
+    _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
+    _lasagnaSummary->setText(tr("From the project's selected Lasagna dataset when a fit is built"));
 }
 
 void SpiralPanel::applySessionScroll(const QJsonObject& request)
@@ -1974,6 +1966,14 @@ void SpiralPanel::applySessionScroll(const QJsonObject& request)
             .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
                  project.value(QStringLiteral("umbilicus")).toObject()
                      .value(QStringLiteral("revision")).toString()));
+    const QJsonObject lasagna = project.value(QStringLiteral("lasagna")).toObject();
+    _lasagnaSummary->setText(
+        lasagna.isEmpty()
+            ? tr("The project selects no Lasagna dataset")
+            : tr("%1 — array %2, %3 fit-volume voxels per array voxel")
+                  .arg(lasagna.value(QStringLiteral("location")).toString(),
+                       scroll.value(QStringLiteral("normal_zarr_group")).toString())
+                  .arg(scroll.value(QStringLiteral("lasagna_scale")).toInt()));
 }
 
 QJsonObject SpiralPanel::sessionRequest() const
@@ -1993,6 +1993,9 @@ QJsonObject SpiralPanel::sessionRequest() const
             _verticalFiberOffsetEnabled->isChecked();
         config[QStringLiteral("pcl_vertical_fiber_radial_offset_voxels")] =
             _verticalFiberOffsetVoxels->value();
+        const QString sense = _outwardSense->currentData().toString();
+        config[QStringLiteral("spiral_outward_sense")] =
+            sense.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(sense);
     }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -2116,6 +2119,14 @@ void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
     updateTrackSamplingUi();
 }
 
+void SpiralPanel::syncOutwardSense(const QJsonObject& effectiveConfig)
+{
+    const QSignalBlocker blocker(_outwardSense);
+    const int index = _outwardSense->findData(
+        effectiveConfig.value(QStringLiteral("spiral_outward_sense")).toString());
+    _outwardSense->setCurrentIndex(qMax(0, index));
+}
+
 void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig)
 {
     const QSignalBlocker enabledBlocker(_verticalFiberOffsetEnabled);
@@ -2196,6 +2207,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         effectiveConfig.value(QStringLiteral("output_save_png_visualizations"))
             .toBool(false));
     syncVerticalFiberOffsetControls(effectiveConfig);
+    syncOutwardSense(effectiveConfig);
     syncTrackSamplingControlsFromAdvanced();
     if (!activeRunConfig.isEmpty())
         applySessionRunConfig(activeRunConfig, sessionGeneration);
@@ -2294,6 +2306,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 .value(QStringLiteral("output_save_png_visualizations"))
                 .toBool(false));
         syncVerticalFiberOffsetControls(effectiveConfig);
+    syncOutwardSense(effectiveConfig);
         syncTrackSamplingControlsFromAdvanced();
         _applyingResolution = false;
         applySessionRunConfig(runConfig, sessionGeneration);
@@ -2626,6 +2639,7 @@ void SpiralPanel::persist() const
                       _verticalFiberOffsetEnabled->isChecked());
     settings.setValue(prefix + "vertical_fiber_offset_voxels",
                       _verticalFiberOffsetVoxels->value());
+    settings.setValue(prefix + "outward_sense", _outwardSense->currentData().toString());
     settings.setValue(prefix + "iterations", _iterations->value());
     settings.setValue(prefix + "dt_loss_schedule_enabled",
                       _dtLossScheduleEnabled->isChecked());
@@ -2669,6 +2683,8 @@ void SpiralPanel::restore()
     _verticalFiberOffsetVoxels->setValue(
         settings.value(prefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
     _verticalFiberOffsetVoxels->setEnabled(_verticalFiberOffsetEnabled->isChecked());
+    _outwardSense->setCurrentIndex(qMax(0, _outwardSense->findData(
+        settings.value(prefix + "outward_sense").toString())));
     _iterations->setValue(settings.value(prefix + "iterations", 100).toInt());
     _dtLossScheduleEnabled->setChecked(
         settings.value(prefix + "dt_loss_schedule_enabled", false).toBool());
@@ -2686,7 +2702,7 @@ void SpiralPanel::restore()
     }
     // Restoring is a profile switch: the previous service's scroll is not this
     // profile's, and nothing is known until the new connection advertises one.
-    applyScrollSpec({});
+    resetScrollSummaries();
     _applyingResolution = false;
     _hasManualEdits = false;
     _hasSession = false;

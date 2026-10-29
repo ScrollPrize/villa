@@ -69,8 +69,8 @@ bool startService(ServiceProcess& service, const QString& python, const QTempora
     return service.port > 0;
 }
 
-// What VC3D sends of a project of the objects' volume "vol": the fixture
-// dataset's scroll specification states the scroll, and this its umbilicus.
+// What VC3D sends of a project of the objects' volume "vol": its voxel size,
+// a catalog orientation (an outward sense of CW) and its umbilicus.
 QJsonObject protocolProject()
 {
     const QJsonObject umbilicus{
@@ -79,7 +79,10 @@ QJsonObject protocolProject()
         {QStringLiteral("points_zyx"), QJsonArray{QJsonArray{0, 32, 32}, QJsonArray{64, 32, 32}}}};
     return {{QStringLiteral("name"), QStringLiteral("protocol")},
             {QStringLiteral("volumes"), QJsonObject{{QStringLiteral("vol"),
-                QJsonObject{{QStringLiteral("umbilicus"), umbilicus}}}}}};
+                QJsonObject{{QStringLiteral("voxel_size_um"), 9.6},
+                            {QStringLiteral("z_direction_is_top_to_bottom"), false},
+                            {QStringLiteral("left_handed_coordinates"), false},
+                            {QStringLiteral("umbilicus"), umbilicus}}}}}};
 }
 
 SpiralServiceProfile protocolProfile(int port)

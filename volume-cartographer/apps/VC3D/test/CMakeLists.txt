@@ -215,7 +215,7 @@ add_executable(test_spiral_project_inputs
     ../SpiralProjectInputs.cpp ../SpiralProjectInputs.hpp)
 target_include_directories(test_spiral_project_inputs PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_spiral_project_inputs PRIVATE vc_core Qt6::Core)
+target_link_libraries(test_spiral_project_inputs PRIVATE vc_core vc_lasagna Qt6::Core)
 add_test(NAME spiral_project_inputs COMMAND test_spiral_project_inputs)
 vc_register_test_target(test_spiral_project_inputs)
 vc_register_ctest(spiral_project_inputs test_spiral_project_inputs)

@@ -60,7 +60,6 @@
 #include <QStatusBar>
 #include <QUuid>
 #include <QTimer>
-#include <QTemporaryFile>
 #include <QVBoxLayout>
 #include <QWindow>
 #include <QtConcurrent/QtConcurrent>
@@ -140,121 +139,6 @@ std::optional<std::array<std::size_t, 3>> parseBaseShapeZYX(
         parsed[static_cast<std::size_t>(axis)] = static_cast<std::size_t>(extent);
     }
     return parsed;
-}
-
-std::optional<int> omeScaledownForGroup(
-    const QString& rootPath, const QString& group, QString* errorMessage)
-{
-    QFile attributesFile(QDir(rootPath).filePath(QStringLiteral(".zattrs")));
-    if (!attributesFile.open(QIODevice::ReadOnly)) {
-        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1")
-            .arg(attributesFile.fileName());
-        return std::nullopt;
-    }
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(
-        attributesFile.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        if (errorMessage) *errorMessage = QObject::tr("Malformed OME metadata at %1: %2")
-            .arg(attributesFile.fileName(), parseError.errorString());
-        return std::nullopt;
-    }
-    const QJsonArray multiscales = document.object()
-        .value(QStringLiteral("multiscales")).toArray();
-    if (multiscales.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("OME multiscales metadata is missing");
-        return std::nullopt;
-    }
-    const QJsonArray datasets = multiscales.at(0).toObject()
-        .value(QStringLiteral("datasets")).toArray();
-    auto datasetScale = [&](const QString& wanted) -> std::optional<double> {
-        for (const QJsonValue& value : datasets) {
-            const QJsonObject dataset = value.toObject();
-            if (dataset.value(QStringLiteral("path")).toString() != wanted) continue;
-            std::optional<double> scale;
-            for (const QJsonValue& transformValue : dataset.value(
-                     QStringLiteral("coordinateTransformations")).toArray()) {
-                const QJsonObject transform = transformValue.toObject();
-                const QString type = transform.value(QStringLiteral("type")).toString();
-                const QJsonArray values = transform.value(type).toArray();
-                if (values.size() != 3) return std::nullopt;
-                if (type == QStringLiteral("translation")) {
-                    for (const QJsonValue& component : values)
-                        if (!component.isDouble() || !std::isfinite(component.toDouble()) ||
-                            std::abs(component.toDouble()) > 1.0e-9) return std::nullopt;
-                } else if (type == QStringLiteral("scale")) {
-                    const double first = values.at(0).toDouble(
-                        std::numeric_limits<double>::quiet_NaN());
-                    if (!std::isfinite(first) || first <= 0.0) return std::nullopt;
-                    for (const QJsonValue& component : values) {
-                        const double current = component.toDouble(
-                            std::numeric_limits<double>::quiet_NaN());
-                        if (!std::isfinite(current) || current <= 0.0 ||
-                            std::abs(current - first) >
-                                1.0e-9 * std::max({1.0, current, first})) return std::nullopt;
-                    }
-                    scale = first;
-                } else return std::nullopt;
-            }
-            return scale;
-        }
-        return std::nullopt;
-    };
-    const auto baseScale = datasetScale(QStringLiteral("0"));
-    const auto groupScale = datasetScale(group);
-    if (!baseScale || !groupScale) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale metadata for groups 0 and %1 is required").arg(group);
-        return std::nullopt;
-    }
-    const double levelValue = std::log2(*groupScale / *baseScale);
-    const int level = static_cast<int>(std::llround(levelValue));
-    if (level < 0 || level > 30 || !std::isfinite(levelValue) ||
-        std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale for group %1 is not a dyadic L0 scale").arg(group);
-        return std::nullopt;
-    }
-    return level;
-}
-
-// Shape of an OME store's level-zero array, the grid its group scaledowns
-// are relative to. Reads the array metadata directly (Zarr v2 ``.zarray`` or
-// v3 ``zarr.json``) so it needs no chunk access.
-std::optional<std::array<std::size_t, 3>> omeLevelZeroShapeZYX(
-    const QString& rootPath, QString* errorMessage)
-{
-    const QDir level(QDir(rootPath).filePath(QStringLiteral("0")));
-    for (const QString& name : {QStringLiteral(".zarray"), QStringLiteral("zarr.json")}) {
-        QFile metadataFile(level.filePath(name));
-        if (!metadataFile.open(QIODevice::ReadOnly)) continue;
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(
-            metadataFile.readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            if (errorMessage) *errorMessage = QObject::tr("Malformed Zarr metadata at %1: %2")
-                .arg(metadataFile.fileName(), parseError.errorString());
-            return std::nullopt;
-        }
-        const QJsonArray shape = document.object().value(QStringLiteral("shape")).toArray();
-        std::array<std::size_t, 3> result{};
-        if (shape.size() == 3) {
-            bool valid = true;
-            for (int axis = 0; axis < 3; ++axis) {
-                const double value = shape.at(axis).toDouble(-1.0);
-                if (!(value > 0.0) || value != std::floor(value)) { valid = false; break; }
-                result[axis] = static_cast<std::size_t>(value);
-            }
-            if (valid) return result;
-        }
-        if (errorMessage) *errorMessage = QObject::tr(
-            "Zarr metadata at %1 must declare a three-axis positive shape")
-            .arg(metadataFile.fileName());
-        return std::nullopt;
-    }
-    if (errorMessage) *errorMessage = QObject::tr(
-        "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
-    return std::nullopt;
 }
 
 QImage maskOverlayToSurface(
@@ -425,6 +309,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         const auto pkg = _state->vpkg();
         if (!pkg) throw std::runtime_error("no project is open");
         return vc3d::spiral::projectBlock(pkg->name(), vc3d::spiral::projectVolumeFacts(*pkg),
+                                          vc3d::spiral::projectLasagna(*pkg),
                                           _state->objectStoreSession().get(),
                                           _state->storeFor("umbilicus"));
     });
@@ -1149,104 +1034,18 @@ std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
 SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
 {
     if (!_lineAnnotationController) return std::nullopt;
-    const QJsonObject scroll = _service->advertisedDataset()
-                                   .value(QStringLiteral("scroll_spec")).toObject();
-    const QString group = scroll.value(QStringLiteral("normal_zarr_group"))
-                              .toString(QStringLiteral("4"));
-    std::optional<int> omeScale;
-    // The grid the normal stores' scaledowns are relative to. It is the
-    // stores' own level zero, which need not be the fiber-inference base
-    // grid: the manifest declares it so the optimizer derives the true
-    // fiber-to-normal conversion rather than assuming the grids coincide.
-    std::optional<std::array<std::size_t, 3>> normalBaseShape;
-    QString omeError;
-    QString fallbackNormal;
-    QTemporaryFile manifest(QDir(QDir::tempPath()).filePath(
-        QStringLiteral("vc3d-spiral-normal-XXXXXX.lasagna.json")));
-    manifest.setAutoRemove(false);
-    const QStringList normalKeys{QStringLiteral("normal_x"), QStringLiteral("normal_y"),
-                                 QStringLiteral("gradient_magnitude")};
-    QStringList mapped;
-    for (const QString& key : normalKeys) {
-        const QString servicePath = _sessionPaths.value(key).toString();
-        mapped.push_back(servicePath.isEmpty() ? QString() : mapServicePath(servicePath));
-    }
-    if (std::all_of(mapped.begin(), mapped.end(),
-                    [](const QString& path) { return !path.isEmpty(); })) {
-        for (const QString& path : mapped) {
-            QString candidateError;
-            const auto candidate = omeScaledownForGroup(path, group, &candidateError);
-            if (!candidate) { omeError = candidateError; omeScale.reset(); break; }
-            if (omeScale && *omeScale != *candidate) {
-                omeError = tr("Spiral normal inputs declare different OME scales");
-                omeScale.reset();
-                break;
-            }
-            const auto candidateShape = omeLevelZeroShapeZYX(path, &candidateError);
-            if (!candidateShape) { omeError = candidateError; omeScale.reset(); break; }
-            if (normalBaseShape && *normalBaseShape != *candidateShape) {
-                omeError = tr("Spiral normal inputs declare different level-zero shapes");
-                omeScale.reset();
-                break;
-            }
-            omeScale = candidate;
-            normalBaseShape = candidateShape;
-        }
-    }
-    if (omeScale && std::all_of(mapped.begin(), mapped.end(),
-                                [](const QString& path) { return !path.isEmpty(); }) &&
-        manifest.open()) {
-        const double encodeScale = _sessionRunConfig
-            .value(QStringLiteral("dense_grad_mag_encode_scale")).toDouble(1000.0);
-        const double gradFactor = _sessionRunConfig
-            .value(QStringLiteral("dense_grad_mag_factor")).toDouble(0.25);
-        QJsonObject groups;
-        const QStringList channels{QStringLiteral("nx"), QStringLiteral("ny"),
-                                   QStringLiteral("grad_mag")};
-        for (int i = 0; i < mapped.size(); ++i) {
-            groups[channels[i]] = QJsonObject{
-                {QStringLiteral("zarr"), QDir(mapped[i]).filePath(group)},
-                {QStringLiteral("scaledown"), *omeScale},
-                {QStringLiteral("channels"), QJsonArray{channels[i]}},
-            };
-        }
-        QJsonObject root{
-            {QStringLiteral("version"), 2},
-            {QStringLiteral("source_to_base"), 1.0},
-            {QStringLiteral("grad_mag_encode_scale"), encodeScale},
-            {QStringLiteral("grad_mag_factor"), gradFactor},
-            {QStringLiteral("groups"), groups},
-        };
-        if (normalBaseShape) {
-            QJsonArray baseShape;
-            for (const std::size_t extent : *normalBaseShape)
-                baseShape.append(static_cast<qint64>(extent));
-            root[QStringLiteral("base_shape_zyx")] = baseShape;
-        }
-        manifest.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-        manifest.close();
-        fallbackNormal = manifest.fileName();
-    }
-
+    // The normals are the project's selected Lasagna dataset, which Spiral
+    // fits read too; the fiber inference may fall back to the one manifest
+    // below the service dataset's fiber_zarrs.
     QString fallbackFiber;
-    const QString serviceRoot = _sessionPaths.value(QStringLiteral("dataset_root")).toString();
     const QStringList manifests = fallbackFiberManifests();
     if (manifests.size() == 1) fallbackFiber = manifests.front();
     auto result = _lineAnnotationController->resolveFiberOptimizationInputs(
-        fallbackNormal.toStdString(), fallbackFiber.toStdString(), errorMessage);
-    if (result && result->normalManifestLocation == fallbackNormal.toStdString())
-        result->normalManifestLocation = QStringLiteral("spiral-session:%1#normals")
-            .arg(serviceRoot).toStdString();
-    if (!fallbackNormal.isEmpty()) QFile::remove(fallbackNormal);
-    if (!result && errorMessage) {
-        if (fallbackNormal.isEmpty())
-            *errorMessage += tr(" Spiral fallback normals require mapped normal_x, normal_y, "
-                                "gradient_magnitude, and valid OME scale metadata: %1").arg(omeError);
-        if (manifests.size() != 1)
-            *errorMessage += manifests.isEmpty()
-                ? tr(" No fiber-inference manifest was found below fiber_zarrs.")
-                : tr(" Multiple fiber-inference manifests were found below fiber_zarrs; select one in the project.");
-    }
+        {}, fallbackFiber.toStdString(), errorMessage);
+    if (!result && errorMessage && manifests.size() != 1)
+        *errorMessage += manifests.isEmpty()
+            ? tr(" No fiber-inference manifest was found below fiber_zarrs.")
+            : tr(" Multiple fiber-inference manifests were found below fiber_zarrs; select one in the project.");
     return result;
 }
 

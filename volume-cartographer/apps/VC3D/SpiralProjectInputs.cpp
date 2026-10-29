@@ -2,12 +2,77 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/lasagna/Manifest.hpp"
 
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 #include <QJsonArray>
 
+#include <cmath>
+
 namespace vc3d::spiral {
+
+ProjectLasagna projectLasagna(const vc::lasagna::LasagnaDatasetManifest& manifest,
+                              const std::string& location)
+{
+    ProjectLasagna result;
+    result.location = location;
+    result.baseShapeZYX = manifest.baseShapeZYX;
+    const std::pair<const char*, const char*> inputs[] = {
+        {"normal_x", "nx"}, {"normal_y", "ny"}, {"gradient_magnitude", "grad_mag"}};
+    std::optional<int> scaledown;
+    for (const auto& [input, channel] : inputs) {
+        const auto* group = manifest.groupForChannel(channel);
+        if (!group) continue;
+        if (group->isRemote()) {
+            result.error = "Spiral reads Lasagna stores from local paths; " + location + " is remote";
+            return result;
+        }
+        if (group->channels.size() != 1) {
+            result.error = "Spiral reads single-channel Lasagna arrays; " + location + "'s channel " +
+                           channel + " shares group " + group->name;
+            return result;
+        }
+        // The group is an array of an OME-Zarr store: the fit reads
+        // <store>/<array>.
+        const auto store = group->zarrPath.parent_path().string();
+        const auto array = group->zarrPath.filename().string();
+        if ((!result.group.empty() && array != result.group) || (scaledown && *scaledown != group->scaledown)) {
+            result.error = "Spiral reads the Lasagna channels at one array; " + location +
+                           " stores them at different ones";
+            return result;
+        }
+        result.stores[input] = store;
+        result.group = array;
+        scaledown = group->scaledown;
+    }
+    if (result.stores.empty())
+        result.error = location + " has no nx, ny or grad_mag channel";
+    else
+        result.baseVoxelsPerArrayVoxel = manifest.sourceToBase * std::ldexp(1.0, *scaledown);
+    return result;
+}
+
+std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg)
+{
+    const std::string location = pkg.selectedLasagnaDataset();
+    if (location.empty()) return std::nullopt;
+    if (vc::project::isLocationRemote(location)) {
+        ProjectLasagna remote;
+        remote.location = location;
+        remote.error = "Spiral reads Lasagna stores from local paths; " + location + " is remote";
+        return remote;
+    }
+    const auto path = vc::project::resolveLocalPath(location, pkg.directory());
+    try {
+        return projectLasagna(vc::lasagna::LasagnaDatasetManifest::parseFile(path), path.string());
+    } catch (const std::exception& error) {
+        ProjectLasagna unreadable;
+        unreadable.location = path.string();
+        unreadable.error = "cannot read " + path.string() + ": " + error.what();
+        return unreadable;
+    }
+}
 
 std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pkg)
 {
@@ -43,9 +108,11 @@ std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pk
 
 QJsonObject projectBlock(const std::string& name,
                          const std::map<std::string, ProjectVolumeFacts>& volumes,
+                         const std::optional<ProjectLasagna>& lasagna,
                          vc::objects::ObjectStoreSession* session,
                          const std::optional<vc::objects::AttachmentIdentity>& umbilicusStore)
 {
+    const bool readable = lasagna && lasagna->error.empty();
     QJsonObject entries;
     for (const auto& [uuid, facts] : volumes) {
         QJsonObject entry;
@@ -57,6 +124,18 @@ QJsonObject projectBlock(const std::string& name,
         if (facts.zTopToBottom) entry[QStringLiteral("z_direction_is_top_to_bottom")] = *facts.zTopToBottom;
         if (facts.leftHandedCoordinates)
             entry[QStringLiteral("left_handed_coordinates")] = *facts.leftHandedCoordinates;
+        if (readable && lasagna->baseShapeZYX && facts.baseShapeZYX) {
+            // An array voxel in this volume's voxels: a whole number, or the
+            // volume is not a dyadic level of the dataset's base.
+            try {
+                const double basePerVolumeVoxel = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+                    *facts.baseShapeZYX, *lasagna->baseShapeZYX);
+                const double scale = lasagna->baseVoxelsPerArrayVoxel / basePerVolumeVoxel;
+                if (scale >= 1 && scale == std::round(scale))
+                    entry[QStringLiteral("lasagna_scale")] = qint64(scale);
+            } catch (const std::exception&) {
+            }
+        }
         if (session && umbilicusStore) {
             // In the volume's own voxels, as the fit reads it.
             if (const auto umbilicus = vc::objects::volumeUmbilicus(
@@ -71,8 +150,20 @@ QJsonObject projectBlock(const std::string& name,
         }
         entries[QString::fromStdString(uuid)] = entry;
     }
-    return {{QStringLiteral("name"), QString::fromStdString(name)},
-            {QStringLiteral("volumes"), entries}};
+    QJsonObject block{{QStringLiteral("name"), QString::fromStdString(name)},
+                      {QStringLiteral("volumes"), entries}};
+    if (lasagna) {
+        QJsonObject value{{QStringLiteral("location"), QString::fromStdString(lasagna->location)}};
+        if (!readable) {
+            value[QStringLiteral("error")] = QString::fromStdString(lasagna->error);
+        } else {
+            value[QStringLiteral("group")] = QString::fromStdString(lasagna->group);
+            for (const auto& [input, store] : lasagna->stores)
+                value[QString::fromStdString(input)] = QString::fromStdString(store);
+        }
+        block[QStringLiteral("lasagna")] = value;
+    }
+    return block;
 }
 
 } // namespace vc3d::spiral

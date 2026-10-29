@@ -10,14 +10,19 @@ with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
 including its links.
 
-The scroll's facts and the umbilicus are the open project's: every build
-request sends the service, which cannot read the project file, each project
-volume's voxel size, a catalog volume's orientation and full-resolution
-shape, and the umbilicus the project's umbilicus store holds for it (see
-"The VC3D project's inputs" in the README). The fit uses the entry of the
-volume its inputs name; import an umbilicus for that volume (File > Import
-Umbilicus) before building. The panel's *Scroll* line shows the session's
-scroll, volume and umbilicus revision.
+The scroll's facts, the umbilicus and the Lasagna stores are the open
+project's: every build request sends the service, which cannot read the
+project file, each project volume's voxel size, a catalog volume's
+orientation and full-resolution shape, the umbilicus the project's umbilicus
+store holds for it, and the selected Lasagna dataset's nx, ny and grad_mag
+stores with their scale relative to each volume (see "The VC3D project's
+inputs" in the README). The fit uses the entry of the volume its inputs
+name; import an umbilicus for that volume (File > Import Umbilicus) and
+select the Lasagna dataset before building. For a volume outside the
+catalog, choose the spiral's *Outward sense* in the panel (a fit setting).
+The panel's *Scroll* and *Store layout* lines show the session's scroll,
+volume, umbilicus revision and Lasagna dataset. Line annotation reads its
+normals from the same selected dataset.
 
 The input list holds local drawings: brush patches and drawn point
 collections. *Save Drafts to Store* (Shift+E) saves the ready ones into that
