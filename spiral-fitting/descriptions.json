@@ -258,6 +258,7 @@
     "object_store_normal_ct_downsampling": "Downsampling of the selected normal CT level relative to the fit volume (selected CT voxel = fit voxel / this).",
     "object_store_normal_ct_volume_uuid": "The volume the normal CT belongs to; must be the fit volume.",
     "fit_volume_uuid": "The reference volume whose voxels are the fit's units. Unset infers it from the frames the selected objects declare; it must agree with every declaration.",
-    "track_scale_factor": "Stored track coordinates = fit-volume voxel coordinates x this factor. Required when a track store is attached to an object-store fit; never inferred."
+    "track_scale_factor": "Stored track coordinates = fit-volume voxel coordinates x this factor. Required when a track store is attached to an object-store fit; never inferred.",
+    "spiral_outward_sense": "The direction the spiral winds outwards (CW or ACW) where the fit volume's catalog orientation does not decide it; one that disagrees with the orientation is refused. Read it off the CT, or from an already-fitted spiral."
   }
 }

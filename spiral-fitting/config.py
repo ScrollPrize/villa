@@ -24,6 +24,7 @@ _ENUMS = {
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
+    "spiral_outward_sense": ["CW", "ACW"],
 }
 
 _NULL_TYPES = {
@@ -45,6 +46,7 @@ _NULL_TYPES = {
     "object_store_normal_ct_volume_uuid": "string",
     "fit_volume_uuid": "string",
     "track_scale_factor": "number",
+    "spiral_outward_sense": "string",
 }
 
 # Settings host preparation consumes irreversibly: patch materialization
@@ -302,7 +304,7 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction"}
+       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
@@ -687,6 +689,11 @@ class Config:
         # Stored track ZYX = fit-volume ZYX x track_scale_factor; required
         # when a track store is attached to an object-store fit.
         self.track_scale_factor = None
+        # The direction ("CW" or "ACW") the spiral winds outwards, where the
+        # fit volume's orientation (the catalog's z direction and handedness)
+        # does not decide it; one that disagrees with it is refused. Read off
+        # the CT by a person, or from an already-fitted spiral.
+        self.spiral_outward_sense = None
 
         defaults = vars(self)
         fields = {key: _field_spec(key, value)

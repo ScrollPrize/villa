@@ -104,9 +104,9 @@ and [Apple file cloning support](https://developer.apple.com/documentation/found
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
 This is not covered by scrollprize.org/tutorial_spiral. (A service session
-takes these facts from the VC3D project instead, so there the file is
-optional; see [The VC3D project's inputs](#the-vc3d-projects-inputs).)
-Required keys:
+takes the scroll's facts and the Lasagna stores from the VC3D project instead
+and uses only the file's `paths` and `num_windings`; see
+[The VC3D project's inputs](#the-vc3d-projects-inputs).) Required keys:
 
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
@@ -119,6 +119,8 @@ Required keys:
   the two catalog properties when both are present, and then only needed as a
   cross-check (a mismatch is an error). Without them it is required and is
   read off the CT data by a person in VC3D, or from an already-fitted spiral.
+  The fit setting `spiral_outward_sense` (`FIT_SPIRAL_CONFIG_OVERRIDES`) may
+  give it instead, and must agree with the file where both do.
 
 Exported surfaces (the per-winding `meshes/`, the combined preview and
 `flatten_spiral_checkpoint.py`'s source surface) read like the scroll: column 0
@@ -542,13 +544,13 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the inputs: it is launched
-with `--dataset` (tracks, Lasagna volumes, fiber directions, winding inference,
-the outer shell and an optional scroll specification), `--object-store`
+with `--dataset` (tracks, fiber directions, winding inference, the outer
+shell and an optional scroll specification), `--object-store`
 (patches, point collections, fibers and their links; see
 [Object-store inputs](#object-store-inputs)) and `--output` (all generated
 state), resolves them once at startup, and advertises the result through
-`/dataset`. The scroll's facts and the umbilicus come from the client's
-project with each session request (below). `--output` must resolve outside the dataset root;
+`/dataset`. The scroll's facts, the umbilicus and the Lasagna stores come
+from the client's project with each session request (below). `--output` must resolve outside the dataset root;
 the optional `--cache` (derived host caches) defaults to the documented user
 cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
 run parameters but cannot repoint the session at other host paths or another
@@ -558,35 +560,48 @@ object store.
 
 A service session fits the VC3D project that asks for it. The project file
 is VC3D's and need not be readable on the service's host, so every initialize
-and rebuild carries a `project` block (`fit_session.SpiralProject`): the
-project's name and, for each store volume its volumes' annotations are kept in
-(a catalog volume once, whatever its working level), the facts the project
-knows exactly (`voxel_size_um`; a catalog volume's
-`z_direction_is_top_to_bottom`, `left_handed_coordinates` and full-resolution
-`base_shape_zyx`) and the volume's umbilicus from the project's umbilicus
-store (`uuid`, `revision`, `points_zyx` in the volume's own voxels).
+and rebuild carries a `project` block (`fit_session.SpiralProject`):
 
-Once the build has linked and pinned its inputs it knows the fit volume they
-name (a checkpoint resume: the one its inputs were read in), and fits that
-project volume:
+- the project's name;
+- its selected Lasagna dataset as VC3D's manifest reader resolves it: the
+  OME-Zarr stores of the `nx`, `ny` and `grad_mag` channels (one-channel
+  arrays sharing one array name, e.g. `s_nx.ome.zarr/4`), or why the fit
+  cannot read it (a remote dataset, multichannel arrays). The stores are paths
+  on the service's host: a service on another machine needs them at the same
+  paths;
+- for each store volume its volumes' annotations are kept in (a catalog
+  volume once, whatever its working level): the facts the project knows
+  exactly (`voxel_size_um`; a catalog volume's `z_direction_is_top_to_bottom`,
+  `left_handed_coordinates` and full-resolution `base_shape_zyx`), the
+  Lasagna arrays' downsampling relative to its voxels (`lasagna_scale`, from
+  the manifest's `source_to_base`, scaledown and base shape and the volume's
+  shape) and its umbilicus from the project's umbilicus store (`uuid`,
+  `revision`, `points_zyx` in the volume's own voxels).
 
-- **Scroll.** The project's facts, completed by the dataset's
-  `spiral-scroll.json` where the project does not know one (a non-catalog
-  volume's orientation, say); a file stating a fact differently is refused,
-  not overruled. The name is the project's. The file's Lasagna layout
-  (`normal_zarr_group`, `lasagna_scale`), path overrides and `num_windings`
-  apply as before.
+The fit volume is the one the selection's objects name (a checkpoint resume:
+the one its inputs were read in). The build fits that project volume:
+
+- **Scroll.** The volume's facts and the project's name. Where the volume's
+  orientation is unknown (a volume outside the catalog) the fit setting
+  `spiral_outward_sense` (the Spiral panel's *Outward sense*) gives the
+  sense; where it is known, a setting that disagrees is refused.
+- **Lasagna.** The session reads the project's stores at their array, at
+  the volume's `lasagna_scale` (normals for the startup link refresh too). A
+  fit whose losses need normals or gradient magnitudes the project cannot
+  give is refused before anything is linked.
 - **Umbilicus.** The project's, written under the output directory
   (`project-inputs/umbilicus-<revision>.json`) as the file the fit reads, at
-  coordinate scale 1. The dataset's `umbilicus.json` is not read.
+  coordinate scale 1.
 
-A fit volume that is not a project volume, or has no umbilicus, fails the
-preparation and leaves any resident fit as it was. The session's
-`session_request` records `project` (name, volume, its facts, the umbilicus's
-identity) and the resolved `scroll`. A rebuild after the project's volume
-changed (another umbilicus revision, a renamed project) rereads everything.
-The command-line fit is unchanged: it reads `spiral-scroll.json` and the
-dataset's `umbilicus.json`.
+The service does not read `spiral-scroll.json`'s scroll facts or Lasagna
+layout (they are the command-line fit's), nor the dataset's `umbilicus.json`
+or `lasagna_inputs/`; the file, if any, gives only its `paths` overrides and
+`num_windings`. A fit volume that is not a project volume, or has no
+umbilicus, fails the preparation and leaves any resident fit as it was. The
+session's `session_request` records `project` (name, volume, its facts, the
+Lasagna dataset, the umbilicus's identity) and the resolved `scroll`. A
+rebuild after the project's volume changed (another umbilicus revision, a
+renamed project, another Lasagna dataset) rereads everything.
 
 ### Object store, positions and input updates
 

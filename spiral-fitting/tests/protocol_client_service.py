@@ -94,10 +94,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     root = Path(args.root)
     dataset = root / 'dataset'
+    # The client's project gives the scroll and umbilicus: the dataset holds
+    # nothing this fixture reads.
     dataset.mkdir(parents=True, exist_ok=True)
-    (dataset / 'spiral-scroll.json').write_text(json.dumps({
-        'schema_version': 1, 'name': 'protocol', 'voxel_size_um': 9.6,
-        'spiral_outward_sense': 'CW', 'base_shape_zyx': [64, 64, 64]}))
     output = root / 'output'
     resolution = spiral_service.bind_service_paths(
         resolve_dataset_root(dataset), output, root / 'cache')

@@ -4342,7 +4342,19 @@ if __name__ == '__main__':
              '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
     cli_args = parser.parse_args()
 
-    scroll_spec = load_scroll_spec(cli_args.dataset, cli_args.scroll_spec)
+    overrides = get_env_config_overrides()
+    # The store is named on the command line only, as the service's
+    # binding owns it there.
+    owned = sorted({'object_store_path', 'object_store_author'} & set(overrides))
+    if owned:
+        raise SystemExit(
+            f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
+            'use --object-store / --object-store-author')
+    # The fit setting spiral_outward_sense stands in for a sense the
+    # specification does not decide, and must agree with one it does.
+    scroll_spec = load_scroll_spec(
+        cli_args.dataset, cli_args.scroll_spec,
+        outward_sense=overrides.get('spiral_outward_sense'))
     input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)
 
     # The CLI is a torchrun rendezvous boundary: this is where RANK /
@@ -4357,14 +4369,6 @@ if __name__ == '__main__':
         # A winding count in spiral-scroll.json replaces the generic default;
         # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
-        overrides = get_env_config_overrides()
-        # The store is named on the command line only, as the service's
-        # binding owns it there.
-        owned = sorted({'object_store_path', 'object_store_author'} & set(overrides))
-        if owned:
-            raise SystemExit(
-                f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
-                'use --object-store / --object-store-author')
         config.update(overrides)
         config['object_store_path'] = cli_args.object_store
         config['object_store_author'] = cli_args.object_store_author

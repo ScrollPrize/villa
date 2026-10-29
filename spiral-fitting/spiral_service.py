@@ -77,12 +77,13 @@ from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG, PROJECT_INPUT_KEYS,
-                         SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
+                         SESSION_BUSY_STATES,
                          SCROLL_SPEC_OWNED_RUN_KEYS,
+                         PROJECT_LASAGNA_INPUTS, VOLUME_INPUT_KEYS,
                          ScrollSpecError, SessionScroll, SessionState,
                          SpiralProject, default_user_cache_dir,
-                         input_source_enabled, load_dataset_scroll_fields,
+                         input_source_enabled,
                          winding_inference_enabled,
                          scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
@@ -1128,7 +1129,7 @@ class ServiceState:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def _dataset_session_request(self, request, *, include_input_config=False):
+    def _dataset_session_request(self, request, project, *, include_input_config=False):
         """Build a dataset-owned request and select its active inputs.
 
         A checkpoint-backed request intentionally carries no UI profile
@@ -1157,6 +1158,9 @@ class ServiceState:
         for key in (*(spec.key for spec in FIT_INPUT_CATALOG),
                     "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
+        # The Lasagna stores are the project's selected dataset's.
+        if project.lasagna is not None and not project.lasagna.error:
+            paths.update(project.lasagna.stores)
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
             allowed = set(resolution.get("detected_checkpoints", []))
@@ -1219,26 +1223,24 @@ class ServiceState:
         """Validate one session request into the arguments a build needs."""
         input_config = None
         try:
-            # The scroll specification in the dataset root owns these. A
-            # request that names one is refused rather than quietly overruled
-            # by the file.
+            # The project (its fit volume and Lasagna dataset) owns these. A
+            # request that names one is refused rather than quietly overruled.
             scroll_owned = sorted(
                 key for key in SCROLL_SPEC_OWNED_RUN_KEYS
                 if key in (request.get("run") or {}))
             if scroll_owned:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
-                    "values; the request must not carry them",
+                    "The project owns these values; the request must not carry them",
                     [{"field": f"run.{key}",
-                      "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
+                      "message": (f"Owned by the project's scroll as "
                                   f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
                      for key in scroll_owned])
             request = self._bind_service_owned_config(request)
             project = self._request_project(request)
             if self.dataset_resolution is not None:
                 request, input_config = self._dataset_session_request(
-                    request, include_input_config=True)
+                    request, project, include_input_config=True)
             paths, run, preview = parse_session_request(request)
         except (KeyError, TypeError, ValueError) as exc:
             # An unparseable request field (an unknown PCL role, say) is the
@@ -1264,19 +1266,19 @@ class ServiceState:
         validation_run = (
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
-        # The project supplies its inputs once the fit volume is known.
+        # The project supplies the umbilicus once the fit volume is known.
         errors = validate_session_request(paths, validation_run,
-                                          supplied=PROJECT_INPUT_KEYS)
-        # The project's facts and the dataset's optional specification make
-        # the scroll, resolved for the fit volume when the build knows it
-        # (_resolve_session_scroll).
-        scroll = None
-        try:
-            fields, source = load_dataset_scroll_fields(paths.dataset_root)
-        except ScrollSpecError as exc:
-            errors.append({"field": "scroll_spec", "message": str(exc)})
-        else:
-            scroll = SessionScroll(project, fields, source)
+                                          supplied=VOLUME_INPUT_KEYS)
+        # Lasagna stores the configuration needs and the project cannot give.
+        if lasagna_error := project.lasagna_error():
+            needed = [spec.key for spec in FIT_INPUT_CATALOG
+                      if spec.key in PROJECT_LASAGNA_INPUTS
+                      and spec.required(validation_run.config)]
+            errors = [error for error in errors if error["field"] not in needed]
+            errors.extend({"field": key, "message": lasagna_error} for key in needed)
+        # The project's scroll, resolved for the fit volume when the build
+        # knows it (_resolve_session_scroll).
+        scroll = SessionScroll(project)
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
@@ -1299,14 +1301,25 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid project: {exc}",
                            [{"field": "project", "message": str(exc)}]) from exc
 
-    def _resolve_session_scroll(self, scroll, volume, paths):
+    def _effective_config(self, paths, run):
+        """The configuration a build applies: a resumed checkpoint's stored
+        one under the request's overrides."""
+        from spiral_runtime import merge_session_config
+        config, _, overrides = merge_session_config(
+            paths.checkpoint, run, warn=lambda warning: None)
+        config.update(overrides)
+        return config
+
+    def _resolve_session_scroll(self, scroll, volume, paths, config):
         """Complete a build's SessionScroll for its fit volume: the scroll it
-        fits and its umbilicus (the project's, written under the output
-        directory as the file the fit reads). The fit infers the same volume
-        from the same inputs, and an input update that would read another is
-        refused (InputReplacementRefused). Returns ``(paths, ScrollSpec)``;
-        raises ScrollSpecError."""
-        spec = scroll.resolve(volume)
+        fits (with ``config``'s spiral_outward_sense, and the Lasagna scale
+        when it reads the stores) and its umbilicus (the project's, written
+        under the output directory as the file the fit reads). The fit infers
+        the same volume from the same inputs, and an input update that would
+        read another is refused (InputReplacementRefused). Returns ``(paths,
+        ScrollSpec)``; raises ScrollSpecError."""
+        spec = scroll.resolve(volume, config.get("spiral_outward_sense"),
+                              lasagna=bool(paths.normal_x or paths.gradient_magnitude))
         umbilicus = write_project_umbilicus(
             Path(paths.output_directory) / "project-inputs", volume,
             scroll.umbilicus(volume))
@@ -1756,7 +1769,8 @@ class ServiceState:
         project = scroll.project
         try:
             volume = self._unprepared_volume(paths, scroll)
-            paths, scroll = self._resolve_session_scroll(scroll, volume, paths)
+            paths, scroll = self._resolve_session_scroll(
+                scroll, volume, paths, self._effective_config(paths, run))
         except ScrollSpecError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, f"Session validation failed: {exc}",
                            [{"field": "project", "message": str(exc)}]) from exc
@@ -1830,13 +1844,23 @@ class ServiceState:
         return build_id
 
     def _prepare_inputs(self, paths, run, scroll, minimum):
-        """object_store_inputs.prepare_position on the bound replica, with the
-        configuration and lasagna normals the build will apply."""
-        from spiral_runtime import merge_session_config
-        config, _, overrides = merge_session_config(
-            paths.checkpoint, run, warn=lambda warning: None)
-        config.update(overrides)
-        return self._prepare_position(config, paths, scroll, minimum, volume=True)
+        """Link and pin the build's position with the configuration it will
+        apply: the fit volume its selection names now resolves the scroll
+        (the link refresh reads normals at its Lasagna scale), then
+        object_store_inputs.prepare_position, which must leave that volume
+        the fit volume. Returns ``(prepared, volume, paths, ScrollSpec)``."""
+        from vc_object_store import ObjectStore
+        from object_store_inputs import read_snapshot, request_from_config
+        config = self._effective_config(paths, run)
+        with ObjectStore.open(self.object_store.path, read_only=True) as store:
+            volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
+        prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
+        if pinned != volume:
+            raise ScrollSpecError(
+                f"the inputs' fit volume changed from {volume} to {pinned} while "
+                "they were linked; retry")
+        return prepared, volume, paths, spec
 
     def _prepare_position(self, config, paths, scroll, minimum, *, volume=False):
         """Link and pin a position for ``config`` on the bound store; with
@@ -1867,9 +1891,9 @@ class ServiceState:
 
     def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum):
         try:
-            prepared, volume = self._prepare_inputs(paths, run, scroll, minimum)
             project = scroll.project
-            paths, scroll = self._resolve_session_scroll(scroll, volume, paths)
+            prepared, volume, paths, scroll = self._prepare_inputs(
+                paths, run, scroll, minimum)
         except BaseException as exc:
             cause = _cause(exc)
             with self.lock:

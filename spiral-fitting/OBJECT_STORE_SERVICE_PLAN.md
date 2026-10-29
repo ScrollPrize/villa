@@ -1328,6 +1328,29 @@ dataset, fiber directions from its fiber-inference dataset, the outer shell
 as a store surface (patch selection must then skip it) and tracks through the
 adapter (the CLI plan's deferred track migration).
 
+Follow-up the same day (API 41):
+
+- Lasagna: VC3D resolves the project's selected Lasagna dataset with its
+  manifest reader (no Python manifest parser) and sends the nx, ny and
+  grad_mag OME-Zarr stores with their shared array name, and per volume the
+  arrays' downsampling relative to it (`source_to_base` x 2^scaledown over
+  the dyadic scale between the volume's and the manifest's base shapes). A
+  remote dataset or multichannel arrays are sent as an error the service
+  reports when the fit needs them. The service resolves the scroll from the
+  fit volume the selection names before linking (the link refresh reads
+  normals at its scale) and refuses a build whose linked inputs then name
+  another. Packed sidecars are still built next to the arrays.
+- Outward sense: the fit setting `spiral_outward_sense` (unset, CW, ACW), a
+  new-fit key, set in the Spiral panel; the volume's catalog orientation
+  decides the sense where known and refuses a disagreeing setting. The CLI
+  applies it to its specification the same way.
+- A service no longer reads `spiral-scroll.json`'s scroll facts or Lasagna
+  layout; its `paths` overrides and `num_windings` still apply.
+- VC3D: the Spiral panel's dead Surface SDT and Scroll/render Zarr rows are
+  gone; line annotation no longer synthesizes a normal manifest from the
+  session's dataset paths (it reads the project's selected dataset, which the
+  session now fits too).
+
 ## Implementation and validation workflow
 
 Keep service and VC3D changes in reviewable patches, with their protocol changes

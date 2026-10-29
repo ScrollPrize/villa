@@ -167,7 +167,16 @@ from surface_orientation import spiral_outward_sense_for
 # optional, may state only what the project does not know, and must not
 # contradict it. /dataset no longer resolves an umbilicus; session_request
 # gains "project" (name, volume, facts, umbilicus identity) and "scroll".
-API_VERSION = 40
+# 41: the project's Lasagna dataset and the outward sense. The project block
+# carries "lasagna" ({location, group, normal_x, normal_y, gradient_magnitude}
+# stores, or {location, error}) and each volume its "lasagna_scale"; the
+# session's Lasagna stores, group and scale are the project's, and /dataset no
+# longer resolves them. The fit setting spiral_outward_sense gives the sense
+# where the fit volume's orientation does not (and must agree where it does).
+# A service no longer reads spiral-scroll.json's scroll facts or Lasagna
+# layout (they are the command-line fit's); its path overrides and
+# num_windings still apply.
+API_VERSION = 41
 
 
 class SessionState(str, Enum):
@@ -481,8 +490,9 @@ class SpiralDatasetResolution:
     warnings: list[str] = field(default_factory=list)
     # The fields spiral-scroll.json states (load_dataset_scroll_fields; path
     # overrides as a mapping), {} without one; None when it is invalid, which
-    # is a missing_required condition ("scroll_spec"). The session's scroll
-    # completes them with the project's facts (SessionScroll).
+    # is a missing_required condition ("scroll_spec"). A service session uses
+    # its path overrides and num_windings; its scroll is the project's
+    # (SessionScroll).
     scroll_spec: dict[str, Any] | None = None
 
     @property
@@ -670,22 +680,32 @@ def _scroll_spec_fields(document: Any, dataset_root: str | os.PathLike[str],
     return fields
 
 
-def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str) -> ScrollSpec:
+def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str, *,
+                             outward_sense: str | None = None) -> ScrollSpec:
     """Require the physical facts in ``fields`` and freeze them: the outward
-    sense is the catalog properties' when both are known (an explicit one must
-    agree), else it must be given."""
+    sense is the catalog properties' when both are known (a stated one, or the
+    configured ``outward_sense`` fit setting, must agree), else the stated or
+    configured one (which must agree with each other)."""
     catalog = {key: fields.get(key)
                for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates")}
     catalog_sense = (
         spiral_outward_sense_for(**catalog)
         if None not in catalog.values() else None)
     required = ["name", "voxel_size_um"]
-    if catalog_sense is None:
+    if catalog_sense is None and outward_sense is None:
         required.append("spiral_outward_sense")
     missing = sorted(key for key in required if key not in fields)
     if missing:
-        raise ScrollSpecError(f"{source}: missing required keys: {missing}")
-    sense = fields.get("spiral_outward_sense", catalog_sense)
+        raise ScrollSpecError(
+            f"{source}: missing required keys: {missing}"
+            + (" (or set the fit setting spiral_outward_sense)"
+               if "spiral_outward_sense" in missing else ""))
+    stated = fields.get("spiral_outward_sense")
+    if stated is not None and outward_sense is not None and stated != outward_sense:
+        raise ScrollSpecError(
+            f"{source}: spiral_outward_sense {stated} contradicts the fit setting "
+            f"spiral_outward_sense {outward_sense}")
+    sense = stated or outward_sense or catalog_sense
     if sense not in ("CW", "ACW"):
         raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
     if catalog_sense is not None and sense != catalog_sense:
@@ -712,11 +732,14 @@ def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str) -> ScrollSp
 
 
 def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
-                      *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
+                      *, source: str = SCROLL_SPEC_FILENAME,
+                      outward_sense: str | None = None) -> ScrollSpec:
     """Validate known spiral-scroll.json fields and freeze them; the file
-    must state every physical fact (``_scroll_spec_from_fields``)."""
+    must state every physical fact except an outward sense the fit setting
+    ``outward_sense`` gives (``_scroll_spec_from_fields``)."""
     return _scroll_spec_from_fields(
-        _scroll_spec_fields(document, dataset_root, source), source)
+        _scroll_spec_fields(document, dataset_root, source), source,
+        outward_sense=outward_sense)
 
 
 def _read_scroll_spec_document(path: Path) -> Any:
@@ -728,7 +751,8 @@ def _read_scroll_spec_document(path: Path) -> Any:
 
 
 def load_scroll_spec(dataset_root: str | os.PathLike[str],
-                     spec_path: str | os.PathLike[str] | None = None) -> ScrollSpec:
+                     spec_path: str | os.PathLike[str] | None = None,
+                     *, outward_sense: str | None = None) -> ScrollSpec:
     """Load the scroll specification for a dataset.
 
     Discovers the single conventional file <dataset_root>/spiral-scroll.json
@@ -753,14 +777,15 @@ def load_scroll_spec(dataset_root: str | os.PathLike[str],
             "non-conventional path overrides).")
     return parse_scroll_spec(_read_scroll_spec_document(path),
                              root if root is not None else path.parent,
-                             source=str(path))
+                             source=str(path), outward_sense=outward_sense)
 
 
 def load_dataset_scroll_fields(dataset_root: str | os.PathLike[str]) -> tuple[dict[str, Any], str]:
     """A service dataset's spiral-scroll.json fields and the file, or ``({},
-    "")`` when it has none: in a service session the project supplies the
-    physical facts it can (``SessionScroll``), so the file is optional and may
-    state only the rest. An invalid file raises ScrollSpecError."""
+    "")`` when it has none. The file is optional there: a service uses only
+    its path overrides and num_windings (the scroll's facts and the Lasagna
+    stores are the project's, ``SessionScroll``), and its other fields are the
+    command-line fit's. An invalid file raises ScrollSpecError."""
     root = Path(_normalise_path(dataset_root))
     path = root / SCROLL_SPEC_FILENAME
     if not path.is_file():
@@ -777,8 +802,13 @@ def load_dataset_scroll_fields(dataset_root: str | os.PathLike[str]) -> tuple[di
 # full-resolution shape, say).
 PROJECT_VOLUME_FACTS = ("voxel_size_um", "base_shape_zyx",
                         "z_direction_is_top_to_bottom", "left_handed_coordinates")
-# Fit inputs a service session reads from the project instead of the dataset.
-PROJECT_INPUT_KEYS = ("umbilicus",)
+# The project's Lasagna stores, by fit input.
+PROJECT_LASAGNA_INPUTS = ("normal_x", "normal_y", "gradient_magnitude")
+# Fit inputs a service session reads from the project instead of the dataset:
+# the Lasagna stores, and the fit volume's umbilicus once the build knows the
+# volume (VOLUME_INPUT_KEYS).
+VOLUME_INPUT_KEYS = ("umbilicus",)
+PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
 
 
 @dataclass(frozen=True)
@@ -800,26 +830,52 @@ class ProjectUmbilicus:
 
 
 @dataclass(frozen=True)
+class ProjectLasagna:
+    """The project's selected Lasagna dataset as the fit reads it: its
+    manifest, the OME-Zarr stores of its nx, ny and grad_mag channels and the
+    array (pyramid group) of each that the dataset declares; ``error`` says
+    why the fit cannot read it (a remote or multichannel dataset)."""
+
+    location: str = ""
+    stores: Mapping[str, str] = field(default_factory=dict)  # PROJECT_LASAGNA_INPUTS
+    group: str = ""
+    error: str = ""
+
+    def manifest(self) -> dict[str, Any]:
+        result = {"location": self.location, "group": self.group,
+                  **dict(sorted(self.stores.items()))}
+        if self.error:
+            result["error"] = self.error
+        return result
+
+    to_mapping = manifest
+
+
+@dataclass(frozen=True)
 class ProjectVolume:
     """What the project knows of one volume; None where it does not know it
-    exactly."""
+    exactly. ``lasagna_scale`` is the project's Lasagna arrays' downsampling
+    relative to this volume's voxels."""
 
     voxel_size_um: float | None = None
     base_shape_zyx: tuple[int, int, int] | None = None
     z_direction_is_top_to_bottom: bool | None = None
     left_handed_coordinates: bool | None = None
+    lasagna_scale: int | None = None
     umbilicus: ProjectUmbilicus | None = None
 
+    def _facts(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in (*PROJECT_VOLUME_FACTS, "lasagna_scale")
+                if getattr(self, key) is not None}
+
     def manifest(self) -> dict[str, Any]:
-        result = {key: getattr(self, key) for key in PROJECT_VOLUME_FACTS
-                  if getattr(self, key) is not None}
+        result = self._facts()
         if self.umbilicus is not None:
             result["umbilicus"] = self.umbilicus.manifest()
         return result
 
     def to_mapping(self) -> dict[str, Any]:
-        result = {key: getattr(self, key) for key in PROJECT_VOLUME_FACTS
-                  if getattr(self, key) is not None}
+        result = self._facts()
         if self.umbilicus is not None:
             result["umbilicus"] = self.umbilicus.to_mapping()
         return result
@@ -829,12 +885,13 @@ class ProjectVolume:
 class SpiralProject:
     """The VC3D project a service session fits. Its file is VC3D's and need
     not be readable by the service, so VC3D sends what the fit reads of it:
-    the project's name and, per volume (keyed by the store volume its
-    annotations are kept in, vc::project::AnnotationVolume), the facts it knows
-    and its umbilicus."""
+    the project's name, its selected Lasagna dataset and, per volume (keyed by
+    the store volume its annotations are kept in,
+    vc::project::AnnotationVolume), the facts it knows and its umbilicus."""
 
     name: str
     volumes: Mapping[str, ProjectVolume]
+    lasagna: ProjectLasagna | None = None
 
     @classmethod
     def from_mapping(cls, value: Any) -> "SpiralProject":
@@ -859,22 +916,58 @@ class SpiralProject:
             for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
                 if entry.get(key) is not None:
                     facts[key] = _checked_flag(entry[key], key, source)
+            if entry.get("lasagna_scale") is not None:
+                scale = entry["lasagna_scale"]
+                if type(scale) is not int or scale <= 0:
+                    raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
+                facts["lasagna_scale"] = scale
             umbilicus = entry.get("umbilicus")
             if umbilicus is not None:
                 facts["umbilicus"] = _checked_umbilicus(umbilicus, source)
             volumes[str(uuid)] = ProjectVolume(**facts)
-        return cls(name=name, volumes=volumes)
+        return cls(name=name, volumes=volumes,
+                   lasagna=_checked_lasagna(value.get("lasagna")))
 
     def to_mapping(self) -> dict[str, Any]:
         """The request block ``from_mapping`` reads."""
-        return {"name": self.name,
-                "volumes": {uuid: volume.to_mapping()
-                            for uuid, volume in sorted(self.volumes.items())}}
+        result = {"name": self.name,
+                  "volumes": {uuid: volume.to_mapping()
+                              for uuid, volume in sorted(self.volumes.items())}}
+        if self.lasagna is not None:
+            result["lasagna"] = self.lasagna.to_mapping()
+        return result
 
     def record(self, volume_uuid: str) -> dict[str, Any]:
         """What a session fitting ``volume_uuid`` records of the project."""
-        return {"name": self.name, "volume": volume_uuid,
-                **self.volumes[volume_uuid].manifest()}
+        result = {"name": self.name, "volume": volume_uuid,
+                  **self.volumes[volume_uuid].manifest()}
+        if self.lasagna is not None:
+            result["lasagna"] = self.lasagna.manifest()
+        return result
+
+    def lasagna_error(self) -> str:
+        """Why the fit cannot read Lasagna stores from this project."""
+        if self.lasagna is None:
+            return (f"the project {self.name!r} selects no Lasagna dataset: attach "
+                    "one and select it")
+        return self.lasagna.error
+
+
+def _checked_lasagna(value: Any) -> ProjectLasagna | None:
+    if value is None:
+        return None
+    source = "project lasagna"
+    if not isinstance(value, Mapping):
+        raise ScrollSpecError(f"{source} must be an object")
+    if value.get("error"):
+        return ProjectLasagna(location=str(value.get("location") or ""),
+                              error=str(value["error"]))
+    stores = {key: str(value[key]) for key in PROJECT_LASAGNA_INPUTS if value.get(key)}
+    group = str(value.get("group") or "")
+    if not stores or not group:
+        raise ScrollSpecError(f"{source} needs its stores and their array group")
+    return ProjectLasagna(location=str(value.get("location") or ""), stores=stores,
+                          group=group)
 
 
 def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
@@ -897,31 +990,14 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
     return ProjectUmbilicus(uuid=uuid, revision=revision, points_zyx=points)
 
 
-def _same_fact(stated: Any, known: Any) -> bool:
-    if isinstance(known, float):
-        return math.isclose(float(stated), known, rel_tol=1e-6)
-    return stated == known
-
-
 @dataclass(frozen=True)
 class SessionScroll:
     """A service session's scroll before its fit volume is known: the
-    project's facts and the dataset's optional spiral-scroll.json fields.
-    ``resolve`` completes it once the inputs name the fit volume."""
+    project's. ``resolve`` completes it once the inputs name the fit volume.
+    The dataset's spiral-scroll.json states the command-line fit's scroll; a
+    service session does not read its facts or Lasagna layout."""
 
     project: SpiralProject
-    spec_fields: Mapping[str, Any] = field(default_factory=dict)
-    spec_source: str = ""
-
-    # The packed Lasagna inputs remain the dataset's, so their layout is the
-    # dataset's specification's (or the default).
-    @property
-    def normal_zarr_group(self) -> str:
-        return str(self.spec_fields.get("normal_zarr_group", "4"))
-
-    @property
-    def lasagna_scale(self) -> int:
-        return int(self.spec_fields.get("lasagna_scale", 4))
 
     def volume(self, volume_uuid: str) -> ProjectVolume:
         try:
@@ -931,31 +1007,33 @@ class SessionScroll:
                 f"the fit volume {volume_uuid} is not a volume of the project "
                 f"{self.project.name!r}: attach it to the project") from None
 
-    def resolve(self, volume_uuid: str) -> ScrollSpec:
-        """The scroll of a fit of ``volume_uuid``: the project volume's facts,
-        the specification's where the project does not know them (a
-        specification stating one differently is refused, not overruled),
-        and the project's name. The umbilicus is the project's, in the fit
-        volume's own voxels."""
+    def resolve(self, volume_uuid: str, outward_sense: str | None = None,
+                *, lasagna: bool = False) -> ScrollSpec:
+        """The scroll of a fit of ``volume_uuid``: the project volume's facts
+        and the project's name, with the configured ``outward_sense`` (the fit
+        setting spiral_outward_sense) where the volume's orientation does not
+        decide it. With ``lasagna`` (the fit reads the Lasagna stores) the
+        project's Lasagna dataset gives the array group and the volume its
+        scale. The umbilicus is the project's, in the fit volume's own
+        voxels."""
         volume = self.volume(volume_uuid)
-        fields = dict(self.spec_fields)
-        for key in PROJECT_VOLUME_FACTS:
-            known = getattr(volume, key)
-            if known is None:
-                continue
-            stated = fields.get(key)
-            if stated is not None and not _same_fact(stated, known):
-                raise ScrollSpecError(
-                    f"{self.spec_source} states {key} {stated!r}, but the project's "
-                    f"volume {volume_uuid} has {known!r}; remove it from "
-                    f"{SCROLL_SPEC_FILENAME}")
-            fields[key] = known
+        fields = {key: getattr(volume, key) for key in PROJECT_VOLUME_FACTS
+                  if getattr(volume, key) is not None}
         fields["name"] = self.project.name
         fields["umbilicus_coordinate_scale"] = 1.0
-        source = f"project {self.project.name!r} (volume {volume_uuid})"
-        if self.spec_source:
-            source += f" with {self.spec_source}"
-        return _scroll_spec_from_fields(fields, source)
+        if lasagna:
+            if error := self.project.lasagna_error():
+                raise ScrollSpecError(error)
+            if volume.lasagna_scale is None:
+                raise ScrollSpecError(
+                    f"the project's Lasagna dataset {self.project.lasagna.location} "
+                    f"has no scale relative to the fit volume {volume_uuid} (neither "
+                    "it nor the volume declares its full-resolution shape)")
+            fields["normal_zarr_group"] = self.project.lasagna.group
+            fields["lasagna_scale"] = volume.lasagna_scale
+        return _scroll_spec_from_fields(
+            fields, f"project {self.project.name!r} (volume {volume_uuid})",
+            outward_sense=outward_sense)
 
     def umbilicus(self, volume_uuid: str) -> ProjectUmbilicus:
         umbilicus = self.volume(volume_uuid).umbilicus

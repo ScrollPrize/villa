@@ -565,31 +565,57 @@ def test_the_build_reads_the_project_of_its_fit_volume(dataset, store):
     from umbilicus import json_umbilicus_z_to_yx
     assert Path(paths.umbilicus).parent == dataset.output / 'project-inputs'
     assert json_umbilicus_z_to_yx(paths.umbilicus)(32.0).tolist() == [32.0, 32.0]
-    assert scroll.name == 's1' and scroll.voxel_size_um == 9.6
+    assert (scroll.name, scroll.voxel_size_um, scroll.spiral_outward_sense) == (
+        's1', 9.6, 'CW')
     request = state.session_request
     assert request['project'] == {
-        'name': 's1', 'volume': VOLUME,
+        'name': 's1', 'volume': VOLUME, 'voxel_size_um': 9.6,
+        'z_direction_is_top_to_bottom': False, 'left_handed_coordinates': False,
         'umbilicus': {'uuid': UMBILICUS['uuid'], 'revision': UMBILICUS['revision'],
                       'points': 2}}
     assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
 
 
-def test_project_facts_complete_the_dataset_and_may_not_contradict_it(dataset, store):
-    # Without a specification the project's facts make the scroll: the
-    # catalog orientation gives the outward sense.
-    (dataset.root / 'spiral-scroll.json').unlink()
+def test_the_scroll_is_the_projects_and_the_sense_a_fit_setting(dataset, store):
+    # The dataset's specification is the command-line fit's: a service
+    # session neither reads its facts nor needs the file.
+    (dataset.root / 'spiral-scroll.json').write_text(json.dumps({
+        'schema_version': 1, 'name': 'cli', 'voxel_size_um': 1.0,
+        'spiral_outward_sense': 'ACW'}))
     facts = {'voxel_size_um': 7.91, 'base_shape_zyx': [100, 64, 64],
-             'z_direction_is_top_to_bottom': True, 'left_handed_coordinates': False}
-    _, scroll = _built(service(dataset, store),
-                       initialize_body() | {'project': project(name='PHerc', **facts)})
+             'z_direction_is_top_to_bottom': None, 'left_handed_coordinates': None}
+    body = initialize_body() | {'project': project(name='PHerc', **facts)}
+    failure = _built(service(dataset, store), body)
+    assert 'set the fit setting spiral_outward_sense' in failure['message']
+    body['run']['config']['spiral_outward_sense'] = 'ACW'
+    _, scroll = _built(service(dataset, store), body)
     assert (scroll.name, scroll.voxel_size_um, scroll.base_shape_zyx,
             scroll.spiral_outward_sense) == ('PHerc', 7.91, (100, 64, 64), 'ACW')
-    # A specification stating a fact differently is refused, not overruled.
-    (dataset.root / 'spiral-scroll.json').write_text(json.dumps({
-        'schema_version': 1, 'voxel_size_um': 9.6}))
-    failure = _built(service(dataset, store),
-                     initialize_body() | {'project': project(**facts)})
-    assert 'states voxel_size_um 9.6' in failure['message']
+    # A volume whose catalog orientation decides the sense refuses another.
+    failure = _built(service(dataset, store), initialize_body() | {
+        'run': {**body['run'], 'config': {**body['run']['config'],
+                                          'spiral_outward_sense': 'ACW'}}})
+    assert 'contradicts the catalog' in failure['message']
+
+
+def test_the_lasagna_stores_are_the_projects(dataset, store, tmp_path):
+    lasagna = {'location': str(tmp_path / 'p.lasagna.json'), 'group': '3'}
+    for key in ('normal_x', 'normal_y', 'gradient_magnitude'):
+        (tmp_path / key).mkdir()
+        lasagna[key] = str(tmp_path / key)
+    body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
+    paths, scroll = _built(service(dataset, store), body)
+    assert (paths.normal_x, paths.gradient_magnitude) == (
+        lasagna['normal_x'], lasagna['gradient_magnitude'])
+    assert (scroll.normal_zarr_group, scroll.lasagna_scale) == ('3', 2)
+    # A fit that needs normals the project cannot give is refused before
+    # anything is linked.
+    body = initialize_body()
+    body['run']['config']['loss_weight_dense_normals'] = 1.0
+    with pytest.raises(ApiError) as refused:
+        service(dataset, store).initialize(body)
+    assert {(detail['field'], 'selects no Lasagna dataset' in detail['message'])
+            for detail in refused.value.details} == {('normal_x', True), ('normal_y', True)}
 
 
 def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(dataset, store):

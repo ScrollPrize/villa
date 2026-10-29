@@ -204,11 +204,15 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
     return state.session
 
 
+_PROJECT = SpiralProject.from_mapping(project())
+
+
 def _publish_request(state, request):
     """Make ``request`` the live session request, as a build publishes it:
     prepared, then resolved for the project's volume."""
     paths, run, preview, scroll = state._prepare_session_request(with_project(request))
-    paths, spec = state._resolve_session_scroll(scroll, VOLUME, paths)
+    paths, spec = state._resolve_session_scroll(
+        scroll, VOLUME, paths, state._effective_config(paths, run))
     state.session_paths = paths
     state.session_request = {
         "paths": paths.manifest(), "run": run.manifest(),
@@ -1028,7 +1032,7 @@ class DatasetOwnershipTests(unittest.TestCase):
     def test_dataset_request_filters_resolved_paths_with_input_toggles(self):
         request = self.state._dataset_session_request({
             "run": {"z_begin": 0, "z_end": 10},
-        })
+        }, _PROJECT)
         # Patches, fibers and PCLs come from the object store, never from
         # dataset paths.
         self.assertFalse({"verified_patches", "fibers", "pcls"} & set(request["paths"]))
@@ -1038,7 +1042,7 @@ class DatasetOwnershipTests(unittest.TestCase):
             "run": {"z_begin": 0, "z_end": 10, "config": {
                 "input_use_tracks": False,
             }},
-        })
+        }, _PROJECT)
         self.assertEqual(disabled["paths"]["tracks_dbm"], "")
 
     def test_omitted_spacing_mode_preserves_default_winding_input(self):
@@ -1094,7 +1098,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         request, input_config = self.state._dataset_session_request({
             "paths": {"checkpoint": str(checkpoint)},
             "run": {"z_begin": 0, "z_end": 10, "config": {}},
-        }, include_input_config=True)
+        }, _PROJECT, include_input_config=True)
 
         self.assertEqual(request["paths"]["winding_inference"], str(winding))
         self.assertEqual(request["paths"]["outer_shell"], str(shell))
@@ -2158,7 +2162,7 @@ class CheckpointUploadTests(unittest.TestCase):
         # dataset-mode load validation accepts it as a resume checkpoint.
         request = self.state._dataset_session_request(
             {"paths": {"checkpoint": str(published)},
-             "run": {"z_begin": 0, "z_end": 10}})
+             "run": {"z_begin": 0, "z_end": 10}}, _PROJECT)
         self.assertEqual(request["paths"]["checkpoint"], str(published))
         # Checkpoint uploads are not session inputs: nothing ephemeral listed.
         self.assertNotIn("ephemeral_inputs", self.state.status())

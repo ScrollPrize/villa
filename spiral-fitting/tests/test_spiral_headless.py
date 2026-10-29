@@ -15,8 +15,7 @@ import torch
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA,
                          ScrollSpecError, SessionScroll, SessionState,
-                         SpiralInputPaths, SpiralProject,
-                         load_dataset_scroll_fields, load_scroll_spec,
+                         SpiralInputPaths, SpiralProject, load_scroll_spec,
                          resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 import spiral_runtime
@@ -153,53 +152,76 @@ class ScrollSpecTests(unittest.TestCase):
 
 class ProjectScrollTests(unittest.TestCase):
     UMBILICUS = {"uuid": "u", "revision": "r", "points_zyx": [[0, 1, 2], [10, 1, 2]]}
+    LASAGNA = {"location": "/d/p.lasagna.json", "group": "4",
+               "normal_x": "/d/nx.ome.zarr", "normal_y": "/d/ny.ome.zarr"}
 
-    def scroll(self, spec=None, **facts):
-        with tempfile.TemporaryDirectory() as temporary:
-            if spec is not None:
-                (Path(temporary) / "spiral-scroll.json").write_text(
-                    json.dumps({"schema_version": 1, **spec}))
-            fields, source = load_dataset_scroll_fields(temporary)
-        project = SpiralProject.from_mapping({"name": "p", "volumes": {
-            "v": {**facts, "umbilicus": self.UMBILICUS}}})
-        return SessionScroll(project, fields, source)
+    def scroll(self, lasagna=None, **facts):
+        block = {"name": "p", "volumes": {"v": {**facts, "umbilicus": self.UMBILICUS}}}
+        if lasagna is not None:
+            block["lasagna"] = lasagna
+        return SessionScroll(SpiralProject.from_mapping(block))
 
     def test_the_project_round_trips_and_rejects_malformed_blocks(self):
-        project = SpiralProject.from_mapping({"name": "p", "volumes": {
-            "v": {"voxel_size_um": 2.0, "umbilicus": self.UMBILICUS}}})
+        project = SpiralProject.from_mapping({
+            "name": "p", "lasagna": self.LASAGNA,
+            "volumes": {"v": {"voxel_size_um": 2.0, "lasagna_scale": 4,
+                              "umbilicus": self.UMBILICUS}}})
         self.assertEqual(SpiralProject.from_mapping(project.to_mapping()), project)
         for block, message in (
                 ({"volumes": {}}, "project.name"),
                 ({"name": "p", "volumes": []}, "keyed by volume"),
                 ({"name": "p", "volumes": {"v": {"voxel_size_um": -1}}}, "positive"),
+                ({"name": "p", "volumes": {"v": {"lasagna_scale": 0.5}}}, "positive integer"),
+                ({"name": "p", "volumes": {}, "lasagna": {"location": "x"}}, "stores"),
                 ({"name": "p", "volumes": {"v": {"umbilicus": {
                     **self.UMBILICUS, "points_zyx": [[0, 1, 2]]}}}}, "two or more")):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ScrollSpecError, message):
                     SpiralProject.from_mapping(block)
 
-    def test_the_project_completes_a_partial_specification(self):
-        # The specification states only what the project does not know.
-        scroll = self.scroll({"spiral_outward_sense": "ACW", "lasagna_scale": 2},
-                             voxel_size_um=3.0).resolve("v")
+    def test_the_scroll_is_the_project_volumes_and_the_sense_setting(self):
+        # The catalog orientation decides the sense; a setting must agree.
+        oriented = self.scroll(voxel_size_um=3.0, z_direction_is_top_to_bottom=True,
+                               left_handed_coordinates=False)
+        scroll = oriented.resolve("v")
         self.assertEqual((scroll.name, scroll.voxel_size_um, scroll.spiral_outward_sense,
-                          scroll.lasagna_scale, scroll.umbilicus_coordinate_scale),
-                         ("p", 3.0, "ACW", 2, 1.0))
-        # Agreeing statements are fine; differing ones are refused.
-        self.scroll({"voxel_size_um": 3.0, "spiral_outward_sense": "CW"},
-                    voxel_size_um=3.0).resolve("v")
-        with self.assertRaisesRegex(ScrollSpecError, "states voxel_size_um"):
-            self.scroll({"voxel_size_um": 4.0, "spiral_outward_sense": "CW"},
-                        voxel_size_um=3.0).resolve("v")
-        # The project's catalog orientation decides the sense, against an
-        # explicit one too.
+                          scroll.umbilicus_coordinate_scale), ("p", 3.0, "ACW", 1.0))
+        self.assertEqual(oriented.resolve("v", "ACW").spiral_outward_sense, "ACW")
         with self.assertRaisesRegex(ScrollSpecError, "contradicts the catalog"):
-            self.scroll({"spiral_outward_sense": "CW"}, voxel_size_um=3.0,
-                        z_direction_is_top_to_bottom=True,
-                        left_handed_coordinates=False).resolve("v")
-        # What neither knows is missing.
-        with self.assertRaisesRegex(ScrollSpecError, "spiral_outward_sense"):
-            self.scroll(voxel_size_um=3.0).resolve("v")
+            oriented.resolve("v", "CW")
+        # Without an orientation the setting gives it, and must be set.
+        bare = self.scroll(voxel_size_um=3.0)
+        self.assertEqual(bare.resolve("v", "CW").spiral_outward_sense, "CW")
+        with self.assertRaisesRegex(ScrollSpecError, "set the fit setting spiral_outward_sense"):
+            bare.resolve("v")
+        with self.assertRaisesRegex(ScrollSpecError, "voxel_size_um"):
+            self.scroll().resolve("v", "CW")
+        with self.assertRaisesRegex(ScrollSpecError, "not a volume of the project"):
+            bare.resolve("w", "CW")
+
+    def test_a_fit_reading_lasagna_takes_the_projects_group_and_the_volumes_scale(self):
+        scroll = self.scroll(self.LASAGNA, voxel_size_um=3.0, lasagna_scale=8).resolve(
+            "v", "CW", lasagna=True)
+        self.assertEqual((scroll.normal_zarr_group, scroll.lasagna_scale), ("4", 8))
+        with self.assertRaisesRegex(ScrollSpecError, "no scale relative to the fit volume"):
+            self.scroll(self.LASAGNA, voxel_size_um=3.0).resolve("v", "CW", lasagna=True)
+        with self.assertRaisesRegex(ScrollSpecError, "selects no Lasagna dataset"):
+            self.scroll(voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
+        with self.assertRaisesRegex(ScrollSpecError, "remote"):
+            self.scroll({"location": "s3://b/p.lasagna.json", "error": "remote"},
+                        voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
+
+    def test_the_cli_takes_the_sense_setting_where_its_spec_does_not_decide(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
+                "schema_version": 1, "name": "s", "voxel_size_um": 2.0}))
+            self.assertEqual(load_scroll_spec(temporary, outward_sense="ACW")
+                             .spiral_outward_sense, "ACW")
+            with self.assertRaisesRegex(ScrollSpecError, "spiral_outward_sense"):
+                load_scroll_spec(temporary)
+            write_scroll_spec(temporary)  # states CW
+            with self.assertRaisesRegex(ScrollSpecError, "contradicts the fit setting"):
+                load_scroll_spec(temporary, outward_sense="ACW")
 
 
 class DatasetResolverTests(unittest.TestCase):
