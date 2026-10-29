@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace vc3d::fibers3d
@@ -20,7 +21,7 @@ using Point = std::array<double, 3>;
 struct Bounds {
     Point lower{}, upper{};
 };
-enum class Source { Annotation, Automated };
+enum class Source { Annotation, Store };
 enum class SpanStyle { Solid, Gap, InferredGap, Damaged };
 enum class MarkerKind { ControlPoint, Break, KollesisTermination };
 struct Marker {
@@ -35,8 +36,8 @@ struct Run {
     std::vector<SpanStyle> styles;
 };
 struct Fiber {
-    // AFV UUID + fiber ID, or annotation:<runtime ID> in the loaded project.
-    // The panel clears native selection when the project changes.
+    std::string objectUuid;
+    // Store UUID + object UUID; live Line Annotation has its own scene key.
     QString key, label, fileName;
     uint64_t id = 0;
     Source source = Source::Annotation;

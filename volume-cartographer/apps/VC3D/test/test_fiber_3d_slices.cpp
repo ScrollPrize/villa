@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DSlices.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "../../../core/test/support/TestZarrVolume.hpp"
 #include <QTemporaryDir>
 #include <QTest>
 #include <cmath>
@@ -19,18 +20,17 @@ private slots:
     void ctSamplesFollowWorldPlanesAndMaskVolumeEdges()
     {
         QTemporaryDir directory;
-        Volume::ZarrCreateOptions options;
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {16, 16, 16};
-        options.compressor = "none";
         options.numLevels = 2;
-        auto volume = Volume::New(directory.path().toStdString(), options);
+        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
         Array3D<uint8_t> data({32, 32, 32});
         for (int z = 0; z < 32; ++z)
             for (int y = 0; y < 32; ++y)
                 for (int x = 0; x < 32; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + 3 * z);
-        volume->writeZYX(data, {0, 0, 0});
+        vc::test::writeZYX(*volume, data, {0, 0, 0});
         for (const auto& p : std::vector<
                  slices::Plane>{{0, {8, 8, 8}, {8, 0, 0}, {0, 8, 0}, 9, 9}, {1, {8, 8, 8}, {8, 0, 0}, {0, 0, 8}, 9, 9}, {2, {8, 8, 8}, {0, 8, 0}, {0, 0, 8}, 9, 9}, {0, {8, 8, 8}, {8, 0, 4}, {0, 8, 0}, 9, 9}}) {
             auto image = slices::sample(p, *volume);
@@ -66,17 +66,16 @@ private slots:
     void volumetricSamplesKeepThicknessAndReverseDirection()
     {
         QTemporaryDir directory;
-        Volume::ZarrCreateOptions options;
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {16, 16, 16};
-        options.compressor = "none";
-        auto volume = Volume::New(directory.path().toStdString(), options);
+        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
         Array3D<uint8_t> data({32, 32, 32});
         for (int z = 0; z < 32; ++z)
             for (int y = 0; y < 32; ++y)
                 for (int x = 0; x < 32; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + 3 * z);
-        volume->writeZYX(data, {0, 0, 0});
+        vc::test::writeZYX(*volume, data, {0, 0, 0});
         slices::Plane p{0, {8, 8, 12}, {8, 0, 0}, {0, 8, 0}, 9, 9, true, {0, 0, 1}, 3, 2};
         auto image = slices::sample(p, *volume);
         QVERIFY(image->slab.has_value());

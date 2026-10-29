@@ -264,7 +264,7 @@ struct Fiber3DRibbonControls::Impl {
     }
     void start()
     {
-        if (busy || !pending || !fiber())
+        if (busy || !pending || !fiber() || !state->currentVolume())
             return;
         pending = false;
         busy = true;
@@ -273,20 +273,19 @@ struct Fiber3DRibbonControls::Impl {
         const auto volume = state->currentVolume();
         const Fiber selected = *fiber();
         const auto clip = scene->clipBounds;
-        const auto source = automated->sourceDescriptor();
+        std::optional<StoreSource> source;
+        if (state->storeFor("fiber") && state->annotationVolume())
+            source = StoreSource{
+                state->objectStoreSession(), *state->storeFor("fiber"), *state->annotationVolume(), volume->voxelSize() / 1000.0, selected.objectUuid};
         const auto cachedFrames = frames;
         const auto surfaceFactory = canonicalSurface;
-        std::optional<LineAnnotationController::FiberMapSnapshot> annotationSource;
-        if (!cachedFrames && clip && selected.source == Source::Annotation)
-            annotationSource = annotations->fiberMapSnapshot(false, selected.id);
         const auto previousWarning = warning;
         const auto centerReference = annotations->displayCenterReference();
         const int w = width->value(), angle = rotation->value(), level = requestedLevel;
         chunksReady->store(false);
         opendata::LasagnaResolutionSnapshot normalSource;
         if (const auto pkg = state->vpkg())
-            normalSource =
-                {pkg->path(), pkg->lasagnaDatasetEntries(), pkg->selectedLasagnaDataset(), pkg->volumeTags(state->currentVolumeId()), volume->shape()};
+            normalSource = opendata::snapshotLasagnaForVolume(*pkg, state->currentVolumeId());
         watcher.setFuture(QtConcurrent::run([=] {
             Result result;
             try {
@@ -296,37 +295,13 @@ struct Fiber3DRibbonControls::Impl {
                     result.frames = std::make_shared<ribbon::Frames>(surfaceFactory(token.get()));
                 if (!result.frames) {
                     Fiber complete = selected;
-                    if (clip && selected.source == Source::Automated && source) {
-                        const auto shape = volume->shapeXyz();
-                        AutomatedSource
-                            fullSource{source->path, source->uuid, source->nativeToViewer, source->nativeVoxelMm, Bounds{{0, 0, 0}, {double(shape[0] - 1), double(shape[1] - 1), double(shape[2] - 1)}}};
+                    if (!selected.objectUuid.empty() && source) {
                         QueryOptions options;
                         options.maximumFibers = 1;
                         options.selectedKey = selected.key;
-                        const auto full = loadAutomated(fullSource, options, token.get());
-                        if (full.fibers.empty() || full.fibers.front().key != selected.key)
-                            throw std::runtime_error("Cannot load the complete fiber for its Line Annotation surface");
-                        complete = full.fibers.front();
-                        vc::fibers::FiberCollection reader(source->path.toStdString());
-                        const auto expected = reader.summary(int64_t(selected.id)).pointCount;
-                        std::sort(complete.runs.begin(), complete.runs.end(), [](const auto& a, const auto& b) {
-                            return a.firstPoint < b.firstPoint;
-                        });
-                        int64_t next = 0;
-                        for (const auto& run : complete.runs) {
-                            if (run.firstPoint != next || run.points.size() < 2)
-                                throw std::runtime_error("Incomplete selected fiber geometry");
-                            next += int64_t(run.points.size()) - 1;
-                        }
-                        if (next + 1 != expected)
-                            throw std::runtime_error("Incomplete selected fiber geometry");
-                    }
-                    if (annotationSource) {
-                        QueryOptions options;
-                        options.maximumFibers = 1;
-                        const auto full = loadAnnotations(*annotationSource, {}, options, token.get());
+                        const auto full = loadStore(*source, options, token.get());
                         if (!full.complete || full.fibers.size() != 1 || full.fibers.front().key != selected.key)
-                            throw std::runtime_error("Cannot load the complete annotation for its Line Annotation surface");
+                            throw std::runtime_error("Cannot load the complete fiber for its Line Annotation surface");
                         complete = full.fibers.front();
                     }
                     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;

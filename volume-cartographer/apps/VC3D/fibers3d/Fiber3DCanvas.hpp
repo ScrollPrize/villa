@@ -20,7 +20,7 @@ struct Mesh;
 }
 
 // Reusable display-only view. Loading, selection ownership and CT navigation
-// belong to the controller; orbiting never reads the AFV again.
+// belong to the controller; orbiting never reads the store again.
 class Fiber3DCanvas : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core
 {
     Q_OBJECT

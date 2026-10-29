@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Fiber3DScene.hpp"
-#include "vc/core/types/FiberCollection.hpp"
+#include "vc/core/types/FiberView.hpp"
 #include <algorithm>
 #include <cmath>
 #include <utility>

@@ -182,7 +182,6 @@ public:
         QString label;
         char hvTag = '?';
         std::vector<cv::Vec3d> controlPoints;
-        std::vector<std::optional<cv::Vec3d>> displayNormals, controlDirections;
         std::vector<cv::Vec3d> linePoints;
         // Per control-point span; size max(0, controlPoints.size() - 1).
         std::vector<bool> tracedSegments;

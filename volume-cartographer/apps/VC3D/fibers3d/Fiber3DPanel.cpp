@@ -3,6 +3,7 @@
 #include "Fiber3DData.hpp"
 #include "Fiber3DRibbonControls.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationController.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "Fiber3DSliceControls.hpp"
 #include "Fiber3DSurfaceControls.hpp"
@@ -54,18 +55,6 @@ struct LoadResult {
     bool preview = false;
 };
 
-void appendScene(Scene& out, Scene part)
-{
-    out.complete = out.complete && part.complete;
-    if (!part.message.isEmpty()) {
-        if (!out.message.isEmpty())
-            out.message += QLatin1Char('\n');
-        out.message += part.message;
-    }
-    if (std::isfinite(part.voxelSizeMm))
-        out.voxelSizeMm = part.voxelSizeMm;
-    out.fibers.insert(out.fibers.end(), std::make_move_iterator(part.fibers.begin()), std::make_move_iterator(part.fibers.end()));
-}
 }  // namespace
 
 struct Fiber3DPanel::Impl {
@@ -79,7 +68,7 @@ struct Fiber3DPanel::Impl {
     Fiber3DSliceControls* sliceControls;
     Fiber3DSurfaceControls* surfaceControls;
     QLabel *status, *selection;
-    QCheckBox *nativeSource, *afvSource, *h, *v, *unknown;
+    QCheckBox *storeSource, *h, *v, *unknown;
     QComboBox *region, *colors, *direction, *palette, *memoryBudget;
     QSpinBox *boxWidth, *limit;
     QDoubleSpinBox *minimum, *rangeMin, *rangeMax;
@@ -225,38 +214,37 @@ struct Fiber3DPanel::Impl {
             contextMenu(p, key, index, {x, y, z});
         });
         QObject::connect(canvas, &Fiber3DCanvas::emptyContextRequested, q, [this](QPoint p) { contextMenu(p, {}, 0, {}); });
-        QObject::connect(annotations, &LineAnnotationController::fibersChanged, q, [this] {
-            // Inspecting a read-only AFV fiber also changes the annotation
-            // controller. It must not restart an unrelated automated-only load.
-            if (nativeSource->isChecked())
-                request();
-        });
-        QObject::connect(automated, &FiberCollectionController::collectionChanged, q, [this] {
+        QObject::connect(state, &CState::storeRoutesChanged, q, [this] {
             if (lineAnnotation)
                 return;
-            afvSource->setEnabled(automated->sourceDescriptor().has_value());
-            if (!selectedKey.startsWith(QStringLiteral("annotation:")))
-                selectedKey.clear();
+            storeSource->setEnabled(state->storeFor("fiber").has_value());
+            selectedKey.clear();
             fitted = false;
             request(true);
         });
-        QObject::connect(automated, &FiberCollectionController::fiberFiltersChanged, q, [this] {
+        QObject::connect(state, &CState::objectStoreChanged, q, [this](const vc::objects::StoreSessionEvent& event) {
+            if (lineAnnotation)
+                return;
+            // Registrations as well as geometry edits invalidate displayed coordinates.
+            if (event.touches({"fiber", "volume_transform", "volume_transform_choice"}) ||
+                event.kind == vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
+                storeSource->setEnabled(state->storeFor("fiber").has_value());
+                request(true);
+            }
+        });
+        QObject::connect(automated, &FiberCollectionController::optionsChanged, q, [this] {
             if (lineAnnotation || syncingFilters)
                 return;
             const QSignalBlocker b1(minimum), b2(h), b3(v);
-            minimum->setValue(automated->minimumLengthMm());
-            h->setChecked(automated->showHorizontal());
-            v->setChecked(automated->showVertical());
+            minimum->setValue(automated->options().minLengthMm);
+            h->setChecked(automated->options().horizontal);
+            v->setChecked(automated->options().vertical);
             request();
         });
-        QObject::connect(automated, &FiberCollectionController::fiberSelectionChanged, q, [this](qint64 id) {
+        QObject::connect(automated, &FiberCollectionController::selectionChanged, q, [this](const FiberCollectionController::Selection& selection) {
             if (lineAnnotation)
                 return;
-            if (const auto source = automated->sourceDescriptor(); source && id > 0) {
-                select(source->uuid + QLatin1Char(':') + QString::number(id), false);
-            } else if (id == 0 && !selectedKey.startsWith(QStringLiteral("annotation:"))) {
-                select({}, false);
-            }
+            q->selectNativeFiber(uint64_t(selection.id));
         });
         auto reset = [this] {
             if (lineAnnotation) {
@@ -284,7 +272,7 @@ struct Fiber3DPanel::Impl {
             if (region->currentIndex() == 0)
                 request();
         });
-        afvSource->setEnabled(automated->sourceDescriptor().has_value());
+        storeSource->setEnabled(state->storeFor("fiber").has_value());
         canvas->setDisplaySettings(display);
         syncCursor();
         updateSelection();
@@ -459,22 +447,20 @@ struct Fiber3DPanel::Impl {
 
         page(q->tr("Fibers"), QStringLiteral("fibers3DSettingsFibers"));
         section(q->tr("Sources"));
-        nativeSource = check("fibers3DNative", q->tr("Project annotations"), true);
-        afvSource = check("fibers3DAutomated", q->tr("Automated collection"), true);
-        body->addWidget(nativeSource);
-        body->addWidget(afvSource);
+        storeSource = check("fibers3DStore", q->tr("Fibers in active object store"), true);
+        body->addWidget(storeSource);
         section(q->tr("Filters"));
-        h = check("fibers3DH", q->tr("H"), automated->showHorizontal());
-        v = check("fibers3DV", q->tr("V"), automated->showVertical());
+        h = check("fibers3DH", q->tr("H"), automated->options().horizontal);
+        v = check("fibers3DV", q->tr("V"), automated->options().vertical);
         unknown = check("fibers3DUnknown", q->tr("Unclassified"), true);
         h->setToolTip(q->tr("Horizontal fibers"));
         v->setToolTip(q->tr("Vertical fibers"));
         row(q->tr("Families"), horizontal({h, v, unknown}));
-        minimum = real("fibers3DMinLength", 0, 10000, automated->minimumLengthMm(), 2, q->tr(" mm"));
+        minimum = real("fibers3DMinLength", 0, 10000, automated->options().minLengthMm, 2, q->tr(" mm"));
         // The collection controls own these shared filters.
-        h->setChecked(automated->showHorizontal());
-        v->setChecked(automated->showVertical());
-        minimum->setValue(automated->minimumLengthMm());
+        h->setChecked(automated->options().horizontal);
+        v->setChecked(automated->options().vertical);
+        minimum->setValue(automated->options().minLengthMm);
         row(q->tr("Minimum length"), minimum);
         region = combo("fibers3DRegion", {q->tr("Around CT focus"), q->tr("Whole volume")}, 1);
         row(q->tr("Region"), region);
@@ -641,7 +627,7 @@ struct Fiber3DPanel::Impl {
             nearbyDistance->setEnabled(display.nearbyOnly);
             applyDisplay();
         };
-        for (auto* w : {nativeSource, afvSource, unknown})
+        for (auto* w : {storeSource, unknown})
             QObject::connect(w, &QCheckBox::toggled, q, [this] {
                 request();
                 saveSettings();
@@ -738,7 +724,11 @@ struct Fiber3DPanel::Impl {
         if (lineAnnotation)
             return;
         syncingFilters = true;
-        automated->setFiberFilters(minimum->value(), h->isChecked(), v->isChecked());
+        auto filters = automated->options();
+        filters.minLengthMm = minimum->value();
+        filters.horizontal = h->isChecked();
+        filters.vertical = v->isChecked();
+        automated->setOptions(filters);
         syncingFilters = false;
         request();
     }
@@ -793,62 +783,50 @@ struct Fiber3DPanel::Impl {
             }
             options.bounds = b;
         }
-        std::optional<AutomatedSource> source;
-        if (afvSource->isChecked())
-            if (const auto afv = automated->sourceDescriptor())
-                source = AutomatedSource{afv->path, afv->uuid, afv->nativeToViewer, afv->nativeVoxelMm, volumeBounds};
-        // Copy live annotation state only on the GUI thread. The worker owns
-        // this snapshot and its own read-only AFV connection, never a controller.
-        std::optional<LineAnnotationController::FiberMapSnapshot> snapshot;
-        std::vector<LineAnnotationController::FiberSummary> summaries;
-        if (nativeSource->isChecked()) {
-            snapshot = annotations->fiberMapSnapshot(false);
-            summaries = annotations->fiberSummaries();
-        }
+        std::optional<StoreSource> source;
+        if (storeSource->isChecked() && state->storeFor("fiber") && state->annotationVolume())
+            source = StoreSource{state->objectStoreSession(), *state->storeFor("fiber"), *state->annotationVolume(), volume->voxelSize() / 1000.0, {}};
         cancelled = std::make_shared<std::atomic_bool>(false);
         status->setText(q->tr("Loading fibers…"));
         const auto token = cancelled;
         const auto generation = revision;
         loading = true;
-        watcher.setFuture(
-            QtConcurrent::run([options, source, snapshot = std::move(snapshot), summaries = std::move(summaries), token, generation](QPromise<LoadResult>& promise) {
-                LoadResult result;
-                result.revision = generation;
-                try {
-                    // Publish a bounded, selectable first view without changing the
-                    // user's final fiber or memory limits. Full loading stays on
-                    // this worker, with the same revision/cancellation safeguards.
-                    if (source && !options.bounds && options.byteBudget > size_t(64) * 1024 * 1024 &&
-                        (!options.maximumFibers || options.maximumFibers > 2000)) {
-                        auto initial = options;
-                        initial.maximumFibers = 2000;
-                        initial.byteBudget = size_t(64) * 1024 * 1024;
-                        auto first = std::make_shared<Scene>(loadAutomated(*source, initial, token.get()));
-                        if (token->load(std::memory_order_relaxed))
-                            return;
-                        if (!first->fibers.empty()) {
-                            // Budget notices belong to the final view; this one is
-                            // explicitly labelled as a preview still being loaded.
-                            first->message.clear();
-                            first->complete = true;
-                            promise.addResult(LoadResult{std::move(first), {}, generation, true});
-                        }
-                    }
-                    result.scene = std::make_shared<Scene>();
-                    result.scene->clipBounds = options.bounds;
-                    if (snapshot && !snapshot->fibers.empty())
-                        appendScene(*result.scene, loadAnnotations(*snapshot, summaries, options, token.get()));
-                    if (source)
-                        appendScene(*result.scene, loadAutomated(*source, options, token.get()));
+        watcher.setFuture(QtConcurrent::run([options, source, token, generation](QPromise<LoadResult>& promise) {
+            LoadResult result;
+            result.revision = generation;
+            try {
+                // Publish a bounded, selectable first view without changing the
+                // user's final fiber or memory limits. Full loading stays on
+                // this worker, with the same revision/cancellation safeguards.
+                if (source && !options.bounds && options.byteBudget > size_t(64) * 1024 * 1024 &&
+                    (!options.maximumFibers || options.maximumFibers > 2000)) {
+                    auto initial = options;
+                    initial.maximumFibers = 2000;
+                    initial.byteBudget = size_t(64) * 1024 * 1024;
+                    auto first = std::make_shared<Scene>(loadStore(*source, initial, token.get()));
                     if (token->load(std::memory_order_relaxed))
-                        result.scene.reset();
-                } catch (const std::exception& e) {
-                    result.scene.reset();
-                    result.error = QString::fromUtf8(e.what());
+                        return;
+                    if (!first->fibers.empty()) {
+                        // Budget notices belong to the final view; this one is
+                        // explicitly labelled as a preview still being loaded.
+                        first->message.clear();
+                        first->complete = true;
+                        promise.addResult(LoadResult{std::move(first), {}, generation, true});
+                    }
                 }
-                if (!token->load(std::memory_order_relaxed))
-                    promise.addResult(std::move(result));
-            }));
+                result.scene = std::make_shared<Scene>();
+                result.scene->clipBounds = options.bounds;
+                if (source)
+                    *result.scene = loadStore(*source, options, token.get());
+                if (token->load(std::memory_order_relaxed))
+                    result.scene.reset();
+            } catch (const std::exception& e) {
+                result.scene.reset();
+                result.error = QString::fromUtf8(e.what());
+            }
+            if (!token->load(std::memory_order_relaxed))
+                promise.addResult(std::move(result));
+        }));
     }
 
     const Fiber* find(const QString& key) const
@@ -872,10 +850,9 @@ struct Fiber3DPanel::Impl {
             request();
         if (notify)
             if (const auto* fiber = find(key)) {
-                if (fiber->source == Source::Annotation)
-                    emit q->nativeFiberSelected(fiber->id);
-                else
-                    automated->selectForInspection(qint64(fiber->id));
+                const auto id = annotations->fiberIdForUuid(fiber->objectUuid);
+                automated->selectFiber(int64_t(id), false, false);
+                emit q->nativeFiberSelected(id);
             }
     }
 
@@ -941,9 +918,7 @@ struct Fiber3DPanel::Impl {
         menu.addAction(q->tr("Fit displayed fibers"), canvas, &Fiber3DCanvas::fitAll);
         if (const auto* fiber = find(key)) {
             // Copy identifiers: nested menus can process scene-reload signals.
-            const auto id = fiber->id;
-            const auto file = fiber->fileName;
-            const auto source = fiber->source;
+            const auto id = annotations->fiberIdForUuid(fiber->objectUuid);
             menu.addAction(q->tr("Fit selected fiber"), q, [this] {
                 if (lineAnnotation)
                     canvas->fitAll();
@@ -958,13 +933,10 @@ struct Fiber3DPanel::Impl {
             if (lineAnnotation) {
                 menu.addAction(q->tr("Go here in Line Annotation"), q, [this, index] { emit q->linePositionPicked(double(index)); });
             } else
-                menu.addAction(q->tr("Open in Line Annotation"), q, [this, id, file, source, index, menuRevision] {
+                menu.addAction(q->tr("Open in Line Annotation"), q, [this, id, menuRevision] {
                     if (menuRevision != revision)
                         return;
-                    if (source == Source::Automated)
-                        automated->selectForInspection(qint64(id), true);
-                    else if (annotations->hasLoadedFiber(id, file.toStdString()))
-                        annotations->openFiberAtLinePointIndex(id, int(std::clamp<qint64>(index, 0, std::numeric_limits<int>::max())));
+                    automated->selectFiber(int64_t(id), false, true);
                 });
         }
         if (!lineAnnotation && !selectedKey.isEmpty()) {
@@ -1078,11 +1050,8 @@ void Fiber3DPanel::clearLineAnnotation()
 
 void Fiber3DPanel::selectNativeFiber(uint64_t id)
 {
-    if (!id) {
-        if (d->selectedKey.startsWith(QStringLiteral("annotation:")))
-            d->select({}, false);
-        return;
-    }
-    d->select(QStringLiteral("annotation:") + QString::number(id), false);
+    const auto attachment = d->state->storeFor("fiber");
+    const auto uuid = id ? d->annotations->fiberUuidForId(id) : std::string{};
+    d->select(attachment && !uuid.empty() ? storeFiberKey(*attachment, uuid) : QString{}, false);
 }
 }  // namespace vc3d::fibers3d

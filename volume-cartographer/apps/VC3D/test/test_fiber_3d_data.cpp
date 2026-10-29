@@ -1,43 +1,53 @@
 #include "fibers3d/Fiber3DData.hpp"
-#include "LineAnnotationPolylineIndices.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
-#include "../../../core/test/FiberCollectionFixture.hpp"
-
+#include <vc_object_store/objects/FiberJson.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include <QtTest/QtTest>
-
+#include <QTemporaryDir>
 using namespace vc3d::fibers3d;
-using vc::fibers::test::FixtureFiber;
-using vc::fibers::test::FixtureFile;
-
+using Json = nlohmann::json;
 namespace
 {
-AutomatedSource automated(const FixtureFile& fixture)
-{
-    return {QString::fromStdString(fixture.path().string()), QStringLiteral("7f3c1a52-8f0e-4b8e-9d1a-2f6b0c4e5a91"), 0.5, 0.008, {{-1000, -1000, -1000}, {1000, 1000, 1000}}};
-}
-
-LineAnnotationController::FiberMapSnapshot annotated()
-{
-    LineAnnotationController::FiberMapSnapshot snapshot;
-    snapshot.frame.factor = 2;
-    snapshot.frame.extentXyz = {2000, 2000, 2000};
-    snapshot.voxelSizeUm = 8.0;
-    LineAnnotationController::FiberMapFiber fiber;
-    fiber.id = 42;
-    fiber.fileName = "source-fiber.json";
-    fiber.label = QStringLiteral("source-42");
-    fiber.hvTag = 'H';
-    fiber.linePoints = {{-10, 0, 0}, {10, 0, 0}, {10, 10, 0}, {-10, 10, 0}, {-10, 0, 0}, {10, 0, 0}};
-    fiber.controlPoints = {fiber.linePoints[0], fiber.linePoints[1], fiber.linePoints[4], fiber.linePoints[5]};
-    fiber.gapSegments = {false, false, true};
-    fiber.damagedSegments = {true, false, false};
-    fiber.breaks = {false, false, true, true};
-    fiber.kollesisTerminations = {true, false, false, false};
-    snapshot.fibers.push_back(std::move(fiber));
-    return snapshot;
-}
+struct Fixture {
+    QTemporaryDir dir;
+    std::shared_ptr<vc::objects::ObjectStoreSession> session = std::make_shared<vc::objects::ObjectStoreSession>();
+    vc::objects::AttachmentIdentity attachment;
+    Fixture()
+    {
+        vc::objects::OpenOptions options;
+        options.author = "fiber-3d-test";
+        const auto path = dir.path().toStdString() + "/test.vcobj";
+        {
+            auto db = vc::objects::ObjectStore::create(path, options);
+        }
+        attachment = session->attach(path, options);
+    }
+    StoreSource source() { return {session, attachment, {"ct", 1}, 0.008, {}}; }
+    std::string add(
+        const std::string& family,
+        const std::vector<Point>& points,
+        double scale = 1,
+        std::string volume = "ct",
+        Json controls = Json::array(),
+        Json extras = Json::object())
+    {
+        const auto id = vc::objects::util::newUuid();
+        Json root =
+            {{"type", "vc3d_fiber"},
+             {"version", 4},
+             {"uuid", id},
+             {"name", family},
+             {"coordinates", {{"volume_uuid", volume}, {"scale_factor", scale}}},
+             {"line_points", points},
+             {"control_points", controls},
+             {"hv_classification", {{"automatic_tag", family}}}};
+        root.update(extras);
+        const auto entry = vc::objects::decodeFiberJson(root.dump());
+        session->act(attachment, {{id, {}}}, [&](auto& db, auto& txn) { vc::objects::ingestGeometryBatch(db, txn, {entry}); });
+        return id;
+    }
+};
 }  // namespace
-
 class Fiber3DDataTest : public QObject
 {
     Q_OBJECT
@@ -130,259 +140,123 @@ private slots:
         QCOMPARE(fiber.markers.size(), size_t(4));
     }
 
-    void nativeRegionsKeepDisjointRunsAndFullSourceLength()
+    void storeFramesAndIdentity()
     {
-        auto snapshot = annotated();
-        QueryOptions options;
-        options.bounds = Bounds{{-1, -1, -1}, {1, 1, 1}};
-        LineAnnotationController::FiberSummary summary;
-        summary.id = 42;
-        summary.tags = {"reviewed", "custom-tag"};
-        const auto scene = loadAnnotations(snapshot, {summary}, options);
-        QVERIFY(scene.complete);
-        QCOMPARE(scene.voxelSizeMm, 0.016);
+        Fixture f;
+        const auto id = f.add("H", {{0, 0, 0}, {20, 0, 0}}, 2);
+        f.add("V", {{0, 0, 0}, {100, 0, 0}}, 1, "unregistered");
+        const auto scene = loadStore(f.source(), {});
         QCOMPARE(scene.fibers.size(), size_t(1));
-        const auto& fiber = scene.fibers[0];
-        QCOMPARE(fiber.key, QStringLiteral("annotation:42"));
-        QCOMPARE(fiber.fileName, QStringLiteral("source-fiber.json"));
-        QCOMPARE(fiber.lengthMm, 80.0 * 0.008);
-        QCOMPARE(fiber.runs.size(), size_t(2));
-        QCOMPARE(fiber.runs[0].firstPoint, int64_t(0));
-        QCOMPARE(fiber.runs[1].firstPoint, int64_t(4));
-        // Neither endpoint is inside the ROI: segment/box clipping must retain
-        // the crossing, and preserve original endpoints for exact GPU clipping.
-        QCOMPARE(fiber.runs[0].points.front()[0], -5.0);
-        QCOMPARE(fiber.runs[0].points.back()[0], 5.0);
-        QCOMPARE(fiber.runs[0].styles[0], SpanStyle::Damaged);
-        QCOMPARE(fiber.runs[1].styles[0], SpanStyle::Gap);
-        QCOMPARE(fiber.tags, QStringList({"reviewed", "custom-tag"}));
-        QCOMPARE(fiber.markers.size(), size_t(7));
-        // This folded/repeating geometry must map the final control to its
-        // later occurrence, not to the same nearest point as the first control.
-        const auto indices = vc3d::line_annotation::orderedControlPointLineIndices(snapshot.fibers[0].controlPoints, snapshot.fibers[0].linePoints);
-        QVERIFY(indices.has_value());
-        QCOMPARE(*indices, std::vector<size_t>({0, 1, 4, 5}));
+        QCOMPARE(scene.fibers[0].objectUuid, id);
+        QCOMPARE(scene.fibers[0].key, storeFiberKey(f.attachment, id));
+        QCOMPARE(scene.fibers[0].runs[0].points.back(), (Point{10, 0, 0}));
+        QCOMPARE(scene.fibers[0].lengthMm, 0.08);
     }
-
-    void nativeFrameAndMissingPhysicalScaleAreDistinct()
+    void filtersSelectionAndLengthOrder()
     {
-        auto snapshot = annotated();
-        snapshot.voxelSizeUm.reset();
-        auto scene = loadAnnotations(snapshot, {}, {});
-        QVERIFY(std::isnan(scene.voxelSizeMm));
-        QVERIFY(std::isnan(scene.fibers[0].lengthMm));
-        QCOMPARE(scene.fibers[0].runs[0].points[0][0], -5.0);
-        QueryOptions options;
-        options.minLengthMm = 0.1;
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadAnnotations(snapshot, {}, options));
-        snapshot.frame.extentXyz = {};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadAnnotations(snapshot, {}, {}));
-    }
-
-    void nativeBudgetAndCancellationAreExplicit()
-    {
-        auto snapshot = annotated();
-        QueryOptions options;
-        options.byteBudget = 2 * sizeof(Point);
-        const auto scene = loadAnnotations(snapshot, {}, options);
+        Fixture f;
+        const auto shortId = f.add("H", {{0, 0, 0}, {10, 0, 0}});
+        f.add("V", {{0, 0, 0}, {80, 0, 0}});
+        const auto longId = f.add("H", {{0, 0, 0}, {30, 0, 0}});
+        QueryOptions o;
+        o.maximumFibers = 1;
+        o.vertical = false;
+        auto scene = loadStore(f.source(), o);
+        QCOMPARE(scene.fibers[0].objectUuid, longId);
         QVERIFY(!scene.complete);
-        QVERIFY(!scene.message.isEmpty());
-        QCOMPARE(scene.fibers[0].runs[0].points.size(), size_t(2));
-        const std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadAnnotations(snapshot, {}, options, &cancelled));
+        o.selectedKey = storeFiberKey(f.attachment, shortId);
+        QCOMPARE(loadStore(f.source(), o).fibers[0].objectUuid, shortId);
+        o.minLengthMm = 0.15;
+        QCOMPARE(loadStore(f.source(), o).fibers[0].objectUuid, longId);
+        o.horizontal = false;
+        o.unclassified = false;
+        QVERIFY(loadStore(f.source(), o).fibers.empty());
     }
-
-    void nativeIdentitySeparatesSameFilenameFromDifferentLoadedSources()
+    void exactRegionPreservesDisjointRunsAndLength()
     {
-        auto snapshot = annotated();
-        auto second = snapshot.fibers[0];
-        second.id = 43;
-        snapshot.fibers.push_back(second);
-        QueryOptions options;
-        options.selectedKey = QStringLiteral("annotation:43");
-        const auto scene = loadAnnotations(snapshot, {}, options);
-        QCOMPARE(scene.fibers.size(), size_t(2));
-        QCOMPARE(scene.fibers[0].key, QStringLiteral("annotation:43"));
-        QCOMPARE(scene.fibers[1].key, QStringLiteral("annotation:42"));
-        QCOMPARE(scene.fibers[0].fileName, scene.fibers[1].fileName);
-    }
-
-    void emptyNativeSourceDoesNotRequireAFrame()
-    {
-        const auto scene = loadAnnotations({}, {}, {});
-        QVERIFY(scene.complete);
-        QVERIFY(scene.fibers.empty());
-    }
-
-    void readOnlyInspectionCopyIsNotAProjectAnnotation()
-    {
-        auto snapshot = annotated();
-        auto inspection = snapshot.fibers[0];
-        inspection.id = 43;
-        inspection.readOnly = true;
-        snapshot.fibers.push_back(inspection);
-        auto scene = loadAnnotations(snapshot, {}, {});
+        Fixture f;
+        const auto id = f.add("H", {{-10, 0, 0}, {10, 0, 0}, {10, 10, 0}, {-10, 10, 0}, {-10, 0, 0}, {10, 0, 0}});
+        QueryOptions o;
+        o.bounds = Bounds{{-1, -1, -1}, {1, 1, 1}};
+        const auto scene = loadStore(f.source(), o);
         QCOMPARE(scene.fibers.size(), size_t(1));
-        QCOMPARE(scene.fibers[0].id, uint64_t(42));
-        snapshot.fibers = {inspection};
-        snapshot.frame.extentXyz = {};
-        scene = loadAnnotations(snapshot, {}, {});
-        QVERIFY(scene.complete);
-        QVERIFY(scene.fibers.empty());
+        QCOMPARE(scene.fibers[0].runs.size(), size_t(2));
+        QCOMPARE(scene.fibers[0].runs[1].firstPoint, int64_t(4));
+        QCOMPARE(scene.fibers[0].lengthMm, 0.64);
+        QCOMPARE(scene.fibers[0].runs[0].points.front(), (Point{-10, 0, 0}));
     }
-
-    void afvRegionsPreserveOriginalIndicesAndInferredGaps()
+    void annotationsAndKnownGapArePreserved()
     {
-        const FixtureFile fixture(
-            {{{{-10, 0, 0}, {10, 0, 0}, {10, 10, 0}, {-10, 10, 0}, {-10, 0, 0}, {10, 0, 0}},
-              "V",
-              R"({"type":"vc3d_fiber","version":1,"tags":["reviewed"],"inferred_gap_point_ranges":[[4,5]]})"}});
-        QueryOptions options;
-        options.bounds = Bounds{{-1, -1, -1}, {1, 1, 1}};
-        const auto scene = loadAutomated(automated(fixture), options);
-        QVERIFY(scene.complete);
-        QCOMPARE(scene.voxelSizeMm, 0.016);
+        Fixture f;
+        Json controls = Json::array(
+            {Json{{"position", {0, 0, 0}}, {"tags", {"break"}}, {"segment_to_next", {{"tags", {"gap"}}}}}, Json{{"position", {2, 0, 0}}}});
+        f.add("H", {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}, 1, "ct", controls, Json{{"tags", {"reviewed"}}});
+        const auto scene = loadStore(f.source(), {});
+        const auto& fiber = scene.fibers[0];
+        QCOMPARE(fiber.markers.size(), size_t(3));
+        QCOMPARE(fiber.tags, QStringList{"reviewed"});
+        QCOMPARE(fiber.runs[0].styles, std::vector<SpanStyle>({SpanStyle::Gap, SpanStyle::Gap}));
+    }
+    void budgetsCancellationAndDetach()
+    {
+        Fixture f;
+        f.add("V", {{0, 0, 0}, {10, 0, 0}});
+        QueryOptions o;
+        o.byteBudget = 2 * sizeof(Point);
+        QVERIFY(!loadStore(f.source(), o).complete);
+        std::atomic_bool cancel{true};
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadStore(f.source(), {}, &cancel));
+        auto source = f.source();
+        f.session->detach(f.attachment);
+        QVERIFY_THROWS_EXCEPTION(std::exception, loadStore(source, {}));
+    }
+    void registeredCoordinatesAndNormalsFollowTheSameTransform()
+    {
+        Fixture f;
+        Json cp =
+            Json::array({Json{{"position", {0, 0, 0}}, {"display_normal", {1, 1, 0}}, {"direction", {1, 1, 0}}}, Json{{"position", {20, 0, 0}}}});
+        const auto id = f.add("H", {{0, 0, 0}, {20, 0, 0}}, 2, "scan-b", cp);
+        vc::objects::VolumeAffine matrix;
+        matrix(0, 0) = 2;
+        matrix(1, 1) = 3;
+        matrix(0, 3) = 100;
+        matrix(1, 3) = 200;
+        vc::objects::registerVolumeTransform(*f.session, f.attachment, "scan-b", "ct", matrix, "test registration");
+        QueryOptions o;
+        o.bounds = Bounds{{99, 199, -1}, {121, 201, 1}};
+        const auto scene = loadStore(f.source(), o);
         QCOMPARE(scene.fibers.size(), size_t(1));
         const auto& fiber = scene.fibers[0];
-        QCOMPARE(fiber.lengthMm, 0.64);
-        QCOMPARE(fiber.family, 'V');
-        QCOMPARE(fiber.key, QStringLiteral("7f3c1a52-8f0e-4b8e-9d1a-2f6b0c4e5a91:1"));
-        QCOMPARE(fiber.runs.size(), size_t(2));
-        QCOMPARE(fiber.runs[0].firstPoint, int64_t(0));
-        QCOMPARE(fiber.runs[1].firstPoint, int64_t(4));
-        QCOMPARE(fiber.runs[1].styles[0], SpanStyle::InferredGap);
-        QCOMPARE(fiber.runs[1].points.front()[0], -5.0);
-        QCOMPARE(fiber.tags, QStringList({"reviewed"}));
+        QCOMPARE(fiber.runs[0].points.front(), (Point{100, 200, 0}));
+        QCOMPARE(fiber.runs[0].points.back(), (Point{120, 200, 0}));
+        QCOMPARE(fiber.lengthMm, .16);
+        QVERIFY(fiber.displayNormals[0]);
+        QVERIFY(fiber.controlDirections[0]);
+        const auto n = *fiber.displayNormals[0], d = *fiber.controlDirections[0];
+        QVERIFY(std::abs(n[0] / n[1] - 1.5) < 1e-12);
+        QVERIFY(std::abs(d[0] / d[1] - 2.0 / 3.0) < 1e-12);
     }
-
-    void afvSpanAnnotationsMapControlsOutsideVisibleRegionAcrossBlocks()
+    void pagingKeepsLongestFirstAcrossCatalogPages()
     {
-        std::vector<vc::fibers::Point> points;
-        for (int i = 0; i < 700; ++i)
-            points.push_back({double(i), 0, 0});
-        const FixtureFile fixture({{points, "H", R"({"type":"vc3d_fiber","version":4,
-            "control_points":[
-              {"position":[10,0,0],"tags":["break"],"segment_to_next":{"tags":["gap"]}},
-              {"position":[690,0,0],"tags":["break","kollesis_termination"]}]})"}});
-        QueryOptions options;
-        options.bounds = Bounds{{150, -1, -1}, {151, 1, 1}};
-        const auto scene = loadAutomated(automated(fixture), options);
+        Fixture f;
+        for (int i = 1; i <= 140; ++i)
+            f.add(i % 2 ? "H" : "V", {{0, 0, 0}, {double(i), 0, 0}});
+        QueryOptions o;
+        o.maximumFibers = 0;
+        const auto scene = loadStore(f.source(), o);
         QVERIFY(scene.complete);
-        QCOMPARE(scene.fibers.size(), size_t(1));
-        const auto& fiber = scene.fibers[0];
-        QVERIFY(!fiber.runs.empty());
-        for (const auto& run : fiber.runs) {
-            QVERIFY(!run.styles.empty());
-            for (const auto style : run.styles)
-                QCOMPARE(style, SpanStyle::Gap);
-        }
-        QCOMPARE(fiber.markers.size(), size_t(5));
-        QCOMPARE(fiber.lengthMm, 699 * 0.008);
+        QCOMPARE(scene.fibers.size(), size_t(140));
+        for (size_t i = 0; i < scene.fibers.size(); ++i)
+            QVERIFY(std::abs(scene.fibers[i].lengthMm - double(140 - i) * .008) < 1e-12);
     }
-
-    void afvLimitReportsPartialAndRetainsSelectedFiber()
+    void singleObjectDoesNotFallBackToAnother()
     {
-        std::vector<FixtureFiber> fibers;
-        for (int i = 0; i < 20; ++i)
-            fibers.push_back({{{-10, 0, 0}, {10, 0, 0}}, "H"});
-        const FixtureFile fixture(fibers);
-        auto source = automated(fixture);
-        QueryOptions options;
-        options.maximumFibers = 2;
-        options.selectedKey = source.uuid + ":19";
-        const auto a = loadAutomated(source, options);
-        const auto b = loadAutomated(source, options);
-        QVERIFY(!a.complete);
-        QVERIFY(!a.message.isEmpty());
-        QCOMPARE(a.fibers.size(), size_t(2));
-        QCOMPARE(a.fibers[0].id, uint64_t(19));
-        QCOMPARE(a.fibers[1].id, b.fibers[1].id);
-        options.byteBudget = 48;
-        QVERIFY(!loadAutomated(source, options).complete);
-    }
-
-    void afvFamilyFiltersDoNotSpendBudgetOnExcludedFibers()
-    {
-        const FixtureFile fixture({{{{-10, 0, 0}, {10, 0, 0}}, "H"}, {{{-10, 0, 0}, {10, 0, 0}}, "V"}, {{{-10, 0, 0}, {10, 0, 0}}, ""}});
-        for (int mask = 0; mask < 8; ++mask) {
-            QueryOptions options;
-            options.horizontal = mask & 1;
-            options.vertical = mask & 2;
-            options.unclassified = mask & 4;
-            const auto scene = loadAutomated(automated(fixture), options);
-            QCOMPARE(scene.fibers.size(), size_t(bool(mask & 1) + bool(mask & 2) + bool(mask & 4)));
-            QVERIFY(scene.complete);
-        }
-    }
-
-    void memoryBudgetRetainsSelectedThenLongestFibers()
-    {
-        const FixtureFile fixture({{{{-5, 0, 0}, {5, 0, 0}}, "H"}, {{{-15, 0, 0}, {15, 0, 0}}, "V"}, {{{-10, 0, 0}, {10, 0, 0}}, "H"}});
-        const auto source = automated(fixture);
-        QueryOptions options;
-        options.maximumFibers = 0;
-        options.byteBudget = 96;
-        auto scene = loadAutomated(source, options);
-        QVERIFY(!scene.complete);
-        QCOMPARE(scene.fibers.size(), size_t(2));
-        QCOMPARE(scene.fibers[0].id, uint64_t(2));
-        QCOMPARE(scene.fibers[1].id, uint64_t(3));
-        options.selectedKey = source.uuid + ":1";
-        scene = loadAutomated(source, options);
-        QCOMPARE(scene.fibers[0].id, uint64_t(1));
-        QCOMPARE(scene.fibers[1].id, uint64_t(2));
-        options.byteBudget = 144;
-        scene = loadAutomated(source, options);
-        QVERIFY(scene.complete);
-        QCOMPARE(scene.fibers.size(), size_t(3));
-        QCOMPARE(scene.fibers[2].id, uint64_t(3));
-    }
-
-    void nativeViewsAlsoPrioritizeFullLengthAndSelection()
-    {
-        auto snapshot = annotated();
-        snapshot.fibers.clear();
-        for (int i = 1; i <= 3; ++i) {
-            LineAnnotationController::FiberMapFiber fiber;
-            fiber.id = uint64_t(i);
-            fiber.linePoints = {{-double(i), 0, 0}, {double(i), 0, 0}};
-            fiber.controlPoints = fiber.linePoints;
-            fiber.hvTag = 'H';
-            snapshot.fibers.push_back(std::move(fiber));
-        }
-        QueryOptions options;
-        options.maximumFibers = 1;
-        auto scene = loadAnnotations(snapshot, {}, options);
-        QCOMPARE(scene.fibers.size(), size_t(1));
-        QCOMPARE(scene.fibers[0].id, uint64_t(3));
-        options.selectedKey = QStringLiteral("annotation:1");
-        scene = loadAnnotations(snapshot, {}, options);
-        QCOMPARE(scene.fibers[0].id, uint64_t(1));
-    }
-
-    void afvRejectsChangedIdentityAndCancellation()
-    {
-        const FixtureFile fixture({{{{-10, 0, 0}, {10, 0, 0}}, "H"}});
-        auto source = automated(fixture);
-        source.uuid = "other-collection";
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadAutomated(source, {}));
-        const std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, loadAutomated(automated(fixture), {}, &cancelled));
-    }
-
-    void afvLengthFilterUsesWholeFiberInNativeScale()
-    {
-        const FixtureFile fixture({{{{-100, 0, 0}, {100, 0, 0}}, "H"}});
-        QueryOptions options;
-        options.bounds = Bounds{{-1, -1, -1}, {1, 1, 1}};
-        options.minLengthMm = 1.5;
-        const auto scene = loadAutomated(automated(fixture), options);
-        QCOMPARE(scene.fibers.size(), size_t(1));
-        QCOMPARE(scene.fibers[0].lengthMm, 1.6);
-        options.minLengthMm = 1.7;
-        QVERIFY(loadAutomated(automated(fixture), options).fibers.empty());
+        Fixture f;
+        f.add("V", {{0, 0, 0}, {10, 0, 0}});
+        auto source = f.source();
+        source.onlyUuid = vc::objects::util::newUuid();
+        QVERIFY(loadStore(source, {}).fibers.empty());
     }
 };
-
-QTEST_APPLESS_MAIN(Fiber3DDataTest)
+QTEST_GUILESS_MAIN(Fiber3DDataTest)
 #include "test_fiber_3d_data.moc"

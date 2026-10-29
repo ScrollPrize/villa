@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DRibbon.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "../../../core/test/support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
@@ -209,17 +210,16 @@ private slots:
     void nativeCtSamplingRotationAndTileSeams()
     {
         QTemporaryDir directory;
-        Volume::ZarrCreateOptions opts;
+        vc::test::ZarrVolumeSpec opts;
         opts.shapeZYX = {1100, 16, 16};
         opts.chunkShapeZYX = {32, 16, 16};
-        opts.compressor = "none";
-        auto volume = Volume::New(directory.path().toStdString(), opts);
+        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), opts);
         Array3D<uint8_t> data({1100, 16, 16});
         for (int z = 0; z < 1100; ++z)
             for (int y = 0; y < 16; ++y)
                 for (int x = 0; x < 16; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + (z % 100));
-        volume->writeZYX(data, {0, 0, 0});
+        vc::test::writeZYX(*volume, data, {0, 0, 0});
         Fiber f;
         f.runs = {Run{{{8, 8, 1}, {8, 8, 1098}}}};
         auto frames = ribbon::makeFrames(f, {}, [](const cv::Vec3d&) { return cv::Vec3d(1, 0, 0); });

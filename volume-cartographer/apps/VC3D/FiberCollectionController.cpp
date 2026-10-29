@@ -291,6 +291,7 @@ void FiberCollectionController::setOptions(const FiberDisplayOptions& options)
 {
     if (options == options_) return;
     const auto previous = std::exchange(options_, options);
+    emit optionsChanged();
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("fiberCollections/minLengthMm", options_.minLengthMm);
     settings.setValue("fiberCollections/maxDisplayed", options_.maxDisplayed);
@@ -323,6 +324,24 @@ void FiberCollectionController::publishSelection(Selection selection)
 {
     selection_ = std::move(selection);
     emit selectionChanged(selection_);
+}
+void FiberCollectionController::clearSelection()
+{
+    ++selectionRevision_;
+    ++navigationRevision_;
+    ++annotationRevision_;
+    selected_ = 0;
+    selectedPin_.reset();
+    selectedBound_ = false;
+    pendingAnnotation_ = 0;
+    pendingIndex_.reset();
+    for (const auto& connection : annotationRenderConnections_)
+        disconnect(connection);
+    annotationRenderConnections_.clear();
+    publishSelection({});
+    emit annotationStatusChanged({});
+    refreshRegions();
+    refreshAll();
 }
 void FiberCollectionController::clear()
 {

@@ -221,10 +221,10 @@ struct Fiber3DSurfaceControls::Impl {
         try {
             // QuadSurface's live grid can be edited in place. Copy on its GUI
             // owner thread; workers never access mutable surface state.
-            auto points = quad->rawPoints();
-            if (points.total() > maxBytes / (sizeof(surface::Vertex) + 6 * sizeof(uint32_t)))
+            const auto grid = quad->gridSize();
+            if (uint64_t(grid.width) * uint64_t(grid.height) > maxBytes / (sizeof(surface::Vertex) + 6 * sizeof(uint32_t)))
                 throw std::runtime_error("Surface exceeds the 3D memory budget. Increase Memory budget in Settings.");
-            points = points.clone();
+            auto points = quad->rawPoints().clone();
             cancelled = std::make_shared<std::atomic_bool>(false);
             busy = true;
             watcher.setFuture(QtConcurrent::run([points = std::move(points), stop = cancelled, budget = maxBytes] {

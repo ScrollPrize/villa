@@ -11251,12 +11251,16 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
 std::function<cv::Vec3f(const cv::Vec3f&)> LineAnnotationController::displayCenterReference()
 {
     const auto umbilicus = ensureScrollUmbilicusLoaded();
-    const float scale = float(annotationFrame().factor);
-    const auto volume = _state->currentVolume();
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume)
+        return {};
     const cv::Vec3f center{float(volume->sliceWidth())*.5f, float(volume->sliceHeight())*.5f, 0.f};
-    return [umbilicus, scale, center](const cv::Vec3f& p) {
+    return [umbilicus, center](const cv::Vec3f& p) {
         if (umbilicus) {
-            try { return umbilicus->vector_to_umbilicus(p*scale) / scale; } catch (...) {}
+            try {
+                return umbilicus->vector_to_umbilicus(p);
+            } catch (...) {
+            }
         }
         return cv::Vec3f{center[0]-p[0], center[1]-p[1], 0.f};
     };
