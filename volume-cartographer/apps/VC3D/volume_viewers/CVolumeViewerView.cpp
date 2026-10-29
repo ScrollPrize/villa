@@ -339,12 +339,6 @@ void CVolumeViewerView::paintEvent(QPaintEvent* event)
     emit paintCompleted();
 }
 
-void CVolumeViewerView::scrollContentsBy(int dx, int dy)
-{
-    QGraphicsView::scrollContentsBy(dx,dy);
-    sendScrolled();  // Emit after scroll so renderVisible sees the new viewport position
-}
-
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 {
     if (pointInSceneWidget(event->position())) {

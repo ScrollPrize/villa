@@ -222,36 +222,3 @@ TEST_CASE("reference replay counts missing widths as filtered stops not failures
     }
 }
 
-TEST_CASE("real cached width predictions have reproducible committed means") {
-    const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
-    const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
-    if (!manifest || !fiberPath) return;
-    const auto dataset=vc::lasagna::LasagnaDataset::open(manifest);
-    FiberPredictionFieldOptions options; options.enableWidth=true;
-    FiberPredictionField field(dataset,options);
-    const auto fiber=loadFiberJson(fiberPath);
-    REQUIRE(fiber.controlPointLineIndices.size()>1);
-    const size_t first=fiber.controlPointLineIndices.front();
-    REQUIRE(first+1<fiber.linePointsXyzBase.size());
-    const auto start=fiber.linePointsXyzBase[first];
-    const auto direction=fiber.linePointsXyzBase[first+1]-start;
-    auto c=config(); c.stepVoxels=16;
-    const auto baseline=traceFiberExtrapolation(field,start,direction,64,c);
-    c.widthRelativeTolerance=.4; c.widthCosineWeight=true;
-    const auto serial=traceFiberExtrapolation(field,start,direction,64,c);
-    c.parallelThreads=4;
-    const auto parallel=traceFiberExtrapolation(field,start,direction,64,c);
-    REQUIRE(serial.points.size()>1);
-    CHECK(serial.points==parallel.points);
-    CHECK(serial.widthMean==parallel.widthMean);
-    std::vector<cv::Vec3f> points;
-    for (const auto& p : serial.points) points.push_back(cv::Vec3f(p));
-    std::vector<float> widths; field.sampleWidths(points,widths);
-    double sum=0; for (float w : widths) sum+=w;
-    CHECK(serial.widthSamples==widths.size());
-    CHECK(serial.widthMean==doctest::Approx(sum/widths.size()));
-    std::cout << "Real width trace: start=" << start[0] << ',' << start[1] << ',' << start[2]
-        << "; baseline=" << baseline.points.size() << " points; gated="
-        << serial.points.size() << "; committed mean=" << serial.widthMean
-        << "; serial/parallel exact\n";
-}

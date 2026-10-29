@@ -188,15 +188,14 @@ per source is tracked:
 | `tool` | `CommandLineToolRunner` lifecycle |
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
-| `atlas` | bridge-started atlas search lifecycle |
 | `catalog` | Open Data sample open lifecycle |
-| `flatten` | SLIM, ABF, and straighten lifecycle |
+| `flatten` | SLIM and straighten lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
 
 Application work started outside the bridge is represented when its lifecycle
-is observable, but only bridge-started atlas and seeding operations are
-registered as jobs. A source retains its eight most recent terminal records.
+is observable, but only bridge-started seeding operations are registered as
+jobs. A source retains its eight most recent terminal records.
 
 `job.status` accepts `jobId`, `source`, or neither. With neither it returns the
 most recently started job across all sources. Its record contains:
@@ -244,7 +243,7 @@ An explicit RPC is treated as consent for the requested mutation, never as
 consent for unrelated prompts. Bridge calls use dialog-free application cores:
 
 - project and catalog opens never ask whether to replace the current project;
-- segment, fiber, atlas, rendering, tracing, and flatten operations report
+- segment, fiber, rendering, tracing, and flatten operations report
   failures through JSON-RPC or job state;
 - interactive menu actions remain responsible for file pickers, confirmation
   prompts, status widgets, and message boxes;
@@ -263,11 +262,19 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
-- `project.create` writes a new `.volpkg.json` referencing one local zarr
-  volume or remote `.zarr` URL. It does not change the current session;
-  remote availability is checked by `volume.open` when the new project is
-  opened.
-- `volume.open` opens a local project and may select a volume. Failed opens do
+- A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
+  datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
+  collections, umbilici, and registrations selects one attached store for
+  display and editing. `state.get.project` describes the project file;
+  `stores` includes reference IDs and availability, and `routes` maps all five
+  kinds to those reference IDs or null.
+- `project.create` writes a `.vcproj` referencing one local Zarr volume or remote
+  `.zarr` URL. `store` selects an existing store; `newStore` creates a store at
+  the given path. If neither is supplied, create a sibling `.vcobj`. Supplying
+  both is invalid. `overwrite` replaces only the project file and never deletes
+  or overwrites a referenced store. The result includes the store path.
+  Creation does not open the project; remote availability is checked on open.
+- `volume.open` opens a project and may select a volume. Failed opens do
   not discard the current project.
 - `volume.attach` loads one local zarr or remote `.zarr` URL asynchronously,
   then persists it in the project only if the same project is still open. It
@@ -286,24 +293,21 @@ dialog.
 
 ### Segments and review state
 
-- `segments.attach` adds one absolute local tifxyz path to the open package.
-  The path may identify a segment or a directory of segments. Attachment uses
-  the same validation, persistence, and UI refresh as the GUI and is
-  idempotent by normalized location. It selects the attached segment source by
-  default; `select: false` preserves the current source. A source whose
-  directory name is already used case-insensitively by another attachment is
-  rejected because the VC3D source picker identifies entries by that name.
-- `segments.list` reports package segments, whether they are loaded, and the
-  active segment.
-- `segments.fetch` materializes an Open Data placeholder. Already-materialized
-  segments return synchronously; downloads return a `catalog` job.
+Segments are surfaces of the store surfaces are kept in: the project's, or the
+store chosen for surfaces. An Open Data sample is opened as a project of its
+own whose catalog surfaces are ordinary surfaces of it. A segment id is the
+surface's store UUID. Methods on segments need an open project and volume (-32000).
+
+- `segments.list` reports the listed surfaces: `id`, `name`, record `tags`,
+  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume)
+  and `active`; `loading` is true while a listing is still being read.
 - `segments.activate` validates before changing selection. Activating the
-  current segment is a no-op success. Placeholder materialization remains an
-  explicit fetch operation.
-- Delete and rename use dialog-free controller cores and preserve editing and
-  active-selection invariants.
-- `segments.review` derives review status and optional geometric/tag filters
-  without changing the current selection.
+  current segment is a no-op success. A catalog surface whose geometry is still
+  remote is fetched first (the call blocks while it downloads).
+- Catalog surfaces are edited, renamed, tagged and deleted in place like any
+  other; delete, rename and `tags.set` fail with -32009 only on a read-only store.
+- `segments.review` derives review status from the record tags, with optional
+  tag filters, without changing the current selection.
 
 ### Canvas and viewers
 
@@ -332,14 +336,14 @@ dialog.
 ### Segmentation editing
 
 - Editing must have an active materialized segment.
-- `segmentation.grow` accepts tracer, corrections, and patch-tracer growth.
+- `segmentation.grow` accepts tracer and corrections growth.
   Manual add is an editing mode, not a growth method.
 - Explicit save returns `jobId:null` when nothing is dirty; otherwise it
   creates an `autosave` job completed by the real save signal.
 - Manual-add begin/finish, line mode, interpolation, undo, correction point
   mode, push/pull, and synthetic canvas input all use the active
   `SegmentationModule` session.
-- `segmentation.grow_patch_from_seed`, tracing, rendering, and reoptimization
+- `segmentation.grow_surface_from_seed`, tracing, rendering, and reoptimization
   use the existing command-runner lifecycle and never open the interactive
   console or parameter dialogs.
 
@@ -351,29 +355,25 @@ values may be finite floats or null where the method declares clearing.
 Metadata and tags are idempotent setters. Save/load methods use explicit paths
 and never open file pickers.
 
-### Lasagna, atlas, and fibers
+### Lasagna and fibers
 
 - Lasagna service and job queries use deferred responses from the service
   manager. Optimization is tracked as a `lasagna` job.
-- Atlas open, remap, result selection, and candidate optimization use
-  dialog-free `CWindow` operations. Only bridge-started searches become
-  `atlas` jobs.
 - Fiber ids are strings on the wire. Bulk deletion validates every id before
   removing any fiber. Import/export paths are explicit. Save waits for the
   controller's persistence completion signal.
-- Fiber launch and create-atlas operations suppress dataset pickers and atlas
-  rebuild prompts; missing prerequisites become ordinary errors.
+- Fiber launch suppresses dataset pickers; missing prerequisites become
+  ordinary errors.
 
 ### Seeding, rendering, flattening, and mesh operations
 
-- Seeding run and expand share one `seeding` source. Preview, cast, reset, and
-  path analysis are synchronous requests over the existing widget state.
+- Seeding run and expand share one `seeding` source. Reset and path analysis
+  are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
-- SLIM, ABF, and straighten share the `flatten` source and application
+- SLIM and straighten share the `flatten` source and application
   lifecycle.
-- Crop and area recalculation are synchronous. Mask generation and append use
-  deferred completion from the in-process renderer.
+- Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
 
 ## MCP behavior
@@ -416,20 +416,10 @@ is the sole bridge method without an MCP tool.
 |---|---|---|
 | `vc3d_activate_segment` | `segments.activate` | Make a segment the active editing target (the programmatic equivalent of clicking it in the segment list). Required before `vc3d_enable_editing` / `vc3d_grow_segment` and after any segment switch. |
 | `vc3d_add_point_collection` | `points.add_collection` |
-| `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
-| `vc3d_attach_segments` | `segments.attach` | Attach a local tifxyz segment, or a folder containing tifxyz segments, to the open volume package. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
-| `vc3d_atlas_open_result` | `atlas.open_result` |
-| `vc3d_atlas_open` | `atlas.open` |
-| `vc3d_atlas_optimize_snap_candidates` | `atlas.optimize_snap_candidates` |
-| `vc3d_atlas_remap` | `atlas.remap` |
-| `vc3d_atlas_search_cancel` | `atlas.search_cancel` |
-| `vc3d_atlas_search_results` | `atlas.search_results` |
-| `vc3d_atlas_search_start` | `atlas.search_start` |
-| `vc3d_atlas_status` | `atlas.status` |
 | `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
-| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
+| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_clear_all_points` | `points.clear_all` |
 | `vc3d_clear_point_collection` | `points.clear_collection` |
@@ -437,15 +427,12 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_editable_segment_copy` | `segments.create_editable_copy` | Copy a fetched immutable Open Data catalog segment into the project's editable storage, attach it, and activate it. Idempotently reuses an existing copy. |
-| `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one local zarr volume or remote `.zarr` URL without opening it. |
+| `vc3d_create_project` | `project.create` | Create a `.vcproj` project that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
-| `vc3d_delete_segment` | `segments.delete` | Delete a segment from disk. **Irreversible** — requires `confirm=true`. Fails while segmentation editing is enabled; deleting the active segment is allowed. |
+| `vc3d_delete_segment` | `segments.delete` | Retire a surface in its store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on read-only stores. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
-| `vc3d_fetch_segment` | `segments.fetch` | Download ("materialize") an open-data placeholder segment so it can be activated/edited. Sync if already materialized; else a `"catalog"` job (`wait` defaults true). |
-| `vc3d_fiber_create_atlas` | `fiber.create_atlas` |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |
@@ -455,16 +442,14 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_save` | `fiber.save` |
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
-| `vc3d_flatten_abf` | `flatten.abf` |
 | `vc3d_flatten_slim` | `flatten.slim` |
 | `vc3d_flatten_straighten` | `flatten.straighten` |
-| `vc3d_generate_segment_mask` | `segment.generate_mask` | Render a segment's binary mask. Blocks until the render completes (130 s client timeout); no job to poll. |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
-| `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
-| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
-| `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
-| `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
+| `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
+| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
+| `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
+| `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |
@@ -477,42 +462,35 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_catalog_samples` | `catalog.list_samples` | List samples available to open from the Open Data catalog; use this for discovery when no volume package is loaded. |
 | `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package and the active workspace's selection. |
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
-| `vc3d_list_segments` | `segments.list` | List segments in the open volume package with loaded/active flags. |
+| `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
-| `vc3d_load_points_json` | `points.load_json` |
-| `vc3d_load_points_segment_path` | `points.load_segment_path` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
-| `vc3d_open_volume` | `volume.open` | Open a volume package (.volpkg / .volpkg.json / zarr project) and optionally select a volume id. |
+| `vc3d_open_volume` | `volume.open` | Open a project (.vcproj) and optionally select a volume id. |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |
 | `vc3d_push_pull_stop` | `segmentation.push_pull.stop` |
-| `vc3d_recalc_segment_area` | `segment.recalc_area` | Recompute surface area for one or more segments. Synchronous. |
 | `vc3d_refine_segment_alpha_comp` | `segment.refine_alpha_comp` | Alpha-composite refinement of a segment. Asynchronous (`source:"tool"`); rejects remote volumes; supports `wait: bool = false` (30-minute cap). |
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
 | `vc3d_remove_point` | `points.remove_point` |
 | `vc3d_rename_point_collection` | `points.rename_collection` |
-| `vc3d_rename_segment` | `segments.rename` | Rename a segment (id + folder). `new_name` must match `^[a-zA-Z0-9_-]+$`, differ from the current name, and not collide. Fails while editing is enabled. |
+| `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails in a read-only store. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
 | `vc3d_reset_windings` | `points.reset_windings` |
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_run_trace` | `tracer.run_trace` |
-| `vc3d_save_points_json` | `points.save_json` |
-| `vc3d_save_points_segment_path` | `points.save_segment_path` |
-| `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
+| `vc3d_save_segment` | `segmentation.save` | Write the active segment's pending edits to the store now. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
 | `vc3d_seeding_cancel` | `seeding.cancel` |
-| `vc3d_seeding_cast_rays` | `seeding.cast_rays` |
 | `vc3d_seeding_expand` | `seeding.expand` |
-| `vc3d_seeding_preview_rays` | `seeding.preview_rays` |
 | `vc3d_seeding_reset_points` | `seeding.reset_points` |
 | `vc3d_seeding_run` | `seeding.run` |
 | `vc3d_seeding_set_winding_annotation_mode` | `seeding.set_winding_annotation_mode` |
@@ -520,7 +498,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
 | `vc3d_set_hud` | `viewer.set_hud` | Turn the slice viewers' measurement overlays (histogram, line profile, coordinate grid, loupe) on or off; with a profile line, returns the gray values, peaks and length along it. |
-| `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
+| `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines viewers draw; stored surfaces (UUIDs) are drawn on every plane viewer. |
 | `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
@@ -572,7 +550,7 @@ volume-package fixtures and is intentionally separate from hermetic CI.
 - Some jobs expose no cancellation authority.
 - Viewer settings that exist only on live viewer instances fall back to
   persisted defaults when no viewer exists.
-- External tools, remote catalogs, atlas data, Lasagna services, and real
-  fixture geometry require their corresponding runtime resources.
+- External tools, remote catalogs, Lasagna services, and real fixture
+  geometry require their corresponding runtime resources.
 - The local bridge is a trusted-user control surface, not a remote security
   boundary.

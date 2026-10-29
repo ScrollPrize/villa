@@ -21,6 +21,8 @@ public:
     HubWorker(ObjectStore& replica, const HubSessionOptions&, std::function<void()> statusChanged);
     ~HubWorker();
     void requestSync(bool afterAction);
+    // Blocks until a sync started after this call has finished; returns its status.
+    HubSessionStatus syncAndWait(std::chrono::milliseconds timeout);
     void requestResolve(const std::string& keep);
     LeaseHold hold(const std::vector<std::string>& objects);
     HubSessionStatus status() const;
@@ -36,7 +38,8 @@ private:
     std::shared_ptr<HubLeaseCounts> leases_ = std::make_shared<HubLeaseCounts>();
     std::mutex hub_;
     mutable std::mutex mutex_;
-    std::condition_variable wake_;
+    std::condition_variable wake_, synced_;
+    uint64_t started_ = 0, finished_ = 0;
     bool stopping_ = false;
     std::chrono::steady_clock::time_point due_;
     std::optional<std::string> resolve_;

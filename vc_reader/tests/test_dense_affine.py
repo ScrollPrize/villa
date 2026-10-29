@@ -1,17 +1,12 @@
 """Affine CT sampling across dense boxes, sparse grids and source boundaries."""
 import itertools
 import json
-import os
-from pathlib import Path
-import sys
 
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import cuda
 from vc_reader.reader import ZarrReader
@@ -78,40 +73,3 @@ def test_affine_sampling(tmp_path, shape, origin, axes, threads):
             with reader.cuda() as device:
                 actual = device.read_affine(shape, origin, axes, source='chunks').numpy()
                 np.testing.assert_allclose(actual, expected, atol=6e-5, rtol=3e-7)
-
-
-def test_zscore_float_extremes_and_cancellation():
-    from vc_reader import transforms as a
-    rng = np.random.default_rng(391)
-    inputs = [rng.normal(size=(1, 31, 33, 35)).astype(np.float32),
-        np.full((1, 17, 19), 1e6, np.float32), np.zeros((1, 9, 13), np.float32),
-        np.full((1, 9, 13), np.finfo(np.float32).max, np.float32),
-        np.resize(np.array([-1, 0, 1], np.float32)*np.finfo(np.float32).max, (1, 13, 17)),
-        np.resize(np.array([0, 1, 2], np.float32)*np.nextafter(np.float32(0), np.float32(1)), (1, 13, 17))]
-    inputs[1].ravel()[::3] += .125
-    for image in inputs:
-        wide = image.astype(np.float64)
-        for eps in (0., 1e-6):
-            divisor = max(wide.std(), eps)
-            expected = (wide-wide.mean())/divisor if divisor else np.zeros_like(wide)
-            for backend in (('cpu', 'cuda') if cuda.is_available() else ('cpu',)):
-                pipe = a.Pipeline([a.Normalize('zscore', nonzero=False, eps=eps)], backend=backend)
-                actual = pipe({'image': image}, seed=0)['image']
-                np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
-    for invalid in (np.nan, np.inf, -np.inf):
-        image = np.zeros((1, 9, 13), np.float32)
-        image[0, 3, 2] = invalid
-        with pytest.raises((ValueError, RuntimeError)):
-            a.Pipeline([a.Normalize('zscore', nonzero=False)])({'image': image}, seed=0)
-
-
-@pytest.mark.skipif(os.environ.get('VC_READER_LARGE_TESTS') != '1', reason='Requires a 2 GiB CPU array')
-def test_zscore_large_constant():
-    from vc_reader import transforms as a
-    # A nonbinary constant and odd count make rounding of an unsegmented
-    # double sum observable as a false nonzero standard deviation.
-    value = np.nextafter(np.float32(1), np.float32(0))
-    image = np.full((1, 1, (1 << 29)+35), value, np.float32)
-    pipe = a.Pipeline([a.Normalize('zscore', nonzero=False)], backend='cpu')
-    actual = pipe({'image': image}, seed=0, inplace=True)['image']
-    assert np.count_nonzero(actual) == 0

@@ -90,11 +90,8 @@ public:
     uint64_t selectedFiberId() const { return _selectedFiberId; }
     std::vector<uint64_t> selectedFiberIds() const;
     bool canDeleteSelection() const;
-    bool canCreateAtlasFromSelection() const;
-    bool canShowFiberSlice() const;
     bool canRenameFiberFile() const;
     std::vector<uint64_t> orderedFiberIds() const;
-    QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     // The listed fibers: one store catalog page. Entries without details load
     // them through fiberDetailsRequested when selected or expanded.
@@ -108,10 +105,8 @@ public:
     // the selected fiber's header line, the total at the top) read in
     // centimetres; unset, they stay in voxels and the column header says so.
     void setAnnotationVoxelSizeUm(std::optional<double> voxelSizeUm);
-    [[nodiscard]] std::optional<double> annotationVoxelSizeUm() const { return _voxelSizeUm; }
     // Sum of every listed fiber's lengthVx (finite values only).
     [[nodiscard]] double totalLengthVx() const;
-    void setAlignmentMetricsPending(bool pending);
     void updateAlignmentMetrics(uint64_t fiberId,
                                 const FiberEntry::AlignmentMetrics& alignment,
                                 const std::vector<FiberEntry::AlignmentMetrics>& spanAlignments);
@@ -138,10 +133,8 @@ signals:
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
-    void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
-    void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void importFibersRequested();
     void exportFibersRequested();
@@ -205,7 +198,6 @@ private:
     void applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled);
     void requestFiberTagChange(const QString& tag, bool enabled);
     void requestDeleteSelectedFibers();
-    void requestShowFiberSlice();
     void requestRenameFiberFile();
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString displayNameForFiber(const FiberEntry& fiber);
@@ -239,7 +231,6 @@ private:
     QSlider* _traceSlider = nullptr;
     QPushButton* _openInLineAnnotationButton = nullptr;
     QLabel* _annotationStatusLabel = nullptr;
-    bool _lineAnnotationActive = false;
     QLabel* _totalLengthLabel = nullptr;
     QCheckBox* _calcMetricsCheckBox;
     QTreeView* _treeView;

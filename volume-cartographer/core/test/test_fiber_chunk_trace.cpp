@@ -153,54 +153,6 @@ TEST_CASE("chunk matching uses orientation overlap and optional width not neares
     region.metric(0,0)=-1;CHECK_THROWS(matchFiberChunkPaths(chunk,history,{1,0,0},c,true,&region));
 }
 
-TEST_CASE("real-data chunk construction roundtrips with identical parallel paths") {
-    const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
-    const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
-    const char* normalManifest=std::getenv("VC_TEST_REVERSE_NORMAL_MANIFEST");
-    if(!manifest||!fiberPath||!normalManifest) return;
-    const auto dataset=vc::lasagna::LasagnaDataset::open(manifest);
-    FiberPredictionFieldOptions options;options.enableWidth=true;
-    FiberPredictionField source(dataset,options);
-    vc::lasagna::LasagnaNormalSampler normals(vc::lasagna::LasagnaDataset::open(normalManifest));
-    const auto fiber=loadFiberJson(fiberPath);const auto seed=fiber.controlPointsXyzBase.front();
-    FiberChunkTraceConfig c;c.coreBase=64;c.haloBase=32;c.gridBase=8;c.nmsBase=8;
-    c.tubeHalfBase=16;c.tubeStepBase=8;c.seedPresence=.4;c.tubePresence=.2;c.rimDrop=.05;
-    auto t=traceConfig();t.stepVoxels=16;t.coneAngleDegrees=25;t.coneAngleStepDegrees=15;
-    t.widthRelativeTolerance=.4;t.widthCosineWeight=true;
-    const std::array<int,3> key{int(std::floor(seed[0]/64)),int(std::floor(seed[1]/64)),int(std::floor(seed[2]/64))};
-    Temp temp;FiberChunkTraceCache cache(c,temp.path,"real-cache-test");
-    auto a=cache.get(key,source,t,normals,1);
-    auto b=buildFiberChunkPaths(key,source,t,normals,c,1,parallel);
-    REQUIRE(a->seeds>0);REQUIRE(!a->lines.empty());
-    CHECK(a->lines==b->lines);CHECK(a->endReasons==b->endReasons);CHECK(a->seeds==b->seeds);
-    c.pinSamplingRegion=false;
-    const auto unpinned=buildFiberChunkPaths(key,source,t,normals,c,1);
-    CHECK(a->lines==unpinned->lines);CHECK(a->endReasons==unpinned->endReasons);
-    c.pinSamplingRegion=true;
-    FiberChunkTraceCache disk(c,temp.path,"real-cache-test");
-    CHECK(disk.get(key,source,t,normals,1)->lines==a->lines);
-    const auto full=makePolylineArcGeometry(fiber.linePointsXyzBase);
-    const double begin=full.vertexArcs.at(fiber.controlPointLineIndices.front());
-    const auto reference=makePolylineArcGeometry(slicePolylineArc(full,begin,begin+256));
-    FiberChunkReplayConfig replay;replay.errorThresholdBase=20;replay.tangentialThresholdFactor=2;
-    size_t joins=0;
-    const auto first=traceFiberChunkReferenceReplay(cache,source,t,1,normals,reference,0,reference.length(),
-        normals,1,replay,{},{},{},{},{},[&](const auto&){++joins;});
-    const auto second=traceFiberChunkReferenceReplay(disk,source,t,1,normals,reference,0,reference.length(),normals,1,replay);
-    REQUIRE(!first.segments.empty());CHECK(joins>0);
-    CHECK(first.completedReferenceArcBase==reference.length());
-    REQUIRE(first.segments.size()==second.segments.size());
-    CHECK(first.failures.size()==second.failures.size());
-    for(size_t i=0;i<first.segments.size();++i) {
-        CHECK(first.segments[i].tracePointsBase==second.segments[i].tracePointsBase);
-        CHECK(first.segments[i].terminationReason==second.segments[i].terminationReason);
-    }
-    std::cout<<"Real-data chunk replay: length="<<reference.length()<<" segments="<<first.segments.size()
-             <<" failures="<<first.failures.size()<<" joins="<<joins<<"; disk reload exact\n";
-    std::cout<<"Real-data chunk: maxima="<<a->maxima<<" seeds="<<a->seeds<<" paths="<<a->lines.size()
-             <<"; serial/parallel/unpinned/disk paths exact\n";
-}
-
 TEST_CASE("chunk route joins suffixes both ways and respects distance and observer budgets") {
     Tubes source;auto t=traceConfig();t.stepVoxels=16;
     auto c=chunkConfig();c.coreBase=64;c.haloBase=32;

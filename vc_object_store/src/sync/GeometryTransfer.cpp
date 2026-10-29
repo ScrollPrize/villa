@@ -112,7 +112,8 @@ void GeometryStage::install(sqlite3* destination, const std::string& objectUuid)
             GeometryReader incoming(destination, revision.uuid);
             continue;
         }
-        for (const auto& [name, array] : nlohmann::json::parse(revision.manifest).at("arrays").items()) {
+        const auto manifest = nlohmann::json::parse(revision.manifest);
+        for (const auto& [name, array] : manifest.at("arrays").items()) {
             if (!array.contains("source_revision")) continue;
             GeometryReader inherited(destination, array.at("source_revision").get<std::string>(), false);
             auto original = inherited.manifest().at("arrays").at(name);

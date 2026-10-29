@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <QObject>
 #include <QFutureWatcher>
@@ -23,17 +24,10 @@ class CWindow;
 class Volume;
 
 namespace vc3d::opendata {
-struct OpenDataSample;
+
 struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
-
-// Options for opening an Open Data sample. `selection` restricts attached
-// resources; `interactive` permits prompts, progress dialogs, and message boxes.
-struct OpenDataSampleOpenOptions {
-    vc3d::opendata::OpenDataResourceSelection selection;
-    bool interactive{true};
-};
 
 class MenuActionController : public QObject
 {
@@ -41,44 +35,34 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
-    static constexpr size_t kMaxRecentObjectStores = 10;
 
     explicit MenuActionController(CWindow* window);
     ~MenuActionController() override;
 
     void populateMenus(QMenuBar* menuBar);
     void updateRecentVolpkgList(const QString& path);
-    void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     bool openVolpkgAt(const QString& path,
                       bool interactive = true,
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
-    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved) and attaches it.
-    bool attachObjectStore();
-    // Prompts for a new .vcobj location, creates an empty store there and attaches it.
-    bool createObjectStore();
-    // With no store attached, explains that `purpose` needs one and offers to
-    // create or attach one. True once a store is attached.
-    bool requireObjectStore(const QString& purpose);
+    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved)
+    // and attaches it beside the project; with `kind`, objects of that kind are
+    // then kept in it. True once attached.
+    bool attachStore(bool readOnly = false, const std::string& kind = {});
+    // With no project open, explains that `purpose` needs one and offers to
+    // create or open one. True once a project is open.
+    bool requireProject(const QString& purpose);
     // Author recorded on edits: the saved username, asked for until it is not "anon".
     // Empty means cancelled.
     QString objectStoreAuthor();
-    void cloneHostedStore();
-    void detachObjectStore();
-    // Resolves sampleId against the cached manifest and opens it. When
-    // interactive is false, prompts, progress dialogs, and message boxes are
-    // suppressed.
-    bool openOpenDataSampleById(const QString& sampleId, bool interactive = true);
-
-    // Opens a sample with explicit resource selection. resultOut receives the
-    // attachment counters and messages when provided.
-    bool openOpenDataSampleById(const QString& sampleId,
-                                const OpenDataSampleOpenOptions& options,
-                                QString* errorMessage = nullptr,
-                                vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
-
+    // Clones a hosted store to a local replica, then opens it as the project
+    // or attaches it beside the project.
+    void cloneHostedStore(bool asProject);
+    // Collects a kind, a source folder and an optional volume binding, then ingests
+    // it into the kind's store in the background (vc::objects::ingestGeometrySource).
+    void importIntoObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
         bool success{false};
@@ -90,14 +74,13 @@ public:
     // returns immediately.
     //
     // Returns false (with *errorMessage) on synchronous precondition failure (no
-    // window/state, empty/unknown id, manifest unavailable, or an open already in
-    // flight). Returns true once the background task started; exactly one GUI-thread
+    // window/state, or an open already in flight). Returns true once the background task started; exactly one GUI-thread
     // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
-    // with the same stream the interactive QProgressDialog consumes.
-    // options.interactive is ignored; this entry point is always non-interactive.
+    // with the same stream the interactive QProgressDialog consumes. `selection`
+    // restricts the attached resources. This entry point is always non-interactive.
     bool startOpenDataSampleOpen(
-        const QString& sampleId,
-        const OpenDataSampleOpenOptions& options,
+        const vcr::catalog::OpenDataSample& sample,
+        const vc3d::opendata::OpenDataResourceSelection& selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
         std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},
         QString* errorMessage = nullptr);
@@ -105,23 +88,29 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
-private slots:
+    // Remove a project entry (volume, normal grid or Lasagna dataset) by
+    // location, after asking.
+    void detachEntryAt(const QString& location);
+    // Open Data: the sample's project store, made or refreshed from the catalog.
+    void resetOpenDataProject();
+
+public slots:
     void newProject();
+    void newStore();
     void saveProjectAs();
     void attachVolume();
-    void attachSegments();
     void attachNormalGrid();
-    void attachUmbilicus();
-    void detachUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
-    void detachEntry();
-    void setOutputSegments();
-    void convertLegacyVolpkg();
     void openVolpkg();
-    void openRecentVolpkg();
     void attachRemoteZarr();
     void showSettingsDialog();
+
+private slots:
+    void importUmbilicus();
+    void removeUmbilicus();
+    void detachEntry();
+    void openRecentVolpkg();
     void showAboutDialog();
     void showKeybindings();
     void resetSegmentationViews();
@@ -131,17 +120,15 @@ private slots:
     void applyMeasurementOverlays();
     void surfaceFromSelection();
     void clearSelection();
-    void importObjAsPatch();
     void beginRotateSurfaceTransform();
-    void materializeCurrentOpenDataSegmentFolder();
     void exitApplication();
 
 signals:
-    // Emitted when the user picks Actions -> Merge tifxyz... CWindow
-    // wires this to SegmentationCommandHandler::onMergeTifxyz with an
+    // Emitted when the user picks Actions -> Merge Surfaces... CWindow
+    // wires this to SegmentationCommandHandler::onMergeSurfaces with an
     // empty seed list so the dialog opens with an empty grid.
-    void mergeTifxyzFromMenuRequested();
-    // Emitted when the user picks Actions -> Patch tifxyz... CWindow
+    void mergeSurfacesFromMenuRequested();
+    // Emitted when the user picks Actions -> Patch Surface... CWindow
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
@@ -149,14 +136,8 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
-    // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
-    bool attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
-    // remote: a replica of a hosted store.
-    struct RecentObjectStore { QString path; bool readOnly{false}; bool remote{false}; };
-    std::vector<RecentObjectStore> loadRecentObjectStores() const;
-    void saveRecentObjectStores(const std::vector<RecentObjectStore>& stores);
-    void refreshRecentObjectStoreMenu();
-    void openRecentObjectStore(const RecentObjectStore& store);
+    // The Stores menu: the stores beside the project and the store each kind uses.
+    void refreshStoresMenu();
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
@@ -166,21 +147,20 @@ private:
     void updateRecentRemoteList(const QString& url);
     void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
-    void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
-    void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
+    void beginLasagnaManifestAttachment(bool remote);
+    void attachCatalogRepresentation(const vcr::catalog::OpenDataSample& sample,
+                                     const vcr::catalog::OpenDataRepresentationRef& ref);
     struct LasagnaAttachTaskResult;
-    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
-                            bool interactive = true,
+    // Interactive: prompts before replacing the open project and shows progress.
+    bool openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
-                            QString* errorMessage = nullptr,
-                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr,
                             const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
     // parented to this; completion and onFinished run on the GUI thread.
     void beginOpenDataSampleOpenTask(
-        const vc3d::opendata::OpenDataSample& sample,
+        const vcr::catalog::OpenDataSample& sample,
         bool interactive,
         const vc3d::opendata::OpenDataResourceSelection* selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
@@ -193,10 +173,6 @@ private:
                                   OpenDataSampleOpenOutcome* outcomeOut);
     void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
     void cancelOpenDataVolumePrefills();
-    // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
-    // prompts the user for an output .volpkg.json, and returns the written path
-    // via `convertedOut` on success.
-    bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -216,21 +192,17 @@ private:
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
     QMenu* _measurementMenu{nullptr};
-    QMenu* _objectStoreMenu{nullptr};
-    QMenu* _recentObjectStoreMenu{nullptr};
+    QMenu* _storesMenu{nullptr};
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
-    QAction* _attachSegmentsAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
-    QAction* _attachUmbilicusAct{nullptr};
-    QAction* _detachUmbilicusAct{nullptr};
+    QAction* _importUmbilicusAct{nullptr};
+    QAction* _removeUmbilicusAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};
-    QAction* _setOutputSegmentsAct{nullptr};
-    QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
     QAction* _openDataCatalogAct{nullptr};
@@ -249,13 +221,10 @@ private:
     QAction* _hudLoupeAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
-    QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
-    QAction* _mergeTifxyzAct{nullptr};
+    QAction* _mergeSurfacesAct{nullptr};
     QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
-    QAction* _materializeOpenDataFolderAct{nullptr};
-    QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;

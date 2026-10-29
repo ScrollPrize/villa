@@ -173,7 +173,7 @@ PointChainBuildResult buildPointChain(
         result.error = PointChainBuildError::InvalidSurface;
         return result;
     }
-    result.samples.push_back({anchors.front().surface, anchors.front().volume, true, 0});
+    result.samples.push_back({anchors.front().surface, anchors.front().volume});
     if (anchors.size() == 1) return result;
 
     std::vector<QPointF> tessellatedCurve;
@@ -242,9 +242,9 @@ PointChainBuildResult buildPointChain(
                 result.error = PointChainBuildError::InvalidSurface;
                 return result;
             }
-            result.samples.push_back({surface, *volume, false, span});
+            result.samples.push_back({surface, *volume});
         }
-        result.samples.push_back({end.surface, end.volume, true, span + 1});
+        result.samples.push_back({end.surface, end.volume});
     }
 
     if (selfIntersects(tessellatedCurve)) {

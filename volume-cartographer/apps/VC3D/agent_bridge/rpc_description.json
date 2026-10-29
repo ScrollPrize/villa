@@ -1,185 +1,5 @@
 {
   "methods": {
-    "atlas.open": {
-      "errors": [
-        -32602,
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "paramRenames": {
-          "atlasDir": "atlas_dir"
-        },
-        "tool": "vc3d_atlas_open"
-      },
-      "params": {
-        "properties": {
-          "atlasDir": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "atlasDir"
-        ],
-        "type": "object"
-      }
-    },
-    "atlas.open_result": {
-      "errors": [
-        -32602,
-        -32007,
-        -32005,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_open_result"
-      },
-      "params": {
-        "properties": {
-          "index": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "index"
-        ],
-        "type": "object"
-      }
-    },
-    "atlas.optimize_snap_candidates": {
-      "errors": [
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_optimize_snap_candidates"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.remap": {
-      "errors": [
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_remap"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.search_cancel": {
-      "errors": [
-        -32007
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_search_cancel"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.search_results": {
-      "errors": [
-        -32602,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_search_results"
-      },
-      "params": {
-        "properties": {
-          "limit": {
-            "default": 100,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "offset": {
-            "default": 0,
-            "maximum": 2147483647,
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      }
-    },
-    "atlas.search_start": {
-      "errors": [
-        -32602,
-        -32004,
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "excludedTags": "excluded_tags",
-          "maxDistance": "max_distance",
-          "requiredTags": "required_tags"
-        },
-        "tool": "vc3d_atlas_search_start"
-      },
-      "params": {
-        "properties": {
-          "excludedTags": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "maxDistance": {
-            "minimum": 0,
-            "type": "number"
-          },
-          "mode": {
-            "default": "atlas_to_non_atlas",
-            "enum": [
-              "atlas_to_non_atlas",
-              "non_atlas_only"
-            ],
-            "type": "string"
-          },
-          "requiredTags": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      }
-    },
-    "atlas.status": {
-      "errors": [],
-      "mcp": {
-        "tool": "vc3d_atlas_status"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
     "canvas.click": {
       "errors": [
         -32602,
@@ -596,35 +416,6 @@
         "type": "object"
       }
     },
-    "fiber.create_atlas": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32007,
-        -32005
-      ],
-      "mcp": {
-        "paramRenames": {
-          "fiberId": "fiber_id"
-        },
-        "tool": "vc3d_fiber_create_atlas"
-      },
-      "params": {
-        "properties": {
-          "fiberId": {
-            "type": [
-              "string",
-              "integer"
-            ]
-          }
-        },
-        "required": [
-          "fiberId"
-        ],
-        "type": "object"
-      }
-    },
     "fiber.delete": {
       "errors": [
         -32602,
@@ -903,49 +694,6 @@
         "type": "object"
       }
     },
-    "flatten.abf": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32005,
-        -32007,
-        -32009
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "downsampleFactor": "downsample_factor",
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_flatten_abf"
-      },
-      "params": {
-        "properties": {
-          "downsampleFactor": {
-            "default": 1,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "iterations": {
-            "default": 10,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "flatten.slim": {
       "errors": [
         -32602,
@@ -965,7 +713,7 @@
           "energyType": "energy_type",
           "inpaintHoles": "inpaint_holes",
           "keepPercent": "keep_percent",
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "segmentId": "segment_id"
         },
         "tool": "vc3d_flatten_slim"
@@ -999,7 +747,7 @@
             "maximum": 100,
             "type": "number"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
           },
           "segmentId": {
@@ -1033,7 +781,7 @@
           "wait"
         ],
         "paramRenames": {
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "overlapPasses": "overlap_passes",
           "segmentId": "segment_id",
           "trimMaxEdge": "trim_max_edge",
@@ -1047,7 +795,7 @@
             "default": true,
             "type": "boolean"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
           },
           "overlapPasses": {
@@ -1230,16 +978,19 @@
         -32007
       ],
       "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
         "tool": "vc3d_lasagna_select_output"
       },
       "params": {
         "properties": {
-          "name": {
+          "segmentId": {
             "type": "string"
           }
         },
         "required": [
-          "name"
+          "segmentId"
         ],
         "type": "object"
       }
@@ -1268,29 +1019,20 @@
           "wait"
         ],
         "paramRenames": {
-          "atlasPath": "atlas_path",
-          "configPath": "config_path",
-          "initShellDir": "init_shell_dir"
+          "configPath": "config_path"
         },
         "tool": "vc3d_lasagna_start_optimization"
       },
       "params": {
         "properties": {
-          "atlasPath": {
-            "type": "string"
-          },
           "configPath": {
-            "type": "string"
-          },
-          "initShellDir": {
             "type": "string"
           },
           "mode": {
             "enum": [
               "reoptimize",
               "new_model",
-              "offset",
-              "atlas"
+              "offset"
             ],
             "type": "string"
           },
@@ -1523,51 +1265,6 @@
         "type": "object"
       }
     },
-    "points.load_json": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_load_points_json"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
-    "points.load_segment_path": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentPath": "segment_path"
-        },
-        "tool": "vc3d_load_points_segment_path"
-      },
-      "params": {
-        "properties": {
-          "segmentPath": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentPath"
-        ],
-        "type": "object"
-      }
-    },
     "points.remove_collection_tag": {
       "errors": [
         -32000,
@@ -1679,51 +1376,6 @@
       },
       "params": {
         "properties": {},
-        "type": "object"
-      }
-    },
-    "points.save_json": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_save_points_json"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
-    "points.save_segment_path": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentPath": "segment_path"
-        },
-        "tool": "vc3d_save_points_segment_path"
-      },
-      "params": {
-        "properties": {
-          "segmentPath": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentPath"
-        ],
         "type": "object"
       }
     },
@@ -1985,6 +1637,9 @@
         -32010
       ],
       "mcp": {
+        "paramRenames": {
+          "newStore": "new_store"
+        },
         "tool": "vc3d_create_project"
       },
       "params": {
@@ -1992,11 +1647,17 @@
           "name": {
             "type": "string"
           },
+          "newStore": {
+            "type": "string"
+          },
           "overwrite": {
             "default": false,
             "type": "boolean"
           },
           "path": {
+            "type": "string"
+          },
+          "store": {
             "type": "string"
           },
           "tags": {
@@ -2166,21 +1827,6 @@
         "type": "object"
       }
     },
-    "seeding.cast_rays": {
-      "errors": [
-        -32000,
-        -32001,
-        -32007,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_seeding_cast_rays"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
     "seeding.expand": {
       "errors": [
         -32000,
@@ -2196,21 +1842,6 @@
           "wait"
         ],
         "tool": "vc3d_seeding_expand"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "seeding.preview_rays": {
-      "errors": [
-        -32000,
-        -32001,
-        -32007,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_seeding_preview_rays"
       },
       "params": {
         "properties": {},
@@ -2274,33 +1905,6 @@
         "type": "object"
       }
     },
-    "segment.append_mask": {
-      "errors": [
-        -32602,
-        -32000,
-        -32001,
-        -32004,
-        -32005,
-        -32007
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_append_segment_mask"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "segment.crop_bounds": {
       "errors": [
         -32602,
@@ -2329,59 +1933,6 @@
         "type": "object"
       }
     },
-    "segment.generate_mask": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32005,
-        -32007
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_generate_segment_mask"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
-    "segment.recalc_area": {
-      "errors": [
-        -32602,
-        -32000,
-        -32001
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentIds": "segment_ids"
-        },
-        "tool": "vc3d_recalc_segment_area"
-      },
-      "params": {
-        "properties": {
-          "segmentIds": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "segmentIds"
-        ],
-        "type": "object"
-      }
-    },
     "segment.refine_alpha_comp": {
       "errors": [
         -32602,
@@ -2400,8 +1951,9 @@
         "paramRenames": {
           "borderOff": "border_off",
           "genVertexColor": "gen_vertex_color",
+          "inPlace": "in_place",
           "ompThreads": "omp_threads",
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "readerScale": "reader_scale",
           "scaleGroup": "scale_group",
           "segmentId": "segment_id"
@@ -2424,6 +1976,10 @@
             "minimum": -2147483648,
             "type": "integer"
           },
+          "inPlace": {
+            "default": false,
+            "type": "boolean"
+          },
           "low": {
             "default": 26,
             "maximum": 2147483647,
@@ -2435,12 +1991,8 @@
             "minimum": -2147483648,
             "type": "integer"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
-          },
-          "overwrite": {
-            "default": true,
-            "type": "boolean"
           },
           "radius": {
             "default": 3,
@@ -2629,7 +2181,7 @@
         "type": "object"
       }
     },
-    "segmentation.grow_patch_from_seed": {
+    "segmentation.grow_surface_from_seed": {
       "errors": [
         -32602,
         -32000,
@@ -2646,10 +2198,10 @@
         ],
         "paramRenames": {
           "minAreaCm": "min_area_cm",
-          "outputDir": "output_dir",
+          "outputTag": "output_tag",
           "volumeId": "volume_id"
         },
-        "tool": "vc3d_grow_patch_from_seed"
+        "tool": "vc3d_grow_surface_from_seed"
       },
       "params": {
         "properties": {
@@ -2664,7 +2216,8 @@
             "minimum": 0,
             "type": "number"
           },
-          "outputDir": {
+          "outputTag": {
+            "default": "paths",
             "type": "string"
           },
           "seed": {
@@ -2926,75 +2479,10 @@
         -32005
       ],
       "mcp": {
-        "extraParams": [
-          "auto_fetch"
-        ],
         "paramRenames": {
           "segmentId": "segment_id"
         },
         "tool": "vc3d_activate_segment"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
-    "segments.attach": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32007,
-        -32005,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_attach_segments"
-      },
-      "params": {
-        "properties": {
-          "location": {
-            "type": "string"
-          },
-          "select": {
-            "default": true,
-            "type": "boolean"
-          },
-          "tags": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "location"
-        ],
-        "type": "object"
-      }
-    },
-    "segments.create_editable_copy": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32005,
-        -32007,
-        -32009,
-        -32010
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_create_editable_segment_copy"
       },
       "params": {
         "properties": {
@@ -3038,53 +2526,16 @@
         "type": "object"
       }
     },
-    "segments.fetch": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32004,
-        -32007
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_fetch_segment"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "segments.list": {
       "errors": [
         -32602,
         -32000
       ],
       "mcp": {
-        "paramRenames": {
-          "onlyLoaded": "only_loaded"
-        },
         "tool": "vc3d_list_segments"
       },
       "params": {
-        "properties": {
-          "onlyLoaded": {
-            "default": false,
-            "type": "boolean"
-          }
-        },
+        "properties": {},
         "type": "object"
       }
     },
@@ -3125,9 +2576,6 @@
         -32000
       ],
       "mcp": {
-        "paramRenames": {
-          "onlyLoaded": "only_loaded"
-        },
         "tool": "vc3d_review_segments"
       },
       "params": {
@@ -3157,10 +2605,6 @@
               }
             },
             "type": "object"
-          },
-          "onlyLoaded": {
-            "default": false,
-            "type": "boolean"
           }
         },
         "type": "object"
@@ -3231,9 +2675,10 @@
         ],
         "paramRenames": {
           "ompThreads": "omp_threads",
-          "outputDir": "output_dir",
+          "outputTag": "output_tag",
           "paramOverrides": "param_overrides",
-          "segmentId": "segment_id"
+          "segmentId": "segment_id",
+          "sourceTag": "source_tag"
         },
         "tool": "vc3d_run_trace"
       },
@@ -3244,7 +2689,8 @@
             "minimum": -2147483648,
             "type": "integer"
           },
-          "outputDir": {
+          "outputTag": {
+            "default": "traces",
             "type": "string"
           },
           "paramOverrides": {
@@ -3255,6 +2701,10 @@
             ]
           },
           "segmentId": {
+            "type": "string"
+          },
+          "sourceTag": {
+            "default": "paths",
             "type": "string"
           }
         },
@@ -3605,16 +3055,13 @@
       "mcp": {
         "paramRenames": {
           "highlightedSurfaceIds": "highlighted_surface_ids",
-          "intersectionMaxSurfaces": "intersection_max_surfaces",
           "intersectionOpacity": "intersection_opacity",
           "intersectionThickness": "intersection_thickness",
           "normalArrowLengthScale": "normal_arrow_length_scale",
           "normalMaxArrows": "normal_max_arrows",
           "overlayOpacity": "overlay_opacity",
           "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
-          "samplingStride": "sampling_stride",
           "segmentationCursorMirroring": "segmentation_cursor_mirroring",
-          "showDirectionHints": "show_direction_hints",
           "showSurfaceNormals": "show_surface_normals",
           "surfaceOverlayEnabled": "surface_overlay_enabled",
           "volumeWindow": "volume_window",
@@ -3629,11 +3076,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "intersectionMaxSurfaces": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
           },
           "intersectionOpacity": {
             "type": "number"
@@ -3655,15 +3097,7 @@
           "planeIntersectionLinesVisible": {
             "type": "boolean"
           },
-          "samplingStride": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
-          },
           "segmentationCursorMirroring": {
-            "type": "boolean"
-          },
-          "showDirectionHints": {
             "type": "boolean"
           },
           "showSurfaceNormals": {
@@ -3833,7 +3267,7 @@
             "enum": [
               "main",
               "lasagna",
-              "fiber_slice"
+              "project"
             ],
             "type": "string"
           }

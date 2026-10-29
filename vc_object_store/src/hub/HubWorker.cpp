@@ -78,6 +78,18 @@ void HubWorker::requestSync(bool afterAction)
     wake_.notify_all();
 }
 
+HubSessionStatus HubWorker::syncAndWait(std::chrono::milliseconds timeout)
+{
+    std::unique_lock lock(mutex_);
+    const auto target = started_ + 1;
+    due_ = std::chrono::steady_clock::now();
+    wake_.notify_all();
+    if (!synced_.wait_for(lock, timeout, [&] { return finished_ >= target; }))
+        throw std::runtime_error("hub: no sync finished within " + std::to_string(timeout.count()) + " ms" +
+                                 (status_.error.empty() ? std::string() : ": " + status_.error));
+    return status_;
+}
+
 void HubWorker::requestResolve(const std::string& keep)
 {
     if (keep != "hub" && keep != "local") throw std::invalid_argument("hub: keep must be \"hub\" or \"local\"");
@@ -180,6 +192,7 @@ void HubWorker::run()
         wake_.wait_until(lock, due_, [&] { return stopping_ || std::chrono::steady_clock::now() >= due_; });
         if (stopping_) return;
         due_ = std::chrono::steady_clock::now() + options_.syncInterval;
+        ++started_;
         const auto resolve = std::exchange(resolve_, std::nullopt);
         const auto previous = status_;
         lock.unlock();
@@ -194,6 +207,8 @@ void HubWorker::run()
         }
         lock.lock();
         status_ = next;
+        ++finished_;
+        synced_.notify_all();
         lock.unlock();
         statusChanged_();
         lock.lock();

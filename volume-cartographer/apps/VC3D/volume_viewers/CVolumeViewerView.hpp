@@ -26,7 +26,6 @@ public:
     void leaveEvent(QEvent *event) override;
     bool viewportEvent(QEvent* event) override;
     void wheelEvent(QWheelEvent *event) override;
-    void scrollContentsBy(int dx, int dy) override;
     void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
@@ -91,7 +90,6 @@ public:
 
 signals:
     void sendResized();
-    void sendScrolled();
     void sendZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers);
     void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);

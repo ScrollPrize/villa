@@ -7,15 +7,8 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 import operator
 import os
-from pathlib import Path
 
-
-def load_build(directory=None):
-    """Use an existing build, including in spawned workers; never install it."""
-    directory = directory or os.environ.get('VC_READER_BUILD_DIR')
-    if directory:
-        from extension_build import load_extensions
-        load_extensions(Path(directory))
+from build_support import load_build
 
 
 @dataclass(frozen=True)

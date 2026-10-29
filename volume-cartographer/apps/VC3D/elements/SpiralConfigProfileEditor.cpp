@@ -287,9 +287,6 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _profileCombo->setToolTip(tr("Default uses the active Python/checkpoint configuration. "
                                  "Saved profiles are available to every Spiral connection."));
     profileRow->addWidget(_profileCombo, 1);
-    _popButton = new QPushButton(tr("Pop Out"), _editorContents);
-    _popButton->setObjectName(QStringLiteral("spiralAdvancedPopOut"));
-    profileRow->addWidget(_popButton);
     editorLayout->addLayout(profileRow);
 
     auto* buttonRow = new QHBoxLayout;
@@ -321,11 +318,9 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _statusLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
     _statusLabel->hide();
     editorLayout->addWidget(_statusLabel);
-    root->addWidget(_editorContents);
 
-    _inlinePopInButton = new QPushButton(tr("Advanced JSON is open in a separate window — Pop In"), this);
+    _inlinePopInButton = new QPushButton(tr("Open Spiral Configuration…"), this);
     _inlinePopInButton->setObjectName(QStringLiteral("spiralAdvancedPopIn"));
-    _inlinePopInButton->hide();
     root->addWidget(_inlinePopInButton);
 
     _dialog = new QDialog(this, Qt::Window);
@@ -335,9 +330,6 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _dialog->resize(1280, 760);
     _dialog->setLayout(new QVBoxLayout);
     _dialog->installEventFilter(this);
-    root->removeWidget(_editorContents);
-    _inlinePopInButton->setText(tr("Open Spiral Configuration…"));
-    _inlinePopInButton->show();
     auto* tabs = new QTabWidget(_dialog);
     _controlsPage = new QWidget(tabs);
     auto* controlsLayout = new QVBoxLayout(_controlsPage);
@@ -355,7 +347,6 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     tabs->addTab(_controlsPage, tr("Controls"));
     tabs->addTab(_editorContents, tr("Expert JSON"));
     _dialog->layout()->addWidget(tabs);
-    _poppedOut = true;
 
     connect(_profileCombo, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int index) {
@@ -370,7 +361,6 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
             this, &SpiralConfigProfileEditor::renameCurrent);
     connect(_deleteButton, &QPushButton::clicked,
             this, &SpiralConfigProfileEditor::deleteCurrent);
-    _popButton->hide();
     connect(_inlinePopInButton, &QPushButton::clicked,
             this, &SpiralConfigProfileEditor::showWindow);
     connect(_search, &QLineEdit::textChanged,
@@ -1028,44 +1018,4 @@ SpiralConfigProfileEditor::findStored(const QString& id) const
 {
     for (const StoredProfile& profile : _profiles) if (profile.id == id) return &profile;
     return nullptr;
-}
-
-void SpiralConfigProfileEditor::popOut()
-{
-    if (_poppedOut) return;
-    // Reparenting the live controls is presentation-only.  Some Qt platform
-    // styles emit editor/combo notifications while a focused widget changes
-    // native windows; those must not turn Default into Custom or make the
-    // containing Spiral panel compare a fictitious config edit.
-    const QSignalBlocker textBlocker(_textEdit);
-    const QSignalBlocker profileBlocker(_profileCombo);
-    const bool wasProgrammatic = _programmatic;
-    _programmatic = true;
-    layout()->removeWidget(_editorContents);
-    _editorContents->setParent(_dialog);
-    _dialog->layout()->addWidget(_editorContents);
-    _inlinePopInButton->show();
-    _popButton->setText(tr("Pop In"));
-    _poppedOut = true;
-    _dialog->show();
-    _dialog->raise();
-    _dialog->activateWindow();
-    _programmatic = wasProgrammatic;
-}
-
-void SpiralConfigProfileEditor::popIn()
-{
-    if (!_poppedOut) return;
-    const QSignalBlocker textBlocker(_textEdit);
-    const QSignalBlocker profileBlocker(_profileCombo);
-    const bool wasProgrammatic = _programmatic;
-    _programmatic = true;
-    _dialog->layout()->removeWidget(_editorContents);
-    _editorContents->setParent(this);
-    static_cast<QVBoxLayout*>(layout())->insertWidget(0, _editorContents);
-    _inlinePopInButton->hide();
-    _popButton->setText(tr("Pop Out"));
-    _poppedOut = false;
-    _dialog->hide();
-    _programmatic = wasProgrammatic;
 }

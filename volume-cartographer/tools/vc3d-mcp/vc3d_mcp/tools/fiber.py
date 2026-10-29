@@ -152,21 +152,6 @@ async def vc3d_fiber_set_tag(fiber_id: str, tag: str, enabled: bool) -> dict[str
 
 
 @mcp.tool()
-async def vc3d_fiber_create_atlas(fiber_id: str) -> dict[str, Any]:
-    """Create a single-fiber atlas from a saved fiber and display it
-    (dialog-free). SYNCHRONOUS and potentially slow (heavy geometry work on
-    the app thread) -- allow a generous client timeout. Requires a
-    manifest-backed Lasagna dataset resolvable for the currently selected
-    volume (a "lasagna"-kind representation, NOT a "normal_grids" store or the
-    vc3d_lasagna_* fit service), AND that dataset's manifest must provide
-    init_shell_dir -- a dataset can resolve for tracing yet still fail atlas
-    creation if that atlas-only field is absent. Returns {"atlasDir",
-    "displayed"} (plus displayDetail when display failed but creation
-    succeeded)."""
-    return await _call("fiber.create_atlas", {"fiberId": fiber_id})
-
-
-@mcp.tool()
 async def vc3d_fiber_export(path: str) -> dict[str, Any]:
     """Export ALL saved fibers to one vc3d_fiber_collection JSON bundle at
     `path` (headless; no dialog). Coordinates and their grid shape are preserved.

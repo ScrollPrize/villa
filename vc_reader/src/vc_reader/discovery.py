@@ -210,7 +210,7 @@ class RelationshipIndex:
                         ), role="label", axes=axes,
                     ), same_grid=True,
                 ) for name in ("supervision", "validation", "mapping_validity")
-                if name in (labels.properties.get("arrays") or ()))
+                if name in labels.arrays)
             elif artifact.type == T.TIFXYZ_TRANSFORMED:
                 storage = _storage(artifact, format='tifxyz')
                 registration = SurfaceRegistration(self._surface_descriptor(sample, artifact, target, identifier), origin='catalog')
@@ -227,8 +227,7 @@ class RelationshipIndex:
 
         supersedes = ()
         if artifact.type != T.INK_LABELS:
-            declared = artifact.properties.get("supersedes") or ()
-            declared = (declared,) if isinstance(declared, str) else declared
+            declared = artifact.supersedes
             prefix = identifier.split("/id/")[0] if artifact.id is not None else identifier.split("/snapshot/")[0]
             supersedes = tuple(v if v.startswith(("catalog:", "user:")) else prefix + "/id/" + quote(v, safe="")
                                for v in declared)
