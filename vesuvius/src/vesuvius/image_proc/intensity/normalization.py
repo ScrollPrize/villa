@@ -12,6 +12,7 @@ __all__ = [
     "normalize_zscore",
     "normalize_ct",
     "normalize_robust",
+    "normalize_robust_histogram",
     "DEFAULT_TARGET_DTYPE",
     "NORMALIZATION_FUNCTIONS",
 ]
@@ -235,6 +236,171 @@ def normalize_robust(
 
     np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return arr
+
+
+def _is_integer_valued_uint8(image: np.ndarray) -> bool:
+    """True when every value is an integer in ``[0, 255]``."""
+
+    if image.size == 0 or image.dtype.kind not in "iuf":
+        return False
+    if image.dtype.kind in "iu":
+        return bool(float(image.min()) >= 0.0 and float(image.max()) <= 255.0)
+    if float(image.min()) < 0.0 or float(image.max()) > 255.0:
+        return False
+    # NaN would pass the bounds test above.
+    if not bool(np.isfinite(image).all()):
+        return False
+    return bool(np.array_equal(image, np.rint(image)))
+
+
+def _histogram_input(image: np.ndarray) -> np.ndarray:
+    """Flat uint8 view for ``np.bincount``."""
+
+    if image.dtype == np.uint8:
+        return image.reshape(-1)
+    return image.astype(np.uint8, copy=False).reshape(-1)
+
+
+def _virtual_index(n: int, percentile: float) -> float:
+    """numpy's linear-method virtual index for ``(n, percentile)``, in float64 for bit-identity."""
+
+    quantile = np.true_divide(float(percentile), 100.0)
+    return float(n) * quantile + (1.0 + quantile * (1.0 - 1.0 - 1.0)) - 1.0
+
+
+def _percentile_from_histogram(histogram: np.ndarray, percentile: float) -> np.float32:
+    """Linear-method percentile from a ``0..255`` histogram, mirroring ``np.percentile`` bit for bit."""
+
+    cumulative = np.cumsum(histogram)
+    total = int(cumulative[-1])
+    if total == 0:
+        return np.float32("nan")
+    position = _virtual_index(total, percentile)
+    lower_index = int(np.floor(position))
+    fraction = position - lower_index
+    value_a = int(np.searchsorted(cumulative, lower_index + 1))
+    if fraction == 0.0:
+        return np.float32(value_a)
+    value_b = int(np.searchsorted(cumulative, min(lower_index + 2, total)))
+    difference = np.float64(np.float32(value_b - value_a))
+    if fraction >= 0.5:
+        interpolated = np.float64(value_b) - difference * (1.0 - fraction)
+    else:
+        interpolated = np.float64(value_a) + difference * fraction
+    return np.float32(interpolated)
+
+
+def _median_weighted(values: np.ndarray, weights: np.ndarray) -> np.float32:
+    """``np.median`` of a weighted value list, mirroring numpy exactly (even n: float32 mean)."""
+
+    cumulative = np.cumsum(weights)
+    total = int(cumulative[-1])
+    if total == 0:
+        return np.float32("nan")
+    if total % 2 == 1:
+        index = int(np.searchsorted(cumulative, total // 2 + 1))
+        return np.float32(values[index])
+    index_a = int(np.searchsorted(cumulative, total // 2))
+    index_b = int(np.searchsorted(cumulative, total // 2 + 1))
+    value_a = np.float32(values[index_a])
+    value_b = np.float32(values[index_b])
+    return np.float32((value_a + value_b) / np.float32(2.0))
+
+
+def _histogram_robust_statistics(
+    values: np.ndarray,
+) -> Tuple[np.float32, np.float32, np.float32, np.float32, bool]:
+    """Return ``(lower, upper, median, scaled_mad, degenerate)`` for an integer multiset.
+
+    ``degenerate`` is True when the MAD collapsed and ``normalize_robust`` must take its ``np.std``
+    fallback, which the fast path must not guess.
+    """
+
+    histogram = np.bincount(values, minlength=256).astype(np.float64)
+    lower = np.float32(_percentile_from_histogram(histogram, 1.0))
+    upper = np.float32(_percentile_from_histogram(histogram, 99.0))
+
+    indices = np.arange(256)
+    below = histogram[indices < float(lower)].sum()
+    above = histogram[indices > float(upper)].sum()
+    interior = (indices >= float(lower)) & (indices <= float(upper))
+    values_list = np.concatenate(
+        [[float(lower)], indices[interior].astype(np.float64), [float(upper)]]
+    )
+    weights_list = np.concatenate([[below], histogram[interior], [above]])
+    keep = weights_list > 0
+    values_list, weights_list = values_list[keep], weights_list[keep]
+    order = np.argsort(values_list, kind="stable")
+    values_list, weights_list = values_list[order], weights_list[order]
+
+    median = _median_weighted(values_list, weights_list)
+    deviations = np.abs(values_list.astype(np.float32) - median).astype(np.float64)
+    deviation_order = np.argsort(deviations, kind="stable")
+    mad = _median_weighted(deviations[deviation_order], weights_list[deviation_order])
+
+    scaled_mad = 1.4826 * float(mad)
+    if not np.isfinite(scaled_mad) or scaled_mad < 1e-6:
+        return lower, upper, median, np.float32(scaled_mad), True
+    return lower, upper, median, np.float32(scaled_mad), False
+
+
+def normalize_robust_histogram(
+    image: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+    use_mask: bool = False,
+    percentile_lower: float = 1.0,
+    percentile_upper: float = 99.0,
+    clip_values: bool = True,
+    target_dtype: np.dtype | type = DEFAULT_TARGET_DTYPE,
+) -> np.ndarray:
+    """Bit-identical fast path of :func:`normalize_robust` for integer-valued patches.
+
+    Used only for integer values in ``[0, 255]``, no mask, default percentiles, clipping and float32
+    target; anything else, including the degenerate-MAD case, is delegated to :func:`normalize_robust`.
+    """
+
+    arr = np.asarray(image)
+    use_fast_path = (
+        not use_mask
+        and mask is None
+        and bool(clip_values)
+        and float(percentile_lower) == 1.0
+        and float(percentile_upper) == 99.0
+        and np.dtype(target_dtype) == np.dtype(DEFAULT_TARGET_DTYPE)
+        and _is_integer_valued_uint8(arr)
+    )
+    if not use_fast_path:
+        return normalize_robust(
+            image,
+            mask=mask,
+            use_mask=use_mask,
+            percentile_lower=percentile_lower,
+            percentile_upper=percentile_upper,
+            clip_values=clip_values,
+            target_dtype=target_dtype,
+        )
+
+    lower, upper, median, scaled_mad, degenerate = _histogram_robust_statistics(
+        _histogram_input(arr)
+    )
+    if degenerate:
+        return normalize_robust(
+            image,
+            mask=mask,
+            use_mask=use_mask,
+            percentile_lower=percentile_lower,
+            percentile_upper=percentile_upper,
+            clip_values=clip_values,
+            target_dtype=target_dtype,
+        )
+
+    normalized = np.array(arr, dtype=np.float32, copy=True)
+    np.clip(normalized, lower, upper, out=normalized)
+    normalized -= median
+    normalized /= scaled_mad
+    np.nan_to_num(normalized, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return normalized
 
 
 def _normalize_identity(

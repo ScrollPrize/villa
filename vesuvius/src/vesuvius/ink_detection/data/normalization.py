@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from vesuvius.ink_detection.config import NormalizationConfig
-from vesuvius.image_proc.intensity.normalization import normalize_robust
+from vesuvius.image_proc.intensity.normalization import normalize_robust_histogram
 
 
 def normalize_image(
@@ -29,7 +29,7 @@ def normalize_image(
         )
         return image_f32
     if config.mode == "robust_mad":
-        return normalize_robust(
+        return normalize_robust_histogram(
             image_f32,
             percentile_lower=config.percentile_lower,
             percentile_upper=config.percentile_upper,

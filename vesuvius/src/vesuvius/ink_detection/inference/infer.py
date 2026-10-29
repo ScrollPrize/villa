@@ -111,9 +111,9 @@ def normalize_flat_patch(
     """Normalize one reader-processed ZYX patch by the legacy flat contract."""
 
     if preprocessing == "tifxyz_robust":
-        from vesuvius.image_proc.intensity.normalization import normalize_robust
+        from vesuvius.image_proc.intensity.normalization import normalize_robust_histogram
 
-        return np.ascontiguousarray(normalize_robust(patch_ZYX))
+        return np.ascontiguousarray(normalize_robust_histogram(patch_ZYX))
     if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0
@@ -1087,6 +1087,18 @@ def infer_single_zarr(
         blend_mode,
         bool(args.tta_mirror),
     )
+    chunk_volume = max(1, depth) * max(1, chunk_h) * max(1, chunk_w)
+    patch_volume = max(1, configured_model.input_depth) * patch_size * patch_size
+    if chunk_volume > 8 * patch_volume:
+        LOGGER.warning(
+            "Surface-volume chunks are %.0fx the inference patch (%d vs %d voxels); each "
+            "patch read must decompress a whole chunk, which can dominate runtime with the "
+            "GPU idle. Re-chunking the render (chunks near 128x128 in y/x) removed 3.2x of "
+            "wall time on a real scroll winding in our measurements.",
+            chunk_volume / patch_volume,
+            chunk_volume,
+            patch_volume,
+        )
     reader = FlatPatchReader(
         input_path=input_zarr,
         resolution=resolution,
