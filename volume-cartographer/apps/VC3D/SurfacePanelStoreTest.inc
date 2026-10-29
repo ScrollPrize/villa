@@ -20,8 +20,11 @@ namespace {
 // Open a store as the state's project, as VC3D opens one.
 void openStoreAsProject(CState& state, const QString& path, const QString& author)
 {
-    const auto attachment = state.attachProjectStore(path.toStdString(), author);
-    state.setVpkg(VolumePkg::open(state.objectStoreSession(), attachment, author.toStdString()));
+    auto projectPath = std::filesystem::path(path.toStdString());
+    projectPath.replace_extension(".vcproj");
+    if (!std::filesystem::exists(projectPath))
+        vc::project::ProjectDocument::create(projectPath, "test", path.toStdString(), false);
+    state.setVpkg(VolumePkg::open(projectPath));
 }
 }
 int runSurfacePanelStoreTests()
@@ -40,7 +43,7 @@ int runSurfacePanelStoreTests()
 
         CState state;
         openStoreAsProject(state, QString::fromStdString(path.string()), "surface-panel-test");
-        auto attachment = *state.projectAttachment();
+        auto attachment = *state.storeFor("surface");
         cv::Mat_<cv::Vec3f> points(3, 3);
         for (int r = 0; r < 3; ++r)
             for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 2.f};
@@ -164,7 +167,7 @@ int runSurfacePanelStoreTests()
 
         // The sample's store is a project like any other: opening it closes the other.
         openStoreAsProject(state, QString::fromStdString(catalogPath.string()), "surface-panel-test");
-        const auto catalogAttachment = *state.projectAttachment();
+        const auto catalogAttachment = *state.storeFor("surface");
         require(!state.objectStoreSession()->current(attachment), "the previous project's store is detached");
         // The level the open volume shows, as the catalog registers it.
         vc::objects::registerVolumeTransform(*state.objectStoreSession(), catalogAttachment, "catalog-volume", "panel-volume",

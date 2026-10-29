@@ -969,7 +969,7 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
     }));
 }
 
-TEST_CASE("A sample's project is a store that names its sample")
+TEST_CASE("A sample's project file names its sample and references its store")
 {
     auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto sample = *manifest.findSample("PHerc0139");
@@ -979,17 +979,18 @@ TEST_CASE("A sample's project is a store that names its sample")
     vc::objects::OpenOptions options;
     options.author = "vc-test";
 
-    const auto path = root / "empty.vcobj";
-    createSampleProjectStore(path, sample, "Empty chosen project", options);
-    CHECK_THROWS(createSampleProjectStore(path, sample, "again", options));
+    const auto path = root / "empty.vcproj";
+    createSampleProjectFiles(path, sample, "Empty chosen project", options);
+    CHECK_THROWS(createSampleProjectFiles(path, sample, "again", options));
     auto session = std::make_shared<vc::objects::ObjectStoreSession>();
-    const auto project = session->attach(path, options);
-    CHECK(openDataProjectSample(*session, project) == std::optional<std::string>("PHerc0139"));
+    auto storePath = path; storePath.replace_extension(".vcobj");
+    const auto project = session->attach(storePath, options);
+    CHECK(openDataProjectSample(*VolumePkg::open(path, {.deferResolution = true})) == std::optional<std::string>("PHerc0139"));
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
     selection.representations.emplace();
     selection.segmentIds.emplace();
-    auto empty = createOpenDataSampleProject(session, project, "vc-test", sample, root, nullptr, {}, &selection);
+    auto empty = createOpenDataSampleProject(session, path, project, sample, root, nullptr, {}, &selection);
     CHECK(empty->volumeEntries().empty());
     CHECK(empty->selectedLasagnaDataset().empty());
     CHECK(empty->name() == "Empty chosen project");
@@ -998,7 +999,7 @@ TEST_CASE("A sample's project is a store that names its sample")
 
     // Any other store is not a sample's project.
     const auto plain = vc::test::createTestProject();
-    CHECK_FALSE(openDataProjectSample(*plain.session, plain.attachment));
+    CHECK_FALSE(openDataProjectSample(*plain.open()));
     std::filesystem::remove_all(root);
 }
 
@@ -1058,19 +1059,20 @@ TEST_CASE("Reopening a sample's project keeps what the user changed")
                       ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
     const auto path = sampleProjectPath(root, sample);
-    CHECK(path == root / "open_data" / "Sample_With_Spaces.vcobj");
+    CHECK(path == root / "open_data" / "Sample_With_Spaces.vcproj");
     vc::objects::OpenOptions options;
     options.author = "vc-test";
-    createSampleProjectStore(path, sample, sample.id, options);
+    createSampleProjectFiles(path, sample, sample.id, options);
     auto session = std::make_shared<vc::objects::ObjectStoreSession>();
-    const auto project = session->attach(path, options);
+    auto storePath = path; storePath.replace_extension(".vcobj");
+    const auto project = session->attach(storePath, options);
 
-    auto first = createOpenDataSampleProject(session, project, "vc-test", sample, root);
+    auto first = createOpenDataSampleProject(session, path, project, sample, root);
     CHECK(first->path() == path);
     first->setSelectedLasagnaDataset("user-marker");
     REQUIRE(first->addVolumeEntry("/user/volume.zarr"));
 
-    auto second = createOpenDataSampleProject(session, project, "vc-test", sample, root);
+    auto second = createOpenDataSampleProject(session, path, project, sample, root);
     CHECK(second->selectedLasagnaDataset() == "user-marker");
     CHECK(std::any_of(second->volumeEntries().begin(), second->volumeEntries().end(),
                       [](const auto& entry) { return entry.location == "/user/volume.zarr"; }));

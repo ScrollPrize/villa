@@ -15,7 +15,7 @@
 #include "utils/Json.hpp"
 #include "vc/core/util/Rect3D.hpp"
 
-#include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include "vc/core/types/ProjectDocument.hpp"
 
 class Volume;
 
@@ -74,12 +74,7 @@ struct AnnotationVolume {
 
 }
 
-// A project: an object store (vc_object_store/objects/Project.hpp) and the
-// volumes, normal grids and Lasagna datasets its resource records reference,
-// opened. Changes are written to the store at once. Remote locations are shared
-// with everyone using the project; local paths are the author's own, as are
-// their focus bounds and Lasagna selections (their project_view). Relative
-// local locations resolve against the store's directory.
+// Resources opened from a standalone .vcproj workspace document.
 class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
@@ -99,27 +94,22 @@ public:
         std::shared_ptr<Volume> volume;
     };
 
-    // The project in `attachment` of `session`, read and written as `author`.
-    static std::shared_ptr<VolumePkg> open(std::shared_ptr<vc::objects::ObjectStoreSession> session,
-                                           const vc::objects::AttachmentIdentity& attachment,
-                                           const std::string& author,
+    static std::shared_ptr<VolumePkg> open(const std::filesystem::path& path,
                                            const vc::project::LoadOptions& opts = {});
+    vc::project::ProjectDocument& document() { return document_; }
+    const vc::project::ProjectDocument& document() const { return document_; }
 
     ~VolumePkg();
 
-    [[nodiscard]] const std::shared_ptr<vc::objects::ObjectStoreSession>& session() const { return session_; }
-    [[nodiscard]] const vc::objects::AttachmentIdentity& attachment() const { return attachment_; }
-    // The store file, and the directory relative locations resolve against.
     [[nodiscard]] std::filesystem::path path() const { return path_; }
     [[nodiscard]] std::filesystem::path directory() const { return path_.parent_path(); }
     [[nodiscard]] bool writable() const;
 
-    // The project record's name; the store's file name without one.
+    // The project document's name.
     [[nodiscard]] std::string name() const;
     void setName(const std::string& v);
 
-    // Follow the store: entries added elsewhere (another replica, a teammate)
-    // are resolved and removed ones dropped. True when the entries changed.
+    // Reload the project file, resolving added resources and dropping removed ones.
     bool reload();
 
     [[nodiscard]] const std::vector<vc::project::Entry>& volumeEntries() const;
@@ -130,8 +120,7 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& allLasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
-    // Who a location's resource belongs to: no one (shared, empty) for a
-    // remote one, the author for a local path.
+    // Resources belong to the project file; returns empty (no per-author ownership).
     [[nodiscard]] std::string entryOwner(const std::string& location) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
@@ -164,7 +153,7 @@ public:
     [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
     // Bounds are source annotation-frame XYZ, never current-volume voxel units.
     void setFocusBounds(std::optional<Rect3D> bounds, bool enabled);
-    // The volume the author last viewed (empty when none).
+    // The last viewed volume (empty when none).
     [[nodiscard]] std::string currentVolumeId() const { return currentVolumeId_; }
     void setCurrentVolumeId(const std::string& id);
 
@@ -201,9 +190,7 @@ public:
 private:
     VolumePkg();
 
-    std::shared_ptr<vc::objects::ObjectStoreSession> session_;
-    vc::objects::AttachmentIdentity attachment_;
-    std::string author_;
+    vc::project::ProjectDocument document_;
     std::filesystem::path path_;
     std::string name_;
     vc::project::LoadOptions opts_;
@@ -225,11 +212,12 @@ private:
     void resolveVolumeEntry(const vc::project::Entry& e);
     void resolveNormalGridEntry(const vc::project::Entry& e);
 
-    // Read the project record, resources and the author's view from the store.
-    void readStore();
+    // Read resources and view state from the document.
+    void readDocument();
     // Write one resource; false when it is already there, unchanged.
     bool writeEntry(const char* kind, const vc::project::Entry& entry);
     void writeView();
+    nlohmann::json viewJson() const;
     // Drop loaded volumes no entry backs any more and resolve the entries
     // that are not in `previous`.
     void followEntries(const std::vector<vc::project::Entry>& previous);

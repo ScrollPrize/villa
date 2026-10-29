@@ -18,6 +18,7 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QFileInfo>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -63,6 +64,8 @@ QString kindTitle(const std::string& kind)
     if (kind == "surface") return QObject::tr("Surfaces");
     if (kind == "fiber") return QObject::tr("Fibers");
     if (kind == "point_collection") return QObject::tr("Point collections");
+    if (kind == "umbilicus") return QObject::tr("Umbilici");
+    if (kind == "volume_transform") return QObject::tr("Registrations");
     return QString::fromStdString(kind);
 }
 
@@ -147,8 +150,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     auto* empty = new QWidget(_pages);
     auto* emptyLayout = new QVBoxLayout(empty);
     emptyLayout->addStretch(1);
-    auto* emptyText = new QLabel(tr("No project is open.\n\nA project is an object store (.vcobj): it lists the "
-                                    "volumes and other data you work with and holds your surfaces, fibers "
+    auto* emptyText = new QLabel(tr("No project is open.\n\nA project file (.vcproj) lists the "
+                                    "volumes and stores you work with. Stores hold your surfaces, fibers "
                                     "and point collections."), empty);
     emptyText->setAlignment(Qt::AlignCenter);
     emptyText->setWordWrap(true);
@@ -203,7 +206,7 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
         projectForm->addRow(title, label);
         return label;
     };
-    _storePath = addLabel(tr("Store:"));
+    _storePath = addLabel(tr("Project file:"));
     _directory = addLabel(tr("Folder:"));
     _access = addLabel(tr("Access:"));
     _hosting = addLabel(tr("Hosting:"));
@@ -279,44 +282,51 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     connect(_stores, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateStoreButtons);
     storeLayout->addWidget(_stores);
     auto* storeButtons = new QHBoxLayout;
+    auto* storeTools = new QHBoxLayout;
+    connect(button(tr("New Store..."), storeBox, storeButtons), &QPushButton::clicked, _menu, &MenuActionController::newStore);
     connect(button(tr("Attach Store..."), storeBox, storeButtons), &QPushButton::clicked, this,
             [this]() { _menu->attachStore(false); });
     connect(button(tr("Attach Read-only..."), storeBox, storeButtons), &QPushButton::clicked, this,
             [this]() { _menu->attachStore(true); });
-    connect(button(tr("Clone Hosted Store..."), storeBox, storeButtons), &QPushButton::clicked, this,
+    connect(button(tr("Clone Hosted Store..."), storeBox, storeTools), &QPushButton::clicked, this,
             [this]() { _menu->cloneHostedStore(false); });
-    connect(button(tr("Import from Folder..."), storeBox, storeButtons), &QPushButton::clicked, _menu,
+    connect(button(tr("Import from Folder..."), storeBox, storeTools), &QPushButton::clicked, _menu,
             &MenuActionController::importIntoObjectStore);
-    _syncStores = button(tr("Sync Hosted Now"), storeBox, storeButtons);
+    _syncStores = button(tr("Sync Hosted Now"), storeBox, storeTools);
     connect(_syncStores, &QPushButton::clicked, this, [this]() {
         const auto session = _state->objectStoreSession();
         std::vector<vc::objects::AttachmentIdentity> stores = _state->attachedStores();
-        if (const auto project = _state->projectAttachment()) stores.insert(stores.begin(), *project);
         for (const auto& store : stores)
             if (session->hubStatus(store)) session->syncHub(store);
         emit hubSyncRequested();
     });
-    _revealStore = button(tr("Open Folder"), storeBox, storeButtons);
+    _revealStore = button(tr("Open Folder"), storeBox, storeTools);
     connect(_revealStore, &QPushButton::clicked, this, [this]() {
         if (const auto store = selectedStore())
             reveal(QString::fromStdString(_state->objectStoreSession()->path(*store).string()));
     });
     _detachStore = button(tr("Detach"), storeBox, storeButtons);
     connect(_detachStore, &QPushButton::clicked, this, [this]() {
-        const auto store = selectedStore();
-        if (!store || store == _state->projectAttachment()) return;
-        if (QMessageBox::question(this, tr("Detach Store"),
-                tr("Detach %1 from this project?\n\nThe store file is kept; objects routed to it are "
-                   "shown from the project's store again.").arg(storeDisplayName(*store)),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
-            return;
-        try { _state->detachStore(*store); }
+        const auto* item = _stores->currentItem();
+        if (!item) return;
+        try { _state->detachStoreReference(item->data(0, kStoreIndexRole).toString().toStdString()); }
         catch (const std::exception& error) {
             QMessageBox::critical(this, tr("Cannot detach store"), QString::fromUtf8(error.what()));
         }
     });
+    connect(button(tr("Locate / Replace..."), storeBox, storeButtons), &QPushButton::clicked, this, [this]() {
+        const auto* item = _stores->currentItem();
+        if (!item || !_state->vpkg() || !_state->vpkg()->writable()) return;
+        const auto id = item->data(0, kStoreIndexRole).toString().toStdString();
+        const auto path = QFileDialog::getOpenFileName(this, tr("Locate Store"), _state->projectDirectory(), tr("Object store (*.vcobj)"));
+        if (path.isEmpty()) return;
+        try { _state->replaceStoreReference(id, path.toStdString()); }
+        catch (const std::exception& error) { QMessageBox::warning(this, tr("Cannot replace store"), QString::fromUtf8(error.what())); }
+    });
     storeButtons->addStretch(1);
+    storeTools->addStretch(1);
     storeLayout->addLayout(storeButtons);
+    storeLayout->addLayout(storeTools);
     auto* routesTitle = new QLabel(tr("Where new and listed objects are kept:"), storeBox);
     storeLayout->addWidget(routesTitle);
     _routesForm = new QFormLayout;
@@ -326,14 +336,7 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
         combo->setObjectName(QStringLiteral("projectRoute_%1").arg(QString::fromStdString(kind)));
         combo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
         connect(combo, &QComboBox::activated, this, [this, kind, combo](int index) {
-            std::optional<vc::objects::AttachmentIdentity> store;
-            if (index > 0) {
-                const auto attached = _state->attachedStores();
-                const int at = combo->itemData(index).toInt();
-                if (at < 0 || at >= int(attached.size())) return;
-                store = attached[size_t(at)];
-            }
-            try { _state->setStoreFor(kind, store); }
+            try { _state->setStoreSelection(kind, combo->itemData(index).toString().toStdString()); }
             catch (const std::exception& error) {
                 QMessageBox::warning(this, tr("Stores"), QString::fromUtf8(error.what()));
                 rebuildRoutes();
@@ -464,7 +467,7 @@ void ProjectWorkspace::hideEvent(QHideEvent* event)
 
 void ProjectWorkspace::rebuild()
 {
-    const bool open = _state->vpkg() && _state->projectAttachment();
+    const bool open = bool(_state->vpkg());
     _pages->setCurrentIndex(open ? 1 : 0);
     if (!open) return;
     rebuildProject();
@@ -482,40 +485,44 @@ QString ProjectWorkspace::storeDisplayName(const vc::objects::AttachmentIdentity
 void ProjectWorkspace::rebuildProject()
 {
     const auto pkg = _state->vpkg();
-    const auto project = *_state->projectAttachment();
     const auto session = _state->objectStoreSession();
     if (!_name->hasFocus()) _name->setText(QString::fromStdString(pkg->name()));
     _name->setReadOnly(!pkg->writable());
     _storePath->setText(QString::fromStdString(pkg->path().string()));
     _directory->setText(_state->projectDirectory());
     _access->setText(pkg->writable() ? tr("Read-write") : tr("Read-only"));
-    const auto hub = session->hubStatus(project);
-    _hosting->setText(hub ? tr("Hosted replica, %1").arg(hubStatusSummary(*hub)) : tr("Local store"));
+    _hosting->setText(tr("Local project file"));
     _author->setText(CState::storeAuthor());
-    const auto sample = vc3d::opendata::openDataProjectSample(*session, project);
+    const auto sample = vc3d::opendata::openDataProjectSample(*pkg);
     _sample->setText(sample ? tr("Made from sample %1").arg(QString::fromStdString(*sample)) : tr("—"));
     _resetOpenData->setVisible(sample.has_value());
-    _resetOpenData->setEnabled(sample && !hub);
+    _resetOpenData->setEnabled(sample && pkg->writable());
 }
 
 void ProjectWorkspace::rebuildStores()
 {
     const auto session = _state->objectStoreSession();
-    const auto project = *_state->projectAttachment();
     const auto attached = _state->attachedStores();
-    const auto selected = selectedStore();
+    const auto selectedId = _stores->currentItem() ? _stores->currentItem()->data(0, kStoreIndexRole).toString() : QString();
     QSignalBlocker block(_stores);
     _stores->clear();
-    std::vector<vc::objects::AttachmentIdentity> stores{project};
-    stores.insert(stores.end(), attached.begin(), attached.end());
-    for (size_t i = 0; i < stores.size(); ++i) {
-        const auto& store = stores[i];
+    for (const auto& reference : _state->vpkg()->document().data().at("stores")) {
+        const auto id = reference.at("id").get<std::string>();
+        const auto available = _state->storeReference(id);
         auto* item = new QTreeWidgetItem(_stores);
-        item->setData(0, kStoreIndexRole, int(i) - 1);  // -1: the project's store
+        item->setData(0, kStoreIndexRole, QString::fromStdString(id));
+        if (selectedId == QString::fromStdString(id)) _stores->setCurrentItem(item);
+        if (!available) {
+            item->setText(StoreName, QString::fromStdString(reference.at("location").get<std::string>()));
+            item->setText(StoreAccess, tr("Unavailable"));
+            item->setText(StorePath, QString::fromStdString(_state->vpkg()->document().resolve(reference.at("location")).string()));
+            continue;
+        }
+        const auto& store = *available;
         const auto path = session->path(store);
         item->setText(StoreName, QString::fromStdString(path.filename().string()));
         item->setToolTip(StoreName, tr("Store UUID %1").arg(QString::fromStdString(store.storeUuid)));
-        item->setText(StoreRole, i == 0 ? tr("Project") : tr("Attached"));
+        item->setText(StoreRole, tr("Attached"));
         item->setText(StoreAccess, session->writable(store) ? tr("Read-write") : tr("Read-only"));
         const auto hub = session->hubStatus(store);
         item->setText(StoreHosting, hub ? hubStatusSummary(*hub) : tr("Local"));
@@ -542,7 +549,6 @@ void ProjectWorkspace::rebuildStores()
         item->setText(StoreSize, ec ? QString() : bytes(size));
         item->setText(StorePath, QString::fromStdString(path.string()));
         item->setToolTip(StorePath, item->text(StorePath));
-        if (selected == store) _stores->setCurrentItem(item);
     }
     for (int c = 0; c < StorePath; ++c) _stores->resizeColumnToContents(c);
     // As tall as its rows, so the data list below gets the room.
@@ -554,22 +560,23 @@ void ProjectWorkspace::rebuildStores()
 
 void ProjectWorkspace::rebuildRoutes()
 {
-    const auto project = *_state->projectAttachment();
-    const auto attached = _state->attachedStores();
+    const auto& data = _state->vpkg()->document().data();
     const auto& kinds = CState::routableKinds();
     for (size_t k = 0; k < kinds.size(); ++k) {
         auto* combo = _routes[k];
         QSignalBlocker block(combo);
         combo->clear();
-        combo->addItem(tr("Project (%1)").arg(storeDisplayName(project)), -1);
-        const auto current = _state->storeFor(kinds[k]);
-        for (size_t i = 0; i < attached.size(); ++i) {
-            QString name = storeDisplayName(attached[i]);
-            if (!_state->objectStoreSession()->writable(attached[i])) name += tr(" [read-only]");
-            combo->addItem(name, int(i));
-            if (current == attached[i]) combo->setCurrentIndex(combo->count() - 1);
+        combo->addItem(tr("None"), QString());
+        for (const auto& reference : data.at("stores")) {
+            const auto id = reference.at("id").get<std::string>();
+            const auto store = _state->storeReference(id);
+            QString name = QString::fromStdString(reference.at("location").get<std::string>());
+            if (!store) name += tr(" [unavailable]");
+            else if (!_state->objectStoreSession()->writable(*store)) name += tr(" [read-only]");
+            combo->addItem(name, QString::fromStdString(id));
+            if (data.at("selections").at(kinds[k]) == id) combo->setCurrentIndex(combo->count() - 1);
         }
-        combo->setEnabled(!attached.empty());
+        combo->setEnabled(_state->vpkg()->writable());
     }
 }
 
@@ -587,19 +594,14 @@ void ProjectWorkspace::rebuildResources()
             ? QString::fromStdString(location)
             : QString::fromStdString(vc::project::resolveLocalPath(location, pkg->directory()).string()));
     };
-    const auto visibility = [&](const std::string& location) {
-        return pkg->entryOwner(location).empty() ? tr("Everyone") : tr("Only you");
-    };
     const auto entryItem = [&](QTreeWidgetItem* parent, const vc::project::Entry& entry) {
         auto* item = new QTreeWidgetItem(parent);
         const auto location = QString::fromStdString(entry.location);
         item->setText(ResName, QFileInfo(trimmedLocation(location)).fileName());
         item->setText(ResLocation, location);
         item->setToolTip(ResLocation, resolved(entry.location));
-        item->setText(ResVisibility, visibility(entry.location));
-        item->setToolTip(ResVisibility, pkg->entryOwner(entry.location).empty()
-            ? tr("A remote location: every user of this project sees it.")
-            : tr("A path on this computer: only you see it in this project."));
+        item->setText(ResVisibility, tr("Project"));
+        item->setToolTip(ResVisibility, tr("A resource referenced by this project file."));
         QStringList tags;
         for (const auto& tag : entry.tags) tags << QString::fromStdString(tag);
         item->setText(ResTags, tags.join(QStringLiteral(", ")));
@@ -749,21 +751,16 @@ std::optional<vc::objects::AttachmentIdentity> ProjectWorkspace::selectedStore()
 {
     const auto* item = _stores->currentItem();
     if (!item) return std::nullopt;
-    const int index = item->data(0, kStoreIndexRole).toInt();
-    if (index < 0) return _state->projectAttachment();
-    const auto attached = _state->attachedStores();
-    if (index >= int(attached.size())) return std::nullopt;
-    return attached[size_t(index)];
+    return _state->storeReference(item->data(0, kStoreIndexRole).toString().toStdString());
 }
 
 void ProjectWorkspace::updateStoreButtons()
 {
     const auto store = selectedStore();
-    _detachStore->setEnabled(store && store != _state->projectAttachment());
+    _detachStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && _state->vpkg()->document().data().at("stores").size() > 1);
     _revealStore->setEnabled(store.has_value());
     const auto session = _state->objectStoreSession();
     bool hosted = false;
-    if (const auto project = _state->projectAttachment()) hosted = session->hubStatus(*project).has_value();
     for (const auto& attached : _state->attachedStores()) hosted = hosted || session->hubStatus(attached);
     _syncStores->setEnabled(hosted);
 }

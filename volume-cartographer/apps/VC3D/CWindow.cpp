@@ -1174,6 +1174,19 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             });
 
     // The Project tab drives the File menu's project actions.
+    _state->prepareStoreSwitch = [this]() {
+        try { _state->savePointCollections(); }
+        catch (const std::exception&) { return false; }
+        if (_segmentationModule) {
+            if (_segmentationModule->growthInProgress()) return false;
+            const auto status = _segmentationModule->autosaveStatus();
+            if (status.pending || status.saveInProgress || status.dirtyAfterSave) {
+                const auto active = _state->activeSurface().lock();
+                if (!active || !_segmentationModule->saveSurface(active.get())) return false;
+            }
+        }
+        return !_lineAnnotationController || _lineAnnotationController->prepareForPackageSwitch();
+    };
     _projectWorkspace = new ProjectWorkspace(_state, _menuController.get(), this);
     _projectWorkspace->setProperty("workspaceId", QStringLiteral("project"));
     const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
@@ -1434,6 +1447,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::project::RECENT).toStringList();
+        files.removeIf([](const QString& path) { return !path.endsWith(".vcproj", Qt::CaseInsensitive); });
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
@@ -4208,7 +4222,7 @@ bool CWindow::OpenVolume(const QString& path,
         }
         aVpkgPath = QFileDialog::getOpenFileName(
             this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-            tr("Project (*.vcobj);;All files (*.*)"),
+            tr("Project (*.vcproj)"),
             nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         if (aVpkgPath.isEmpty()) {
             Logger()->info("Open project canceled");
@@ -4223,24 +4237,16 @@ bool CWindow::OpenVolume(const QString& path,
         return false;
     }
     std::shared_ptr<VolumePkg> package;
-    std::optional<vc::objects::AttachmentIdentity> attachment;
     QString loadError;
     try {
-        attachment = _state->attachProjectStore(aVpkgPath.toStdString(), author);
         vc::project::LoadOptions options;
         options.catalog = vc3d::opendata::cachedCatalog();
-        package = VolumePkg::open(_state->objectStoreSession(), *attachment, author.toStdString(), options);
+        package = VolumePkg::open(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to open project: {}", e.what());
         loadError = QString::fromUtf8(e.what());
     }
-    // Anything below that does not switch to the package leaves its store as it was.
-    auto release = [&] {
-        if (attachment && (!_state->vpkg() || _state->vpkg() != package)) _state->releaseProjectStore(*attachment);
-    };
-
     if (!package) {
-        release();
         Logger()->error("Cannot open project: {}", aVpkgPath.toStdString());
         const QString message = loadError.isEmpty()
             ? tr("Project failed to load.")
@@ -4261,7 +4267,6 @@ bool CWindow::OpenVolume(const QString& path,
         const auto ids = package->volumeIDs();
         const auto id = preferredVolumeId.toStdString();
         if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
-            release();
             if (errorMessage) {
                 *errorMessage = tr("Unknown volume id: %1").arg(preferredVolumeId);
             }
@@ -4273,7 +4278,6 @@ bool CWindow::OpenVolume(const QString& path,
         try {
             (void)package->volume(id);
         } catch (const std::exception& e) {
-            release();
             if (errorMessage) {
                 *errorMessage = tr("Failed to load volume %1: %2")
                                     .arg(preferredVolumeId, QString::fromUtf8(e.what()));
@@ -4290,12 +4294,10 @@ bool CWindow::OpenVolume(const QString& path,
     // close path would save into the new package. A refusal (a running
     // optimization, a failed finalization) aborts the switch with the
     // workspace intact.
-    if (_lineAnnotationController &&
-        !_lineAnnotationController->prepareForPackageSwitch()) {
-        release();
+    if (_state->prepareStoreSwitch && !_state->prepareStoreSwitch()) {
         if (errorMessage) {
-            *errorMessage = tr("Open line annotation sessions could not be "
-                               "closed; the project was not switched.");
+            *errorMessage = tr("Pending edits could not be saved; "
+                               "the project was not switched.");
         }
         if (openError) {
             *openError = VolumeOpenError::PackageLoadFailed;
@@ -4324,7 +4326,7 @@ bool CWindow::OpenVolume(const QString& path,
 void CWindow::attachStore(const QString& path)
 {
     try {
-        if (!_state->projectAttachment()) throw std::runtime_error("no project is open");
+        if (!_state->hasVpkg()) throw std::runtime_error("no project is open");
         _state->attachStore(path.toStdString(), CState::storeAuthor());
     } catch (const std::exception& error) {
         const auto message = tr("Cannot attach store %1: %2").arg(path, QString::fromUtf8(error.what()));
@@ -4445,7 +4447,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std:
     // The store's resolution (catalog registrations, its own and its route
     // choices); without a store, the cached catalog's registrations.
     vc::objects::VolumeTransforms transforms;
-    if (const auto attachment = _state->projectAttachment()) {
+    if (const auto attachment = _state->storeFor("volume_transform")) {
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             transforms = db.volumeTransforms(txn);
         });
@@ -5552,7 +5554,6 @@ namespace {
 std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
 {
     std::vector<vc::objects::AttachmentIdentity> stores;
-    if (const auto project = state.projectAttachment()) stores.push_back(*project);
     for (const auto& attached : state.attachedStores()) stores.push_back(attached);
     return stores;
 }

@@ -262,16 +262,18 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
-- A project is an object store (`.vcobj`): it references its volumes, normal
-  grids and Lasagna datasets and holds the surfaces, fibers and point
-  collections. Remote locations are shared with everyone using the project; a
-  local path is its author's alone. Other stores (e.g. a hosted team store) can
-  be attached beside it, and surfaces, fibers and point collections each come
-  from one chosen store (`state.get`: `project`, `stores`, `routes`).
-- `project.create` writes a new `.vcobj` project referencing one local zarr
-  volume or remote `.zarr` URL. It does not change the current session;
-  remote availability is checked by `volume.open` when the new project is
-  opened.
+- A project is a JSON `.vcproj` file referencing volumes, normal grids, Lasagna
+  datasets, and one or more `.vcobj` stores. Each of surfaces, fibers, point
+  collections, umbilici, and registrations selects one attached store for
+  display and editing. `state.get.project` describes the project file;
+  `stores` includes reference IDs and availability, and `routes` maps all five
+  kinds to those reference IDs or null.
+- `project.create` writes a `.vcproj` referencing one local Zarr volume or remote
+  `.zarr` URL. `store` selects an existing store; `newStore` creates a store at
+  the given path. If neither is supplied, create a sibling `.vcobj`. Supplying
+  both is invalid. `overwrite` replaces only the project file and never deletes
+  or overwrites a referenced store. The result includes the store path.
+  Creation does not open the project; remote availability is checked on open.
 - `volume.open` opens a project and may select a volume. Failed opens do
   not discard the current project.
 - `volume.attach` loads one local zarr or remote `.zarr` URL asynchronously,
@@ -420,7 +422,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_project` | `project.create` | Create a `.vcobj` project that references one local zarr volume or remote `.zarr` URL without opening it. |
+| `vc3d_create_project` | `project.create` | Create a `.vcproj` project that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
 | `vc3d_delete_segment` | `segments.delete` | Retire a surface in its store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on read-only stores. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
@@ -463,7 +465,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
-| `vc3d_open_volume` | `volume.open` | Open a project (.vcobj) and optionally select a volume id. |
+| `vc3d_open_volume` | `volume.open` | Open a project (.vcproj) and optionally select a volume id. |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |

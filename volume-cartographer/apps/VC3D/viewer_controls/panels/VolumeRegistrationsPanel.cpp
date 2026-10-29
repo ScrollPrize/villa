@@ -67,6 +67,7 @@ VolumeRegistrationsPanel::VolumeRegistrationsPanel(CState* state, QWidget* paren
     _status->setWordWrap(true);
     layout->addWidget(_status);
 
+    connect(_state, &CState::storeRoutesChanged, this, &VolumeRegistrationsPanel::refresh);
     connect(_list, &QTreeWidget::itemSelectionChanged, this, &VolumeRegistrationsPanel::updateButtons);
     connect(_choose, &QPushButton::clicked, this, &VolumeRegistrationsPanel::chooseRoute);
     connect(_register, &QPushButton::clicked, this, &VolumeRegistrationsPanel::registerTransform);
@@ -86,7 +87,7 @@ void VolumeRegistrationsPanel::refresh()
     _related.clear();
     _graph = {};
     const auto volume = _state ? _state->currentVolume() : nullptr;
-    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("volume_transform") : std::nullopt;
     if (!volume || !attachment) {
         _heading->setText(tr("Open a volume and attach an object store to see its registrations."));
         _status->clear();
@@ -122,7 +123,7 @@ void VolumeRegistrationsPanel::refresh()
 
 void VolumeRegistrationsPanel::updateButtons()
 {
-    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("volume_transform") : std::nullopt;
     const bool writable = attachment && _state->currentVolume() && _state->objectStoreSession()->writable(*attachment);
     const int row = _list->currentIndex().isValid() ? _list->currentIndex().row() : -1;
     _choose->setEnabled(writable && row >= 0 && row < int(_related.size()) && _related[size_t(row)].routes.size() > 1);
@@ -132,7 +133,7 @@ void VolumeRegistrationsPanel::updateButtons()
 void VolumeRegistrationsPanel::registerTransform()
 {
     const auto volume = _state->currentVolume();
-    const auto attachment = _state->projectAttachment();
+    const auto attachment = _state->storeFor("volume_transform");
     if (!volume || !attachment) return;
 
     QDialog dialog(this);
@@ -179,7 +180,7 @@ void VolumeRegistrationsPanel::registerTransform()
 void VolumeRegistrationsPanel::chooseRoute()
 {
     const auto volume = _state->currentVolume();
-    const auto attachment = _state->projectAttachment();
+    const auto attachment = _state->storeFor("volume_transform");
     const int row = _list->currentIndex().row();
     if (!volume || !attachment || row < 0 || row >= int(_related.size())) return;
     const auto related = _related[size_t(row)];

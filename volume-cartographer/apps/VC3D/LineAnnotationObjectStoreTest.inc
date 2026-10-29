@@ -13,8 +13,15 @@ namespace {
 // Open a store as the state's project, as VC3D opens one.
 void openStoreAsProject(CState& state, const QString& path, const QString& author, bool readOnly = false)
 {
-    const auto attachment = state.attachProjectStore(path.toStdString(), author, readOnly);
-    state.setVpkg(VolumePkg::open(state.objectStoreSession(), attachment, author.toStdString()));
+    auto projectPath = std::filesystem::path(path.toStdString());
+    projectPath.replace_extension(".vcproj");
+    if (!std::filesystem::exists(projectPath))
+        vc::project::ProjectDocument::create(projectPath, "test", path.toStdString(), readOnly);
+    auto document = vc::project::ProjectDocument::load(projectPath);
+    auto data = document.data();
+    data["stores"][0]["read_only"] = readOnly;
+    document.replace(std::move(data));
+    state.setVpkg(VolumePkg::open(projectPath));
 }
 }
 int runObjectStoreControllerTests()
@@ -39,7 +46,7 @@ int runObjectStoreControllerTests()
         for (int i = 0; i < 20; ++i) {
             QElapsedTimer timer; timer.start();
             state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
-                *state.projectAttachment(), 0, {}});
+                *state.storeFor("fiber"), 0, {}});
             QApplication::processEvents();
             while (!catalogReady() && timer.elapsed() < 10000) {
                 QApplication::processEvents(); QThread::msleep(1);
@@ -122,7 +129,7 @@ int runObjectStoreControllerTests()
             int changed = 0, fibersChanged = 0;
             QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
             QObject::connect(&controller, &Controller::fibersChanged, [&] { ++fibersChanged; });
-            const auto attachment = *state.projectAttachment();
+            const auto attachment = *state.storeFor("fiber");
             require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id()) &&
                         !controller.umbilicusStatus().available,
                     "a volume without a stored umbilicus has none");
@@ -180,7 +187,7 @@ int runObjectStoreControllerTests()
             const auto anchored = points->addCollection("correction");
             points->setCollectionAnchor2d(anchored, cv::Vec2f(1, 1));
             points->addPoint("correction", {7, 7, 7});
-            const auto attachment = *state.projectAttachment();
+            const auto attachment = *state.storeFor("fiber");
             auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, volume->id()); };
             require(settle([&] { return stored().size() == 1 && stored()[0].points.points.size() == 2; }),
                     "an edited collection reaches the store after the debounce");
@@ -254,7 +261,7 @@ int runObjectStoreControllerTests()
             };
             auto stored = [&](const std::string& uuid) {
                 vc::geometry::Fiber fiber;
-                state.objectStoreSession()->read(*state.projectAttachment(), [&](const auto& db, const auto& txn, const auto&) {
+                state.objectStoreSession()->read(*state.storeFor("fiber"), [&](const auto& db, const auto& txn, const auto&) {
                     fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
                 });
                 return fiber;
@@ -378,7 +385,7 @@ int runObjectStoreControllerTests()
                 [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
             QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
             const auto connection = state.objectStoreSession();
-            const auto attachment = *state.projectAttachment();
+            const auto attachment = *state.storeFor("fiber");
             const auto unrelated = vc::objects::util::newUuid();
             connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
@@ -688,7 +695,7 @@ int runObjectStoreControllerTests()
             CState child(nullptr,false,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
-        require(state.projectAttachment().has_value(),"secondary destruction keeps main attachment");
+        require(state.storeFor("fiber").has_value(),"secondary destruction keeps main attachment");
         state.closeProject();
         require(controller.readStoredFibers(std::nullopt).empty() && controller.fiberUuidForId(merged.id).empty(),
                 "detach leaves nothing to read and no identities");

@@ -34,12 +34,8 @@ fs::path tmpDir(const std::string& tag)
 std::shared_ptr<VolumePkg> openElsewhere(const fs::path& path, bool readOnly = false,
                                          const vc::project::LoadOptions& opts = {})
 {
-    vc::objects::OpenOptions options;
-    options.author = "vc-test";
-    options.readOnly = readOnly;
-    auto session = std::make_shared<vc::objects::ObjectStoreSession>();
-    const auto attachment = session->attach(path, options);
-    return VolumePkg::open(session, attachment, "vc-test", opts);
+    if (readOnly) fs::permissions(path, fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read);
+    return VolumePkg::open(path, opts);
 }
 
 // Build a small local zarr volume in `root/volumes/<id>/`. Returns the
@@ -131,7 +127,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
     deferred.deferResolution = true;
     auto reloaded = store.open(deferred);
     REQUIRE(reloaded->volumeEntries().size() == 1);
-    CHECK(reloaded->volumeEntries().front().location == firstPath.string());
+    CHECK(vc::project::resolveLocalPath(reloaded->volumeEntries().front().location, reloaded->directory()) == firstPath);
     CHECK(reloaded->volumeEntries().front().tags ==
           std::vector<std::string>{"overlay"});
     fs::remove_all(d);
@@ -196,7 +192,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
     }
 
     // Package opened through the alias, volume attached through the real path.
-    auto package = openElsewhere(alias / "project.vcobj");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -226,7 +222,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a s
         return;
     }
 
-    auto package = openElsewhere(alias / "project.vcobj");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(

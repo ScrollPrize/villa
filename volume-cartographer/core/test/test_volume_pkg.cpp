@@ -1,4 +1,4 @@
-// Coverage for core/src/VolumePkg.cpp — a project kept in its object store
+// Coverage for core/src/VolumePkg.cpp — a project kept in a standalone file
 // (open/reopen), entry add/remove, validators, and the free vc::project helpers.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -146,7 +146,7 @@ TEST_CASE("A new project is empty")
     CHECK(p->name() == "test");
 }
 
-TEST_CASE("VolumePkg: setName is the project's name in its store")
+TEST_CASE("VolumePkg: setName persists in the project file")
 {
     const auto store = vc::test::createTestProject();
     auto p = store.open();
@@ -199,7 +199,7 @@ TEST_CASE("VolumePkg: reopening the project returns its entries")
     CHECK(loaded->normalGridEntries().size() == 1);
 }
 
-TEST_CASE("VolumePkg: the selected Lasagna dataset is the author's, kept in the store")
+TEST_CASE("VolumePkg: the selected Lasagna dataset is kept in the project file")
 {
     const auto store = vc::test::createTestProject();
     CHECK(store.open()->selectedLasagnaDataset().empty());
@@ -207,30 +207,25 @@ TEST_CASE("VolumePkg: the selected Lasagna dataset is the author's, kept in the 
     store.open()->setSelectedLasagnaDataset(manifest);
     auto loaded = store.open();
     CHECK(loaded->selectedLasagnaDataset() == manifest);
-    // Another author has a view of their own.
-    CHECK(VolumePkg::open(store.session, store.attachment, "someone-else")->selectedLasagnaDataset().empty());
+    // Reopening the document restores the same view.
+    CHECK(VolumePkg::open(store.path)->selectedLasagnaDataset() == manifest);
     loaded->clearSelectedLasagnaDataset();
     CHECK(store.open()->selectedLasagnaDataset().empty());
 }
 
-TEST_CASE("VolumePkg shares remote volumes and keeps local paths to their author")
+TEST_CASE("VolumePkg resources belong to the project file")
 {
     const auto store = vc::test::createTestProject();
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto alice = VolumePkg::open(store.session, store.attachment, "alice", options);
-    auto bob = VolumePkg::open(store.session, store.attachment, "bob", options);
-    REQUIRE(alice->addVolumeEntry("s3://bucket/shared.zarr"));
-    REQUIRE(alice->addVolumeEntry("/home/alice/predictions.zarr"));
-    REQUIRE(bob->addVolumeEntry("/home/alice/predictions.zarr"));  // the same path on his disk is his own
-    CHECK(bob->reload());
-    std::vector<std::string> seen;
-    for (const auto& entry : bob->volumeEntries()) seen.push_back(entry.location);
-    CHECK(seen == std::vector<std::string>{"s3://bucket/shared.zarr", "/home/alice/predictions.zarr"});
-    // Removing his own leaves hers.
-    REQUIRE(bob->removeEntry("/home/alice/predictions.zarr"));
-    CHECK(VolumePkg::open(store.session, store.attachment, "alice", options)->volumeEntries().size() == 2);
-    CHECK(VolumePkg::open(store.session, store.attachment, "bob", options)->volumeEntries().size() == 1);
+    auto first = store.open(options);
+    REQUIRE(first->addVolumeEntry("s3://bucket/shared.zarr"));
+    REQUIRE(first->addVolumeEntry("/home/alice/predictions.zarr"));
+    auto second = store.open(options);
+    CHECK(second->volumeEntries() == first->volumeEntries());
+    REQUIRE(second->removeEntry("/home/alice/predictions.zarr"));
+    CHECK(first->reload());
+    CHECK(first->volumeEntries().size() == 1);
 }
 
 TEST_CASE("VolumePkg follows entries another session adds or removes")
@@ -280,7 +275,7 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one resource ki
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
     store.session->read(store.attachment, [](const auto& db, const auto& txn, const auto&) {
-        CHECK(vc::objects::projectResources(db, txn, vc::objects::kLasagnaDatasetResource).size() == 2);
+        CHECK(vc::objects::projectResources(db, txn, vc::objects::kLasagnaDatasetResource).empty());
     });
 
     vc::project::LoadOptions options;
@@ -513,3 +508,56 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
           "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
 }
 
+
+TEST_CASE("Project documents preserve store references and resource ownership on Save As")
+{
+    const auto root = tmpDir("document_copy");
+    const auto project = vc::test::createTestProject(root / "original.vcproj");
+    auto document = vc::project::ProjectDocument::load(project.path);
+    auto data = document.data();
+    data["volumes"].push_back({{"location", "volumes/scan.zarr"}, {"tags", {"vc-lasagna-derived:predictions/manifest.json"}}});
+    data["lasagna_datasets"].push_back({{"location", "predictions/manifest.json"}, {"tags", nlohmann::json::array()}});
+    data["view"]["selected_lasagna_dataset"] = "predictions/manifest.json";
+    data["normal_grids"].push_back({{"location", "s3://bucket/grid"}, {"tags", nlohmann::json::array()}});
+    document.replace(data);
+    fs::create_directory(root / "copies");
+    auto copy = document.saveAs(root / "copies" / "copy.vcproj");
+    CHECK(copy.resolve(copy.data()["stores"][0]["location"]) == project.storePath);
+    CHECK(copy.data()["volumes"][0]["location"] == "../volumes/scan.zarr");
+    CHECK(copy.data()["volumes"][0]["tags"][0] == "vc-lasagna-derived:../predictions/manifest.json");
+    CHECK(copy.data()["view"]["selected_lasagna_dataset"] == "../predictions/manifest.json");
+    CHECK(copy.data()["normal_grids"][0]["location"] == "s3://bucket/grid");
+    auto changed = copy.data();
+    changed["name"] = "Independent name";
+    copy.replace(changed);
+    CHECK(vc::project::ProjectDocument::load(project.path).data() == data);
+    CHECK_THROWS(copy.saveAs(project.path));
+    CHECK_THROWS(vc::project::ProjectDocument::load(project.storePath));
+    fs::remove_all(root);
+}
+
+TEST_CASE("Project document validation and failed saves leave existing state intact")
+{
+    const auto project = vc::test::createTestProject();
+    auto document = vc::project::ProjectDocument::load(project.path);
+    const auto original = document.data();
+    auto invalid = original;
+    invalid["version"] = 2;
+    CHECK_THROWS(document.replace(invalid));
+    invalid = original;
+    invalid["stores"] = nlohmann::json::array();
+    CHECK_THROWS(document.replace(invalid));
+    invalid = original;
+    invalid["selections"]["fiber"] = "missing-id";
+    CHECK_THROWS(document.replace(invalid));
+    CHECK(document.data() == original);
+    CHECK(vc::project::ProjectDocument::load(project.path).data() == original);
+    fs::permissions(project.path, fs::perms::owner_read);
+    CHECK_FALSE(document.writable());
+    auto changed = original;
+    changed["name"] = "Should fail";
+    CHECK_THROWS(document.replace(changed));
+    CHECK(document.data() == original);
+    CHECK(vc::project::ProjectDocument::load(project.path).data() == original);
+    fs::permissions(project.path, fs::perms::owner_all);
+}

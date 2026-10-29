@@ -379,7 +379,7 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption volumePackageOption(
         "project",
-        "Open a project (.vcobj) at startup.",
+        "Open a project (.vcproj) at startup.",
         "path");
     parser.addOption(volumePackageOption);
     QCommandLineOption attachStoreOption(

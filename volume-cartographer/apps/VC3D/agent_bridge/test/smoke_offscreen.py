@@ -28,7 +28,6 @@ import json
 import os
 import re
 import socket
-import sqlite3
 import sys
 import tempfile
 import time
@@ -81,8 +80,16 @@ def launch(
         args.extend(["--project", project])
     env = dict(OFFSCREEN_ENV)
     if config_home is not None:
+        config = Path(config_home)
+        config.mkdir(parents=True, exist_ok=True)
+        settings = config / "VC3D.ini"
+        if not settings.exists():
+            settings.write_text(
+                "[viewer]\nusername=bridge-smoke\nremote_cache_dir=" + str(config / "cache") +
+                "\n[project]\nshow_open_data_catalog_on_startup=false\nauto_open=0\n")
         env["XDG_CONFIG_HOME"] = config_home
         env["VC3D_CONFIG_DIR"] = config_home
+        env["XDG_DATA_HOME"] = str(config / "data")
     return VC3DProcess(
         binary,
         args,
@@ -158,30 +165,22 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
 
 
 def project_volumes(project: Path) -> list[dict]:
-    """The volume entries a project store records ({location, tags}), read
-    directly from its database as VC3D wrote them."""
-    with sqlite3.connect(project.resolve().as_uri() + "?mode=ro", uri=True) as db:
-        rows = db.execute(
-            "SELECT o.id, o.storage_ref FROM objects o "
-            "LEFT JOIN object_lifecycle l ON l.object_id=o.id "
-            "WHERE o.kind='volume' AND COALESCE(l.retired,0)=0 ORDER BY o.id").fetchall()
-        return [{"location": location,
-                 "tags": [tag for (tag,) in db.execute(
-                     "SELECT tag FROM object_tags WHERE object_id=? ORDER BY tag", (object_id,))]}
-                for object_id, location in rows]
+    entries = json.loads(project.read_text())["volumes"]
+    for entry in entries:
+        if "://" not in entry["location"]:
+            entry["location"] = str((project.parent / entry["location"]).resolve())
+    return entries
 
 
 def project_name(project: Path) -> str | None:
-    with sqlite3.connect(project.resolve().as_uri() + "?mode=ro", uri=True) as db:
-        row = db.execute("SELECT name FROM objects WHERE kind='project'").fetchone()
-        return row[0] if row else None
+    return json.loads(project.read_text())["name"]
 
 
 def create_test_project(client: BridgeClient, root: Path) -> Path:
     """The smoke project: one local volume, made and opened through the bridge."""
     volume = root / "volumes" / "vol1"
     create_test_volume(volume, "vol1")
-    project = root / "smoke.vcobj"
+    project = root / "smoke.vcproj"
     client.call("project.create", {"path": str(project), "volume": str(volume)}, timeout=RPC_TIMEOUT)
     client.call("volume.open", {"path": str(project)}, timeout=RPC_TIMEOUT)
     return project
@@ -461,7 +460,7 @@ def check_project_create(
 ) -> None:
     volume = root / "volumes" / "vol1"
     requested = root / "created" / "agent-project"
-    created = requested.with_suffix(".vcobj")
+    created = requested.with_suffix(".vcproj")
 
     try:
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -479,6 +478,7 @@ def check_project_create(
             result == {
                 "path": str(created),
                 "name": "agent-project",
+                "store": str(created.with_suffix(".vcobj")),
                 "volume": str(volume),
             }
             and project_name(created) == "agent-project"
@@ -546,7 +546,7 @@ def check_project_create(
                 error.code == -32007
                 and error.data.get("kind") == "volume"
                 and expected_detail in detail
-                and not output.with_suffix(".vcobj").exists(),
+                and not output.with_suffix(".vcproj").exists(),
                 f"returned code={error.code} detail={detail!r}",
             )
         except Exception as error:  # noqa: BLE001
@@ -958,7 +958,7 @@ def check_c4(client: BridgeClient, results: Results, project: str) -> None:
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         client.call(
             "volume.open",
-            {"path": "/vc3d-smoke/does-not-exist.vcobj"},
+            {"path": "/vc3d-smoke/does-not-exist.vcproj"},
             timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_failure_is_headless", False,

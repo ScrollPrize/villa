@@ -110,7 +110,7 @@ To preload a project during auto-launch:
 ```sh
 ./tools/vc3d-mcp/run.sh \
   --launch /path/to/VC3D \
-  --project /data/example.vcobj
+  --project /data/example.vcproj
 ```
 
 The PowerShell launcher accepts the same arguments:
@@ -118,7 +118,7 @@ The PowerShell launcher accepts the same arguments:
 ```powershell
 .\tools\vc3d-mcp\run.ps1 `
   --launch C:\path\to\VC3D.exe `
-  --project D:\data\example.vcobj
+  --project D:\data\example.vcproj
 ```
 
 To start VC3D yourself:

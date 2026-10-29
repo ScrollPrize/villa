@@ -26,8 +26,8 @@ class PointCollectionSync : public QObject {
 public:
     explicit PointCollectionSync(CState* state);
 
-    // Write pending edits now (before the store or volume goes away).
-    void flush();
+    // Write pending edits now; retain them and return false on failure.
+    bool flush();
     // Flush, then drop the volume's collections from memory, leaving the store
     // as it is (closing the project).
     void unload();

@@ -335,16 +335,16 @@ class FakeAgentBridgeServer:
                     },
                 )
             else:
-                if not path.lower().endswith(".vcobj"):
-                    path += ".vcobj"
+                if not path.lower().endswith(".vcproj"):
+                    path += ".vcproj"
                 name = params.get(
                     "name",
-                    Path(path).name[:-len(".vcobj")] or "Untitled",
+                    Path(path).name[:-len(".vcproj")] or "Untitled",
                 )
                 await self._reply(
                     writer,
                     req_id,
-                    result={"path": path, "name": name, "volume": volume},
+                    result={"path": path, "name": name, "volume": volume, "store": params.get("store") or params.get("newStore") or str(Path(path).with_suffix(".vcobj"))},
                 )
         elif method == "volume.attach":
             job_id = "job-7"
@@ -365,7 +365,7 @@ class FakeAgentBridgeServer:
                 "alreadyAttached": False,
                 "volumeId": "vol-c",
                 "location": params.get("location"),
-                "projectPath": "/tmp/project.vcobj",
+                "projectPath": "/tmp/project.vcproj",
             }
         elif method == "volume.list":
             await self._reply(

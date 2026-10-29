@@ -81,10 +81,10 @@ void PointCollectionSync::markRemoved(uint64_t collectionId)
     debounce_.start();
 }
 
-void PointCollectionSync::flush()
+bool PointCollectionSync::flush()
 {
     debounce_.stop();
-    if (!attachment_ || (changed_.empty() && removed_.empty())) return;
+    if (!attachment_ || (changed_.empty() && removed_.empty())) return true;
     const auto& all = state_->pointCollection()->getAllCollections();
     std::vector<vc::objects::AttachedCollection> changed;
     for (const auto id : changed_) {
@@ -101,15 +101,17 @@ void PointCollectionSync::flush()
         changed.push_back(std::move(stored));
     }
     const std::vector<std::string> removed(removed_.begin(), removed_.end());
-    changed_.clear();
-    removed_.clear();
     try {
         vc::objects::writeVolumeCollections(*state_->objectStoreSession(), *attachment_, volume_, changed, removed);
         std::vector<std::string> uuids(removed);
         for (const auto& collection : changed) uuids.push_back(collection.uuid);
         noteRevisions(uuids);
+        changed_.clear();
+        removed_.clear();
+        return true;
     } catch (const std::exception& error) {
         Logger()->warn("Point collections: could not save to the object store: {}", error.what());
+        return false;
     }
 }
 
@@ -125,7 +127,7 @@ void PointCollectionSync::noteRevisions(const std::vector<std::string>& uuids)
 
 void PointCollectionSync::unload()
 {
-    flush();
+    if (!flush()) return;
     attachment_.reset();
     volume_.clear();
     uuids_.clear();
@@ -136,7 +138,7 @@ void PointCollectionSync::unload()
 
 void PointCollectionSync::reload()
 {
-    flush();
+    if (!flush()) return;
     const auto attachment = state_->storeFor("point_collection");
     const auto volume = state_->currentVolume();
     std::vector<vc::objects::AttachedCollection> stored;

@@ -96,6 +96,7 @@ public:
 
 public slots:
     void newProject();
+    void newStore();
     void saveProjectAs();
     void attachVolume();
     void attachNormalGrid();

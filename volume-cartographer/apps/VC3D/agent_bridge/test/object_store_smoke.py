@@ -83,9 +83,17 @@ def main():
         tag = 'bridge_smoke_' + str(os.getpid())
 
         def launch(index, store=database):
+            project = store.with_suffix('.vcproj')
+            if not project.exists():
+                project.write_text(json.dumps(dict(
+                    format='vcproj', version=1, name='Store smoke',
+                    stores=[dict(id='main', location=str(store), read_only=False)],
+                    selections={kind: 'main' for kind in ('surface', 'fiber', 'point_collection', 'umbilicus', 'volume_transform')},
+                    volumes=[dict(location=str(root / 'volumes'), tags=[])],
+                    normal_grids=[], lasagna_datasets=[], view={})))
             process = VC3DProcess(args.vc3d,
                 ['--agent-bridge', '--agent-bridge-name', f'vc3d-store-{os.getpid()}-{index}',
-                 '--project', str(store)],
+                 '--project', str(project)],
                 env_overrides={'QT_QPA_PLATFORM': 'offscreen',
                                'XDG_CONFIG_HOME': str(config), 'VC3D_CONFIG_DIR': str(config)})
             client = None

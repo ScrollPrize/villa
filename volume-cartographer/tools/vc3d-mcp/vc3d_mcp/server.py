@@ -339,7 +339,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--project",
         default=None,
         help=(
-            "Optional project (.vcobj) forwarded to an auto-launched VC3D as "
+            "Optional project (.vcproj) forwarded to an auto-launched VC3D as "
             "--project, so the agent's first action need not be opening a "
             "project. Only used on the auto-launch path."
         ),

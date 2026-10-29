@@ -446,7 +446,7 @@ void OpenDataCatalogWindow::createSelectedProject()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const auto defaultDirectory = vc3d::defaultNewProjectDirectory(settings);
     const auto defaultPath = QDir(defaultDirectory).filePath(
-        QString::fromStdString(sample.id) + ".vcobj");
+        QString::fromStdString(sample.id) + ".vcproj");
     auto* path = new QLineEdit(defaultPath, &dialog);
     path->setObjectName(QStringLiteral("catalogProjectPath"));
     bool nameEdited = false;
@@ -454,8 +454,8 @@ void OpenDataCatalogWindow::createSelectedProject()
     connect(path, &QLineEdit::textChanged, &dialog, [&](const QString& value) {
         if (nameEdited) return;
         auto filename = QFileInfo(value.trimmed()).fileName();
-        if (filename.endsWith(".vcobj", Qt::CaseInsensitive))
-            filename.chop(int(QStringLiteral(".vcobj").size()));
+        if (filename.endsWith(".vcproj", Qt::CaseInsensitive))
+            filename.chop(int(QStringLiteral(".vcproj").size()));
         name->setText(filename);
     });
     auto* browse = new QPushButton(tr("Browse..."), &dialog);
@@ -543,8 +543,8 @@ void OpenDataCatalogWindow::createSelectedProject()
     layout->addWidget(buttons);
     connect(browse, &QPushButton::clicked, &dialog, [&]() {
         const auto destination = QFileDialog::getSaveFileName(&dialog, tr("New Project"),
-            path->text().isEmpty() ? QDir(defaultDirectory).filePath(name->text() + ".vcobj") : path->text(),
-            tr("VC3D project (*.vcobj)"), nullptr, QFileDialog::DontConfirmOverwrite);
+            path->text().isEmpty() ? QDir(defaultDirectory).filePath(name->text() + ".vcproj") : path->text(),
+            tr("VC3D project (*.vcproj)"), nullptr, QFileDialog::DontConfirmOverwrite);
         if (!destination.isEmpty()) path->setText(destination);
     });
     auto validate = [&]() {
@@ -556,8 +556,8 @@ void OpenDataCatalogWindow::createSelectedProject()
     validate();
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
-        if (!path->text().trimmed().endsWith(".vcobj", Qt::CaseInsensitive))
-            path->setText(path->text().trimmed() + ".vcobj");
+        if (!path->text().trimmed().endsWith(".vcproj", Qt::CaseInsensitive))
+            path->setText(path->text().trimmed() + ".vcproj");
         if (QFileInfo::exists(path->text())) {
             QMessageBox::warning(&dialog, tr("Create Project"),
                 tr("A project already exists at:\n%1\n\nChoose a new file, or open that project.").arg(path->text()));

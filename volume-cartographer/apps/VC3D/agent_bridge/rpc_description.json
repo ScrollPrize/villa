@@ -1634,6 +1634,9 @@
         -32010
       ],
       "mcp": {
+        "paramRenames": {
+          "newStore": "new_store"
+        },
         "tool": "vc3d_create_project"
       },
       "params": {
@@ -1641,11 +1644,17 @@
           "name": {
             "type": "string"
           },
+          "newStore": {
+            "type": "string"
+          },
           "overwrite": {
             "default": false,
             "type": "boolean"
           },
           "path": {
+            "type": "string"
+          },
+          "store": {
             "type": "string"
           },
           "tags": {

@@ -186,7 +186,7 @@ private slots:
                 QVERIFY(selection.representations.has_value());
                 QVERIFY(selection.representations->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
-                QCOMPARE(project.path.string(), temp.filePath("my-selection.VCOBJ").toStdString());
+                QCOMPARE(project.path.string(), temp.filePath("my-selection.VCPROJ").toStdString());
                 vc::project::LoadOptions options;
                 options.deferResolution = true;
                 auto pkg = vc::test::emptyProject(options);
@@ -202,7 +202,7 @@ private slots:
                 QVERIFY(dialog);
                 auto* path = dialog->findChild<QLineEdit*>("catalogProjectPath");
                 QVERIFY(path);
-                path->setText(temp.filePath("my-selection.VCOBJ"));
+                path->setText(temp.filePath("my-selection.VCPROJ"));
                 auto trees = dialog->findChildren<QTreeWidget*>();
                 for (auto* tree : trees) {
                     if (tree->topLevelItem(0)->text(0) == "Source volumes")

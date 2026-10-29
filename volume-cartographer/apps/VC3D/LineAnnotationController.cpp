@@ -5443,7 +5443,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
 const LineAnnotationController::StoredUmbilicus&
 LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
 {
-    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("umbilicus") : std::nullopt;
     const auto key = (attachment ? attachment->storeUuid : std::string{}) + "/" + volumeId;
     const auto [found, inserted] = _storedUmbilici.try_emplace(key);
     if (!inserted) return found->second;
@@ -5464,7 +5464,7 @@ LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
 QString LineAnnotationController::umbilicusFingerprint() const
 {
     // Changes whenever the answer does: uuid@revision, else why there is none.
-    if (!_state || !_state->projectAttachment() || _state->currentVolumeId().empty()) {
+    if (!_state || !_state->storeFor("umbilicus") || _state->currentVolumeId().empty()) {
         return {};
     }
     const auto& stored = storedUmbilicus(_state->currentVolumeId());
@@ -11209,7 +11209,7 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
     // Built once per volume (points in its voxels, centres sized to it) from
     // the stored umbilicus; an umbilicus change drops it.
     const auto volume = _state ? _state->currentVolume() : nullptr;
-    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("umbilicus") : std::nullopt;
     if (!volume || !attachment) {
         _scrollUmbilicusVolumeId.clear();
         _scrollUmbilicus.reset();

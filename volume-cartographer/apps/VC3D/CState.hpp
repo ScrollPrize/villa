@@ -4,6 +4,7 @@
 #include <QString>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -58,42 +59,31 @@ public:
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
 
-    // --- Project and stores ---
-    // The project's store: the store of the package set last (setVpkg), kept
-    // attached until another project's package replaces it.
-    std::optional<vc::objects::AttachmentIdentity> projectAttachment() const;
-    // Attach a store as a project to be (or find it attached already), for
-    // VolumePkg::open; it becomes the project when setVpkg receives that
-    // package. releaseProjectStore() detaches it again if that never happens.
-    vc::objects::AttachmentIdentity attachProjectStore(const std::filesystem::path& path, const QString& author,
-                                                       bool readOnly = false);
-    void releaseProjectStore(const vc::objects::AttachmentIdentity& attachment);
-    // Close the package and detach the project's store and the stores beside it.
+    // Project references are stable IDs; attachments exist only for available stores.
+    std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;
+    std::optional<vc::objects::AttachmentIdentity> sampleStore() const;
+    vc::objects::AttachmentIdentity prepareStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
+    void releasePreparedStore(const vc::objects::AttachmentIdentity&);
     void closeProject();
-    // Stores attached beside the project (e.g. a team's hosted store), in attach order.
     std::vector<vc::objects::AttachmentIdentity> attachedStores() const;
-    vc::objects::AttachmentIdentity attachStore(const std::filesystem::path& path, const QString& author,
-                                                bool readOnly = false);
-    void detachStore(const vc::objects::AttachmentIdentity& attachment);
-    // The kinds whose store can be chosen: surfaces, fibers, point collections.
+    vc::objects::AttachmentIdentity attachStore(const std::filesystem::path&, const QString& author, bool readOnly = false);
+    void detachStore(const vc::objects::AttachmentIdentity&);
+    void detachStoreReference(const std::string& id);
+    void replaceStoreReference(const std::string& id, const std::filesystem::path& path);
     static const std::vector<std::string>& routableKinds();
-    // Where objects of `kind` are listed, drawn and created: the store chosen
-    // for it, else the project's. Volume data (registrations, umbilici) is the project's.
     std::optional<vc::objects::AttachmentIdentity> storeFor(std::string_view kind) const;
-    // The surfaces' store while a volume is open (none or one), for session
-    // queries across attachments.
     std::vector<vc::objects::AttachmentIdentity> surfaceSources() const;
-    // Choose the store of a routable kind (nullopt: the project's).
     void setStoreFor(const std::string& kind, const std::optional<vc::objects::AttachmentIdentity>& store);
+    void setStoreSelection(const std::string& kind, const std::string& id);
+    // Called before a source is changed or detached; failure leaves it unchanged.
+    std::function<bool()> prepareStoreSwitch;
     void pollObjectStoreChanges();
 
     // --- VolumePkg ---
     std::shared_ptr<VolumePkg> vpkg() const;
-    // Set the open project: the package's store becomes the project store
-    // (the previous project's store and the stores beside it are detached).
-    // nullptr closes the package; its store stays attached.
+    // Replace the project and its store attachments; nullptr closes it.
     void setVpkg(std::shared_ptr<VolumePkg> pkg);
-    // The project store's directory (relative locations resolve against it).
+    // The project file directory (relative locations resolve against it).
     QString projectDirectory() const;
     bool hasVpkg() const;
 
@@ -189,21 +179,16 @@ private:
     std::string _activeSurfaceDraft;
     bool _activeSurfaceEditing = false;
 
-    // Replace the project store (and the stores beside it) with `next`.
-    void switchProject(const std::optional<vc::objects::AttachmentIdentity>& next);
-    // Attached stores and routes of the project, saved per project store.
-    void saveStoreRoutes() const;
     void restoreStoreRoutes();
     std::optional<vc::objects::AttachmentIdentity> attachedAt(const std::filesystem::path& path) const;
-
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
-    std::optional<vc::objects::AttachmentIdentity> _projectAttachment;
     std::vector<vc::objects::AttachmentIdentity> _attachedStores;
-    std::map<std::string, vc::objects::AttachmentIdentity> _storeRoutes;  // by kind
+    std::map<std::string, vc::objects::AttachmentIdentity> _storeReferences;
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
+
     std::optional<vc::project::AnnotationVolume> _annotationVolume;
     std::optional<Rect3D> _focusBounds; // In the annotation volume, independent of pyramid level.
     bool _focusBoundsEnabled = false;

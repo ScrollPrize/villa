@@ -18,7 +18,6 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
-#include <vc_object_store/objects/Project.hpp>
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -419,51 +418,41 @@ std::string validateSingleVolumeLocation(const std::string& location)
 VolumePkg::VolumePkg() = default;
 VolumePkg::~VolumePkg() = default;
 
-std::shared_ptr<VolumePkg> VolumePkg::open(std::shared_ptr<vc::objects::ObjectStoreSession> session,
-                                           const vc::objects::AttachmentIdentity& attachment,
-                                           const std::string& author,
-                                           const vc::project::LoadOptions& opts)
+std::shared_ptr<VolumePkg> VolumePkg::open(const fs::path& path, const vc::project::LoadOptions& opts)
 {
-    if (!session) throw std::invalid_argument("a project needs an object store session");
     auto p = std::shared_ptr<VolumePkg>(new VolumePkg());
-    p->session_ = std::move(session);
-    p->attachment_ = attachment;
-    p->author_ = author;
+    p->document_ = vc::project::ProjectDocument::load(path);
+    p->path_ = p->document_.path();
     p->opts_ = opts;
-    p->path_ = p->session_->path(attachment);
-    p->readStore();
-    if (!opts.deferResolution)
-        p->resolveAll();
+    p->readDocument();
+    if (!opts.deferResolution) p->resolveAll();
     return p;
 }
 
-bool VolumePkg::writable() const { return session_->writable(attachment_); }
-
+bool VolumePkg::writable() const { return document_.writable(); }
 std::string VolumePkg::name() const { return name_; }
-
 void VolumePkg::setName(const std::string& v)
 {
-    vc::objects::setProjectName(*session_, attachment_, v);
+    auto data = document_.data();
+    data["name"] = v;
+    document_.replace(std::move(data));
     name_ = v;
 }
 
-void VolumePkg::readStore()
+void VolumePkg::readDocument()
 {
-    nlohmann::json view;
-    session_->read(attachment_, [&](const auto& store, const auto& txn, const auto&) {
-        const auto record = vc::objects::projectRecord(store, txn);
-        name_ = record && !record->name.empty() ? record->name : path_.stem().string();
-        const auto entries = [&](const char* kind) {
-            std::vector<vc::project::Entry> out;
-            for (auto& resource : vc::objects::projectResources(store, txn, kind, author_))
-                out.push_back({std::move(resource.location), std::move(resource.tags)});
-            return out;
-        };
-        volumes_ = entries(vc::objects::kVolumeResource);
-        normalGrids_ = entries(vc::objects::kNormalGridResource);
-        lasagnaDatasets_ = entries(vc::objects::kLasagnaDatasetResource);
-        view = vc::objects::projectView(store, txn, author_);
-    });
+    const auto& data = document_.data();
+    name_ = data.at("name").get<std::string>();
+    const auto entries = [&](const char* key) {
+        std::vector<vc::project::Entry> out;
+        for (const auto& entry : data.at(key))
+            out.push_back({entry.at("location"), entry.at("tags").get<std::vector<std::string>>()});
+        return out;
+    };
+    volumes_ = entries("volumes");
+    normalGrids_ = entries("normal_grids");
+    lasagnaDatasets_ = entries("lasagna_datasets");
+    const auto& view = data.at("view");
     const auto selection = [&](const char* key) -> std::optional<std::string> {
         const auto value = view.value(key, std::string{});
         return value.empty() ? std::nullopt : std::optional(value);
@@ -479,35 +468,68 @@ void VolumePkg::readStore()
     }
 }
 
-// A remote location is the same for everyone sharing the project; a local path
-// names something on its author's disk, so it is theirs alone.
-std::string VolumePkg::entryOwner(const std::string& location) const
-{
-    return vc::project::isLocationRemote(location) ? std::string{} : author_;
-}
+std::string VolumePkg::entryOwner(const std::string&) const { return {}; }
 
+namespace {
+// Keep resources inside the project tree portable; external paths stay absolute.
+std::string portableResource(const std::string& location, const fs::path& directory) {
+    if (location.empty() || vc::project::isLocationRemote(location)) return location;
+    const auto path = vc::project::resolveLocalPath(location);
+    if (!path.is_absolute()) return location;
+    const auto relative = path.lexically_normal().lexically_relative(directory);
+    if (relative.empty() || *relative.begin() == "..") return location;
+    return relative.generic_string();
+}
+std::vector<std::string> portableTags(std::vector<std::string> tags, const fs::path& directory) {
+    for (auto& tag : tags)
+        for (const std::string prefix : {"vc-lasagna-derived:", "vc-lasagna-manifest:"})
+            if (tag.starts_with(prefix)) tag = prefix + portableResource(tag.substr(prefix.size()), directory);
+    return tags;
+}
+const char* resourceKey(const std::string& kind) {
+    if (kind == "volume") return "volumes";
+    if (kind == "normal_grid") return "normal_grids";
+    return "lasagna_datasets";
+}
+nlohmann::json entryJson(const vc::project::Entry& entry) {
+    return {{"location", entry.location}, {"tags", entry.tags}};
+}
+}
 bool VolumePkg::writeEntry(const char* kind, const vc::project::Entry& entry)
 {
-    return vc::objects::addProjectResource(*session_, attachment_, kind, entry.location, entry.tags,
-                                           nlohmann::json::object(), entryOwner(entry.location));
+    auto data = document_.data();
+    auto& entries = data[resourceKey(kind)];
+    auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.at("location") == entry.location; });
+    if (found != entries.end()) {
+        if (*found == entryJson(entry)) return false;
+        *found = entryJson(entry);
+    } else entries.push_back(entryJson(entry));
+    document_.replace(std::move(data));
+    return true;
 }
-
-void VolumePkg::writeView()
+nlohmann::json VolumePkg::viewJson() const
 {
-    // A read-only project keeps the author's view in memory only.
-    if (!writable() || author_.empty()) return;
     auto view = nlohmann::json::object();
     if (selectedLasagnaDataset_) view["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) view["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
     if (!currentVolumeId_.empty()) view["current_volume"] = currentVolumeId_;
     if (focusBounds_) view["focus_bounds"] = boundsJson(*focusBounds_, focusBoundsEnabled_);
-    vc::objects::setProjectView(*session_, attachment_, author_, view);
+    return view;
+}
+void VolumePkg::writeView()
+{
+    if (!writable()) return; // Read-only projects may still be explored.
+    auto data = document_.data();
+    data["view"] = viewJson();
+    try { document_.replace(std::move(data)); }
+    catch (...) { readDocument(); throw; }
 }
 
 bool VolumePkg::reload()
 {
     const auto volumes = volumes_, grids = normalGrids_, lasagna = lasagnaDatasets_;
-    readStore();
+    document_ = vc::project::ProjectDocument::load(path_);
+    readDocument();
     if (volumes_ == volumes && normalGrids_ == grids && lasagnaDatasets_ == lasagna)
         return false;
     if (!opts_.deferResolution)
@@ -585,7 +607,7 @@ VolumePkg::matchingVolumeEntry(const std::string& location) const
 bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
-    std::string persistedLocation = location;
+    std::string persistedLocation = portableResource(location, directory());
     std::optional<vc::RemoteVolumeSpec> inputSpec;
     if (vc::project::isLocationRemote(location)) {
         inputSpec = vc::parseRemoteVolumeSpec(location);
@@ -604,10 +626,12 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
             } catch (...) {
             }
         }
-        if (samePersistedVolumeIdentity(e.location, persistedLocation)) return false;
+        if (samePersistedVolumeIdentity(e.location, persistedLocation) ||
+            (!vc::project::isLocationRemote(e.location) && !vc::project::isLocationRemote(persistedLocation) &&
+             vc::project::resolveLocalPath(e.location, directory()).lexically_normal() == vc::project::resolveLocalPath(persistedLocation, directory()).lexically_normal())) return false;
     }
-    vc::project::Entry entry{persistedLocation, std::move(tags)};
-    writeEntry(vc::objects::kVolumeResource, entry);
+    vc::project::Entry entry{persistedLocation, portableTags(std::move(tags), directory())};
+    writeEntry("volume", entry);
     volumes_.push_back(std::move(entry));
     if (!opts_.deferResolution)
         resolveVolumeEntry(volumes_.back());
@@ -622,7 +646,7 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
     if (location.empty() || !volume)
         throw std::invalid_argument("volume location and prepared volume are required");
 
-    std::string persistedLocation = location;
+    std::string persistedLocation = portableResource(location, directory());
     if (vc::project::isLocationRemote(location)) {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         if (spec.hasBaseScaleSelector)
@@ -657,8 +681,8 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
 
     if (insertEntry) {
         // Written first: a failed write leaves the project as it was.
-        vc::project::Entry added{persistedLocation, std::move(tags)};
-        writeEntry(vc::objects::kVolumeResource, added);
+        vc::project::Entry added{persistedLocation, portableTags(std::move(tags), directory())};
+        writeEntry("volume", added);
         volumes_.push_back(std::move(added));
     }
     if (insertVolume)
@@ -673,37 +697,40 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
                               : AttachVolumeResult::Attached;
 }
 
-bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std::string> tags)
+bool VolumePkg::addNormalGridEntry(const std::string& requestedLocation, std::vector<std::string> tags)
 {
+    const auto location = portableResource(requestedLocation, directory());
     if (location.empty()) return false;
     for (const auto& e : normalGrids_) if (e.location == location) return false;
-    vc::project::Entry entry{location, std::move(tags)};
-    writeEntry(vc::objects::kNormalGridResource, entry);
+    vc::project::Entry entry{location, portableTags(std::move(tags), directory())};
+    writeEntry("normal_grid", entry);
     normalGrids_.push_back(std::move(entry));
     if (!opts_.deferResolution)
         resolveNormalGridEntry(normalGrids_.back());
     return true;
 }
 
-bool VolumePkg::addLasagnaDatasetEntry(const std::string& location,
+bool VolumePkg::addLasagnaDatasetEntry(const std::string& requestedLocation,
                                        std::vector<std::string> tags)
 {
+    const auto location = portableResource(requestedLocation, directory());
     if (location.empty()) return false;
     for (const auto& entry : lasagnaDatasets_)
         if (entry.location == location) return false;
-    vc::project::Entry entry{location, std::move(tags)};
-    writeEntry(vc::objects::kLasagnaDatasetResource, entry);
+    vc::project::Entry entry{location, portableTags(std::move(tags), directory())};
+    writeEntry("lasagna_dataset", entry);
     lasagnaDatasets_.push_back(std::move(entry));
     return true;
 }
 
 VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
-    const std::string& manifestLocation,
+    const std::string& requestedManifestLocation,
     std::vector<std::string> manifestTags,
     bool fiberInference,
     const std::vector<PreparedVolumeAttachment>& preparedVolumes,
     bool updateSelection)
 {
+    const auto manifestLocation = portableResource(requestedManifestLocation, directory());
     if (manifestLocation.empty())
         throw std::invalid_argument("Lasagna manifest location is required");
     auto hasTag = [](const std::vector<std::string>& tags, std::string_view tag) {
@@ -765,7 +792,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const auto oldSelected = selectedLasagnaDataset_;
     const auto oldSelectedFiber = selectedFiberInferenceDataset_;
     bool changed = false;
-    std::vector<vc::project::Entry> writtenVolumes;
     try {
         auto manifest = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
             return entry.location == manifestLocation;
@@ -805,7 +831,8 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         }
 
         for (const auto& prepared : preparedVolumes) {
-            std::string persistedLocation = prepared.location;
+            std::string persistedLocation = portableResource(prepared.location, directory());
+            const auto tags = portableTags(prepared.tags, directory());
             if (vc::project::isLocationRemote(prepared.location)) {
                 const auto spec = vc::parseRemoteVolumeSpec(prepared.location);
                 if (spec.hasBaseScaleSelector)
@@ -818,18 +845,16 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                         directory());
                 });
             if (entry == volumes_.end()) {
-                volumes_.push_back({persistedLocation, prepared.tags});
+                volumes_.push_back({persistedLocation, tags});
                 entry = std::prev(volumes_.end());
-                writtenVolumes.push_back(*entry);
                 changed = true;
             } else {
                 const auto oldTags = entry->tags;
-                for (const auto& tag : prepared.tags) {
+                for (const auto& tag : tags) {
                     addUniqueTags(entry->tags, {tag});
                 }
                 if (entry->tags != oldTags) {
-                    writtenVolumes.push_back(*entry);
-                    changed = true;
+                        changed = true;
                 }
             }
             auto loaded = loadedVolumes_.find(prepared.volume->id());
@@ -847,10 +872,13 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         }
         if (!changed)
             return AttachLasagnaResult::AlreadyAttached;
-        writeEntry(vc::objects::kLasagnaDatasetResource, *manifest);
-        for (const auto& written : writtenVolumes) writeEntry(vc::objects::kVolumeResource, written);
-        if (selectedLasagnaDataset_ != oldSelected || selectedFiberInferenceDataset_ != oldSelectedFiber)
-            writeView();
+        auto data = document_.data();
+        data["volumes"] = nlohmann::json::array();
+        data["lasagna_datasets"] = nlohmann::json::array();
+        for (const auto& entry : volumes_) data["volumes"].push_back(entryJson(entry));
+        for (const auto& entry : lasagnaDatasets_) data["lasagna_datasets"].push_back(entryJson(entry));
+        data["view"] = viewJson();
+        document_.replace(std::move(data));
     } catch (...) {
         lasagnaDatasets_ = oldLasagna;
         volumes_ = oldVolumes;
@@ -865,17 +893,23 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     return AttachLasagnaResult::Attached;
 }
 
-bool VolumePkg::removeEntry(const std::string& location)
+bool VolumePkg::removeEntry(const std::string& requestedLocation)
 {
+    const auto location = portableResource(requestedLocation, directory());
+    auto data = document_.data();
     bool removed = false;
-    for (const auto* kind : {vc::objects::kVolumeResource, vc::objects::kNormalGridResource,
-                             vc::objects::kLasagnaDatasetResource})
-        removed |= vc::objects::removeProjectResource(
-            *session_, attachment_, vc::objects::projectResourceUuid(kind, location, entryOwner(location)));
-    if (!removed)
-        return false;
+    for (const auto* key : {"volumes", "normal_grids", "lasagna_datasets"}) {
+        auto& entries = data[key];
+        const auto count = entries.size();
+        entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& e) { return e.at("location") == location; }), entries.end());
+        removed |= count != entries.size();
+    }
+    if (!removed) return false;
+    for (const auto* key : {"selected_lasagna_dataset", "selected_fiber_inference_dataset"})
+        if (data["view"].value(key, std::string{}) == location) data["view"].erase(key);
+    document_.replace(std::move(data));
     const auto previous = volumes_;
-    readStore();
+    readDocument();
     if (selectedLasagnaDataset_ == location || selectedFiberInferenceDataset_ == location) {
         if (selectedLasagnaDataset_ == location) selectedLasagnaDataset_.reset();
         if (selectedFiberInferenceDataset_ == location) selectedFiberInferenceDataset_.reset();
@@ -897,7 +931,7 @@ void VolumePkg::setSelectedLasagnaDataset(std::string location)
         clearSelectedLasagnaDataset();
         return;
     }
-    selectedLasagnaDataset_ = std::move(location);
+    selectedLasagnaDataset_ = portableResource(location, directory());
     writeView();
 }
 
@@ -919,7 +953,7 @@ void VolumePkg::setSelectedFiberInferenceDataset(std::string location)
         clearSelectedFiberInferenceDataset();
         return;
     }
-    selectedFiberInferenceDataset_ = std::move(location);
+    selectedFiberInferenceDataset_ = portableResource(location, directory());
     writeView();
 }
 

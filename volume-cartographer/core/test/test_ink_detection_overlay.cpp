@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "vc/ui/VCCollection.hpp"
 #include "SurfaceCatalog.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -188,8 +189,7 @@ TEST_CASE("CState::closeAll clears the project's surfaces and keeps the view pla
         CState state;
         if (withProject) {
             const auto store = vc::test::createTestProject();
-            state.setVpkg(VolumePkg::open(state.objectStoreSession(),
-                                          state.attachProjectStore(store.path, "vc-test"), "vc-test"));
+            state.setVpkg(VolumePkg::open(store.path));
         }
         state.setSurface("segmentation", makeSurface("segmentation"));
         state.setSurface("other", makeSurface("other"));
@@ -261,4 +261,90 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CHECK(!overlay.horizontalFlip());
     CHECK(qRed(overlay.selectedImageForTesting().pixel(0, 0)) == 40);
     CHECK(qRed(overlay.selectedImageForTesting().pixel(2, 1)) == 30);
+}
+
+TEST_CASE("Project stores are peers with independent persistent per-kind selections")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    CState state;
+    state.setVpkg(project.open());
+    const auto first = state.storeFor("surface");
+    REQUIRE(first);
+    const auto second = state.attachStore(other.storePath, "vc-test");
+    REQUIRE(state.attachedStores().size() == 2);
+    CHECK(state.storeFor("fiber") == first);
+    for (const auto& kind : CState::routableKinds()) {
+        state.setStoreFor(kind, second);
+        CHECK(state.storeFor(kind) == second);
+        state.setStoreFor(kind, first);
+    }
+    state.setStoreFor("fiber", second);
+    state.setStoreFor("umbilicus", second);
+    CHECK(state.storeFor("surface") == first);
+    CHECK(state.storeFor("volume_transform") == first);
+    auto document = vc::project::ProjectDocument::load(project.path);
+    CHECK(document.data()["selections"]["fiber"] != document.data()["selections"]["surface"]);
+    state.prepareStoreSwitch = [] { return false; };
+    CHECK_THROWS(state.setStoreFor("fiber", first));
+    CHECK(state.storeFor("fiber") == second);
+    state.prepareStoreSwitch = {};
+    state.detachStore(second);
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK_FALSE(state.storeFor("umbilicus"));
+    CHECK(fs::exists(other.storePath));
+    CHECK_THROWS(state.detachStore(*first));
+    state.closeProject();
+    state.setVpkg(project.open());
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK(state.storeFor("surface"));
+}
+
+TEST_CASE("Unavailable store references survive opening and can be relocated")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    auto document = vc::project::ProjectDocument::load(project.path);
+    auto data = document.data();
+    data["stores"].push_back({{"id", "unavailable"}, {"location", "missing.vcobj"}, {"read_only", true}});
+    data["selections"]["fiber"] = "unavailable";
+    document.replace(data);
+    CState state;
+    state.setVpkg(project.open());
+    CHECK(state.hasVpkg());
+    CHECK_FALSE(state.storeFor("fiber"));
+    CHECK(state.storeFor("surface"));
+    CHECK(state.vpkg()->document().data() == data);
+    state.replaceStoreReference("unavailable", other.storePath);
+    REQUIRE(state.storeFor("fiber"));
+    CHECK_FALSE(state.objectStoreSession()->writable(*state.storeFor("fiber")));
+    CHECK(state.vpkg()->document().data()["selections"]["fiber"] == "unavailable");
+}
+
+TEST_CASE("A failed point-collection save prevents switching its store")
+{
+    const auto project = vc::test::createTestProject();
+    const auto other = vc::test::createTestProject();
+    CState state;
+    state.setVpkg(project.open());
+    const auto first = state.storeFor("point_collection");
+    REQUIRE(first);
+    const auto second = state.attachStore(other.storePath, "vc-test");
+    vc::test::ZarrVolumeSpec spec;
+    spec.uuid = "point-save-failure";
+    spec.shapeZYX = {4, 4, 4};
+    spec.chunkShapeZYX = {4, 4, 4};
+    auto volume = vc::test::createZarrVolume(vc::test::testProjectDirectory() / spec.uuid, spec);
+    state.setCurrentVolume(volume);
+    state.pointCollection()->addPoint("unsaved", {1, 2, 3});
+    const auto before = state.vpkg()->document().data();
+    // Simulate a lost store connection while the debounce has pending work.
+    state.objectStoreSession()->detach(*first);
+    CHECK_THROWS(state.setStoreFor("point_collection", second));
+    CHECK(state.storeFor("point_collection") == first);
+    CHECK(state.vpkg()->document().data() == before);
+    CHECK(state.pointCollection()->getCollectionId("unsaved").has_value());
+    CHECK_THROWS(state.savePointCollections()); // Still pending, not silently dropped.
+    CHECK_THROWS(state.closeAll());
+    CHECK(state.pointCollection()->getCollectionId("unsaved").has_value());
 }

@@ -60,7 +60,7 @@ TEST_CASE("The volume an author last viewed is kept with the project")
     CHECK(store.open()->currentVolumeId().empty());
     store.open()->setCurrentVolumeId("scan-a");
     CHECK(store.open()->currentVolumeId() == "scan-a");
-    CHECK(VolumePkg::open(store.session, store.attachment, "someone-else")->currentVolumeId().empty());
+    CHECK(VolumePkg::open(store.path)->currentVolumeId() == "scan-a");
 }
 
 fs::path makeLocalVolume(const fs::path& root, const std::string& id = "vol1")
@@ -84,7 +84,7 @@ TEST_CASE("directory is the project store's directory")
     auto d = tmpDir("vpkg_dir");
     const auto store = vc::test::createTestProject(d / "project.vcobj");
     CHECK(store.open()->directory() == d);
-    CHECK(store.open()->path() == d / "project.vcobj");
+    CHECK(store.open()->path() == d / "project.vcproj");
     fs::remove_all(d);
 }
 

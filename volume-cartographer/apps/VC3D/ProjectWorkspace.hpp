@@ -27,8 +27,8 @@ class QTreeWidgetItem;
 // One line on a hosted replica's sync state ("synced 12:03:04", "2 pending", ...).
 QString hubStatusSummary(const vc::objects::HubSessionStatus& status);
 
-// The Project tab: an overview of the open project. Its store and the stores
-// attached beside it (paths, access, hosting, object counts) and which store
+// The Project tab: an overview of the project file and its attached stores
+// (paths, access, hosting, object counts), and which store
 // each kind is kept in; its volumes, normal grids and Lasagna datasets (where
 // they are, who sees them, their disk cache); and the chunk and surface caches'
 // use against their limits. Attaching and detaching goes through the File

@@ -361,8 +361,9 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result,
             {
-                "path": "/tmp/new-project.vcobj",
+                "path": "/tmp/new-project.vcproj",
                 "name": "new-project",
+                "store": "/tmp/new-project.vcobj",
                 "volume": "/tmp/volume",
             },
         )
@@ -377,26 +378,28 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_vc3d_create_project_forwards_optional_values(self) -> None:
         await vc3d_create_project(
-            "/tmp/new-project.vcobj",
+            "/tmp/new-project.vcproj",
             "https://example.test/volume.zarr",
             name="Example",
             tags=["source:test"],
             overwrite=True,
+            store="/tmp/existing.vcobj",
         )
         self.assertEqual(
             self.fake_server.received_requests[-1]["params"],
             {
-                "path": "/tmp/new-project.vcobj",
+                "path": "/tmp/new-project.vcproj",
                 "volume": "https://example.test/volume.zarr",
                 "name": "Example",
                 "tags": ["source:test"],
                 "overwrite": True,
+                "store": "/tmp/existing.vcobj",
             },
         )
 
     async def test_vc3d_create_project_derives_name_case_insensitively(self) -> None:
         result = await vc3d_create_project(
-            "/tmp/Upper.VOLPKG.JSON",
+            "/tmp/Upper.VCPROJ",
             "/tmp/volume",
         )
         self.assertEqual(result["name"], "Upper")

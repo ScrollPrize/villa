@@ -1,4 +1,56 @@
-# VC3D Project Lasagna Data
+# VC3D project files
+
+A project is a versioned JSON `.vcproj` file. It references one or more `.vcobj`
+object stores, volumes, normal grids, and Lasagna datasets. Stores contain the
+objects, their history, registrations, umbilici, and object-owned artifacts.
+Multiple projects can reference the same store while keeping independent
+resource lists and settings.
+
+New Project asks for a project file and an existing or new store. Open Project
+accepts `.vcproj`; old store-based projects are not converted or imported.
+Create a project and attach an existing `.vcobj` to use its objects.
+
+The Project workspace lists every attached store, including unavailable ones.
+Surfaces, fibers, point collections, umbilici, and registrations each select one
+store (or None) for display and editing. The initial store is selected for all
+five categories. Attaching another store does not change these selections.
+Read-only stores can be displayed, but objects cannot be edited in them.
+
+Changes autosave atomically to the project file. Save As copies the description
+and rebases its paths; it references the same stores and does not copy objects.
+A read-only project can still display resources and edit writable stores, but
+changes to its resource list or store selections require a writable project.
+Viewer navigation in a read-only project remains temporary.
+
+Detach removes a reference, never store data. Affected selections become None;
+the last store reference cannot be detached. Unavailable references and their
+selections survive opening. Locate / Replace reconnects such a reference.
+
+Open Data creates a project and store automatically. Sample provenance records
+which store received the catalog objects, independently of the display
+selection. Reset to Open Data prepares a fresh store and restores the sample's
+resource list and selections, retaining previous stores as attachments.
+
+The version 1 document contains:
+
+- `format: "vcproj"`, `version: 1`, and `name`.
+- `stores`: entries with a stable project-local `id`, local `location`, and
+  `read_only` preference. Hosted replicas remain local store references.
+- `selections`: `surface`, `fiber`, `point_collection`, `umbilicus`, and
+  `volume_transform`, each a store reference ID or null. Registrations and their
+  route choices use the `volume_transform` selection.
+- `volumes`, `normal_grids`, and `lasagna_datasets`: location/tag entries.
+- `view`: focus bounds, current volume, and selected Lasagna datasets.
+- Optional `open_data`: catalog `sample` and populated `store` reference ID.
+
+Store references and resources within the project directory use relative paths.
+External resources may use absolute paths. Relative local paths resolve against
+the project-file directory. Remote URLs
+remain URLs. Resource entries and view settings belong to the project file;
+there is no author-specific resource filtering. Credentials, user identity,
+cache limits, and global UI/tool preferences remain application settings.
+
+## Lasagna data
 
 ## Project Entries
 
@@ -15,12 +67,6 @@ VC projects store both regular and fiber inference manifests in
 `vc-lasagna-fiber` is the reserved fiber-inference role tag. No role tag means
 regular Lasagna data. `selected_lasagna_dataset` and
 `selected_fiber_inference_dataset` independently select each role.
-
-Older project files may contain `fiber_inference_datasets`. The reader adds the
-fiber role tag and merges those entries into `lasagna_datasets`; subsequent
-writes use only the canonical collection. The old field is a project-schema
-compatibility input, not a statement that the manifest data or tracer is
-obsolete.
 
 ## Attachment
 

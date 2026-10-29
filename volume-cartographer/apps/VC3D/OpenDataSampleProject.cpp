@@ -1,4 +1,5 @@
 #include "OpenDataSampleProject.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataLasagna.hpp"
@@ -107,34 +108,43 @@ std::filesystem::path sampleProjectPath(const std::filesystem::path& projectsDir
                                         const vcr::catalog::OpenDataSample& sample)
 {
     return projectsDirectory / "open_data" /
-           (vcr::catalog::safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".vcobj");
+           (vcr::catalog::safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".vcproj");
 }
 
-void createSampleProjectStore(const std::filesystem::path& path, const vcr::catalog::OpenDataSample& sample,
+void createSampleProjectFiles(const std::filesystem::path& path, const vcr::catalog::OpenDataSample& sample,
                               const std::string& name, const vc::objects::OpenOptions& options)
 {
     std::filesystem::create_directories(path.parent_path());
-    vc::objects::createProject(path, name, {{"open_data", {{"sample", sample.id}}}}, options);
+    if (std::filesystem::exists(path)) throw std::runtime_error(path.string() + " already exists");
+    auto storePath = path;
+    storePath.replace_extension(".vcobj");
+    if (std::filesystem::exists(storePath))
+        storePath = path.parent_path() / (path.stem().string() + "-" + vc::objects::util::newUuid() + ".vcobj");
+    { auto store = vc::objects::ObjectStore::create(storePath, options); }
+    try {
+        auto document = vc::project::ProjectDocument::create(path, name, storePath);
+        auto data = document.data();
+        data["open_data"] = {{"sample", sample.id}, {"store", data["stores"][0]["id"]}};
+        document.replace(std::move(data));
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(storePath, ignored);
+        std::filesystem::remove(path, ignored);
+        throw;
+    }
 }
 
-std::optional<std::string> openDataProjectSample(vc::objects::ObjectStoreSession& session,
-                                                 const vc::objects::AttachmentIdentity& project)
+std::optional<std::string> openDataProjectSample(const VolumePkg& project)
 {
-    std::optional<std::string> sample;
-    session.read(project, [&](const auto& store, const auto& txn, const auto&) {
-        const auto record = vc::objects::projectRecord(store, txn);
-        if (!record) return;
-        const auto meta = nlohmann::json::parse(record->meta);
-        if (const auto openData = meta.find("open_data"); openData != meta.end() && openData->is_object())
-            if (const auto id = openData->value("sample", std::string{}); !id.empty()) sample = id;
-    });
-    return sample;
+    const auto& data = project.document().data();
+    if (!data.contains("open_data")) return std::nullopt;
+    return data.at("open_data").at("sample").get<std::string>();
 }
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const std::filesystem::path& projectPath,
     const vc::objects::AttachmentIdentity& project,
-    const std::string& author,
     const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut,
@@ -147,7 +157,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     vc::project::LoadOptions loadOptions;
     loadOptions.catalog = vc3d::opendata::cachedCatalog();
     loadOptions.deferResolution = true;
-    auto pkg = VolumePkg::open(session, project, author, loadOptions);
+    auto pkg = VolumePkg::open(projectPath, loadOptions);
 
     const auto surfaces = vc::objects::addCatalogSample(*session, project, sample,
                                                         selection ? selection->segmentIds : std::nullopt);
