@@ -33,13 +33,12 @@ vesuvius.predict \
 | `--input_format` | Format hint (`zarr` by default, or `volume` for explicit catalog identifiers). Paths are opened as Zarr; this does not enable TIFF input.
 | `--tta_type` / `--disable_tta` | Choose `mirroring` (default) or `rotation`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
-| `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
+| `--bbox` | Select full global-grid patches intersecting a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
 | `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
-| `--overlap` | Fractional patch overlap (0–1, default `0.5`).
+| `--overlap` | Patch stride as a fraction of patch size (0–1, default `0.5`, giving 50% overlap).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
-| `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
-| `--intensity-properties-json` | nnU-Net style JSON with intensity stats for CT normalization.
+| `--normalization` | Fallback input normalization when the model supplies no setting (default `instance_zscore`). Model-declared normalization takes precedence; required statistics are read from the checkpoint or nnU-Net plans. |
 | `--device` | Device string such as `cuda`, `cuda:1`, or `cpu`.
 | `--skip_empty_patches` / `--no_skip_empty_patches` | Toggle automatic removal of homogeneous patches.
 | `--zarr_compressor` / `--zarr_compression_level` | Configure output compression (`zstd` with level `3` by default).
@@ -60,7 +59,7 @@ Each worker writes `logits_part_<id>.zarr` and `coordinates_part_<id>.zarr` into
 
 ### Region-of-interest inference
 
-`--bbox` restricts the sliding window to one region of the volume, given in **global voxel
+`--bbox` selects patches intersecting a region of the volume, given in **global voxel
 coordinates** as `"z0:z1,y0:y1,x0:x1"`. Ranges are half-open (`z0` included, `z1` excluded),
 and either bound may be omitted to reach the volume edge:
 
@@ -78,14 +77,22 @@ Patch coordinates stay in the global frame, so `blend_logits` and `finalize_outp
 extra flags — the merged output lands at the same absolute position it would have had in a
 full-volume run. The requested ROI is recorded in the logits store's `bbox` attribute.
 
-This matters most when streaming a remote volume: only the chunks intersecting the ROI are
-ever fetched, so a small region of a multi-terabyte scroll costs seconds of network instead
-of hours. It is also the practical way to iterate on a model, inspect one column of text, or
-reproduce a result on a laptop.
+The bounding box filters the full-volume patch grid; it does not move the grid origin to
+the box or trim every written patch to its bounds. For a 256-cube, 128-cube patches and
+the default half-patch stride, each axis starts at 0, 64 and 128. The box `32:160` on all
+three axes overlaps 27 patches. A one-patch limit selects the middle patch, starting at
+`(64, 64, 64)` and reading `64:192` on each axis. Inspect the written coordinate store
+when interpreting prediction and blended output positions.
+
+
+Selecting a smaller region can reduce the number of patches and input reads. Reads cover
+the selected full patches and their storage chunks, which can extend beyond the requested
+box. Actual transfer and compute costs depend on patch size, chunking, grid coverage and
+the input volume.
 
 Notes:
-- `--num_parts`/`--part_id` split the ROI's Z extent (not the whole volume), so distributed
-  runs stay balanced when a bbox is active.
+- `--num_parts`/`--part_id` partition the Z span occupied by the selected patch starts.
+  Each patch is assigned by its starting Z coordinate; this span can begin outside the box.
 - An ROI smaller than the model patch size along an axis is grown to the patch size and
   shifted back inside the volume, so the model always sees a full patch.
 - Bounds are clamped to the volume; a bbox entirely outside it is an error.
