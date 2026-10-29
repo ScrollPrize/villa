@@ -10,16 +10,6 @@ set_tests_properties(volume_path_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=
 vc_register_test_target(test_volume_path_labels)
 vc_register_ctest(volume_path_labels test_volume_path_labels)
 
-add_executable(test_surface_render_policy test_surface_render_policy.cpp)
-set_target_properties(test_surface_render_policy PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_surface_render_policy PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_surface_render_policy PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME surface_render_policy COMMAND test_surface_render_policy)
-vc_register_test_target(test_surface_render_policy)
-vc_register_ctest(surface_render_policy test_surface_render_policy)
-
 add_executable(test_catalog_project_dialog
     test_catalog_project_dialog.cpp
     ../OpenDataCatalogWindow.cpp
@@ -225,47 +215,6 @@ target_link_libraries(test_spiral_preview_provenance PRIVATE
 add_test(NAME spiral_preview_provenance COMMAND test_spiral_preview_provenance)
 vc_register_test_target(test_spiral_preview_provenance)
 vc_register_ctest(spiral_preview_provenance test_spiral_preview_provenance)
-
-add_executable(test_download_queue_stats
-    test_download_queue_stats.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueStats.cpp)
-
-set_target_properties(test_download_queue_stats PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_download_queue_stats PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_download_queue_stats PRIVATE
-    vc_core
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME download_queue_stats COMMAND test_download_queue_stats)
-vc_register_test_target(test_download_queue_stats)
-vc_register_ctest(download_queue_stats test_download_queue_stats)
-
-add_executable(test_download_queue_debug
-    test_download_queue_debug.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueDebugOverlay.cpp)
-
-set_target_properties(test_download_queue_debug PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_download_queue_debug PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_download_queue_debug PRIVATE
-    vc_core
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Test)
-
-add_test(NAME download_queue_debug COMMAND test_download_queue_debug)
-vc_register_test_target(test_download_queue_debug)
-vc_register_ctest(download_queue_debug test_download_queue_debug)
-set_tests_properties(download_queue_debug PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp

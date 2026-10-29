@@ -760,7 +760,7 @@ int runObjectStoreControllerTests()
         const auto artifact=controller.fiberTransportPaths({merged.id}).at(merged.uuid);
         require(std::filesystem::exists(artifact) && controller.fiberIdForFilePath(artifact)==merged.id,"pinned Spiral transport retains UUID");
         {
-            CState child(nullptr,false,&state);
+            CState child(nullptr,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
         require(state.storeFor("fiber").has_value(),"secondary destruction keeps main attachment");

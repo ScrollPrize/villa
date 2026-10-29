@@ -45,8 +45,7 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(QObject* parent = nullptr,
-                    bool debugDownloadQueue = false, CState* objectStoreOwner = nullptr);
+    explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr);
     ~CState();
 
     // One session for all object kinds; controllers share this handle.
@@ -125,8 +124,6 @@ public:
     // and (through pointCollectionsSaveRequested) the open surface's corrections.
     void savePointCollections();
 
-    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
-
     // --- Teardown ---
     void closeAll();
 
@@ -204,8 +201,6 @@ private:
     VCCollection* _pointCollection;
     // Keeps the volume's point collections in the store (the main state only).
     vc3d::PointCollectionSync* _pointCollectionSync = nullptr;
-
-    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

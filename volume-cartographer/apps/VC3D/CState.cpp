@@ -222,9 +222,8 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwner)
+CState::CState(QObject* parent, CState* objectStoreOwner)
     : QObject(parent)
-    , _debugDownloadQueue(debugDownloadQueue)
 {
     _objectStoreOwner = objectStoreOwner;
     _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()

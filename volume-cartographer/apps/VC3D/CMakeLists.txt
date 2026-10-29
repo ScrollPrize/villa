@@ -102,11 +102,7 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
-    elements/DownloadQueueStats.cpp
-    elements/DownloadQueueStats.hpp
     elements/GrowOnlyLabel.hpp
-    elements/DownloadQueueDebugOverlay.cpp
-    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     SettingsDialog.cpp
@@ -278,6 +274,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/ViewerSampling.cpp
+    volume_viewers/ViewerSampling.hpp
     volume_viewers/CameraGizmoWidget.cpp
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp

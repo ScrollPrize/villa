@@ -200,20 +200,6 @@ flight are excluded. The adaptive controller consumes this same measurement.
 Local and custom fetchers do not contribute network bandwidth or adaptive
 history.
 
-For render-order debugging, start VC3D with
-`--debug-download-queue`. Every shared slice viewer, including plane, segment,
-strip, generated annotation, and Spiral views, then overlays pixels belonging
-to chunks which are actively being fetched from a remote source. The overlay
-uses stable colors by pyramid level at 50-percent opacity and includes both the
-base and volume-overlay sources.
-
-The overlay tracks actual source fetch start/stop events. It does not show
-requests waiting in a queue, persistent-cache reads, decoding, or decoded-cache
-hits. Each accepted render builds compact `uint16` pixel-to-chunk maps for its
-requested and fallback levels. This full-frame pass and its retained maps add
-CPU and memory overhead, so the flag is intended only for diagnostics and is
-disabled by default.
-
 ## Regular Chunk Cache
 
 Core owns one process-lifetime `vc::render::ChunkCacheService`, returned by

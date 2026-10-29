@@ -749,6 +749,11 @@ vc_add_test(NAME test_chunked_plane_sampler)
 vc_add_test(NAME test_volume_pkg)
 vc_add_test(NAME test_opened_volumes
     SOURCES test_opened_volumes.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp)
+vc_add_test(NAME test_grid_resample)
+vc_add_test(NAME test_viewer_sampling
+    SOURCES test_viewer_sampling.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerSampling.cpp
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 
 vc_add_test(NAME test_vcdataset)

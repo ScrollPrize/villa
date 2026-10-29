@@ -29,9 +29,8 @@
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
 #include "VolumetricCompositor.hpp"
+#include "ViewerSampling.hpp"
 #include "annotation_tools/SameWrapAnnotationTool.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
-#include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/Rect3D.hpp"
@@ -48,16 +47,11 @@ class QTimer;
 struct POI;
 class PlaneSurface;
 class Surface;
+class QuadSurface;
 class ViewerManager;
 class ViewerStatsBar;
 class VCCollection;
 class Volume;
-
-namespace vc::render {
-class ChunkCache;
-class SurfaceCache;
-class SurfaceGeometryTileCache;
-}
 
 class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
 {
@@ -248,8 +242,6 @@ public:
     // viewer itself cannot see (an overlay's source edited elsewhere).
     void refreshOverlays() { if (_closing) return; emit overlaysUpdated(); }
     void reloadPerfSettings() override;
-    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
-    void setPreferSurfaceTileFills(bool enabled) override;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -328,8 +320,10 @@ private:
     void repositionStatsBarRight();
     void notifyNormalOffsetChanged();
     void setZOffset(float value);
-    void rebuildChunkArray();
-    void refreshDownloadQueueDebugOverlay();
+    void openLevels();
+    // Starts the background read of what the last frames could not sample from
+    // the caches (see ViewerLoad), unless one is running.
+    void startPendingLoad();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
@@ -338,11 +332,6 @@ private:
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     // Push the displayed plane's basis to the view's coordinate frame gizmo.
     void updateCoordinateFrame();
-    // Build/drop the base and overlay SurfaceCache to match the current
-    // (volume, surface, geometry epoch) identity and the configured budgets.
-    void ensureSurfaceCaches();
-    void dropSurfaceCaches();
-    void dropOverlaySurfaceCache();
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
     // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
@@ -357,11 +346,8 @@ private:
     // Signed depth band along the surface normal that the view currently
     // displays; gates which volume points project onto a quad surface.
     void quadProjectDepthBand(float& depthLo, float& depthHi) const;
-    struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
-        vc::render::ChunkRequestContext chunkRequest;
-        std::array<float, 2> renderFocus{};
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -378,9 +364,9 @@ private:
         float windowHigh = 255.0f;
         std::shared_ptr<Surface> surf;
         std::string surfaceName;
-        std::shared_ptr<vc::render::ChunkCache> chunkArray;
+        std::shared_ptr<const vc3d::ViewerLevels> levels;
         std::shared_ptr<Volume> overlayVolume;
-        std::shared_ptr<vc::render::ChunkCache> overlayChunkArray;
+        std::shared_ptr<const vc3d::ViewerLevels> overlayLevels;
         float overlayOpacity = 0.0f;
         std::string overlayColormapId;
         float overlayWindowLow = 0.0f;
@@ -389,17 +375,12 @@ private:
         OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
-        // Null unless this is a flattened view with a live SurfaceCache. The
-        // epoch changes whenever a cache is rebuilt, so a carried-forward
-        // previous frame is never mixed with a different cache's samples.
-        std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
-        std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
-        std::uint64_t surfaceCacheEpoch = 0;
         // Effective launch-time bounds. Null for disabled bounds and for view
         // types outside the supported plane/annotation scope.
         std::optional<Rect3D> focusBoundsBase;
-        std::shared_ptr<GeneratedSurfaceCache> genCache;
-        bool genCacheDirty = false;
+        // The vertex grid of the QuadSurface shown (null for planes).
+        std::shared_ptr<const vcr::grid::Surface> gridSurface;
+        bool geometryDirty = false;
         std::string profileReason;
         std::string profileCaller;
         std::chrono::steady_clock::time_point submittedAt;
@@ -427,7 +408,6 @@ private:
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
-    void markChunkRequestViewActive();
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -479,11 +459,8 @@ private:
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
     ViewerStatsBar* _statsBarRight = nullptr;
-    // Shared cache/scheduler statistics are refreshed at most every 250 ms:
-    // updateStatusLabel runs per mouse move and ChunkCache::stats() takes the
-    // cache-state and scheduler mutexes that every fetch/decode worker hammers
-    // while a solve streams chunks - polling them at input rate stalls the GUI
-    // thread and the workers alike.
+    // Shared cache statistics are refreshed at most every 250 ms: updateStatusLabel
+    // runs per mouse move.
     QElapsedTimer _sharedCacheStatsThrottle;
     QStringList _cachedSharedCacheItems;
     CameraGizmoWidget* _cameraGizmo = nullptr;
@@ -496,10 +473,6 @@ private:
     // viewer catches up on whatever went stale while invisible.
     bool _renderStaleWhileHidden = false;
     bool _suppressNextSurfaceEditRender = false;
-    // An editing tool can invalidate all tiles or a precise region before it
-    // emits a same-object surfaceChanged signal. Consume that fact at the
-    // signal so regional invalidation is not widened to the whole surface.
-    bool _surfaceEditInvalidationPending = false;
 
     bool _volumetricAzimuthInSurface = false;
     // Last-seen frame of a displayed PlaneSurface: when the plane is rotated
@@ -519,9 +492,14 @@ private:
     std::weak_ptr<Surface> _surfWeak;
     std::shared_ptr<Surface> _defaultSurface;
     std::string _surfName;
-    std::shared_ptr<vc::render::ChunkCache> _chunkArray;
-    vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
-    std::uint64_t _chunkRemoteFetchCbId = 0;
+    std::shared_ptr<const vc3d::ViewerLevels> _levels;
+    // The background read of chunks frames lacked: one at a time; the newest
+    // frame's request waits and replaces older waiting ones. `_loadSuperseded`
+    // tells the running read that a newer request is waiting.
+    bool _loadRunning = false;
+    std::optional<vc3d::ViewerLoad> _pendingLoad;
+    std::shared_ptr<std::atomic<bool>> _loadSuperseded;
+    QString _loadError;
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
@@ -534,38 +512,16 @@ private:
     std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
-    std::uint64_t _chunkViewId = 0;
-    bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _surfaceEditEpoch = 0;
     std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
-    std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
-    bool _genCacheDirty = true;
-
-    // --- SurfaceCache (flattened view only) ---
-    // Tiles of resampled surface space. Present only when the app-wide
-    // per-workspace budget is non-zero and this viewer shows a QuadSurface
-    // segmentation; a null cache means the legacy render path is used.
-    std::shared_ptr<vc::render::SurfaceCache> _surfaceCache;
-    std::shared_ptr<vc::render::SurfaceCache> _overlaySurfaceCache;
-    std::shared_ptr<vc::render::SurfaceGeometryTileCache> _surfaceGeometryTiles;
-    std::size_t _surfaceCacheBudgetBytes = 0;
-    std::size_t _overlaySurfaceCacheBudgetBytes = 0;
-    // See VolumeViewerBase::setPreferSurfaceTileFills.
-    bool _preferSurfaceTileFills = false;
-    // Identity the live caches were built for.
-    Volume* _surfaceCacheVolume = nullptr;
-    Surface* _surfaceCacheSurface = nullptr;
-    std::uint64_t _surfaceCacheGeometryEpoch = 0;
-    Volume* _overlaySurfaceCacheVolume = nullptr;
-    std::uint64_t _surfaceCacheEpoch = 0;
-    std::uint64_t _surfaceTileCbId = 0;
-    std::uint64_t _overlaySurfaceTileCbId = 0;
-    // Last frame fell outside the stored band and used the legacy path, so the
-    // status bar can make that performance cliff legible.
-    bool _surfaceCacheOutOfBand = false;
+    // The shown QuadSurface's vertex grid for vcr::grid; dropped on every edit.
+    std::shared_ptr<const vcr::grid::Surface> _gridSurface;
+    const QuadSurface* _gridSurfaceFor = nullptr;
+    // The view's geometry changed: the next frame does not carry the last one's pixels.
+    bool _geometryDirty = true;
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
@@ -582,10 +538,7 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::shared_ptr<Volume> _overlayVolume;
-    std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
-    vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
-    std::uint64_t _overlayRemoteFetchCbId = 0;
-    std::atomic<std::uint64_t> _overlayGeneration{1};
+    std::shared_ptr<const vc3d::ViewerLevels> _overlayLevels;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;

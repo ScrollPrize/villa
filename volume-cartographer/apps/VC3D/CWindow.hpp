@@ -127,8 +127,7 @@ public:
         VolumeNotFound,
     };
 
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     bool debugDownloadQueue = false);
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -350,7 +349,6 @@ private:
     std::unique_ptr<MenuActionController> _menuController;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
-    bool _debugDownloadQueue{false};
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 

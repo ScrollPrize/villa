@@ -396,11 +396,6 @@ auto main(int argc, char* argv[]) -> int
         "Enable VC3D render profiling logs.");
     parser.addOption(profileOption);
 
-    QCommandLineOption debugDownloadQueueOption(
-        "debug-download-queue",
-        "Overlay currently downloading remote chunks in every slice view.");
-    parser.addOption(debugDownloadQueueOption);
-
     QCommandLineOption agentBridgeOption(
         "agent-bridge",
         "Enable the agent bridge (JSON-RPC over a local socket) on the default "
@@ -501,7 +496,7 @@ auto main(int argc, char* argv[]) -> int
             chunkCacheService->configureFetchConcurrency(
                 fixedDownloadParallelism, false);
         }
-        CWindow aWin(cacheSizeGB, parser.isSet(debugDownloadQueueOption));
+        CWindow aWin(cacheSizeGB);
 
         if (parser.isSet(volumePackageOption)) {
             QString errorMessage;

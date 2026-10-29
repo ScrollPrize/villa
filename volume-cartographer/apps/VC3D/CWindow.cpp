@@ -736,9 +736,8 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
-    _debugDownloadQueue(debugDownloadQueue),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
@@ -866,7 +865,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
 
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         _cacheSizeBytes);
-    _state = new CState(this, _debugDownloadQueue);
+    _state = new CState(this);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);

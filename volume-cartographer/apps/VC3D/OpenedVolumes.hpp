@@ -27,6 +27,12 @@ public:
     // array->placement.fromLevel0(axis, working.toLevel0(axis, c)). Thread-safe.
     Level level(const Volume& volume, int level);
 
+    struct CacheStats {
+        std::size_t bytes = 0, capacity = 0;
+    };
+    // The decoded bytes the shared memory cache holds, and its limit.
+    CacheStats cacheStats() const { return {cache_->nbytes(), cache_->max_bytes()}; }
+
 private:
     std::shared_ptr<vcr::zarr::OpenedArray> open(const Volume& volume, int physical);
 

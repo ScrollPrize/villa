@@ -280,8 +280,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
     // Regular volume chunks use the process service. Derived surface tiles
     // remain local to each ViewerManager.
-    _state = new CState(
-        this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
+    _state = new CState(this, _mainState);
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();

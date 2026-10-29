@@ -421,6 +421,8 @@ public:
     // The surface's tags: its store record's, or a tifxyz meta.json's "tags" keys.
     std::vector<std::string> tags;
 
+    // Column ranges [first, last) of disconnected components; empty: one component.
+    const std::vector<std::pair<int, int>>& components() const { return _components; }
     // Override disconnected component column ranges for an in-memory view.
     void setComponents(std::vector<std::pair<int, int>> components)
     {
