@@ -3,6 +3,7 @@
 // password through SSH_ASKPASS, then execs the installed OpenSSH sftp-server.
 // No network, sshd or credentials are involved.
 #include "TestSupport.hpp"
+#include "HubTestSupport.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
@@ -85,21 +86,6 @@ int fakeSsh(int argc, char** argv)
     return 43;
 }
 
-OpenOptions as(const std::string& author) { OpenOptions options; options.author = author; return options; }
-
-std::string meta(ObjectStore& store, const std::string& uuid)
-{
-    auto txn = store.read();
-    const auto object = store.objectByUuid(txn, uuid);
-    return nlohmann::json::parse(object ? object->meta : store.edgeByUuid(txn, uuid)->meta).dump();
-}
-
-void setNote(ObjectStore& store, const std::string& uuid, const std::string& value)
-{
-    auto txn = store.write();
-    store.setMeta(txn, uuid, "note", nlohmann::json(value).dump());
-    txn.commit();
-}
 
 std::vector<std::byte> bytes(size_t size, unsigned seed)
 {

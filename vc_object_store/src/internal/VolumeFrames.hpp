@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/RecordSql.hpp"
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "internal/Sqlite.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -16,11 +17,47 @@ namespace vc::objects::detail {
 struct VolumeFrame {
     std::string coordinates; // exact declaration, for the coordinates filters
     double toVolume = 1.0;
+    VolumeAffine mapping;
+    bool registered = false;
 };
 
-inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& volume,
-                                             const std::optional<std::string>& kind, bool includeRetired)
+// How geometry declared in one frame (`coordinates`, a geometryCoordinates
+// object) maps to `volume`'s voxels, as volumeFrames maps that frame; nothing
+// when the frame is not placed in the volume.
+inline std::optional<VolumeAffine> frameMapping(const nlohmann::json& coordinates, const std::string& volume,
+                                                const VolumeTransforms* transforms)
 {
+    const auto& source = coordinates.at("volume_uuid");
+    const auto& scale = coordinates.at("scale_factor");
+    if (!source.is_string() || !scale.is_number()) return std::nullopt;
+    const double toVolume = 1.0 / scale.get<double>();
+    if (transforms && !transforms->graph.registrations().empty()) {
+        const auto resolution = transforms->resolve(source.get<std::string>(), volume);
+        if (resolution.status != vcr::catalog::TransformStatus::Resolved) return std::nullopt;
+        return resolution.resolved().forward * VolumeAffine::scale(toVolume);
+    }
+    if (source.get<std::string>() != volume) return std::nullopt;
+    return VolumeAffine::scale(toVolume);
+}
+
+inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& volume,
+                                             const std::optional<std::string>& kind, bool includeRetired,
+                                             const VolumeTransforms* transforms = nullptr)
+{
+    if (transforms && !transforms->graph.registrations().empty()) {
+        std::set<std::string> volumes{volume};
+        for(const auto& r:transforms->graph.registrations()){volumes.insert(r.source);volumes.insert(r.target);}
+        std::vector<VolumeFrame> result;
+        for(const auto& source:volumes) {
+            const auto resolution=transforms->resolve(source,volume);
+            if(resolution.status!=vcr::catalog::TransformStatus::Resolved)continue;
+            for(auto frame:volumeFrames(db,source,kind,includeRetired)) {
+                frame.mapping=resolution.resolved().forward*VolumeAffine::scale(frame.toVolume);
+                frame.registered=true;result.push_back(std::move(frame));
+            }
+        }
+        return result;
+    }
     // Seek each distinct scale of the volume through objects_coordinates: one
     // probe per frame, never a scan of the volume's objects. Scales are
     // validated finite positive numbers; the walk stops at any other value.
@@ -51,7 +88,7 @@ inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& vol
         }
     std::vector<VolumeFrame> frames;
     for (const double scale : scales)
-        frames.push_back({nlohmann::json{{"volume_uuid", volume}, {"scale_factor", scale}}.dump(), 1.0 / scale});
+        frames.push_back({nlohmann::json{{"volume_uuid", volume}, {"scale_factor", scale}}.dump(), 1.0 / scale, VolumeAffine::scale(1.0 / scale)});
     return frames;
 }
 

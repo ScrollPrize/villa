@@ -23,9 +23,10 @@
 // bilinear resampling, matching the Python reference.
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
@@ -65,17 +66,24 @@ static bool isInvalid(const cv::Vec3f& p) {
     return p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f;
 }
 
-static Grid loadGrid(const fs::path& dir)
+// A grid from a loaded surface, its sentinels as invalid cells.
+static Grid gridOf(QuadSurface& surf)
 {
-    auto surf = load_quad_from_tifxyz(dir.string());
     Grid g;
-    g.P = surf->rawPointsPtr()->clone();
-    g.scale = surf->scale();
+    g.P = surf.rawPointsPtr()->clone();
+    g.scale = surf.scale();
     const int H = g.P.rows, W = g.P.cols;
     g.valid = cv::Mat_<uint8_t>::zeros(H, W);
     for (int r = 0; r < H; ++r)
         for (int c = 0; c < W; ++c)
             if (!isInvalid(g.P(r, c))) g.valid(r, c) = 1;
+    return g;
+}
+
+static Grid loadGrid(const fs::path& dir)
+{
+    Grid g = gridOf(*load_quad_from_tifxyz(dir.string()));
+    const int H = g.P.rows, W = g.P.cols;
 
     // Honor an explicit mask.tif the same way the Python loader does.
     const fs::path mp = dir / "mask.tif";
@@ -120,12 +128,10 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     Json meta;
     const fs::path sm = srcdir / "meta.json";
     if (fs::exists(sm)) meta = Json::parse_file(sm.string());
-    meta["uuid"] = vc::util::newUuid();  // a straightened copy is a new object
-    // Straightening moves every point, so an isometry block (#2279) copied from the
-    // source is measured against the wrong grid; drop it (recompute with
-    // `vc_tifxyz --isometry`).
+    meta["uuid"] = vc::objects::util::newUuid();  // a straightened copy is a new object
+    // Straightening moves every point, so a copied isometry block (#2279) is
+    // measured against the wrong grid; drop it.
     meta.erase("isometry");
-    meta.erase("vc_open_data_representation");
     meta["name"] = outdir.filename().string();
     meta["format"] = "tifxyz";
     meta["type"] = "seg";
@@ -138,8 +144,7 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     // Recompute rather than erase: straightening moves every point, so the
     // input's bbox is stale, but dropping the key entirely makes the output
     // invisible to any tool gating on meta.contains("bbox") — e.g. three
-    // checks in vc_grow_seg_from_seed.cpp, and vc_seg_add_overlap.cpp's own
-    // directory discovery (is_tifxyz_dir requires it). See villa#1321.
+    // checks in vc_grow_seg_from_seed.cpp. See villa#1321.
     Rect3D bb;
     if (bbox_of_valid_points(P, bb)) {
         meta["bbox"] = bbox_to_json(bb);
@@ -786,6 +791,8 @@ int main(int argc, char** argv)
         ("stride", po::value<int>(&op.stride)->default_value(2), "subsample stride for the KD-tree")
         ("trim-max-edge", po::value<double>(&trimMaxEdge)->default_value(100.0), "trim cells touching a 3D edge longer than this (voxels)")
         ("seed", po::value<unsigned>(&op.seed)->default_value(7), "RNG seed for the spacing estimate");
+    StoreToolOptions::add(desc, "object store: the input is the stored --surface and the result a new surface (--name, "
+                                "prints surface_uuid:)", {.surfaces = true, .creates = true, .named = true});
     po::positional_options_description pos;
     pos.add("input", 1).add("output", 1);
     po::variables_map vm;
@@ -796,23 +803,39 @@ int main(int argc, char** argv)
         std::cerr << "error: " << e.what() << "\n" << desc << "\n";
         return 1;
     }
-    if (vm.count("help") || inPath.empty()) { std::cout << desc << "\n"; return vm.count("help") ? 0 : 1; }
+    if (vm.count("help")) { std::cout << desc << "\n"; return 0; }
 
     // Default pipeline when no stage flag is given.
     const bool anyStage = doUnbend || doOrtho || doTrim || overlapCount >= 0 || analyze;
     if (!anyStage) { doUnbend = true; overlapCount = 2; doOrtho = true; doTrim = true; }
     if (overlapCount < 0) overlapCount = 0;
 
+    std::optional<StoreToolOptions> storeOptions;
+    std::optional<StoreSurfaces> store;
+    std::unique_ptr<QuadSurface> stored;
     Grid g;
-    try { g = loadGrid(inPath); }
+    try {
+        storeOptions = StoreToolOptions::from(vm);
+        if (storeOptions) {
+            if (!inPath.empty() || !outPath.empty() || storeOptions->surfaces.size() != 1)
+                throw std::runtime_error("store mode takes one --surface and no input or output directories");
+            inPath = storeOptions->surfaces.front();
+            store.emplace(storeOptions->store, "vc_straighten");
+            stored = store->load(inPath, true, storeOptions->volume);
+            g = gridOf(*stored);
+        } else {
+            if (inPath.empty()) { std::cout << desc << "\n"; return 1; }
+            g = loadGrid(inPath);
+        }
+    }
     catch (const std::exception& e) { std::cerr << "error loading " << inPath << ": " << e.what() << "\n"; return 1; }
 
     if (analyze) {
         stageOverlapPairs(g, op, /*applyWarp=*/false, nullptr);
         return 0;
     }
-    if (outPath.empty()) { std::cerr << "error: output dir required\n"; return 1; }
-    if (fs::exists(outPath)) { std::cerr << "error: output exists: " << outPath << "\n"; return 1; }
+    if (!store && outPath.empty()) { std::cerr << "error: output dir required\n"; return 1; }
+    if (!store && fs::exists(outPath)) { std::cerr << "error: output exists: " << outPath << "\n"; return 1; }
 
     try {
         if (doUnbend) g = stageUnbend(g, unbendSmooth, unbendMinRows);
@@ -823,6 +846,22 @@ int main(int argc, char** argv)
         }
         if (doOrtho) g = stageOrthogonalize(g, qp);
         if (doTrim)  stageTrim(g, trimMaxEdge);
+        if (store) {
+            cv::Mat_<cv::Vec3f> P = g.P.clone();
+            for (int r = 0; r < g.H(); ++r)
+                for (int c = 0; c < g.W(); ++c)
+                    if (!g.valid(r, c)) P(r, c) = cv::Vec3f(-1, -1, -1);
+            QuadSurface result(P, g.scale);
+            result.meta = stored->meta;  // a straightened copy keeps the input's metadata
+            const std::string name = storeOptions->name.value_or(
+                (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight");
+            const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
+                                               {"orthogonalize", doOrtho}, {"trim", doTrim}};
+            const auto uuid = store->create(result, name, parameters, {stored->id}, storeOptions->tags);
+            store->objects().finish();
+            std::cout << "surface_uuid: " << uuid << "\n";
+            return 0;
+        }
         saveGrid(g, outPath, inPath);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

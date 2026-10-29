@@ -16,7 +16,6 @@ integration, not a new quality result or a prescribed experiment configuration.
 | Resident CUDA beam tracing and online fixed-plane refinement | Optional CUDA plugin; shared portable tensor/scoring primitives |
 | RAM-only top2 spatial-companion 2x prediction pooling | Native read-only Zarr view, explicit source channel mapping |
 | Generic evaluation | Existing callable `vc.fiber_evaluation` extended; native `replay-set` accepts `chunk-beam` |
-| Construction/filter microbenchmarks and verified legacy cache import | `vc.fiber_chunk_benchmark` |
 
 Historical parameter sweeps, model/checkpoint paths, cohort configurations,
 results, plots, exported data and machine-specific launchers are **not** imported
@@ -90,21 +89,6 @@ immutable parameter block by reference: the previous second by-value copy
 caused invalid local-memory reads in optimized CUDA 12.8/H100 execution at the
 second expansion. Keep the device regression in addition to host math tests.
 
-Old experimental chunk files without main's specification need **explicit
-provenance attestation**, not an unchecked compatibility switch:
-
-```sh
-python -m vc.fiber_chunk_benchmark import-legacy provenance.json NEW_DIRECTORY
-```
-
-The version-1 manifest contains `specification` from
-`ft.chunk_cache_specification(chunks, trace, scale, source_identity)` and `files`
-entries containing `path` and `sha256`. The source identity must identify the
-immutable predictions, normals and transforms. The caller must verify the
-attested construction settings against the original run. Import checks hashes,
-native geometry and bounds, rejects duplicate keys and existing destinations,
-and writes new copies. It cannot establish missing provenance by itself.
-
 For historical native replay documents, keep using
 `vesuvius.neural_tracing.fiber_trace_3d.replay_metrics` for minimum-piece pruning,
 retained percentage, mean/median and restart-episode accounting. Do not interpret
@@ -112,34 +96,6 @@ all `failures` as GT-distance errors: report `distance_above_threshold`,
 `chunk_no_initial_path`, `chunk_no_overlap`, limits and other reasons separately.
 Filtered stops remain separate. The callable evaluator exposes raw counts and
 geometry, not an implicit cohort-specific score.
-
-## Microbenchmarks
-
-Time native construction with caller-owned dataset handles, no path-cache IO:
-
-```python
-from vc.fiber_chunk_benchmark import time_construction
-report = time_construction(field, normals, trace, chunks, [0, 0, 0],
-                           workers=(1, 4, 16, 64), repeats=3)
-```
-
-An untimed warmup fills dataset caches. Timed runs rebuild paths and include
-queue setup, pinning, seed processing and tracing. Worker-count parity checks
-exact paths and stop reasons. Returned stage timings are backend-specific;
-do not infer pure tracer time by subtracting unrelated runs.
-
-Time only conflict filtering of already loaded path geometry:
-
-```sh
-python -m vc.fiber_chunk_benchmark time-filter \
-  --normal-manifest normals.lasagna.json --config filter.json \
-  --trace-to-base 1 --workers 1 4 16 64 --repeats 3 \
-  --output filter-timing.json chunk-path-cache/0_0_0.json
-```
-
-Reports min/median/max/mean, exact rejected-ID parity, and throughput. Normal
-data are warmed but not pinned: any subsequent normal-cache miss is included.
-Neither helper starts inference or acquires resources on the caller's behalf.
 
 ## CUDA build and limitations
 

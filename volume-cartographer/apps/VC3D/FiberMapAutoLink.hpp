@@ -66,7 +66,7 @@ struct MapMeeting {
                                             double linePosition);
 
 // Cumulative 3D arclength per line point (index 0 = 0). The controller can
-// pass fiber_slice::cumulativePolylineArclengths' array; this is the same
+// pass fiber_line::cumulativePolylineArclengths' array; this is the same
 // quantity for callers without that dependency.
 [[nodiscard]] std::vector<double> cumulativeArclengths(const std::vector<cv::Vec3d>& linePoints);
 

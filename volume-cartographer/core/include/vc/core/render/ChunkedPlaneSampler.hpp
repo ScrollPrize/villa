@@ -109,22 +109,6 @@ public:
         bool overflowed = false;
     };
 
-    // Queue chunk dependencies for pixels not already covered. The viewer can
-    // call these before sampling a frame so cache misses start resolving early.
-    static Stats requestPlaneDependencies(IChunkedArray& array,
-                                          int level,
-                                          const cv::Vec3f& origin,
-                                          const cv::Vec3f& vxStep,
-                                          const cv::Vec3f& vyStep,
-                                          const cv::Mat_<uint8_t>& coverage,
-                                          const Options& options = Options());
-
-    static Stats requestCoordsDependencies(IChunkedArray& array,
-                                           int level,
-                                           const cv::Mat_<cv::Vec3f>& coords,
-                                           const cv::Mat_<uint8_t>& coverage,
-                                           const Options& options = Options());
-
     static std::vector<ChunkKey> collectPlaneDependencies(IChunkedArray& array,
                                                           int level,
                                                           const cv::Vec3f& origin,
@@ -263,24 +247,6 @@ public:
 
     static Stats sampleCoordsFineToCoarse(IChunkedArray& array,
                                           int startLevel,
-                                          const cv::Mat_<cv::Vec3f>& coords,
-                                          cv::Mat_<uint8_t>& out,
-                                          cv::Mat_<uint8_t>& coverage,
-                                          const Options& options = Options());
-
-    // Coarse-to-fine progressive render. Coarser levels provide the first
-    // available image; ready finer levels overwrite those pixels.
-    static Stats samplePlaneCoarseToFine(IChunkedArray& array,
-                                         int finestLevel,
-                                         const cv::Vec3f& origin,
-                                         const cv::Vec3f& vxStep,
-                                         const cv::Vec3f& vyStep,
-                                         cv::Mat_<uint8_t>& out,
-                                         cv::Mat_<uint8_t>& coverage,
-                                         const Options& options = Options());
-
-    static Stats sampleCoordsCoarseToFine(IChunkedArray& array,
-                                          int finestLevel,
                                           const cv::Mat_<cv::Vec3f>& coords,
                                           cv::Mat_<uint8_t>& out,
                                           cv::Mat_<uint8_t>& coverage,

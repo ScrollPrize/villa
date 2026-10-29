@@ -1,6 +1,7 @@
 #include <iostream>
 #include <random>
 
+#include "TargetContext.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -13,6 +14,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
@@ -93,46 +95,6 @@ static bool chunk_has_source_data(vc::render::IChunkedArray& chunks,
     }
     return result.status == vc::render::ChunkStatus::Data;
 }
-
-static void add_target_context(Json& meta, const std::filesystem::path& volume_path)
-{
-    std::filesystem::path normalized_volume_path = volume_path.lexically_normal();
-    if (normalized_volume_path.filename().empty()) {
-        normalized_volume_path = normalized_volume_path.parent_path();
-    }
-
-    const std::string volume_name = normalized_volume_path.filename().string();
-    if (!volume_name.empty() && !meta.contains("target_volume")) {
-        meta["target_volume"] = volume_name;
-    }
-
-    const std::filesystem::path volumes_dir = normalized_volume_path.parent_path();
-    if (volumes_dir.filename() != "volumes") {
-        return;
-    }
-
-    const std::filesystem::path volpkg_root = volumes_dir.parent_path();
-    std::string scroll_name = volpkg_root.filename().string();
-
-    const std::filesystem::path config_path = volpkg_root / "config.json";
-    std::error_code ec;
-    if (std::filesystem::is_regular_file(config_path, ec)) {
-        try {
-            auto cfg = Json::parse_file(config_path);
-            if (cfg.contains("name") && cfg["name"].is_string()) {
-                scroll_name = cfg["name"].get_string();
-            }
-        } catch (...) {
-            // Keep folder-based fallback if config.json cannot be parsed.
-        }
-    }
-
-    if (!scroll_name.empty() && !meta.contains("scroll_source")) {
-        meta["scroll_source"] = scroll_name;
-    }
-}
-
-
 
 std::string time_str()
 {
@@ -271,9 +233,13 @@ static int run_main(int argc, char *argv[])
     cv::Vec3d origin;
     Json params;
     PointCollections corrections;
-    bool skip_overlap_check = false;
     std::string segment_name;
     std::optional<unsigned int> rng_seed;
+    // Store mode: surfaces come from and go to an object store instead of tifxyz directories.
+    std::filesystem::path store_path;
+    std::string surface_uuid;
+    std::optional<vc::objects::VolumeVoxels> volume_voxels;
+    std::vector<std::string> output_tags;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -289,19 +255,20 @@ static int run_main(int argc, char *argv[])
         desc.add_options()
             ("help,h", "produce help message")
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
-            ("target-dir,t", po::value<std::string>()->required(), "Target directory for output")
+            ("target-dir,t", po::value<std::string>(), "Target directory for output (tifxyz mode)")
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
             ("rewind-gen", po::value<int>(), "Generation to rewind to")
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
-            ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
-            ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
             ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
                                                     "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
+        StoreToolOptions::add(desc, "Object store (local or hosted replica) holding input and output surfaces; "
+                                    "--surface is the stored surface to resume from or to project",
+                              {.surfaces = true, .creates = true});
 
         po::variables_map vm;
         try {
@@ -320,8 +287,33 @@ static int run_main(int argc, char *argv[])
         }
 
         vol_path = vm["volume"].as<std::string>();
-        tgt_dir = vm["target-dir"].as<std::string>();
         params_path = vm["params"].as<std::string>();
+        std::optional<StoreToolOptions> store_options;
+        try {
+            store_options = StoreToolOptions::from(vm);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store_options) {
+            store_path = store_options->store;
+            volume_voxels = store_options->volume;
+            output_tags = store_options->tags;
+        }
+        if (vm.count("target-dir")) tgt_dir = vm["target-dir"].as<std::string>();
+        if (store_path.empty() == tgt_dir.empty()) {
+            std::cerr << "ERROR: specify exactly one of --store and --target-dir" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store_options && store_options->surfaces.size() > 1) {
+            std::cerr << "ERROR: give at most one --surface" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store_options && !store_options->surfaces.empty()) surface_uuid = store_options->surfaces.front();
+        if (!store_path.empty() && vm.count("resume")) {
+            std::cerr << "ERROR: in store mode, resume from --surface UUID" << std::endl;
+            return EXIT_FAILURE;
+        }
 
         if (vm.count("seed")) {
             auto seed_coords = vm["seed"].as<std::vector<float>>();
@@ -336,8 +328,8 @@ static int run_main(int argc, char *argv[])
         }
 
         if (vm.count("correct")) {
-            if (!vm.count("resume")) {
-                std::cerr << "ERROR: --correct can only be used with --resume" << std::endl;
+            if (!vm.count("resume") && surface_uuid.empty()) {
+                std::cerr << "ERROR: --correct can only be used with --resume or --surface" << std::endl;
                 return EXIT_FAILURE;
             }
             correct_path = vm["correct"].as<std::string>();
@@ -358,10 +350,6 @@ static int run_main(int argc, char *argv[])
             params["inpaint"] = true;
         }
 
-        if (vm.count("skip-overlap-check")) {
-            skip_overlap_check = true;
-        }
-
         if (vm.count("resume-opt")) {
             std::string resume_opt = vm["resume-opt"].as<std::string>();
             if (resume_opt == "skip" || resume_opt == "local" || resume_opt == "global") {
@@ -370,10 +358,6 @@ static int run_main(int argc, char *argv[])
                 std::cerr << "ERROR: --resume-opt must be one of 'skip', 'local', or 'global'" << std::endl;
                 return EXIT_FAILURE;
             }
-        }
-
-        if (vm.count("resume-generations")) {
-            params["resume_generations"] = vm["resume-generations"].as<int>();
         }
 
         if (vm.count("segment-name")) {
@@ -445,6 +429,28 @@ static int run_main(int argc, char *argv[])
 
     srand(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
 
+    std::optional<StoreSurfaces> store;
+    if (!store_path.empty()) store.emplace(store_path, "vc_grow_seg_from_seed");
+    // Stored surfaces are read in volume_voxels, the units of the
+    // selection, proximity queries and the output binding below.
+
+    const bool resuming = !resume_path.empty() || !surface_uuid.empty();
+    // Stored surfaces within `tolerance` of a point (in the bound volume's voxels when given).
+    auto stored_surfaces_near = [&](const cv::Vec3d& p, double tolerance) {
+        vc::objects::SurfaceProximityQuery query;
+        query.point = {p[0], p[1], p[2]};
+        query.tolerance = tolerance;
+        if (volume_voxels) {
+            query.volume = volume_voxels->volume;
+            query.targetScale = volume_voxels->scale;
+        }
+        std::vector<vc::objects::SurfaceProximityHit> hits;
+        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            hits = db.nearestSurfaces(txn, query);
+        });
+        return hits;
+    };
+
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
     float min_area_cm = params.value("min_area_cm", 0.3);
@@ -499,6 +505,7 @@ static int run_main(int argc, char *argv[])
 
     //expansion mode
     int count_overlap = 0;
+    std::unique_ptr<QuadSurface> stored_src;
     if (mode == "expansion") {
         //got trough all exising segments (that match filter/start with auto ...)
         //list which ones do not yet less N overlapping (in symlink dir)
@@ -510,6 +517,7 @@ static int run_main(int argc, char *argv[])
             //if both still have less than N then grow a seg from the seed
             //after growing, check locations on the new seg agains all existing segs
 
+        if (!store)
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry)) {
                 std::string name = entry.path().filename().string();
@@ -531,23 +539,20 @@ static int run_main(int argc, char *argv[])
                     continue;
 
                 QuadSurface *sm = new QuadSurface(entry.path(), meta);
-                sm->readOverlappingJson();
 
                 surfs[name] = sm;
                 surfs_v.push_back(sm);
             }
             
-        if (!surfs.size()) {
+        if (!store && !surfs.size()) {
             std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl; 
             return EXIT_FAILURE;
         }
-        
-        std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
-        std::shuffle(std::begin(surfs_v), std::end(surfs_v), rng);
 
 
-        for(auto &it : surfs_v) {
-            src = it;
+        // A seed on `src`: a random vertex, or one walked in from an edge, over dense voxels.
+        auto sample_seed = [&](QuadSurface& seed_surface) {
+            QuadSurface* src = &seed_surface;
             cv::Mat_<cv::Vec3f> points = src->rawPoints();
             int w = points.cols;
             int h = points.rows;
@@ -598,7 +603,45 @@ static int run_main(int argc, char *argv[])
                 }
             }
 
-            if (!found)
+            return found;
+        };
+        if (store) {
+            // One candidate loaded at a time; overlaps are counted with the store's proximity query.
+            std::vector<std::string> candidates;
+            store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+                vc::objects::ObjectSelection selection;
+                selection.kind = "surface";
+                if (volume_voxels) {
+                    selection.volume = volume_voxels->volume;
+                    selection.targetScale = volume_voxels->scale;
+                }
+                for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{}))
+                    candidates.push_back(object.uuid);
+            });
+            if (candidates.empty()) {
+                std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl;
+                return EXIT_FAILURE;
+            }
+            std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
+            std::shuffle(candidates.begin(), candidates.end(), rng);
+            for (const auto& uuid : candidates) {
+                auto candidate = store->load(uuid, true, volume_voxels);
+                if (!sample_seed(*candidate))
+                    continue;
+                count_overlap = 0;
+                for (const auto& hit : stored_surfaces_near(origin, 2.0))
+                    if (hit.objectUuid != uuid) ++count_overlap;
+                stored_src = std::move(candidate);
+                src = stored_src.get();
+                if (count_overlap < tgt_overlap_count-1)
+                    break;
+            }
+        } else {
+        std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
+        std::shuffle(std::begin(surfs_v), std::end(surfs_v), rng);
+        for(auto &it : surfs_v) {
+            src = it;
+            if (!sample_seed(*src))
                 continue;
 
             count_overlap = 0;
@@ -613,11 +656,11 @@ static int run_main(int argc, char *argv[])
             if (count_overlap < tgt_overlap_count-1)
                 break;
         }
-
+        }
         std::cout << "found potential overlapping starting seed " << origin << " with overlap " << count_overlap << std::endl;
     }
     else if (mode != "gen_neighbor") {
-        if (!resume_path.empty()) {
+        if (resuming) {
             mode = "resume";
         } else if (use_old_args && argc == 7) {
             mode = "explicit_seed";
@@ -660,7 +703,8 @@ static int run_main(int argc, char *argv[])
                     cv::Vec3d p = origin + i*dir;
                     interpolator.Evaluate(p[2], p[1], p[0], &v);
                     if (v >= 128) {
-                        if (check_existing_segments(tgt_dir, p, name_prefix, search_effort))
+                        if (store ? !stored_surfaces_near(p, 2.0).empty()
+                                  : check_existing_segments(tgt_dir, p, name_prefix, search_effort))
                             continue;
                         succ = true;
                         origin = p;
@@ -700,7 +744,9 @@ static int run_main(int argc, char *argv[])
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
-        if (corrections.getAllCollections().empty())
+        if (store)
+            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty(), volume_voxels);
+        else if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
         else
             resume_surf = load_quad_from_tifxyz(resume_path, SURF_LOAD_IGNORE_MASK);
@@ -719,7 +765,10 @@ static int run_main(int argc, char *argv[])
 
     std::string seg_name;
     std::filesystem::path seg_dir;
-    if (!segment_name.empty()) {
+    if (store) {
+        // Store outputs are objects; the tracer writes no file snapshots.
+        seg_name = segment_name.empty() ? name_prefix + time_str() : segment_name;
+    } else if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
         seg_name = segment_name;
         seg_dir = tgt_dir;
@@ -729,20 +778,28 @@ static int run_main(int argc, char *argv[])
         seg_dir = tgt_dir / seg_name;
     }
 
+    // Store mode output: a new surface object recording how it was made.
+    auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
+        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
+                                        volume_voxels);
+        store->objects().finish();
+        std::cout << "surface_uuid: " << uuid << std::endl;
+    };
+
     //
     // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
     // to the first nonzero voxel within a max distance, producing a new tifxyz surface.
     //
     if (mode == "gen_neighbor") {
-        if (resume_path.empty()) {
-            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> to provide the source surface" << std::endl;
+        if (!resuming) {
+            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> or --surface UUID for the source surface" << std::endl;
             return EXIT_FAILURE;
         }
 
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface = load_quad_from_tifxyz(resume_path);
+            src_surface = store ? store->load(surface_uuid, true, volume_voxels) : load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;
@@ -751,10 +808,6 @@ static int run_main(int argc, char *argv[])
         const cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
         const int rows = src_points.rows;
         const int cols = src_points.cols;
-
-        const auto is_valid_vertex = [](const cv::Vec3f& p) -> bool {
-            return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
-        };
 
         const cv::Vec3f invalid_marker(-1.f, -1.f, -1.f);
         cv::Mat_<cv::Vec3f> dst_points(src_points.size());
@@ -767,7 +820,7 @@ static int run_main(int argc, char *argv[])
         cv::Mat_<uchar> src_valid(rows, cols);
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
-                src_valid(r, c) = is_valid_vertex(src_points(r, c)) ? 1 : 0;
+                src_valid(r, c) = vc::geometry::validSurfacePoint(src_points(r, c)) ? 1 : 0;
             }
         }
 
@@ -859,7 +912,7 @@ static int run_main(int argc, char *argv[])
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 const cv::Vec3f start = src_points(r, c);
-                if (!is_valid_vertex(start)) {
+                if (!vc::geometry::validSurfacePoint(start)) {
                     continue;
                 }
 
@@ -1183,7 +1236,7 @@ static int run_main(int argc, char *argv[])
             cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
             for (int r = 0; r < pts.rows; ++r) {
                 for (int c = 0; c < pts.cols; ++c) {
-                    if (is_valid_vertex(pts(r, c))) {
+                    if (vc::geometry::validSurfacePoint(pts(r, c))) {
                         for (int i = 0; i < 3; ++i) {
                             min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
                             max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
@@ -1227,7 +1280,7 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 for (int col : cols_list) {
                     const cv::Vec3f& p = new_points(row, col);
-                    if (!is_valid_vertex(p)) {
+                    if (!vc::geometry::validSurfacePoint(p)) {
                         continue;
                     }
                     acc += p;
@@ -1249,7 +1302,7 @@ static int run_main(int argc, char *argv[])
             for (int r = 0; r < rows; ++r) {
                 valid_cols.clear();
                 for (int c = 0; c < cols; ++c) {
-                    if (is_valid_vertex(new_points(r, c))) {
+                    if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                         valid_cols.push_back(c);
                     }
                 }
@@ -1263,7 +1316,7 @@ static int run_main(int argc, char *argv[])
                 right_cols.reserve(window);
 
                 for (int c = 0; c < cols; ++c) {
-                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                    if (!src_valid(r, c) || vc::geometry::validSurfacePoint(new_points(r, c))) {
                         continue;
                     }
 
@@ -1307,7 +1360,7 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 for (int row : rows_list) {
                     const cv::Vec3f& p = new_points(row, col);
-                    if (!is_valid_vertex(p)) {
+                    if (!vc::geometry::validSurfacePoint(p)) {
                         continue;
                     }
                     acc += p;
@@ -1329,7 +1382,7 @@ static int run_main(int argc, char *argv[])
             for (int c = 0; c < cols; ++c) {
                 valid_rows.clear();
                 for (int r = 0; r < rows; ++r) {
-                    if (is_valid_vertex(new_points(r, c))) {
+                    if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                         valid_rows.push_back(r);
                     }
                 }
@@ -1343,7 +1396,7 @@ static int run_main(int argc, char *argv[])
                 lower_rows.reserve(window);
 
                 for (int r = 0; r < rows; ++r) {
-                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                    if (!src_valid(r, c) || vc::geometry::validSurfacePoint(new_points(r, c))) {
                         continue;
                     }
 
@@ -1384,7 +1437,7 @@ static int run_main(int argc, char *argv[])
                 if (!src_valid(r, c)) {
                     continue;
                 }
-                if (is_valid_vertex(new_points(r, c))) {
+                if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                     dst_points(r, c) = new_points(r, c);
                     continue;
                 }
@@ -1395,14 +1448,14 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 if (!row_interp.empty()) {
                     const cv::Vec3f& row_est = row_interp(r, c);
-                    if (is_valid_vertex(row_est)) {
+                    if (vc::geometry::validSurfacePoint(row_est)) {
                         acc += row_est;
                         ++count;
                     }
                 }
                 if (!col_interp.empty()) {
                     const cv::Vec3f& col_est = col_interp(r, c);
-                    if (is_valid_vertex(col_est)) {
+                    if (vc::geometry::validSurfacePoint(col_est)) {
                         acc += col_est;
                         ++count;
                     }
@@ -1426,7 +1479,7 @@ static int run_main(int argc, char *argv[])
             cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
             for (int r = 0; r < pts.rows; ++r) {
                 for (int c = 0; c < pts.cols; ++c) {
-                    if (is_valid_vertex(pts(r, c))) {
+                    if (vc::geometry::validSurfacePoint(pts(r, c))) {
                         for (int i = 0; i < 3; ++i) {
                             min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
                             max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
@@ -1481,8 +1534,8 @@ static int run_main(int argc, char *argv[])
                     int c1 = std::min(c0 + 1, cols - 1);
 
                     // Check all 4 corners are valid - skip if any are invalid
-                    if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
-                        !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
+                    if (!vc::geometry::validSurfacePoint(dst_points(r0, c0)) || !vc::geometry::validSurfacePoint(dst_points(r0, c1)) ||
+                        !vc::geometry::validSurfacePoint(dst_points(r1, c0)) || !vc::geometry::validSurfacePoint(dst_points(r1, c1))) {
                         continue;  // Leave as invalid marker
                     }
 
@@ -1527,9 +1580,41 @@ static int run_main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        out_surf->saveAsNew(out_dir, true);
+        if (!params.contains("refine")) {
+            if (store) publish(*out_surf, uuid_local, neighbor_meta, {surface_uuid});
+            else out_surf->saveAsNew(out_dir, true);
+            return EXIT_SUCCESS;
+        }
 
-        // Done
+        // "refine": tracer parameters for a local resume of the projected
+        // surface in this run, so the copy is one output surface.
+        Json refine = params["refine"];
+        if (!refine.is_object()) {
+            std::cerr << "ERROR: gen_neighbor \"refine\" must be an object of tracer parameters" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (!refine.contains("resume_opt")) refine["resume_opt"] = "local";
+        for (auto& p : *out_surf->rawPointsPtr())
+            if (!vc::geometry::validSurfacePoint(p)) p = invalid_marker;
+        if (const int threads = refine.value("thread_limit", 0); threads > 0) omp_set_num_threads(threads);
+
+        Json refine_meta;
+        refine_meta["source"] = "vc_grow_seg_from_seed";
+        refine_meta["vc_gsfs_params"] = refine;
+        refine_meta["vc_gsfs_mode"] = std::string("resume");
+        refine_meta["vc_gsfs_version"] = "dev";
+        add_target_context(refine_meta, vol_path);
+        std::unique_ptr<QuadSurface> refined;
+        try {
+            refined.reset(tracer(*volume, 1.0, 0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
+                                 load_direction_fields(refine, cache_root), out_surf.get(),
+                                 store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: vc_grow_seg_from_seed: neighbor refinement failed: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store) publish(*refined, uuid_local, refined->meta, {surface_uuid});
+        else refined->saveAsNew(out_dir, true);
         return EXIT_SUCCESS;
     }
 
@@ -1553,7 +1638,7 @@ static int run_main(int argc, char *argv[])
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
-            if (std::filesystem::exists(seg_dir)) {
+            if (!store && std::filesystem::exists(seg_dir)) {
                 std::filesystem::remove_all(seg_dir);
             }
 #if defined(_WIN32)
@@ -1567,69 +1652,19 @@ static int run_main(int argc, char *argv[])
         }
     }
 
+    if (store) {
+        // Overlap relationships between stored surfaces are discovered by vc_object_links.
+        std::vector<std::string> sources;
+        if (mode == "resume") sources.push_back(surface_uuid);
+        else if (mode == "expansion" && src) sources.push_back(src->id);
+        publish(*surf, seg_name, surf->meta, sources);
+        delete surf;
+        return EXIT_SUCCESS;
+    }
+
     std::cout << "saving " << seg_dir.string() << std::endl;
     surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
-
-    if (mode == "expansion" && !skip_overlap_check) {
-        // Read existing overlapping data
-        std::set<std::string> current_overlapping = read_overlapping_json(surf->path);
-
-        // Add the source segment
-        current_overlapping.insert(src->id);
-
-        // Update source's overlapping data
-        std::set<std::string> src_overlapping = read_overlapping_json(src->path);
-        src_overlapping.insert(surf->id);
-        write_overlapping_json(src->path, src_overlapping);
-
-        // Check overlaps with existing surfaces
-        for(auto &s : surfs_v)
-            if (overlap(*surf, *s, search_effort)) {
-                current_overlapping.insert(s->id);
-
-                std::set<std::string> s_overlapping = read_overlapping_json(s->path);
-                s_overlapping.insert(surf->id);
-                write_overlapping_json(s->path, s_overlapping);
-            }
-
-        // Check for additional surfaces in target directory
-        for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename().string()))
-            {
-                std::string name = entry.path().filename().string();
-                if (name.compare(0, name_prefix.size(), name_prefix))
-                    continue;
-
-                if (name == surf->id)
-                    continue;
-
-                std::filesystem::path meta_fn = entry.path() / "meta.json";
-                if (!std::filesystem::exists(meta_fn))
-                    continue;
-
-                auto meta = utils::Json::parse_file(meta_fn);
-
-                if (!meta.count("bbox"))
-                    continue;
-
-                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
-                    continue;
-
-                QuadSurface other = QuadSurface(entry.path(), meta);
-
-                if (overlap(*surf, other, search_effort)) {
-                    current_overlapping.insert(other.id);
-
-                    std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-                    other_overlapping.insert(surf->id);
-                    write_overlapping_json(other.path, other_overlapping);
-                }
-            }
-
-        // Write final overlapping data for current
-        write_overlapping_json(surf->path, current_overlapping);
-    }
 
     delete surf;
     for (auto sm : surfs_v) {

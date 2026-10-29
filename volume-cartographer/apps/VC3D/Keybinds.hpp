@@ -32,7 +32,6 @@ namespace shortcuts {
 extern const ShortcutDef OpenVolpkg;
 extern const ShortcutDef AxisAlignedSlices;
 extern const ShortcutDef SurfaceNormals;
-extern const ShortcutDef DirectionHints;
 extern const ShortcutDef CompositeView;
 extern const ShortcutDef RawPointsOverlay;
 extern const ShortcutDef ZoomIn;
@@ -56,12 +55,8 @@ extern const KeyPressDef RecenterFocus;
 extern const KeyPressDef SliceStepDecrease;
 extern const KeyPressDef SliceStepIncrease;
 
-extern const KeyPressDef ApprovalPaintToggle;
-extern const KeyPressDef UnapprovalPaintToggle;
-extern const KeyPressDef ApprovalUndo;
 extern const KeyPressDef SegmentationUndo;
 extern const KeyPressDef ManualAddToggle;
-extern const KeyPressDef LineDrawHold;
 extern const KeyPressDef GrowSegmentation;
 extern const KeyPressDef CancelOperation;
 extern const KeyPressDef PushPullIn;

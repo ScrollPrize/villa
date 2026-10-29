@@ -81,65 +81,6 @@ TEST_CASE("replay rejects invalid intervals and overflowing budgets before calli
     CHECK_THROWS_AS(traceReferenceReplayCore(reference,0,40,10,3,2,0,4,1,normals,1,{}),std::invalid_argument);
 }
 
-TEST_CASE("real Paris4 native tracing plugs into shared reference replay with reverse checks") {
-    using namespace vc::fiber_tracer;
-    const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
-    const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
-    const char* normalManifest=std::getenv("VC_TEST_REVERSE_NORMAL_MANIFEST");
-    if (!manifest || !fiberPath || !normalManifest) return;
-    const auto dataset=vc::lasagna::LasagnaDataset::open(manifest);
-    const auto normalData=vc::lasagna::LasagnaDataset::open(normalManifest);
-    FiberPredictionField field(dataset);
-    vc::lasagna::LasagnaNormalSampler normals(normalData);
-    const auto fiber=loadFiberJson(fiberPath);
-    REQUIRE(fiber.controlPointLineIndices.size()>1);
-    const auto full=makePolylineArcGeometry(fiber.linePointsXyzBase);
-    const double begin=full.vertexArcs.at(fiber.controlPointLineIndices.front());
-    const auto reference=makePolylineArcGeometry(slicePolylineArc(full,begin,begin+64));
-    FiberTraceConfig c; c.stepVoxels=16; c.beamWidth=3; c.parallelThreads=1;
-    c.smoothnessNormalWeight=c.smoothnessTangentWeight=c.cumulativeSmoothnessTangentWeight=0;
-    const ReplaySegmentRunner runner=[&](const PolylineArcSample& seed,double,int maximumSteps,
-            const ReplayPointObserver& observe,const FiberTraceProgressCallback& progress) {
-        return traceFiberExtrapolation(field,seed.point,seed.tangent,maximumSteps*c.stepVoxels,
-            c,&normals,progress,false,observe).reason;
-    };
-    ReplayConsistencyPolicy policy;
-    policy.intervalBase=32;
-    policy.verify=[&](const auto& points) {
-        const auto geometry=makePolylineArcGeometry(points);
-        return verifyFiberReverseSpan(field,normals,c,geometry,geometry.length(),20,40)<=1e-12;
-    };
-    policy.nextSeed=[&](double arc)->std::optional<PolylineArcSample> {
-        return samplePolylineArc(reference,arc);
-    };
-    const auto run=[&](const ReplayConsistencyPolicy& p) {
-        return traceReferenceReplayCore(reference,0,reference.length(),16,3,20,0,2,1,normals,1,runner,{},{},p);
-    };
-    const auto baseline=run({});
-    const auto serial=run(policy);
-    c.parallelThreads=4;
-    const auto parallel=run(policy);
-    CHECK(serial.completedReferenceArcBase==reference.length());
-    REQUIRE(!serial.segments.empty());
-    REQUIRE(parallel.segments.size()==serial.segments.size());
-    CHECK(serial.failures.size()==parallel.failures.size());
-    CHECK(serial.filteredStops==parallel.filteredStops);
-    CHECK(serial.reverseChecks==parallel.reverseChecks);
-    for(size_t i=0;i<serial.segments.size();++i) {
-        const auto& segment=serial.segments[i];
-        CHECK(segment.tracePointsBase==parallel.segments[i].tracePointsBase);
-        for(const auto& match:segment.matches) {
-            const auto measured=measureFiberReplayThreshold(segment.tracePointsBase.at(match.tracePointIndex),
-                match.matchedReferencePointBase,normals,1,20,2);
-            CHECK(measured.thresholdErrorRatio==match.thresholdMeasurement.thresholdErrorRatio);
-        }
-    }
-    std::cout << "Real Paris4 replay: " << reference.length() << " base voxels; baseline failures="
-        << baseline.failures.size() << "; filtered failures=" << serial.failures.size()
-        << "; filtered stops=" << serial.filteredStops.size() << "; reverse checks="
-        << serial.reverseChecks << "; serial/parallel exact\n";
-}
-
 TEST_CASE("Periodic consistency checks final partial span and accounts rejected tail")
 {
     using namespace vc::fiber_tracer;

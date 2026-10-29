@@ -4,7 +4,9 @@
 // issue #2279. A tifxyz grid promises, via `scale` in meta.json, that neighbouring
 // nodes sit `1 / scale` voxels apart; this header measures how well the grid keeps
 // that promise and writes the block under the `isometry` key of the metadata.
-// Validity follows `vc::surface::SurfaceArea` (non-finite or (-1,-1,-1) sentinel).
+// Validity follows issue #2279 (finite coordinates, not the (-1,-1,-1) sentinel),
+// the same rule the Python half applies. A loader may already have replaced `z <= 0`
+// extrapolations with that sentinel.
 // The flatboi metrics come from the shared core in `TriangleStretch.hpp`, which
 // flatboi itself also calls, so the grid and flatboi cannot drift. The same numbers
 // are produced in Python by `vesuvius.tifxyz.compute_grid_isometry`.
@@ -14,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include <vc_object_store/geometry/Geometry.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
@@ -56,10 +60,24 @@ struct GridIsometryStats
 
 namespace detail
 {
+// A usable node: finite coordinates and not the (-1,-1,-1) invalid sentinel.
 template <typename Vec>
 inline bool nodeValid(const Vec& v)
 {
-    return isFiniteVec(v) && !isSentinelInvalid(v);
+    return std::isfinite(static_cast<double>(v[0])) &&
+           std::isfinite(static_cast<double>(v[1])) &&
+           std::isfinite(static_cast<double>(v[2])) &&
+           !(static_cast<double>(v[0]) == -1.0 &&
+             static_cast<double>(v[1]) == -1.0 &&
+             static_cast<double>(v[2]) == -1.0);
+}
+
+// A valid grid cell's area, the same diagonal split vc::geometry::surfaceGridArea
+// (and SurfaceArea) use.
+template <typename Vec>
+inline double quadArea(const Vec& p00, const Vec& p10, const Vec& p01, const Vec& p11)
+{
+    return vc::geometry::triangleArea(p00, p10, p11) + vc::geometry::triangleArea(p00, p11, p01);
 }
 
 // numpy's linear-method percentile of an ascending-sorted sample, so the C++
@@ -122,7 +140,7 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
     const int rows = points.rows;
     const int cols = points.cols;
 
-    // Node validity, reusing the SI/area convention.
+    // Node validity, the rule issue #2279 specifies.
     cv::Mat_<std::uint8_t> ok(rows, cols, std::uint8_t(0));
     bool anyValid = false;
     for (int y = 0; y < rows; ++y) {
@@ -198,7 +216,8 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
         for (std::size_t i = 0; i < ratios.size(); ++i) {
             logs[i] = std::abs(std::log(ratios[i]));
         }
-        stats.median_abs_log_ratio = detail::median(logs);
+        std::sort(logs.begin(), logs.end());
+        stats.median_abs_log_ratio = detail::percentileLinear(logs, 50.0);
     }
 
     std::size_t stretchedNodes = 0;
@@ -220,7 +239,7 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
     std::size_t cellCount = 0;
 
     // flatboi's stretch metrics from the shared per-triangle core, with the same
-    // diagonal split as SurfaceArea's quadArea (p00-p10-p11, p00-p11-p01).
+    // diagonal split as vc::geometry::surfaceGridArea (p00-p10-p11, p00-p11-p01).
     std::vector<TriangleStretch> triangles;
     triangles.reserve(2 * static_cast<std::size_t>(std::max(0, rows - 1)) *
                       static_cast<std::size_t>(std::max(0, cols - 1)));

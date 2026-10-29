@@ -1,12 +1,7 @@
 // flatboi.cpp
 #include <igl/slim.h>
 #include <igl/MappingEnergyType.h>
-#include <igl/readOBJ.h>
-#include <igl/writeOBJ.h>
-#include <igl/read_triangle_mesh.h>
 #include <igl/boundary_loop.h>
-#include <igl/map_vertices_to_circle.h>
-#include <igl/harmonic.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -35,9 +30,15 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-// flatboi and the tifxyz grid isometry block (#2279) share this per-triangle
-// stretch core, so both report L2 and Linf from the same code.
+#include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/InpaintSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
 #include "vc/core/util/TriangleStretch.hpp"
+#include <vc_object_store/Uuid.hpp>
+
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -345,7 +346,8 @@ private:
 // Flatboi
 // ------------------------------
 struct Flatboi {
-  std::string input_obj;
+  // Names the energy and heatmap files: <parent>/<stem>_*.
+  std::string report_path;
   int max_iter = 50;
   // Relative-energy convergence tolerance; <=0 disables early-stop.
   double conv_tol = 1e-5;
@@ -354,25 +356,12 @@ struct Flatboi {
   Eigen::MatrixXi F;          // #F x 3
   Eigen::MatrixXd TC;         // #TC x 2
   Eigen::MatrixXi FTC;        // #F x 3
-  bool have_per_corner_uv = false;
 
-  // Backwards-compatible constructor: defaults to Symmetric Dirichlet
-  Flatboi(const std::string& obj_path, int max_iter_)
-    : Flatboi(obj_path, max_iter_, igl::MappingEnergyType::SYMMETRIC_DIRICHLET) {}
-
-  // New constructor where the caller can select the SLIM energy type
-  Flatboi(const std::string& obj_path, int max_iter_, igl::MappingEnergyType energy_)
-    : input_obj(obj_path), max_iter(max_iter_), energy(energy_) {
-    read_mesh();
-  }
-
-  void read_mesh() {
-    Eigen::MatrixXd N; Eigen::MatrixXi FN;
-    if(!igl::readOBJ(input_obj, V, TC, N, F, FTC, FN)) {
-      throw std::runtime_error("Failed to read OBJ: " + input_obj);
-    }
-    have_per_corner_uv = (TC.size() > 0 && FTC.size() > 0);
-    if(F.cols() != 3) throw std::runtime_error("Expecting a triangle mesh (F.cols()==3).");
+  // An in-memory mesh with per-vertex initial UVs.
+  Flatboi(Eigen::MatrixXd V_, Eigen::MatrixXi F_, Eigen::MatrixXd TC_, int max_iter_,
+          igl::MappingEnergyType energy_, const std::string& report_path_)
+    : report_path(report_path_), max_iter(max_iter_), energy(energy_),
+      V(std::move(V_)), F(std::move(F_)), TC(std::move(TC_)), FTC(F) {
     if(V.rows() == 0 || F.rows() == 0) throw std::runtime_error("Empty mesh.");
   }
 
@@ -383,24 +372,14 @@ struct Flatboi {
     return bnd;
   }
 
-  void harmonic_ic(Eigen::VectorXi& bnd, Eigen::MatrixXd& bnd_uv, Eigen::MatrixXd& uv) const {
-    bnd = generate_boundary();
-    igl::map_vertices_to_circle(V, bnd, bnd_uv);
-    if(!igl::harmonic(V, F, bnd, bnd_uv, 1, uv)) {
-      throw std::runtime_error("harmonic_ic: igl::harmonic failed.");
-    }
-  }
-
   void original_ic(Eigen::VectorXi& bnd, Eigen::MatrixXd& bnd_uv, Eigen::MatrixXd& uv) const {
     uv.setZero(V.rows(), 2);
-    if(have_per_corner_uv) {
-      for (int t = 0; t < F.rows(); ++t)
-        for (int v = 0; v < F.cols(); ++v) {
-          int vi  = F(t,v);
-          int tci = FTC(t,v);
-          uv.row(vi) = TC.row(tci);
-        }
-    }
+    for (int t = 0; t < F.rows(); ++t)
+      for (int v = 0; v < F.cols(); ++v) {
+        int vi  = F(t,v);
+        int tci = FTC(t,v);
+        uv.row(vi) = TC.row(tci);
+      }
     bnd = generate_boundary();
     bnd_uv.resize(bnd.size(), 2);
     for (int i = 0; i < bnd.size(); ++i) bnd_uv.row(i) = uv.row(bnd(i));
@@ -411,10 +390,8 @@ struct Flatboi {
     return uv.rowwise() - mn;
   }
 
-  // Per-triangle stretch comes from the shared Eigen-free core (TriangleStretch.hpp,
-  // villa #2279 item 4), which the tifxyz grid isometry block calls too, so flatboi's
-  // numbers and a grid's are the same code.
-  // returns (L2_mean, L2_median, Linf, area_error)
+  // Per-triangle stretch from the shared Eigen-free core (TriangleStretch.hpp,
+  // villa #2279 item 4); returns (L2_mean, L2_median, Linf, area_error).
   std::tuple<double,double,double,double> stretch_metrics(const Eigen::MatrixXd& uv_in) const {
     bool per_vertex = (uv_in.rows() == V.rows() && uv_in.cols() == 2);
     const int T = F.rows();
@@ -427,10 +404,10 @@ struct Flatboi {
         {V(F(t,1),0), V(F(t,1),1), V(F(t,1),2)},
         {V(F(t,2),0), V(F(t,2),1), V(F(t,2),2)},
       };
-      double uv[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+      double uv[3][2] = {};
       if (per_vertex) {
         for (int k = 0; k < 3; ++k) { uv[k][0]=uv_in(F(t,k),0); uv[k][1]=uv_in(F(t,k),1); }
-      } else if (have_per_corner_uv) {
+      } else {
         for (int k = 0; k < 3; ++k) { uv[k][0]=TC(FTC(t,k),0);  uv[k][1]=TC(FTC(t,k),1); }
       }
       tris.push_back(vc::surface::triangleStretch(p, uv));
@@ -440,22 +417,18 @@ struct Flatboi {
     return {m.l2_mean, m.l2_median, m.linf, m.area_error};
   }
 
-  // Run SLIM; initial_condition = "original" or "harmonic"
+  // Run SLIM from the mesh's own UVs.
   std::pair<Eigen::MatrixXd, std::vector<double>>
-  slim_run(const std::string& initial_condition, WBLogger* wblog=nullptr) {
+  slim_run(WBLogger* wblog=nullptr) {
     Eigen::VectorXi bnd; Eigen::MatrixXd bnd_uv, uv;
 
-    if (initial_condition == "original") {
-      original_ic(bnd, bnd_uv, uv);
+    original_ic(bnd, bnd_uv, uv);
+    {
       auto [l2m, l2med, linf, area] = stretch_metrics(uv);
       std::cout << "Starting metrics from VC3D flattening -- "
                 << "L2(mean): " << l2m << ", L2(median): " << l2med
                 << ", Linf: " << linf << ", Area Error: " << area << "\n";
       if (wblog) wblog->log_stretch(l2m, l2med, linf, area, /*step=*/0);
-    } else if (initial_condition == "harmonic") {
-      harmonic_ic(bnd, bnd_uv, uv);
-    } else {
-      throw std::runtime_error("Unknown initial_condition: " + initial_condition);
     }
 
     igl::SLIMData data;
@@ -527,42 +500,6 @@ struct Flatboi {
     }
 
     return { data.V_o.leftCols<2>(), energies };
-  }
-
-  void save_obj(const Eigen::MatrixXd& uv) const {
-    const fs::path in = fs::path(input_obj);
-    const fs::path out = in.parent_path() / (in.stem().string() + "_flatboi.obj");
-
-    Eigen::MatrixXd shifted = shift_uv(uv);
-    Eigen::MatrixXd UVc(F.rows()*3, 2);
-    Eigen::MatrixXi FUV(F.rows(), 3);
-    for (int t = 0; t < F.rows(); ++t) {
-      for (int v = 0; v < 3; ++v) {
-        const int corner_idx = t*3 + v;
-        const int vi = F(t,v);
-        UVc.row(corner_idx) = shifted.row(vi);
-        FUV(t,v) = corner_idx;
-      }
-    }
-
-    Eigen::MatrixXd CN; CN.resize(0,3);
-    Eigen::MatrixXi FN; FN.resize(0,3);
-    if (!igl::writeOBJ(out.string(), V, F, CN, FN, UVc, FUV)) {
-        throw std::runtime_error("Failed to write OBJ with UVs");
-    }
-    std::cout << "Wrote: " << out << "\n";
-
-    // Flattening preserves vertex order (V/F written unchanged), so a grid-UV
-    // sidecar next to the input applies to the output too. Copy it through.
-    const fs::path in_griduv = fs::path(input_obj + ".griduv");
-    if (fs::exists(in_griduv)) {
-      std::error_code ec;
-      fs::copy_file(in_griduv, fs::path(out.string() + ".griduv"),
-                    fs::copy_options::overwrite_existing, ec);
-      if (ec) {
-        std::cerr << "warning: failed to copy grid-UV sidecar: " << ec.message() << "\n";
-      }
-    }
   }
 
   // === UV heatmaps (OpenCV PNG write; no clipping; V increases downward) ===
@@ -692,7 +629,7 @@ Flatboi::HeatPaths Flatboi::save_uv_heatmaps(const Eigen::MatrixXd& uv_in, const
     std::cerr << "save_uv_heatmaps: expecting per-vertex UVs (#V x 2)\n"; return paths;
   }
 
-  const fs::path in = fs::path(input_obj);
+  const fs::path in = fs::path(report_path);
   const fs::path base = in.parent_path() / in.stem();
 
   // Shift & pack UVs
@@ -889,42 +826,234 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 }
 
 // ------------------------------
+// Surface mode
+// ------------------------------
+// Flattens a surface (stored, or a tifxyz directory) into a new one without
+// OBJ files: the mesh of the grid's valid quads with their grid positions as
+// initial UVs (as vc_tifxyz2obj writes them), SLIM, then the flattened mesh
+// rasterized onto a grid at the source's sampling density (as vc_obj2tifxyz
+// with a source surface). With keep_percent < 100 SLIM runs on a decimated grid
+// and every full-grid vertex takes the UV of the point at its grid position in
+// the decimated mesh.
+namespace surface_mode {
+
+struct Options {
+  int iters = 50;
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+  std::string energy_label = "symmetric_dirichlet";
+  double conv_tol = 0.0;
+  float keep_percent = 100.0f;
+  bool inpaint = false;
+};
+
+// The flattened surface, or nullptr when SLIM diverged. Energies and heatmaps
+// are named after `report_path`.
+static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options& opt,
+                                            const fs::path& report_path, const std::string& run_name)
+{
+  cv::Mat_<cv::Vec3f> full = surface.rawPoints().clone();
+
+  // Initial UVs are grid positions scaled by 1/scale, as vc_tifxyz2obj writes them.
+  const cv::Vec2f scale = surface.scale();
+  const float uv_fac_x = (std::isfinite(scale[0]) && scale[0] > 0.f) ? 1.0f / scale[0] : 1.0f;
+  const float uv_fac_y = (std::isfinite(scale[1]) && scale[1] > 0.f) ? 1.0f / scale[1] : 1.0f;
+
+  const bool decimating = opt.keep_percent > 0.0f && opt.keep_percent < 100.0f;
+  const int stride = decimating ? vc::meshing::decimationStride(opt.keep_percent / 100.0f) : 1;
+  cv::Mat_<cv::Vec3f> coarse = decimating ? vc::meshing::decimateGrid(full, stride) : full;
+  if (decimating)
+    std::cout << "Decimated " << full.rows << " x " << full.cols << " to " << coarse.rows << " x " << coarse.cols
+              << " (stride " << stride << ")\n";
+  // Interior holes add boundary loops that break SLIM; fill them if asked.
+  if (opt.inpaint) {
+    for (auto* points : decimating ? std::vector{&coarse, &full} : std::vector{&full}) {
+      const int filled = vc::core::util::inpaintSurfaceHoles(*points);
+      if (filled > 0) std::cerr << "warning: inpainted " << filled << " invalid surface cell(s)\n";
+    }
+  }
+
+  const auto coarse_mesh = vc::meshing::meshGrid(coarse);
+  if (coarse_mesh.faces.empty()) throw std::runtime_error("the surface has no valid quads");
+  Eigen::MatrixXd V(coarse_mesh.positions.size(), 3), TC(coarse_mesh.positions.size(), 2);
+  for (std::size_t i = 0; i < coarse_mesh.positions.size(); ++i) {
+    const auto& p = coarse_mesh.positions[i];
+    V.row(i) << p[0], p[1], p[2];
+    TC.row(i) << float(coarse_mesh.cells[i][1]) * uv_fac_x, float(coarse_mesh.cells[i][0]) * uv_fac_y;
+  }
+  Eigen::MatrixXi F(coarse_mesh.faces.size(), 3);
+  for (std::size_t f = 0; f < coarse_mesh.faces.size(); ++f)
+    F.row(f) << coarse_mesh.faces[f][0], coarse_mesh.faces[f][1], coarse_mesh.faces[f][2];
+
+  Flatboi fb(std::move(V), std::move(F), std::move(TC), opt.iters, opt.energy, report_path.string());
+  fb.conv_tol = opt.conv_tol;
+  WBLogger wblog(run_name, opt.iters);
+  auto [uv_out, energies] = fb.slim_run(wblog.enabled() ? &wblog : nullptr);
+  bool diverged = !uv_out.allFinite();
+  for (std::size_t k = 1; k < energies.size() && !diverged; ++k) diverged = !std::isfinite(energies[k]);
+  if (diverged) {
+    std::cerr << "Error: SLIM diverged (NaN energy or non-finite UVs). "
+              << "Try a lower --keep percent (smaller mesh).\n";
+    return nullptr;
+  }
+  save_energies(report_path, energies);
+  const auto heatmaps = fb.save_uv_heatmaps(uv_out);
+  if (wblog.enabled()) {
+    wblog.log_image("heatmap/L2",       heatmaps.L2.string());
+    wblog.log_image("heatmap/Linf",     heatmaps.Linf.string());
+    wblog.log_image("heatmap/kappa",    heatmaps.kappa.string());
+    wblog.log_image("heatmap/log_area", heatmaps.logarea.string());
+    wblog.finish();
+  }
+
+  // The flattened mesh at full resolution.
+  const auto fine_mesh = decimating ? vc::meshing::meshGrid(full) : coarse_mesh;
+  std::vector<cv::Vec2f> uvs(fine_mesh.positions.size());
+  std::vector<uint8_t> uv_valid(fine_mesh.positions.size(), 1);
+  if (decimating) {
+    std::vector<cv::Vec2d> coarse_uvs(coarse_mesh.cells.size());
+    for (std::size_t i = 0; i < coarse_uvs.size(); ++i) coarse_uvs[i] = cv::Vec2d(uv_out(i, 0), uv_out(i, 1));
+    auto lifted = vc::meshing::liftGridUVs(fine_mesh, coarse, coarse_mesh, coarse_uvs, stride);
+    uvs = std::move(lifted.uvs);
+    uv_valid = std::move(lifted.valid);
+  } else {
+    for (std::size_t i = 0; i < uvs.size(); ++i) uvs[i] = cv::Vec2f(float(uv_out(i, 0)), float(uv_out(i, 1)));
+  }
+  std::vector<vc::meshing::UvFace> faces;
+  faces.reserve(fine_mesh.faces.size());
+  for (const auto& f : fine_mesh.faces)
+    if (uv_valid[f[0]] && uv_valid[f[1]] && uv_valid[f[2]])
+      faces.push_back({{f[0], f[1], f[2]}, {f[0], f[1], f[2]}});
+  if (faces.size() != fine_mesh.faces.size())
+    std::cerr << "warning: " << (fine_mesh.faces.size() - faces.size()) << " triangle(s) had no flattened UVs\n";
+
+  // Rasterized at the source's sampling density, as vc_obj2tifxyz --tifxyz-source does.
+  vc::meshing::UvGridRasterizer rasterizer;
+  if (scale[0] > 0.f && scale[1] > 0.f) rasterizer.setSrcScale(scale);
+  rasterizer.setMesh(fine_mesh.positions, std::move(uvs), std::move(faces));
+  rasterizer.determineGridDimensions(1.0f);
+  std::unique_ptr<QuadSurface> flat(rasterizer.createQuadSurface(1.0f));
+  flat->meta = surface.meta;
+  return flat;
+}
+
+static nlohmann::json parameters(const Options& opt)
+{
+  return {{"iterations", opt.iters}, {"energy", opt.energy_label}, {"tolerance", opt.conv_tol},
+          {"keep_percent", opt.keep_percent}, {"inpaint", opt.inpaint}};
+}
+
+// A stored surface into a new surface object; reports go to its artifact directory.
+static int run_store(const StoreToolOptions& output, const std::string& source, const Options& opt)
+{
+  StoreSurfaces store(output.store, "flatboi");
+  // With --volume-uuid the surface is flattened in that volume's voxels.
+  const auto surface = store.load(source, true, output.volume);
+  const fs::path report_dir = fs::temp_directory_path() / ("flatboi-" + source + "-" + std::to_string(::getpid()));
+  fs::create_directories(report_dir);
+  const auto flat = flatten(*surface, opt, report_dir / "slim.obj", source);
+  if (!flat) return 3;
+
+  const std::string name = output.name.value_or(
+      (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi");
+  const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
+  const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
+  for (const auto& entry : fs::directory_iterator(report_dir)) {
+    std::error_code ignored;
+    fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
+  }
+  std::error_code ignored;
+  fs::remove_all(report_dir, ignored);
+  store.objects().finish();
+  std::cout << "surface_uuid: " << uuid << std::endl;
+  return 0;
+}
+
+// A tifxyz directory into a new one (a new surface: fresh uuid); reports are
+// written beside it as <output>_energies_flatboi.txt and <output>_heat_*.png.
+static int run_tifxyz(const fs::path& input, const fs::path& output, const Options& opt)
+{
+  if (fs::exists(output)) throw std::runtime_error("output exists: " + output.string());
+  const auto surface = load_quad_from_tifxyz(input.string());
+  const auto flat = flatten(*surface, opt, output.parent_path() / (output.filename().string() + ".obj"), input.string());
+  if (!flat) return 3;
+  flat->meta["uuid"] = vc::objects::util::newUuid();
+  flat->save(output);
+  std::cout << "Wrote: " << output << "\n";
+  return 0;
+}
+
+} // namespace surface_mode
+
+// ------------------------------
 // main
 // ------------------------------
 int main(int argc, char** argv) {
-  std::string obj_path;
+  std::string input_path;
   int iters = 50;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
   std::string energy_label = "symmetric_dirichlet";
   // Default 0 (disabled) keeps reproducible iteration counts for VC3D and
-  // script callers that pass only <obj> <iters>. Pass --tol=1e-5 to opt in.
+  // script callers that pass only the iterations. Pass --tol=1e-5 to opt in.
   double conv_tol = 0.0;
 
   auto print_usage = [&]() {
-    std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
+    std::cerr << "Usage: " << argv[0] << " <tifxyz-dir> --output=<dir> [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
+              << "       " << argv[0] << " --store <store> --surface <uuid> [--name <name>] [--tag <tag>]...\n"
+              << "                [--volume-uuid <id>] [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
               << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
-              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n";
+              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n"
+              << "  a tifxyz surface (directory or stored) is flattened into a new surface: a tifxyz\n"
+              << "  directory at --output, or a stored surface (prints surface_uuid:);\n"
+              << "  --keep=<p> runs SLIM on ~p percent of the grid points and lifts the UVs to the\n"
+              << "  full grid, --inpaint fills interior holes first\n";
   };
 
+  std::optional<StoreToolOptions> store_output;
+  std::string tifxyz_output;
+  float keep_percent = 100.0f;
+  bool inpaint = false;
   std::vector<std::string> positional;
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a.rfind("--tol=", 0) == 0) {
-      conv_tol = std::atof(a.c_str() + 6);
-    } else if (a == "--help" || a == "-h") {
-      print_usage();
-      return 0;
-    } else {
-      positional.push_back(std::move(a));
+  try {
+    std::vector<std::string> args(argv + 1, argv + argc);
+    store_output = StoreToolOptions::take(args, {.surfaces = true, .creates = true, .named = true});
+    for (auto& a : args) {
+      if (a.rfind("--tol=", 0) == 0) {
+        conv_tol = std::atof(a.c_str() + 6);
+      } else if (a == "--help" || a == "-h") {
+        print_usage();
+        return 0;
+      } else if (a.rfind("--output=", 0) == 0) {
+        tifxyz_output = a.substr(9);
+      } else if (a.rfind("--keep=", 0) == 0) {
+        keep_percent = std::stof(a.substr(7));
+        if (!(keep_percent > 0.0f && keep_percent <= 100.0f)) throw std::invalid_argument("--keep must be in (0, 100]");
+      } else if (a == "--inpaint") {
+        inpaint = true;
+      } else {
+        positional.push_back(std::move(a));
+      }
     }
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
   }
 
+  const bool store_mode = store_output.has_value();
+  if (store_mode && store_output->surfaces.size() != 1) {
+    std::cerr << "--store takes one --surface\n"; return 1;
+  }
+  // The tifxyz path, or nothing in store mode.
+  if (store_mode) positional.insert(positional.begin(), std::string());
   if (positional.empty() || positional.size() > 3) { print_usage(); return 1; }
-  obj_path = positional[0];
+  input_path = positional[0];
   if (positional.size() >= 2) iters = std::atoi(positional[1].c_str());
   if (iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
-  if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
-  if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
+  if (!store_mode && !fs::is_directory(input_path)) {
+    std::cerr << "Not a tifxyz directory: " << input_path << "\n"; return 1;
+  }
+  if (store_mode != tifxyz_output.empty()) {
+    std::cerr << "--output=<dir> is the output of a tifxyz input, and only of one\n"; return 1;
+  }
 
   if (positional.size() == 3) {
     std::string e_lower = positional[2];
@@ -959,55 +1088,12 @@ int main(int argc, char** argv) {
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
 
+  const surface_mode::Options options{iters, energy, energy_label, conv_tol, keep_percent, inpaint};
   try {
-    Flatboi fb(obj_path, iters, energy);
-    fb.conv_tol = conv_tol;
-
-    WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
-
-    // Use the input's UVs as the initial condition when present (matches the
-    // Python/VC3D default); otherwise fall back to a harmonic parametrization
-    // so flatboi can flatten a raw mesh that has no UVs (e.g. a scrollfiesta
-    // surface mesh streamed straight from the mesher).
-    const std::string ic = fb.have_per_corner_uv ? "original" : "harmonic";
-    if (!fb.have_per_corner_uv)
-      std::cout << "No per-corner UVs in input; using harmonic initial condition.\n";
-    auto [uv_out, energies] = fb.slim_run(ic, wblog.enabled()? &wblog : nullptr);
-
-    // Persist
-    save_energies(obj_path, energies);
-    fb.save_obj(uv_out);
-
-    // Heatmaps (post-SLIM) via OpenCV PNG + log them if W&B is available
-    auto paths = fb.save_uv_heatmaps(uv_out);
-    if (wblog.enabled()) {
-      wblog.log_image("heatmap/L2",       paths.L2.string());
-      wblog.log_image("heatmap/Linf",     paths.Linf.string());
-      wblog.log_image("heatmap/kappa",    paths.kappa.string());
-      wblog.log_image("heatmap/log_area", paths.logarea.string());
-      wblog.finish();
-    }
-
-    // Fail the run if SLIM diverged. Two failure modes seen in practice:
-    //   1. Output UVs themselves contain NaN/Inf.
-    //   2. Every iter went NaN but data.V_o was left at the initial UVs
-    //      (allFinite passes, downstream sees an unchanged parametrization).
-    // Catch both by scanning the per-iter energies list for any non-finite
-    // entry past iter 0, and by checking UV finiteness.
-    bool diverged = !uv_out.allFinite();
-    if (!diverged) {
-      for (std::size_t k = 1; k < energies.size(); ++k) {
-        if (!std::isfinite(energies[k])) { diverged = true; break; }
-      }
-    }
-    if (diverged) {
-      std::cerr << "Error: SLIM diverged (NaN energy or non-finite UVs). "
-                << "Try a lower --keep percent on the input (smaller mesh).\n";
-      return 3;
-    }
+    return store_mode ? surface_mode::run_store(*store_output, store_output->surfaces.front(), options)
+                      : surface_mode::run_tifxyz(input_path, tifxyz_output, options);
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";
     return 2;
   }
-  return 0;
 }

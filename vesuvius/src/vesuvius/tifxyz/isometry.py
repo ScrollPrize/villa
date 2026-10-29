@@ -346,8 +346,7 @@ def update_meta_isometry(
     """Write the ``isometry`` block into an existing tifxyz ``meta.json``.
 
     Only ``meta.json`` is rewritten; the TIFFs stay untouched, so published
-    segments can be stamped in place. Counterpart of ``vc_tifxyz --isometry``.
-    Returns the block that was written.
+    segments can be stamped in place. Returns the block that was written.
 
     Coordinates are loaded through :func:`read_tifxyz`, so the backfill sees the
     same ``Z <= 0`` invalidation and ``mask.tif`` rules as every other reader.

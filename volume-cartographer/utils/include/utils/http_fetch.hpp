@@ -1,9 +1,5 @@
 #pragma once
 
-// Only compile if curl is available
-#if __has_include(<curl/curl.h>)
-#define UTILS_HAS_CURL 1
-
 #include <string>
 #include <string_view>
 #include <vector>
@@ -206,5 +202,3 @@ private:
 };
 
 } // namespace utils
-
-#endif // __has_include(<curl/curl.h>)

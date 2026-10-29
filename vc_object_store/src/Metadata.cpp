@@ -96,6 +96,19 @@ void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const st
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
 }
 
+void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& objectUuid, const std::string& volume,
+                                          double storedUnitsPerVoxel)
+{
+    const auto object = objectByUuid(txn, objectUuid);
+    if (!object) throw std::invalid_argument("object not found: " + objectUuid);
+    if (!hasGeometryCoordinates(object->kind))
+        throw std::invalid_argument("objects of kind " + object->kind + " have no coordinate frame");
+    const auto meta = nlohmann::json::parse(object->meta);
+    const auto merged = mergeGeometryCoordinates(meta.value("coordinates", nlohmann::json::object()),
+                                                 volumeCoordinates(volume, storedUnitsPerVoxel));
+    setMeta(txn, objectUuid, "coordinates", merged.dump());
+}
+
 void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
 {
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);

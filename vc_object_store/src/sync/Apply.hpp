@@ -3,8 +3,8 @@
 #include "geometry/Dependencies.hpp"
 #include <functional>
 
-// Installing current-state sync records (syncRecord JSON) into one store. Shared
-// by two-store synchronization and hosted hub pushes/pulls.
+// Installing current-state sync records (syncRecord JSON) into one store, for
+// hosted hub pushes and pulls.
 namespace vc::objects::detail {
 inline Json recordAt(const Json& state, const std::string& id) { return state.value(id, Json()); }
 inline Json recordHead(const Json& record)

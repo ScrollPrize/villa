@@ -186,29 +186,14 @@ must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
 translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
-Coordinate-bearing artifacts created by VC3D retain the selected source view
-in their JSON metadata (`meta.json`, point collections, fibers, and atlas
-`metadata.json`). For example:
-
-```json
-{
-  "vc_open_data_coordinate_space": "PHerc1451/20260319101107@L2",
-  "vc_open_data_source_path": "s3://path/to/the/source/volume",
-  "vc_open_data_source_coordinate_level": 2,
-  "vc_open_data_source_coordinate_scale_factor": 4,
-  "vc_open_data_source_original_resolution": 2.4
-}
-```
-
-The source path identifies the native volume without the `#vc-base-scale`
-selector. The scale factor is `2^level`, and the original resolution is the
-native level-0 voxel size in micrometers.
-
-The selector is part of persistent volume identity but is never sent in HTTP
-requests. Tools that support remote volumes receive the complete portable
-locator. Local-only tools reject it instead of silently discarding the
-selector. Catalog surfaces, normal grids, and overlays are automatically paired
-only when their explicit coordinate-space tags match the selected view.
+The selector is the volume's working level, not part of its identity: a
+project keeps one entry per volume, VC3D changes the level with the L spinbox
+beside the volume selector, and the volume keeps its ID at every level. It is
+never sent in HTTP requests. Tools that support remote volumes receive the
+complete portable locator, and store-mode tools also receive `--voxel-scale
+2^-N` with `--volume-uuid`, so the surfaces they read and create are in level
+N's voxels of the volume. Local-only tools reject the selector instead of
+silently discarding it.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json
@@ -223,9 +208,12 @@ Your folder structure should resemble this:
     │   │   └── meta.json - REQUIRED!
     │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
     │       └── meta.json - REQUIRED!
-    ├── paths 
     └── config.json - REQUIRED!
 ```
+
+A VC3D project is an object store (`.vcobj`, `File -> New Project...`): it
+references the volumes above and holds the surfaces (segments), fibers and
+point collections.
 
 ### Working on remote volumes from the command line
 
@@ -286,9 +274,8 @@ To grow the segment further, pass `--resume out/auto_grown_<timestamp>` and
 raise `generations` in `params.json`: it is the total generation count the
 segment stops at, not a number of additional generations, so resuming with
 the unchanged `generations: 8` reports `Resuming from generation 7 with 196
-points`, adds nothing and writes the same 196 points again
-(`--resume-generations 8` on the command line changes nothing either; the
-tracer does not read that option). With `generations: 16` the same command
+points`, adds nothing and writes the same 196 points again. With
+`generations: 16` the same command
 continues from generation 8 to 15 (1.41 cm² to 7.02 cm² here) and writes the
 result to a new `auto_grown_<timestamp>/` under the target directory, reading
 the remote volume as before.
@@ -329,9 +316,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   segment's `meta.json` keeps the selector in `target_volume`.
 
 ### Opening a volume package and navigating the UI
-First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
+First, click `File -> Open Project...` and select the project (`.vcobj`) you wish to work with.
 
-On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the surface list, which lists the surfaces of the project (an Open Data sample's project includes its catalog surfaces) and selects the currently displayed segment. Selecting a surface in the list should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
 
 There are a number of widgets, each with their own purpose. From top to bottom, and left to right : 
 
@@ -341,13 +328,11 @@ _Main UI widget for interacting with the volume package and surface list_
 
 <img src="docs/imgs/volume-package-ui.png" style="height: 500px">
 
-- `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is {volpkg}/paths
 - `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
   - the most important one to remember here is `Current Segment Only`, which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
-- `Approved`, `Defective`, `Reviewed`, `Inspect`  : tags which can be applied to the surface meta.json, and filtered against
-- `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
+- `Tags` : filter by the tags of the surface's object store record (`Approved`, `Defective`, `Reviewed`, `Inspect`)
 
-**Location**
+**Viewer Controls**
 
 _Main UI widget for adjusting the ROI and display of the volume viewers_
 
@@ -355,69 +340,71 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 
 - `Focus` : Displays the current location of the focus point (in XYZ) -- also can be used to set the focus point by modifying the values in the text box
 - `Zoom` : Can be used in place of scroll wheel based zooming, mostly exists to alleviate touchy track pad zooming
-- `Overlay Volume` : Selects the volume to overlay onto the base volume 
-- `Overlay opacity` : Modifies the opacity of the overlay volume 
-- `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
-- `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
+- `Use axis-aligned slice planes` (`Ctrl+J`) : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead render them on fixed axis-aligned slices
+- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
+
+The opacity of the plane slice axis overlays is set by `Axis overlay opacity` in the settings dialog.
+
+**Overlay**
+
+_Overlays a second volume onto the base volume_
+
+- `Overlay volume` : Selects the volume to overlay onto the base volume
+- `Overlay opacity` : Modifies the opacity of the overlay volume
+- `Overlay window` : The overlay intensity range to draw; values outside it are transparent (raise its low end to remove background)
 - `Overlay colormap` : The colormap to use for the overlay volume
 - `Overlay interpolation` : Selects nearest-neighbor (default) or trilinear sampling independently of the base volume
-- `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
-- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
 
 _Keybinds:_
 > - `Right mouse + drag` : pans the current viewer
 > - `Scroll wheel` : zooms the current viewer
 > - `Ctrl + left mouse button` : centers the focus point on the cursor position
-> - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
+> - `Middle mouse + drag` : with axis-aligned slice planes on, rotates the slicing plane in the XZ or YZ volume viewers
 > - `Spacebar` : toggles the overlay on / off
-> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the "composite" dock tab, next to the location tab)
+> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the `Composite View` dock, under the `View` menu)
 
 **Segmentation**
 
-_Primary entry point for interacting with the segmentation, more info in the [segmentation docs](docs/segmentation.md)_
+_Primary entry point for interacting with the segmentation, more info in [extending and modifying segmentations](docs/extending_and_modifying_segmentations.md)_
  
 <img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
 
-- `Enable editing` : Must be checked to enable any of the actions in this widget. Creates a copy of the base surface upon which we perform any of the following actions
+- `Enable editing` (`Shift+T`) : Must be checked to enable any of the actions in this widget. Edits are applied to the surface and saved to the attached object store as new revisions
 - `Surface Growth` - grouping of settings mostly pertaining to the `Grow` action
   - `Steps` : The number of "generations" the growth action will undertake
-  - `Allowed Directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
+  - `Allowed directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
   - `Limit Z range` : Constrains the growth to a selected `Z` range
-  - `Volume` : the volume to pass to the `tracer()` call _should be a surface prediction volume!_ 
-- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._
-  - `Max Radius` : the maximum radius of the area to be affected by the action
-  - `Sigma` : the _strength_ of the push/pull on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
-  - `Push Pull Step` : The number of "offset steps" to take along the surface normal (in voxels) for each push/pull action (this parameter only affects the push/pull in the segmentation window that is applied with `F` and `G`)
+  - `Volume` : the volume to pass to the tracer _should be a surface prediction volume!_
+- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._ `Drag Brush` and `Push/Pull` each have their own:
+  - `Radius` : the radius of the area to be affected by the action
+  - `Sigma` : the _strength_ of the action on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
+  - `Step` (`Push/Pull` only) : The step size (in world units) to take along the surface normal for each push/pull action
 - `Direction Fields`
-  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/scroll.volpkg/fiber-directions.zarr/horizontal`) _these are optional_ 
-    - `Orientation` : the orientation/type of the direction field (from horizontal, vertical, or normal)
+  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/fiber-directions.zarr/horizontal`) _these are optional_
+    - `Orientation` : the orientation/type of the direction field (normal, horizontal, or vertical)
     - `Scale level` : the zarr resolution from which these were computed
     - `Weight` : the weight to apply to the field when optimizing.
 - `Corrections` : group which controls / manages the "correction points" for the current growth session
-  - `New correction set` : creates a new point collection containing a single "correction" 
-      
+  - `Active set` : chooses an existing correction set to apply
+  - `New correction set` : creates a new point collection containing a single "correction"
+
 _Keybinds:_
-> - `F` or `G` : push/pull the current surface in a positive or negative direction along the surface normal (only works in the surface
-> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up, down, right, all, respectively
-> - `T` : create a new correction set
+> - `A` or `D` (hold) : push/pull the current surface inward or outward along the surface normal (`Ctrl` for alpha mode)
+> - `1`, `2`, `3`, `4`, `5` : grow left, up, down, right, all, respectively (requires `Enable growth keybinds`)
+> - `T` : toggle correction annotation mode (click adds a correction point, right-click removes one)
 
 **Seeding** 
 
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 
-<img src="docs/imgs/seeding-ui.png" style="height: 500px">
-
-- `Switch to point mode` : toggles the seeding widget into draw mode (not recommended)
-- `Source Collection` : the source point collection to use as seed points (will autofill if you draw/analyze)
-- `Parallel processes` : the number of processes to run seeding with
+- `Draw paths` : while on, a left-drag in a viewer draws a path
+- `Source Collection` : the source point collection to use as seed points (`Analyze Paths` writes its peaks to `seeding_peaks`; select it here to seed from them)
+- `Parallel Processes` : the number of processes to run seeding with
 - `OMP Threads` : limits the amount of threads each process can use (recommend to set this to 1)
-- `Intensity threshold` : mostly unused, can leave default
-- `Peak detection window` : how closely each peak detected along a path/raycast can be
-- `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
-- `Show Preview Points` : unused, can be ignored
-- `Clear` (both) : clears current points, paths, or raycasts
+- `Intensity Threshold` : minimum intensity for a peak along a path
+- `Expansion Iterations` : how many iterations to run expansion mode on after initial seeding
+- `Clear Peaks` : clears the detected peaks
 - `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
-- `Run seeding` : creates segmentations from the current seed points
-- `Expand seeds` : expands the current seed points to the given number of iterations
-- `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
-- `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
+- `Run Seeding` : creates segmentations from the current seed points
+- `Expand Seeds` : expands the current seed points to the given number of iterations
+- `Clear All Paths` / `Reset Points` : clears the drawn paths and the detected peaks
