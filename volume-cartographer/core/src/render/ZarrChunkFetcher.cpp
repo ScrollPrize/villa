@@ -3,6 +3,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
+#include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
@@ -107,11 +108,29 @@ public:
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
         : baseUrl_(stripTrailingSlash(std::move(baseUrl)))
         , client_(makeClient(std::move(auth)))
+        , metadataCacheable_(vc::core::util::RemoteMetadataCache::cacheable(baseUrl_))
     {
     }
 
     bool exists(const std::string& key) const override
     {
+        if (cachesMetadata(key)) {
+            auto& cache = vc::core::util::remoteMetadataCache();
+            if (const auto answer = cache.lookup(makeUrl(key)))
+                return answer->has_value();
+            // A metadata object is tiny, so a GET costs what a HEAD does and
+            // answers the read that usually follows. Statuses other than
+            // 200/404 fall through to the HEAD classification below.
+            auto response = client_.get(makeUrl(key));
+            if (response.ok()) {
+                cache.record(makeUrl(key), std::move(response.body));
+                return true;
+            }
+            if (response.not_found()) {
+                cache.record(makeUrl(key), std::nullopt);
+                return false;
+            }
+        }
         auto response = client_.head(makeUrl(key));
         if (response.ok())
             return true;
@@ -136,13 +155,26 @@ public:
 
     std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override
     {
+        const bool cacheMetadata = cachesMetadata(key);
+        if (cacheMetadata) {
+            if (auto answer = vc::core::util::remoteMetadataCache().lookup(makeUrl(key))) {
+                if (*answer)
+                    rememberMetadata(key, **answer);
+                return std::move(*answer);
+            }
+        }
         auto response = client_.get(makeUrl(key));
         if (response.ok()) {
             rememberMetadata(key, response.body);
+            if (cacheMetadata)
+                vc::core::util::remoteMetadataCache().record(makeUrl(key), response.body);
             return std::move(response.body);
         }
-        if (response.not_found())
+        if (response.not_found()) {
+            if (cacheMetadata)
+                vc::core::util::remoteMetadataCache().record(makeUrl(key), std::nullopt);
             return std::nullopt;
+        }
         if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
@@ -225,6 +257,11 @@ private:
         return utils::HttpClient(std::move(config));
     }
 
+    bool cachesMetadata(std::string_view key) const
+    {
+        return metadataCacheable_ && isZarrMetadataKey(key);
+    }
+
     void rememberMetadata(const std::string& key,
                           const std::vector<std::byte>& bytes) const
     {
@@ -236,6 +273,7 @@ private:
 
     std::string baseUrl_;
     utils::HttpClient client_;
+    bool metadataCacheable_ = false;
     mutable std::atomic<bool> sawForbiddenMetadataMiss_{false};
     mutable std::mutex metadataMutex_;
     mutable std::unordered_map<std::string, std::vector<std::byte>> metadata_;

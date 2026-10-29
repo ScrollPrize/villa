@@ -1,6 +1,6 @@
 # Fiber constraints, winding/UV layout and minimum flow
 
-This extracts the existing AFV-to-constraint and fiber-layout implementations.
+This extracts the existing fiber-to-constraint and fiber-layout implementations.
 Inputs and earlier stage solutions are immutable; preparation records source
 identities, hashes and coordinate conventions. Preparation, search, experiment
 matrices, diagnostics and tifxyz surface export are documented in
@@ -9,13 +9,24 @@ external; portable usage samples are included.
 
 ## Native fixed evidence
 
-`vc_fiber_constraints CONFIG.json` reads an AFV collection and normal inference,
+`vc_fiber_constraints CONFIG.json` reads the fibers of a VC object store
+(`fibers`, a `.vcobj` file) bound to the volume named by `coordinate_space`
+(`SAMPLE/VOLUME_ID`), in that volume's voxels, and normal inference,
 checks scan identity/base shape against inference provenance, and exports local
 parallel/perpendicular evidence. It retains continuous evidence; downstream
 stages decide rejection/quantization. Optional normal orientation and axial
 priors reuse the same shared normal field and geometry implementations.
 
-Required extraction config entries are `afv`, `coordinate_space`,
+Fibers are identified by their object-store UUID strings everywhere: the
+constraint database keys `fibers(id)` and `constraints(fiber_a, fiber_b)` by
+UUID, trace order and `source_index` are ascending UUID order, and Python stage
+arrays (`ids`, `source_id`) are fixed-width UUID string arrays. Results record
+`fibers_store_uuid`; axial priors also record `fibers_digest` (from
+`fiber_store.fibers_digest`) and `umbilicus_sha256`. The Python stages read
+fibers through `vesuvius.neural_tracing.tracers.shared.annotations.fiber_store`
+and write derived fiber subsets as new stores with its `write_fibers`.
+
+Required extraction config entries are `fibers`, `coordinate_space`,
 `normal_manifest`, `normal_provenance`, `remote_cache`, `output`, and either
 `full_volume: true` or `minimum_xyz`/`maximum_xyz` (base XYZ). Use `database` to
 write a constraint database, with `repetitions: 1`. Existing outputs are not
@@ -77,8 +88,8 @@ using measured phases/arclength and caller-supplied integer labels.
 optional one-sided penalties. It returns integer winding labels and a primal/
 dual certificate. `Seam` and `corrected_targets` transport fiber and connector
 crossings in the same gauge. `fiber_min_flow_split` retains the existing
-arc-based split proposal/solve support. The cached AFV adapter reuses shared
-AFV and polyline geometry rather than copying loaders.
+arc-based split proposal/solve support. The cached fiber adapter reuses the
+shared fiber store reader and polyline geometry rather than copying loaders.
 
 Validation (from `vesuvius/`):
 

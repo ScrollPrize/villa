@@ -140,7 +140,7 @@ def test_disk_resume_and_manifest_guard(tmp_path, monkeypatch):
     import pytest
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_weight_search as search
-    data = dict(source_id=np.array([1]), start=np.array([0.]),
+    data = dict(source_id=np.array(['00000000-0000-4000-8000-000000000001']), start=np.array([0.]),
                 end=np.array([100.]), family=np.array([0]))
     tensor = tmp_path / 'tensor.npz'
     np.savez(tensor, **data)

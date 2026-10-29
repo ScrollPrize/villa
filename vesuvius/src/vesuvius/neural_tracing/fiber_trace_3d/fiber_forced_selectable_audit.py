@@ -94,11 +94,11 @@ def run(settings):
             row['joint_transferred_exact_selectable_graph']['loss'])
         row['sigma_policy']='Each candidate retains its complete saved distribution: transferred children inherit parent sigma. No uncertainty update.'
         for name,b in [('joint',joint),('selectable',select)]:
-            gt=json.loads((root/name/'dataset.json').read_text())['gt_source_id_map'].values()
+            gt=json.loads((root/name/'dataset.json').read_text())['gt_source_ids']
             mask=np.isin(b[1]['source_id'],list(gt))
             row[name]['graph']={'pieces':len(mask),'GT_pieces':int(mask.sum()),'continuations':len(b[1]['links']),
                 'constraints':len(b[1]['i'])}
-            row[name]['GT_by_source']=[dict(source=int(src),pieces=int((b[1]['source_id']==src).sum()),
+            row[name]['GT_by_source']=[dict(source=str(src),pieces=int((b[1]['source_id']==src).sum()),
                 retained_vx=float(b[1]['lengths'][(b[1]['source_id']==src)&(b[2]['state'][:,3]>=0)].sum()))
                 for src in sorted(set(b[1]['source_id'][mask]))]
         output[result_key]=row

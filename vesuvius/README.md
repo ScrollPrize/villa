@@ -67,8 +67,8 @@ $ pip install vesuvius
 ```
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
-`uv sync --all-extras` build the local `volume-cartographer` Python bindings from
-C++ source. Install its [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
+`uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
+Python bindings from C++ source. Install their [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
 first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian,
 `qt` in Homebrew), even for headless use. `uv` does not install these system
 libraries. This requirement does not apply to the base `vesuvius` installation

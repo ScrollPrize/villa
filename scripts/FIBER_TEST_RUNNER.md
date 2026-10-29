@@ -339,3 +339,15 @@ actual available device/CPU budgets. It reads completed native-resolution Zarr
 predictions and constructs only requested chunks; it does not run inference or
 whole-volume production. Existing chunks are reused, and results report raw and
 512-base filtered metrics against the same-case direct and historical controls.
+
+## Main integration validation
+
+The local suites `main-integration-build` and `main-integration-tests` use
+`local/test_main_integration.py` to build into a separate directory, without
+relinking libraries used by an active production tracer. Select both in
+`local/fiber_tests.json`, then run `scripts/run_fiber_tests` (no arguments).
+They cover cache scheduling/eviction/channel hints, sampling diagnostics with
+profiling disabled and enabled, tracing and width/reverse checks, fiber JSON
+and reference replay, Python chunk/stream workflows, and GPU-manager tests.
+Python native tests explicitly select the new build rather than an editable
+installation. These are correctness/integration tests, not throughput gates.

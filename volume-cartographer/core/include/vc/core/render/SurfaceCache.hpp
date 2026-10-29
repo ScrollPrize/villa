@@ -91,11 +91,6 @@ public:
     SurfaceCache(const SurfaceCache&) = delete;
     SurfaceCache& operator=(const SurfaceCache&) = delete;
 
-    // Concurrent tile fills the process-wide pool can run. Callers sizing a
-    // chunk pool for the filler need this: one round of fills is what has to be
-    // resident at once.
-    [[nodiscard]] static std::size_t fillWorkerCount();
-
     [[nodiscard]] int levels() const;
     [[nodiscard]] int wMin() const;
     [[nodiscard]] int wCount() const;
@@ -172,8 +167,9 @@ public:
     void setByteCapacity(std::size_t bytes);
 
     void invalidateAll();
-    // Drop the tiles overlapping a changed rectangle of the surface's *grid*
-    // (row/col) space, e.g. a brush edit.
+    // Mark stale the tiles overlapping a changed rectangle of the surface's
+    // *grid* (row/col) space, e.g. a brush edit. They stay drawable until
+    // requestView's refill replaces them, so the region never goes blank.
     void invalidateSurfaceRegion(const cv::Rect& gridCells);
 
     [[nodiscard]] Stats stats() const;

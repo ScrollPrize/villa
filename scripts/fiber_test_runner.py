@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "local/fiber_tests.json"
 SUITES = {
+    "main-integration-build": ("local/test_main_integration.py::test_build",),
+    "main-integration-tests": ("local/test_main_integration.py::test_regressions",),
     "stream-attributes-pilot": ("local/test_stream_attributes.py::test_pilot",),
     "stream-attributes-fresh": ("local/test_stream_attributes.py::test_fresh_full",),
     "stream-attributes-audit": ("local/test_stream_attributes.py::test_audit_full",),

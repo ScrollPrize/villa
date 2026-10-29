@@ -6,7 +6,6 @@
 #include <functional>
 #include <limits>
 #include <optional>
-#include <set>
 #include <system_error>
 
 #include "utils/Json.hpp"
@@ -21,7 +20,6 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -51,106 +49,6 @@ public:
 private:
     int _previousThreadCount{1};
 };
-
-// maxBackups < 0 -> use QuadSurface's app-configured count (the user setting).
-void createRotatingBackup(QuadSurface* surface, int maxBackups = -1)
-{
-    if (!surface) {
-        return;
-    }
-
-    qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surface->path.string());
-
-    try {
-        // Rotating snapshot; handles path normalization, rotation, file copying,
-        // the per-segment count, and the per-minute throttle internally.
-        surface->saveSnapshot(maxBackups);
-        qCInfo(lcSegGrowth) << "Backup creation complete";
-    } catch (const std::exception& e) {
-        qCWarning(lcSegGrowth) << "Failed to create backup:" << e.what();
-    }
-}
-
-void ensureMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-    surface->meta = utils::Json::object();
-}
-
-bool ensureGenerationsChannel(QuadSurface* surface)
-{
-    if (!surface) {
-        return false;
-    }
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        return true;
-    }
-
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return false;
-    }
-
-    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
-    surface->setChannel("generations", seeded);
-    return true;
-}
-
-void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
-{
-    if (!oldSurface || !newSurface) {
-        return;
-    }
-
-    // Load old approval mask without auto-resize
-    cv::Mat old_approval = oldSurface->channel("approval", SURF_CHANNEL_NORESIZE);
-    if (old_approval.empty()) {
-        return;  // No approval mask to preserve
-    }
-
-    // Get new surface dimensions
-    const cv::Mat_<cv::Vec3f>* new_points = newSurface->rawPointsPtr();
-    if (!new_points || new_points->empty()) {
-        return;
-    }
-
-    cv::Size new_size = new_points->size();
-
-    // Create new approval mask with same type as old mask
-    // Approval masks can be 1-channel (legacy) or 3-channel (RGB)
-    cv::Mat new_approval;
-    if (old_approval.channels() == 3) {
-        new_approval = cv::Mat(new_size, CV_8UC3, cv::Scalar(0, 0, 0));
-    } else {
-        new_approval = cv::Mat(new_size, CV_8UC1, cv::Scalar(0));
-    }
-
-    // Copy old approval values to same grid positions
-    // Grid expansion preserves old point indices, so old[r,c] == new[r,c]
-    int copy_rows = std::min(old_approval.rows, new_approval.rows);
-    int copy_cols = std::min(old_approval.cols, new_approval.cols);
-
-    if (copy_rows > 0 && copy_cols > 0) {
-        cv::Rect src_roi(0, 0, copy_cols, copy_rows);
-        cv::Rect dst_roi(0, 0, copy_cols, copy_rows);
-        old_approval(src_roi).copyTo(new_approval(dst_roi));
-
-        qCInfo(lcSegGrowth) << "Preserved approval mask from"
-                            << old_approval.cols << "x" << old_approval.rows
-                            << "to" << new_approval.cols << "x" << new_approval.rows
-                            << "(channels:" << old_approval.channels() << ")";
-    }
-
-    // Set preserved approval mask on new surface
-    newSurface->setChannel("approval", new_approval);
-}
-
 
 QString directionToString(SegmentationGrowthDirection direction)
 {
@@ -365,6 +263,27 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
 }
 } // namespace
 
+bool ensureGenerationsChannel(QuadSurface* surface)
+{
+    if (!surface) {
+        return false;
+    }
+    cv::Mat generations = surface->channel("generations");
+    if (!generations.empty()) {
+        return true;
+    }
+
+    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return false;
+    }
+
+    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
+    surface->setChannel("generations", seeded);
+    return true;
+}
+
+
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context)
 {
@@ -456,9 +375,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }
-    if (!context.normal3dZarrPath.isEmpty()) {
-        params["normal3d_zarr_path"] = context.normal3dZarrPath.toStdString();
-    }
 
     if (request.correctionsZRange) {
         int zMin = std::max(0, request.correctionsZRange->first);
@@ -512,7 +428,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-        createRotatingBackup(context.resumeSurface);
 
         std::optional<ScopedOmpThreadLimit> regularTracerOmpLimit;
         if (request.method == SegmentationGrowthMethod::Tracer) {
@@ -534,7 +449,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       correctionCollection,
                                       context.allowedGrowthMask.empty() ? nullptr : &context.allowedGrowthMask);
 
-        // Note: approval and mask channels are preserved inside the tracer
+        // Note: the mask channel is preserved inside the tracer
 
         result.surface = surface;
         result.statusMessage = QStringLiteral("Tracer growth completed");
@@ -543,126 +458,4 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     return result;
-}
-
-TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
-                                        const TracerGrowthContext& context)
-{
-    TracerGrowthResult result;
-
-    if (!context.resumeSurface) {
-        result.error = QStringLiteral("Missing segmentation surface for Patch Tracer growth");
-        return result;
-    }
-
-    if (!ensureGenerationsChannel(context.resumeSurface)) {
-        result.error = QStringLiteral("Segmentation surface lacks a generations channel");
-        return result;
-    }
-
-    utils::Json params = buildTracerParams(request);
-    params["resume_growth"] = true;
-    params["steps"] = std::max(0, request.steps);
-    params["use_patch_cache"] = false;
-    if (!context.cacheRoot.isEmpty()) {
-        params["cache_root"] = context.cacheRoot.toStdString();
-    }
-
-    std::filesystem::path targetDir;
-    if (!context.resumeSurface->path.empty()) {
-        targetDir = context.resumeSurface->path.parent_path();
-    }
-    if (targetDir.empty() && !context.cacheRoot.isEmpty()) {
-        targetDir = std::filesystem::path(context.cacheRoot.toStdString());
-    }
-    if (targetDir.empty()) {
-        targetDir = std::filesystem::temp_directory_path();
-    }
-    params["tgt_dir"] = targetDir.string();
-
-    std::vector<QuadSurface*> surfaces;
-    surfaces.reserve(context.patchSurfaces.size() + 1);
-    std::set<QuadSurface*> seen;
-    auto appendSurface = [&](QuadSurface* surface) {
-        if (surface && seen.insert(surface).second) {
-            surfaces.push_back(surface);
-        }
-    };
-    for (const auto& surface : context.patchSurfaces) {
-        appendSurface(surface.get());
-    }
-    appendSurface(context.resumeSurface);
-
-    try {
-        qCInfo(lcSegGrowth) << "Calling grow_surf_from_surfs() for Patch Tracer";
-        qCInfo(lcSegGrowth) << "  surface count:" << static_cast<int>(surfaces.size());
-        qCInfo(lcSegGrowth) << "  external patch index:" << (context.surfacePatchIndex != nullptr);
-        qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-        createRotatingBackup(context.resumeSurface);
-        result.surface = grow_surf_from_surfs(context.resumeSurface,
-                                              surfaces,
-                                              params,
-                                              static_cast<float>(context.voxelSize),
-                                              context.surfacePatchIndex);
-        result.statusMessage = QStringLiteral("Patch Tracer growth completed");
-    } catch (const std::exception& ex) {
-        result.error = QStringLiteral("Patch Tracer growth failed: %1").arg(ex.what());
-    } catch (...) {
-        result.error = QStringLiteral("Patch Tracer growth failed with an unknown exception");
-    }
-
-    return result;
-}
-
-void updateSegmentationSurfaceMetadata(QuadSurface* surface,
-                                       double voxelSize)
-{
-    if (!surface) {
-        return;
-    }
-
-    ensureMetaObject(surface);
-
-    // Other writers state an unknown area as null rather than omitting the key
-    // (merge_concat_runs.py, for one), so read leniently: anything that is not
-    // a number means "not established".
-    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
-
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (points && !points->empty()) {
-        const double areaVx2 = vc::surface::computeSurfaceAreaVox2(*points);
-        surface->meta["area_vx2"] = areaVx2;
-
-        double areaCm2 = std::numeric_limits<double>::quiet_NaN();
-        if (const auto derived = vc::surface::areaCm2FromVox2(areaVx2, voxelSize)) {
-            areaCm2 = *derived;
-        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 > 0.0) {
-            // Rescaling a surface whose physical scale was already established.
-            const double cm2PerVx2 = previousAreaCm2 / previousAreaVx2;
-            areaCm2 = areaVx2 * cm2PerVx2;
-        }
-
-        if (std::isfinite(areaCm2)) {
-            surface->meta["area_cm2"] = areaCm2;
-        } else {
-            // No voxel size and no established scale to carry forward. Leave
-            // area_cm2 absent: a guessed physical area is worse than none,
-            // because nothing downstream can tell it apart from a real one.
-            if (surface->meta.contains("area_cm2")) {
-                surface->meta.erase("area_cm2");
-            }
-            qCWarning(lcSegGrowth) << "Surface area left in voxels only: volume reports no voxel size";
-        }
-    }
-
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        double minGen = 0.0;
-        double maxGen = 0.0;
-        cv::minMaxLoc(generations, &minGen, &maxGen);
-        surface->meta["max_gen"] = static_cast<int>(std::round(maxGen));
-    }
-
-    surface->meta["date_last_modified"] = get_surface_time_str();
 }

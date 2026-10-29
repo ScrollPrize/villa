@@ -324,7 +324,6 @@ public:
 
     PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
     PersistentCacheLayout persistentCacheLayout() const noexcept;
-    std::vector<ChunkKey> persistedStorageObjectRepresentatives() const;
     std::vector<ChunkKey> storageObjectRepresentatives(int level) const;
 
     Stats stats() const;
@@ -345,16 +344,6 @@ public:
         int iy,
         int ix,
         PersistentRequestMode mode = PersistentRequestMode::Ensure);
-
-    // Deprecated no-op compatibility API. Legacy compressed entries remain
-    // readable; new writes are never recompressed.
-    static void setPersistentCompressionDefault(bool enabled);
-    static bool persistentCompressionDefault();
-
-    // Process-wide default for Options::cacheQuantBinWidth (same pattern as
-    // the compression default above; the larger of the two values wins).
-    static void setPersistentQuantizationDefault(int binWidth);
-    static int persistentQuantizationDefault();
 
     // Optional process-wide default aggregate budget. Applications install
     // this once; explicitly supplied budgets (for example the overlay pool)

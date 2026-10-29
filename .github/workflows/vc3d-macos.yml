@@ -169,13 +169,13 @@ jobs:
           # Console CLI tool: loads the vc_core/OpenCV/Ceres dylib closure.
           # No-args prints usage and exits 1; anything else means load failure.
           set +e
-          "$bin/vc_tifxyz_trim"; rc=$?
+          "$bin/vc_tifxyz2obj"; rc=$?
           set -e
           if [[ $rc -ne 0 && $rc -ne 1 ]]; then
-            echo "::error::vc_tifxyz_trim failed to start (exit $rc)"
+            echo "::error::vc_tifxyz2obj failed to start (exit $rc)"
             exit 1
           fi
-          echo "vc_tifxyz_trim OK (exit $rc)"
+          echo "vc_tifxyz2obj OK (exit $rc)"
 
           # GUI app: Homebrew's macOS Qt package ships the native Cocoa
           # platform plugin, not the offscreen plugin. --version exits without

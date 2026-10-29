@@ -36,6 +36,7 @@ bool matchesEdgeSelection(const EdgeRecord& edge, const EdgeSelection& selection
         return std::any_of(ids.begin(), ids.end(), [&](const auto& value) { return formatUuid(parseUuid(value)) == id; });
     };
     if (selection.kind && edge.kind != *selection.kind) return false;
+    if (!selection.attachments && edge.kind == kAttachmentEdgeKind) return false;
     if (!matchesFiberAdjacency(edge, selection.adjacent)) return false;
     if (!selection.approvalStates.empty() && std::find(selection.approvalStates.begin(), selection.approvalStates.end(),
                                                     edge.approvalState) == selection.approvalStates.end()) return false;

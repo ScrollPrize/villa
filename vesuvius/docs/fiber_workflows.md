@@ -29,8 +29,7 @@ grant, unlike ordinary search trials.
 
 Native extraction uses `vc_fiber_constraints` on `PATH`, or `native_binary`.
 Command-list jobs also accept `native_binaries` (name-to-path mapping) and
-`binary_dir`. Old `vc_fiber_trace_chunk afv-constraints CONFIG` requests are routed
-to the same standalone exporter. Supply `native_regression_binary` to the
+`binary_dir`. Supply `native_regression_binary` to the
 normal/axial-prior wrappers to run the native regression executable first.
 Other native tools, such as reference replay, must be available separately.
 
@@ -38,13 +37,13 @@ Other native tools, such as reference replay, must be available separately.
 
 | Workflow key | Inputs / result |
 |---|---|
-| `fiber_json_solve` | Reviewed JSON directory + AFV metadata template + explicit ordered stages; creates AFV and dispatches extraction, normal/HV/direction and layout requests. |
+| `fiber_json_solve` | Reviewed JSON directory + `volume` id and `volume_shape_zyx` + explicit ordered stages; creates a fiber store (`fibers.vcobj`, each fiber keeping its document `uuid`) and dispatches extraction, normal/HV/direction and layout requests. |
 | `fiber_anchored_dataset` | Reference-curated source graph; constructs an anchored dataset with fixed reference events. |
 | `fiber_selected_dataset_eval` | `dataset`, `base_config`, `gt_root`, `output_root`; filter unsupported sources, split if configured, initialize, solve and score. |
 | `fiber_selected_score` / `fiber_selected_checkpoint_report` | Score completed or published intermediate states without rerunning optimization. |
 | `fiber_joint_gt_eval` | `baseline_root`, `base_config`, `gt_root`, `output_root`; attach GT, with `force_gt_enabled: true` or `false`. `report_only` reads completed output. |
 | `fiber_gt_inpainting` | Fixed-reference solve and optional post-solve deformation. |
-| `fiber_neighbor_expansion` | `seed_solve`, whole `parent_tensors`, `afv`, `gt_root`, `z_range`, extraction/orientation templates; MAP-select neighbors, re-solve, re-filter per round. |
+| `fiber_neighbor_expansion` | `seed_solve`, whole `parent_tensors`, `fibers`, `gt_root`, `z_range`, extraction/orientation templates; MAP-select neighbors, re-solve, re-filter per round. |
 | `fiber_neighbor_pair` | Run and compare no-GT/forced-GT variants on the expanded dataset. |
 | `fiber_full_slab` / `fiber_full_slab_soft` / `fiber_full_slab_progress` | Whole-slab dataset construction, soft-only control and checkpoint reporting. |
 
@@ -63,7 +62,7 @@ Minimal selected-set job:
 ```
 
 `base.json` wraps the solver config under `fiber_implicit_winding`. The selected
-dataset contains `selected.afv`, `tensors.npz` and `cross/cross_events.json`.
+dataset contains `selected.vcobj`, `tensors.npz` and `cross/cross_events.json`.
 `gt_root/uv_whole` contains the trusted `config.json`, `solution.npz` and referenced
 tensors. Joint evaluation uses a prepared baseline's `tensors.npz` and
 `gt_events.json`. These schemas are also checked by the
@@ -77,10 +76,10 @@ and supply `umbilicus` in stages that require it. Do not infer scan identity fro
 Use `stages`, an ordered list of `{name, config_file}` or `{name, request}`
 entries. Each request is a complete workflow object (or native command-list
 job). Stage names are caller-selected output labels, not preset selectors.
-`{afv}` and `{output_root}` are expanded in request string values; referenced
+`{fibers}` and `{output_root}` are expanded in request string values; referenced
 native configuration files must already contain their own correct paths. No
 solver settings, enablement policies, pass counts or GPU reservations are injected.
-An empty list converts JSON to AFV only. `layout_output` optionally requests the
+An empty list converts JSON to a fiber store only. `layout_output` optionally requests the
 categorical-layout report; omit it for other checkpoint formats. See the
 [JSON pipeline example](examples/fiber_workflows/json_pipeline.json).
 
@@ -179,7 +178,7 @@ retain their own checkpoint schemas.
 
 Extra read-only tools have module CLIs (use `--help`):
 `fiber_constraint_database_report`, `fiber_constraint_database_validation`
-(requires AFV and the matching C++ header), `fiber_oriented_normals_validation`,
+(requires `--fibers`, the source fiber store, and the matching C++ header), `fiber_oriented_normals_validation`,
 and `fiber_violation_neighborhoods` (consumes `paired_winding_review` output).
 
 Performance modes restored in `fiber_uv_layout`: `benchmark_pair_fusion`,

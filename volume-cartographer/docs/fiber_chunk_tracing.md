@@ -1911,3 +1911,20 @@ parity across worker migration, cold CT reads, completed-page resume, cancellati
 coordinate scaling, output roundtrip, and shared neural-policy parity. Local
 production inputs and pilot timings remain under the ephemeral experiment
 directory rather than becoming repository defaults.
+
+### Cache/sampling timing diagnostics
+
+`VC_SAMPLING_WAIT_PROFILE=1` enables the opt-in `SamplingWaitProfile` hooks in
+`ChunkCache.cpp` and `ChunkedPlaneSampler.cpp`. Per-thread counters attribute
+blocking/cached/prefetch calls, lock acquisition, payload waits, budget work,
+and corner preparation/pinning/gather. Summaries are emitted at most once per
+ten seconds per sampling thread, outside cache locks. Some timings are nested;
+do not sum all fields as exclusive wall time. Disabled profiling does not
+construct the thread-local stats or read clocks for these cache timers.
+
+The helper and its enabled/disabled regression test are retained through the
+main/object-store integration. Existing cache-pressure counters and standalone
+contention/ROI benchmarks remain available as well: unit tests check behavior,
+whereas throughput regressions require matched performance runs. The profiling
+hooks do not change cache policy, precision, or trace scoring. See
+`scripts/FIBER_TEST_RUNNER.md` for isolated integration validation.
