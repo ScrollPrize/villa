@@ -7,10 +7,10 @@ inline void require(bool value, const char* message)
 {
     if (!value) throw std::runtime_error(message);
 }
-template<class F> void mustFail(F&& callback)
+template<class F> void mustFail(F&& callback, const char* what = "operation")
 {
     try { callback(); } catch (const std::exception&) { return; }
-    throw std::runtime_error("expected operation to fail");
+    throw std::runtime_error(std::string("expected ") + what + " to fail");
 }
 struct TemporaryDirectory {
     std::filesystem::path path = std::filesystem::temp_directory_path() / vc::objects::util::newUuid();

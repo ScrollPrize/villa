@@ -1329,7 +1329,42 @@ private:
     void showError(const QString& message, bool suppressDialog = false) const;
     // Shared worker and write barrier for saveOpenFibers /
     // saveOpenFibersHeadless.
-    void refreshChangedStoreFibers();
+    // Panes whose stored revision moved are reopened; branch views are
+    // rebuilt for the panes that show or link one of `fiberIds` (every pane
+    // when `all`). The failure path, with no event to scope by, passes all.
+    // Hosted replicas: keep the session's fiber leased for as long as the
+    // session lives (the hub worker grants later holds on a held object
+    // without waiting for a sync). True when held or when the store is not
+    // hosted; false with the reason when the hub refused.
+    // `createdHere`: the fiber's identity was generated here and never
+    // published (a new seed), see ObjectStoreSession::holdLeases.
+    bool holdSessionLease(LineAnnotationSession& session, QString* error = nullptr, bool createdHere = false);
+    // Checked activation for sessions the edit-session factory creates
+    // (auto-link, re-optimization): takes the lease, then confirms the
+    // session still describes the stored revision (leasing may have pulled
+    // a newer record). On refusal the session becomes read-only with the
+    // reason recorded, so its placements and saves are refused rather than
+    // silently dropped.
+    bool activateSessionEditing(LineAnnotationSession& session, QString* error = nullptr);
+    // True (after reporting the reason) when the session must not be mutated.
+    bool refuseIfReadOnly(LineAnnotationSession& session);
+    void refreshChangedStoreFibers(const std::set<uint64_t>& fiberIds, bool all);
+    void refreshChangedStoreFibers() { refreshChangedStoreFibers({}, true); }
+    // Scoped variant of refreshBranchLineViews: one pass over the panes.
+    void refreshBranchLineViewsFor(const std::set<uint64_t>& fiberIds, bool all);
+    // Per-record invalidation of the decode and strip caches for a Committed
+    // event: the affected fibers (changed records, cached fibers referencing
+    // them, both endpoints of every changed or removed edge) are computed
+    // before anything is evicted. `complete` is false when a removed edge
+    // had no cached holder, so its far endpoint is unknown and the decode
+    // cache was cleared wholesale.
+    struct StoreInvalidation {
+        std::set<std::string> uuids;
+        std::set<uint64_t> fiberIds;  // uuids with a live runtime id
+        bool complete = true;
+        size_t decodeEvictions = 0, stripEvictions = 0;
+    };
+    StoreInvalidation invalidateStoreCaches(const vc::objects::StoreSessionEvent& event);
     void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
         const std::vector<FiberBranchRef>& branches) const;
@@ -1450,10 +1485,29 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
-    // See readStoredFibersCached: decoded fibers keyed by uuid.
+    // See readStoredFibersCached: decoded fibers keyed by uuid. Entries go in
+    // and out through cacheDecodedFiber / evictDecodedFiber /
+    // clearDecodedFiberCache, which keep the reverse indexes below current:
+    // which cached fibers reference a uuid as a branch target, and which
+    // cached fibers hold a branch record for an edge uuid.
     mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
     // The voxels _storedFiberDecodeCache was decoded in.
     mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
+    mutable std::unordered_map<std::string, std::set<std::string>> _storedFiberReferencedBy;
+    mutable std::unordered_map<std::string, std::set<std::string>> _storedFiberEdgeHolders;
+    void cacheDecodedFiber(StoredFiber fiber) const;
+    void evictDecodedFiber(const std::string& uuid) const;
+    // (edge uuid, peer uuid) pairs a cached fiber depends on: every incident
+    // relationship it was read with, plus its decoded branches.
+    std::vector<std::pair<std::string, std::string>> cachedFiberDependencies(const StoredFiber& fiber) const;
+    void clearDecodedFiberCache() const;
+    // Runtime id already assigned to a uuid, 0 when none (never allocates).
+    uint64_t existingFiberIdForUuid(const std::string& uuid) const;
+    // Diagnostics for the Committed handler (tests and the metrics log).
+    struct StoreChangeCounters {
+        uint64_t events = 0, entries = 0, decodeEvictions = 0, stripEvictions = 0, wholesale = 0, panesRebuilt = 0;
+    } _storeChangeCounters;
+    StoreInvalidation _lastStoreInvalidation;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

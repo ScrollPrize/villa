@@ -10,7 +10,15 @@
 #include <bit>
 #include <cstring>
 #include <iostream>
+#include <atomic>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <mutex>
+#include <exception>
+#include <memory>
 #include <thread>
+#include <algorithm>
 
 using namespace vc::objects;
 
@@ -308,10 +316,107 @@ int main() try
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         };
-        ObjectStoreSession session;
         HubSessionOptions fast; fast.syncInterval = std::chrono::milliseconds(200); fast.pushDelay = std::chrono::milliseconds(50);
-        const auto attachment = session.attach(alicePath, as("alice"), fast);
+        // The optional span trace reports the worker's phases and lease waits
+        // as strictly nested begin/end pairs on the thread doing the work.
+        std::mutex traceMutex;
+        std::map<std::thread::id, std::vector<std::string>> traceStacks;
+        std::map<std::string, int> traceCounts;
+        bool traceNested = true;
+        // Parking: the hook blocks the thread entering the named phase until
+        // the test lets it go, so the worker can be frozen inside a sync
+        // (holding hub_) or just before one.
+        std::mutex parkMutex;
+        std::condition_variable parkCv;
+        std::string parkAt;
+        bool parked = false;
+        // One begin callback throws: the worker's sync must complete regardless.
+        std::atomic<bool> traceThrowOnce{true};
+        std::function<void()> onStart;  // runs in the "start" trace (before a worker claims the replica)
+        fast.trace = [&](std::string_view name, bool begin) {
+            if (begin && name == "start" && onStart) onStart();
+            {
+                std::lock_guard lock(traceMutex);
+                auto& stack = traceStacks[std::this_thread::get_id()];
+                if (begin) { stack.emplace_back(name); ++traceCounts[std::string(name)]; }
+                else if (stack.empty() || stack.back() != name) traceNested = false;
+                else stack.pop_back();
+            }
+            // The begin was recorded; its end still arrives (the scope ends).
+            if (begin && name == "sync.push" && traceThrowOnce.exchange(false)) throw std::runtime_error("trace hook failure");
+            if (!begin) return;
+            std::unique_lock lock(parkMutex);
+            if (parkAt != name) return;
+            parked = true;
+            parkCv.notify_all();
+            parkCv.wait(lock, [&] { return parkAt != name; });
+            parked = false;
+            parkCv.notify_all();
+        };
+        auto park = [&](const char* phase) {
+            std::unique_lock lock(parkMutex);
+            parkAt = phase;
+            require(parkCv.wait_for(lock, std::chrono::seconds(20), [&] { return parked; }), "worker parks");
+        };
+        auto unpark = [&] {
+            std::unique_lock lock(parkMutex);
+            parkAt.clear();
+            parkCv.notify_all();
+            parkCv.wait_for(lock, std::chrono::seconds(20), [&] { return !parked; });
+        };
+        auto count = [&](const char* name) { std::lock_guard lock(traceMutex); return traceCounts[name]; };
+        // Helper threads are unparked and joined before they are destroyed;
+        // what they throw is rethrown on the test thread by join().
+        struct JoinedThread {
+            std::function<void()> release; std::exception_ptr error; std::thread thread;
+            JoinedThread(std::function<void()> body, std::function<void()> unpark)
+                : release(std::move(unpark)),
+                  thread([this, body = std::move(body)] { try { body(); } catch (...) { error = std::current_exception(); } }) {}
+            void join() { if (thread.joinable()) thread.join(); if (error) std::rethrow_exception(error); }
+            ~JoinedThread() { if (thread.joinable()) { release(); thread.join(); } }
+        };
+        auto hubSeconds = [&](const std::string& object, int64_t seconds) {
+            // Shortens this replica's lease on the hub itself: the mirror
+            // learns of it at the next pull (direct lease calls on a managed
+            // replica are refused, see below).
+            const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            sql(hubPath, "UPDATE hub_leases SET expires_us=" + std::to_string(now + seconds * 1000000) +
+                         " WHERE object_uuid='" + object + "';");
+        };
+        ObjectStoreSession session;
+        // A failed assertion while the worker is parked must still let the
+        // session stop: the guard (declared after the session) unparks before
+        // the session is destroyed, and the callback state outlives both.
+        struct UnparkOnExit { std::function<void()> unpark; ~UnparkOnExit() { unpark(); } } unparkOnExit{unpark};
+        auto attachment = session.attach(alicePath, as("alice"), fast);
+        // Reattaching the same replica hands the lease ownership over.
+        attachment = session.replace(attachment, alicePath, as("alice"), fast);
+        // One worker manages a replica's leases: a second session, also
+        // through an alias of the file, and direct lease calls are refused
+        // while it lives.
+        {
+            ObjectStoreSession other;
+            mustFail([&] { other.attach(alicePath, as("alice"), fast); }, "a second session on the replica");
+            // Refused before anything was published: the session has no
+            // attachment to grant holds on without a worker.
+            require(other.attachments().empty(), "a refused attachment leaves the session detached");
+            // A session attached elsewhere keeps that attachment when the
+            // reattachment is refused.
+            const auto plainPath = directory.path / "plain.vcobj";
+            { auto plain = ObjectStore::create(plainPath, as("alice")); }
+            const auto before = other.attach(plainPath, as("alice"));
+            mustFail([&] { other.attach(alicePath, as("alice"), fast); }, "a refused reattachment");
+            require(other.attachments() == std::vector{before} && other.current(before), "a refused reattachment keeps the previous attachment");
+        }
+        const auto aliasPath = directory.path / "alias.vcobj";
+        std::filesystem::create_symlink(alicePath, aliasPath);
+        mustFail([&] { ObjectStoreSession other; other.attach(aliasPath, as("alice"), fast); }, "a second session through an alias");
+        mustFail([&] { renewLeases(alice, {b}); }, "a direct lease call on a managed replica");
+        mustFail([&] { auto alias = ObjectStore::open(aliasPath, as("alice")); renewLeases(alias, {b}); },
+                 "a direct lease call through an alias");
         eventually([&] { return session.hubStatus(attachment) && session.hubStatus(attachment)->syncedAtUs; }, "session syncs on attach");
+        require(!traceThrowOnce && session.hubStatus(attachment)->error.empty(), "a throwing trace callback does not fail the sync");
         require(session.artifactDirectory(attachment, b) == std::filesystem::path(hubPath.string() + ".artifacts") / b,
                 "replicas share the artifact directory beside the hub");
         mustFail([&] { session.act(attachment, {}, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"unleased\""); }); });
@@ -333,11 +438,224 @@ int main() try
         eventually([&] {
             try { acquireLeases(bob, {b}); return true; } catch (const HubLeaseRefused&) { return false; }
         }, "lease released once the hold ends");
+        releaseLeases(bob, {b});
+        {
+            // A hold on an object another live hold keeps leased never waits
+            // for a running sync, while one that needs a lease does.
+            auto editing = session.holdLeases(attachment, {b});  // acquires b
+            park("sync.push");  // the worker now holds hub_ mid-sync
+            const auto waits = count("hold.wait"), acquires = count("hold.acquire");
+            const auto start = std::chrono::steady_clock::now();
+            auto fast = session.holdLeases(attachment, {b});
+            require(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500) &&
+                    count("hold.wait") == waits && count("hold.acquire") == acquires,
+                    "a held object's lease is granted without the sync");
+            RevisionSelection expected;
+            session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+                expected[b] = store.currentObjectRevision(txn, b)->uuid;
+            });
+            session.act(attachment, expected, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"fast\""); });
+            mustFail([&] { acquireLeases(bob, {b}); });
+            // Mixed request: b qualifies, c is leased to its creator bob. The
+            // refusal leaves b's count as it was.
+            std::atomic<bool> refused{false};
+            JoinedThread mixed{[&] {
+                try { session.holdLeases(attachment, {b, c}); } catch (const HubLeaseRefused&) { refused = true; }
+            }, unpark};
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            require(!refused, "a request needing a lease waits for the sync");
+            unpark();
+            mixed.join();
+            require(refused, "the unleased object's refusal propagates");
+            park("sync.push");
+            const auto waitsAfter = count("hold.wait");
+            auto still = session.holdLeases(attachment, {b});
+            require(count("hold.wait") == waitsAfter, "the editing hold survived the refused request");
+            unpark();
+            // A lease inside the margin leaves the fast path: the hold waits
+            // for the sync that renews it.
+            hubSeconds(b, 30);
+            park("sync.renew");  // the pull mirrored the 30 s expiry; renewal is next
+            std::atomic<bool> returned{false};
+            JoinedThread slow{[&] { auto renewed = session.holdLeases(attachment, {b}); returned = true; }, unpark};
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            require(!returned, "a lease inside the margin takes the slow path");
+            unpark();
+            slow.join();
+            require(returned && count("hold.wait") > waitsAfter, "the slow path waited for hub_");
+            // A never-pushed object needs no lease; its creator lease arrives
+            // with the push and later holds take the fast path.
+            const auto d = util::newUuid();
+            park("sync");  // frozen before taking hub_
+            session.act(attachment, {{d, std::nullopt}}, [&](auto& store, auto& txn) {
+                ObjectRecord record; record.uuid = d; record.kind = "fiber";
+                store.upsertObject(txn, record);
+                store.putGeometry(txn, d, vc::geometry::encode(fiber));
+            });
+            const auto acquiresBefore = count("hold.acquire");
+            auto seed = session.holdLeases(attachment, {d}, /*createdHere=*/true);
+            require(count("hold.acquire") == acquiresBefore, "a never-pushed object is held without a lease");
+            unpark();
+            eventually([&] {
+                const auto status = session.hubStatus(attachment);
+                return status && std::any_of(status->leases.begin(), status->leases.end(),
+                                             [&](const auto& lease) { return lease.objectUuid == d; });
+            }, "the push grants the creator lease");
+            park("sync.push");
+            const auto waitsSeed = count("hold.wait");
+            auto seedAgain = session.holdLeases(attachment, {d});
+            require(count("hold.wait") == waitsSeed, "the creator lease serves the fast path");
+            unpark();
+            mustFail([&] { hubPull(bob); acquireLeases(bob, {d}); });
+            // Only a fresh identity skips the lease: a supplied one (an
+            // import) may exist on the hub already, under another replica's
+            // creator lease, and is leased like any other object even while
+            // this replica knows no hub version for it.
+            const auto e = util::newUuid();
+            {
+                auto txn = bob.write();
+                ObjectRecord record; record.uuid = e; record.kind = "fiber";
+                bob.upsertObject(txn, record);
+                bob.putGeometry(txn, e, vc::geometry::encode(fiber));
+                txn.commit();
+            }
+            park("sync");  // alice has not pulled e when she asks for it
+            hubSync(bob);
+            mustFail([&] { session.holdLeases(attachment, {e}); }, "a hold on an identity bob created meanwhile");
+            unpark();
+            releaseLeases(bob, {e});
+            // An uncertain release: the hub drops the lease, the mirror write
+            // fails. The mirror still shows the lease but is not trusted, so
+            // the next hold acquires again instead of editing on a lost lease.
+            seedAgain.reset(); seed.reset(); still.reset(); fast.reset(); editing.reset();
+            park("sync.release");
+            sqlite3* raw = nullptr;
+            require(sqlite3_open(alicePath.c_str(), &raw) == SQLITE_OK, "raw replica connection");
+            // Closed (and its transaction rolled back) on every exit path.
+            const std::unique_ptr<sqlite3, decltype(&sqlite3_close)> rawGuard(raw, sqlite3_close);
+            require(sqlite3_exec(raw, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK, "replica write lock");
+            unpark();
+            eventually([&] { const auto status = session.hubStatus(attachment); return status && !status->error.empty(); },
+                       "the failed mirror write is reported");
+            park("sync");
+            sqlite3_exec(raw, "ROLLBACK;", nullptr, nullptr, nullptr);
+            const auto mirror = *hubStatus(alice);
+            require(std::any_of(mirror.leases.begin(), mirror.leases.end(),
+                                [&](const auto& lease) { return lease.objectUuid == b; }), "the stale mirror still shows the lease");
+            // A competitor that took the lease meanwhile is seen: the stale
+            // mirror is not trusted, so the hold is refused, not granted.
+            hubPull(bob); acquireLeases(bob, {b});
+            mustFail([&] { session.holdLeases(attachment, {b}); });
+            releaseLeases(bob, {b});
+            const auto acquiresUncertain = count("hold.acquire");
+            auto again = session.holdLeases(attachment, {b});
+            require(count("hold.acquire") == acquiresUncertain + 1, "an uncertain release forces re-acquisition");
+            again.reset();
+            unpark();
+            eventually([&] {
+                try { acquireLeases(bob, {b}); return true; } catch (const HubLeaseRefused&) { return false; }
+            }, "lease released again once the holds end");
+            // A competitor holding the lease after our release refuses the hold.
+            mustFail([&] { session.holdLeases(attachment, {b}); });
+            releaseLeases(bob, {b});
+            // A lease that expired outright (the mirror shows it) leaves the
+            // fast path: the hold waits for the sync that renews it.
+            auto expiring = session.holdLeases(attachment, {b});
+            hubSeconds(b, 2);
+            park("sync.renew");  // the pull mirrored the 2 s expiry; renewal is next
+            std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+            const auto waitsExpired = count("hold.wait");
+            JoinedThread expired{[&] { auto reacquired = session.holdLeases(attachment, {b}); }, unpark};
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            require(count("hold.wait") == waitsExpired + 1, "an expired lease leaves the fast path");
+            unpark();
+            expired.join();
+            expiring.reset();
+            eventually([&] {
+                try { acquireLeases(bob, {b}); return true; } catch (const HubLeaseRefused&) { return false; }
+            }, "lease released after the re-acquisition's holds end");
+        }
         bool hubEvent = false;
         for (const auto& event : session.takeEvents()) hubEvent |= event.kind == StoreSessionEvent::Kind::Hub;
         require(hubEvent, "status changes are session events");
+        // A hold that outlives its worker does not keep the lease: stopping
+        // the worker releases the leases of pushed objects.
+        releaseLeases(bob, {b});
+        auto outliving = session.holdLeases(attachment, {b});
         session.detach(attachment);
         require(!session.hubStatus(attachment), "no hub status without an attachment");
+        hubPull(bob); acquireLeases(bob, {b});
+        releaseLeases(bob, {b});
+        outliving.reset();
+        // An inherited mirror is not trusted: a release that reached the hub
+        // but not the mirror (here: a lease dropped behind the mirror's back
+        // and taken by bob) must not let the first hold of a new worker edit
+        // on a lease bob owns.
+        acquireLeases(alice, {b});
+        sql(hubPath, "DELETE FROM hub_leases WHERE object_uuid='" + b + "';");
+        {
+            const auto mirror = *hubStatus(alice);
+            require(std::any_of(mirror.leases.begin(), mirror.leases.end(),
+                                [&](const auto& lease) { return lease.objectUuid == b; }), "the mirror still shows the lease");
+        }
+        hubPull(bob); acquireLeases(bob, {b});
+        { std::lock_guard lock(parkMutex); parkAt = "sync"; }  // the new worker parks before its first pull
+        attachment = session.attach(alicePath, as("alice"), fast);
+        { std::unique_lock lock(parkMutex); require(parkCv.wait_for(lock, std::chrono::seconds(20), [&] { return parked; }), "worker parks"); }
+        const auto pullsBefore = count("hold.pull");
+        mustFail([&] { session.holdLeases(attachment, {b}); }, "a hold on an inherited mirror row bob took meanwhile");
+        require(count("hold.pull") == pullsBefore + 1, "the first hold verifies the inherited mirror");
+        unpark();
+        releaseLeases(bob, {b});
+        // A refused reattachment of ANOTHER replica leaves the current one
+        // untouched, its holds included; a refused reattachment of the SAME
+        // replica (whose worker had to stop, releasing its leases) leaves
+        // the session detached rather than attached with dead holds.
+        {
+            ObjectStoreSession blocker;
+            const auto blocking = blocker.attach(bobPath, as("bob"), fast);  // bob's replica is managed now
+            auto held = session.holdLeases(attachment, {b});
+            mustFail([&] { session.attach(bobPath, as("bob"), fast); }, "a reattachment to a managed replica");
+            require(session.attachments() == std::vector{attachment} && session.current(attachment), "the previous attachment survives");
+            // Alice's hold survived: bob's session is refused the lease (not
+            // a direct call, which bob's own worker would refuse regardless).
+            bool refused = false;
+            try { blocker.holdLeases(blocking, {b}); } catch (const HubLeaseRefused& error) { refused = error.held == std::vector<std::string>{b}; }
+            require(refused, "the hold survived too");
+            held.reset();
+            eventually([&] {
+                try { blocker.holdLeases(blocking, {b}); return true; } catch (const HubLeaseRefused&) { return false; }
+            }, "released once the hold ends");
+            blocker.detach(blocking);
+        }
+        {
+            // Another owner appears while alice's worker is stopped (the
+            // "start" trace runs between the old worker's stop and the new
+            // worker's claim): the worker lock is a flock on the sidecar
+            // beside the replica, taken here by a second description.
+            auto held = session.holdLeases(attachment, {b});
+            const auto sidecar = std::filesystem::weakly_canonical(alicePath).string() + ".worker-lock";
+            const int taker = ::open(sidecar.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+            require(taker >= 0, "sidecar opened");
+            require(::flock(taker, LOCK_EX | LOCK_NB) != 0, "alice's worker holds the sidecar lock");
+            onStart = [&] { require(::flock(taker, LOCK_EX | LOCK_NB) == 0, "the sidecar is free once the old worker stopped"); };
+            mustFail([&] { session.replace(attachment, alicePath, as("alice"), fast); }, "a same-replica reattachment refused by another owner");
+            onStart = nullptr;
+            require(session.attachments().empty() && !session.current(attachment), "the session is detached, not attached with dead holds");
+            ::close(taker);
+        }
+        hubPull(bob); acquireLeases(bob, {b});  // released when alice's worker stopped
+        releaseLeases(bob, {b});
+        session.detach(attachment);
+        {
+            std::lock_guard lock(traceMutex);
+            require(traceNested, "trace begin/end pairs nest");
+            require(std::all_of(traceStacks.begin(), traceStacks.end(), [](const auto& e) { return e.second.empty(); }),
+                    "every traced span ended");
+            for (const char* name : {"sync", "sync.wait", "sync.pull", "sync.push", "hold", "hold.wait", "hold.acquire"})
+                require(traceCounts[name] > 0, "trace reports every sync and hold phase");
+            require(traceCounts["hold"] > traceCounts["hold.wait"], "fast holds never waited");
+        }
         releaseLeases(bob, {b});
         hubSync(alice);
     }

@@ -83,14 +83,9 @@ AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path,
         if (std::any_of(attached_.begin(), attached_.end(),
                         [&](const auto& a) { return a->identity.storeUuid == next->identity.storeUuid; }))
             throw std::runtime_error("object store is already attached to this session");
-        next->identity.generation = ++generation_;
-        attached_.push_back(next);
-        events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
-    startFetching(*next);
-    if (next->writable && vc::objects::hubStatus(next->store))
-        next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
-            [this, owner = next.get()] { hubChanged(owner); });
+    startWorker(*next, hubOptions);
+    announce(next);
     return next->identity;
 }
 
@@ -107,7 +102,29 @@ AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identit
                 return a != previous && a->identity.storeUuid == next->identity.storeUuid; }))
             throw std::runtime_error("object store is already attached to this session");
     }
+    // The old attachment's worker stops first: one worker manages a replica's
+    // leases, so reattaching the same replica hands over. A refused claim then
+    // leaves the session without either attachment rather than attached to
+    // the old one with holds its stopped worker released.
     retire(previous);
+    startWorker(*next, hubOptions);
+    announce(next);
+    return next->identity;
+}
+
+void ObjectStoreSession::startWorker(Attachment& attachment, const HubSessionOptions& hubOptions)
+{
+    // Before the attachment is announced: a hosted attachment is never
+    // visible without its worker (holds would be granted without leases),
+    // and a refused claim (another session manages the replica) leaves the
+    // session as it was.
+    if (attachment.writable && vc::objects::hubStatus(attachment.store))
+        attachment.hub = std::make_unique<detail::HubWorker>(attachment.store, hubOptions,
+            [this, owner = &attachment] { hubChanged(owner); });
+}
+
+void ObjectStoreSession::announce(const std::shared_ptr<Attachment>& next)
+{
     {
         std::lock_guard lock(mutex_);
         next->identity.generation = ++generation_;
@@ -115,10 +132,6 @@ AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identit
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
     startFetching(*next);
-    if (next->writable && vc::objects::hubStatus(next->store))
-        next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
-            [this, owner = next.get()] { hubChanged(owner); });
-    return next->identity;
 }
 
 void ObjectStoreSession::retire(const std::shared_ptr<Attachment>& attachment)
@@ -789,12 +802,13 @@ LeaseHold ObjectStoreSession::holdForEditing(const PinnedObject& pin)
     return lease;
 }
 
-LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, const std::vector<std::string>& objects)
+LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, const std::vector<std::string>& objects,
+                                         bool createdHere)
 {
     auto attachment = acquire(identity, true);
     LeaseHold hold;
     try {
-        if (attachment->hub) hold = attachment->hub->hold(objects);
+        if (attachment->hub) hold = attachment->hub->hold(objects, createdHere);
     } catch (...) { release(*attachment, true); throw; }
     release(*attachment, true);
     return hold;

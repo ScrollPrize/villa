@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "PublicationMetrics.hpp"
 #include "VolumeComboTooltip.hpp"
 
 #include <QDateTime>
@@ -3363,7 +3364,11 @@ void CWindow::CreateWidgets(void)
         };
 
         connect(collection, &FiberCollectionController::catalogChanged, this,
-                [this, withFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                [this, withFiberWidget, catalogEntry, collection](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                    vc3d::metrics::Span span("consumer.catalog", [&] {
+                        return "cause=" + std::to_string(collection->catalogCause()) + " request=" +
+                               std::to_string(collection->catalogRequest()) + " rows=" + std::to_string(rows.size());
+                    });
                     std::vector<CFiberWidget::FiberEntry> entries;
                     entries.reserve(rows.size());
                     for (const auto& row : rows) {
@@ -3408,6 +3413,7 @@ void CWindow::CreateWidgets(void)
         });
         connect(_lineAnnotationController.get(), &LineAnnotationController::fibersChanged, this,
                 [this, withFiberWidget]() {
+                    vc3d::metrics::Span span("consumer.window_fibers");
                     const auto tags = _lineAnnotationController->knownFiberTags();
                     withFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
                     updateLineAnnotationLengthLabel();

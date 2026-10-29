@@ -1,4 +1,11 @@
 #include "hub/HubRules.hpp"
+#include <fcntl.h>
+#include <stdexcept>
+#include <utility>
+#ifndef _WIN32
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 namespace vc::objects::detail {
 namespace {
@@ -152,5 +159,63 @@ void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
     }
     Statement pending(db, "INSERT INTO hub_pending VALUES(?,1,?) ON CONFLICT(record_uuid) DO UPDATE SET counter=counter+1");
     for (const auto& id : changed) pending.run(id, pool.startGeometry);
+}
+}
+
+namespace vc::objects::detail {
+std::set<std::string> uuidColumn(sqlite3* db, const char* sql)
+{
+    std::set<std::string> ids;
+    Statement rows(db, sql);
+    while (rows.row()) ids.insert(rows.text(0));
+    return ids;
+}
+
+namespace {
+// Keyed by the replica's filesystem identity, so an alias (a symlink to the
+// same database) shares the lock.
+std::filesystem::path workerLockPath(const std::filesystem::path& replica)
+{
+    std::error_code error;
+    auto resolved = std::filesystem::weakly_canonical(replica, error);
+    if (error) resolved = std::filesystem::absolute(replica);
+    return resolved.string() + ".worker-lock";
+}
+thread_local int t_insideWorker = 0;
+}
+
+ReplicaWorkerLock::ReplicaWorkerLock(const std::filesystem::path& replica)
+{
+#ifndef _WIN32
+    fd_ = ::open(workerLockPath(replica).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd_ < 0) throw std::runtime_error("hub: cannot create the worker lock beside " + replica.string());
+    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+        ::close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("hub: the leases of " + replica.string() +
+                                 " are managed by another session or lease call; use that session instead");
+    }
+#else
+    (void)replica;
+#endif
+}
+
+ReplicaWorkerLock::~ReplicaWorkerLock()
+{
+#ifndef _WIN32
+    if (fd_ >= 0) ::close(fd_);  // releases the flock
+#endif
+}
+
+InsideWorkerScope::InsideWorkerScope() { ++t_insideWorker; }
+InsideWorkerScope::~InsideWorkerScope() { --t_insideWorker; }
+OutsideWorkerScope::OutsideWorkerScope() : saved_(std::exchange(t_insideWorker, 0)) {}
+OutsideWorkerScope::~OutsideWorkerScope() { t_insideWorker = saved_; }
+bool insideWorker() { return t_insideWorker > 0; }
+
+std::optional<ReplicaWorkerLock> requireLeaseOwnership(const std::filesystem::path& replica)
+{
+    if (insideWorker()) return std::nullopt;
+    return ReplicaWorkerLock(replica);
 }
 }

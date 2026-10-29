@@ -8,6 +8,13 @@
 #include <qapplication.h>
 #include <QAbstractSpinBox>
 #include <QCommandLineParser>
+#include <QSocketNotifier>
+#include <cerrno>
+#include <csignal>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <QComboBox>
 #include <QEvent>
 #include <QImageReader>
@@ -15,6 +22,7 @@
 #include "CWindow.hpp"
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "PublicationMetrics.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
@@ -396,6 +404,13 @@ auto main(int argc, char* argv[]) -> int
         "Enable VC3D render profiling logs.");
     parser.addOption(profileOption);
 
+    QCommandLineOption publicationMetricsOption(
+        "publication-metrics",
+        "Write line-annotation publication spans and a GUI heartbeat to this file "
+        "(read with scripts/publication_metrics.py).",
+        "file");
+    parser.addOption(publicationMetricsOption);
+
     QCommandLineOption debugDownloadQueueOption(
         "debug-download-queue",
         "Overlay currently downloading remote chunks in every slice view.");
@@ -426,6 +441,76 @@ auto main(int argc, char* argv[]) -> int
         SetProfileLoggingEnabled(true);
         Logger()->info("[vc3d-profile] enabled");
     }
+    if (parser.isSet(publicationMetricsOption)) try {
+        const auto path = parser.value(publicationMetricsOption).trimmed().toStdString();
+        vc3d::metrics::enable(path);
+        if (vc3d::metrics::enabled()) {
+            vc3d::metrics::startHeartbeat(&app);
+            try {
+                vc3d::metrics::header("pid=" + std::to_string(QCoreApplication::applicationPid()) +
+                                      " args=" + vc3d::metrics::word(QCoreApplication::arguments().join(',').toStdString()));
+            } catch (...) { vc3d::metrics::recordFailure(); }
+            Logger()->info("[publication-metrics] writing {}", path);
+        } else {
+            Logger()->error("[publication-metrics] cannot open {}", path);
+        }
+    } catch (...) {
+        // Measurement setup is optional: a failure is counted, never fatal.
+        vc3d::metrics::recordFailure();
+    }
+#ifndef _WIN32
+    // Measurement runs only: SIGTERM/SIGINT end the event loop instead of
+    // killing the process, so shutdown work runs (the publication-metrics
+    // log is flushed and closed with its end marker). Installed with the
+    // recorder, before the window loads: a signal that arrives before the
+    // event loop runs is kept in the pipe and quits the loop as it starts. A second signal
+    // falls back to the default action. Ordinary runs keep the default.
+    static int quitPipe[2] = {-1, -1};
+    if (vc3d::metrics::enabled() && ::pipe(quitPipe) != 0) {
+        // Without the bridge a SIGTERM ends the process without the log's
+        // end marker: counted as a recording failure, so the run cannot pass.
+        Logger()->error("[publication-metrics] cannot create the quit pipe; a signal will not end the run cleanly");
+        vc3d::metrics::recordFailure();
+    }
+    if (vc3d::metrics::enabled() && quitPipe[0] >= 0) try {
+        // The handler only writes one byte to a non-blocking pipe (never
+        // blocks, preserves errno); a second signal takes the default
+        // action, so a stuck shutdown can still be killed.
+        bool ready = true;
+        for (const int fd : quitPipe) {
+            const int flags = ::fcntl(fd, F_GETFL);
+            ready = ready && flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+        }
+        auto* notifier = new QSocketNotifier(quitPipe[0], QSocketNotifier::Read, &app);
+        QObject::connect(notifier, &QSocketNotifier::activated, &app, [notifier] {
+            char byte = 0;
+            while (::read(quitPipe[0], &byte, 1) == 1) {}
+            notifier->setEnabled(false);
+            // Marks where the measurement ends: later spans are shutdown work.
+            vc3d::metrics::header("quit=1");
+            QCoreApplication::quit();
+        });
+        struct sigaction action {};
+        action.sa_handler = [](int) {
+            const int saved = errno;
+            const char byte = 1;
+            const ssize_t written = ::write(quitPipe[1], &byte, 1);
+            (void)written;
+            ::signal(SIGTERM, SIG_DFL);
+            ::signal(SIGINT, SIG_DFL);
+            errno = saved;
+        };
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = SA_RESTART;
+        ready = ready && ::sigaction(SIGTERM, &action, nullptr) == 0 && ::sigaction(SIGINT, &action, nullptr) == 0;
+        if (!ready) {
+            Logger()->error("[publication-metrics] graceful SIGTERM/SIGINT handling is not available");
+            vc3d::metrics::recordFailure();
+        }
+    } catch (...) {
+        vc3d::metrics::recordFailure();
+    }
+#endif
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;
@@ -511,6 +596,7 @@ auto main(int argc, char* argv[]) -> int
                 std::cerr << "Error: " << errorMessage.toStdString() << std::endl;
                 std::cout.flush();
                 std::cerr.flush();
+                vc3d::metrics::shutdown();
                 std::_Exit(2);
             }
         }
@@ -539,6 +625,7 @@ auto main(int argc, char* argv[]) -> int
                 // Exit like the std::_Exit path below rather than returning: a plain
                 // return runs DSO finalizers (gnutls/libtasn1 free through mimalloc
                 // post-teardown) and segfaults in _dl_fini. Nothing has loaded yet.
+                vc3d::metrics::shutdown();
                 std::_Exit(2);
             }
             std::cout << "VC3D-AGENT-BRIDGE: listening name="
@@ -552,6 +639,9 @@ auto main(int argc, char* argv[]) -> int
         rc = QApplication::exec();
     }
     saveAdaptiveDownloadState(chunkCacheService->adaptiveDownloadState());
+    // After CWindow's cleanup (close-time saves, store detach): the log's end
+    // marker covers everything the process recorded.
+    vc3d::metrics::shutdown();
     // Skip DSO finalizers: gnutls/libtasn1 destructors free through mimalloc after
     // its own teardown, segfaulting in _dl_fini on every otherwise-clean exit.
     // CWindow (above scope) has already run its real cleanup.

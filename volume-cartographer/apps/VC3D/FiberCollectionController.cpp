@@ -2,6 +2,7 @@
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "CState.hpp"
+#include "PublicationMetrics.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
 #include "LineAnnotationController.hpp"
@@ -355,6 +356,8 @@ void FiberCollectionController::clear()
     }
     catalogPending_ = false;
     pendingIndex_.reset();
+    // Clearing answers no request: its consumer carries no attribution.
+    catalogCause_ = catalogRequest_ = 0;
     emit catalogChanged({}, false);
     emit annotationStatusChanged({});
     publishSelection({});
@@ -363,6 +366,9 @@ void FiberCollectionController::clear()
 }
 void FiberCollectionController::projectChanged(bool preserveSelection)
 {
+    // The scheduling span is the cause of the catalog request this starts
+    // (the request itself begins once the count below has arrived).
+    const uint64_t cause = vc3d::metrics::current();
     if (!preserveSelection) clear();
     else ++revision_;
     const auto connection = state_->objectStoreSession();
@@ -389,11 +395,12 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
             });
             return count;
         },
-        [this, rev, preserveSelection](Outcome<int64_t> result) {
+        [this, rev, preserveSelection, cause](Outcome<int64_t> result) {
             if (rev != revision_) return;
             if (!result.error.isEmpty()) { publishStatus(result.error); return; }
             totalFibers_ = result.value;
             const bool wasEnabled = std::exchange(enabled_, true);
+            catalogCauseNext_ = cause;
             listPage(true);
             if (wasEnabled) publishCount();
             else invalidate();
@@ -457,8 +464,14 @@ void FiberCollectionController::listPage(bool reset)
 {
     if (!enabled_) return;
     if (reset) catalogCursor_.reset();
+    // A deferred request keeps its cause for the listing that serves it.
     if (catalogBusy_) { catalogPending_ = true; catalogPendingReset_ = catalogPendingReset_ || reset; return; }
     const auto rev = revision_;
+    const uint64_t request = ++catalogRequests_;
+    const uint64_t cause = catalogCauseNext_ ? std::exchange(catalogCauseNext_, 0) : vc3d::metrics::current();
+    if (vc3d::metrics::enabled()) try {
+        vc3d::metrics::event("catalog.request", "id=" + std::to_string(request) + " cause=" + std::to_string(cause));
+    } catch (...) { vc3d::metrics::recordFailure(); }
     const auto volume = state_->currentVolume();
     // Longest first in the active volume's voxels, then fibers not bound to it.
     vc::objects::ObjectSelection selection;
@@ -516,7 +529,7 @@ void FiberCollectionController::listPage(bool reset)
             });
             return rows;
         },
-        [this, rev, filters, volume=bool(volume)](Outcome<std::vector<CatalogRow>> result) {
+        [this, rev, filters, volume=bool(volume), request, cause](Outcome<std::vector<CatalogRow>> result) {
             catalogBusy_ = false;
             if (catalogPending_) {
                 catalogPending_ = false;
@@ -534,6 +547,8 @@ void FiberCollectionController::listPage(bool reset)
                 catalogCursor_ = CatalogCursor{last.record.uuid, !volume ? std::optional(stored) : last.record.volumeLength};
             }
             const bool more = rows.size() == size_t(kCatalogPageSize);
+            catalogRequest_ = request;
+            catalogCause_ = cause;
             emit catalogChanged(std::move(rows), more);
         });
 }

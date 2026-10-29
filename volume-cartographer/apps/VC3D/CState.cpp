@@ -1,6 +1,7 @@
 #include "CState.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
+#include "PublicationMetrics.hpp"
 
 #include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
@@ -306,11 +307,54 @@ std::optional<vc::objects::AttachmentIdentity> CState::attachedAt(const std::fil
     }
     return std::nullopt;
 }
+vc::objects::HubSessionOptions CState::storeHubOptions()
+{
+    vc::objects::HubSessionOptions hub;
+    if (!vc3d::metrics::enabled()) return hub;
+    try {
+        // Measurement runs only (scripts/publication_metrics.py): shorter
+        // sync cadences make commit/sync overlaps frequent enough to observe.
+        // Ordinary runs keep the library defaults whatever the environment.
+        const auto override = [](const char* name, std::chrono::milliseconds& value) {
+            const QByteArray text = qgetenv(name);
+            bool ok = false;
+            const int ms = text.toInt(&ok);
+            if (ok && ms >= 10 && ms <= 3600000) value = std::chrono::milliseconds(ms);
+        };
+        override("VC3D_HUB_SYNC_INTERVAL_MS", hub.syncInterval);
+        override("VC3D_HUB_PUSH_DELAY_MS", hub.pushDelay);
+        hub.trace = [](std::string_view name, bool begin) {
+            // Paired by id, per thread: a begin that failed to record (id 0)
+            // ends nothing, so the enclosing span is not closed in its place.
+            thread_local std::vector<uint64_t> open;
+            if (begin) {
+                // The slot is allocated before the span opens: a failed
+                // allocation records nothing and counts as a failure.
+                try { open.push_back(0); } catch (...) { vc3d::metrics::recordFailure(); return; }
+                open.back() = vc3d::metrics::begin(name);
+            } else if (!open.empty()) {
+                const auto id = open.back();
+                open.pop_back();
+                if (id) vc3d::metrics::end(id, {});
+            }
+        };
+    } catch (...) { vc3d::metrics::recordFailure(); }
+    return hub;
+}
+
 vc::objects::AttachmentIdentity CState::prepareStore(const std::filesystem::path& path, const QString& author, bool readOnly)
 {
     if (_objectStoreOwner) return _objectStoreOwner->prepareStore(path, author, readOnly);
     if (const auto existing = attachedAt(path)) return *existing;
-    return _objectStoreSession->attach(path, storeOpenOptions(author, readOnly));
+    const auto hub = storeHubOptions();
+    const auto attachment = _objectStoreSession->attach(path, storeOpenOptions(author, readOnly), hub);
+    if (vc3d::metrics::enabled()) try {
+        vc3d::metrics::header("attach=" + vc3d::metrics::word(path.string()) + " read_only=" + (readOnly ? "1" : "0") +
+                              " hosted=" + (_objectStoreSession->hubStatus(attachment) ? "1" : "0") +
+                              " sync_interval_ms=" + std::to_string(hub.syncInterval.count()) +
+                              " push_delay_ms=" + std::to_string(hub.pushDelay.count()));
+    } catch (...) { vc3d::metrics::recordFailure(); }
+    return attachment;
 }
 void CState::releasePreparedStore(const vc::objects::AttachmentIdentity& attachment)
 {
@@ -468,8 +512,10 @@ void CState::applySurfaceGeometryCacheSettings()
 void CState::pollObjectStoreChanges()
 {
     if(_objectStoreOwner) { _objectStoreOwner->pollObjectStoreChanges(); return; }
+    vc3d::metrics::Span poll("poll");
     try {
         const auto events = _objectStoreSession->takeEvents();
+        poll.attr([&] { return "events=" + std::to_string(events.size()); });
         _objectStoreObservationError.clear();
         for (const auto& event : events) emit objectStoreChanged(event);
     } catch (const std::exception& error) {

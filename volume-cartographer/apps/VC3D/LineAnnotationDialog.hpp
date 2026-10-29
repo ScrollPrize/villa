@@ -186,6 +186,9 @@ public:
                                                    size_t total);
     void setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers = 0);
     void setGeneratedSideStripIntersectionError();
+    // Re-queries the side strip's fiber intersections (other fibers crossing
+    // this one may have changed without this pane's own fiber changing).
+    void requestGeneratedSideStripIntersections();
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     // blockInput=true covers the panes with the input-swallowing overlay
@@ -439,7 +442,6 @@ private:
     // current cut (Ctrl+Shift-scroll) back onto the model line.
     void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
-    void requestGeneratedSideStripIntersections();
     cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
                                            double linePosition) const;
     bool controlPointPlacementAllowedAt(double linePosition) const;
