@@ -236,6 +236,12 @@ def same_commit_replay(repo, channel, expected_sha, rolling_oid):
         emit("BOOTSTRAPPED_UNCHANGED", archive=archive,
              release_id=release["id"], asset_ids=sorted(six), tag_object=rolling_oid)
         return
+    # A completed release can be intact while the alias pre-staged for its
+    # *next* promotion has been deleted. A false no-op would hide this outage.
+    # Unlike the legacy bootstrap, receipt-bearing tags MUST name that alias.
+    if len(re.findall(r"^Staged archive: (\S+)$", body, re.MULTILINE)) != 1:
+        raise ArchiveError("current tag has no unique staged archive receipt")
+    staged_archive(channel, expected_sha, rolling_oid)
     lines = re.findall(rf"^Previous archive: (vc3d-archive-{re.escape(channel)}-([0-9a-f]{{12}})-[1-9][0-9]*)$",
                        annotation, flags=re.MULTILINE)
     release_ids = re.findall(r"^Previous archive release ID: ([1-9][0-9]*)$",

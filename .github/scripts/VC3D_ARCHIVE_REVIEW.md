@@ -52,3 +52,19 @@ For manual recovery, use independently retained pre-interruption evidence (for e
 - PHerc 343 in the issue is another researcher's experiment. A separate CPU renderer reproduced that particular result; we do not claim the render is impossible without old VC3D. We did not run VC3D on scroll CT data.
 
 The upstream [CONTRIBUTING.md](../../CONTRIBUTING.md) asks for firsthand real-scroll use and direct before/after evidence. This proposal does **not** satisfy those requirements today. Feedback on whether a release-infrastructure PR can be reviewed with release-level evidence is requested; the author verification box must remain unchecked until personally verified.
+
+## Current-tag readiness on same-commit replay (P139)
+
+A published rolling release may still have its six assets while a third party
+has deleted the **current** tag's pre-staged archive alias. Previously an
+idempotent same-commit replay returned `ALREADY_PUBLISHED`, even though the next
+promotion would fail because that required alias was gone. A local-Git
+counterexample reproduced this in both channels. The helper now requires a
+unique `Staged archive:` receipt and the matching remote alias whenever the
+rolling tag has our archive receipts. The original legacy tag/bootstrap check
+is unchanged. The new test is local-only, with a fake GitHub release API.
+
+An intact release with a missing alias now fails closed even on a no-op or
+release-only repair; maintainers must investigate and restore the exact-object
+alias before proceeding. This does not fix external races or verify native
+GitHub permissions, and does not prove the byte content of any assets.

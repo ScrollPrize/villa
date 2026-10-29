@@ -236,6 +236,22 @@ class ArchiveLocalGit(unittest.TestCase):
                 self.assertEqual(f.refs(), refs)
                 self.assertEqual(len(f.patch_calls()), writes)
 
+    def test_same_commit_detects_missing_current_prestaged_alias(self):
+        for channel in CHANNELS:
+            with self.subTest(channel=channel):
+                f = self.fixture(channel)
+                f.complete()
+                stage = f"vc3d-archive-{channel}-{f.new[:12]}-1001"
+                f.git("push", "origin", ":refs/tags/" + stage)
+                before = f.load()["releases"]
+                refs, writes = f.refs(), len(f.patch_calls())
+                result = f.helper(f.new, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("staged archive receipt/remote alias mismatch", result.stderr)
+                self.assertEqual(f.refs(), refs)
+                self.assertEqual(f.load()["releases"], before)
+                self.assertEqual(len(f.patch_calls()), writes)
+
     def test_crash_after_tag_push_allows_release_only_repair(self):
         for channel in CHANNELS:
             with self.subTest(channel=channel):
