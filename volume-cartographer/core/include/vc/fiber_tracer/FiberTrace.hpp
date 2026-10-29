@@ -52,6 +52,15 @@ struct FiberTraceProfile {
     std::vector<uint64_t> localityCurrentDepth1Dependencies;
     std::vector<uint64_t> localityPreviousStepDependencies;
     double startSampleSeconds = 0.0;
+    double widthSampleSeconds = 0.0;
+    size_t widthSamplePoints = 0;
+    size_t samplingWindowLoads = 0;
+    size_t samplingWindowFallbacks = 0;
+    size_t samplingWindowPeakBytes = 0;
+    size_t samplingWindowPeakTableBytes = 0;
+    size_t samplingWindowCopiedBytes = 0;
+    double samplingWindowLoadSeconds = 0;
+    double combinedChannelSampleSeconds = 0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
     double readinessPlanSeconds = 0.0;
@@ -96,6 +105,9 @@ struct FiberTraceConfig {
     size_t lookaheadParentCap = 32;
     size_t lookaheadRetryParentCap = 0;
     int parallelThreads = 0;
+    // Opt-in retained decoded-chunk window, side in stored voxels. Zero disables.
+    // Only scalar one-worker compatible fields; all other paths are unchanged.
+    int samplingWindowVoxels = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
@@ -124,6 +136,9 @@ struct FiberTraceConfig {
     // selected option's direction/width-modulated presence, before smoothness.
     double replayPresenceCutoff = 0.0;
     bool replayPresenceModulated = false;
+    // Opt-in direct CPU eligibility, independent of the width-weighted objective.
+    bool replayPresenceIgnoreWidth = false;
+    double widthHardRelativeTolerance = 0.0; // zero disabled; inclusive relative deviation
     // Existing reference-replay consistency controls; zero interval disables them.
     double replayReverseIntervalBase = 0.0;
     double replayReverseNormalRadiusBase = 20.0;
@@ -131,6 +146,11 @@ struct FiberTraceConfig {
     bool replayReverseToStart = false;
     bool replayReverseAllEndpoints = false;
     int replayReverseHistorySteps = 0;
+    int replayReverseDelaySteps = 0; // incoming reverse history from later forward edges
+    double replayReverseConvergenceMinBase = 0; // zero disables early success
+    double replayReverseConvergenceDistanceBase = 4;
+    double replayReverseConvergenceAngleDegrees = 5;
+    int replayReverseConvergenceSteps = 4;
     bool preserveInitialDirection = false; // history prior, not a forced step
     // Stop the entire frontier after any surviving branch exits this box.
     std::optional<std::array<cv::Vec3d, 2>> committedBounds;
@@ -378,6 +398,14 @@ struct FiberPredictionFieldOptions {
 
 class FiberPredictionField final : public FiberPredictionSource {
 public:
+    // Canonical single-option region loader metadata. Await publication once,
+    // then read the returned presence/nx/ny/width bindings into owned tensors.
+    // The field remains alive while bindings are used. Width multiplier converts
+    // stored units into the same working units as sampleWidths().
+    [[nodiscard]] std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
+        chunkRegionChannels(const cv::Vec3d& lo,const cv::Vec3d& hi) const;
+    // Metadata-only capability check. Does not wait for inference or read chunks.
+    [[nodiscard]] bool supportsDenseSampling(const vc::lasagna::LasagnaNormalSampler&) const;
     // Configure before concurrent sampling; empty keeps offline behavior.
     // The gate may be called concurrently and must not sample this field itself.
     void setReadinessGate(FiberPredictionReadinessGate gate);
@@ -426,12 +454,21 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
+    // Batch chunk access without changing the scalar interpolation arithmetic.
+    void sampleBatchScalarEquivalent(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* region = nullptr) const;
     void sampleBatch(
         const std::vector<cv::Vec3f>& volumePoints,
         const std::vector<cv::Vec3f>& referenceDirections,
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
-        FiberTraceProfile* profile) const;
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* region = nullptr) const;
     [[nodiscard]] bool sampleCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,
@@ -456,6 +493,9 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+[[nodiscard]] FiberPredictionSampleOption materializeFiberScalarPrediction(
+    double rawPresence,const cv::Vec3d& direction,const cv::Vec3d& reference);
 
 struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;
@@ -508,6 +548,35 @@ struct FiberTraceOneWayResult {
         std::numeric_limits<double>::infinity();
     double widthMean = 0.0;
     uint64_t widthSamples = 0;
+};
+
+struct FiberTraceCommit {
+    cv::Vec3d point;
+    double loss=0, widthMean=0;
+    int step=0;
+    // Observations from the chosen beam node, not a later re-evaluation.
+    double sampledWidth=0, modulatedPresence=0, stepCost=0;
+    cv::Vec3d normal{};
+    bool normalValid=false;
+};
+
+// Cooperative frontier advancement. Only one worker may advance a cursor at a
+// time, but ownership may move between workers. No thread is retained on yield.
+// Sources must outlive the cursor. Uses the synchronous tracer's same beam loop.
+class FiberTraceCursor {
+public:
+    FiberTraceCursor(const FiberPredictionSource&,const cv::Vec3d& start,
+        const cv::Vec3d& direction,double distance,const FiberTraceConfig&,
+        const vc::lasagna::NormalSampler* = nullptr);
+    ~FiberTraceCursor();
+    FiberTraceCursor(FiberTraceCursor&&) noexcept;
+    FiberTraceCursor& operator=(FiberTraceCursor&&) noexcept;
+    bool advance(); // true when complete; at most one frontier quantum
+    std::vector<FiberTraceCommit> takeCommitted();
+    const FiberTraceOneWayResult& result() const; // only after completion
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 struct FiberTraceSegmentResult {
@@ -680,7 +749,8 @@ struct CandidateScoreDebug {
     // false stops after this point. Only irrevocable points are reported,
     // excluding the seed, before optional final length clipping.
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
-    const std::vector<cv::Vec3d>& initialStepDirections = {});
+    const std::vector<cv::Vec3d>& initialStepDirections = {},
+    double* observedWidthMean = nullptr);
 
 // Evaluation adapter: length-bounded beam tracing towards the reference end,
 // with committed-point observation (no target-plane snapping). widthMean is

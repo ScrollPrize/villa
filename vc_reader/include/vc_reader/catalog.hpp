@@ -319,11 +319,6 @@ struct OpenDataModel {
     nlohmann::json raw = nlohmann::json::object();
 };
 
-// The id of a catalog volume shown at a pyramid level: the volume's own id at
-// level 0, "<id>@L<level>" otherwise. Registration graphs built from the
-// catalog relate every level to its volume (RegistrationGraph::addSample).
-[[nodiscard]] std::string levelVolumeId(std::string_view volumeId, int level);
-
 // What an opened volume shows: a catalog volume of a sample at a pyramid level.
 struct OpenDataVolumeView {
     std::string sampleId;
@@ -333,7 +328,11 @@ struct OpenDataVolumeView {
     // (prediction, normal grids, Lasagna) on its grid.
     bool source = true;
     const OpenDataArtifact* artifact = nullptr;
-    [[nodiscard]] std::string frameId() const { return levelVolumeId(volumeId, level); }
+    // Same catalog volume at the same level: one voxel grid.
+    [[nodiscard]] bool sameGrid(const OpenDataVolumeView& other) const
+    {
+        return sampleId == other.sampleId && volumeId == other.volumeId && level == other.level;
+    }
 };
 
 struct OpenDataManifest {

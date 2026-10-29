@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QObject>
@@ -42,9 +43,9 @@ private:
 
     CState* state_;
     QTimer debounce_;
-    // What the loaded collections belong to.
+    // What the loaded collections belong to, and the voxels they are in.
     std::optional<vc::objects::AttachmentIdentity> attachment_;
-    std::string volume_;
+    vc::objects::VolumeVoxels volume_;
     // Runtime id to UUID of the volume's collections in memory.
     std::map<uint64_t, std::string> uuids_;
     std::set<uint64_t> changed_;

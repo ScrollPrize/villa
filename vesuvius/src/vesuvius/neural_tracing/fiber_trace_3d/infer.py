@@ -138,7 +138,7 @@ def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> d
         "metric_value": scalar(top.get("metric")),
         "architecture": model.get("architecture") if isinstance(model, dict) else None,
         "output_schema": {
-            **({"annotations": config["annotations"], "annotation_products_exported": False}
+            **({"annotations": config["annotations"]}
                if config.get("annotations") else {}),
             **{key: model[key] for key in (
                 "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
@@ -427,7 +427,7 @@ def run_fiber_trace_3d_inference(
     tile_size: int | None = None,
     overlap: int = 16,
     border: int = 16,
-    inference_scaledown_power: int = 2,
+    inference_scaledown_power: int | None = None,
     base_ref: str | None = None,
     base_scale: int | None = None,
     no_download: bool = False,
@@ -496,10 +496,15 @@ def run_fiber_trace_3d_inference(
             "inside an OME-Zarr group with level 0 metadata."
         )
     input_sd = _input_scaledown_from_base(base_shape_zyx, input_shape)
-    power = int(inference_scaledown_power)
+    from .inference_adapter import _model_cfg_from_raw
+    native_stride = int(_model_cfg_from_raw(config).get("output_stride", 1))
+    native_power = _level_from_scaledown(native_stride)
+    power = native_power if inference_scaledown_power is None else int(inference_scaledown_power)
     if power < 0 or power > 30:
         raise ValueError(f"inference_scaledown_power must be in [0, 30], got {power}")
     output_sd_input = 1 << power
+    if output_sd_input < native_stride:
+        raise ValueError("requested output resolution is finer than the model's native output stride")
     effective_output_sd = input_sd * output_sd_input
     output_level = _level_from_scaledown(effective_output_sd)
     n_levels = max(int(levels), output_level + 2)
@@ -541,6 +546,7 @@ def run_fiber_trace_3d_inference(
         )
 
     from .annotations import AnnotationConfig
+    annotation_heads = AnnotationConfig.from_mapping(config).names
     predict_adapter = FiberTrace3DPredictAdapter(
         config,
         checkpoint=checkpoint,
@@ -553,7 +559,8 @@ def run_fiber_trace_3d_inference(
         recurrent_steps=recurrent_steps,
         width_uint8_base=width_uint8_base,
         input_to_base=input_sd,
-        emit_width="width" in AnnotationConfig.from_mapping(config).names,
+        emit_width="width" in annotation_heads,
+        emit_normals="normal" in annotation_heads,
     )
     if output_format == "compact":
         products = predict_adapter.output_products
@@ -642,6 +649,8 @@ def run_fiber_trace_3d_inference(
             "code_commit": code_commit(Path(__file__)),
             "scaledown_power": power,
             "scaledown_factor_from_input": output_sd_input,
+            "native_output_stride": native_stride,
+            "additional_downsample_factor": output_sd_input // native_stride,
             "effective_base_factor": effective_output_sd,
             "produced_levels": list(range(output_level, n_levels)),
             "crop_xyzwhd_base": list(crop_xyzwhd) if crop_xyzwhd is not None else None,
@@ -814,8 +823,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
     parser.add_argument(
-        "--inference-scaledown-power", type=int, default=2,
-        help="Power-of-two output reduction relative to input (2 means factor 4).",
+        "--inference-scaledown-power", type=int, default=None,
+        help="Total power-of-two output reduction relative to input, including model stride. "
+             "Default: native model output, without additional downsampling.",
     )
     parser.add_argument(
         "--crop",
@@ -976,7 +986,7 @@ def main(argv: list[str] | None = None) -> int:
         tile_size=args.tile_size,
         overlap=int(args.overlap),
         border=int(args.border),
-        inference_scaledown_power=int(args.inference_scaledown_power),
+        inference_scaledown_power=args.inference_scaledown_power,
         base_ref=args.base_ref,
         base_scale=args.base_scale,
         no_download=bool(args.no_download),

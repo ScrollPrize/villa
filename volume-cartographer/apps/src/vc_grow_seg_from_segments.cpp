@@ -951,7 +951,7 @@ int main(int argc, char *argv[])
     // Store mode: sources and outputs are surface objects.
     std::filesystem::path store_path;
     std::string src_surface, source_tag;
-    std::optional<std::string> volume_uuid;
+    std::optional<vc::objects::VolumeVoxels> volume_voxels;
     std::vector<std::string> output_tags;
 
     bool use_old_args = argc == 6 && argv[1][0] != '-' && argv[2][0] != '-' &&
@@ -1034,7 +1034,7 @@ int main(int argc, char *argv[])
             }
             if (!store_options->surfaces.empty()) src_surface = store_options->surfaces.front();
             if (vm.count("source-tag")) source_tag = vm["source-tag"].as<std::string>();
-            volume_uuid = store_options->volume;
+            volume_voxels = store_options->volume;
             output_tags = store_options->tags;
         } else {
             if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("source-tag")) {
@@ -1162,13 +1162,16 @@ int main(int argc, char *argv[])
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
-            selection.volume = volume_uuid;
+            if (volume_voxels) {
+                selection.volume = volume_voxels->volume;
+                selection.targetScale = volume_voxels->scale;
+            }
             for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);
         // Read in the bound volume's voxels, the units of the selection and the output binding.
-        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid, true, volume_uuid));
+        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid, true, volume_voxels));
     }
     std::vector<QuadSurface*> stored_source_pointers;
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
@@ -1176,7 +1179,7 @@ int main(int argc, char *argv[])
     auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
         const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
                                         source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
-                                        output_tags, volume_uuid);
+                                        output_tags, volume_voxels);
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };

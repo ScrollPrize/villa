@@ -1,6 +1,5 @@
 #include "vc/core/types/VolumePkg.hpp"
 
-#include <vc_reader/registrations.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -158,11 +157,13 @@ std::string validateRemoteVolumeLocation(
     return {};
 }
 
-// Note that this deliberately disagrees with sameAttachmentLocation() for
-// remote locators: two selector-free locators are deduped there when they
-// resolve to the same source URL, and kept distinct here unless the strings
-// match. Pre-existing, and left alone, but it means attach/match and
-// persisted-entry dedupe can reach different answers for the same pair.
+// One entry per volume: a working level (#vc-base-scale) does not make a
+// second one. Note that this deliberately disagrees with
+// sameAttachmentLocation() for remote locators: two selector-free locators
+// are deduped there when they resolve to the same source URL, and kept
+// distinct here unless the strings match. Pre-existing, and left alone, but it
+// means attach/match and persisted-entry dedupe can reach different answers
+// for the same pair.
 bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
@@ -174,8 +175,7 @@ bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
         const auto bSpec = vc::parseRemoteVolumeSpec(b);
         if (!aSpec.hasBaseScaleSelector && !bSpec.hasBaseScaleSelector)
             return false; // Preserve legacy exact-string native deduplication.
-        return aSpec.sourceUrl == bSpec.sourceUrl &&
-               aSpec.baseScaleLevel == bSpec.baseScaleLevel;
+        return aSpec.sourceUrl == bSpec.sourceUrl;
     } catch (...) {
         return false;
     }
@@ -353,9 +353,9 @@ utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog,
     if (!view->source) name = view->artifact->type + " of " + name;
     if (view->level) name += " [L" + std::to_string(view->level) + "]";
     metadata["name"] = name;
-    // The catalog volume's own zarr is that volume (at its level); a derived
-    // dataset is a volume of its own on the same grid.
-    if (view->source) metadata["uuid"] = view->frameId();
+    // The catalog volume's own zarr is that volume at every level; a derived
+    // dataset is a volume of its own on its grid.
+    if (view->source) metadata["uuid"] = view->volumeId;
     return metadata;
 }
 
@@ -608,25 +608,16 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
 {
     if (location.empty()) return false;
     std::string persistedLocation = portableResource(location, directory());
-    std::optional<vc::RemoteVolumeSpec> inputSpec;
     if (vc::project::isLocationRemote(location)) {
-        inputSpec = vc::parseRemoteVolumeSpec(location);
-        if (inputSpec->hasBaseScaleSelector)
-            persistedLocation = inputSpec->portableLocator;
+        const auto spec = vc::parseRemoteVolumeSpec(location);
+        if (spec.hasBaseScaleSelector)
+            persistedLocation = spec.portableLocator;
     }
     for (const auto& e : volumes_) {
-        if (inputSpec && inputSpec->hasBaseScaleSelector &&
-            inputSpec->baseScaleLevel == 0 &&
-            vc::project::isLocationRemote(e.location)) {
-            try {
-                const auto existing = vc::parseRemoteVolumeSpec(e.location);
-                if (existing.baseScaleLevel == 0 &&
-                    existing.sourceUrl == inputSpec->sourceUrl)
-                    return false;
-            } catch (...) {
-            }
-        }
+        // The location as given too: an explicit level 0 is canonicalized
+        // to a selector-free locator, which dedupes only by exact string.
         if (samePersistedVolumeIdentity(e.location, persistedLocation) ||
+            samePersistedVolumeIdentity(e.location, location) ||
             (!vc::project::isLocationRemote(e.location) && !vc::project::isLocationRemote(persistedLocation) &&
              vc::project::resolveLocalPath(e.location, directory()).lexically_normal() == vc::project::resolveLocalPath(persistedLocation, directory()).lexically_normal())) return false;
     }
@@ -920,6 +911,37 @@ bool VolumePkg::removeEntry(const std::string& requestedLocation)
     return true;
 }
 
+bool VolumePkg::setVolumeLevel(const std::string& volumeId, int level)
+{
+    const auto loaded = loadedVolumes_.find(volumeId);
+    if (loaded == loadedVolumes_.end() || !loaded->second->isRemote())
+        throw std::invalid_argument("only a loaded remote volume has a working level");
+    const auto current = loaded->second->remoteLocator();
+    const auto entry = std::find_if(volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+        return entryBacksAttachmentLocation(candidate.location, current, directory());
+    });
+    if (entry == volumes_.end())
+        throw std::invalid_argument("volume " + volumeId + " has no project entry");
+    const auto source = vc::parseRemoteVolumeSpec(current).sourceUrl;
+    auto updated = *entry;
+    updated.location = vc::parseRemoteVolumeSpec(source + "#vc-base-scale=" + std::to_string(level)).portableLocator;
+    if (updated.location == entry->location) return false;
+
+    // Opened before the entry changes: a level that fails to open leaves the
+    // project and the loaded volume as they were.
+    auto reopened = openRemoteVolumeEntry(updated, opts_.catalog.get());
+    if (reopened->id() != volumeId)
+        throw std::runtime_error("volume " + volumeId + " opens as " + reopened->id() + " at level " +
+                                 std::to_string(level));
+    auto data = document_.data();
+    for (auto& e : data["volumes"])
+        if (e.at("location") == entry->location) e["location"] = updated.location;
+    document_.replace(std::move(data));
+    readDocument();
+    loadedVolumes_[volumeId] = std::move(reopened);
+    return true;
+}
+
 std::string VolumePkg::selectedLasagnaDataset() const
 {
     return selectedLasagnaDataset_.value_or(std::string{});
@@ -1063,7 +1085,7 @@ bool VolumePkg::overlayCompatible(const std::string& baseId, const std::string& 
 {
     const auto base = catalogView(baseId);
     const auto overlay = catalogView(overlayId);
-    return !base || !overlay || base->frameId() == overlay->frameId();
+    return !base || !overlay || base->sameGrid(*overlay);
 }
 
 bool VolumePkg::isRemote() const
@@ -1283,10 +1305,9 @@ vc::project::AnnotationVolume vc::project::annotationVolume(const VolumePkg* pkg
     };
     if (const auto view = pkg ? pkg->catalogView(volume.id()) : std::nullopt) {
         const auto* sample = pkg->catalog()->findSample(view->sampleId);
-        vcr::catalog::RegistrationGraph graph;
-        graph.addSample(*sample);
-        return {view->volumeId, graph.resolve(view->frameId(), view->volumeId).resolved().forward,
+        return {{view->volumeId, std::ldexp(1.0, -view->level)},
                 positive(sample->findVolume(view->volumeId)->pixelSizeUm)};
     }
-    return {volume.id(), {}, positive(volume.voxelSize())};
+    const double scale = std::ldexp(1.0, -volume.baseScaleLevel());
+    return {{volume.id(), scale}, positive(volume.voxelSize() * scale)};
 }

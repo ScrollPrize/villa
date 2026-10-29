@@ -92,6 +92,9 @@ public:
     [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
+    // The working level: the source pyramid level this volume opened as its
+    // level 0 (a remote locator's #vc-base-scale=N), so one voxel is 2^N
+    // source voxels. The volume keeps its ID at every working level.
     [[nodiscard]] int baseScaleLevel() const noexcept { return baseScaleLevel_; }
     [[nodiscard]] bool hasExplicitVoxelSizeOverride() const noexcept
     {
@@ -132,6 +135,8 @@ public:
     // Blocking integer reads through the chunked local/remote cache.
     // ZYX order matches zarr storage and numpy-style volume indexing:
     //   offset = [z, y, x], shape = [z, y, x].
+    // A successful read overwrites every output voxel. Reuse an already-sized
+    // output to avoid allocation. On exceptions the partial output is unusable.
     bool readZYX(Array3D<uint8_t>& out,
                  const std::array<int, 3>& offsetZYX,
                  int level = 0,
@@ -143,11 +148,16 @@ public:
     static void readZYX(Array3D<uint8_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
     static void readZYX(Array3D<uint16_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
+    // Float scalar channels, preserving physical values and fill value.
+    static void readZYX(Array3D<float>& out,
+                        const std::array<int, 3>& offsetZYX,
+                        vc::render::IChunkedArray& array,
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
 
     // UI/coordinate-order convenience:
     //   offset = [x, y, z], shape = [x, y, z].

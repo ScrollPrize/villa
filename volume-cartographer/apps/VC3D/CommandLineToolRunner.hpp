@@ -75,8 +75,9 @@ public:
                              const QString& sessionToken,
                              const QString& region);
     // Tools read and write surfaces in this object store (the attached store's
-    // file; a hosted replica's local file, which tools sync themselves).
-    void setStore(const QString& storePath);
+    // file; a hosted replica's local file, which tools sync themselves), in the
+    // voxels of their volume at `voxelScale` of its own (--voxel-scale).
+    void setStore(const QString& storePath, double voxelScale);
     // The stored surface a render or OBJ export reads.
     void setSurface(const QString& uuid);
     void setOutputPattern(const QString& pattern);
@@ -87,7 +88,8 @@ public:
                              const QString& label = QString(),
                              ExecutionOptions options = {},
                              const QString& store = {},
-                             const QString& volume = {});
+                             const QString& volume = {},
+                             double voxelScale = 1);
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
@@ -95,8 +97,9 @@ public:
     // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run (default
     // TifStack; interactive re-asserts TifStack to avoid leaking a prior Zarr choice).
     void setRenderOutputFormat(RenderOutputFormat format);
-    // The volume a render reads the surface in, through the store's view of it.
-    void setRenderVolume(const QString& volumeUuid);
+    // The volume a render reads the surface in, through the store's view of it,
+    // at `voxelScale` of its voxels.
+    void setRenderVolume(const QString& volumeUuid, double voxelScale);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            double rotateDegrees, int flipAxis);
     // vc_grow_seg_from_segments: grow `srcSurface` along the surfaces of `volumeUuid`
@@ -206,6 +209,7 @@ private:
     QString _remoteSessionToken;
     QString _remoteRegion;
     QString _storePath;
+    double _voxelScale = 1;
     QString _surfaceUuid;
     QString _outputPattern;
     QString _sourceTag;
@@ -229,6 +233,7 @@ private:
     int _cropWidth{0};
     int _cropHeight{0};
     QString _renderVolumeUuid;
+    double _renderVoxelScale = 1;
     double _rotateDeg{0.0};
     int _flipAxis{-1};
     bool _includeTifs{false};
@@ -242,6 +247,7 @@ private:
     QStringList _customArgs;
     QString _customStore;
     QString _customVolume;
+    double _customVoxelScale = 1;
     QString _customLabel;
 
     int _nextOmpThreads{-1};

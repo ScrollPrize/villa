@@ -86,12 +86,12 @@ def _d_channel(d: np.ndarray | None, shape: tuple[int, int], *, name: str) -> np
 
 
 def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
-						  volume: str | None = None) -> ApprovalSurface:
+						  volume: str | None = None, target_scale: float = 1.0) -> ApprovalSurface:
 	"""A tifxyz directory with approval.tif (and optionally d.tif), or a stored surface (``vcobj:`` reference
-	into ``store``, in voxels of ``volume``) with ``approval`` (and optionally ``d``) channels."""
+	into ``store``, in voxels of ``volume`` at ``target_scale``) with ``approval`` (and optionally ``d``) channels."""
 	from stored_surfaces import parse_surface_ref, read_surface
 	if parse_surface_ref(path) is not None:
-		stored = read_surface(store, str(path), volume=volume)
+		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
 		approval = stored.channel("approval")
 		if approval is None:
 			raise ValueError(f"stored surface {path} has no approval channel")

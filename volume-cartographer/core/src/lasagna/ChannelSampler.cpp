@@ -329,13 +329,7 @@ bool readSingleChunkCube(const LasagnaChannelBinding& binding,
 
 [[nodiscard]] double interpolateChannelValues(const std::array<double,8>& values,const LasagnaCubeRequest& request)
 {
-    const double c00 = values[0] * (1.0 - request.fx) + values[1] * request.fx;
-    const double c01 = values[2] * (1.0 - request.fx) + values[3] * request.fx;
-    const double c10 = values[4] * (1.0 - request.fx) + values[5] * request.fx;
-    const double c11 = values[6] * (1.0 - request.fx) + values[7] * request.fx;
-    const double c0 = c00 * (1.0 - request.fy) + c01 * request.fy;
-    const double c1 = c10 * (1.0 - request.fy) + c11 * request.fy;
-    return c0 * (1.0 - request.fz) + c1 * request.fz;
+    return interpolateLasagnaScalarCorners(values,{request.fx,request.fy,request.fz});
 }
 
 [[nodiscard]] std::optional<double> sampleLasagnaChannelValues(
@@ -730,7 +724,8 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     LasagnaCornerBatch& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     samples.values.assign(
         samplers.size(),
@@ -759,18 +754,19 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
         volumePoints,
         &context,
         materialize,
-        parallelThreads);
+        parallelThreads, false, pinnedRegion);
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     std::vector<std::vector<LasagnaCornerSample>>& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     LasagnaCornerBatch batch;
     const NormalPrefetchReport report = sampleLasagnaChannelCornerBatch(
-        samplers, volumePoints, batch, parallelThreads);
+        samplers, volumePoints, batch, parallelThreads, pinnedRegion);
     samples.assign(
         samplers.size(),
         std::vector<LasagnaCornerSample>(volumePoints.size()));
@@ -1512,22 +1508,49 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
         return std::nullopt;
     }
 
+    return interpolateLasagnaCompactTensorCorners(nxValues,nyValues,
+        {nxRequest.fx,nxRequest.fy,nxRequest.fz},mask);
+}
+
+double interpolateLasagnaScalarCorners(const std::array<double,8>& values,const cv::Vec3d& f)
+{
+    const double c00 = values[0] * (1.0 - f[0]) + values[1] * f[0];
+    const double c01 = values[2] * (1.0 - f[0]) + values[3] * f[0];
+    const double c10 = values[4] * (1.0 - f[0]) + values[5] * f[0];
+    const double c11 = values[6] * (1.0 - f[0]) + values[7] * f[0];
+    const double c0 = c00 * (1.0 - f[1]) + c01 * f[1];
+    const double c1 = c10 * (1.0 - f[1]) + c11 * f[1];
+    return c0 * (1.0 - f[2]) + c1 * f[2];
+}
+
+std::optional<double> interpolateLasagnaMaskedScalarCorners(const std::array<double,8>& samples,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
+    if(std::all_of(mask.begin(),mask.end(),[](uint8_t v){return v!=0;}))
+        return interpolateLasagnaScalarCorners(samples,f);
+    double sum=0,denom=0;
+    for(size_t k=0;k<8;++k) if(mask[k]) {
+        const double w=((k&1)?f[0]:1-f[0])*((k&2)?f[1]:1-f[1])*((k&4)?f[2]:1-f[2]);
+        if(w>0){sum+=w*samples[k];denom+=w;}
+    }
+    if(denom>0)return sum/denom;
+    return std::nullopt;
+}
+
+LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
     const auto& normalTable = decodedCompactNormalTable();
-    double t00 = 0.0;
-    double t01 = 0.0;
-    double t02 = 0.0;
-    double t11 = 0.0;
-    double t12 = 0.0;
-    double t22 = 0.0;
-    cv::Vec3d hint{0.0, 0.0, 0.0};
-    double totalWeight = 0.0;
+    LasagnaCompactTensor tensor;
+    auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     size_t cubeIndex = 0;
     for (int dz = 0; dz <= 1; ++dz) {
-        const double wz = dz == 0 ? (1.0 - nxRequest.fz) : nxRequest.fz;
+        const double wz = dz == 0 ? (1.0 - f[2]) : f[2];
         for (int dy = 0; dy <= 1; ++dy) {
-            const double wy = dy == 0 ? (1.0 - nxRequest.fy) : nxRequest.fy;
+            const double wy = dy == 0 ? (1.0 - f[1]) : f[1];
             for (int dx = 0; dx <= 1; ++dx) {
-                const double wx = dx == 0 ? (1.0 - nxRequest.fx) : nxRequest.fx;
+                const double wx = dx == 0 ? (1.0 - f[0]) : f[0];
                 const double weight = wx * wy * wz;
                 if (weight <= 0.0 || !mask[cubeIndex]) {
                     ++cubeIndex;
@@ -1556,6 +1579,12 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
             }
         }
     }
+    return tensor;
+}
+
+std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor& tensor)
+{
+    const auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     if (totalWeight <= kEpsilon) {
         return std::nullopt;
     }
@@ -1565,6 +1594,13 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
         return std::nullopt;
     }
     return normal;
+}
+
+std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
+    return finalizeLasagnaCompactTensor(accumulateLasagnaCompactTensorCorners(nxValues,nyValues,f,mask));
 }
 
 std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
@@ -1634,12 +1670,8 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
                 const bool available=pinned?haveSamples:readInterpolationCubeValues(channels[c],request,samples);
                 value=std::nullopt;
                 if (available) {
-                    double sum=0,denom=0;
-                    for (size_t k=0;k<8;++k) if (mask[k]) {
-                        const double w=((k&1)?request.fx:1-request.fx)*((k&2)?request.fy:1-request.fy)*((k&4)?request.fz:1-request.fz);
-                        if (w>0) { sum+=w*samples[k]; denom+=w; }
-                    }
-                    if (denom>0) value=sum/denom;
+                    value=interpolateLasagnaMaskedScalarCorners(samples,
+                        {request.fx,request.fy,request.fz},mask);
                 }
             }
             if (!value || !std::isfinite(*value)) { vector.clear(); break; }

@@ -490,7 +490,7 @@ TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations"
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit base zero")
+TEST_CASE("VolumePkg keeps one entry per volume at any working level")
 {
     vc::project::LoadOptions opts;
     opts.deferResolution = true;
@@ -498,14 +498,15 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     REQUIRE(pkg->addVolumeEntry("s3://bucket/source.zarr"));
     CHECK_FALSE(pkg->addVolumeEntry(
         "s3://bucket/source.zarr#vc-base-scale=0"));
-    CHECK(pkg->addVolumeEntry(
+    CHECK_FALSE(pkg->addVolumeEntry(
         "s3://bucket/source.zarr/#vc-base-scale=02"));
     CHECK_FALSE(pkg->addVolumeEntry(
         "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2"));
-    REQUIRE(pkg->volumeEntries().size() == 2);
+    REQUIRE(pkg->volumeEntries().size() == 1);
     CHECK(pkg->volumeEntries()[0].location == "s3://bucket/source.zarr");
-    CHECK(pkg->volumeEntries()[1].location ==
-          "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
+    CHECK(pkg->addVolumeEntry("s3://bucket/other.zarr#vc-base-scale=1"));
+    CHECK(pkg->volumeEntries().back().location ==
+          "https://bucket.s3.us-east-1.amazonaws.com/other.zarr#vc-base-scale=1");
 }
 
 

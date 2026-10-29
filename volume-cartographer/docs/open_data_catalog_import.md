@@ -23,15 +23,18 @@ catalog surfaces. Set the project name and a new `.vcobj` file, then choose
 A remote volume the catalog publishes is named by the catalog when opened,
 including from existing saved projects (`vcr::catalog::OpenDataManifest::volumeAt`).
 A source scan uses the catalog volume ID (for example, `20260102150214`), so
-object-store surfaces and fibers bound to it match the streamed scan. A source
-opened at pyramid level n is the volume `<id>@Ln` (`levelVolumeId`), related to
-the scan by the catalog's level registration (scale 2^-n), so objects bound at
-any level are seen at every other. Predictions keep IDs of their own.
+object-store surfaces and fibers bound to it match the streamed scan. A scan
+has one project entry; its working level (VC3D's L spinbox beside the volume
+selector, stored as the entry's `#vc-base-scale=n`) reopens the same volume,
+with the same ID, in level n's voxels. Objects made at a level are stored in
+the scan's own voxels at scale 2^-n, so they are seen at every level.
+Predictions keep IDs of their own; their objects are kept in their scan's
+voxels at the prediction's level.
 
 The annotation ID is separate from the remote chunk-cache identity. Catalog
 scans reuse the original source cache directory (the URL-derived ID, or the
-upstream metadata UUID when present), with separate directories for rebased
-views. Existing directories are neither renamed nor merged. Any cache created
+upstream metadata UUID when present), with separate directories for working
+levels. Existing directories are neither renamed nor merged. Any cache created
 under the plain catalog ID by the earlier implementation is left untouched.
 
 The initial JSON destination uses the same directory as File -> New Project
@@ -42,9 +45,9 @@ type, model, level, coordinates, parameters and URL where applicable. Long value
 have full-text tooltips. Select all/none operates across both tabs.
 
 Selecting a derived resource includes its channel volumes, using existing
-attachment/coordinate validation. It does not add raw scans, rebased scan views,
-or unrelated representations. Lasagna can resolve directly against a selected
-L0 scan without a rebased view.
+attachment/coordinate validation. It does not add raw scans or unrelated
+representations. To overlay a prediction published at level n, set the scan's
+working level to n. Lasagna resolves directly against its scan at any level.
 
 Preparation runs on the existing asynchronous open worker. A detached package
 prevents preparation from replacing the active project's autosave. After successful

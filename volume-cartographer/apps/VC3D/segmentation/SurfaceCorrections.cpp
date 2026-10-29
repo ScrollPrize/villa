@@ -3,7 +3,6 @@
 #include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
-#include "vc/core/types/Volume.hpp"
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -38,17 +37,17 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
 }
 
 void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
-                              const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
+                              const std::map<uint64_t, utils::Json>& collections, const vc::objects::VolumeVoxels& volume,
                               const std::optional<vc::objects::ViewFrame>& view)
 {
     std::vector<AttachedCollection> stored;
     for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
     replaceAttachedCollections(session, attachment, surfaceUuid, kRole, stored,
-                               vc::objects::volumeCoordinates(volume.id(), 1), view);
+                               vc::objects::volumeCoordinates(volume), view);
 }
 
 std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                     const GrowthAnnotation& annotation, const Volume& volume)
+                                                     const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume)
 {
     auto points = annotation.points;
     std::stable_sort(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.creationTime < b.creationTime; });
@@ -60,7 +59,7 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
         pointAttributes.push_back({{"collection_id", point.collectionId}, {"collection_name", point.collectionName},
                                    {"creation_time", point.creationTime}});
     }
-    Json meta{{"coordinates", vc::objects::volumeCoordinates(volume.id(), 1)}};
+    Json meta{{"coordinates", vc::objects::volumeCoordinates(volume)}};
     meta["role"] = "growth_annotation";
     meta["source"] = {{"growth_annotation", {{"surface", annotation.surfaceUuid},
                                              {"before_geometry", annotation.beforeGeometry},

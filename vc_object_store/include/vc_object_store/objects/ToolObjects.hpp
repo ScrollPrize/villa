@@ -26,15 +26,15 @@ public:
     const AttachmentIdentity& attachment() const { return attachment_; }
 
     // The tool read `uuid` at these revisions: in stored coordinates
-    // (`volume` unset), or through `volume`'s view of it, where `identity`
+    // (`volume` unset), or through the view of it in `volume`, where `identity`
     // says whether that view maps stored coordinates unchanged.
     void noteRead(const std::string& uuid, const std::string& objectRevision, const std::string& geometryRevision,
-                  const std::optional<std::string>& volume, bool identity);
-    // The coordinates of a new object made from `sources`: bound to `volume`'s
-    // voxels when given, else to the frame the sources were read in (the
-    // volume they were read through, else the first source's binding).
-    // Sources read in different frames throw.
-    CoordinateJson coordinatesFor(const std::vector<std::string>& sources, const std::optional<std::string>& volume);
+                  const std::optional<VolumeVoxels>& volume, bool identity);
+    // The coordinates of a new object made from `sources`: bound to `volume`
+    // when given, else to the frame the sources were read in (the voxels they
+    // were read through, else the first source's binding). Sources read in
+    // different frames throw.
+    CoordinateJson coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume);
     // The pins (object and geometry revision) of writing back `uuid`: one this
     // tool read in stored units (writing a mapped grid back would rewrite every
     // stored coordinate). Throws otherwise.
@@ -51,7 +51,7 @@ public:
 private:
     struct Read {
         std::string objectRevision, geometryRevision;
-        std::optional<std::string> volume;
+        std::optional<VolumeVoxels> volume;
         bool identity = true;
     };
     std::string tool_;

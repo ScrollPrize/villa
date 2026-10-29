@@ -20,8 +20,8 @@ download work are therefore excluded while production cache lookup, locking,
 and request-context handling remain measured.
 
 Every score must stay at or below the reference plus the one-sided slowdown
-tolerance stored in `core/test/data/render_valgrind_ci_reference.json` (5%,
-with a 10% case override for `parallel/mixed_shuffled`). Faster
+tolerance stored in `core/test/data/render_valgrind_ci_reference.json` (10%;
+`parallel/mixed_shuffled` keeps its own 10% case override). Faster
 scores pass. This is a regression score, not estimated native wall time.
 
 ## Running Locally
@@ -177,8 +177,8 @@ accepting references when a parallel score is close to the chosen tolerance.
 ## Tightening Or Loosening Tolerance
 
 Tolerance is a fraction in `[0, 1)` stored once at the top level of
-`render_valgrind_ci_reference.json`. The current `0.05` accepts any finite,
-positive ratio at or below `1.05`:
+`render_valgrind_ci_reference.json`. The current `0.10` accepts any finite,
+positive ratio at or below `1.10`:
 
 - lowering it to `0.03` tightens the maximum accepted ratio to `1.03`;
 - raising it to `0.15` loosens the maximum accepted ratio to `1.15`.

@@ -284,12 +284,13 @@ class _MmapBandDescriptor:
 	paths: tuple[str, ...]
 	shape_zyx: tuple[int, int, int]
 	dtype: str = "float32"
-	chunk_side: int = 0  # zero: existing circular-Z layout; positive: full-volume bricks
+	chunk_side: int = 0  # zero: flat circular-Z layout; positive: chunk-major bricks
 	prefault: bool = False
 	# Storage-axis-0 sizes for each sparse file shard. Paths are channel-major:
 	# all shards for channel zero, then all shards for channel one, and so on.
 	# Empty retains the historical one-file-per-channel representation.
 	shard_axis0_sizes: tuple[int, ...] = ()
+	circular: bool = False  # Wrap logical Z for chunk-major circular bands too.
 
 	def __post_init__(self):
 		if self.chunk_side < 0:
@@ -1987,7 +1988,12 @@ def _plan_circular_z_depth(
 
 
 class _CircularZBand:
-	"""Fixed-depth mmap ring addressed by monotonically increasing logical Z."""
+	"""Fixed-depth mmap ring; optional bricks keep spatial chunks page-local.
+
+	Storage layout changes neither logical ownership nor the per-voxel add order.
+	The flat default is retained for direct callers; full-volume inference uses
+	output-sized bricks through the same helpers as on-demand accumulation.
+	"""
 
 	def __init__(
 		self,
@@ -2001,12 +2007,16 @@ class _CircularZBand:
 		prefix: str,
 		ring_depth: int | None = None,
 		dtype: str | np.dtype = np.float32,
+		chunk_side: int = 0,
 	) -> None:
 		self.name = str(name)
 		self.channel_count = int(channel_count)
 		self.z_size = int(z_size)
 		self.y_size = int(y_size)
 		self.x_size = int(x_size)
+		self.chunk_side = int(chunk_side)
+		if self.chunk_side < 0:
+			raise ValueError("negative circular band chunk size")
 		self.ring_depth = min(
 			self.z_size,
 			max(1, int(self.z_size if ring_depth is None else ring_depth)),
@@ -2020,6 +2030,14 @@ class _CircularZBand:
 		self.origin_z = 0
 		self._generation = np.full(self.ring_depth, -1, dtype=np.int64)
 		self._arrays = [self._new_array(ch) for ch in range(self.channel_count)]
+		self._descriptor = self.mmap_descriptor()
+		self._cache = dict(zip(self._descriptor.paths, self._arrays))
+
+	@property
+	def storage_shape(self):
+		shape = (self.ring_depth, self.y_size, self.x_size)
+		b = self.chunk_side
+		return tuple((n + b - 1) // b for n in shape) + (b, b, b) if b else shape
 
 	def _new_array(self, ch: int) -> np.memmap:
 		fd, path = tempfile.mkstemp(
@@ -2028,12 +2046,7 @@ class _CircularZBand:
 			dir=self.tmp_dir if self.tmp_dir else None,
 		)
 		try:
-			logical_bytes = (
-				max(0, self.ring_depth)
-				* max(0, self.y_size)
-				* max(0, self.x_size)
-				* self.dtype.itemsize
-			)
+			logical_bytes = int(np.prod(self.storage_shape)) * self.dtype.itemsize
 			os.ftruncate(fd, logical_bytes)
 		except Exception:
 			os.close(fd)
@@ -2044,7 +2057,7 @@ class _CircularZBand:
 			path,
 			dtype=self.dtype,
 			mode="r+",
-			shape=(self.ring_depth, self.y_size, self.x_size),
+			shape=self.storage_shape,
 		)
 		mm._lasagna_tmp_path = path
 		atexit.register(lambda p=path: os.path.exists(p) and os.unlink(p))
@@ -2063,6 +2076,7 @@ class _CircularZBand:
 			paths=paths,
 			shape_zyx=(self.ring_depth, self.y_size, self.x_size),
 			dtype=self.dtype.name,
+			chunk_side=self.chunk_side, circular=bool(self.chunk_side),
 		)
 
 	def validate_frozen(self, z0: int, z1: int) -> None:
@@ -2116,6 +2130,9 @@ class _CircularZBand:
 		if z1 <= z0 or y1 <= y0 or x1 <= x0:
 			return
 		self.ensure(z0, z1)
+		if self.chunk_side:
+			_add_mmap_band_chunk(self._descriptor, ch, z0, z1, y0, y1, x0, x1, data, self._cache)
+			return
 		data_offset = 0
 		for physical_z, _logical_z, length in self.layout.split(z0, z1):
 			_add_accumulator_view(
@@ -2139,7 +2156,11 @@ class _CircularZBand:
 			physical_z = logical_z % self.ring_depth
 			generation = int(self._generation[physical_z])
 			if generation == logical_z:
-				out[offset] = self._arrays[int(ch)][physical_z, y0:y1, x0:x1]
+				if self.chunk_side:
+					out[offset] = _read_mmap_band_chunk(self._descriptor, ch,
+						logical_z, logical_z + 1, y0, y1, x0, x1, self._cache)[0]
+				else:
+					out[offset] = self._arrays[int(ch)][physical_z, y0:y1, x0:x1]
 			elif generation != -1:
 				raise ValueError(
 					f"{self.name} stale logical z={logical_z}; slot contains z={generation}"
@@ -2153,7 +2174,12 @@ class _CircularZBand:
 	def clear(self, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int) -> None:
 		for physical_z, _logical_z, length in self.layout.split(z0, z1):
 			for arr in self._arrays:
-				arr[physical_z:physical_z + length, y0:y1, x0:x1] = 0.0
+				if self.chunk_side:
+					for view, _ in _chunk_major_views(arr, self._descriptor,
+							(physical_z, physical_z + length, y0, y1, x0, x1)):
+						view[...] = 0
+				else:
+					arr[physical_z:physical_z + length, y0:y1, x0:x1] = 0.0
 
 	def discard_before(self, z_new: int) -> None:
 		z_new = int(z_new)
@@ -2181,6 +2207,7 @@ class _CircularZBand:
 		for arr in self._arrays:
 			self._cleanup_array(arr)
 		self._arrays = []
+		self._cache.clear()
 		self.origin_z = self.z_size
 
 
@@ -2532,7 +2559,7 @@ def _chunk_major_views(array, descriptor, bounds, *, axis0_index_offset=0, relat
 def _mmap_shard(descriptor, channel, shard, mode, cache):
 	path = descriptor.shard_path(channel, shard)
 	array = cache.get(path)
-	if array is None:
+	if array is None or (mode != "r" and not array.flags.writeable):
 		array = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode=mode,
 			shape=descriptor.shard_storage_shape(shard))
 		cache[path] = array
@@ -2551,9 +2578,19 @@ def _read_mmap_band_chunk(
 	channel: int,
 	z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
 	cache: dict[str, np.memmap],
+	*, clear: bool = False,
 ) -> np.ndarray:
 	if not 0 <= int(channel) < descriptor.channel_count:
 		raise ValueError("invalid mmap channel")
+	if descriptor.chunk_side and descriptor.circular:
+		out = np.empty((z1-z0, y1-y0, x1-x0), dtype=np.float32)
+		physical_descriptor = replace(descriptor, circular=False)
+		layout = _CircularZLayout(*descriptor.shape_zyx)
+		for physical, logical, length in layout.split(z0, z1):
+			out[logical-z0:logical-z0+length] = _read_mmap_band_chunk(
+				physical_descriptor, channel, physical, physical+length,
+				y0, y1, x0, x1, cache, clear=clear)
+		return out
 	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
 	if descriptor.chunk_side:
 		b = descriptor.chunk_side
@@ -2563,11 +2600,13 @@ def _read_mmap_band_chunk(
 			lo, hi = max(int(z0), logical_start), min(int(z1), logical_stop)
 			if lo >= hi:
 				continue
-			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			arr = _mmap_shard(descriptor, channel, shard, "r+" if clear else "r", cache)
 			for view, relative in _chunk_major_views(
 					arr, descriptor, (lo, hi, y0, y1, x0, x1),
 					axis0_index_offset=storage_start, relative_origin=(z0, y0, x0)):
 				out[relative] = view
+				if clear:
+					view[...] = 0
 		return out
 	offset = 0
 	logical = int(z0)
@@ -2582,9 +2621,11 @@ def _read_mmap_band_chunk(
 			else:
 				raise ValueError("physical mmap index outside shards")
 			length = min(remaining, storage_start + storage_size - physical)
-			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			arr = _mmap_shard(descriptor, channel, shard, "r+" if clear else "r", cache)
 			out[offset:offset+length] = arr[
 				physical-storage_start:physical-storage_start+length, y0:y1, x0:x1]
+			if clear:
+				arr[physical-storage_start:physical-storage_start+length, y0:y1, x0:x1] = 0
 			offset += length
 			logical += length
 			physical += length
@@ -2632,6 +2673,15 @@ def _add_mmap_band_chunk(
 ) -> str:
 	if not 0 <= int(channel) < descriptor.channel_count:
 		raise ValueError("invalid mmap channel")
+	if descriptor.chunk_side and descriptor.circular:
+		physical_descriptor = replace(descriptor, circular=False)
+		layout = _CircularZLayout(*descriptor.shape_zyx)
+		backend = "numpy"
+		for physical, logical, length in layout.split(z0, z1):
+			backend = _add_mmap_band_chunk(physical_descriptor, channel,
+				physical, physical+length, y0, y1, x0, x1,
+				source[logical-z0:logical-z0+length], cache)
+		return backend
 	if descriptor.chunk_side:
 		backend = "numpy"
 		b = descriptor.chunk_side
@@ -2680,6 +2730,40 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	z, y, x = (int(value) for value in origin)
 	value = int(sd) * 73856093 + z * 19349663 + y * 83492791 + x * 2654435761
 	return int(value % int(worker_count))
+
+
+class _ReadyChunkQueue:
+	"""Coordinator-owned FIFO per chunk, shared ready queue across all workers.
+
+	Callers enqueue in canonical tile order. A chunk stays locked until its
+	worker acknowledges completion; independent chunks may finish in any order.
+	Memory is bounded by the caller's existing result-slot window.
+	"""
+	def __init__(self):
+		self.pending = {}
+		self.ready = deque()
+		self.active = set()
+
+	def put(self, key, value):
+		if key not in self.pending:
+			self.pending[key] = deque()
+			self.ready.append(key)
+		self.pending[key].append(value)
+
+	def take(self):
+		if not self.ready:
+			return None
+		key = self.ready.popleft()
+		assert key not in self.active
+		self.active.add(key)
+		return key, self.pending[key].popleft()
+
+	def complete(self, key):
+		self.active.remove(key)
+		if self.pending[key]:
+			self.ready.append(key)
+		else:
+			del self.pending[key]
 
 
 def _record_array(record: np.ndarray, layout: _SharedArrayLayout) -> np.ndarray:
@@ -2827,6 +2911,7 @@ def _execute_flush_process_task(
 	model_adapter: Any,
 	output_adapter: Any,
 	cache: dict[str, np.memmap],
+	*, clear: bool = False,
 ) -> tuple[int, int, int, float]:
 	started = time.perf_counter()
 	oz0, oy0, ox0, oz1, oy1, ox1 = task.region
@@ -2837,7 +2922,10 @@ def _execute_flush_process_task(
 	lx1 = min(lx0 + task.oc, task.b + ox1 - ox0)
 	written = 0
 	if task.weight_dirty:
-		denom = _read_mmap_band_chunk(task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, cache)
+		# The coordinator froze this disjoint chunk. Consume and clear it in the
+		# owning flush worker, before acknowledging completion/ring reuse. A worker
+		# failure aborts the run; persisted output remains atomically resumable.
+		denom = _read_mmap_band_chunk(task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, cache, clear=clear)
 		if np.any(denom > 0.0):
 			np.maximum(denom, 1.0e-7, out=denom)
 			products = {product.name: product for product in task.products}
@@ -2848,6 +2936,7 @@ def _execute_flush_process_task(
 				raw = np.stack([
 					_read_mmap_band_chunk(
 						accumulators[name], ch, lz0, lz1, ly0, ly1, lx0, lx1, cache,
+						clear=clear,
 					)
 					for ch in range(product.raw_channel_count)
 				])
@@ -2868,6 +2957,14 @@ def _execute_flush_process_task(
 			else:
 				for product, persisted in finalized:
 					output_adapter.write_product_chunk(product, chunk_origin_zyx=task.origin, data=persisted)
+		elif clear:
+			# Even a zero-weight chunk must release any dirty product storage.
+			accumulators = dict(task.accumulators)
+			for product in task.products:
+				if product.name in task.dirty_products:
+					for ch in range(product.raw_channel_count):
+						_read_mmap_band_chunk(accumulators[product.name], ch,
+							lz0, lz1, ly0, ly1, lx0, lx1, cache, clear=True)
 		del denom
 	return task.batch_id, task.task_id, written, time.perf_counter() - started
 
@@ -2888,7 +2985,7 @@ def _flush_process_main(
 				break
 			try:
 				batch_id, task_id, written, elapsed = _execute_flush_process_task(
-					task, model_adapter, output_adapter, cache,
+					task, model_adapter, output_adapter, cache, clear=True,
 				)
 				result_queue.put(("result", batch_id, task_id, worker_index, written, elapsed))
 			except BaseException as exc:
@@ -3402,15 +3499,17 @@ def run_tiled_inference_3d(
 				name=f"acc_{p.name}", channel_count=p.raw_channel_count,
 				z_size=Zo, y_size=Yo, x_size=Xo, tmp_dir=tmp_dir,
 				prefix=temp_prefix, ring_depth=depth, dtype=product_accumulator_dtype,
+				chunk_side=oc,
 			)
 			for p in group_products
 		}
 		weight = _CircularZBand(
 			name=f"weight_sd{sd}", channel_count=1, z_size=Zo, y_size=Yo, x_size=Xo,
 			tmp_dir=tmp_dir, prefix=temp_prefix, ring_depth=depth, dtype=np.float32,
+			chunk_side=oc,
 		)
-		product_bytes = sum(p.raw_channel_count for p in group_products) * depth * Yo * Xo * product_accumulator_dtype.itemsize
-		weight_bytes = depth * Yo * Xo * np.dtype(np.float32).itemsize
+		product_bytes = sum(a.channel_count * int(np.prod(a.storage_shape)) * a.dtype.itemsize for a in acc.values())
+		weight_bytes = int(np.prod(weight.storage_shape)) * weight.dtype.itemsize
 		bytes_total = product_bytes + weight_bytes
 		print(
 			f"[predict3d] ring sd={sd} zyx=({depth},{Yo},{Xo}) logical_z={Zo} "
@@ -3702,6 +3801,7 @@ def run_tiled_inference_3d(
 	flush_wait_total = 0.0
 	flush_chunks_total = 0
 	flush_started_at: float | None = None
+	flush_last_health_check = 0.0
 
 	def _start_flush_workers() -> None:
 		nonlocal flush_task_queue, flush_result_queue, flush_processes
@@ -3789,10 +3889,17 @@ def run_tiled_inference_3d(
 		pending_flush.work_s += float(message[5])
 
 	def _pump_pending_flush(*, block: bool) -> bool:
+		nonlocal flush_last_health_check
 		if pending_flush is None:
 			return True
 		if int(flush_workers) <= 0:
 			return True
+		now = time.monotonic()
+		if now - flush_last_health_check >= 0.25:
+			# Nonblocking scheduling must also detect workers that die without
+			# sending an error; otherwise backpressure would wait forever.
+			_check_flush_workers()
+			flush_last_health_check = now
 		made_progress = False
 		window = max(1, 2 * int(flush_workers))
 		while pending_flush.tasks and len(pending_flush.inflight) < window:
@@ -3879,10 +3986,8 @@ def run_tiled_inference_3d(
 				lx1 = min(lx0 + oc, b + ox1 - ox0)
 				voxels = (lz1-lz0) * (ly1-ly0) * (lx1-lx0)
 				for name in chunk.dirty_products:
-					g["acc"][name].clear(lz0, lz1, ly0, ly1, lx0, lx1)
 					cleared_bytes += by_name[name].raw_channel_count * voxels * g["acc"][name].dtype.itemsize
 				if chunk.weight_dirty:
-					g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
 					cleared_bytes += voxels * 4
 			g["cleared_bytes"] += cleared_bytes
 			for acc in g["acc"].values():
@@ -3926,7 +4031,7 @@ def run_tiled_inference_3d(
 				while pending_flush.tasks:
 					task = pending_flush.tasks.popleft()
 					_batch, task_id, written, elapsed = _execute_flush_process_task(
-						task, model_adapter, output_adapter, cache,
+						task, model_adapter, output_adapter, cache, clear=True,
 					)
 					pending_flush.completed_ids.add(task_id)
 					pending_flush.written_by_sd[task.sd] += int(written)
@@ -3984,6 +4089,7 @@ def run_tiled_inference_3d(
 			progress["live_cache"] = live_cache.snapshot()
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
 	progress_emitter = _Predict3dProgressEmitter()
+	requested_flush_frontier = None
 	try:
 		def _record_commit(
 			*,
@@ -3995,6 +4101,7 @@ def run_tiled_inference_3d(
 		) -> None:
 			nonlocal done, processed, skipped, skipped_empty, skipped_resume
 			nonlocal tile_time, eta_started_at
+			nonlocal requested_flush_frontier
 			done += 1
 			if was_processed:
 				if skip_reason is not None:
@@ -4030,7 +4137,10 @@ def run_tiled_inference_3d(
 			progress_emitter.emit(status, done=done, total=total)
 			if row_end:
 				progress_emitter.finish_line()
-				_advance_flushes(next_tz)
+				if parallel:
+					requested_flush_frontier = next_tz
+				else:
+					_advance_flushes(next_tz)
 				if live_cache is not None:
 					safe_input_z = min(
 						volume_shape[0], max(0, int(next_tz) + int(z0) - int(pad)),
@@ -4436,7 +4546,10 @@ def run_tiled_inference_3d(
 			commit_time = 0.0
 			accum_task_id = 0
 			accum_pending: dict[int, dict[str, Any]] = {}
+			accum_ready = _ReadyChunkQueue()
+			accum_next_worker = 0
 			accum_work_sum = 0.0
+			accum_counts = [0 for _ in accum_queues]
 			accum_queue_wait = 0.0
 			accum_started_at: float | None = None
 			accum_backends: set[str] = set()
@@ -4592,6 +4705,8 @@ def run_tiled_inference_3d(
 					)
 				if message[0] != "result":
 					raise RuntimeError(f"unknown accumulator worker message: {message}")
+				accum_ready.complete(metadata["queue_key"])
+				accum_counts[source_worker] += 1
 				accum_backends.add(str(message[4]))
 				accum_work_sum += float(message[5])
 				g = metadata["group"]
@@ -4671,30 +4786,37 @@ def run_tiled_inference_3d(
 					accum_started_at = time.perf_counter()
 
 			def _pump_accumulator_submissions(seq: int, event: dict[str, Any]) -> bool:
-				nonlocal accum_task_id, accum_queue_wait
-				pending = event.get("accum_to_submit")
+				nonlocal accum_task_id
+				pending = event.pop("accum_to_submit", None)
 				if not pending:
 					return False
-				progressed = False
-				while pending:
-					task_template, metadata = pending[0]
+				for task_template, metadata in pending:
 					task = replace(task_template, task_id=accum_task_id, event_seq=int(seq))
-					owner = _stable_accumulator_owner(task.sd, task.origin, len(accum_queues))
-					if len(accum_outstanding[owner]) >= 2:
-						break
-					wait_started = time.perf_counter()
-					try:
-						accum_queues[owner].put_nowait(task)
-					except queue.Full:
-						break
-					accum_queue_wait += time.perf_counter() - wait_started
-					pending.popleft()
-					accum_pending[accum_task_id] = metadata
-					accum_outstanding[owner][accum_task_id] = int(seq)
+					key = (task.sd, task.origin)
+					metadata["queue_key"] = key
+					accum_ready.put(key, (task, metadata))
 					accum_task_id += 1
+				return True
+
+			def _dispatch_ready_accumulation() -> bool:
+				nonlocal accum_next_worker, accum_queue_wait
+				progressed = False
+				for offset in range(len(accum_queues)):
+					owner = (accum_next_worker + offset) % len(accum_queues)
+					if accum_outstanding[owner]:
+						continue
+					item = accum_ready.take()
+					if item is None:
+						break
+					_key, (task, metadata) = item
+					wait_started = time.perf_counter()
+					# One outstanding task per worker: its two-slot queue cannot be full.
+					accum_queues[owner].put_nowait(task)
+					accum_queue_wait += time.perf_counter() - wait_started
+					accum_pending[task.task_id] = metadata
+					accum_outstanding[owner][task.task_id] = task.event_seq
 					progressed = True
-				if not pending:
-					event.pop("accum_to_submit", None)
+				accum_next_worker = (accum_next_worker + 1) % max(1, len(accum_queues))
 				return progressed
 
 			def _validate_worker_ownership() -> None:
@@ -4758,6 +4880,14 @@ def run_tiled_inference_3d(
 					active_workers = cooperative.tick(gpu_outstanding) if cooperative else set(range(len(workers)))
 					_pump_pending_flush(block=False)
 					made_progress = _pump_accumulator_results()
+					if requested_flush_frontier is not None:
+						if pending_flush is not None:
+							# Backpressure only the next Z band. Keep polling resource
+							# changes and flush completions rather than blocking here.
+							time.sleep(0.005)
+							continue
+						_advance_flushes(requested_flush_frontier)
+						requested_flush_frontier = None
 					if band_source_done and not events:
 						if active_band is not None:
 							active_band.validate_complete()
@@ -4995,6 +5125,7 @@ def run_tiled_inference_3d(
 							event["status"] = "done_accum"
 						next_accum_dispatch += 1
 						made_progress = True
+					made_progress = _dispatch_ready_accumulation() or made_progress
 					commit_started = time.perf_counter()
 					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_accum"):
 						event = events.pop(next_commit)
@@ -5096,6 +5227,7 @@ def run_tiled_inference_3d(
 					f"[predict3d] accumulator stats workers={len(accum_processes)} tasks={accum_task_id} "
 					f"work_sum={accum_work_sum:.2f}s queue_wait={accum_queue_wait:.2f}s "
 					f"wall={accum_wall:.2f}s rate={accum_rate:.2f}tasks/s "
+					f"worker_tasks={accum_counts} "
 					f"backends={','.join(sorted(accum_backends)) or ('native-sync' if not accum_processes else 'none')}",
 					flush=True,
 				)

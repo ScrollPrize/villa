@@ -238,7 +238,7 @@ static int run_main(int argc, char *argv[])
     // Store mode: surfaces come from and go to an object store instead of tifxyz directories.
     std::filesystem::path store_path;
     std::string surface_uuid;
-    std::optional<std::string> volume_uuid;
+    std::optional<vc::objects::VolumeVoxels> volume_voxels;
     std::vector<std::string> output_tags;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
@@ -297,7 +297,7 @@ static int run_main(int argc, char *argv[])
         }
         if (store_options) {
             store_path = store_options->store;
-            volume_uuid = store_options->volume;
+            volume_voxels = store_options->volume;
             output_tags = store_options->tags;
         }
         if (vm.count("target-dir")) tgt_dir = vm["target-dir"].as<std::string>();
@@ -431,7 +431,7 @@ static int run_main(int argc, char *argv[])
 
     std::optional<StoreSurfaces> store;
     if (!store_path.empty()) store.emplace(store_path, "vc_grow_seg_from_seed");
-    // Stored surfaces are read in volume_uuid's voxels, the units of the
+    // Stored surfaces are read in volume_voxels, the units of the
     // selection, proximity queries and the output binding below.
 
     const bool resuming = !resume_path.empty() || !surface_uuid.empty();
@@ -440,7 +440,10 @@ static int run_main(int argc, char *argv[])
         vc::objects::SurfaceProximityQuery query;
         query.point = {p[0], p[1], p[2]};
         query.tolerance = tolerance;
-        query.volume = volume_uuid;
+        if (volume_voxels) {
+            query.volume = volume_voxels->volume;
+            query.targetScale = volume_voxels->scale;
+        }
         std::vector<vc::objects::SurfaceProximityHit> hits;
         store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
             hits = db.nearestSurfaces(txn, query);
@@ -608,7 +611,10 @@ static int run_main(int argc, char *argv[])
             store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
                 vc::objects::ObjectSelection selection;
                 selection.kind = "surface";
-                selection.volume = volume_uuid;
+                if (volume_voxels) {
+                    selection.volume = volume_voxels->volume;
+                    selection.targetScale = volume_voxels->scale;
+                }
                 for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{}))
                     candidates.push_back(object.uuid);
             });
@@ -619,7 +625,7 @@ static int run_main(int argc, char *argv[])
             std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
             std::shuffle(candidates.begin(), candidates.end(), rng);
             for (const auto& uuid : candidates) {
-                auto candidate = store->load(uuid, true, volume_uuid);
+                auto candidate = store->load(uuid, true, volume_voxels);
                 if (!sample_seed(*candidate))
                     continue;
                 count_overlap = 0;
@@ -739,7 +745,7 @@ static int run_main(int argc, char *argv[])
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
         if (store)
-            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty(), volume_uuid);
+            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty(), volume_voxels);
         else if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
         else
@@ -775,7 +781,7 @@ static int run_main(int argc, char *argv[])
     // Store mode output: a new surface object recording how it was made.
     auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
         const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
-                                        volume_uuid);
+                                        volume_voxels);
         store->objects().finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
@@ -793,7 +799,7 @@ static int run_main(int argc, char *argv[])
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface = store ? store->load(surface_uuid, true, volume_uuid) : load_quad_from_tifxyz(resume_path);
+            src_surface = store ? store->load(surface_uuid, true, volume_voxels) : load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;

@@ -58,10 +58,10 @@ def surface_step_stats(xyz: torch.Tensor, valid: torch.Tensor) -> tuple[float, f
 
 
 def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
-				store: str | Path | None = None, volume: str | None = None,
+				store: str | Path | None = None, volume: str | None = None, target_scale: float = 1.0,
 				) -> tuple[torch.Tensor, torch.Tensor, dict]:
 	"""Load a tifxyz directory, or a stored surface (``vcobj:`` reference into ``store``, in voxels of
-	``volume``), into a mesh tensor.
+	``volume`` at ``target_scale``), into a mesh tensor.
 
 	Returns (xyz, valid, meta) where:
 	  xyz: (H, W, 3) float32 tensor — invalid vertices zeroed out
@@ -73,7 +73,7 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
 	if parse_surface_ref(path) is not None:
 		if store is None:
 			raise ValueError(f"stored surface {path} needs a store")
-		stored = read_surface(store, str(path), volume=volume)
+		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
 		xyz = stored.xyz
 		meta = stored.meta
 		label = stored.meta["name"]

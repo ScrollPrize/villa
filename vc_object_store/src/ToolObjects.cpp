@@ -15,23 +15,23 @@ ToolObjects::ToolObjects(const std::filesystem::path& store, const std::string& 
 }
 
 void ToolObjects::noteRead(const std::string& uuid, const std::string& objectRevision,
-                           const std::string& geometryRevision, const std::optional<std::string>& volume, bool identity)
+                           const std::string& geometryRevision, const std::optional<VolumeVoxels>& volume, bool identity)
 {
     std::lock_guard lock(mutex_);
     read_[uuid] = {objectRevision, geometryRevision, volume, !volume || identity};
 }
 
-CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<std::string>& volume)
+CoordinateJson ToolObjects::coordinatesFor(const std::vector<std::string>& sources, const std::optional<VolumeVoxels>& volume)
 {
-    if (volume) return volumeCoordinates(*volume, 1);
-    std::set<std::optional<std::string>> frames;
+    if (volume) return volumeCoordinates(*volume);
+    std::set<std::optional<VolumeVoxels>> frames;
     {
         std::lock_guard lock(mutex_);
         for (const auto& source : sources)
             if (const auto found = read_.find(source); found != read_.end()) frames.insert(found->second.volume);
     }
     if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
-    if (!frames.empty() && *frames.begin()) return volumeCoordinates(**frames.begin(), 1);
+    if (!frames.empty() && *frames.begin()) return volumeCoordinates(**frames.begin());
     auto coordinates = CoordinateJson::object();
     if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {

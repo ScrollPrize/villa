@@ -978,6 +978,9 @@
         -32007
       ],
       "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
         "tool": "vc3d_lasagna_select_output"
       },
       "params": {

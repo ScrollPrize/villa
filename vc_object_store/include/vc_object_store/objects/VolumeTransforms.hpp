@@ -13,9 +13,12 @@ using VolumeAffine = vcr::catalog::Affine;
 struct VolumeTransforms {
     vcr::catalog::RegistrationGraph graph;
     std::map<std::pair<std::string,std::string>,std::vector<std::string>> choices;
+    // The route choice in force from `source` to `target`: the stored choice
+    // for that pair, else the stored choice for the reverse pair walked
+    // backwards, so one choice settles both directions of a volume pair.
+    std::optional<std::vector<std::string>> chosen(const std::string& source,const std::string& target) const;
     vcr::catalog::TransformResolution resolve(const std::string& source,const std::string& target) const {
-        const auto it=choices.find({source,target});
-        return graph.resolve(source,target,it==choices.end()?std::nullopt:std::optional(it->second));
+        return graph.resolve(source,target,chosen(source,target));
     }
     std::optional<VolumeAffine> toVolume(const nlohmann::json& metadata,const std::string& target,double targetScale=1) const;
     // A volume with a route into a target volume.

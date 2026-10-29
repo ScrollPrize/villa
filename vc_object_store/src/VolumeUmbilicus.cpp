@@ -20,26 +20,26 @@ RevisionSelection volumeUmbilicusRevisions(const ObjectStore& store, const Txn& 
     return store.currentRevisions(txn, umbilici(volume));
 }
 
-std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const Txn& txn, const std::string& volume)
+std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const Txn& txn, const VolumeVoxels& volume)
 {
-    const auto records = store.selectObjects(txn, umbilici(volume));
+    const auto records = store.selectObjects(txn, umbilici(volume.volume));
     if (records.empty()) return std::nullopt;
     if (records.size() > 1) {
         std::string names;
         for (const auto& record : records) names += " " + (record.name.empty() ? record.uuid : record.name);
-        throw std::runtime_error("several umbilici map to volume " + volume + ":" + names);
+        throw std::runtime_error("several umbilici map to volume " + volume.volume + ":" + names);
     }
     const auto& record = records.front();
     if (!store.currentGeometry(txn, record.uuid))
         throw std::runtime_error("umbilicus " + record.name + " has no geometry");
     const auto canonical = GeometrySnapshot(store, txn).umbilicus(record.uuid);
     VolumeUmbilicus result{record.uuid, record.name, store.currentObjectRevision(txn, record.uuid)->uuid,
-                           canonical.viewTransformedAt(volume).points("points", 0, canonical.size())};
+                           canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
     return result;
 }
 
 std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                               const std::string& volume)
+                                               const VolumeVoxels& volume)
 {
     std::optional<VolumeUmbilicus> umbilicus;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {

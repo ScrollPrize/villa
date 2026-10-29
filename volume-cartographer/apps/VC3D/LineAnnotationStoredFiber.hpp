@@ -7,6 +7,7 @@
 // without the controller or Qt Widgets. The controller keeps `using` aliases
 // under its former nested names.
 
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 #include <array>
@@ -67,9 +68,10 @@ struct FiberBranchRef {
 };
 
 // A fiber read in an open volume: positions, vectors and widths are in that
-// volume's voxels, mapped from the stored frame by the store's transform.
+// volume's voxels (`volume`, its store volume at its scale), mapped from the
+// stored frame by the store's transform.
 struct FiberVolumeFrame {
-    std::string volume;
+    vc::objects::VolumeVoxels volume;
     vc::objects::VolumeAffine storedToVolume;
 };
 

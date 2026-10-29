@@ -5,8 +5,8 @@
 #include "OpenDataLasagna.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include <vc_object_store/objects/Project.hpp>
@@ -49,11 +49,15 @@ void preflightPredictionAndSource(const std::string& predictionUrl,
         throw std::runtime_error("prediction /0 coordinate scale must be identity");
 }
 
+// An entry of the same Zarr, at any working level (#vc-base-scale).
 bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
 {
     const auto& entries = pkg.volumeEntries();
+    const auto source = vc::parseRemoteVolumeSpec(location).sourceUrl;
     return std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
-        return entry.location == location;
+        return entry.location == location ||
+               (vc::project::isLocationRemote(entry.location) &&
+                vc::parseRemoteVolumeSpec(entry.location).sourceUrl == source);
     });
 }
 
@@ -229,13 +233,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         int sourceCoordinateLevel = 0;
     };
     std::vector<PredictionCandidate> predictions;
-    struct VirtualSourceCandidate {
-        const vcr::catalog::OpenDataVolume* volume = nullptr;
-        std::string sourceUrl;
-        int sourceCoordinateLevel = 0;
-        std::string representationLabel;
-    };
-    std::vector<VirtualSourceCandidate> virtualSources;
     std::vector<std::string> attachedLocations;
 
     for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
@@ -276,14 +273,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                         "Skipped coordinate view for " +
                         volumeArtifactLabel(volume, artifact) +
                         ": parameters.level is missing or invalid.");
-                    continue;
-                }
-                if (*artifact.sourceCoordinateLevel > 0) {
-                    virtualSources.push_back(VirtualSourceCandidate{
-                        &volume,
-                        preferredSourceUrl,
-                        *artifact.sourceCoordinateLevel,
-                        volumeArtifactLabel(volume, artifact)});
                 }
                 continue;
             }
@@ -385,7 +374,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             (sourceMustBeAttached &&
              std::find(attachedLocations.begin(), attachedLocations.end(), sourceUrl) ==
                  attachedLocations.end())) {
-            return "Skipped virtual source for " + label +
+            return "Skipped coordinate pairing for " + label +
                    ": preferred source Zarr is unavailable or was not attached.";
         }
         if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) || *volume.pixelSizeUm <= 0.0) {
@@ -417,56 +406,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             continue;
         }
 
-        if (level == 0)
-            continue;
-
-        virtualSources.push_back(VirtualSourceCandidate{
-            &volume, candidate.sourceUrl, level, predictionLabel});
-    }
-
-    std::vector<std::string> attachedVirtualLocators;
-    for (const auto& candidate : virtualSources) {
-        // An explicit source selection must not grow additional scan entries.
-        // Prediction coordinate metadata remains available without attaching a
-        // rebased source; native L0 Lasagna resolution is supported directly.
-        if (selection && selection->rawVolumeIds)
-            continue;
-        const int level = candidate.sourceCoordinateLevel;
-        if (const auto problem = pairingProblem(*candidate.volume, candidate.sourceUrl, true,
-                                                candidate.representationLabel)) {
-            ++result.failedVolumes;
-            result.messages.push_back(*problem);
-            continue;
-        }
-
-        const auto virtualLocator = vc::parseRemoteVolumeSpec(
-            candidate.sourceUrl + "#vc-base-scale=" +
-            std::to_string(level)).portableLocator;
-        if (std::find(attachedVirtualLocators.begin(), attachedVirtualLocators.end(),
-                      virtualLocator) != attachedVirtualLocators.end()) {
-            continue;
-        }
-        attachedVirtualLocators.push_back(virtualLocator);
-
-        const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
-        if (hasVolumeEntry(pkg, virtualLocator)) {
-            ++result.skippedVolumes;
-        } else if (pkg.addVolumeEntry(virtualLocator, tags)) {
-            ++result.attachedVolumeEntries;
-            result.messages.push_back(
-                "Attached rebased source view " + virtualLocator + ".");
-            if (!pkg.entryResolutionDeferred() &&
-                !pkg.hasLoadedVolumeEntry(virtualLocator)) {
-                ++result.failedVolumes;
-                result.messages.push_back(
-                    "Persisted rebased source view but remote open/base-level validation failed: " +
-                    virtualLocator + ".");
-            }
-        } else {
-            ++result.failedVolumes;
-            result.messages.push_back(
-                "Failed to persist rebased source view " + virtualLocator + ".");
-        }
     }
 
     if (const auto segmentPreferredId =

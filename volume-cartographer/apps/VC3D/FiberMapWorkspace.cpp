@@ -1691,7 +1691,7 @@ FiberMapWorkspace::currentDependencies() const
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
     if (const auto& annotation = _state->annotationVolume()) {
-        deps.annotationVolume = QString::fromStdString(annotation->id);
+        deps.annotationVolume = QString::fromStdString(annotation->volume);
         deps.voxelSizeUm = annotation->voxelSizeUm;
     }
     deps.catalogOrientation = catalogOrientationKey(_controller->fiberMapCatalogVolume());

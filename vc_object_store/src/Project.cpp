@@ -68,8 +68,8 @@ void copyProject(ObjectStoreSession& session, const AttachmentIdentity& attachme
         sqlite3* from = nullptr;
         sqlite3* to = nullptr;
         const auto close = [&] { sqlite3_close(from); sqlite3_close(to); };
-        if (sqlite3_open_v2(source.c_str(), &from, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
-            sqlite3_open_v2(destination.c_str(), &to, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+        if (sqlite3_open_v2(reinterpret_cast<const char*>(source.u8string().c_str()), &from, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+            sqlite3_open_v2(reinterpret_cast<const char*>(destination.u8string().c_str()), &to, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
             const std::string error = from ? sqlite3_errmsg(to ? to : from) : "out of memory";
             close();
             throw std::runtime_error("object store: cannot copy " + source.string() + ": " + error);

@@ -86,7 +86,7 @@ int main(int argc, char** argv)
             require(done(), message);
         };
         session->takeEvents();
-        catalog.setSource(attachment, volume);
+        catalog.setSource(attachment, volume, {volume->id()});
         pump([&] { return !catalog.loading() && catalog.rows().size() == 4; }, "lists the volume's surfaces and those not bound to it");
         require(catalog.row(native)->mapping == VolumeAffine::identity() && catalog.row(half)->mapping == VolumeAffine::scale(2.0) &&
                 !catalog.row(unbound)->bound() && !catalog.row(other)->bound(),
@@ -159,7 +159,7 @@ int main(int argc, char** argv)
             const auto fix = points.getCollectionId("fix").value();
             points.setCollectionAnchor2d(fix, cv::Vec2f(1.5f, 0.5f));
             const auto saved = points.anchoredCollections();
-            vc3d::corrections::write(*session, attachment, half, saved, *volume);
+            vc3d::corrections::write(*session, attachment, half, saved, {volume->id()});
             auto stored = vc3d::corrections::read(*session, attachment, half);
             require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
             session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -175,14 +175,14 @@ int main(int argc, char** argv)
                     collection.points.size() == 1 && collection.points.begin()->second.p == cv::Vec3f(1, 2, 3),
                     "corrections keep identity, anchor and points");
             points.addPoint("fix", {4, 5, 6});
-            vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), *volume);
+            vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
             require(vc3d::corrections::read(*session, attachment, half).at(fix).at("points").size() == 2, "corrections update in place");
             {
                 const auto firstPoint = points.getAllCollections().at(fix).points.begin()->second;
                 auto movedPoint = firstPoint;
                 movedPoint.p = {7, 8, 9};
                 points.updatePoint(movedPoint);
-                vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), *volume);
+                vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
                 const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix);
                 const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
                 require(moved[0].get_double() == 7 && moved[2].get_double() == 9, "moved correction points keep their id");
@@ -196,12 +196,12 @@ int main(int argc, char** argv)
                 const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);
                 require(shown.at(fix).at("points").at(firstId).at("p")[0].get_double() == 3.5, "corrections read through the view");
                 shown.at(fix)["points"][secondId]["p"] = utils::Json::parse("[1.0, 1.0, 1.0]");
-                vc3d::corrections::write(*session, attachment, half, shown, *volume, coarse);
+                vc3d::corrections::write(*session, attachment, half, shown, {volume->id()}, coarse);
                 const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix).at("points");
                 require(stored.at(firstId).at("p")[0].get_double() == 7 && stored.at(secondId).at("p")[0].get_double() == 2,
                         "corrections save back to their stored frame");
             }
-            vc3d::corrections::write(*session, attachment, half, {}, *volume);
+            vc3d::corrections::write(*session, attachment, half, {}, {volume->id()});
             require(vc3d::corrections::read(*session, attachment, half).empty(), "dropped corrections are retired");
             require(vc3d::corrections::read(*session, attachment, native).empty(), "corrections belong to one surface");
             vc3d::corrections::GrowthAnnotation annotation;
@@ -209,7 +209,7 @@ int main(int argc, char** argv)
             annotation.beforeGeometry = "before";
             annotation.afterGeometry = "after";
             annotation.points = {{fix, 2, "fix", {1, 2, 3}, 20}, {fix, 1, "fix", {4, 5, 6}, 10}};
-            const auto annotationUuid = vc3d::corrections::writeGrowthAnnotation(*session, attachment, annotation, *volume);
+            const auto annotationUuid = vc3d::corrections::writeGrowthAnnotation(*session, attachment, annotation, {volume->id()});
             session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
                 const auto object = db.objectByUuid(txn, annotationUuid);
                 require(object && nlohmann::json::parse(object->meta)["source"]["growth_annotation"]["after_geometry"] == "after",
@@ -313,38 +313,31 @@ int main(int argc, char** argv)
             });
         }
 
-        // An Open Data volume opened at pyramid level 1 is a volume of its own
-        // (vcr::catalog::levelVolumeId), related to the volume it shows by the
-        // catalog's level registrations, which every attachment is given.
-        vcr::catalog::OpenDataSample sample;
-        sample.id = "sample";
-        sample.volumes.push_back({});
-        sample.volumes.back().id = "vol1";
-        auto levels = std::make_shared<vcr::catalog::RegistrationGraph>();
-        levels->addSample(sample);
-        auto withCatalog = options;
-        withCatalog.catalogTransforms = levels;
-        const auto leveled = session->replace(attachment, path, withCatalog);
+        // The volume at working level 1 is the same volume in half its voxels:
+        // surfaces are listed at that scale, and those made there are kept in
+        // the volume's own voxels at it, seen at full scale in the full volume.
         vc::test::ZarrVolumeSpec coarse = create;
-        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = vcr::catalog::levelVolumeId("vol1", 1);
+        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2};
         const auto level = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
+        const VolumeVoxels atHalf{volume->id(), 0.5};
         const auto atLevel = util::newUuid();
-        session->act(leveled, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {
+        session->act(attachment, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {
             ObjectRecord record; record.uuid = atLevel; record.kind = "surface"; record.name = "at-level";
-            record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(level->id(), 1)}}.dump();
+            record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(atHalf)}}.dump();
             db.upsertObject(txn, record);
             db.putGeometry(txn, atLevel, quad_surface_geometry(grid));
         });
-        catalog.setSource(leveled, level);
+        catalog.setSource(attachment, level, atHalf);
         pump([&] { const auto* row = catalog.row(native); return !catalog.loading() && row && row->mapping; },
-             "the level lists the surfaces of the volume it shows");
+             "the level lists the surfaces of its volume");
         require(*catalog.row(native)->mapping == VolumeAffine::scale(0.5), "seen at the level's scale");
-        catalog.setSource(leveled, volume);
+        require(catalog.row(atLevel)->toolInput(), "tools at the level take surfaces made there");
+        catalog.setSource(attachment, volume, {volume->id()});
         pump([&] { const auto* row = catalog.row(atLevel); return !catalog.loading() && row && row->mapping; },
              "the full volume lists surfaces made at the level");
         require(*catalog.row(atLevel)->mapping == VolumeAffine::scale(2), "seen at the full volume's scale");
 
-        catalog.setSource(std::nullopt, volume);
+        catalog.setSource(std::nullopt, volume, {volume->id()});
         require(catalog.rows().empty(), "no attachment lists nothing");
 
         // A cold intersection query waits for every selected placeholder and
@@ -390,34 +383,34 @@ int main(int argc, char** argv)
             slice.localBounds = {-1, -1, -1, 3, 3, 1};
             RegionOptions query;
             query.uuids = std::vector<std::string>{ids[0], ids[1]};
-            const auto cold = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
+            const auto cold = SurfaceCatalog::region(remoteSession, {remote}, {volume->id()}, slice, query);
             std::set<std::string> reached;
             for (const auto& [attachment, uuid] : cold.remote) reached.insert(uuid);
             require(cold.runs.empty() && reached == std::set<std::string>{ids[0], ids[1]},
                     "a cold query lists the selected placeholders it reached");
             for (const auto& [attachment, uuid] : cold.remote) remoteSession.ensureGeometry(attachment, uuid);
-            const auto crossings = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
+            const auto crossings = SurfaceCatalog::region(remoteSession, {remote}, {volume->id()}, slice, query);
             std::set<std::string> crossed;
             for (const auto& run : crossings.runs) crossed.insert(run.objectUuid);
             require(crossings.complete && crossings.remote.empty() && crossed == std::set<std::string>{ids[0], ids[1]} &&
                         fetchCount == 2,
                     "fetched placeholders are read, and only the selected surfaces were fetched");
-            const auto warm = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
+            const auto warm = SurfaceCatalog::region(remoteSession, {remote}, {volume->id()}, slice, query);
             require(warm.complete && warm.runs.size() == crossings.runs.size() && fetchCount == 2,
                     "warm queries reuse fetched geometry");
             query.uuids = std::vector<std::string>{ids[2]};
-            const auto failing = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
+            const auto failing = SurfaceCatalog::region(remoteSession, {remote}, {volume->id()}, slice, query);
             bool failed = false;
             try { for (const auto& [attachment, uuid] : failing.remote) remoteSession.ensureGeometry(attachment, uuid); }
             catch (const GeometryUnavailable&) { failed = true; }
             require(failing.remote.size() == 1 && failed, "fetch errors are reported to the fetcher");
             query.uuids = std::vector<std::string>{ids[3]};
-            const auto cancelled = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query,
+            const auto cancelled = SurfaceCatalog::region(remoteSession, {remote}, {volume->id()}, slice, query,
                                                           [] { return true; });
             require(!cancelled.complete && cancelled.runs.empty() && fetchCount == 2,
                     "cancelled queries neither publish intersections nor fetch more surfaces");
         }
-        session->detach(leveled);
+        session->detach(attachment);
         std::cout << "surface catalog tests passed\n";
         return 0;
     } catch (const std::exception& error) {

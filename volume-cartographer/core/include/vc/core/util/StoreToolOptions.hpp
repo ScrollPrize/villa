@@ -5,6 +5,8 @@
 //                       the store's view of them (their binding or a
 //                       registration), and new surfaces are bound to it; none:
 //                       stored coordinates
+//   --voxel-scale S    with --volume-uuid: those voxels at scale S of the
+//                       volume's own (2^-N at working level N); default 1
 //   --surface UUID      a stored input surface (repeatable, in order)
 //   --name NAME         the name of the surface the tool creates
 //   --tag TAG           a tag for the created surfaces (repeatable)
@@ -22,7 +24,7 @@
 
 struct StoreToolOptions {
     std::filesystem::path store;
-    std::optional<std::string> volume;
+    std::optional<vc::objects::VolumeVoxels> volume;
     std::vector<std::string> surfaces;
     std::optional<std::string> name;
     std::vector<std::string> tags;
@@ -42,7 +44,9 @@ struct StoreToolOptions {
         desc.add_options()("store", po::value<std::string>(), storeHelp.c_str())(
             "volume-uuid", po::value<std::string>(),
             "Volume whose voxels stored surfaces are read in, through the store's view of them, and that new "
-            "surfaces are bound to (store mode)");
+            "surfaces are bound to (store mode)")(
+            "voxel-scale", po::value<std::string>(),
+            "Scale of those voxels to the volume's own, 2^-N at working level N (with --volume-uuid; default 1)");
         if (takes.surfaces)
             desc.add_options()("surface", po::value<std::vector<std::string>>()->composing(),
                                "Stored input surface UUID (store mode, repeatable)");
@@ -59,7 +63,11 @@ struct StoreToolOptions {
     {
         StoreToolOptions options;
         if (vm.count("store")) options.store = vm["store"].as<std::string>();
-        if (vm.count("volume-uuid")) options.volume = vm["volume-uuid"].as<std::string>();
+        if (vm.count("volume-uuid")) options.volume = vc::objects::VolumeVoxels{vm["volume-uuid"].as<std::string>()};
+        if (vm.count("voxel-scale")) {
+            if (!options.volume) throw std::runtime_error("--voxel-scale needs --volume-uuid");
+            options.volume->scale = parseVoxelScale(vm["voxel-scale"].as<std::string>());
+        }
         if (vm.count("surface")) options.surfaces = vm["surface"].as<std::vector<std::string>>();
         if (vm.count("name")) options.name = vm["name"].as<std::string>();
         if (vm.count("tag")) options.tags = vm["tag"].as<std::vector<std::string>>();
@@ -72,13 +80,15 @@ struct StoreToolOptions {
     static std::optional<StoreToolOptions> take(std::vector<std::string>& args, Takes takes)
     {
         StoreToolOptions options;
+        std::optional<std::string> scale;
         std::vector<std::string> rest;
         for (size_t i = 0; i < args.size(); ++i) {
             const auto& arg = args[i];
             const auto eq = arg.find('=');
             const auto key = arg.substr(0, eq);
             std::vector<std::string>* repeated = nullptr;
-            const bool known = key == "--store" || key == "--volume-uuid" || (key == "--surface" && takes.surfaces) ||
+            const bool known = key == "--store" || key == "--volume-uuid" || key == "--voxel-scale" ||
+                               (key == "--surface" && takes.surfaces) ||
                                (key == "--tag" && takes.creates) || (key == "--name" && takes.named);
             if (!known) {
                 rest.push_back(arg);
@@ -93,8 +103,13 @@ struct StoreToolOptions {
             if (value.empty()) throw std::invalid_argument(key + " needs a value");
             if (repeated) repeated->push_back(value);
             else if (key == "--store") options.store = value;
-            else if (key == "--volume-uuid") options.volume = value;
+            else if (key == "--volume-uuid") options.volume = vc::objects::VolumeVoxels{value};
+            else if (key == "--voxel-scale") scale = value;
             else options.name = value;
+        }
+        if (scale) {
+            if (!options.volume) throw std::runtime_error("--voxel-scale needs --volume-uuid");
+            options.volume->scale = parseVoxelScale(*scale);
         }
         args = std::move(rest);
         return checked(std::move(options));

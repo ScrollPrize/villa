@@ -119,6 +119,12 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         const auto b = geometryCoordinates(far.coordinateIdentity.value("coordinates", nlohmann::json::object()));
         // Advisory bindings (volume labels, dimensions) do not define a frame.
         if (a != b) throw std::invalid_argument("different coordinate frames");
+        // Both must be in the same voxels too: the merged fiber's positions are
+        // mapped back to the stored frame through the clicked fiber's frame.
+        const bool sameView = clicked.frame.has_value() == far.frame.has_value() &&
+            (!clicked.frame || (clicked.frame->volume == far.frame->volume &&
+                                clicked.frame->storedToVolume == far.frame->storedToVolume));
+        if (!sameView) throw std::invalid_argument("different coordinate frames");
         (void)mergeGeometryCoordinates(a, b); // Also check exact mixed integer/float scales.
     } catch (const std::exception&) {
         fail(error, "Cannot merge fibers from different coordinate frames");
@@ -190,6 +196,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     merged.hvClassification =
         vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(merged.controlPoints));
     merged.coordinateIdentity = clicked.coordinateIdentity;
+    merged.frame = clicked.frame;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
     // left as stored; the batch canonicalization recomputes them from the
@@ -243,6 +250,7 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
         half.coordinateIdentity = parent.coordinateIdentity;
+        half.frame = parent.frame;
     };
     StoredFiber& prefix = result.prefix;
     StoredFiber& suffix = result.suffix;

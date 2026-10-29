@@ -229,7 +229,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     }
     if (reverseSource_) {
         owned = reverseSource_->chunk(name, index);
-        storedHash = reverseSource_->manifest().at("arrays").at(name).at("chunks").at(index);
+        storedHash = reverseSource_->manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>();
     } else if (storedHash.empty()) {
         const auto& descriptor = manifest_.at("arrays").at(name);
         if (descriptor.contains("source_revision")) {
@@ -246,7 +246,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             auto sourceLayout = original; sourceLayout.erase("chunks"); sourceLayout.erase("source_revision");
             if (layout != sourceLayout) throw std::runtime_error("geometry: array source layout mismatch");
             owned = inherited.chunk(name, index);
-            storedHash = original.at("chunks").at(index);
+            storedHash = original.at("chunks").at(index).get<std::string>();
         } else {
             if (readRequest) {
                 Statement size(db_, "SELECT length(c.data) FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "

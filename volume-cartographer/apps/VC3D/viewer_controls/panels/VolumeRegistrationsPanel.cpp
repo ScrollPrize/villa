@@ -94,12 +94,14 @@ void VolumeRegistrationsPanel::refresh()
         updateButtons();
         return;
     }
-    _heading->setText(tr("Volumes mapped into %1").arg(QString::fromStdString(volume->id())));
+    // Registrations relate store volumes in their own (full-resolution) voxels.
+    const auto target = _state->annotationVolume()->volume;
+    _heading->setText(tr("Volumes mapped into %1").arg(QString::fromStdString(target)));
     try {
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             const auto transforms = db.volumeTransforms(txn);
             _graph = transforms.graph;
-            _related = transforms.related(volume->id());
+            _related = transforms.related(target);
         });
         _status->setText(_related.empty() ? tr("No other volume maps into this one.") : QString());
     } catch (const std::exception& error) {
@@ -135,6 +137,7 @@ void VolumeRegistrationsPanel::registerTransform()
     const auto volume = _state->currentVolume();
     const auto attachment = _state->storeFor("volume_transform");
     if (!volume || !attachment) return;
+    const auto target = _state->annotationVolume()->volume;
 
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Register Transform"));
@@ -148,7 +151,7 @@ void VolumeRegistrationsPanel::registerTransform()
         volumes.insert(registration.source);
         volumes.insert(registration.target);
     }
-    volumes.erase(volume->id());
+    volumes.erase(target);
     for (const auto& id : volumes) source->addItem(QString::fromStdString(id));
     source->setCurrentText({});
     form->addRow(tr("Source volume"), source);
@@ -158,8 +161,9 @@ void VolumeRegistrationsPanel::registerTransform()
     auto* matrix = new QPlainTextEdit(&dialog);
     matrix->setPlaceholderText(QStringLiteral("1 0 0 0\n0 1 0 0\n0 0 1 0"));
     form->addRow(tr("Matrix"), matrix);
-    form->addRow(new QLabel(tr("Three or four rows of four numbers mapping source-volume voxels (x, y, z) to "
-                               "voxels of %1.").arg(QString::fromStdString(volume->id())), &dialog));
+    form->addRow(new QLabel(tr("Three or four rows of four numbers mapping full-resolution source-volume voxels "
+                               "(x, y, z) to full-resolution voxels of %1.").arg(QString::fromStdString(target)),
+                            &dialog));
     auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     form->addRow(box);
     connect(box, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
@@ -169,8 +173,8 @@ void VolumeRegistrationsPanel::registerTransform()
         const auto affine = vc3d::registrations::parseAffine(matrix->toPlainText().toStdString());
         const auto from = source->currentText().trimmed().toStdString();
         const auto label = name->text().trimmed().toStdString();
-        vc::objects::registerVolumeTransform(*_state->objectStoreSession(), *attachment, from, volume->id(), affine,
-                                             label.empty() ? from + " → " + volume->id() : label);
+        vc::objects::registerVolumeTransform(*_state->objectStoreSession(), *attachment, from, target, affine,
+                                             label.empty() ? from + " → " + target : label);
         _state->pollObjectStoreChanges();
     } catch (const std::exception& error) {
         QMessageBox::warning(this, tr("Register Transform"), QString::fromUtf8(error.what()));
@@ -183,6 +187,7 @@ void VolumeRegistrationsPanel::chooseRoute()
     const auto attachment = _state->storeFor("volume_transform");
     const int row = _list->currentIndex().row();
     if (!volume || !attachment || row < 0 || row >= int(_related.size())) return;
+    const auto target = _state->annotationVolume()->volume;
     const auto related = _related[size_t(row)];
     QStringList routes;
     int current = 0;
@@ -193,11 +198,11 @@ void VolumeRegistrationsPanel::chooseRoute()
     }
     bool accepted = false;
     const auto picked = QInputDialog::getItem(this, tr("Choose Route"),
-        tr("Route from %1 to %2:").arg(QString::fromStdString(related.volume), QString::fromStdString(volume->id())),
+        tr("Route from %1 to %2:").arg(QString::fromStdString(related.volume), QString::fromStdString(target)),
         routes, current, false, &accepted);
     if (!accepted) return;
     try {
-        vc::objects::chooseVolumeTransform(*_state->objectStoreSession(), *attachment, related.volume, volume->id(),
+        vc::objects::chooseVolumeTransform(*_state->objectStoreSession(), *attachment, related.volume, target,
                                          related.routes[size_t(routes.indexOf(picked))].path);
         _state->pollObjectStoreChanges();
     } catch (const std::exception& error) {

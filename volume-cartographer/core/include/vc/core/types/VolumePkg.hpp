@@ -1,6 +1,5 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
-#include <vc_reader/affine.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +15,8 @@
 #include "vc/core/util/Rect3D.hpp"
 
 #include "vc/core/types/ProjectDocument.hpp"
+
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 class Volume;
 
@@ -57,18 +58,16 @@ std::string validateSingleVolumeLocation(const std::string& location);
 std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::catalog::OpenDataManifest*,
                                                                   const std::string& location);
 // The volume metadata (uuid, voxelsize, name) a catalog gives a location: the
-// catalog volume's level id and voxel size for its own zarr, the voxel size of
-// its grid for a dataset derived from it. Empty for other locations.
+// catalog volume's ID at every level and the voxel size of the opened grid.
+// Empty for other locations.
 utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest*, const std::string& location);
 
-// The volume annotations on an open volume are kept in: the catalog volume it
-// shows, at level 0, so its pyramid levels and derived datasets share them;
-// else the volume itself. With the map from the open volume's voxels into
-// that volume's (the catalog registration graph's route) and that volume's
-// voxel size.
-struct AnnotationVolume {
-    std::string id;
-    vcr::catalog::Affine fromVolume;
+// The open volume's voxels in the store: those of the volume objects made on it
+// are kept in (the catalog volume it shows, so every working level and derived
+// dataset of it shares them; else the volume itself) at `scale` = 2^-level of
+// its own. What views and queries of the open volume target, and the
+// coordinates of objects made in it. `voxelSizeUm` is a voxel of `volume`.
+struct AnnotationVolume : vc::objects::VolumeVoxels {
     std::optional<double> voxelSizeUm;
 };
 
@@ -140,6 +139,9 @@ public:
         const std::vector<PreparedVolumeAttachment>& preparedVolumes,
         bool updateSelection = true);
     bool removeEntry(const std::string& location);
+    // Reopen a loaded remote volume at working level `level` (its entry's
+    // #vc-base-scale), keeping its ID; false when it is already there.
+    bool setVolumeLevel(const std::string& volumeId, int level);
 
     [[nodiscard]] std::string selectedLasagnaDataset() const;
     void setSelectedLasagnaDataset(std::string location);
@@ -179,7 +181,7 @@ public:
     // What a loaded remote volume shows in that catalog; nullopt for other volumes.
     [[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> catalogView(const std::string& volumeId) const;
     // An overlay samples in the base volume's voxels; refused only when the
-    // catalog places the two in different frames (catalog volume and level).
+    // catalog places the two on different grids (catalog volume and level).
     [[nodiscard]] bool overlayCompatible(const std::string& baseId, const std::string& overlayId) const;
 
     [[nodiscard]] bool isRemote() const;

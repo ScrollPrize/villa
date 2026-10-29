@@ -129,7 +129,7 @@ void PointCollectionSync::unload()
 {
     if (!flush()) return;
     attachment_.reset();
-    volume_.clear();
+    volume_ = {};
     uuids_.clear();
     installing_ = true;
     state_->pointCollection()->replaceUnanchoredCollections({});
@@ -140,17 +140,17 @@ void PointCollectionSync::reload()
 {
     if (!flush()) return;
     const auto attachment = state_->storeFor("point_collection");
-    const auto volume = state_->currentVolume();
+    const auto& volume = state_->annotationVolume();
     std::vector<vc::objects::AttachedCollection> stored;
     if (attachment && volume) {
         try {
-            stored = vc::objects::volumeCollections(*state_->objectStoreSession(), *attachment, volume->id());
+            stored = vc::objects::volumeCollections(*state_->objectStoreSession(), *attachment, *volume);
         } catch (const std::exception& error) {
             Logger()->warn("Point collections: could not read the object store: {}", error.what());
         }
     }
     attachment_ = attachment && volume ? attachment : std::nullopt;
-    volume_ = volume ? volume->id() : std::string{};
+    volume_ = volume.value_or(vc::project::AnnotationVolume{});
     std::vector<utils::Json> collections;
     std::map<std::string, std::vector<std::string>> linked;
     for (auto& collection : stored) {

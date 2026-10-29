@@ -1038,6 +1038,8 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<revision>]) the fit reads")
 	p.add_argument("--volume-uuid", default=None,
 		help="Volume whose voxels stored-surface coordinates are read in")
+	p.add_argument("--voxel-scale", type=float, default=1.0,
+		help="Scale of those voxels to the volume's own, 2^-N at working level N")
 	p.add_argument("--tifxyz-flow-gate-channels", action=argparse.BooleanOptionalAction, default=False,
 		help="Store flow-gate component maps in the final checkpoint for tifxyz export")
 	p.add_argument("--progress", action="store_true", default=False,
@@ -1171,9 +1173,10 @@ def _load_scaled_tifxyz(
 	path_label: str,
 	store: str | None = None,
 	volume: str | None = None,
+	target_scale: float = 1.0,
 ):
 	from tifxyz_io import load_tifxyz
-	xyz, valid, meta = load_tifxyz(path, device=device, store=store, volume=volume)
+	xyz, valid, meta = load_tifxyz(path, device=device, store=store, volume=volume, target_scale=target_scale)
 	scale = _tifxyz_scale_to_base(
 		meta,
 		base_shape_zyx=base_shape_zyx,
@@ -1198,9 +1201,10 @@ def _scaled_approval_surface(
 	request_shape_zyx: tuple[int, int, int] | None,
 	store: str | None,
 	volume: str | None,
+	target_scale: float = 1.0,
 ):
 	from approval_inpaint import load_approval_surface
-	surface = load_approval_surface(path, store=store, volume=volume)
+	surface = load_approval_surface(path, store=store, volume=volume, target_scale=target_scale)
 	scale = _tifxyz_scale_to_base(
 		surface.meta,
 		base_shape_zyx=base_shape_zyx,
@@ -1339,7 +1343,8 @@ def _run_flatten_mode(
 
 	device = torch.device(str(getattr(args, "device", "cuda")))
 	from tifxyz_io import load_tifxyz
-	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device, store=args.store, volume=args.volume_uuid)
+	xyz, valid, meta = load_tifxyz(
+		str(ext0["path"]), device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
 	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
 	scale = _scale_from_tifxyz_meta(meta, source_step)
 
@@ -1668,6 +1673,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			request_shape_zyx=vc3d_volume_shape_zyx,
 			store=args.store,
 			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 
 		result = build_approval_inpaint(
@@ -1876,6 +1882,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			winding_step=model_cfg.winding_step,
 			store=args.store,
 			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 		mdl = atlas_init.model
 		atlas_lines_3d = atlas_init.atlas_lines
@@ -1897,6 +1904,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			path_label="tifxyz-init",
 			store=args.store,
 			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(xyz_init, valid_init)
 		mesh_step_init = model_cfg.mesh_step
@@ -2170,6 +2178,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 				path_label=f"external surface {es_path}",
 				store=args.store,
 				volume=args.volume_uuid,
+				target_scale=args.voxel_scale,
 			)
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
 			meta_ext_base = volume_scale.scale_tifxyz_meta(

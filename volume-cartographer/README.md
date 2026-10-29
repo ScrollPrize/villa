@@ -186,10 +186,14 @@ must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
 translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
-The selector is part of persistent volume identity but is never sent in HTTP
-requests. Tools that support remote volumes receive the complete portable
-locator. Local-only tools reject it instead of silently discarding the
-selector.
+The selector is the volume's working level, not part of its identity: a
+project keeps one entry per volume, VC3D changes the level with the L spinbox
+beside the volume selector, and the volume keeps its ID at every level. It is
+never sent in HTTP requests. Tools that support remote volumes receive the
+complete portable locator, and store-mode tools also receive `--voxel-scale
+2^-N` with `--volume-uuid`, so the surfaces they read and create are in level
+N's voxels of the volume. Local-only tools reject the selector instead of
+silently discarding it.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json

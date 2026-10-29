@@ -1364,7 +1364,7 @@ int main(int argc, char *argv[])
         logPrintf(stderr, "Error: give --segmentation, or --store with one --surface\n");
         return EXIT_FAILURE;
     }
-    const std::optional<std::string> view_volume = store_mode ? store_options->volume : std::nullopt;
+    const std::optional<vc::objects::VolumeVoxels> view_volume = store_mode ? store_options->volume : std::nullopt;
     if (view_volume && (parsed.count("affine") || parsed.count("affine-invert") || !parsed["scale-segmentation"].defaulted())) {
         logPrintf(stderr, "Error: --volume-uuid replaces --affine and --scale-segmentation\n");
         return EXIT_FAILURE;

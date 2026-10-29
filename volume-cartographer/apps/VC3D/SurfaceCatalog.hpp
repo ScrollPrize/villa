@@ -4,9 +4,10 @@
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
 // viewed or edited. Surfaces are identified by their store UUID and read in the
-// open volume's voxels, through the store's registrations (an Open Data level
-// is a registered volume). Open Data catalog surfaces are ordinary surfaces of
-// the store whose geometry is fetched on first use.
+// open volume's voxels (vc::project::AnnotationVolume: a volume of the store at
+// a scale), through the store's bindings and registrations. Open Data catalog
+// surfaces are ordinary surfaces of the store whose geometry is fetched on
+// first use.
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -72,8 +73,10 @@ public:
     explicit SurfaceCatalog(std::shared_ptr<vc::objects::ObjectStoreSession> session, QObject* parent = nullptr);
     ~SurfaceCatalog() override;
 
-    // List the surfaces of `volume` in `attachment` (nothing without both).
-    void setSource(const std::optional<vc::objects::AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume);
+    // List the surfaces of the open `volume`, read in `voxels` (its
+    // vc::project::AnnotationVolume), in `attachment` (nothing without both).
+    void setSource(const std::optional<vc::objects::AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume,
+                   const vc::objects::VolumeVoxels& voxels);
     // The attachment listed, while a volume is open (none or one), for
     // session queries across attachments.
     std::vector<vc::objects::AttachmentIdentity> sources() const;
@@ -83,6 +86,8 @@ public:
     const std::shared_ptr<vc::objects::ObjectStoreSession>& session() const { return session_; }
     const std::optional<vc::objects::AttachmentIdentity>& attachment() const { return attachment_; }
     const std::shared_ptr<Volume>& volume() const { return volume_; }
+    // The open volume's voxels surfaces are read in; meaningful with a volume.
+    const vc::objects::VolumeVoxels& voxels() const { return voxels_; }
     const std::map<std::string, Row>& rows() const { return rows_; }
     const Row* row(const std::string& uuid) const;
     // A full listing is being read; rows() holds the previous one meanwhile.
@@ -95,10 +100,10 @@ public:
     Opened open(const std::string& uuid, const std::optional<std::string>& revision = std::nullopt) const;
     // The same from an explicit source, for worker threads.
     static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
-                       const vc::objects::AttachmentIdentity& attachment, const std::string& volume,
+                       const vc::objects::AttachmentIdentity& attachment, const vc::objects::VolumeVoxels& volume,
                        const std::string& uuid, const std::optional<std::string>& revision = std::nullopt);
 
-    // Where the surfaces of every source cross `slice` (voxels of `volume`),
+    // Where the surfaces of every source cross `slice` (in `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
     // read was. Placeholders reached (geometry not local yet) are listed with
     // their attachment; fetch them (ObjectStoreSession::ensureGeometry) and
@@ -109,25 +114,26 @@ public:
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
-                            const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
-                            const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
+                            const std::vector<vc::objects::AttachmentIdentity>& sources,
+                            const vc::objects::VolumeVoxels& volume, const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
 
     // The nearest point of each of `uuids` (drafts or objects of the sources)
-    // within `tolerance` of each of `points` (voxels of `volume`): the hits per
+    // within `tolerance` of each of `points` (in `volume`): the hits per
     // point, nearest first, each with its fractional grid position. Placeholders
     // reached are queued for fetching, not waited for.
     static std::vector<std::vector<vc::objects::SurfaceProximityHit>> nearest(
         vc::objects::ObjectStoreSession& session, const std::vector<vc::objects::AttachmentIdentity>& sources,
-        const std::string& volume, const std::vector<std::string>& uuids,
+        const vc::objects::VolumeVoxels& volume, const std::vector<std::string>& uuids,
         const std::vector<std::array<double, 3>>& points, double tolerance);
 
     // Where tools launched for the open volume read and write: the user's store
-    // file (a hosted replica's local file) and the volume's id. Throws without a
-    // writable attachment and an open volume.
+    // file (a hosted replica's local file) and the open volume's voxels
+    // (--volume-uuid, --voxel-scale). Throws without a writable attachment and
+    // an open volume.
     struct ToolStore {
         std::filesystem::path store;
-        std::string volume;
+        vc::objects::VolumeVoxels volume;
     };
     ToolStore toolStore() const;
 
@@ -157,6 +163,7 @@ private:
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;
     std::shared_ptr<Volume> volume_;
+    vc::objects::VolumeVoxels voxels_;
     std::map<std::string, Row> rows_;
     // Bumped by setSource(): reads of an earlier source are dropped.
     uint64_t generation_ = 0;

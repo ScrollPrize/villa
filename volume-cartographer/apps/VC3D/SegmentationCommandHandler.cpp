@@ -608,6 +608,7 @@ public:
     struct Spec {
         QString tool;         // executable path
         QString store, volume;  // the store contract (ToolProcess::Launch)
+        double voxelScale = 1;
         QStringList args;
         QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
         QString title;        // "SLIM-flatten", "Straighten"
@@ -651,6 +652,7 @@ public:
         launch.args = spec_.args;
         launch.store = spec_.store;
         launch.volume = spec_.volume;
+        launch.voxelScale = spec_.voxelScale;
         if (!run_->start(launch)) {
             vc3d::ToolProcess::Result failed;
             failed.error = run_->error();
@@ -824,7 +826,8 @@ SegmentationCommandHandler::storeForTools(CommandLaunchError* error) const
     try {
         const auto tools = catalog->toolStore();
         StoredSurface stored;
-        stored.volumeUuid = QString::fromStdString(tools.volume);
+        stored.volumeUuid = QString::fromStdString(tools.volume.volume);
+        stored.voxelScale = tools.volume.scale;
         stored.store = QString::fromStdString(tools.store.string());
         return stored;
     } catch (const std::exception& e) {
@@ -1175,7 +1178,7 @@ bool SegmentationCommandHandler::startRunTraceImpl(
     paramsFile->flush();
     _traceParamsFile = std::move(paramsFile);
 
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setTraceParams(
         getCurrentVolumePath(),
         stored->volumeUuid,
@@ -1280,7 +1283,7 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     }
 
     // Every option is set, so earlier settings cannot leak in.
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setSurface(QString::fromStdString(stored->uuid));
     _cmdRunner->setOutputPattern(outputPattern);
     _cmdRunner->setRenderOutputFormat(params.outputFormat);
@@ -1299,7 +1302,9 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     _cmdRunner->setVolumePath(volumePath);
     configureCommandRunnerForVolume(renderVolume->id());
 
-    _cmdRunner->setRenderVolume(QString::fromStdString(renderVolume->id()));
+    // Read in the render volume's voxels: those of the volume it is kept in, at its level.
+    const auto renderTarget = vc::project::annotationVolume(_state->vpkg().get(), *renderVolume);
+    _cmdRunner->setRenderVolume(QString::fromStdString(renderTarget.volume), renderTarget.scale);
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     _cmdRunner->setRenderAdvanced(params.cropX, params.cropY, params.cropWidth, params.cropHeight,
                                   params.rotateDegrees, params.flipAxis);
@@ -1354,7 +1359,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     args << QString::number(iters) << params.energyType;
 
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {flatboiExe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
+                   {flatboiExe, stored->store, stored->volumeUuid, stored->voxelScale, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
                     outputName, iters, /*modal=*/true},
                    /*suppressDialogs=*/!interactive);
 
@@ -1396,7 +1401,7 @@ bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentI
     std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
               << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe, stored->store, stored->volumeUuid,
+                   {exe, stored->store, stored->volumeUuid, stored->voxelScale,
                     QStringList{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
                                 QStringLiteral("--name"), outputName} + args,
                     QStringLiteral("flatten.straighten"), tr("Straighten"), tr("Running vc_straighten..."), outputName},
@@ -1513,7 +1518,7 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     paramsFile->flush();
 
     configureCommandRunnerForVolume(dlg.selectedVolumeId().toStdString());
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
                                       dlg.selectedVolumeId(), outputTag, QString());
     _cmdRunner->showConsoleOutput();
@@ -1712,7 +1717,7 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
     job.paramsFile = std::move(paramsFile);
 
     // The resumed surface is a new surface tagged like a grown patch.
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath,
                                       job.paramsPath,
                                       QString::fromStdString(segmentId),
@@ -2027,7 +2032,7 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
     }
 
     // The tool writes into the surface's artifact directory and reports the path.
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setToObjParams(QString::fromStdString(stored->uuid), objName, stored->volumeUuid);
     _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
@@ -2338,7 +2343,7 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
             _alphaCompJob.reset();
         });
 
-    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setObjRefineParams(volumePath, QString::fromStdString(stored->uuid), newName, paramsPath,
                                    QString::fromStdString(sampledVolume));
     _cmdRunner->setNextOmpThreads(params.ompThreads);
@@ -2538,7 +2543,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     });
 
     if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"), {}, store->store,
-                                      store->volumeUuid)) {
+                                      store->volumeUuid, store->voxelScale)) {
         QObject::disconnect(*connection);
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Failed to start vc_tifxyz2zarr_sparse."));
@@ -2605,7 +2610,7 @@ void SegmentationCommandHandler::onMergeSurfaces(const QStringList& segmentIds)
     mergeJson->flush();
 
     // The merge is a new surface bound to the current volume.
-    _cmdRunner->setStore(store->store);
+    _cmdRunner->setStore(store->store, store->voxelScale);
     _cmdRunner->setMergeParams(mergeJson->fileName(),
                                store->volumeUuid,
                                QStringLiteral("paths"),
@@ -2672,7 +2677,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setStore(store->store);
+    _cmdRunner->setStore(store->store, store->voxelScale);
     _cmdRunner->setMergePatchParams(dlg.parentSurface(),
                                     dlg.childSurface(),
                                     dlg.explicitRoles(),
@@ -2811,7 +2816,7 @@ void SegmentationCommandHandler::onGrowTrackPatches()
 
     _cmdRunner->showConsoleOutput();
     const bool started = _cmdRunner->executeCustomCommand(python, args, tr("Grow Track Patches"), {}, store->store,
-                                                          store->volumeUuid);
+                                                          store->volumeUuid, store->voxelScale);
     if (!started) {
         QObject::disconnect(*connection);
         emit statusMessage(tr("Failed to start grow_track_graph.py"), 5000);

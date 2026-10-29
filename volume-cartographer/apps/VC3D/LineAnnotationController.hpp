@@ -1362,13 +1362,14 @@ private:
         std::optional<vc::objects::VolumeUmbilicus> umbilicus;
         QString problem;  // why there is none
     };
-    const StoredUmbilicus& storedUmbilicus(const std::string& volumeId) const;
+    // In `voxels` (a volume of the store at a scale), cached per store and voxels.
+    const StoredUmbilicus& storedUmbilicus(const vc::objects::VolumeVoxels& voxels) const;
     mutable std::map<std::string, StoredUmbilicus> _storedUmbilici;
     // Scroll-center reference for orienting generated-view normals: the stored
     // umbilicus of the current volume, in its voxels. nullopt after a failed
     // attempt (volume-center fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
-    // The store and volume the cached reference was built for (empty: none built).
+    // The store and voxels the cached reference was built for (empty: none built).
     std::string _scrollUmbilicusVolumeId;
     // Bumped whenever the orientation inputs change out from under built views
     // (umbilicus attach/detach, active volume switch). Sessions record the
@@ -1380,10 +1381,11 @@ private:
     // decide staleness of derived geometry; a volume switch is deliberately not
     // an attachment change.
     uint64_t _umbilicusGeneration = 0;
-    // The volumeId of the last volumeChanged this controller acted on, so a
-    // reselection of the current volume is not treated as a switch. Cleared on
-    // package change.
-    std::string _lastVolumeChangedId;
+    // The volume of the last volumeChanged this controller acted on, so a
+    // reselection of the current volume is not treated as a switch (a new
+    // working level is a new Volume under the same ID). Cleared on package
+    // change.
+    std::weak_ptr<Volume> _lastVolumeChanged;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation
@@ -1450,8 +1452,8 @@ private:
         _sideStripSessionSnapshotCache;
     // See readStoredFibersCached: decoded fibers keyed by uuid.
     mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
-    // The volume id _storedFiberDecodeCache was decoded in.
-    mutable std::string _storedFiberDecodeVolume;
+    // The voxels _storedFiberDecodeCache was decoded in.
+    mutable vc::objects::VolumeVoxels _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

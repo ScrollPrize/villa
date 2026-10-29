@@ -1614,7 +1614,10 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
     request[QStringLiteral("output_name")] = rootName;
     request[QStringLiteral("output_name_mode")] = outputNameMode;
-    request[QStringLiteral("volume_uuid")] = QString::fromStdString(_surfaceCatalog->volume()->id());
+    // Stored surfaces and point collections are read, and results bound, in the
+    // open volume's voxels: its store volume at its working level's scale.
+    request[QStringLiteral("volume_uuid")] = QString::fromStdString(_surfaceCatalog->voxels().volume);
+    request[QStringLiteral("voxel_scale")] = _surfaceCatalog->voxels().scale;
     if (!volumeShapeZyx.isEmpty()) {
         request[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx;
     }

@@ -204,7 +204,7 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
             changed.push_back(storedPointCollection(drafts[index], uuid, meta.value("source", nlohmann::json::object())));
         }
     });
-    vc::objects::writeVolumeCollections(session, attachment, volume, changed, removed, expected);
+    vc::objects::writeVolumeCollections(session, attachment, vc::objects::VolumeVoxels{volume}, changed, removed, expected);
     // Each written head is this commit's: the objects are leased on a hosted
     // replica, and a new one is known to no one else yet.
     for (std::size_t i = 0; i < drafts.size(); ++i)

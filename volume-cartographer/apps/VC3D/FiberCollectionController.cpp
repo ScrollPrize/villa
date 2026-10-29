@@ -183,14 +183,14 @@ std::map<std::string, std::string> linkGroupsOf(const vc::objects::ObjectStore& 
 // Stored coordinates -> volume voxels of each listed object bound to the volume.
 template <class Keys>
 std::map<std::string, vc::objects::VolumeAffine> volumeMappings(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
-                                                                const Keys& objects, const std::string& volume)
+                                                                const Keys& objects, const vc::objects::VolumeVoxels& volume)
 {
     vc::objects::ObjectSelection selection;
     for (const auto& [uuid, value] : objects) selection.uuids.push_back(uuid);
     const auto transforms = db.volumeTransforms(txn);
     std::map<std::string, vc::objects::VolumeAffine> mappings;
     for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"meta"}))
-        if (const auto mapping = transforms.toVolume(Json::parse(object.meta), volume))
+        if (const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale))
             mappings.emplace(object.uuid, *mapping);
     return mappings;
 }
@@ -468,7 +468,10 @@ void FiberCollectionController::listPage(bool reset)
     selection.family = familyFilter();
     if (options_.minLengthMm > 0) selection.minLength = options_.minLengthMm / nativeVoxelMm_;
     if (volume) {
-        selection.volume = volume->id();
+        // In the open volume's voxels: its store volume at its scale.
+        const auto& target = *state_->annotationVolume();
+        selection.volume = target.volume;
+        selection.targetScale = target.scale;
         selection.includeUnbound = true;
     }
     if (catalogCursor_) {
@@ -487,7 +490,8 @@ void FiberCollectionController::listPage(bool reset)
                 const auto transforms = db.volumeTransforms(txn);
                 for (auto& record : db.selectObjects(txn, selection, std::vector<std::string>{"name", "tags", "fiber", "meta"})) {
                     CatalogRow row;
-                    if (selection.volume) row.mapping = transforms.toVolume(Json::parse(record.meta), *selection.volume);
+                    if (selection.volume)
+                        row.mapping = transforms.toVolume(Json::parse(record.meta), *selection.volume, selection.targetScale);
                     uuids.push_back(record.uuid);
                     row.record = std::move(record);
                     rows.push_back(std::move(row));
@@ -555,11 +559,10 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
     const auto token = ++selectionRevision_;
     const auto rev = revision_;
     publishSelection({id, tr("Loading fiber #%1…").arg(id), {}, 0, 0, false});
-    const auto volume = state_->currentVolume();
-    const auto volumeId = volume ? volume->id() : std::string{};
+    const vc::objects::VolumeVoxels volume = state_->annotationVolume().value_or(vc::project::AnnotationVolume{});
     background<SelectedFiber>(
         this,
-        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),uuid,volumeId]() {
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),uuid,volume]() {
             SelectedFiber selected;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
                 const auto revision=db.currentObjectRevision(txn,uuid);
@@ -568,8 +571,9 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 auto& row=selected.row;
                 selected.pin={attachment,{attachment.storeUuid,uuid},revision->uuid,revision->geometryRevision};
                 row.record=revision->record;
-                if (!volumeId.empty()) row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volumeId);
-                if (row.mapping) selected.volumeLength = db.geometryLengthInVolume(txn, uuid, volumeId);
+                if (!volume.volume.empty())
+                    row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);
+                if (row.mapping) selected.volumeLength = db.geometryLengthInVolume(txn, uuid, volume.volume, volume.scale);
                 const auto& fiber=*row.record.fiber;
                 selected.pointCount=fiber.linePointCount ? fiber.linePointCount : fiber.controlPointCount;
             });
@@ -625,12 +629,12 @@ void FiberCollectionController::navigate(int index)
     background<Point>(
         this,
         [connection=state_->objectStoreSession(),pin=*selectedPin_,index,
-         volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{}]() {
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{}))]() {
             Point point{};
             connection->read(pin.attachment,[&](const auto& db,const auto& txn,const auto&) {
                 // The fiber's point in the volume's voxels, through the store's mapping.
                 const auto fiber=vc::objects::GeometrySnapshot(db,txn).fiber(pin.object.objectUuid);
-                const auto shown=fiber.viewTransformedAt(volume);
+                const auto shown=fiber.viewTransformedAt(volume.volume,volume.scale);
                 const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
                 point=shown.points(name,index,1).front();
             });return point;
@@ -690,15 +694,15 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             return found == views_.end() ? nullptr : found->second.get();
         },
         [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
-         volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{},
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})),
          selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
          none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
             RegionResult result;
-            if (none || volume.empty()) return result;
+            if (none || volume.volume.empty()) return result;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
                 const auto slice = vc3d::store::regionSlice(query);
                 vc::objects::RegionOptions options;
-                options.kind="fiber"; options.volume=volume; options.maximumObjects=maximum; options.minLength=min;
+                options.kind="fiber"; options.volume=volume.volume; options.targetScale=volume.scale; options.maximumObjects=maximum; options.minLength=min;
                 if (!selectedUuid.empty()) options.selected=selectedUuid;
                 options.family=family;
                 auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel.load() || cancelled.load(); });
@@ -996,16 +1000,17 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
     background<ChainResult>(
         this,
         [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
-         volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{}, box, cancel,
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})), box, cancel,
          min=options_.minLengthMm / nativeVoxelMm_, family=familyFilter(), maximum=options_.maxDisplayed,
          linked=options_.showLinked, none=noFamilies()]() {
             ChainResult result;
-            if (none || volume.empty()) return result;
+            if (none || volume.volume.empty()) return result;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
                 // Fibers drawn from a sampled line carry annotation controls.
                 vc::objects::ObjectSelection selection;
                 selection.kind = "fiber";
-                selection.volume = volume;
+                selection.volume = volume.volume;
+                selection.targetScale = volume.scale;
                 selection.bbox = box;
                 if (min > 0) selection.minLength = min;
                 selection.family = family;
@@ -1017,7 +1022,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                     if (cancel->load() || cancelled.load()) return;
                     if (!object.fiber || object.fiber->linePointCount == 0) continue;
                     // Fibers bound by scale or through a registration, in volume voxels.
-                    const auto mapping = transforms.toVolume(Json::parse(object.meta), volume);
+                    const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale);
                     const auto head = db.currentGeometry(txn, object.uuid);
                     if (!mapping || !head) continue;
                     uuids.push_back(object.uuid);

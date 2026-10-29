@@ -117,7 +117,7 @@ struct CatalogFixture {
         const auto attachment = state.objectStoreSession()->attach(storePath, storeOptions);
         inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
         catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
-        catalog->setSource(attachment, volume);
+        catalog->setSource(attachment, volume, {volume->id()});
         QElapsedTimer timer;
         timer.start();
         while ((catalog->loading() || catalog->rows().empty()) && timer.elapsed() < 10000) {

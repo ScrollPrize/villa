@@ -221,6 +221,8 @@ struct ObjectSelection {
     // lengths are measured from the transformed polyline. Returned object
     // records retain their canonical metadata. Spatial regions use target bounds.
     std::optional<std::string> volume;
+    // With volume: target voxels at this scale of the volume's (as in RegionOptions).
+    double targetScale = 1;
     // With volume: also list objects not bound to it, after the bound ones in
     // UUID order (a cursor into them has afterUuid without afterLength).
     // Excluded when minLength is positive. Not valid for spatialRegions.

@@ -896,7 +896,9 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     copyJob.store = QString::fromStdString(toolStore.store.string());
     copyJob.surfaceUuid = pin->object.objectUuid;
     copyJob.geometryRevision = *pin->geometryRevision;
-    copyJob.volumeUuid = toolStore.volume;
+    // The service works in level-0 voxels of the zarr it is given, not in the
+    // open volume's working level: the store volume's own voxels.
+    copyJob.volumeUuid = toolStore.volume.volume;
     copyJob.volumeZarrPath = volumeZarr;
     copyJob.volumeScale = volumeScale;
     copyJob.checkpointPath = copyCheckpointPath;
@@ -1181,7 +1183,7 @@ void SegmentationGrower::onFutureFinished()
                                                  {point.p[0], point.p[1], point.p[2]}, int64_t(point.creation_time)});
             try {
                 vc3d::corrections::writeGrowthAnnotation(*_context.state->objectStoreSession(), afterPin->attachment, annotation,
-                                                         *_context.state->currentVolume());
+                                                         _context.state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
             } catch (const std::exception& ex) {
                 qCWarning(lcSegGrowth) << "Failed to save the corrections annotation:" << ex.what();
             }

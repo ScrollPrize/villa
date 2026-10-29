@@ -804,7 +804,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                  threshold,
                  session,
                  sources = _state->surfaceSources(),
-                 volume = _state->currentVolumeId(),
+                 volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
                  cancel]() -> QImage {
                 try {
                     QElapsedTimer timer;

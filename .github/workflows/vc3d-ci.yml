@@ -10,6 +10,7 @@ on:
     paths:
       - 'volume-cartographer/**'
       - 'vc_object_store/**'
+      - 'vc_reader/**'
       - '.github/workflows/vc3d-ci.yml'
 
 permissions:
@@ -44,6 +45,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -52,6 +54,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -59,6 +62,7 @@ jobs:
             vc:
               - 'volume-cartographer/**'
               - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
               - '.github/workflows/vc3d-macos.yml'
             test_core:
@@ -72,6 +76,7 @@ jobs:
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
               - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             test_specialized:
               - 'volume-cartographer/CMakeLists.txt'
@@ -84,6 +89,7 @@ jobs:
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
               - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             vc3d:
               - 'volume-cartographer/CMakeLists.txt'
@@ -96,6 +102,7 @@ jobs:
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
               - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             cli:
               - 'volume-cartographer/CMakeLists.txt'
@@ -110,6 +117,7 @@ jobs:
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
               - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             flatboi:
               - 'volume-cartographer/CMakeLists.txt'
@@ -157,6 +165,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -165,6 +174,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -217,6 +227,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -225,6 +236,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -272,6 +284,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -280,6 +293,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -355,6 +369,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -363,6 +378,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -418,6 +434,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -426,6 +443,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -487,6 +505,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -495,6 +514,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
       # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
       - name: Install SQLite and OpenSSL headers
@@ -535,6 +555,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -543,6 +564,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -585,6 +607,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
@@ -593,6 +616,7 @@ jobs:
           sparse-checkout: |
             volume-cartographer
             vc_object_store
+            vc_reader
 
       - name: Checkout VC3D dependencies
         id: checkout_deps

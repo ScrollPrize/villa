@@ -309,7 +309,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume leaves the project as it was when the
     fs::remove_all(d);
 }
 
-TEST_CASE("A catalog gives remote entries their catalog volume identity at their level")
+TEST_CASE("A catalog gives remote entries their catalog volume identity at every level")
 {
     const auto catalog = vcr::catalog::parseOpenDataManifest(R"({"samples": {"s": {
       "volumes": {"vol": {"id": "vol", "suffix": "scan.zarr", "properties": {"pixel_size_um": 2.5},
@@ -322,7 +322,7 @@ TEST_CASE("A catalog gives remote entries their catalog volume identity at their
     CHECK(source.at("uuid").get_string() == "vol");
     CHECK(source.at("voxelsize").get_double() == doctest::Approx(2.5));
     const auto level = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr#vc-base-scale=2");
-    CHECK(level.at("uuid").get_string() == "vol@L2");
+    CHECK(level.at("uuid").get_string() == "vol");
     CHECK(level.at("voxelsize").get_double() == doctest::Approx(10.0));
     CHECK(level.at("name").get_string() == "scan.zarr [L2]");
     const auto prediction = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/pred.zarr");
