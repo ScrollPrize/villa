@@ -340,6 +340,20 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     assert rebuilt['input_position']['sequence'] == position['sequence']
     assert rebuilt['applied_config']['object_store_input_position'] == position['sequence']
     assert state.session._context.config['object_store_input_position'] == position['sequence']
+    # A model-only rebuild resumes from the session's checkpoint, whose inputs
+    # the update replaced: a session that names one rebuilds in full.
+    import dataclasses
+    paths, run, preview, _ = state._prepare_session_request({'run': {
+        **REQUEST['run'], 'config': {**REQUEST['run']['config'], 'model_num_flow_stages': 3}}})
+    with state.lock:
+        live_request = state.session_request
+        assert state._rebuild_stage_locked(paths, run, preview, 'Idle') == 'model'
+        resumed = dataclasses.replace(paths, checkpoint='before-update.ckpt')
+        state.session_request = {**live_request, 'paths': resumed.manifest()}
+        try:
+            assert state._rebuild_stage_locked(resumed, run, preview, 'Idle') == 'all'
+        finally:
+            state.session_request = live_request
 
 
 def test_an_update_with_identical_inputs_republishes_the_manifest(state, hub, device_stubs,

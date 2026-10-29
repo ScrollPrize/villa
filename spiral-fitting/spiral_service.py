@@ -1567,6 +1567,12 @@ class ServiceState:
             # Nothing to keep: there is no resident session, or it has no
             # model to rebuild around (Error), or it is not quiescent.
             return "all"
+        if paths.checkpoint and int(self.session.status().get("input_generation") or 0):
+            # The model stage resumes from the checkpoint, whose inputs an
+            # update has since replaced: its manifest no longer matches the
+            # resident inputs, and the refusal would come after the model was
+            # released. The full rebuild reads the checkpoint's position.
+            return "all"
         if (paths.manifest() != current.get("paths")
                 or preview.manifest() != current.get("preview")):
             return "all"
