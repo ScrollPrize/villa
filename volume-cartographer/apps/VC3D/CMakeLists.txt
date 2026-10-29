@@ -12,6 +12,7 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
+    CoordinateCopy.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp

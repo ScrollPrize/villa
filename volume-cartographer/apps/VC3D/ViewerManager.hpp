@@ -151,6 +151,12 @@ public:
     // centerFocusAt() at the volume position under the mouse cursor: prefers
     // the viewer under the cursor, then scans all visible viewer viewports.
     bool centerFocusOnCursor();
+    // The volume position under the mouse, as the hovered viewer's readout
+    // reports it (normal offset included). Unlike
+    // CChunkedVolumeViewer::cursorVolumePosition(), nullopt when the mouse is
+    // not over a viewer or is off the mesh in a flattened segment view.
+    std::optional<cv::Vec3f> hoveredVolumePosition() const;
+    CState* state() const { return _state; }
     bool recenterViewersOnCurrentFocus();
     void recenterPlaneViewersOn(const cv::Vec3f& position);
     void recenterSegmentationViewerNear(const cv::Vec3f& position);

@@ -224,6 +224,8 @@ private slots:
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
+    void onCopyFocusCoordinates();
+    void onCopyCursorCoordinates();
     void onResetAxisAlignedRotations();
     void onAxisAlignedSlicesToggled(bool enabled);
     void onAxisOverlayVisibilityToggled(bool enabled);

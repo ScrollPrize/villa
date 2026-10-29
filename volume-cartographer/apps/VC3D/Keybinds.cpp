@@ -174,6 +174,14 @@ const ShortcutDef FocusedView{
     "Shift+Ctrl+F",
     QKeySequence::Open
 };
+const ShortcutDef CopyFocusCoordinates{
+    "copy_focus_coordinates",
+    kSectionNavigation,
+    "Copy the focus point (POI) coordinates (x, y, z)",
+    ShortcutKind::Text,
+    "Shift+Ctrl+C",
+    QKeySequence::Open
+};
 const ShortcutDef CycleViewers{
     "cycle_viewers",
     kSectionViewerControls,
@@ -208,6 +216,14 @@ const KeyPressDef RecenterFocus{
     Qt::Key_X,
     Qt::NoModifier,
     false
+};
+const KeyPressDef CopyCursorCoordinates{
+    "copy_cursor_coordinates",
+    kSectionNavigation,
+    "Copy the volume coordinates under the mouse (x, y, z)",
+    Qt::Key_C,
+    Qt::ControlModifier,
+    true
 };
 const KeyPressDef SliceStepDecrease{
     "slice_step_decrease",
@@ -473,6 +489,8 @@ QString buildKeybindsHelpText()
         { kSectionViewerControls, shortcuts::WorldOffsetZNeg.description, HelpKeyType::Shortcut, &shortcuts::WorldOffsetZNeg, nullptr, nullptr },
         { kSectionViewerControls, "Pan view", HelpKeyType::Literal, nullptr, nullptr, "Arrow Keys" },
 
+        { kSectionNavigation, keypress::CopyCursorCoordinates.description, HelpKeyType::KeyPress, nullptr, &keypress::CopyCursorCoordinates, nullptr },
+        { kSectionNavigation, shortcuts::CopyFocusCoordinates.description, HelpKeyType::Shortcut, &shortcuts::CopyFocusCoordinates, nullptr, nullptr },
         { kSectionNavigation, keypress::CenterFocusOnCursor.description, HelpKeyType::KeyPress, nullptr, &keypress::CenterFocusOnCursor, nullptr },
         { kSectionNavigation, keypress::RecenterFocus.description, HelpKeyType::KeyPress, nullptr, &keypress::RecenterFocus, nullptr },
 
