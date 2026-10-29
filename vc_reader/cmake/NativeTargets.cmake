@@ -1,13 +1,24 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
-# Publish the existing Python-independent headers without maintaining copies.
-# configure_file tracks edits and keeps build-tree and installed include paths identical.
+# Publish the Python-independent headers without maintaining copies. In the build
+# tree vc_reader/native is a link to src/cpp, so a source file may include a
+# header by either path and #pragma once still sees one file; installs copy them.
 file(GLOB_RECURSE _vc_native_headers CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.cuh")
 list(FILTER _vc_native_headers EXCLUDE REGEX "(^|/)([^/]*_)?bindings\\.hpp$")
+set(_vc_native_link "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader/native")
+if(EXISTS "${_vc_native_link}" AND NOT IS_SYMLINK "${_vc_native_link}")
+    file(REMOVE_RECURSE "${_vc_native_link}")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader")
+if(NOT EXISTS "${_vc_native_link}")
+    file(CREATE_LINK "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" "${_vc_native_link}" RESULT _vc_native_linked SYMBOLIC)
+endif()
 foreach(header IN LISTS _vc_native_headers)
-    configure_file("src/cpp/${header}" "include/vc_reader/native/${header}" COPYONLY)
+    if(NOT IS_SYMLINK "${_vc_native_link}")  # no symbolic links (e.g. Windows without developer mode)
+        configure_file("src/cpp/${header}" "include/vc_reader/native/${header}" COPYONLY)
+    endif()
     get_filename_component(directory "${header}" DIRECTORY)
     install(FILES "src/cpp/${header}" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/${directory}")
 endforeach()
