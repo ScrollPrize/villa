@@ -829,7 +829,7 @@ NB_MODULE(_native, m)
             return result;
         }, nb::arg("position"), nb::arg("object_uuids") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("relationships") = true, nb::arg("geometry") = true,
-           "revision_read_view of the hub's state at a hub position: objects present then (or those of object_uuids "
+           "revision_read_view of the hub's state at a hub position (or a position of a plain store that records them): objects present then (or those of object_uuids "
            "present then), their records and (unless relationships=False) relationship applicability, read from the "
            "hub's history. Geometry revisions it names are read from this replica, which must hold them (unless "
            "geometry=False: a read of records only).")
@@ -864,6 +864,18 @@ NB_MODULE(_native, m)
             result["leases"] = hubLeases(status->leases);
             return result;
         }, "Local hosting state of a replica, or None for an ordinary store.")
+        .def("enable_store_positions", [](PyObjectStore& self) {
+            auto& db = self.require();
+            nb::gil_scoped_release release;
+            return vo::enableStorePositions(db);
+        }, "Record positions of this plain store from now on (every write, by any connection), so "
+           "hub_read_view_at reads its states. Returns its head.")
+        .def("store_positions", [](PyObjectStore& self) -> nb::object {
+            const auto positions = vo::storePositions(self.require());
+            if (!positions) return nb::none();
+            nb::dict result; result["store"] = positions->store; result["position"] = positions->position;
+            return result;
+        }, "{store, position} of a plain store that records positions (its identity and head), else None.")
         .def("resolve_hub_conflict", [](PyObjectStore& self, const std::string& uuid, const std::string& keep) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("resolve_hub_conflict requires an idle store");

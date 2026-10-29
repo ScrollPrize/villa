@@ -381,6 +381,19 @@ it. A hub made before the index reads only its head until its next write.
 `hubJournal(replica, after, upTo)` (session `hubJournal`, Python
 `hub_journal`) lists the hub's journal entries between two positions: what a
 position includes beyond another, and by whom.
+- A plain store can have positions without a hub, for processes on one
+  machine that share its file (a Spiral service and VC3D).
+  `enableStorePositions(store)` (Python `enable_store_positions`) starts its
+  own `hub_publications` index: from then on every write records its
+  position, whichever connection or process makes it (the check is per
+  write), and the store's schema version becomes 18, as an indexed hub's.
+  `storePositions(store)` (Python `store_positions`) gives the store's
+  identity, which its positions belong to, and its head. `readHubPosition`
+  and `hubJournal` then read the store's own history and journal. There is no
+  conditional publication: a writer that must pin its own writes on top of a
+  head checks the journal between the head and its result for other authors.
+  `detachHub` drops a replica's index (the hub's positions are not its own),
+  and `initHub` keeps a plain store's: its positions become the hub's.
 - `hubPush(replica, expectedHead)` publishes only while the hub is still at
   that position, checked in the publishing hub transaction. Otherwise it
   publishes nothing and reports `headMismatch` with the hub's head, even when the

@@ -287,6 +287,47 @@ int main() try
         require(!session.hubStatus(attachment)->pushesHeld, "hold released");
         session.detach(attachment);
     }
+    {
+        // A plain store shared by two connections (two processes on one
+        // machine) records positions of its own; either connection's writes
+        // record theirs once the other has started the index.
+        const auto plainPath = directory.path / "plain.vcobj";
+        auto service = ObjectStore::create(plainPath, as("service"));
+        auto editor = ObjectStore::open(plainPath, as("editor"));
+        const auto x = addFiber(editor), y = addFiber(editor);
+        require(!storePositions(service), "a plain store records no positions until asked");
+        mustFail([&] { readHubPosition(service, 1, [](auto&, auto&, auto&) {}); });
+        const auto enabled = enableStorePositions(service);
+        require(storePositions(editor)->position == enabled && storePositions(editor)->store == storePositions(service)->store,
+                "every connection sees the store's positions");
+        setNote(editor, x, "one");
+        const auto xy = link(service, x, y);
+        const auto one = storePositions(service)->position;
+        setNote(editor, x, "two");
+        addFiber(editor);
+        require(state(service, enabled)["objects"][x]["meta"].value("note", "") == "", "the enabling head reads as it was");
+        const auto atOne = state(editor, one);
+        require(atOne["objects"][x]["meta"]["note"] == "one" && atOne["objects"].size() == 2 &&
+                atOne["relationships"].contains(xy), "a position holds exactly the writes before it");
+        const auto entries = hubJournal(service, enabled, one);
+        require(!entries.empty() && entries.back().author == "service" && entries.front().author == "editor",
+                "the journal between positions names their writers");
+        require(state(service, storePositions(service)->position)["objects"][x]["meta"]["note"] == "two", "the head reads now");
+        mustFail([&] { auto replica = ObjectStore::open(alicePath, as("alice")); enableStorePositions(replica); });
+        // Hosting keeps the store's positions; detaching a replica drops the hub's.
+        service.checkpoint();
+    }
+    {
+        const auto plainPath = directory.path / "plain.vcobj";
+        initHub(plainPath, "curator");
+        const auto replicaPath = directory.path / "plain-replica.vcobj";
+        cloneHub(plainPath, replicaPath, as("carol"));
+        detachHub(replicaPath, "carol");
+        auto detached = ObjectStore::open(replicaPath, as("carol"));
+        require(!storePositions(detached), "a detached replica keeps none of its hub's positions");
+        detached.checkpoint();
+    }
+    initHub(directory.path / "plain-replica.vcobj", "carol");  // and can be hosted again
     std::cout << "object_store_hub_positions: ok\n";
     return 0;
 } catch (const std::exception& error) {

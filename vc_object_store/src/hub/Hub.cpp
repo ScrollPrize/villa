@@ -366,6 +366,8 @@ void detachHub(const std::filesystem::path& path, const std::string& author)
         try {
             for (const auto* table : {"hub_upstream", "hub_versions", "hub_pending", "hub_inflight", "hub_conflicts", "hub_leases"})
                 exec(db, (std::string("DROP TABLE ") + table + ";").c_str());
+            // The hub's positions are not this store's.
+            dropPublications(db);
             exec(db, "COMMIT;");
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
     } catch (...) { sqlite3_close(db); throw; }
@@ -694,6 +696,14 @@ void readHubPosition(ObjectStore& replica, int64_t position,
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
+        if (detectHubRole(conn(local)) == HubRole::None) {
+            // A plain store's positions are its own history.
+            if (!hasPublications(conn(local)))
+                throw std::runtime_error("object store: " + replica.path().string() + " records no positions");
+            const auto publication = hubPublicationAt(conn(local), position);
+            read(replica, local, replica.revisionSelectionAt(local, publication.publishedAtUs, true));
+            return;
+        }
         hub = openHub(replica, local, upstream(conn(local)));
     }
     auto txn = hub->read();
@@ -724,6 +734,11 @@ std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
+        if (detectHubRole(conn(local)) == HubRole::None) {
+            auto entries = replica.journalSince(local, after);
+            std::erase_if(entries, [&](const JournalEntry& entry) { return entry.seq > upTo; });
+            return entries;
+        }
         hub = openHub(replica, local, upstream(conn(local)));
     }
     auto txn = hub->read();
@@ -741,6 +756,23 @@ std::vector<std::string> hubWriters(ObjectStore& replica)
                               "ORDER BY author");
     while (rows.row()) authors.push_back(rows.text(0));
     return authors;
+}
+
+int64_t enableStorePositions(ObjectStore& store)
+{
+    auto txn = store.write();
+    if (detectHubRole(conn(txn)) != HubRole::None)
+        throw std::runtime_error("object store: " + store.path().string() + " is hosted; its positions are its hub's");
+    const auto head = ensurePublications(conn(txn));
+    txn.commit();
+    return head;
+}
+
+std::optional<StorePositions> storePositions(ObjectStore& store)
+{
+    auto txn = store.read();
+    if (detectHubRole(conn(txn)) != HubRole::None || !hasPublications(conn(txn))) return std::nullopt;
+    return StorePositions{replicaIdentity(conn(txn)), hubHead(conn(txn))};
 }
 
 std::optional<HubStatus> hubStatus(ObjectStore& store)

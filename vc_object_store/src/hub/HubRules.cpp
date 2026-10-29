@@ -45,15 +45,10 @@ int64_t latestPublicationUs(sqlite3* db)
     return row.i64(0);
 }
 
-bool hasPublications(sqlite3* db)
-{
-    Statement table(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_publications'");
-    return table.row();
-}
-
-// Positions name hub states by journal sequence; each hub write that journals
-// records the publication time its history reads at. Hubs made before the
-// index start it, with the state they had, at their next write.
+// Positions name store states by journal sequence; each write that journals
+// on a hub or an indexed plain store records the publication time its history
+// reads at. Hubs made before the index start it, with the state they had, at
+// their next write.
 void createPublications(sqlite3* db, int64_t head, int64_t publishedAtUs)
 {
     exec(db, R"SQL(
@@ -71,6 +66,36 @@ HubPublication publication(Statement& row)
 {
     return {row.i64(0), row.i64(1), row.i64(2), row.text(3)};
 }
+
+void publish(sqlite3* db, const StatementPool& pool, const std::string& acting)
+{
+    const auto head = hubHead(db);
+    if (head <= pool.startJournal) return;
+    if (!hasPublications(db)) createPublications(db, pool.startJournal, pool.startPublishedUs);
+    else if (pragmaInt(db, "user_version") != kIndexedHubSchemaVersion)
+        // Indexed before the version gate existed.
+        exec(db, ("PRAGMA user_version=" + std::to_string(kIndexedHubSchemaVersion) + ";").c_str());
+    execute(db, "INSERT INTO hub_publications VALUES(?,?,?,?)", head, pool.startJournal, latestPublicationUs(db), acting);
+}
+}
+
+bool hasPublications(sqlite3* db)
+{
+    Statement table(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_publications'");
+    return table.row();
+}
+
+int64_t ensurePublications(sqlite3* db)
+{
+    const auto head = hubHead(db);
+    if (!hasPublications(db)) createPublications(db, head, latestPublicationUs(db));
+    return head;
+}
+
+void dropPublications(sqlite3* db)
+{
+    if (hasPublications(db)) exec(db, "DROP TABLE hub_publications;");
+    exec(db, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
 }
 
 HubRole detectHubRole(sqlite3* db)
@@ -90,7 +115,8 @@ CREATE TABLE hub_leases(
   holder TEXT NOT NULL, author TEXT NOT NULL, host TEXT NOT NULL,
   acquired_us INTEGER NOT NULL, expires_us INTEGER NOT NULL
 );)SQL");
-    createPublications(db, hubHead(db), latestPublicationUs(db));
+    // A plain store's own index carries over: its positions are the hub's.
+    ensurePublications(db);
 }
 
 int64_t hubHead(sqlite3* hub)
@@ -214,7 +240,12 @@ void beginHubWrite(sqlite3* db, StatementPool& pool)
 
 void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
 {
-    if (role == HubRole::None || (role == HubRole::Replica && pool.hubApply)) return;
+    if (role == HubRole::None) {
+        // Checked per write: another connection may have started the index.
+        if (hasPublications(db)) publish(db, pool, replicaIdentity(db));
+        return;
+    }
+    if (role == HubRole::Replica && pool.hubApply) return;
     const auto changed = changedRecords(db, pool);
     if (role == HubRole::Hub) {
         const auto acting = pool.actingHolder.value_or(replicaIdentity(db));
@@ -222,13 +253,7 @@ void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
         for (const auto& object : changedObjects(db, changed))
             if (const auto held = lease(db, object); held && held->expiresUs > now && held->holder != acting)
                 throw std::runtime_error("object store: " + object + " is leased to " + describe(*held));
-        if (const auto head = hubHead(db); head > pool.startJournal) {
-            if (!hasPublications(db)) createPublications(db, pool.startJournal, pool.startPublishedUs);
-            else if (pragmaInt(db, "user_version") != kIndexedHubSchemaVersion)
-                // Indexed before the version gate existed.
-                exec(db, ("PRAGMA user_version=" + std::to_string(kIndexedHubSchemaVersion) + ";").c_str());
-            execute(db, "INSERT INTO hub_publications VALUES(?,?,?,?)", head, pool.startJournal, latestPublicationUs(db), acting);
-        }
+        publish(db, pool, acting);
         return;
     }
     const auto self = replicaIdentity(db);

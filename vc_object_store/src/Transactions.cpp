@@ -98,7 +98,7 @@ WriteTxn ObjectStore::write()
     impl_->statementPools.at(impl_->writer)->actionConflict = false;
     try {
         exec(impl_->writer, "BEGIN IMMEDIATE;");
-        if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
+        beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
     }
     catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.

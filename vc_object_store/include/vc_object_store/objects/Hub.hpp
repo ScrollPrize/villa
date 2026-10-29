@@ -123,7 +123,8 @@ std::vector<std::string> hubWriters(ObjectStore& replica);
 
 // Read the hub's state at a position through the hub's own history: `read`
 // gets the hub, a read transaction and the hub's revision of every object
-// present at that position, retired ones included. Records, tags, deletions
+// present at that position, retired ones included. On a plain store that
+// records positions (enableStorePositions), `read` gets the store itself. Records, tags, deletions
 // and relationship membership/approval come from the hub; geometry revisions
 // are shared and read from this replica, so a reader checks the objects whose
 // geometry it reads with requireHubGeometry. Throws for a position that is
@@ -137,8 +138,23 @@ void requireHubGeometry(ObjectStore& replica, const ReadTxn& hubTxn, int64_t pos
                         const RevisionSelection& objects);
 
 // The hub's journal entries after one position up to another: which
-// records the hub states between them changed, by whom.
+// records the hub states between them changed, by whom (a plain store's own
+// entries, for a store that records positions).
 std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_t upTo);
+
+// Positions of a plain store, without a hub: processes on one machine share
+// the store file, and a position names one of its states, read through its
+// own history as readHubPosition reads a hub's. Start recording them (a
+// write; nothing happens when the store already does): from then on every
+// write records its position, whichever connection or process makes it.
+// Refuses a hub or replica. Returns the store's head.
+int64_t enableStorePositions(ObjectStore& store);
+struct StorePositions {
+    std::string store;     // the store's own identity: positions belong to it
+    int64_t position = 0;  // its head now
+};
+// nullopt unless a plain store that records positions.
+std::optional<StorePositions> storePositions(ObjectStore& store);
 
 // Local state only; no hub contact.
 std::optional<HubStatus> hubStatus(ObjectStore& store);
