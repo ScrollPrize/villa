@@ -293,7 +293,7 @@ NB_MODULE(_transforms, m) {
 
     nb::class_<Plan>(m, "Plan")
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
-    m.def("cuda_available", &cuda::available);
+    m.def("cuda_available", &vcr::cuda::available);
 #ifdef VC_READER_CUDA
     nb::class_<DeviceOutputs>(m, "DeviceOutputs")
         .def("export", &DeviceOutputs::mark_exported)

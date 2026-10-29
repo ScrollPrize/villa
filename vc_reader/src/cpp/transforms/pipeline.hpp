@@ -1,4 +1,5 @@
 #pragma once
+#include "../cuda_available.hpp"
 #include "cpu/tracing.hpp"
 #include "cpu/palette.hpp"
 #include "cpu/distance_transform.hpp"
@@ -45,7 +46,7 @@ using Op = std::variant<
 using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {
-bool available();
+using vcr::cuda::available;
 void execute(const Op&, Sample&, const Parameters&, void*);
 std::shared_ptr<void> begin(const Sample&);
 void finish(Sample&, void*);
@@ -54,7 +55,7 @@ Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
 void validate_program(const std::vector<Op>&);
 }
 #else
-namespace cuda { inline bool available() { return false; } }
+namespace cuda { using vcr::cuda::available; }
 #endif
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };

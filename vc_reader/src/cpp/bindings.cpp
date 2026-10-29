@@ -1,5 +1,6 @@
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
+#include "cuda_available.hpp"
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
 #include "output_pool.hpp"
@@ -122,7 +123,7 @@ NB_MODULE(_reader, m)
 #ifdef VC_READER_CUDA
     vcr::reader_cuda::bind(m);
 #else
-    m.def("reader_cuda_available", [] { return false; });
+    m.def("reader_cuda_available", &vcr::cuda::available);
 #endif
     vcr::aligned::bind(m);
     vcr::surface::bind(m);

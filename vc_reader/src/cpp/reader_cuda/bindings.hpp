@@ -1,5 +1,6 @@
 #pragma once
 #include "reader.hpp"
+#include "../cuda_available.hpp"
 #include "../cuda_stream.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
@@ -29,7 +30,7 @@ inline nb::object outputs(Result result, int device) {
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
     using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
-    m.def("reader_cuda_available",[] { int n=0; return cudaGetDeviceCount(&n)==cudaSuccess && n>0; });
+    m.def("reader_cuda_available",&vcr::cuda::available);
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
