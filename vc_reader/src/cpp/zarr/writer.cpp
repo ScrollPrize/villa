@@ -104,6 +104,8 @@ Writer Writer::open(const fs::path& path)
     impl->encode = encodeOptions(impl->meta.compressor);
     OpenOptions options;
     options.threads = 4;
+    // Mutable arrays must see atomic replacements by this or another writer.
+    options.readMode = "slab";
     impl->reader = std::move(openArray(path.string(), options).array);
     return Writer(std::move(impl));
 }
@@ -111,6 +113,22 @@ Writer Writer::open(const fs::path& path)
 const ArrayMeta& Writer::meta() const { return impl_->meta; }
 const fs::path& Writer::path() const { return impl_->path; }
 Array& Writer::reader() { return *impl_->reader; }
+
+void Writer::setFillValue(const Json& value)
+{
+    auto raw = impl_->meta.raw;
+    raw["fill_value"] = value;
+    auto meta = parseArrayMeta(raw);
+    OpenOptions options;
+    options.threads = 4;
+    options.readMode = "slab";
+    ArrayHints hints;
+    hints.metadata = raw;
+    auto opened = openArray(impl_->path.string(), options, hints);
+    atomicWrite(impl_->path / ".zarray", raw.dump(2) + "\n");
+    impl_->meta = std::move(meta);
+    impl_->reader = std::move(opened.array);
+}
 
 fs::path Writer::chunkPath(const Index& chunk) const
 {

@@ -258,6 +258,11 @@ public:
     // Reads the stored array (no memory cache: always what is on disk).
     Array& reader();
 
+    // Change the fill used for absent chunks, preserving stored chunks and all
+    // other metadata. Invalidates references returned by reader(); separately
+    // opened arrays must be reopened. Call only with no concurrent writer users.
+    void setFillValue(const Json& value);
+
     std::filesystem::path chunkPath(const Index& chunk) const;
     bool chunkExists(const Index& chunk) const;
     // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.

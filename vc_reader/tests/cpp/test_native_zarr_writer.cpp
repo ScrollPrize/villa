@@ -142,6 +142,78 @@ void editing(const fs::path& root)
     must_fail([&] { vcr::zarr::Writer::create(root / "bad", bad); }, "unknown compressor refused");
     require(!fs::exists(root / "bad" / ".zarray"), "refused arrays write no metadata");
 }
+
+void mutableChunks(const fs::path& root)
+{
+    for (const auto* codec : {"none", "gzip"}) {
+        vcr::zarr::CreateOptions options;
+        options.shape = {3, 3, 3};
+        options.chunks = {2, 2, 2};
+        options.dtype = "<u2";
+        options.compressor = codec;
+        options.fillValue = 513;
+        const auto path = root / (std::string("mutable-") + codec);
+        auto writer = vcr::zarr::Writer::create(path, options);
+        std::vector<uint16_t> chunk(8, 42), got(8, 0);
+        auto* bytes = reinterpret_cast<uint8_t*>(got.data());
+        writer.writeChunk({1, 1, 1}, reinterpret_cast<uint8_t*>(chunk.data()), 16);
+        require(writer.reader().read_chunk({1, 1, 1}, bytes, 16) && got == chunk,
+                "full edge chunk retains stored padding");
+        require(!writer.reader().read_chunk({0, 0, 0}, bytes, 16) && got == std::vector<uint16_t>(8, 513),
+                "missing chunk materializes a multi-byte fill");
+        must_fail([&] { writer.reader().read_chunk({0, 0, 0}, bytes, 15); }, "wrong destination size refused");
+        must_fail([&] { writer.reader().read_chunk({2, 0, 0}, bytes, 16); }, "invalid chunk index refused");
+        const auto untouched = got;
+        must_fail([&] {
+            writer.reader().read_many({{0, 0, 0}, {2, 2, 2}}, {{1, 1, 1}, {2, 1, 1}},
+                                     {bytes, bytes + 2}, vcr::Array::Bounds::Strict);
+        }, "strict batch refuses an out-of-bounds region");
+        require(got == untouched, "strict refusal leaves all outputs untouched");
+        must_fail([&] {
+            writer.reader().read_many({{0, 0, 0}}, {{INT64_MAX, 1, 1}}, {bytes}, vcr::Array::Bounds::Strict);
+        }, "strict bounds check avoids overflow");
+        must_fail([&] {
+            writer.reader().read_many({{0, 0, 0}}, {}, {bytes});
+        }, "mismatched batch counts refused");
+        writer.reader().read_many({{-1}}, {{0}}, {nullptr}, vcr::Array::Bounds::Strict);
+        writer.reader().read_many({{0, 0, 0}}, {{2, 2, 2}}, {bytes}, vcr::Array::Bounds::Strict);
+        require(got == std::vector<uint16_t>(8, 513), "strict reads still fill missing chunks");
+
+        // Read, replace through another writer, then patch twice. A retained
+        // mmap of the first file loses edits or hides the replacement/removal.
+        auto other = vcr::zarr::Writer::open(path);
+        read(writer.reader(), {2, 2, 2}, {1, 1, 1}, 2);
+        std::fill(chunk.begin(), chunk.end(), 77);
+        other.writeChunk({1, 1, 1}, reinterpret_cast<uint8_t*>(chunk.data()), 16);
+        auto region = read(writer.reader(), {2, 2, 2}, {1, 1, 1}, 2);
+        require(region[0] == 77 && region[1] == 0, "reader sees another writer's atomic replacement");
+        uint16_t a = 1234, b = 5678;
+        writer.writeRegion({0, 0, 0}, {1, 1, 1}, reinterpret_cast<uint8_t*>(&a));
+        writer.writeRegion({0, 0, 1}, {1, 1, 1}, reinterpret_cast<uint8_t*>(&b));
+        writer.reader().read_chunk({0, 0, 0}, bytes, 16);
+        require(got[0] == a && got[1] == b && got[2] == 513, "repeated partial writes keep previous edits");
+        other.removeChunk({1, 1, 1});
+        region = read(writer.reader(), {2, 2, 2}, {1, 1, 1}, 2);
+        require(region[0] == 1 && region[1] == 2, "reader sees removal after a read");
+
+        const auto before = writer.meta().raw;
+        vcr::zarr::writeAttributes(path, {{"purpose", "labels"}});
+        writer.setFillValue(1027);
+        auto expected = before;
+        expected["fill_value"] = 1027;
+        auto reopened = vcr::zarr::openArray(path.string(), {});
+        require(writer.meta().raw == expected && reopened.meta.raw == expected,
+                "fill update preserves all other array metadata");
+        require(vcr::zarr::readAttributes(path)["purpose"] == "labels", "fill update preserves attributes");
+        require(!writer.reader().read_chunk({1, 1, 1}, bytes, 16) && got == std::vector<uint16_t>(8, 1027),
+                "fill update reaches the writer reader");
+        writer.reader().read_chunk({0, 0, 0}, bytes, 16);
+        require(got[0] == a && got[1] == b && got[2] == 513, "fill update leaves stored chunks unchanged");
+        must_fail([&] { writer.setFillValue(Json::object()); }, "invalid fill refused before writing");
+        require(vcr::zarr::openArray(path.string(), {}).meta.raw == expected,
+                "failed fill update leaves metadata unchanged");
+    }
+}
 }  // namespace
 
 int main()
@@ -160,6 +232,7 @@ int main()
         fs::create_directories(root);
         codecs(root);
         editing(root);
+        mutableChunks(root);
         std::cout << "every codec round-trips; skip-empty, regions, attributes and validation passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

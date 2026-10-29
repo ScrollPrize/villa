@@ -244,6 +244,8 @@ public:
             http_->set_auth(std::move(auth));
     }
 
+    enum class Bounds { Fill, Strict };
+
     // Reads every region [start, start+size) into its C-order output buffer.
     // Parts outside the array, and chunks that are not stored, read as fill.
     // `stream`: raw local chunks missing from the memory cache are copied straight
@@ -253,13 +255,40 @@ public:
                    const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
                    bool stream = false)
     {
+        read_many(starts, sizes, outs, Bounds::Fill, output, stream);
+    }
+
+    // Strict reads reject nonempty regions outside the array before touching
+    // any output. Missing chunks still read as fill. Empty regions are no-ops.
+    void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
+                   const std::vector<std::uint8_t*>& outs, Bounds bounds,
+                   const BoxOutput* output = nullptr, bool stream = false)
+    {
         const std::size_t nd = spec_.shape.size();
+        if (starts.size() != sizes.size() || starts.size() != outs.size())
+            throw std::invalid_argument("region starts, sizes and outputs must have equal counts");
+        if (bounds == Bounds::Strict) {
+            for (std::size_t r = 0; r < starts.size(); ++r) {
+                const auto& start = starts[r];
+                const auto& size = sizes[r];
+                if (std::find(size.begin(), size.end(), 0) != size.end())
+                    continue;
+                if (start.size() != nd || size.size() != nd)
+                    throw std::invalid_argument("region rank does not match the array");
+                for (std::size_t i = 0; i < nd; ++i)
+                    if (start[i] < 0 || size[i] < 0 || start[i] > spec_.shape[i] ||
+                        size[i] > spec_.shape[i] - start[i])
+                        throw std::out_of_range("region outside the array: " + spec_.identity);
+            }
+        }
         std::vector<Index> out_strides(starts.size());
         std::map<std::int64_t, std::size_t> slot;  // linear chunk index -> work item (ordered: locality)
         std::vector<Work> work;
         for (std::size_t r = 0; r < starts.size(); ++r) {
             const Index& start = starts[r];
             const Index& size = sizes[r];
+            if (bounds == Bounds::Strict && std::find(size.begin(), size.end(), 0) != size.end())
+                continue;
             if (start.size() != nd || size.size() != nd)
                 throw std::invalid_argument("region rank does not match the array");
             out_strides[r] = c_strides(size, output ? output->itemsize : spec_.itemsize);
@@ -464,6 +493,21 @@ public:
         if (cache_)
             cache_->put(ck, chunk);
         return chunk;
+    }
+
+    // Copy a full decoded chunk, including stored padding at the array edge, or
+    // materialize fill when absent. The destination must hold exactly one chunk.
+    // Returns whether the chunk was stored. Like chunk(), uses configured caches.
+    bool read_chunk(const Index& idx, std::uint8_t* out, std::size_t size)
+    {
+        if (size != chunk_bytes_)
+            throw std::invalid_argument("destination size does not match the chunk");
+        const auto data = chunk(idx);
+        if (data)
+            std::memcpy(out, data->data(), size);
+        else
+            fill_elements(out, size / spec_.itemsize, spec_.fill);
+        return bool(data);
     }
 
     // Whether the chunk's decoded bytes are already in memory (the memory cache or a
