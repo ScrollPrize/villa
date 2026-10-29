@@ -149,6 +149,7 @@ struct LayerOptions {
 struct Layers {
     std::vector<CacheLayer> layers;
     int writer = -1;
+    std::vector<std::string> busy;  // VC3D caches skipped: another process is replacing them
 };
 Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& url, const ArrayMeta& source,
                   const LayerOptions& options);

@@ -1,6 +1,7 @@
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
 #include "vc_reader/reader.hpp"
+#include "vc_reader/zarr.hpp"
 #include "output_pool.hpp"
 
 #include <nanobind/nanobind.h>
@@ -11,6 +12,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
 
 #include <functional>
 #include <numeric>
@@ -196,6 +198,67 @@ NB_MODULE(_reader, m)
         .def_prop_ro("misses", &vcr::MemoryCache::misses)
         .def("__len__", &vcr::MemoryCache::size)
         .def("clear", &vcr::MemoryCache::clear);
+
+    // Disk-cache layers of remote arrays (vc_reader/zarr.hpp); the Python reader's
+    // vc_reader.reader.disk_cache is a thin layer over these.
+    nb::class_<vcr::zarr::Layers>(m, "CacheLayers")
+        .def("__len__", [](const vcr::zarr::Layers& l) { return l.layers.size(); })
+        .def_prop_ro("writer", [](const vcr::zarr::Layers& l) { return l.writer; })
+        .def_prop_ro("busy", [](const vcr::zarr::Layers& l) { return l.busy; })
+        .def("layer", [](const vcr::zarr::Layers& l, std::size_t i) {
+            const auto& c = l.layers.at(i);
+            return std::make_tuple(c.kind, c.root, c.stored.raw.dump(), c.emptyRoot, c.allowLossy, c.budgetRoot);
+        }, "index"_a)
+        .def("release", [](vcr::zarr::Layers& l, std::size_t i) { l.layers.at(i).lease.reset(); }, "index"_a);
+    m.def("open_layers",
+          [](const std::vector<std::string>& cache_dirs, const std::string& url, const std::string& source,
+             std::optional<std::string> group_url, std::optional<std::string> level_key, bool writable,
+             bool allow_lossy, bool compress, std::optional<std::int64_t> max_bytes) {
+              vcr::zarr::LayerOptions options;
+              options.groupUrl = std::move(group_url);
+              options.levelKey = std::move(level_key);
+              options.writable = writable;
+              options.allowLossy = allow_lossy;
+              options.compress = compress;
+              options.maxBytes = max_bytes;
+              const auto meta = vcr::zarr::parseArrayMeta(vcr::zarr::Json::parse(source));
+              nb::gil_scoped_release release;
+              return vcr::zarr::openLayers(cache_dirs, url, meta, options);
+          },
+          "cache_dirs"_a, "url"_a, "source"_a, "group_url"_a.none(), "level_key"_a.none(), "writable"_a,
+          "allow_lossy"_a, "compress"_a, "max_bytes"_a.none());
+    m.def("cached_source_zarray",
+          [](const std::vector<std::string>& cache_dirs, const std::string& url, std::optional<std::string> group_url,
+             std::optional<std::string> level_key) -> std::optional<std::string> {
+              const auto found = vcr::zarr::cachedSourceZarray(cache_dirs, url, group_url, level_key);
+              return found ? std::optional<std::string>(found->dump()) : std::nullopt;
+          },
+          "cache_dirs"_a, "url"_a, "group_url"_a.none(), "level_key"_a.none());
+    m.def("cached_node_dirs", [](const std::vector<std::string>& cache_dirs, const std::string& url) {
+        std::vector<std::string> out;
+        for (const auto& d : vcr::zarr::cachedNodeDirs(cache_dirs, url))
+            out.push_back(d.string());
+        return out;
+    }, "cache_dirs"_a, "url"_a);
+    m.def("cache_roots", [](const std::vector<std::string>& cache_dirs) {
+        std::vector<std::string> out;
+        for (const auto& d : vcr::zarr::cacheRoots(cache_dirs))
+            out.push_back(d.string());
+        return out;
+    }, "cache_dirs"_a);
+    m.def("decoded_cache_path", [](const std::string& cache_dir, const std::string& url) {
+        return vcr::zarr::decodedCachePath(cache_dir, url).string();
+    }, "cache_dir"_a, "url"_a);
+    m.def("vc3d_volume_id", &vcr::zarr::vc3dVolumeId, "url"_a);
+    m.def("vc3d_cache_root", []() -> std::optional<std::string> {
+        const auto root = vcr::zarr::vc3dCacheRoot();
+        return root ? std::optional<std::string>(root->string()) : std::nullopt;
+    });
+    m.def("disk_budget", &vcr::zarr::diskBudget, "root"_a, "max_bytes"_a.none(),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("atomic_write", [](const std::string& path, nb::bytes data) {
+        vcr::zarr::atomicWrite(path, std::string(data.c_str(), data.size()));
+    }, "path"_a, "data"_a);
 
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,

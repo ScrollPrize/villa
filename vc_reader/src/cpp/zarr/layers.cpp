@@ -200,7 +200,7 @@ std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& so
              (order.is_null() || order == "C") && sameArray(*stored, source, true);
     }
     if (!ok)
-        throw std::runtime_error("disk cache " + root.string() + " holds a different array than " + url +
+        throw std::invalid_argument("disk cache " + root.string() + " holds a different array than " + url +
                                  " (the remote .zarray changed?); delete that cache directory to refill it");
     CacheLayer layer;
     layer.kind = "decoded";
@@ -211,13 +211,15 @@ std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& so
 }
 
 std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string& levelKey, const ArrayMeta& source,
-                                    bool allowLossy, bool writable)
+                                    bool allowLossy, bool writable, std::vector<std::string>& busy)
 {
     if (source.v3)
         return std::nullopt;  // VC3D mirror layouts describe v2 source chunks
     auto lease = std::make_shared<Vc3dLease>(volumeDir);
-    if (!lease->acquire())
-        return std::nullopt;  // being replaced by another process
+    if (!lease->acquire()) {  // being replaced by another process
+        busy.push_back(volumeDir.string());
+        return std::nullopt;
+    }
     const bool delta3d = readText(volumeDir / kDelta3dMarker) == std::string(kDelta3dMarkerContents);
     const auto root = volumeDir / levelKey;
     auto stored = readJson(root / ".zarray");
@@ -234,7 +236,7 @@ std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string
     if (delta3d) {
         const auto comp = stored->value("compressor", Json());
         if (comp.value("id", std::string()) != kDelta3d || !sameArray(*stored, source, true))
-            throw std::runtime_error("VC3D Delta3D cache " + root.string() + " does not hold this array's chunks");
+            throw std::invalid_argument("VC3D Delta3D cache " + root.string() + " does not hold this array's chunks");
         if (!allowLossy && !losslessCodec(comp))
             return std::nullopt;
         layer.kind = "vc3d-delta3d";
@@ -244,7 +246,7 @@ std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string
         return layer;
     }
     if (!sameArray(*stored, source, false))
-        throw std::runtime_error("VC3D cache " + root.string() + " mirrors a different array (the remote .zarray changed?)");
+        throw std::invalid_argument("VC3D cache " + root.string() + " mirrors a different array (the remote .zarray changed?)");
     layer.kind = "vc3d-mirror";
     layer.stored = parseArrayMeta(*stored);
     return layer;
@@ -504,13 +506,13 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
     if (options.vc3dVolumeDir && options.levelKey) {
         std::error_code ec;
         if (fs::is_directory(*options.vc3dVolumeDir, ec))
-            if (auto layer = vc3dLayer(*options.vc3dVolumeDir, *options.levelKey, source, options.allowLossy, vc3dWritable))
+            if (auto layer = vc3dLayer(*options.vc3dVolumeDir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy))
                 out.layers.push_back(std::move(*layer));
     }
     for (const auto& root : roots) {
         if (options.groupUrl && options.levelKey && !options.vc3dVolumeDir)
             if (const auto vdir = vc3dDir(root, *options.groupUrl))
-                if (auto layer = vc3dLayer(*vdir, *options.levelKey, source, options.allowLossy, vc3dWritable))
+                if (auto layer = vc3dLayer(*vdir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy))
                     out.layers.push_back(std::move(*layer));
         if (auto layer = decodedLayer(decodedCachePath(root, url), source, url, false, false, options.allowLossy))
             out.layers.push_back(std::move(*layer));
