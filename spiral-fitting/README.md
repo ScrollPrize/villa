@@ -199,6 +199,29 @@ the z chunk rows of your fit window packs correctly; rows outside it read back
 as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
 the CT mask.
 
+## Fitting from the public Lasagna release: choose a spacing mode
+
+The open-data Lasagna release (`<scroll>/representations/predictions/lasagna/`)
+ships `nx`, `ny`, `grad_mag` and `cos`, but no winding-inference store and no
+outer shell. The default `dense_spacing_mode` is `winding_model`, which needs
+both, so a fit from public data has to switch them off
+(`"input_use_winding_inference": false`, `"input_use_outer_shell": false`).
+That also switches off the only active spacing loss: `grad_mag` is not used
+unless `dense_spacing_mode` is `grad_mag`, whatever
+`input_use_gradient_magnitude` says. The windings are then placed by the normals
+and the regularisers alone, with the min-spacing barrier as a lower bound, and
+the step-0 loss line shows no `dense_spacing` term. To supervise spacing from
+public data, add
+
+```json
+{ "dense_spacing_mode": "grad_mag" }
+```
+
+and pack `grad_mag` as above. The fitter prints a `WARNING` at start-up when no
+dense spacing loss is active. (The retired `phase` mode, used by some published
+recipes pinned to commits before September 2026, is now rejected as an invalid
+value.)
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
