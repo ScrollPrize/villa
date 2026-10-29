@@ -154,6 +154,34 @@ int main() try {
          auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
+        // One choice settles both directions: b -> a follows the chosen route backwards.
+        const auto context=db.volumeTransforms(read);
+        const auto back=context.resolve("b","a");
+        require(back.status==vcr::catalog::TransformStatus::Resolved,"the reverse direction resolves through the choice");
+        require(back.resolved().path.size()==1&&back.resolved().path[0]=="inverse:"+paths[0][0],"the reverse route is the choice inverted");
+        const auto forward=context.resolve("a","b").resolved().forward;
+        require(forward.equivalent(back.resolved().inverse)&&(forward*back.resolved().forward).equivalent(VolumeAffine{}),
+                "a point mapped a -> b -> a returns to itself");
+        bool reverseChosen=false;
+        for(const auto& related:context.related("a"))if(related.volume=="b")reverseChosen=related.chosen&&*related.chosen==back.resolved().path;
+        require(reverseChosen,"the reverse pair reports the implied choice");
+        require(!context.chosen("a","c")&&!context.chosen("c","a"),"unrelated pairs have no choice");
+    }
+    {
+        // An explicit reverse choice wins over the implied one.
+        std::vector<std::vector<std::string>> paths;
+        {auto read=db.read();for(const auto& c:db.volumeTransforms(read).graph.resolve("b","a").candidates)paths.push_back(c.path);}
+        require(paths.size()==2,"two candidate reverse routes");
+        const auto implied=[&]{auto read=db.read();return db.volumeTransforms(read).resolve("b","a").resolved().path;}();
+        const auto other=paths[0]==implied?paths[1]:paths[0];
+        {auto txn=db.write();db.chooseVolumeTransform(txn,"b","a",other);txn.commit();}
+        auto read=db.read();const auto context=db.volumeTransforms(read);
+        require(context.resolve("b","a").resolved().path==other,"an explicit reverse choice is used");
+        require(context.resolve("a","b").resolved().path!=other,"the forward choice is unchanged");
+        const auto choice=volumeTransformChoice(db,read,"b","a");
+        require(choice.has_value(),"the explicit reverse choice is stored");
+        {auto txn=db.write({{choice->uuid,db.currentObjectRevision(read,choice->uuid)->uuid}});db.retireObject(txn,choice->uuid);txn.commit();}
+        {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
     }
     {
         // A volume's one umbilicus, read in its voxels; importing another replaces it.

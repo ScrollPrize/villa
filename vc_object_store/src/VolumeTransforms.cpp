@@ -8,6 +8,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <limits>
+#include <string_view>
 namespace vc::objects {
 std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& metadata,const std::string& target,double targetScale) const {
     if(target.empty() || !std::isfinite(targetScale) || targetScale<=0)throw std::invalid_argument("invalid target volume or scale");
@@ -17,6 +18,17 @@ std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& met
     if(resolution.status!=vcr::catalog::TransformStatus::Resolved)return std::nullopt;
     return VolumeAffine::scale(targetScale)*resolution.resolved().forward*VolumeAffine::scale(1./coordinates["scale_factor"].get<double>());
 }
+std::optional<std::vector<std::string>> VolumeTransforms::chosen(const std::string& source,const std::string& target) const {
+    if(const auto it=choices.find({source,target});it!=choices.end())return it->second;
+    const auto reverse=choices.find({target,source});
+    if(reverse==choices.end())return std::nullopt;
+    // Walk the reverse pair's route backwards: each step inverted, last first.
+    constexpr std::string_view inversePrefix="inverse:";
+    std::vector<std::string> path;
+    for(auto step=reverse->second.rbegin();step!=reverse->second.rend();++step)
+        path.push_back(step->starts_with(inversePrefix)?step->substr(inversePrefix.size()):std::string(inversePrefix)+*step);
+    return path;
+}
 std::vector<VolumeTransforms::Related> VolumeTransforms::related(const std::string& target) const {
     std::vector<Related> result;
     for(auto& routes:graph.reaching(target)) {
@@ -24,7 +36,7 @@ std::vector<VolumeTransforms::Related> VolumeTransforms::related(const std::stri
         entry.volume=routes.source;
         entry.status=resolve(routes.source,target).status;
         entry.routes=std::move(routes.candidates);
-        if(const auto chosen=choices.find({entry.volume,target});chosen!=choices.end())entry.chosen=chosen->second;
+        entry.chosen=chosen(entry.volume,target);
         result.push_back(std::move(entry));
     }
     return result;
