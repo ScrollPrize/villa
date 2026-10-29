@@ -190,7 +190,6 @@ public slots:
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onStraighten(const std::string& segmentId);
-    void onRasterizeSegments(const QStringList& segmentIds);
     // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
     // dialog with empty grid for the user to populate via "Add segments").
     void onMergeSurfaces(const QStringList& segmentIds);
@@ -199,7 +198,6 @@ public slots:
     // is empty and the user picks both via the dialog combos.
     void onMergePatch(const QStringList& segmentIds);
     void onGrowTrackPatches();
-    void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
@@ -279,8 +277,6 @@ public:
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
-
-    // Marks a rasterized label volume and records its source surfaces (UUIDs).
 
 private:
     /** Helper: get current volume path from state */

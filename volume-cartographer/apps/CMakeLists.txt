@@ -68,19 +68,6 @@ target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
 target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
 
-add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
-target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
-
-add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp src/alpha_wrap.cpp)
-target_link_libraries(vc_add_ignore_label
-    vc_core
-    Boost::program_options
-    CGAL::CGAL
-    opencv_core
-    opencv_imgproc
-    opencv_imgcodecs
-)
-
 add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
 target_link_libraries(vc_obj2tifxyz vc_core)
 
@@ -117,8 +104,7 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
     vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-    vc_grow_seg_from_segments vc_tifxyz2obj
-    vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+    vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
     vc_obj2tifxyz_legacy vc_straighten
     vc_fiber_trace_metric vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
     vc_tifxyz_gengt vc_merge_tifxyz vc_merge_patch
@@ -144,8 +130,7 @@ add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
 if(VC_USE_PCH)
     foreach(_app
         vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-        vc_grow_seg_from_segments vc_tifxyz2obj
-        vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+        vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
         vc_obj2tifxyz_legacy
         vc_fiber_trace_metric vc_tifxyz_gengt
         vc_merge_tifxyz vc_merge_patch

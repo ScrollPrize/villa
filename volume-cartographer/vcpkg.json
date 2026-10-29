@@ -32,7 +32,6 @@
     "zlib",
     "blosc",
     "zstd",
-    "lz4",
-    "cgal"
+    "lz4"
   ]
 }

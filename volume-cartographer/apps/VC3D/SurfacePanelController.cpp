@@ -536,12 +536,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     contextMenu.addSeparator();
 
-    QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
-    rasterizeAction->setEnabled(allUsable);
-    connect(rasterizeAction, &QAction::triggered, this, [this, targets]() {
-        emit rasterizeSegmentsRequested(targets);
-    });
-
     // Merge only makes sense for >=2 surfaces; gate on selection so it
     // doesn't appear when the user right-clicks a single surface.
     if (selectedSegmentIds.size() >= 2 && allUsable) {
@@ -558,12 +552,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
             emit mergePatchRequested(selectedSegmentIds);
         });
     }
-
-    QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
-    addIgnoreLabelAction->setEnabled(usable);
-    connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {
-        emit addIgnoreLabelRequested();
-    });
 
     contextMenu.addSeparator();
 

@@ -15,7 +15,6 @@ apt-get install -y --no-install-recommends \
     libboost-system-dev libboost-program-options-dev \
     libceres-dev libsuitesparse-dev \
     libopencv-dev libopencv-contrib-dev \
-    libcgal-dev libmpfr-dev libgmp-dev \
     libblosc-dev libzstd-dev libcurl4-openssl-dev \
     nlohmann-json3-dev libavahi-client-dev libsqlite3-dev libssl-dev \
     liblz4-dev libtiff-dev \

@@ -2945,14 +2945,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onStraighten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::rasterizeSegmentsRequested,
-        this, [this](const QStringList& segmentIds) {
-            _segmentationCommandHandler->onRasterizeSegments(segmentIds);
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
-        this, [this]() {
-            _segmentationCommandHandler->onAddIgnoreLabel();
-        });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
                 showStatusBarMessage(message, timeoutMs);

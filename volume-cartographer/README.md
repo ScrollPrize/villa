@@ -104,7 +104,7 @@ cmake --preset windows-msvc
 cmake --build build\windows-msvc
 ```
 
-The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, ...)
 from source via vcpkg — this takes a while, but later configures restore it from
 vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
 plugins and dependency DLLs deployed alongside it, runnable in place. To work in

@@ -96,7 +96,6 @@ required_formulae=(
   ceres-solver
   eigen
   opencv
-  cgal
   c-blosc
   boost
   libtiff

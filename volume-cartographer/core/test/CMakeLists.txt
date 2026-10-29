@@ -343,22 +343,10 @@ vc_add_test(NAME test_surface_meshing)
 # configurations that build the apps -- the test shards configure with
 # VC_BUILD_APPS=OFF and apps/ returns before the tool targets are created.
 if(VC_BUILD_APPS)
-    vc_add_test(NAME test_ignore_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
-    add_dependencies(test_ignore_zarr_output vc_add_ignore_label)
-    set_tests_properties(test_ignore_zarr_output PROPERTIES
-        ENVIRONMENT "VC_ADD_IGNORE_LABEL_BIN=$<TARGET_FILE:vc_add_ignore_label>"
-        TIMEOUT 180)
-
     vc_add_test(NAME test_ngrids_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
     add_dependencies(test_ngrids_zarr_output vc_ngrids)
     set_tests_properties(test_ngrids_zarr_output PROPERTIES
         ENVIRONMENT "VC_NGRIDS_BIN=$<TARGET_FILE:vc_ngrids>"
-        TIMEOUT 180)
-
-    vc_add_test(NAME test_sparse_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
-    add_dependencies(test_sparse_zarr_output vc_tifxyz2zarr_sparse)
-    set_tests_properties(test_sparse_zarr_output PROPERTIES
-        ENVIRONMENT "VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>"
         TIMEOUT 180)
 
     # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
@@ -379,9 +367,9 @@ if(VC_BUILD_APPS)
     if(TARGET flatboi)
         add_dependencies(test_tool_store_modes flatboi)
     endif()
-    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_tifxyz2zarr_sparse vc_grow_seg_from_segments)
+    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_grow_seg_from_segments)
     set_tests_properties(test_tool_store_modes PROPERTIES
-        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
+        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 endif()
 
 add_executable(bench_render_synthetic bench_render_synthetic.cpp)

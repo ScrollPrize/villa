@@ -68,15 +68,12 @@ fi
     libavahi-client-dev \
     libblosc-dev \
     libboost-program-options-dev \
-    libcgal-dev \
     libceres-dev \
     libcurl4-openssl-dev \
-    libgmp-dev \
     libhwloc-dev \
     liblapack-dev \
     liblapacke-dev \
     liblz4-dev \
-    libmpfr-dev \
     libopenblas-dev \
     libopencv-contrib-dev \
     libopencv-dev \
