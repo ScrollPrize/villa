@@ -106,13 +106,9 @@ namespace viewer {
 
     // Display & Appearance
     constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
-    constexpr auto SHOW_DIRECTION_HINTS = "viewer/show_direction_hints";
     constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
     constexpr auto NORMAL_ARROW_LENGTH_SCALE = "viewer/normal_arrow_length_scale";
     constexpr auto NORMAL_MAX_ARROWS = "viewer/normal_max_arrows";
-    constexpr auto DIRECTION_STEP = "viewer/direction_step";
-    constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
-    constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
     constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
@@ -120,13 +116,9 @@ namespace viewer {
     constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
-    constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
     constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
     constexpr int NORMAL_ARROW_LENGTH_SCALE_DEFAULT = 100;  // Percentage (100 = 1.0x)
     constexpr int NORMAL_MAX_ARROWS_DEFAULT = 32;  // Max arrows per axis for sampling
-    constexpr double DIRECTION_STEP_DEFAULT = 10.0;
-    constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
-    constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
     constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
@@ -143,15 +135,9 @@ namespace viewer {
     // Intersection Rendering
     constexpr auto INTERSECTION_OPACITY = "viewer/intersection_opacity";
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
-
-    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
-    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
@@ -179,17 +165,9 @@ namespace viewer {
     // Viewer control group expansion states
     constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
     constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
-    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
-    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
-    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
-    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -199,13 +177,6 @@ namespace appearance {
     // Theme id ("classic", "modern-dark", a user theme) or a theme file path.
     constexpr auto THEME = "appearance/theme";
     constexpr auto THEME_DEFAULT = "classic";
-}
-
-// -----------------------------------------------------------------------------
-// Atlas Workspace Settings
-// -----------------------------------------------------------------------------
-namespace atlas {
-    constexpr auto SEARCH_MAX_DISTANCE = "atlas/search_max_distance";
 }
 
 // -----------------------------------------------------------------------------
@@ -239,17 +210,6 @@ namespace perf {
     constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
     constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
     constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
-
-    // LOD synthesis method.  Selects how c3d chunks are decoded when a
-    // downscaled view is requested.  Value is one of:
-    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
-    //   "full_decode_box"   — full decode + box-average pool.
-    //   "full_decode_min"   — full decode + min pool.
-    //   "full_decode_max"   — full decode + max pool.
-    // Has no effect until the sampler calls into the LOD-synthesis path
-    // (no-op on the current multi-level zarr pyramid).
-    constexpr auto LOD_METHOD = "perf/lod_method";
-    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
     // Process-wide remote source-download admission. Automatic mode adapts
     // between 2 and the fixed worker capacity. Manual mode admits exactly the
@@ -296,6 +256,12 @@ namespace viewer_cache {
     // leaves the overlay channel on its legacy resident-only sampling path.
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
     constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
+
+    // App-wide budget for decoded object-store surface geometry (every
+    // surface's tiles read for intersections and lookups), shared by all
+    // workspaces and stores.
+    constexpr auto SURFACE_GEOMETRY_CACHE_GB = "viewer_cache/surface_geometry_cache_gb";
+    constexpr int SURFACE_GEOMETRY_CACHE_GB_DEFAULT = 8;
 
 }
 
@@ -388,21 +354,6 @@ namespace line_annotation {
 }
 
 // -----------------------------------------------------------------------------
-// Export Settings
-// -----------------------------------------------------------------------------
-namespace export_ {  // underscore because 'export' is reserved keyword
-    constexpr auto CHUNK_WIDTH_PX = "export/chunk_width_px";
-    constexpr auto CHUNK_OVERLAP_PX = "export/chunk_overlap_px";
-    constexpr auto OVERWRITE = "export/overwrite";
-    constexpr auto DIR = "export/dir";
-
-    constexpr int CHUNK_WIDTH_PX_DEFAULT = 40000;
-    constexpr int CHUNK_OVERLAP_PX_DEFAULT = 0;
-    constexpr bool OVERWRITE_DEFAULT = true;
-    constexpr auto DIR_DEFAULT = "";
-}
-
-// -----------------------------------------------------------------------------
 // Neighbor Copy Settings
 // -----------------------------------------------------------------------------
 namespace neighbor_copy {
@@ -418,31 +369,17 @@ namespace neighbor_copy {
 // AWS Settings
 // -----------------------------------------------------------------------------
 namespace aws {
-    constexpr auto DEFAULT_PROFILE = "aws/default_profile";
     constexpr auto ACCESS_KEY = "aws/access_key";
     constexpr auto SECRET_KEY = "aws/secret_key";
     constexpr auto SESSION_TOKEN = "aws/session_token";
-
-    constexpr auto DEFAULT_PROFILE_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------
 // Tools Settings
 // -----------------------------------------------------------------------------
 namespace tools {
-    constexpr auto FLATBOI_PATH = "tools/flatboi_path";
-    constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
     constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
     constexpr auto GROW_TRACK_VENV_DEFAULT = "";
-}
-
-// -----------------------------------------------------------------------------
-// Backup Settings
-// -----------------------------------------------------------------------------
-namespace backup {
-    // How many rotating snapshots to keep per segment under <volpkg_dir>/backups/.
-    constexpr auto SEGMENT_COUNT = "backup/segment_count";
-    constexpr int  SEGMENT_COUNT_DEFAULT = 10;
 }
 
 // -----------------------------------------------------------------------------
@@ -452,18 +389,14 @@ namespace segmentation {
     // Tool group expansion states
     constexpr auto GROUP_EDITING_EXPANDED = "group_editing_expanded";
     constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
-    constexpr auto GROUP_LINE_EXPANDED = "group_line_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
     constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
-    constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
     constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
 
     constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_LINE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
 
     // Drag tool (note: these are stored in a QSettings group)
@@ -471,10 +404,6 @@ namespace segmentation {
     constexpr auto DRAG_SIGMA_STEPS = "drag_sigma_steps";
     constexpr auto RADIUS_STEPS = "radius_steps";  // Legacy key
     constexpr auto SIGMA_STEPS = "sigma_steps";    // Legacy key
-
-    // Line tool
-    constexpr auto LINE_RADIUS_STEPS = "line_radius_steps";
-    constexpr auto LINE_SIGMA_STEPS = "line_sigma_steps";
 
     // Push/Pull tool
     constexpr auto PUSH_PULL_RADIUS_STEPS = "push_pull_radius_steps";
@@ -518,20 +447,9 @@ namespace segmentation {
     // Hover marker
     constexpr auto SHOW_HOVER_MARKER = "show_hover_marker";
 
-    // Approval brush
-    constexpr auto APPROVAL_BRUSH_RADIUS = "approval_brush_radius";
-    constexpr auto APPROVAL_BRUSH_DEPTH = "approval_brush_depth";
-    constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
-    constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
-    constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
-    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
-
-    // Auto-approval settings
-    constexpr auto AUTO_APPROVAL_ENABLED = "auto_approval_enabled";
-    constexpr auto AUTO_APPROVAL_RADIUS = "auto_approval_radius";
-    constexpr auto AUTO_APPROVAL_THRESHOLD = "auto_approval_threshold";
-    constexpr auto AUTO_APPROVAL_MAX_DISTANCE = "auto_approval_max_distance";
-
+    // Draw mask brush radius (voxels)
+    constexpr auto MASK_BRUSH_RADIUS = "mask_brush_radius";
+    constexpr float MASK_BRUSH_RADIUS_DEFAULT = 50.0f;
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;

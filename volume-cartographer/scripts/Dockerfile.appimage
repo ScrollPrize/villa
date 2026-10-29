@@ -38,11 +38,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends patchelf file desktop-file-utils zstd \
  && rm -rf /var/lib/apt/lists/*
 
-# Preserve the monorepo sibling layout used by VC3D's runtime service install.
+# Preserve the monorepo sibling layout used by VC3D's runtime service install
+# and by cmake/ObjectStore.cmake, which builds ../vc_object_store from source.
 # Dockerfile.appimage.dockerignore limits the repository-root context to these
 # inputs, keeping unrelated subprojects and local build products out of it.
 COPY volume-cartographer/ /src/volume-cartographer/
 COPY spiral-fitting/ /src/spiral-fitting/
+COPY vc_object_store/ /src/vc_object_store/
 COPY vesuvius/src/vc3d_fiber_format/ /src/vesuvius/src/vc3d_fiber_format/
 WORKDIR /src/volume-cartographer
 

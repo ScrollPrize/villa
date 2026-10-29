@@ -6,6 +6,8 @@
 #include "geometry/SharedGeometry.hpp"
 #include "internal/History.hpp"
 #include <nlohmann/json.hpp>
+#include <limits>
+#include <optional>
 #include <set>
 
 namespace vc::objects {
@@ -37,37 +39,47 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
     try {
         // Even a no-op must check the caller's pin.
         auto head = db.editGeometry(txn, uuid, {}, expected);
-        auto data = db.readGeometryData(txn, head);
+        const auto revision = *db.geometryRevision(txn, head);
         (void)detail::geometrySchema(desired);
-        if (data.kind != desired.kind || data.formatVersion != desired.formatVersion ||
-            data.coordinateSystem != desired.coordinateSystem || Json::parse(data.attributes) != Json::parse(desired.attributes))
+        if (revision.kind != desired.kind || revision.formatVersion != desired.formatVersion ||
+            revision.coordinateSystem != desired.coordinateSystem || Json::parse(revision.attributes) != Json::parse(desired.attributes))
             throw std::invalid_argument("array updates require unchanged geometry schema and attributes");
+        // Sequence edits (fibers, point collections, tracks) work on whole arrays.
+        // Other arrays, including every surface array, are diffed in bounded
+        // windows so surfaces of any size update without a full read.
+        std::optional<GeometryData> whole;
+        auto sequenceData = [&]() -> GeometryData& {
+            if (!whole) whole = db.readGeometryData(txn, head, std::numeric_limits<uint64_t>::max());
+            return *whole;
+        };
         std::set<std::string> identityArrays;
         for (const auto& array : desired.arrays) {
             const auto name = detail::sequenceIdArray(desired.kind, array.name);
             if (!name.empty()) identityArrays.insert(name);
         }
-        for (const auto& array : data.arrays)
+        for (const auto& array : revision.arrays)
             if (!findArray(desired, array.name))
                 throw std::invalid_argument("array updates cannot remove arrays");
         for (const auto& [name, value] : annotations)
             if (!findArray(desired, name) || (desired.kind == "fiber" ? name != "control_points" && name != "line_points"
-                : desired.kind == "patch" || name != "points"))
+                : desired.kind == "surface" || name != "points"))
                 throw std::invalid_argument("invalid sequence annotations: " + name);
         auto decisions = [&](const std::vector<EdgeRecord>& edges) {
             return decide ? decide(edges) : std::vector<GeometryEdgeEdit>{};
         };
         for (const auto& target : desired.arrays) {
             if (identityArrays.contains(target.name)) continue;
-            const auto* previous = findArray(data, target.name);
-            if (!previous || previous->dtype != target.dtype)
+            const auto previous = std::find_if(revision.arrays.begin(), revision.arrays.end(),
+                [&](const auto& a) { return a.name == target.name; });
+            if (previous == revision.arrays.end() || previous->dtype != target.dtype)
                 throw std::invalid_argument("array updates cannot change array schema");
-            auto old = *previous;
             const auto scalarBytes = detail::geometryByteLength(target.dtype, {1});
             const auto idsName = detail::sequenceIdArray(desired.kind, target.name);
             const bool sequence = desired.kind == "fiber" ? target.name == "control_points" || target.name == "line_points"
-                : desired.kind != "patch" && target.name == "points";
+                : desired.kind != "surface" && target.name == "points";
             if (sequence) {
+                auto& data = sequenceData();
+                const auto old = *findArray(data, target.name);
                 const size_t count = target.shape.at(0), oldCount = old.shape.at(0);
                 const auto oldIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(data, idsName, oldCount);
                 const auto newIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(desired, idsName, count);
@@ -116,28 +128,34 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                     }
                     const auto affected = detail::structuralSnapshotEdges(db, txn, uuid, proposed, changedIds);
                     head = db.editGeometrySequence(txn, uuid, edit, head, decisions(affected));
-                    data = db.readGeometryData(txn, head);
-                    old = *findArray(data, target.name);
+                    whole.reset();
                 }
-            } else if (target.shape != old.shape) {
+            } else if (target.shape != previous->shape) {
                 throw std::invalid_argument("array updates cannot resize a grid or auxiliary array");
             }
             std::vector<GeometryArrayEdit> edits;
             // Coalesce consecutive changed scalars, preserving exact encoded bytes.
-            for (size_t offset = 0; offset < target.bytes.size();) {
-                if (std::equal(target.bytes.begin() + offset, target.bytes.begin() + offset + scalarBytes, old.bytes.begin() + offset)) {
-                    offset += scalarBytes; continue;
+            // Runs continue across read windows.
+            std::optional<size_t> run;
+            auto close = [&](size_t end) {
+                edits.push_back({target.name, int64_t(*run / scalarBytes), {target.bytes.begin() + *run, target.bytes.begin() + end}});
+                run.reset();
+            };
+            for (size_t window = 0; window < target.bytes.size(); window += detail::geometryChunkSize) {
+                const auto count = std::min(detail::geometryChunkSize, target.bytes.size() - window);
+                const auto old = db.readGeometryArray(txn, head, target.name, int64_t(window), int64_t(count));
+                if (old.size() != count) throw std::runtime_error("geometry: short array read");
+                for (size_t offset = 0; offset < count; offset += scalarBytes) {
+                    const bool same = std::equal(old.begin() + offset, old.begin() + offset + scalarBytes,
+                                                 target.bytes.begin() + window + offset);
+                    if (!same && !run) run = window + offset;
+                    else if (same && run) close(window + offset);
                 }
-                const auto start = offset;
-                do { offset += scalarBytes; }
-                while (offset < target.bytes.size() && !std::equal(target.bytes.begin() + offset,
-                       target.bytes.begin() + offset + scalarBytes, old.bytes.begin() + offset));
-                edits.push_back({target.name, int64_t(start / scalarBytes), {target.bytes.begin() + start, target.bytes.begin() + offset}});
             }
+            if (run) close(target.bytes.size());
             if (!edits.empty()) {
-                const auto affected = db.affectedGeometryEditEdges(txn, uuid, edits, head);
-                head = db.editGeometry(txn, uuid, edits, head, decisions(affected));
-                data = db.readGeometryData(txn, head);
+                head = db.editGeometry(txn, uuid, edits, head, ObjectStore::EdgeDecider(decisions));
+                whole.reset();
             }
         }
         savepoint.release();

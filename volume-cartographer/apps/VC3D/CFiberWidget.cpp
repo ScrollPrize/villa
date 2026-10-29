@@ -243,18 +243,18 @@ void CFiberWidget::setupUi()
     auto* mainWidget = new QWidget(scrollArea);
     auto* layout = new QVBoxLayout(mainWidget);
 
-    // Store: the attached object store every listed and drawn fiber comes from.
+    // Store: where every listed and drawn fiber is kept (the project's, or another store chosen for fibers).
     auto* storeLayout = new QHBoxLayout();
-    _attachButton = new QPushButton(tr("Attach store…"), mainWidget);
+    _attachButton = new QPushButton(tr("Fibers from another store…"), mainWidget);
     _attachButton->setObjectName(QStringLiteral("fiberAttachStoreButton"));
-    _detachButton = new QPushButton(tr("Detach"), mainWidget);
+    _detachButton = new QPushButton(tr("Fibers from the project"), mainWidget);
     _detachButton->setObjectName(QStringLiteral("fiberDetachStoreButton"));
     _detachButton->setEnabled(false);
     storeLayout->addWidget(_attachButton);
     storeLayout->addWidget(_detachButton);
     storeLayout->addStretch(1);
     layout->addLayout(storeLayout);
-    _storeStatusLabel = new QLabel(tr("No object store attached."), mainWidget);
+    _storeStatusLabel = new QLabel(tr("No project open."), mainWidget);
     _storeStatusLabel->setObjectName(QStringLiteral("fiberStoreStatusLabel"));
     _storeStatusLabel->setWordWrap(true);
     layout->addWidget(_storeStatusLabel);
@@ -568,7 +568,7 @@ void CFiberWidget::setupUi()
     connect(_deleteButton, &QPushButton::clicked, this, &CFiberWidget::onDeleteClicked);
 
     updateClassificationUi();
-    setStoreStatus(false, tr("No object store attached."));
+    setStoreStatus(false, tr("No project open."));
     scrollArea->setWidget(mainWidget);
     setWidget(scrollArea);
 }
@@ -655,7 +655,6 @@ void CFiberWidget::setAnnotationStatus(const QString& text)
 
 void CFiberWidget::setLineAnnotationActive(bool active)
 {
-    _lineAnnotationActive = active;
     _treeView->setToolTip(active
         ? tr("Click a fiber to select it; double-click to open it in Line Annotation.")
         : tr("Click a fiber to select it and focus the main views; "
@@ -725,16 +724,6 @@ bool CFiberWidget::canDeleteSelection() const
     return !selectedFiberIds().empty();
 }
 
-bool CFiberWidget::canCreateAtlasFromSelection() const
-{
-    return selectedFiberIds().size() == 1;
-}
-
-bool CFiberWidget::canShowFiberSlice() const
-{
-    return selectedFiberIds().size() == 1;
-}
-
 bool CFiberWidget::canRenameFiberFile() const
 {
     return selectedFiberIds().size() == 1;
@@ -750,17 +739,6 @@ std::vector<uint64_t> CFiberWidget::orderedFiberIds() const
         }
     }
     return ids;
-}
-
-QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
-{
-    auto* action = new QAction(tr("Show fiber slice"), parent);
-    action->setObjectName(QStringLiteral("showFiberSliceAction"));
-    action->setEnabled(canShowFiberSlice());
-    connect(action, &QAction::triggered, this, [this]() {
-        requestShowFiberSlice();
-    });
-    return action;
 }
 
 QAction* CFiberWidget::createRenameFiberFileAction(QObject* parent)
@@ -926,19 +904,6 @@ void CFiberWidget::updateTotalLengthLabel()
         tr("Total fiber length: %1  (%2 fibers)")
             .arg(vc3d::fiber_length::formatLength(totalLengthVx(), _voxelSizeUm))
             .arg(_listedFibers.size()));
-}
-
-void CFiberWidget::setAlignmentMetricsPending(bool pending)
-{
-    FiberEntry::AlignmentMetrics metric;
-    metric.pending = pending;
-    for (auto& fiber : _listedFibers) {
-        fiber.alignment = metric;
-        for (auto& span : fiber.spans) {
-            span.alignment = metric;
-        }
-    }
-    refreshMetricDisplays();
 }
 
 void CFiberWidget::updateAlignmentMetrics(
@@ -1587,16 +1552,6 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     }
 
     QMenu menu(this);
-    auto* showFiberSliceAction = createShowFiberSliceAction(&menu);
-    menu.addAction(showFiberSliceAction);
-    menu.addSeparator();
-    auto* newAtlasAction = menu.addAction(tr("New atlas from line"));
-    newAtlasAction->setEnabled(canCreateAtlasFromSelection());
-    connect(newAtlasAction, &QAction::triggered, this, [this]() {
-        if (_selectedFiberId != 0) {
-            emit newAtlasFromFiberRequested(_selectedFiberId);
-        }
-    });
     const auto selectedForCollection = selectedFiberIds();
     auto* addToCollectionAction = menu.addAction(
         selectedForCollection.size() > 1
@@ -1642,13 +1597,6 @@ void CFiberWidget::requestDeleteSelectedFibers()
     }
 
     emit deleteFibersRequested(ids);
-}
-
-void CFiberWidget::requestShowFiberSlice()
-{
-    if (_selectedFiberId != 0 && canShowFiberSlice()) {
-        emit fiberSliceRequested(_selectedFiberId);
-    }
 }
 
 void CFiberWidget::requestRenameFiberFile()

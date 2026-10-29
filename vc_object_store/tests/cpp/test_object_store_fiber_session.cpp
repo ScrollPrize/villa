@@ -68,18 +68,18 @@ int main() try
     const auto bits = std::bit_cast<uint64_t>(-5.0);
     GeometryArrayEdit edit{"control_points", 0, std::vector<uint8_t>(8)};
     for (int i = 0; i < 8; ++i) edit.bytes[i] = uint8_t(bits >> (i*8));
-    std::vector<GeometryEdgeEdit> decisions;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        for (const auto& edge : store.affectedGeometryEditEdges(txn, a, {edit}, originalGeometry)) {
-            GeometryEdgeEdit decision; decision.edgeUuid = edge.uuid; decision.expectedGeneration = edge.generation;
-            decision.aRevision = store.currentGeometry(txn, edge.aUuid)->uuid;
-            decision.bRevision = store.currentGeometry(txn, edge.bUuid)->uuid;
-            decision.action = "keep_recorded";
-            decisions.push_back(decision);
-        }
-    });
     session.act(attachment, expected, [&](auto& store, auto& txn) {
-        store.editGeometry(txn, a, {edit}, originalGeometry, decisions);
+        store.editGeometry(txn, a, {edit}, originalGeometry, [&](const std::vector<EdgeRecord>& affected) {
+            std::vector<GeometryEdgeEdit> decisions;
+            for (const auto& edge : affected) {
+                GeometryEdgeEdit decision; decision.edgeUuid = edge.uuid; decision.expectedGeneration = edge.generation;
+                decision.aRevision = store.currentGeometry(txn, edge.aUuid)->uuid;
+                decision.bRevision = store.currentGeometry(txn, edge.bUuid)->uuid;
+                decision.action = "keep_recorded";
+                decisions.push_back(decision);
+            }
+            return decisions;
+        });
         auto record = *store.objectByUuid(txn, a);
         record.fiber->length = geometry.length();
         store.upsertObject(txn, record);
@@ -142,7 +142,7 @@ int main() try
         store.upsertObject(txn, record);
         store.retireObject(txn, right);
     });
-    session.detach();
+    session.detach(attachment);
     const auto reattached = session.attach(path, options);
     session.read(reattached, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, left)->fiber->controlPointCount == 3, "immediate persistence and reload");

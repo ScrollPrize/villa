@@ -13,10 +13,13 @@ them (see [Offset report](#offset-report)).
 
 ```sh
 vc_objrefine <zarr-volume> <src-surface> <out-surface> params.json
+vc_objrefine --store <store> --surface <uuid> [--name <new surface>] [--volume-uuid <id>] [--tag <tag>] <zarr-volume> params.json
 ```
 
 The source is either an `.obj` with one `vn` line per `v` line, or a tifxyz
-directory; the output has the same type.
+directory; the output has the same type. In store mode the stored surface is
+refined in place, or into a new surface named `--name`; VC3D's dialog uses
+this mode.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -42,7 +45,9 @@ resolution voxels) at every `scale_group`.
 `"offset_report": true` keeps the offset `vc_objrefine` computes for each
 vertex instead of discarding it. It is opt-in, needs tifxyz input (the maps
 live on the segment grid; for `.obj` input the flag is ignored with a
-warning) and never changes the surface written. It is set in the params JSON
+warning) and never changes the surface written. A stored surface (`--store`)
+has no folder to hold it: there a report-only run is refused, and with
+`refine` the flag is ignored with a warning. It is set in the params JSON
 on the command line; VC3D's dialog does not set it.
 
 With `"refine": false` the run only measures, and the output path is a

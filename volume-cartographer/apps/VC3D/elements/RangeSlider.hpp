@@ -12,23 +12,16 @@ public:
 
     void setRange(int minimum, int maximum);
     void setValues(int low, int high);
-    void setLowValue(int value);
-    void setHighValue(int value);
-    void setHandleBorderColor(const QColor& color);
 
-    int minimum() const { return _minimum; }
-    int maximum() const { return _maximum; }
     int lowValue() const { return _lowValue; }
     int highValue() const { return _highValue; }
-    // The ring of the handles: the palette's highlight color unless one was set.
+    // The ring of the handles: the palette's highlight color, read when
+    // painting so a theme change applies.
     QColor handleBorderColor() const;
 
     void setMinimumSeparation(int separation);
-    int minimumSeparation() const { return _minimumSeparation; }
 
 signals:
-    void lowValueChanged(int value);
-    void highValueChanged(int value);
     void valuesChanged(int low, int high);
 
 protected:
@@ -47,7 +40,7 @@ private:
         High
     };
 
-    void updateValues(int low, int high, bool emitSignals);
+    void updateValues(int low, int high);
     int valueFromPosition(int position) const;
     int positionFromValue(int value) const;
     QRect handleRectForValue(int value) const;
@@ -62,5 +55,4 @@ private:
 
     DragTarget _dragTarget;
     int _dragOffset{}; // pixel delta between cursor and handle center
-    QColor _handleBorderColor;  // invalid: follow the palette, which a theme can change
 };

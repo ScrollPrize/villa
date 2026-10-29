@@ -338,9 +338,6 @@ class Volume(_Context):
         return open_sample(self.level(level), {k: v.source if isinstance(v, Asset) else v for k, v in (targets or {}).items()},
                            backend=backend, **options)
 
-    def transform_to(self, other):
-        return self.scroll.transform(self.id, _id(other))
-
     def __repr__(self):
         return f'Volume({self.sample_id!r}, {self.id!r})'
 
@@ -537,10 +534,6 @@ class VolumeLevel:
     @property
     def source(self):
         return _select_level(self.volume.source, self.level)
-
-    @property
-    def voxel_size_um(self):
-        return None if self.volume.pixel_size_um is None else self.volume.pixel_size_um * 2**self.level
 
     def open(self, **options):
         return self.source.open(**options)

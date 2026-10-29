@@ -12,6 +12,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -398,6 +399,77 @@ void writeOffsetReport(const fs::path& dir,
 
 }  // namespace
 
+// The surface with every valid vertex moved along its normal by the
+// alpha-composited offset (unchanged without cfg.refine); null if it has no points.
+// With offsetMap and opacityMap (the offset report), each vertex's offset and
+// accumulated opacity also land there, on the surface grid; NaN marks vertices
+// where no ray was cast: the same ones refine leaves in place (loc_valid fails,
+// which includes the last row and column, or gridNormal has no valid normal there).
+std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader, const RefinementConfig& cfg,
+                                            cv::Mat_<float>* offsetMap = nullptr,
+                                            cv::Mat_<float>* opacityMap = nullptr)
+{
+    cv::Mat_<cv::Vec3f> original = surf.rawPoints().clone();
+    if (original.empty()) {
+        std::cerr << "surface has no points\n";
+        return nullptr;
+    }
+
+    cv::Mat_<cv::Vec3f> refined = original.clone();
+
+    const bool report = offsetMap && opacityMap;
+    if (report) {
+        *offsetMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
+        *opacityMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
+    }
+
+    if (cfg.refine || report) {
+        const int rows = original.rows;
+        const int cols = original.cols;
+
+#pragma omp parallel for collapse(2)
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < cols; ++x) {
+                if (!loc_valid(original, cv::Vec2d(y, x))) {
+                    continue;
+                }
+                const cv::Vec3f normal = surf.gridNormal(y, x);
+                if (!normal_is_valid(normal)) {
+                    continue;
+                }
+                const cv::Vec3f& point = original(y, x);
+                float opacity = 0.0f;
+                const float off = alphacomp_offset(reader,
+                                                   point,
+                                                   normal,
+                                                   cfg.start,
+                                                   cfg.stop,
+                                                   cfg.step,
+                                                   cfg.low,
+                                                   cfg.high,
+                                                   cfg.r,
+                                                   &opacity);
+                if (cfg.refine) {
+                    refined(y, x) = point + normal * (off + cfg.border_off);
+                }
+                if (report) {
+                    (*offsetMap)(y, x) = off;
+                    (*opacityMap)(y, x) = opacity;
+                }
+            }
+        }
+    }
+
+    auto out = std::make_unique<QuadSurface>(refined, surf.scale());
+    if (!surf.meta.is_null()) {
+        out->meta = surf.meta;
+    }
+    if (cfg.gen_vertexcolor) {
+        std::cerr << "warning: gen_vertexcolor not supported for surface output; ignoring flag\n";
+    }
+    return out;
+}
+
 int process_tifxyz(const std::filesystem::path& src,
                    const std::filesystem::path& dst,
                    DSReader& reader,
@@ -423,71 +495,18 @@ int process_tifxyz(const std::filesystem::path& src,
         return EXIT_FAILURE;
     }
 
-    cv::Mat_<cv::Vec3f> original = surf->rawPoints().clone();
-    if (original.empty()) {
-        std::cerr << "tifxyz surface has no points\n";
-        return EXIT_FAILURE;
-    }
-
-    cv::Mat_<cv::Vec3f> refined = original.clone();
-
-    // NaN marks vertices where no ray was cast: the same ones refine leaves
-    // in place (loc_valid fails, which includes the last row and column, or
-    // gridNormal has no valid normal there).
     cv::Mat_<float> offsetMap;
     cv::Mat_<float> opacityMap;
-    if (cfg.offset_report) {
-        offsetMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
-        opacityMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
-    }
-
-    if (cfg.refine || cfg.offset_report) {
-        const int rows = original.rows;
-        const int cols = original.cols;
-
-#pragma omp parallel for collapse(2)
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < cols; ++x) {
-                if (!loc_valid(original, cv::Vec2d(y, x))) {
-                    continue;
-                }
-                const cv::Vec3f normal = surf->gridNormal(y, x);
-                if (!normal_is_valid(normal)) {
-                    continue;
-                }
-                const cv::Vec3f& point = original(y, x);
-                float opacity = 0.0f;
-                const float off = alphacomp_offset(reader,
-                                                   point,
-                                                   normal,
-                                                   cfg.start,
-                                                   cfg.stop,
-                                                   cfg.step,
-                                                   cfg.low,
-                                                   cfg.high,
-                                                   cfg.r,
-                                                   &opacity);
-                if (cfg.refine) {
-                    refined(y, x) = point + normal * (off + cfg.border_off);
-                }
-                if (cfg.offset_report) {
-                    offsetMap(y, x) = off;
-                    opacityMap(y, x) = opacity;
-                }
-            }
-        }
-    }
+    auto outSurf = refine_surface(*surf, reader, cfg,
+                                  cfg.offset_report ? &offsetMap : nullptr,
+                                  cfg.offset_report ? &opacityMap : nullptr);
+    if (!outSurf) return EXIT_FAILURE;
 
     if (!reportOnly) {
-        QuadSurface outSurf(refined, surf->scale());
-        outSurf.id = dst.filename().string();
-
-        if (!surf->meta.is_null()) {
-            outSurf.meta = surf->meta;
-        }
+        outSurf->id = dst.filename().string();
 
         try {
-            outSurf.saveEdited(src, dst, cfg.overwrite);
+            outSurf->saveEdited(src, dst, cfg.overwrite);
         } catch (const std::exception& e) {
             std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
             return EXIT_FAILURE;
@@ -498,10 +517,6 @@ int process_tifxyz(const std::filesystem::path& src,
             // save already drops subfolders on Linux and macOS, not on Windows.
             std::error_code ec;
             std::filesystem::remove_all(reportDir, ec);
-        }
-
-        if (cfg.gen_vertexcolor) {
-            std::cerr << "warning: gen_vertexcolor not supported for tifxyz output; ignoring flag\n";
         }
     }
 
@@ -553,6 +568,42 @@ int process_tifxyz(const std::filesystem::path& src,
     return EXIT_SUCCESS;
 }
 
+// The stored --surface, refined in place, or into a new object named --name
+// (tagged --tag). With --volume-uuid it is read in that volume's voxels (the
+// zarr sampled), and a new object is bound to it.
+int process_stored(StoreSurfaces& store, const StoreToolOptions& options, const nlohmann::json& parameters,
+                   DSReader& reader, const RefinementConfig& cfg)
+{
+    // The offset report writes files beside a tifxyz folder; a stored surface
+    // has none, so it needs a tifxyz path. Report-only would store an
+    // unchanged revision, so refuse it; with refine, refine and skip the report.
+    if (cfg.offset_report && !cfg.refine) {
+        std::cerr << "offset report: needs a tifxyz folder, not a stored surface; nothing was changed" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (cfg.offset_report) {
+        std::cerr << "warning: offset_report needs a tifxyz folder, not a stored surface; ignoring\n";
+    }
+
+    const auto& uuid = options.surfaces.front();
+    try {
+        auto surf = store.load(uuid, true, options.volume);
+        auto refined = refine_surface(*surf, reader, cfg);
+        if (!refined) return EXIT_FAILURE;
+        if (!options.name) {
+            std::cout << "geometry_revision: " << store.update(surf->id, *refined) << std::endl;
+        } else {
+            const auto created = store.create(*refined, *options.name, parameters, {surf->id}, options.tags);
+            std::cout << "surface_uuid: " << created << std::endl;
+        }
+        store.objects().finish();
+    } catch (const std::exception& e) {
+        std::cerr << "failed to refine stored surface " << uuid << ": " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 class MeasureLife
 {
 public:
@@ -572,16 +623,32 @@ private:
 
 int main(int argc, char *argv[])
 {
-    if (argc != 5) {
-        std::cout << "usage: " << argv[0]
-                  << " <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl;
+    // Store mode: the --surface is refined in place, or into a new surface
+    // when --name is given; with --volume-uuid it is read in that volume's
+    // voxels (the zarr's) through the store's view of it.
+    std::vector<std::string> args(argv + 1, argv + argc);
+    std::optional<StoreToolOptions> store;
+    try {
+        store = StoreToolOptions::take(args, {.surfaces = true, .creates = true, .named = true});
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (store ? args.size() != 2 || store->surfaces.size() != 1 : args.size() != 4) {
+        std::cout << "usage: " << argv[0] << " <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl
+                  << "   or: " << argv[0]
+                  << " --store <store> --surface <uuid> [--name <new surface>] [--volume-uuid <id>] [--tag <tag>]"
+                  << " <zarr-volume> <json-params>" << std::endl
+                  << "  in store mode the surface is refined in place, or into a new surface named --name; with"
+                  << " --volume-uuid it is read in that volume's voxels (the zarr's) through the store's view of it"
+                  << std::endl;
         return EXIT_SUCCESS;
     }
 
-    const std::filesystem::path vol_path    = argv[1];
-    const std::filesystem::path surface_src = argv[2];
-    const std::filesystem::path surface_dst = argv[3];
-    const std::filesystem::path params_path = argv[4];
+    const std::filesystem::path vol_path = args[0];
+    const std::filesystem::path surface_src = store ? store->surfaces.front() : args[1];
+    const std::filesystem::path surface_dst = store ? std::filesystem::path() : std::filesystem::path(args[2]);
+    const std::filesystem::path params_path = store ? std::filesystem::path(args[1]) : std::filesystem::path(args[3]);
 
     std::ifstream params_f(params_path);
     if (!params_f) {
@@ -626,6 +693,11 @@ int main(int argc, char *argv[])
     DSReader reader = {&volume, cfg.reader_scale, level};
 
     MeasureLife timer("processing surface ...\n");
+
+    if (store) {
+        StoreSurfaces surfaces(store->store, "vc_objrefine");
+        return process_stored(surfaces, *store, nlohmann::json::parse(params.dump()), reader, cfg);
+    }
 
     int ret = EXIT_FAILURE;
     const SurfaceInputType inputType = detect_surface_type(surface_src);

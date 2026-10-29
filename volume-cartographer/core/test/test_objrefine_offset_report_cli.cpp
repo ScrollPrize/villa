@@ -14,6 +14,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "vc_test.hpp"
 
+#include "support/TestZarrVolume.hpp"
 #include "utils/Json.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -83,15 +84,13 @@ void write_tifxyz(const fs::path& dir)
 // SLAB_DIST voxels away, so an exact probe sample lands on its face.
 void write_volume(const fs::path& dir, float normalZ)
 {
-    Volume::ZarrCreateOptions opts;
-    opts.shapeZYX = {VOL_Z, VOL_XY, VOL_XY};
-    opts.chunkShapeZYX = {32, 32, 32};
-    opts.numLevels = 1;
-    opts.uuid = "objrefine-fixture-vol";
-    opts.name = "objrefine-fixture-vol";
-    opts.overwriteExisting = true;
-    opts.compressor = "none";
-    auto vol = Volume::New(dir, opts);
+    vc::test::ZarrVolumeSpec spec;
+    spec.shapeZYX = {VOL_Z, VOL_XY, VOL_XY};
+    spec.chunkShapeZYX = {32, 32, 32};
+    spec.numLevels = 1;
+    spec.uuid = "objrefine-fixture-vol";
+    spec.name = "objrefine-fixture-vol";
+    auto vol = vc::test::createZarrVolume(dir, spec);
     REQUIRE(vol);
     Array3D<uint8_t> data({VOL_Z, VOL_XY, VOL_XY}, 0);
     for (int z = 0; z < VOL_Z; ++z) {
@@ -101,7 +100,7 @@ void write_volume(const fs::path& dir, float normalZ)
             for (int x = SLAB_X0; x < VOL_XY; ++x)
                 data(z, y, x) = 255;
     }
-    vol->writeZYX(data, {0, 0, 0}, 0);
+    vc::test::writeZYX(*vol, data, {0, 0, 0}, 0);
 }
 
 void write_params(const fs::path& path, bool refine, bool report)

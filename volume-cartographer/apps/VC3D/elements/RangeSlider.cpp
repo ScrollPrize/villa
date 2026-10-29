@@ -50,45 +50,26 @@ void RangeSlider::setRange(int minimum, int maximum)
     const int span = std::max(_minimumSeparation, 1);
     const int clampedLow = std::clamp(_lowValue, _minimum, _maximum - span);
     const int clampedHigh = std::clamp(_highValue, _minimum + span, _maximum);
-    updateValues(clampedLow, clampedHigh, true);
+    updateValues(clampedLow, clampedHigh);
 }
 
 void RangeSlider::setValues(int low, int high)
 {
-    updateValues(low, high, true);
-}
-
-void RangeSlider::setLowValue(int value)
-{
-    updateValues(value, _highValue, true);
-}
-
-void RangeSlider::setHighValue(int value)
-{
-    updateValues(_lowValue, value, true);
+    updateValues(low, high);
 }
 
 void RangeSlider::setMinimumSeparation(int separation)
 {
     _minimumSeparation = std::max(0, separation);
-    updateValues(_lowValue, _highValue, true);
+    updateValues(_lowValue, _highValue);
 }
 
 QColor RangeSlider::handleBorderColor() const
 {
-    return _handleBorderColor.isValid() ? _handleBorderColor : palette().color(QPalette::Highlight);
+    return palette().color(QPalette::Highlight);
 }
 
-void RangeSlider::setHandleBorderColor(const QColor& color)
-{
-    if (_handleBorderColor == color) {
-        return;
-    }
-    _handleBorderColor = color;
-    update();
-}
-
-void RangeSlider::updateValues(int low, int high, bool emitSignals)
+void RangeSlider::updateValues(int low, int high)
 {
     if (_minimum >= _maximum) {
         return;
@@ -122,12 +103,7 @@ void RangeSlider::updateValues(int low, int high, bool emitSignals)
     }
 
     update();
-
-    if (emitSignals) {
-        emit lowValueChanged(_lowValue);
-        emit highValueChanged(_highValue);
-        emit valuesChanged(_lowValue, _highValue);
-    }
+    emit valuesChanged(_lowValue, _highValue);
 }
 
 QSize RangeSlider::sizeHint() const
@@ -203,12 +179,12 @@ void RangeSlider::mousePressEvent(QMouseEvent* event)
             _dragTarget = DragTarget::Low;
             _dragOffset = 0;
             const int value = valueFromPosition(pos.x());
-            updateValues(value, _highValue, true);
+            updateValues(value, _highValue);
         } else {
             _dragTarget = DragTarget::High;
             _dragOffset = 0;
             const int value = valueFromPosition(pos.x());
-            updateValues(_lowValue, value, true);
+            updateValues(_lowValue, value);
         }
     }
 
@@ -227,9 +203,9 @@ void RangeSlider::mouseMoveEvent(QMouseEvent* event)
     const int value = valueFromPosition(pos.x() - _dragOffset);
 
     if (_dragTarget == DragTarget::Low) {
-        updateValues(value, _highValue, true);
+        updateValues(value, _highValue);
     } else if (_dragTarget == DragTarget::High) {
-        updateValues(_lowValue, value, true);
+        updateValues(_lowValue, value);
     }
 }
 
@@ -266,7 +242,7 @@ void RangeSlider::keyPressEvent(QKeyEvent* event)
         step *= 10;
     }
 
-    updateValues(_lowValue + step, _highValue + step, true);
+    updateValues(_lowValue + step, _highValue + step);
 }
 
 int RangeSlider::valueFromPosition(int position) const

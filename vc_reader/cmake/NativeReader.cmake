@@ -36,7 +36,7 @@ target_include_directories(vc_reader_native PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD
-    SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads nlohmann_json::nlohmann_json)
+    SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 
 
 if(VC_READER_ENABLE_CUDA)
