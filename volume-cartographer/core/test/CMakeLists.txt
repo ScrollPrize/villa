@@ -602,6 +602,7 @@ vc_add_test(NAME test_volume_live_s3
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
+vc_add_test(NAME test_normal_grid_generate)
 
 vc_add_test(NAME test_surface_patch_index)
 

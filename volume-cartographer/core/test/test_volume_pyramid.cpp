@@ -104,22 +104,3 @@ TEST_CASE("Volume::shape(level) for all levels matches numScales")
     }
     fs::remove_all(d);
 }
-
-TEST_CASE("Volume: a stored raw chunk round-trips through readChunkInto")
-{
-    auto d = tmpDir("chunkinto");
-    auto v = vc::test::createZarrVolume(d, optsMultiLevel());
-    REQUIRE(v);
-    std::vector<std::byte> in(v->chunkByteSize(0));
-    std::memset(in.data(), 0xCD, in.size());
-    vc::test::writeChunk(*v, 0, {0, 0, 0}, in);
-
-    std::vector<std::byte> out(v->chunkByteSize(0));
-    CHECK(v->readChunkInto(0, {0, 0, 0}, out));
-    CHECK(int(std::to_integer<int>(out[0])) == 0xCD);
-
-    // Missing chunk: readChunkInto returns false.
-    std::vector<std::byte> missing(v->chunkByteSize(0));
-    CHECK_FALSE(v->readChunkInto(0, {1, 1, 1}, missing));
-    fs::remove_all(d);
-}

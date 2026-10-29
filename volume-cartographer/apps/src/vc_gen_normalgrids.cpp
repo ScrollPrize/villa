@@ -35,7 +35,7 @@ inline uint32_t be32(uint32_t v) {
 }
 
 
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/render/ChunkCache.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
@@ -1158,31 +1158,17 @@ void run_generate(const po::variables_map& vm) {
         std::cout << "Opening volume: " << input_path << std::endl;
     }
     const auto open_start = std::chrono::steady_clock::now();
-    Volume input_volume{fs::path(input_path)};
-    if (!input_volume.hasScaleLevel(input_level)) {
-        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
-        // through one silently yields fill value instead of failing.
-        std::string levels;
-        for (int level : input_volume.presentScaleLevels())
-            levels += " " + std::to_string(level);
-        throw std::runtime_error("--level " + std::to_string(input_level) +
-                                 " is not present in this volume; present levels:" +
-                                 levels);
+    auto input_array = vcr::zarr::openPyramidLevel(input_path, input_level, {});
+    const std::vector<size_t> shape(input_array.meta.shape.begin(), input_array.meta.shape.end());
+    const std::vector<size_t> source_chunk_shape(input_array.meta.chunks.begin(), input_array.meta.chunks.end());
+    if (shape.size() != 3 || input_array.meta.dtype != "|u1")
+        throw std::runtime_error("vc_gen_normalgrids requires a 3D uint8 array");
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (shape[axis] > std::numeric_limits<int>::max() ||
+            source_chunk_shape[axis] > std::numeric_limits<int>::max())
+            throw std::runtime_error("source dimensions exceed the slice assembler's integer range");
     }
-    auto* input_chunks = input_volume.chunkedCache();
-    const auto level_shape = input_chunks->shape(input_level);
-    const auto level_chunk_shape = input_chunks->chunkShape(input_level);
-    const size_t dtype_size = input_chunks->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
-    const std::vector<size_t> shape = {
-        static_cast<size_t>(level_shape[0]),
-        static_cast<size_t>(level_shape[1]),
-        static_cast<size_t>(level_shape[2]),
-    };
-    const std::vector<size_t> source_chunk_shape = {
-        static_cast<size_t>(level_chunk_shape[0]),
-        static_cast<size_t>(level_chunk_shape[1]),
-        static_cast<size_t>(level_chunk_shape[2]),
-    };
+    const size_t dtype_size = input_array.meta.itemsize();
     if (!print_plan) {
         const double open_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - open_start).count();
@@ -1542,9 +1528,8 @@ void run_generate(const po::variables_map& vm) {
                     };
 
                     const auto read_start = std::chrono::steady_clock::now();
-                    vc::core::util::fillBinarySliceBatchFromVolume(
-                        input_volume,
-                        input_level,
+                    vc::core::util::fillBinarySliceBatchFromArray(
+                        input_array,
                         to_normal_grid_direction(dir),
                         static_cast<int>(source_chunk_plan.sourceChunkIndex),
                         volume_shape_i,

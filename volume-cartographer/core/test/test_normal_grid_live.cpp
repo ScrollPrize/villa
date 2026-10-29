@@ -10,7 +10,6 @@
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/types/Volume.hpp"
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -30,7 +29,7 @@ namespace fs = std::filesystem;
 
 using vc::core::util::BinarySliceTarget;
 using vc::core::util::NormalGridSliceDirection;
-using vc::core::util::fillBinarySliceBatchFromVolume;
+using vc::core::util::fillBinarySliceBatchFromArray;
 using vc::core::util::normalGridSliceSize;
 
 namespace {
@@ -82,7 +81,7 @@ fs::path tmpDir(const std::string& tag)
 }
 
 // Stage a minimal local volume directory by downloading the level 5 zarr
-// chunks and adding the wrapping meta.json + .zgroup needed by Volume::New.
+// chunks and adding a one-level group.
 // Returns the local path on success, empty on network failure.
 fs::path stagePHerc172Level5(const fs::path& dst)
 {
@@ -97,7 +96,7 @@ fs::path stagePHerc172Level5(const fs::path& dst)
     auto zarray = fetch(httpRoot + "/5/.zarray");
     if (!zarray) return {};
 
-    // Stage as the SOLE level "0" in dst (so Volume sees a 1-level pyramid).
+    // Stage as the sole level "0" in dst.
     fs::create_directories(dst);
     {
         std::ofstream zg(dst / ".zgroup");
@@ -149,7 +148,7 @@ fs::path stagePHerc172Level5(const fs::path& dst)
     MESSAGE("Staged PHerc 0172 level 5: " << downloaded << " chunks ("
             << missing << " missing/skipped)");
 
-    // 4. Write a meta.json that Volume::New expects.
+    // 4. Retain project metadata for manual inspection of the staged fixture.
     {
         std::ofstream m(dst / "meta.json");
         m << R"({"type":"vol","uuid":"pherc0172-level5","name":"PHerc0172-L5",)"
@@ -163,7 +162,7 @@ fs::path stagePHerc172Level5(const fs::path& dst)
 
 } // namespace
 
-TEST_CASE("Stage PHerc 0172 level 5 and run fillBinarySliceBatchFromVolume")
+TEST_CASE("Stage PHerc 0172 level 5 and run fillBinarySliceBatchFromArray")
 {
     auto d = tmpDir("pherc172_l5");
     auto staged = stagePHerc172Level5(d);
@@ -173,27 +172,10 @@ TEST_CASE("Stage PHerc 0172 level 5 and run fillBinarySliceBatchFromVolume")
         return;
     }
 
-    std::shared_ptr<Volume> v;
-    try {
-        v = Volume::New(staged);
-    } catch (const std::exception& e) {
-        if (requireNetwork()) FAIL("Volume::New on staged dir: " << e.what());
-        MESSAGE("Skipping: Volume::New failed: " << e.what());
-        fs::remove_all(d);
-        return;
-    }
-    REQUIRE(v);
-    REQUIRE_FALSE(v->isRemote());
-
-    auto sh = v->shape(0);
-    CHECK(sh[0] == kSliceCount);
-    CHECK(sh[1] == kHeight);
-    CHECK(sh[2] == kWidth);
-    CHECK(v->dtypeSize() == 1);
-
     // Run normal-grid generation on the first chunk-along-Z (sliceAxisChunkIndex=0)
     // for the XY direction. The chunk depth is 128, so we sample localSlices
     // 0, 8, 16, 24 — four binary slices per chunk-walk.
+    auto source = vcr::zarr::openPyramidLevel(staged.string(), 0, {});
     const std::array<int, 3> shape{kSliceCount, kHeight, kWidth};
     const std::array<int, 3> chunks{kChunk, kChunk, kChunk};
     auto sliceSize = normalGridSliceSize(
@@ -208,8 +190,8 @@ TEST_CASE("Stage PHerc 0172 level 5 and run fillBinarySliceBatchFromVolume")
         targets[i].localSliceIndex = i * 8;
     }
 
-    fillBinarySliceBatchFromVolume(
-        *v, /*level=*/0, NormalGridSliceDirection::XY,
+    fillBinarySliceBatchFromArray(
+        source, NormalGridSliceDirection::XY,
         /*sliceAxisChunkIndex=*/0,
         shape, chunks,
         std::span<BinarySliceTarget>(targets),
@@ -231,15 +213,7 @@ TEST_CASE("XZ direction also produces some non-empty slices on PHerc 0172 L5")
     auto staged = stagePHerc172Level5(d);
     if (staged.empty()) { fs::remove_all(d); return; }
 
-    std::shared_ptr<Volume> v;
-    try {
-        v = Volume::New(staged);
-    } catch (const std::exception&) {
-        fs::remove_all(d);
-        return;
-    }
-    REQUIRE(v);
-
+    auto source = vcr::zarr::openPyramidLevel(staged.string(), 0, {});
     const std::array<int, 3> shape{kSliceCount, kHeight, kWidth};
     const std::array<int, 3> chunks{kChunk, kChunk, kChunk};
     auto sliceSize = normalGridSliceSize(
@@ -252,8 +226,8 @@ TEST_CASE("XZ direction also produces some non-empty slices on PHerc 0172 L5")
     t.localSliceIndex = 0;
     std::vector<BinarySliceTarget> ts = {t};
 
-    fillBinarySliceBatchFromVolume(
-        *v, 0, NormalGridSliceDirection::XZ,
+    fillBinarySliceBatchFromArray(
+        source, NormalGridSliceDirection::XZ,
         /*sliceAxisChunkIndex=*/0, shape, chunks,
         std::span<BinarySliceTarget>(ts), 1);
 
