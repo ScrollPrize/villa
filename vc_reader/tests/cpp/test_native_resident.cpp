@@ -103,6 +103,82 @@ int main() try {
             check(valid==download<std::uint8_t>(gpuValid,N),"CUDA composite coverage");
 #endif
         }
+        // Blocking consumers share the service with the viewer. Start cold for
+        // each CPU/CUDA request, then verify a resident repaint needs no fetches.
+        s::Cached cached{*array,service,source};
+        for (const auto order : {s::Order::Nearest,s::Order::Linear,s::Order::Cubic}) {
+            service.invalidate(source);
+            s::plane(*array,type,origin,u,v,W,H,order,expected.data());
+            s::plane(cached,type,origin,u,v,W,H,order,actual.data());
+            compare(actual,expected);
+            const auto fetched=service.stats().fetched;
+            s::plane(resident,type,origin,u,v,W,H,order,actual.data(),valid.data());
+            compare(actual,expected);
+            for(auto b:valid) check(b==1,"cached request makes viewer footprints resident");
+            s::plane(cached,type,origin,u,v,W,H,order,actual.data());
+            check(service.stats().fetched==fetched,"cached warm request reuses shared chunks");
+#ifdef VC_READER_CUDA
+            service.invalidate(source);
+            compare(expected,download<float>(s::cuda::plane(cached,type,origin,u,v,W,H,order),N));
+#endif
+            service.invalidate(source);
+            s::points(*array,type,points,4,order,pointRef.data());
+            s::points(cached,type,points,4,order,pointOut.data());
+            compare(pointOut,pointRef);
+#ifdef VC_READER_CUDA
+            service.invalidate(source);
+            compare(pointRef,download<float>(s::cuda::points(cached,type,points,4,order),4));
+#endif
+            service.invalidate(source);
+            s::band(*array,type,base.data(),dirs.data(),N,W,offsets,order,bandRef.data());
+            s::band(cached,type,base.data(),dirs.data(),N,W,offsets,order,band.data());
+            compare(band,bandRef);
+#ifdef VC_READER_CUDA
+            service.invalidate(source);
+            compare(bandRef,download<float>(s::cuda::band(cached,type,base.data(),dirs.data(),N,W,offsets,order),N*3));
+#endif
+            for (const auto method : {s::Composite::Method::Mean,s::Composite::Method::Max,
+                                     s::Composite::Method::Min,s::Composite::Method::Median,
+                                     s::Composite::Method::MinAbs,s::Composite::Method::Alpha,
+                                     s::Composite::Method::BeerLambert}) {
+                s::Composite config;config.method=method;
+                service.invalidate(source);
+                s::composite(*array,type,base.data(),dirs.data(),N,W,offsets,order,config,expected.data());
+                s::composite(cached,type,base.data(),dirs.data(),N,W,offsets,order,config,actual.data());
+                compare(actual,expected);
+#ifdef VC_READER_CUDA
+                service.invalidate(source);
+                compare(expected,download<float>(s::cuda::composite(cached,type,base.data(),dirs.data(),N,W,offsets,order,config),N));
+#endif
+            }
+        }
+        // Even when chunks are evicted as they are fetched, each wave retains
+        // the data it needs until sampling finishes.
+        service.configure(1,1,false);
+        s::plane(*array,type,origin,u,v,W,H,s::Order::Cubic,expected.data());
+        s::plane(cached,type,origin,u,v,W,H,s::Order::Cubic,actual.data());
+        compare(actual,expected);
+        check(service.stats().decodedBytes<=1 && service.stats().evicted>0,"bounded shared cache");
+#ifdef VC_READER_CUDA
+        compare(expected,download<float>(s::cuda::plane(cached,type,origin,u,v,W,H,s::Order::Cubic),N));
+#endif
+        service.configure(1<<20,1,false);
+        const auto failed=service.addSource([](std::int32_t,std::int64_t,std::int64_t,std::int64_t)->ChunkPtr {
+            throw std::runtime_error("fixture fetch error");
+        },1);
+        s::Cached broken{*array,service,failed};
+        const float inside[]={1,1,1};
+        bool threw=false;
+        try {s::points(broken,type,inside,1,s::Order::Nearest,actual.data());}
+        catch(const std::runtime_error& e) {threw=std::string(e.what()).find("fixture fetch error")!=std::string::npos;}
+        check(threw,"blocking sampling propagates fetch errors");
+#ifdef VC_READER_CUDA
+        threw=false;
+        try {(void)s::cuda::points(broken,type,inside,1,s::Order::Nearest);}
+        catch(const std::runtime_error& e) {threw=std::string(e.what()).find("fixture fetch error")!=std::string::npos;}
+        check(threw,"CUDA blocking sampling propagates fetch errors");
+#endif
+        service.removeSource(failed);
         service.invalidate(source);
         service.get({source,0,0,0,0});
         const float boundary[]={3.5f,1,1};

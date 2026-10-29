@@ -176,3 +176,11 @@ next coarser level. CUDA validity buffers reside on the same device as values.
 
 The current CUDA path uploads the resident float32 wave blocks for each request;
 it does not retain a separate device brick cache across renders.
+
+`slice::Cached` uses the same wave assembly and sampling formulas, but fetches
+missing chunks through the shared service with foreground priority. CPU and CUDA
+requests see the same per-wave chunk snapshot, including when the service budget
+is smaller than the working set. Fetch failures throw; absent chunks use the
+array fill value. Registered arrays must not also hold a private memory cache.
+This path shares host decoded chunks with resident viewers; CUDA still uploads
+float32 wave blocks per request.

@@ -165,6 +165,21 @@ void composite(Array& array, const ElementType& type, const float* base, const f
                std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out)
 { compositeImpl(array, type, base, dirs, n, width, offsets, order, method, out, nullptr); }
 
+void points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
+{ pointsImpl(cached, type, xyz, n, order, out, nullptr); }
+
+void plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out)
+{ planeImpl(cached, type, origin, u, v, width, height, order, out, nullptr); }
+
+void band(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out)
+{ bandImpl(cached, type, base, dirs, n, width, offsets, order, out, nullptr); }
+
+void composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out)
+{ compositeImpl(cached, type, base, dirs, n, width, offsets, order, method, out, nullptr); }
+
 void points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
            std::uint8_t* valid)
 { pointsImpl(resident, type, xyz, n, order, out, valid); }
@@ -333,6 +348,21 @@ device::Storage band(Array& array, const ElementType& type, const float* base, c
 device::Storage composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                           std::size_t width, std::span<const float> offsets, Order order, const Composite& method)
 { return compositeImpl(array, type, base, dirs, n, width, offsets, order, method, nullptr); }
+
+device::Storage points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order)
+{ return pointsImpl(cached, type, xyz, n, order, nullptr); }
+
+device::Storage plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
+{ return planeImpl(cached, type, origin, u, v, width, height, order, nullptr); }
+
+device::Storage band(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order)
+{ return bandImpl(cached, type, base, dirs, n, width, offsets, order, nullptr); }
+
+device::Storage composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method)
+{ return compositeImpl(cached, type, base, dirs, n, width, offsets, order, method, nullptr); }
 
 device::Storage points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order,
            device::Storage* valid)

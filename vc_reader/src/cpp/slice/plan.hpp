@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -136,21 +137,23 @@ inline void readBlocks(Array& array, const ElementType& type, const Wave& wave, 
 
 inline Array& arrayOf(Array& array) { return array; }
 inline Array& arrayOf(Resident& resident) { return resident.array; }
+inline Array& arrayOf(Cached& cached) { return cached.array; }
 
-// The same wave layout as blocking reads, populated exclusively from resident
-// decoded chunks. Pin each probe result while copying; eviction may proceed.
-inline void readBlocks(Resident& resident, const ElementType& type, const Wave& wave,
+// Assemble service-backed blocks once for both sampling backends. Pin each
+// chunk for the wave so eviction cannot change overlapping tiles mid-request.
+template<class Input>
+inline void readBlocks(Input& resident, const ElementType& type, const Wave& wave,
                        std::vector<float>& buffer, std::vector<std::uint8_t>& coverage)
 {
     const auto& spec = resident.array.spec();
     const auto& shape = spec.shape;
     const auto& c = spec.chunks;
     if (type.itemsize != spec.itemsize)
-        throw std::invalid_argument("resident sampling element size differs from the array");
+        throw std::invalid_argument("service sampling element size differs from the array");
     const float fill = float(type.load(spec.fill.data()));
     buffer.assign(std::size_t(wave.elements), fill);
     coverage.assign(std::size_t(wave.elements), 1);
-    // A chunk is probed once per wave, so overlapping tiles see one snapshot.
+    // A chunk is acquired once per wave, so overlapping tiles see one snapshot.
     std::unordered_map<chunks::Key, chunks::Chunk, chunks::KeyHash> snapshot;
     for (const auto& tile : wave.tiles) {
         if (!tile.hasBlock) continue;
@@ -163,7 +166,18 @@ inline void readBlocks(Resident& resident, const ElementType& type, const Wave& 
                 for (auto cx=lo[2]/c[2]; cx<=(hi[2]-1)/c[2]; ++cx) {
                     chunks::Key key{resident.source,resident.level,cz,cy,cx};
                     auto [it,fresh]=snapshot.try_emplace(key);
-                    if (fresh) it->second=resident.service.probe(key);
+                    if (fresh) {
+                        if constexpr (std::is_same_v<Input, Cached>) {
+                            it->second=resident.service.get(key);
+                            const auto& loaded=it->second;
+                            if (loaded.status!=chunks::Status::Fill &&
+                                (loaded.status!=chunks::Status::Data || !loaded.bytes ||
+                                 loaded.bytes->size()!=resident.array.chunk_bytes()))
+                                throw std::runtime_error("cached sampling chunk fetch failed: " + loaded.error);
+                        } else {
+                            it->second=resident.service.probe(key);
+                        }
+                    }
                     const auto& chunk=it->second;
                     if (chunk.status==chunks::Status::Fill) continue;
                     const bool available=chunk.status==chunks::Status::Data && chunk.bytes &&

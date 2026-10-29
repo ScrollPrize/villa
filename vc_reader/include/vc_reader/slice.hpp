@@ -48,6 +48,16 @@ struct Resident {
     std::int32_t level = 0;
 };
 
+// Blocking sampling through the same decoded budget used by resident viewers.
+// Fetches missing chunks with foreground priority, pins them for each wave and
+// throws on fetch errors. Arrays must be registered without a separate MemoryCache.
+struct Cached {
+    Array& array;
+    chunks::Service& service;
+    chunks::SourceId source;
+    std::int32_t level = 0;
+};
+
 // `type` says how the array's elements read as numbers.
 void points(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out);
 // out[row * width + col] at origin + col * u + row * v.
@@ -59,6 +69,18 @@ void band(Array& array, const ElementType& type, const float* base, const float*
           std::size_t width, std::span<const float> offsets, Order order, float* out);
 // out[p]: the composite of pixel p's band, in offsets order.
 void composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+               std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out);
+
+void points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out);
+// out[row * width + col] at origin + col * u + row * v.
+void plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+           std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out);
+// out[k * n + p] at base[p] + dirs[p] * offsets[k]. `width` > 0 says the n
+// pixels form a row-major image that wide, which keeps reads compact.
+void band(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+          std::size_t width, std::span<const float> offsets, Order order, float* out);
+// out[p]: the composite of pixel p's band, in offsets order.
+void composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out);
 
 // Resident overloads return one validity byte per output (1 = all required
@@ -90,6 +112,13 @@ device::Storage plane(Array& array, const ElementType& type, std::array<float, 3
 device::Storage band(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                      std::size_t width, std::span<const float> offsets, Order order);
 device::Storage composite(Array& array, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                          std::size_t width, std::span<const float> offsets, Order order, const Composite& method);
+device::Storage points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order);
+device::Storage plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
+                      std::array<float, 3> v, std::size_t width, std::size_t height, Order order);
+device::Storage band(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
+                     std::size_t width, std::span<const float> offsets, Order order);
+device::Storage composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                           std::size_t width, std::span<const float> offsets, Order order, const Composite& method);
 device::Storage points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order,
            device::Storage* valid = nullptr);
