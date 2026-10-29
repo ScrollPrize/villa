@@ -11,6 +11,11 @@
 
 namespace vc3d {
 
+namespace {
+// Finer levels a frame may take resident data from when its own level lacks it.
+constexpr int kFinerFallbackLevels = 2;
+}
+
 bool ViewerLevels::has(int level) const
 {
     return level >= 0 && level < count() && levels[std::size_t(level)].array;
@@ -133,36 +138,44 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
     request.offsets = what.offsets;
     request.composite = what.composite;
     request.cachedOnly = true;
-    std::size_t used = 0;  // levels in the request
-    const int last = std::min(levels.count() - 1, what.startLevel + std::max(0, what.fallbackLevels));
-    for (int level = std::max(0, what.startLevel); level <= last; ++level)
-        if (levels.has(level)) {
+    // The view's level, then finer levels (resident after zooming in, and as good),
+    // then coarser ones filling holes.
+    const auto add = [&](int level) {
+        if (levels.has(level))
             request.levels.push_back(levels.gridLevel(level));
-            ++used;
-        }
+    };
+    const int start = std::clamp(what.startLevel, 0, std::max(0, levels.count() - 1));
+    add(start);
+    for (int level = start - 1; level >= std::max(0, start - kFinerFallbackLevels); --level)
+        add(level);
+    const std::size_t firstCoarser = request.levels.size();
+    const int last = std::min(levels.count() - 1, start + std::max(0, what.fallbackLevels));
+    for (int level = start + 1; level <= last; ++level)
+        add(level);
     if (request.levels.empty())
         return {};
     auto result = geometry.sample(request);
     if (!load)
         return result;
 
-    // Pixels with a layer not from the start level read it; pixels with a layer no
-    // level held also read the coarsest level, for a quick preview.
-    const std::size_t pixels = std::size_t(result.width) * std::size_t(result.height);
+    // Pixels with a layer from a coarser level, or none, read the start level; pixels
+    // with a layer no level held also read the coarsest level, for a quick preview.
+    const std::size_t pixels = result.level.size();
+    const bool coarser = request.levels.size() > firstCoarser;
     std::vector<std::uint8_t> target(pixels, 0), coarse(pixels, 0);
     bool anyTarget = false, anyCoarse = false;
-    for (std::size_t k = 0; k < std::size_t(result.layers); ++k)
-        for (std::size_t q = 0; q < pixels; ++q) {
-            const auto level = result.level[k * pixels + q];
-            if (level == vcr::grid::Result::kNone || level == 0)
-                continue;
-            target[q] = 1;
-            anyTarget = true;
-            if (level == vcr::grid::Result::kMissing && used > 1) {
-                coarse[q] = 1;
-                anyCoarse = true;
-            }
+    for (std::size_t q = 0; q < pixels; ++q) {
+        const auto level = result.level[q];
+        const bool missing = level == vcr::grid::Result::kMissing;
+        if (!missing && (level == vcr::grid::Result::kNone || std::size_t(level) < firstCoarser))
+            continue;
+        target[q] = 1;
+        anyTarget = true;
+        if (missing && coarser) {
+            coarse[q] = 1;
+            anyCoarse = true;
         }
+    }
     const auto read = [&](std::size_t index, std::vector<std::uint8_t> mask) {
         ViewerRead r{geometry, what.levels, {}, std::move(mask)};
         r.request.levels = {request.levels[index]};
@@ -171,7 +184,7 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
         return r;
     };
     if (anyCoarse)
-        load->coarse.push_back(read(used - 1, std::move(coarse)));
+        load->coarse.push_back(read(request.levels.size() - 1, std::move(coarse)));
     if (anyTarget)
         load->target.push_back(read(0, std::move(target)));
     return result;
@@ -220,11 +233,13 @@ std::optional<vcr::composite::Options> compositeOptions(const CompositeParams& p
 void toDisplay(const vcr::grid::Result& result, int layer, uint8_t* values, uint8_t* coverage)
 {
     const std::size_t pixels = std::size_t(result.width) * std::size_t(result.height);
-    const float* v = result.values.data() + std::size_t(layer) * pixels;
+    // Composites have one value per pixel; layers are layer-major.
+    const float* v = result.values.data() + (result.values.size() == pixels ? 0 : std::size_t(layer) * pixels);
     for (std::size_t q = 0; q < pixels; ++q) {
-        if (!std::isfinite(v[q]))
+        const float value = v[q];
+        if (!std::isfinite(value))
             continue;
-        values[q] = static_cast<uint8_t>(std::clamp(v[q], 0.0f, 255.0f));
+        values[q] = static_cast<uint8_t>(std::clamp(value, 0.0f, 255.0f));
         coverage[q] = 1;
     }
 }

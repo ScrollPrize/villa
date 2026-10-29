@@ -141,7 +141,7 @@ TEST_CASE("a coarser level in memory fills a frame while the start level loads")
     CHECK(r.values[6 * 32 + 10] == float(f.level1[(2 * 16 + 3) * 16 + 5]));
 }
 
-TEST_CASE("pixels outside the volume have no sample and are not read")
+TEST_CASE("pixels outside the volume read as fill and are not read in the background")
 {
     Fixture f;
     OpenedVolumes opened(64 << 20);
@@ -156,7 +156,8 @@ TEST_CASE("pixels outside the volume have no sample and are not read")
     vc3d::loadPending(load, [] { return true; });
     const auto r = vc3d::sampleCached(g, what, nullptr);
     CHECK(r.level[3] == 0);
-    CHECK(r.level[4] == vcr::grid::Result::kNone);
+    CHECK(r.level[4] == 0);
+    CHECK(r.values[4] == 0.0f);
     CHECK(r.values[0] == float(f.at0(3, 3, 28)));
 }
 
@@ -198,4 +199,24 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     CHECK(r.values[9 * 30 + 9] == expected);
     params.method = "volumetric";
     CHECK_FALSE(vc3d::compositeOptions(params));
+}
+
+TEST_CASE("a zoomed-out frame takes resident finer data and does not read its own level")
+{
+    Fixture f;
+    OpenedVolumes opened(64 << 20);
+    const auto levels = openLevels(opened, *f.volume);
+    // Level 0 in memory (as after zooming in); the frame wants level 1.
+    {
+        const vc3d::ViewerSample fine{levels, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+        vc3d::ViewerLoad load;
+        vc3d::sampleCached(planeAt(5), fine, &load);
+        vc3d::loadPending(load, [] { return true; });
+    }
+    const vc3d::ViewerSample coarse{levels, 1, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    vc3d::ViewerLoad load;
+    const auto r = vc3d::sampleCached(planeAt(5), coarse, &load);
+    CHECK(load.empty());
+    CHECK(r.level[0] == 1);  // the second level of the request: level 0
+    CHECK(r.values[7 * 32 + 9] == float(f.at0(5, 7, 9)));
 }
