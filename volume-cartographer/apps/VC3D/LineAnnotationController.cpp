@@ -133,6 +133,12 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string selectedFiberInferenceDatasetLocation;
     std::string selectedFiberManifestIdentity;
     fs::path selectedFiberInferenceManifestPath;
+    // The stored object's coordinate binding and, when it was read in the open
+    // volume, the mapping its session geometry is in. Snapshots carry both so
+    // saves map back to the stored frame and fibers derived from this one
+    // (split halves, a merge) keep its frame.
+    nlohmann::json coordinateIdentity = nlohmann::json::object();
+    std::optional<vc3d::line_annotation::FiberVolumeFrame> frame;
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
@@ -3955,6 +3961,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberWidthGapFraction = fiber.widthGapFraction;
     session->fiberOptimizationMode = fiber.optimizationMode;
     session->modelOnly = fiber.modelOnly;
+    session->coordinateIdentity = fiber.coordinateIdentity;
+    session->frame = fiber.frame;
     session->branches = fiber.branches;
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
@@ -14169,6 +14177,8 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberOptimizationMode = fiber.optimizationMode;
     session->modelOnly = fiber.modelOnly;
     if (_state->currentVolume() && !fiberInVolume(fiber)) throw std::runtime_error("Fiber coordinate binding is missing");
+    session->coordinateIdentity = fiber.coordinateIdentity;
+    session->frame = fiber.frame;
     session->branches = fiber.branches;
     session->focusedLinePosition = std::clamp(
         focusLinePosition,
@@ -14290,6 +14300,8 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.uuid = session.fiberUuid;
     registerFiberId(fiber.uuid, fiber.id);
     fiber.storePin = session.storePin;
+    fiber.coordinateIdentity = session.coordinateIdentity;
+    fiber.frame = session.frame;
     if ((!session.storePin || session.storePin->objectRevision.empty()) && !(_state && _state->currentVolume()))
         throw std::runtime_error("Cannot save a new fiber without an active volume");
 
@@ -14653,6 +14665,8 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
         const StoredFiber* saved = &snapshot->fiber;
         if (session.watcher && session.storePin != saved->storePin) session.solveQueue.noteSessionMutated();
         session.storePin = saved->storePin;
+        session.coordinateIdentity = saved->coordinateIdentity;
+        session.frame = saved->frame;
         const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
         for (size_t i = 0; i < ordering.size(); ++i)
             if (ordering[i] >= 0 && size_t(ordering[i]) < saved->controlPoints.size() &&
@@ -15023,22 +15037,30 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         // A fiber read in an open volume, back in its stored frame: positions
         // through the store's view (unchanged points keep their exact values),
         // vectors and width through the inverse; classification in that frame.
+        // A new object derived from one (split halves, a merge) has no stored
+        // view yet; its positions go through the inverse of the frame it carries.
         std::map<std::string, StoredFiber> storedFrames;
         auto inStoredFrame = [&](const StoredFiber& fiber) -> const StoredFiber& {
             if (const auto found = storedFrames.find(fiber.uuid); found != storedFrames.end()) return found->second;
             auto stored = fiber;
             if (fiber.frame) {
-                const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume);
-                if (shown.mapping() != fiber.frame->storedToVolume)
-                    throw std::runtime_error("The fiber's volume registration changed; reopen it");
                 vc::geometry::Fiber edited;
                 for (const auto& cp : fiber.controlPoints) {
                     edited.controlPoints.push_back({cp[0], cp[1], cp[2]});
                     edited.controlPointIds.push_back(cp.storeId);
                 }
                 for (const auto& point : fiber.linePoints) edited.linePoints.push_back({point[0], point[1], point[2]});
-                const auto canonical = shown.canonicalFiber(edited);
                 const auto inverse = fiber.frame->storedToVolume.inverse();
+                auto canonical = edited;
+                if (db.objectByUuid(txn, fiber.uuid)) {
+                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume);
+                    if (shown.mapping() != fiber.frame->storedToVolume)
+                        throw std::runtime_error("The fiber's volume registration changed; reopen it");
+                    canonical = shown.canonicalFiber(edited);
+                } else {
+                    for (auto& point : canonical.controlPoints) point = inverse.apply(point);
+                    for (auto& point : canonical.linePoints) point = inverse.apply(point);
+                }
                 for (size_t i = 0; i < stored.controlPoints.size(); ++i) {
                     auto& cp = stored.controlPoints[i];
                     cp[0] = canonical.controlPoints[i][0]; cp[1] = canonical.controlPoints[i][1]; cp[2] = canonical.controlPoints[i][2];

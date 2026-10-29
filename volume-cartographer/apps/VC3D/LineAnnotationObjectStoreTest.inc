@@ -230,23 +230,27 @@ int runObjectStoreControllerTests()
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions frameOptions; frameOptions.author = "vc3d-frame-test";
             VolumeAffine shear; shear(0,0)=2; shear(0,1)=.5; shear(0,3)=1; shear(2,3)=3;
-            std::string scaled, registered;
+            std::string scaled, registered, scaledLong;
             const std::vector<vc::geometry::Point> controls{{2,4,6},{10,4,6}}, line{{2,4,6},{6,4,6},{10,4,6}};
+            const std::vector<vc::geometry::Point> longControls{{2,4,6},{6,4,6},{10,4,6},{14,4,6}};
             {
                 auto db = ObjectStore::create(storePath, frameOptions);
                 auto txn = db.write();
                 (void)db.registerVolumeTransform(txn, "other-volume", "frame-volume", shear, "scan registration");
-                auto add = [&](const nlohmann::json& meta) {
+                auto add = [&](const nlohmann::json& meta, const std::vector<vc::geometry::Point>& cps,
+                               const std::vector<vc::geometry::Point>& samples) {
                     ObjectRecord record; record.kind = "fiber"; record.meta = meta.dump();
                     vc::objects::FiberDetail detail; detail.width = 8; record.fiber = detail;
                     const auto uuid = db.upsertObject(txn, record);
-                    vc::geometry::Fiber fiber; fiber.controlPoints = controls; fiber.linePoints = line;
+                    vc::geometry::Fiber fiber; fiber.controlPoints = cps; fiber.linePoints = samples;
                     db.putGeometry(txn, uuid, vc::geometry::encode(fiber));
                     return uuid;
                 };
                 // Two stored units per voxel: the volume sees half the coordinates.
-                scaled = add(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}});
-                registered = add({{"coordinates", {{"volume_uuid", "other-volume"}, {"scale_factor", 1}}}});
+                scaled = add(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}, controls, line);
+                registered = add({{"coordinates", {{"volume_uuid", "other-volume"}, {"scale_factor", 1}}}}, controls, line);
+                scaledLong = add(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}},
+                                 longControls, longControls);
                 txn.commit();
             }
             CState state;
@@ -302,6 +306,60 @@ int runObjectStoreControllerTests()
                 const auto after = stored(uuid);
                 require(after.linePoints == before.linePoints && after.controlPoints == before.controlPoints,
                         "a record-only edit keeps the stored geometry");
+            }
+            // An open session of a bound fiber is in the volume's voxels too. Its
+            // snapshot carries the frame, so a save and the fibers split or merged
+            // from it are written in the stored frame and stay bound to the volume.
+            {
+                namespace la = vc3d::line_annotation;
+                const auto opened = read(scaledLong);
+                auto live = std::make_shared<Controller::LineAnnotationSession>();
+                live->surfaceName = "frame-test-session"; live->fiberId = opened.id; live->fiberUuid = opened.uuid;
+                live->fiberFileName = opened.fileName; live->fiberUsername = opened.username;
+                live->fiberStartedAt = opened.startedAt; live->fiberSequence = opened.sequence;
+                live->storePin = opened.storePin; live->coordinateIdentity = opened.coordinateIdentity; live->frame = opened.frame;
+                live->fiberOptimizationMode = opened.optimizationMode; live->suppressGeneratedViews = true; live->suppressErrorDialogs = true;
+                for (size_t i = 0; i < opened.controlPoints.size(); ++i) {
+                    la::LineControlPoint control(double(i), opened.controlPoints[i], i == 0, int(i));
+                    control.storeId = opened.controlPoints[i].storeId;
+                    live->controlPoints.push_back(control);
+                }
+                for (const auto& point : opened.linePoints) { vc::lasagna::LinePoint sample; sample.position = point; live->optimizedLine.points.push_back(sample); }
+                live->controlPoints[3].volumePoint[0] += 1; live->optimizedLine.points[3].position[0] += 1;
+                auto snapshot = controller.makeStoredFiberSessionSnapshot(*live).fiber;
+                require(snapshot.frame && snapshot.coordinateIdentity == opened.coordinateIdentity, "session snapshot carries the stored frame");
+                std::vector<Controller::FiberSaveSnapshot> save{controller.makeFiberSaveSnapshot(snapshot)};
+                controller.commitFiberStoreAction(save);
+                require(stored(scaledLong).controlPoints[3] == vc::geometry::Point{16,4,6}, "a session save maps back to the stored frame");
+                live->storePin = save.front().fiber.storePin;
+                const auto parent = controller.makeStoredFiberSessionSnapshot(*live).fiber;
+                const auto identity = [&](const char* name) {
+                    la::NewFiberIdentity result; result.id = controller.nextFiberId(); result.username = "test";
+                    result.startedAt = "20260101"; result.sequence = result.id; result.fileName = name; return result;
+                };
+                std::string error;
+                const auto halves = la::planFiberSplit(parent, 1, identity("frame-prefix.json"), identity("frame-suffix.json"), true, &error);
+                if (!halves) throw std::runtime_error(error);
+                Controller::StructuralEditRequest split; split.verb = "split";
+                split.newFibers = {halves->prefix, halves->suffix}; split.originals = {parent};
+                bool committed = false;
+                const auto splitResult = controller.commitStructuralEdit(std::move(split), &committed);
+                if (!splitResult.ok) throw std::runtime_error("split: " + splitResult.error);
+                const auto storedPrefix = stored(halves->prefix.uuid), storedSuffix = stored(halves->suffix.uuid);
+                require(storedPrefix.controlPoints == std::vector<vc::geometry::Point>{{2,4,6},{6,4,6}} &&
+                        storedSuffix.controlPoints == std::vector<vc::geometry::Point>{{10,4,6},{16,4,6}},
+                        "split halves of an open session are written in the stored frame");
+                const auto prefix = read(halves->prefix.uuid), suffix = read(halves->suffix.uuid);
+                require(prefix.coordinateIdentity == opened.coordinateIdentity && controller.fiberInVolume(prefix) &&
+                        controller.fiberInVolume(suffix), "split halves keep the parent's frame");
+                const auto merge = la::planFiberMerge(prefix, 1, suffix, 0, parent.optimizationMode, identity("frame-merged.json"), &error);
+                if (!merge) throw std::runtime_error(error);
+                Controller::StructuralEditRequest join; join.verb = "merge";
+                join.newFibers = {merge->merged}; join.originals = {prefix, suffix};
+                const auto mergeResult = controller.commitStructuralEdit(std::move(join), &committed);
+                if (!mergeResult.ok) throw std::runtime_error("merge: " + mergeResult.error);
+                require(stored(merge->merged.uuid).controlPoints == std::vector<vc::geometry::Point>{{2,4,6},{6,4,6},{10,4,6},{16,4,6}},
+                        "a merge of bound fibers is written in the stored frame");
             }
             state.closeProject();
         }
@@ -668,6 +726,7 @@ int runObjectStoreControllerTests()
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
             live->storePin=merged.storePin;
+            live->coordinateIdentity=merged.coordinateIdentity;live->frame=merged.frame;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {
                 la::LineControlPoint control(double(i),merged.controlPoints[i],i==0,int(i));
@@ -684,6 +743,15 @@ int runObjectStoreControllerTests()
             const auto savedPin=live->storePin;
             controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
+            {
+                // Split and merge plan from session snapshots; new fibers must keep the stored frame.
+                const auto snapshot=controller.makeStoredFiberSessionSnapshot(*live).fiber;
+                require(snapshot.coordinateIdentity.value("coordinates",nlohmann::json())==frame,"session snapshot carries stored frame");
+                const auto halves=la::planFiberSplit(snapshot,1,identity("live-prefix.json"),identity("live-suffix.json"),false,&error);
+                if(!halves) throw std::runtime_error(error);
+                require(halves->prefix.coordinateIdentity.value("coordinates",nlohmann::json())==frame &&
+                        halves->suffix.coordinateIdentity.value("coordinates",nlohmann::json())==frame,"split of an open fiber keeps its frame");
+            }
             controller._panes.clear();
             auto db=ObjectStore::open(path,options);auto txn=db.read();
             const auto saved=std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn,*savedPin->geometryRevision)));
