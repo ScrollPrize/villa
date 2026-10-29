@@ -1,10 +1,9 @@
 #pragma once
 // Arrays whose chunks are computed on demand from other data, e.g. a distance
 // transform of a thresholded CT volume. A computed array is an ordinary vcr::Array:
-// register it with chunks::Service or read and sample it like a stored one.
-// The compute callback reads its inputs through vc_reader (typically
-// chunks::Service::read on the service the computed array is registered with).
-// Computed chunks can persist in a decoded disk cache that later opens reuse.
+// read and sample it like a stored one. The compute callback reads its inputs
+// through vc_reader (typically region reads of other arrays). Computed chunks can
+// persist in a decoded disk cache that later opens reuse.
 
 #include "vc_reader/native/array.hpp"
 
@@ -33,12 +32,12 @@ struct Options {
     // Byte budget shared by everything under cacheDir (oldest chunks are evicted); unbounded when unset.
     std::optional<std::int64_t> cacheMaxBytes;
     bool compressCache = false;
+    std::shared_ptr<MemoryCache> memoryCache;  // decoded chunks in memory; none when unset
     std::size_t threads = 0;  // region-read and sampling workers; 0: min(16, cores)
 };
 
-// A computed array. Chunks are computed once at a time each and cached only on
-// disk (when cacheDir is set): register the array with a chunks::Service, which
-// holds decoded chunks in memory.
+// A computed array. Each chunk is computed by one caller at a time, then kept in
+// the memory cache and on disk when those are set.
 std::unique_ptr<Array> open(const Options& options, ChunkCompute compute);
 
 // The directory holding the persisted chunks of `options` (requires cacheDir).

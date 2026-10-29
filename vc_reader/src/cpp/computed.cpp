@@ -83,7 +83,7 @@ std::unique_ptr<Array> open(const Options& options, ChunkCompute compute)
         if (options.cacheMaxBytes)
             spec.disk_cache = zarr::diskBudget(options.cacheDir->string(), options.cacheMaxBytes);
     }
-    return std::make_unique<Array>(std::move(spec), nullptr);
+    return std::make_unique<Array>(std::move(spec), options.memoryCache);
 }
 
 }  // namespace vcr::computed

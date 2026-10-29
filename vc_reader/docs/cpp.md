@@ -52,7 +52,6 @@ already link them. The Python extensions link those same CUDA libraries.
 | `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
 | `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2/v3 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/composite.hpp` | `vcr::composite::reduce`: one value per pixel from a stack of sampled layers (mean, max, min, median, minabs, alpha, Beer-Lambert), with an iso cutoff | CPU and `composite::cuda` (device inputs and outputs) |
-| `vc_reader/chunks.hpp` | `vcr::chunks::Service`: one decoded-chunk budget shared by many sources, prioritized asynchronous and blocking fetches, view demand, ready listeners, region reads (`read`) | Host service |
 | `vc_reader/computed.hpp` | `vcr::computed::open`: an `Array` whose chunks a callback computes from other data, persisted in a decoded disk cache named by the computation's identity | Register with the service and sample like any array, on CPU and CUDA |
 | `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
@@ -143,7 +142,7 @@ the process, including updates through separately opened writers. Separate
 processes writing the same shard, or partial writes to the same chunk, must
 coordinate externally. Local reads keep one file snapshot for the index and
 payload. Remote arrays are treated as immutable. Writer-owned readers see local
-changes; callers using a separate memory cache or chunk service must invalidate
+changes; callers using a separate memory cache must invalidate
 their cached chunks after writes.
 
 ## Transform pipelines and replay

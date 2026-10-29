@@ -1,10 +1,8 @@
-// Computed arrays and region reads through the chunk service: a derived field (a
-// max filter with a border) computed per chunk from a stored array read through the
-// service; one local worker cannot deadlock on nested reads; chunks persist on disk
-// and are reused by a later open of the same identity; mismatched persisted arrays
-// are refused; fill chunks; errors; point sampling of the computed array.
+// Computed arrays: a derived field (a max filter with a border) computed per chunk
+// from region reads of a stored array; a memory cache serves repeated reads; chunks
+// persist on disk and are reused by a later open of the same identity; mismatched
+// persisted arrays are refused; fill chunks; point sampling of the computed array.
 #include "vc_reader/computed.hpp"
-#include "vc_reader/chunks.hpp"
 #include "vc_reader/zarr.hpp"
 
 #include <atomic>
@@ -73,17 +71,16 @@ struct Fixture {
     }
 };
 
-// A max-filter computed array reading its input through `service`.
+// A max-filter computed array reading its input with region reads.
 struct Filter {
-    chunks::Service& service;
-    chunks::SourceId input;
+    Array& input;
     std::atomic<int> computed{0};
     bool operator()(const Index& chunk, std::uint8_t* out)
     {
         ++computed;
         const std::int64_t S = C + 2 * B;
         std::vector<std::uint8_t> region(std::size_t(S * S * S));
-        service.read(input, 0, {chunk[0] * C - B, chunk[1] * C - B, chunk[2] * C - B}, {S, S, S}, region.data());
+        input.read_many({{chunk[0] * C - B, chunk[1] * C - B, chunk[2] * C - B}}, {{S, S, S}}, {region.data()});
         bool any = false;
         for (int z = 0; z < C; ++z)
             for (int y = 0; y < C; ++y)
@@ -110,57 +107,27 @@ computed::Options options(const fs::path& cache)
     return o;
 }
 
-void regionReads(const Fixture& f)
-{
-    chunks::Service service({.decodedBytes = 1 << 20, .remoteWorkers = 1, .localWorkers = 1});
-    const auto source = service.addSource({f.stored});
-    const Index start{-3, 5, 15}, size{30, 9, 10};  // crosses chunks, the fill slabs and the edges
-    std::vector<std::uint8_t> got(std::size_t(size[0] * size[1] * size[2]));
-    service.read(source, 0, start, size, got.data());
-    for (int z = 0; z < size[0]; ++z)
-        for (int y = 0; y < size[1]; ++y)
-            for (int x = 0; x < size[2]; ++x)
-                require(got[(std::size_t(z) * size[1] + y) * size[2] + x] == field(start[0] + z, start[1] + y, start[2] + x),
-                        "region read");
-    std::vector<std::uint8_t> outside(8, 9);
-    service.read(source, 0, {100, 0, 0}, {2, 2, 2}, outside.data());
-    require(outside == std::vector<std::uint8_t>(8, 0), "a region outside the array reads as fill");
-    auto broken = computed::open({.shape = {8, 8, 8}, .chunks = {8, 8, 8}},
-                                 [](const Index&, std::uint8_t*) -> bool { throw std::runtime_error("no input"); });
-    const auto failing = service.addSource({std::shared_ptr<Array>(std::move(broken))});
-    bool threw = false;
-    try {
-        service.read(failing, 0, {0, 0, 0}, {1, 1, 1}, outside.data());
-    } catch (const std::runtime_error& e) {
-        threw = std::string(e.what()).find("no input") != std::string::npos;
-    }
-    require(threw, "region reads propagate chunk errors");
-}
-
 void computedArrays(const Fixture& f)
 {
     const fs::path cache = f.root / "cache";
-    // One local worker: computing a chunk reads its inputs through the same service.
-    chunks::Service service({.decodedBytes = 1 << 20, .remoteWorkers = 1, .localWorkers = 1});
-    const auto input = service.addSource({f.stored});
-    Filter filter{service, input};
-    auto array = std::shared_ptr<Array>(
-        computed::open(options(cache), [&](const Index& c, std::uint8_t* out) { return filter(c, out); }));
-    const auto derived = service.addSource({array});
+    Filter filter{*f.stored};
+    auto withMemory = options(cache);
+    withMemory.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    auto array = computed::open(withMemory, [&](const Index& c, std::uint8_t* out) { return filter(c, out); });
     std::vector<std::uint8_t> all(std::size_t(Z) * Y * X);
-    service.read(derived, 0, {0, 0, 0}, {Z, Y, X}, all.data());
+    array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {all.data()});
     for (int z = 0; z < Z; ++z)
         for (int y = 0; y < Y; ++y)
             for (int x = 0; x < X; ++x)
                 require(all[(std::size_t(z) * Y + y) * X + x] == maxFiltered(z, y, x), "computed chunk values");
     const int grid = ((Z + C - 1) / C) * ((Y + C - 1) / C) * ((X + C - 1) / C);
     require(filter.computed == grid, "each chunk computed once");
-    require(service.get({derived, 0, 3, 0, 0}).status == chunks::Status::Fill, "an all-fill chunk is Fill");
+    require(!array->chunk({3, 0, 0}), "an all-fill chunk is not stored");
 
-    // Direct region reads of the array (no service) give the same values.
+    // A second read is served by the memory cache.
     std::vector<std::uint8_t> direct(all.size());
     array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {direct.data()});
-    require(direct == all, "array reads of computed chunks");
+    require(direct == all && filter.computed == grid, "cached computed chunks are not recomputed");
     array->flush();
     require(array->stats().write_errors == 0, "persisted without errors");
 
@@ -198,7 +165,7 @@ void computedArrays(const Fixture& f)
     // Lossless compressed persistence.
     auto packed = options(f.root / "packed");
     packed.compressCache = true;
-    Filter again2{service, input};
+    Filter again2{*f.stored};
     {
         auto a = computed::open(packed, [&](const Index& c, std::uint8_t* out) { return again2(c, out); });
         a->read_many({{0, 0, 0}}, {{Z, Y, X}}, {again.data()});
@@ -214,9 +181,8 @@ int main()
 {
     try {
         Fixture f;
-        regionReads(f);
         computedArrays(f);
-        std::cout << "computed arrays and service region reads passed\n";
+        std::cout << "computed arrays passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;
