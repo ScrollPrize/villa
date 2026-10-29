@@ -6,6 +6,7 @@ import argparse
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -382,6 +383,80 @@ def _write_json_replace(path: Path, value: Mapping) -> None:
     os.replace(temporary, path)
 
 
+def _cgroup_cpu_quota(
+    proc_cgroup: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> float | None:
+    """The tightest CPU quota on this process's cgroup or its parents, in CPUs."""
+    try:
+        entries = proc_cgroup.read_text().splitlines()
+    except OSError:
+        return None
+    quotas = []
+    for entry in entries:
+        _, controllers, path = entry.split(":", 2)
+        if controllers == "":
+            base, version = cgroup_root, 2
+        elif "cpu" in controllers.split(","):
+            base, version = cgroup_root / "cpu", 1
+        else:
+            continue
+        node = Path(path)
+        while True:
+            folder = base / node.relative_to(node.anchor)
+            try:
+                if version == 2:
+                    quota, period = (folder / "cpu.max").read_text().split()
+                else:
+                    quota = (folder / "cpu.cfs_quota_us").read_text().strip()
+                    period = (folder / "cpu.cfs_period_us").read_text().strip()
+                if quota not in ("max", "-1") and int(period) > 0:
+                    quotas.append(int(quota) / int(period))
+            except (OSError, ValueError):
+                pass
+            if node == node.parent:
+                break
+            node = node.parent
+    return min(quotas) if quotas else None
+
+
+def usable_cpu_count() -> int:
+    """CPUs this process may use: its CPU affinity, capped by a cgroup CPU quota.
+
+    Inside a container with a CPU quota (Docker --cpus, Kubernetes limits,
+    Hugging Face Jobs) the affinity and os.cpu_count() still report the host's
+    CPUs.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        cpus = min(cpus, max(1, math.ceil(quota)))
+    return max(1, cpus)
+
+
+def limit_loader_worker_threads(worker_id: int) -> None:
+    """DataLoader worker_init_fn: give this worker's Numba pool its share of the CPUs.
+
+    InkDataset samples run tifxyz's parallel Numba kernels, and every loader
+    worker starts its own Numba pool sized to the whole machine, so several
+    workers oversubscribe the CPUs and their spinning threads use up a container
+    CPU quota. torch already gives each worker one intra-op thread. An explicit
+    NUMBA_NUM_THREADS still wins.
+    """
+    if "NUMBA_NUM_THREADS" in os.environ:
+        return
+    import numba
+    from torch.utils.data import get_worker_info
+
+    info = get_worker_info()
+    workers = info.num_workers if info is not None else 1
+    share = max(1, usable_cpu_count() // workers)
+    numba.set_num_threads(min(share, numba.config.NUMBA_NUM_THREADS))
+
+
 def _run_training(request: TrainingRequest) -> int:
     try:
         import accelerate
@@ -494,6 +569,7 @@ def _run_training(request: TrainingRequest) -> int:
                 "multiprocessing_context": "spawn",
                 "persistent_workers": True,
                 "prefetch_factor": config.prefetch_factor,
+                "worker_init_fn": limit_loader_worker_threads,
             }
         )
     if config.extra_patches.enabled:
