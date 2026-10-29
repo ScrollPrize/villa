@@ -117,7 +117,6 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     options.interpolation = surface.genInterpolation() == GenInterpolation::Smooth
         ? vcr::grid::Interpolation::Smooth
         : vcr::grid::Interpolation::Linear;
-    options.strictQuads = surface.strictQuadRenderValidity();
     options.components = surface.components();
     return std::make_shared<const vcr::grid::Surface>(
         vcr::grid::Vertices{reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,

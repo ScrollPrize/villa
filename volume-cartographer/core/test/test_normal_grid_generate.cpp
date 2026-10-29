@@ -38,8 +38,12 @@ TEST_CASE("Native normal-grid assembly covers sparse edges and parallel read err
         }
         cv::Mat brokenImage = cv::Mat::zeros(5,7,CV_8U);
         BinarySliceTarget brokenTarget{&brokenImage,0,false};
-        CHECK_THROWS(fillBinarySliceBatchFromArray(source, NormalGridSliceDirection::XY, 1,
-                                                  {3,5,7}, {2,3,4}, {&brokenTarget,1}, 2));
+        // A corrupt chunk is noted and skipped: it reads as fill.
+        auto reopened = vcr::zarr::openArray(path.string(), {});
+        CHECK_NOTHROW(fillBinarySliceBatchFromArray(reopened, NormalGridSliceDirection::XY, 1,
+                                                    {3,5,7}, {2,3,4}, {&brokenTarget,1}, 2));
+        CHECK_FALSE(brokenTarget.anyNonZero);
+        CHECK(reopened.array->stats().corrupt == 1);
         writer.setFillValue(1);
         auto nonzero = vcr::zarr::openArray(path.string(), {});
         cv::Mat image = cv::Mat::zeros(5,7,CV_8U);

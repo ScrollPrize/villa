@@ -61,6 +61,7 @@ add_library(vc_core
 
 target_link_libraries(vc_core
     PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog vc_reader::reader
+        vc_reader::transforms
         PUBLIC
         opencv_core
         opencv_imgproc
