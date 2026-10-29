@@ -163,6 +163,21 @@ int main() try {
         compare(expected,download<float>(s::cuda::plane(cached,type,origin,u,v,W,H,s::Order::Cubic),N));
 #endif
         service.configure(1<<20,1,false);
+        const float scalarPoints[] = {3.5f,3.5f,3.5f, 9,2,2, NAN,0,0, -100,0,0,
+                                      -0.5f,0,0, 0.5f,0,0, 1.5f,0,0, 11.5f,7.5f,7.5f,
+                                      INFINITY,0,0, 1e30f,0,0};
+        for (std::size_t p=0; p<std::size(scalarPoints)/3; ++p) {
+            service.invalidate(source);
+            float ref, got;
+            s::points(*array,type,scalarPoints+3*p,1,s::Order::Nearest,&ref);
+            s::points(cached,type,scalarPoints+3*p,1,s::Order::Nearest,&got);
+            compare({got},{ref});
+#ifdef VC_READER_CUDA
+            service.invalidate(source);
+            compare({got},download<float>(s::cuda::points(cached,type,scalarPoints+3*p,1,s::Order::Nearest),1));
+#endif
+        }
+
         const auto failed=service.addSource([](std::int32_t,std::int64_t,std::int64_t,std::int64_t)->ChunkPtr {
             throw std::runtime_error("fixture fetch error");
         },1);

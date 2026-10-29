@@ -166,7 +166,13 @@ void composite(Array& array, const ElementType& type, const float* base, const f
 { compositeImpl(array, type, base, dirs, n, width, offsets, order, method, out, nullptr); }
 
 void points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
-{ pointsImpl(cached, type, xyz, n, order, out, nullptr); }
+{
+    if (n == 1 && order == Order::Nearest) {
+        *out = detail::nearestPoint(cached, type, xyz);
+        return;
+    }
+    pointsImpl(cached, type, xyz, n, order, out, nullptr);
+}
 
 void plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
            std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out)

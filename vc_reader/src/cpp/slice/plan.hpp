@@ -139,6 +139,39 @@ inline Array& arrayOf(Array& array) { return array; }
 inline Array& arrayOf(Resident& resident) { return resident.array; }
 inline Array& arrayOf(Cached& cached) { return cached.array; }
 
+inline chunks::Chunk fetchChunk(Cached& input, const chunks::Key& key)
+{
+    auto chunk = input.service.get(key);
+    if (chunk.status != chunks::Status::Fill &&
+        (chunk.status != chunks::Status::Data || !chunk.bytes || chunk.bytes->size() != input.array.chunk_bytes()))
+        throw std::runtime_error("cached sampling chunk fetch failed: " + chunk.error);
+    return chunk;
+}
+
+// Scalar nearest requests (e.g. optimizer residuals) need one element of one
+// service chunk. Avoid allocating a dense wave and its snapshot map for them.
+inline float nearestPoint(Cached& input, const ElementType& type, const float* xyz)
+{
+    const auto& spec = input.array.spec();
+    if (spec.shape.size() != 3)
+        throw std::invalid_argument("sampling requires a 3-D array");
+    if (type.itemsize != spec.itemsize)
+        throw std::invalid_argument("service sampling element size differs from the array");
+    if (!finite(xyz[0]) || !finite(xyz[1]) || !finite(xyz[2]))
+        return std::numeric_limits<float>::quiet_NaN();
+    const float fill = float(type.load(spec.fill.data()));
+    if (outside(xyz[0], xyz[1], xyz[2], spec.shape[0], spec.shape[1], spec.shape[2], 0))
+        return fill;
+    std::int64_t index[3], last;
+    for (int a = 0; a < 3; ++a) footprint(xyz[2-a], 0, index[a], last);
+    const auto& c = spec.chunks;
+    const chunks::Key key{input.source, input.level, index[0]/c[0], index[1]/c[1], index[2]/c[2]};
+    const auto chunk = fetchChunk(input, key);
+    if (chunk.status == chunks::Status::Fill) return fill;
+    const auto offset = ((index[0]%c[0])*c[1] + index[1]%c[1])*c[2] + index[2]%c[2];
+    return float(type.load(chunk.bytes->data() + offset*type.itemsize));
+}
+
 // Assemble service-backed blocks once for both sampling backends. Pin each
 // chunk for the wave so eviction cannot change overlapping tiles mid-request.
 template<class Input>
@@ -168,12 +201,7 @@ inline void readBlocks(Input& resident, const ElementType& type, const Wave& wav
                     auto [it,fresh]=snapshot.try_emplace(key);
                     if (fresh) {
                         if constexpr (std::is_same_v<Input, Cached>) {
-                            it->second=resident.service.get(key);
-                            const auto& loaded=it->second;
-                            if (loaded.status!=chunks::Status::Fill &&
-                                (loaded.status!=chunks::Status::Data || !loaded.bytes ||
-                                 loaded.bytes->size()!=resident.array.chunk_bytes()))
-                                throw std::runtime_error("cached sampling chunk fetch failed: " + loaded.error);
+                            it->second=fetchChunk(resident,key);
                         } else {
                             it->second=resident.service.probe(key);
                         }
