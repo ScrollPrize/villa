@@ -121,6 +121,10 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     const fs::path sm = srcdir / "meta.json";
     if (fs::exists(sm)) meta = Json::parse_file(sm.string());
     meta["uuid"] = vc::util::newUuid();  // a straightened copy is a new object
+    // Straightening moves every point, so an isometry block (#2279) copied from the
+    // source is measured against the wrong grid; drop it (recompute with
+    // `vc_tifxyz --isometry`).
+    meta.erase("isometry");
     meta.erase("vc_open_data_representation");
     meta["name"] = outdir.filename().string();
     meta["format"] = "tifxyz";

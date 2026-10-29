@@ -202,6 +202,9 @@ static bool patch_target_meta(const fs::path& target_dir,
 
     j["source_png"]   = source_png_basename;
     j["converted_by"] = "vc_rgb2tifxyz";
+    // The output grid is the RGB-derived mesh, not any segment's, so an inherited
+    // isometry block (#2279) would be stale; drop it.
+    j.erase("isometry");
 
     try {
         std::ofstream out(meta_path);

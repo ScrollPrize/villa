@@ -302,3 +302,31 @@ TEST_CASE("cloneSurfaceForTransform handles null meta on the source")
     REQUIRE(clone != nullptr);
     CHECK(clone->meta.is_object());
 }
+
+TEST_CASE("transformSurfacePoints drops a stale isometry block when it regrids")
+{
+    auto pts = makePlanarGrid(8, 8);
+    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
+    qs.meta = utils::Json::object();
+    utils::Json iso = utils::Json::object();
+    iso["version"] = 1;
+    qs.meta["isometry"] = iso;
+    // The 2x pre-scale changes the measured spacing, so the surface is regridded
+    // and a copied block (#2279) no longer describes this grid.
+    transformSurfacePoints(&qs, 2, std::nullopt);
+    CHECK(qs.meta.is_object());
+    CHECK(!qs.meta.contains("isometry"));
+}
+
+TEST_CASE("transformSurfacePoints keeps the isometry block when the grid is unchanged")
+{
+    auto pts = makePlanarGrid(8, 8);
+    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
+    qs.meta = utils::Json::object();
+    utils::Json iso = utils::Json::object();
+    iso["version"] = 1;
+    qs.meta["isometry"] = iso;
+    // Nothing scales, so no regrid fires and the block still describes the grid.
+    transformSurfacePoints(&qs, 1, std::nullopt);
+    CHECK(qs.meta.contains("isometry"));
+}

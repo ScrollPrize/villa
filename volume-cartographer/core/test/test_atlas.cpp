@@ -2181,6 +2181,26 @@ TEST_CASE("Atlas base mesh copy preserves source columns and explicit wrapped se
     CHECK(savedLabels.at<uint8_t>(0, 4) == 99);
 }
 
+TEST_CASE("Atlas base mesh copy drops an inherited isometry block")
+{
+    const fs::path root = tempRoot("vc_atlas_base_mesh_copy_isometry");
+    cv::Mat_<cv::Vec3f> points(2, 5);
+    for (int row = 0; row < points.rows; ++row)
+        for (int col = 0; col < points.cols; ++col)
+            points(row, col) = cv::Vec3f(static_cast<float>(col),
+                                         static_cast<float>(row),
+                                         static_cast<float>(10 + col));
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    surface.meta = utils::Json::object();
+    utils::Json iso = utils::Json::object();
+    iso["version"] = 1;
+    surface.meta["isometry"] = iso;
+
+    vc::atlas::saveAtlasBaseMeshCopy(surface, root / "base_mesh" / "shell.tifxyz");
+    QuadSurface saved(root / "base_mesh" / "shell.tifxyz");
+    CHECK(!saved.meta.contains("isometry"));
+}
+
 TEST_CASE("Atlas mapped object covered size uses line anchors only")
 {
     vc::atlas::Atlas atlas;

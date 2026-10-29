@@ -165,6 +165,9 @@ def restore_scale(meta_path: Path, sx: float, sy: float) -> None:
     with meta_path.open() as f:
         meta = json.load(f)
     meta["scale"] = [sx, sy]
+    # The grid was resampled above, so a copied `isometry` block (villa#2279) no
+    # longer describes it; drop it (recompute with `vc_tifxyz --isometry`).
+    meta.pop("isometry", None)
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=4)
         f.write("\n")

@@ -3982,6 +3982,12 @@ void saveAtlasBaseMeshCopy(const QuadSurface& surface,
     }
     QuadSurface copy(*points, surface.scale());
     copy.meta = surface.meta;
+    // A newly saved derived object: the block is not re-measured for it here, so
+    // drop any inherited isometry block (#2279) rather than assert the source's
+    // (recompute with `vc_tifxyz --isometry`).
+    if (copy.meta.is_object()) {
+        copy.meta.erase("isometry");
+    }
     auto& mutableSurface = const_cast<QuadSurface&>(surface);
     for (const auto& name : mutableSurface.channelNames()) {
         cv::Mat channel = mutableSurface.channel(name, SURF_CHANNEL_NORESIZE);

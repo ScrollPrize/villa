@@ -435,6 +435,12 @@ void transformSurfacePoints(QuadSurface* surface,
                               static_cast<float>(spacingScaleY),
                               cv::INTER_LINEAR);
             surface->_scale = originalScale;
+            // The regridded surface is a new tessellation, so an isometry block
+            // (#2279) copied from the input no longer describes this grid; drop it
+            // (recompute with `vc_tifxyz --isometry`).
+            if (surface->meta.is_object()) {
+                surface->meta.erase("isometry");
+            }
             surface->invalidateCache();
         }
     }
