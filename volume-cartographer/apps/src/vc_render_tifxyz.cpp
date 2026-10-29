@@ -10,7 +10,7 @@
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/Json.hpp"
 #include "utils/http_fetch.hpp"
@@ -692,10 +692,10 @@ static void renderTiles(
     int numParts, int partId,
     int cvType,
     // Zarr output
-    vc::VcDataset* dsOut, const std::vector<size_t>& chunks0,
+    vcr::zarr::Writer* dsOut, const std::vector<size_t>& chunks0,
     size_t tilesXSrc, size_t tilesYSrc,
     // Pyramid datasets L1-L5 (empty = no inline pyramid)
-    const std::vector<vc::VcDataset*>& pyramidDs,
+    const std::vector<vcr::zarr::Writer*>& pyramidDs,
     // TIF output (optional)
     std::vector<TiffWriter>* tifWriters, uint32_t tiffTileH,
     bool quickTif,
@@ -740,12 +740,12 @@ static void renderTiles(
     if (!pyramidDs.empty()) {
         pyrAccum.resize(pyramidDs.size());
         for (size_t li = 0; li < pyramidDs.size(); li++) {
-            const auto& pc = pyramidDs[li]->defaultChunkShape();
+            const auto& pc = pyramidDs[li]->meta().chunks;
             pyrAccum[li].chZ = pc[0];
             pyrAccum[li].chY = pc[1];
             pyrAccum[li].chX = pc[2];
             // Number of pyramid chunk columns at this level
-            const auto& ps = pyramidDs[li]->shape();
+            const auto& ps = pyramidDs[li]->meta().shape;
             pyrAccum[li].pyrChunksX = (ps[2] + pc[2] - 1) / pc[2];
             pyrAccum[li].bufs.resize(pyrAccum[li].pyrChunksX);
             for (auto& b : pyrAccum[li].bufs)
@@ -778,13 +778,18 @@ static void renderTiles(
                     if (needsRotFlip)
                         mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
                                      std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
-                    if (dsOut->chunkExists(0, size_t(dTy), size_t(dTx))) {
+                    if (dsOut->chunkExists({0, dTy, dTx})) {
                         // Still need to scatter into pyramid accum buffers
                         // No rotation when inline pyramid is active
                         if (!pyrAccum.empty()) {
                             size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
                             std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
-                            dsOut->readChunk(0, size_t(dTy), size_t(dTx), existingBuf.data());
+                            const auto existing = dsOut->reader().chunk({0, dTy, dTx});
+                            if (existing) {
+                                if (existing->size() != existingBuf.size() * sizeof(T))
+                                    throw std::runtime_error("resume chunk has unexpected dtype or size");
+                                std::memcpy(existingBuf.data(), existing->data(), existing->size());
+                            }
                             uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
                             size_t dy_actual = std::min(chunkY, size_t(dy));
                             size_t dx_actual = std::min(chunkX, size_t(dxTile));
@@ -874,8 +879,8 @@ static void renderTiles(
                             std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
                         }
                     }
-                    dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
-                                               chunkBuf.data(), chunkBuf.size() * sizeof(T));
+                    dsOut->writeChunkSkipEmpty({0, dstTy, dstTx},
+                                               reinterpret_cast<const uint8_t*>(chunkBuf.data()), chunkBuf.size() * sizeof(T));
 
                     // Scatter L0 tile into L1 pyramid accumulation buffer
                     // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
@@ -958,8 +963,8 @@ static void renderTiles(
 
                 // Write each column's accumulation buffer as a zarr chunk
                 for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                    pyramidDs[li]->writeChunkSkipEmpty(0, pyrChunkRow, cx,
-                                                       pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
+                    pyramidDs[li]->writeChunkSkipEmpty({0, int64_t(pyrChunkRow), int64_t(cx)},
+                        reinterpret_cast<const uint8_t*>(pa.bufs[cx].data()), pa.bufs[cx].size() * sizeof(T));
                 }
 
                 // Cascade: scatter this level's buffers into the next level's accum
@@ -1796,7 +1801,7 @@ int main(int argc, char *argv[])
         const size_t CH = 128, CW = 128;
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
         std::vector<size_t> chunks0;
-        std::unique_ptr<vc::VcDataset> dsOut;
+        std::unique_ptr<vcr::zarr::Writer> dsOut;
         std::filesystem::path outFilePath(wantZarr ? zarrOutputArg : "/dev/null");
         size_t tilesYSrc = 0, tilesXSrc = 0;
 
@@ -1808,13 +1813,18 @@ int main(int argc, char *argv[])
             outFilePath = zarrOutputArg;
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
-            auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
+            vcr::zarr::CreateOptions outputOptions;
+            outputOptions.shape.assign(shape0.begin(), shape0.end());
+            outputOptions.chunks.assign(chunks0.begin(), chunks0.end());
+            outputOptions.dtype = useU16 ? "<u2" : "|u1";
+            outputOptions.compressor = zarrCompressor;
+            outputOptions.separator = zarrSeparator;
+            outputOptions.level = zarrCompressionLevel;
 
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
-                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
-                                      zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
+                vcr::zarr::Writer::create(outFilePath / "0", outputOptions);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
                     createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
@@ -1830,14 +1840,14 @@ int main(int argc, char *argv[])
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
                     logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return false;
                 }
-                dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
+                dsOut = std::make_unique<vcr::zarr::Writer>(vcr::zarr::Writer::open(outFilePath / "0"));
             } else if (resumeFlag && std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
-                dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
+                dsOut = std::make_unique<vcr::zarr::Writer>(vcr::zarr::Writer::open(outFilePath / "0"));
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
-                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
-                                              zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
+                dsOut = std::make_unique<vcr::zarr::Writer>(
+                    vcr::zarr::Writer::create(outFilePath / "0", outputOptions));
             }
 
             tilesYSrc = (tgt_size.height + CH - 1) / CH;
@@ -1902,8 +1912,8 @@ int main(int argc, char *argv[])
         // Inline pyramid only works without rotation/flip (accumulation assumes
         // source tile-rows map 1:1 to destination tile-rows for row-group flushing)
         const bool inlinePyramid = wantZarr && wantPyramid && !pre_flag && !hasRotFlip;
-        std::vector<vc::VcDataset*> pyramidDs;
-        std::vector<std::unique_ptr<vc::VcDataset>> pyramidOwned;
+        std::vector<vcr::zarr::Writer*> pyramidDs;
+        std::vector<std::unique_ptr<vcr::zarr::Writer>> pyramidOwned;
         if (wantZarr && wantPyramid && !pre_flag) {
             // Single-part: create datasets now; multi-part/resume: already created them
             if (numParts <= 1 && !resumeFlag) {
@@ -1915,7 +1925,8 @@ int main(int argc, char *argv[])
             }
             if (inlinePyramid) {
                 for (int level = 1; level <= 5; level++) {
-                    pyramidOwned.push_back(std::make_unique<vc::VcDataset>(outFilePath / std::to_string(level)));
+                    pyramidOwned.push_back(std::make_unique<vcr::zarr::Writer>(
+                        vcr::zarr::Writer::open(outFilePath / std::to_string(level))));
                     pyramidDs.push_back(pyramidOwned.back().get());
                 }
             }

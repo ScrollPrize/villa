@@ -1,5 +1,5 @@
 #include "vc/core/util/Zarr.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -50,12 +50,16 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
                        size_t CH, size_t CW,
                        int numParts, int partId)
 {
-    auto src = std::make_unique<vc::VcDataset>(outDir / std::to_string(level - 1));
-    auto dst = std::make_unique<vc::VcDataset>(outDir / std::to_string(level));
-    const auto& ss = src->shape();
-    const auto& sc = src->defaultChunkShape();
-    const auto& dc = dst->defaultChunkShape();
-    const auto& ds = dst->shape();
+    auto src = vcr::zarr::openArray((outDir / std::to_string(level - 1)).string(), {});
+    auto dst = vcr::zarr::Writer::open(outDir / std::to_string(level));
+    const auto& ss = src.meta.shape;
+    const auto& sc = src.meta.chunks;
+    const auto& dc = dst.meta().chunks;
+    const auto& ds = dst.meta().shape;
+    if (ss.size() != 3 || ds.size() != 3 ||
+        src.meta.type.kind != 'u' || dst.meta().type.kind != 'u' ||
+        src.meta.itemsize() != sizeof(T) || dst.meta().itemsize() != sizeof(T))
+        throw std::runtime_error("pyramid levels must be 3-D arrays of the output dtype");
 
     size_t srcChunksY = (ss[1] + sc[1] - 1) / sc[1];
     size_t srcChunksX = (ss[2] + sc[2] - 1) / sc[2];
@@ -85,12 +89,15 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
                 if (scy >= srcChunksY || scx >= srcChunksX) continue;
 
                 std::vector<T> srcBuf(srcElems, T(0));
-                if (!src->readChunk(0, scy, scx, srcBuf.data()))
-                    continue;
+                const auto chunk = src.array->chunk({0, int64_t(scy), int64_t(scx)});
+                if (!chunk) continue;
+                if (chunk->size() != srcBuf.size() * sizeof(T))
+                    throw std::runtime_error("pyramid source chunk has unexpected dtype or size");
+                std::memcpy(srcBuf.data(), chunk->data(), chunk->size());
 
                 size_t saZ = std::min(sc[0], ss[0]);
-                size_t saY = std::min(sc[1], ss[1] - scy * sc[1]);
-                size_t saX = std::min(sc[2], ss[2] - scx * sc[2]);
+                size_t saY = std::min(size_t(sc[1]), size_t(ss[1]) - scy * sc[1]);
+                size_t saX = std::min(size_t(sc[2]), size_t(ss[2]) - scx * sc[2]);
 
                 size_t halfY = sc[1] / 2, halfX = sc[2] / 2;
                 size_t offY = sy * halfY;
@@ -103,8 +110,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
             }
         }
 
-        dst->writeChunkSkipEmpty(0, dcy, dcx,
-                                 dstBuf.data(), dstBuf.size() * sizeof(T));
+        dst.writeChunkSkipEmpty({0, int64_t(dcy), int64_t(dcx)},
+                                reinterpret_cast<const uint8_t*>(dstBuf.data()), dstBuf.size() * sizeof(T));
 
         size_t d = ++done;
         #pragma omp critical(pp)
@@ -128,7 +135,6 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
                            int compressionLevel,
                            const std::string& dimensionSeparator)
 {
-    auto dtype = isU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
@@ -136,8 +142,14 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
         std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
         size_t chZ = std::min(shape[0], shape0[0]);
         std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
-        vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype,
-                              compressor, dimensionSeparator, 0, compressionLevel);
+        vcr::zarr::CreateOptions options;
+        options.shape.assign(shape.begin(), shape.end());
+        options.chunks.assign(chunks.begin(), chunks.end());
+        options.dtype = isU16 ? "<u2" : "|u1";
+        options.compressor = compressor;
+        options.separator = dimensionSeparator;
+        options.level = compressionLevel;
+        vcr::zarr::Writer::create(outDir / std::to_string(level), options);
         prevShape = shape;
     }
 }
@@ -265,5 +277,5 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     multiscales.push_back(buildMultiscales(baseVoxelSize, voxelUnit, sliceStep, pixelsPerVoxel));
     attrs["multiscales"] = std::move(multiscales);
 
-    vc::writeZarrAttributes(outDir, attrs);
+    vcr::zarr::writeAttributes(outDir, vcr::zarr::Json::parse(attrs.dump()));
 }

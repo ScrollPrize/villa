@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/Zarr.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -57,9 +57,8 @@ TEST_CASE("createPyramidDatasets writes L1..L5 metadata directories")
 {
     auto d = tmpDir("pyr_create");
     // Create L0 first (createPyramidDatasets only writes L1..L5).
-    vc::createZarrDataset(d, "0",
-        /*shape=*/{64, 64, 64}, /*chunks=*/{32, 32, 32},
-        vc::VcDtype::uint8, /*compressor=*/"none");
+    vcr::zarr::Writer::create(d / "0", {
+        .shape = {64, 64, 64}, .chunks = {32, 32, 32}, .compressor = "none"});
     createPyramidDatasets(d, /*shape0=*/{64, 64, 64},
                           /*CH=*/32, /*CW=*/32, /*isU16=*/false);
     for (int lvl = 1; lvl <= 5; ++lvl) {
@@ -265,28 +264,49 @@ TEST_CASE("writeZarrAttrs keeps multiscales and only relative scaling when the s
     fs::remove_all(d);
 }
 
-TEST_CASE("buildPyramidLevel: builds L1 from L0")
+template<class T>
+void checkPyramidRoundTrip()
 {
     auto d = tmpDir("buildpyr");
-    auto l0 = vc::createZarrDataset(d, "0",
-        /*shape=*/{16, 16, 16}, /*chunks=*/{8, 8, 8},
-        vc::VcDtype::uint8, "none");
-    REQUIRE(l0);
-    // Fill chunk (0,0,0) with a known value so L1 has data to downsample.
-    std::vector<uint8_t> payload(8 * 8 * 8, 60);
-    l0->writeChunk(0, 0, 0, payload.data(), payload.size());
-
-    // createPyramidDatasets writes L1..L5 metadata.
-    createPyramidDatasets(d, {16, 16, 16}, 8, 8, /*isU16=*/false);
-    buildPyramidLevel<uint8_t>(d, /*level=*/1, /*CH=*/8, /*CW=*/8);
-
-    // L1 chunk (0,0,0) should have the downsampled constant.
-    vc::VcDataset l1(d / "1");
-    std::vector<uint8_t> out(l1.defaultChunkSize(), 0);
-    if (l1.chunkExists(0, 0, 0)) {
-        CHECK(l1.readChunk(0, 0, 0, out.data()));
-        // L0 was constant 60 — L1 should also be 60 in the downsampled region.
-        CHECK(int(out[0]) == 60);
-    }
+    const bool u16 = sizeof(T) == 2;
+    auto l0 = vcr::zarr::Writer::create(d / "0", {
+        .shape = {3, 19, 21}, .chunks = {3, 8, 8},
+        .dtype = u16 ? "<u2" : "|u1", .compressor = "zstd", .separator = "/"});
+    std::vector<T> input(3 * 19 * 21, 0);
+    for (size_t z = 0; z < 3; ++z)
+        for (size_t y = 0; y < 19; ++y)
+            for (size_t x = 0; x < 21; ++x)
+                if (y >= 8 || x >= 8)
+                    input[(z * 19 + y) * 21 + x] = T((u16 ? 1000 : 10) + z * 23 + y + x);
+    l0.writeRegion({0, 0, 0}, {3, 19, 21}, reinterpret_cast<const uint8_t*>(input.data()));
+    // Remove the zero chunk so the build also has to handle absent data.
+    l0.removeChunk({0, 0, 0});
+    createPyramidDatasets(d, {3, 19, 21}, 8, 8, u16, "zstd", -1, "/");
+    buildPyramidLevel<T>(d, 1, 8, 8);
+    auto l1 = vcr::zarr::openArray((d / "1").string(), {});
+    REQUIRE(l1.meta.shape == vcr::Index{3, 10, 11});
+    std::vector<T> output(3 * 10 * 11);
+    l1.array->read_many({{0, 0, 0}}, {{3, 10, 11}}, {reinterpret_cast<uint8_t*>(output.data())});
+    for (size_t z = 0; z < 3; ++z)
+        for (size_t y = 0; y < 10; ++y)
+            for (size_t x = 0; x < 11; ++x) {
+                uint32_t sum = 0, count = 0;
+                for (size_t sy = y * 2; sy < std::min(y * 2 + 2, size_t(19)); ++sy)
+                    for (size_t sx = x * 2; sx < std::min(x * 2 + 2, size_t(21)); ++sx) {
+                        sum += input[(z * 19 + sy) * 21 + sx];
+                        ++count;
+                    }
+                CHECK(output[(z * 10 + y) * 11 + x] == T((sum + count / 2) / count));
+            }
     fs::remove_all(d);
+}
+
+TEST_CASE("buildPyramidLevel preserves uint8 slices, sparse chunks and odd edges")
+{
+    checkPyramidRoundTrip<uint8_t>();
+}
+
+TEST_CASE("buildPyramidLevel preserves uint16 slices, sparse chunks and odd edges")
+{
+    checkPyramidRoundTrip<uint16_t>();
 }
