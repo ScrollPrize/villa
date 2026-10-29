@@ -146,6 +146,61 @@ void metadata()
               "object dtype");
 }
 
+void localShards(const fs::path& root, bool remote = false)
+{
+    for (bool end : {false, true}) for (bool crc : {false, true}) {
+        const auto path = root / (std::string("shard-") + (end ? "end" : "start") + (crc ? "-crc" : ""));
+        const vcr::ShardLayout layout({1, 1, 2}, end, crc, 2);
+        auto fixture = [&](bool firstPresent) {
+            std::vector<uint8_t> index(layout.indexBytes, 255), body;
+            auto put = [&](size_t at, uint64_t value, int count) {
+                for (int i = 0; i < count; ++i) index[at + i] = uint8_t(value >> (8 * i));
+            };
+            if (firstPresent) {
+                put(0, end ? 0 : layout.indexBytes, 8);
+                put(8, 2, 8);
+                body = {1, 2};
+            }
+            put(16, body.size() + (end ? 0 : layout.indexBytes), 8);
+            put(24, 2, 8);
+            body.insert(body.end(), firstPresent ? std::initializer_list<uint8_t>{9, 10}
+                                                : std::initializer_list<uint8_t>{7, 8});
+            if (crc) put(index.size() - 4, vcr::crc32c(index.data(), index.size() - 4), 4);
+            if (end) body.insert(body.end(), index.begin(), index.end());
+            else body.insert(body.begin(), index.begin(), index.end());
+            return std::string(reinterpret_cast<const char*>(body.data()), body.size());
+        };
+        vcr::zarr::atomicWrite(path, fixture(false));
+        vcr::LocalShard snapshot(path, layout);
+        vcr::zarr::atomicWrite(path, fixture(true));
+        std::vector<uint8_t> got;
+        require(!snapshot.readEntry(0, got), "snapshot retains missing entry");
+        require(snapshot.readEntry(1, got) && got == std::vector<uint8_t>{7, 8},
+                "index and payload use one file snapshot across replacement");
+        require(vcr::LocalShard(path, layout).readEntry(1, got) && got == std::vector<uint8_t>{9, 10},
+                "new shard reader sees replacement");
+        std::atomic<uint64_t> requests{0}, bytes{0};
+        std::unique_ptr<vcr::HttpClient> client;
+        if (remote) client = std::make_unique<vcr::HttpClient>(vcr::HttpOptions{});
+        vcr::ZarrStorage storage(remote ? sftp_fixture::url(root) : root.string(), "", ".", {1, 1, 2},
+                                 end, crc, 2, client.get(), requests, bytes);
+        vcr::zarr::atomicWrite(root / "0.0.0", fixture(true));
+        require(storage.read("0.0.1", got) && got == std::vector<uint8_t>{9, 10}, "storage shard read");
+        require(storage.read("0.0.0", got) && got == std::vector<uint8_t>{1, 2}, "second shard entry read");
+        if (remote) require(requests == 3, "remote shard reuses its validated index");
+        auto broken = fixture(true);
+        broken.resize(3);
+        vcr::zarr::atomicWrite(path, broken);
+        must_fail([&] { vcr::LocalShard(path, layout); }, "truncated index refused");
+        if (crc) {
+            broken = fixture(true);
+            broken[end ? broken.size() - 1 : layout.indexBytes - 1] ^= 1;
+            vcr::zarr::atomicWrite(path, broken);
+            must_fail([&] { vcr::LocalShard(path, layout); }, "corrupt index CRC refused");
+        }
+    }
+}
+
 void local(const fs::path& root, const std::vector<uint16_t>& v)
 {
     const auto group = root / "local.zarr";
@@ -314,12 +369,14 @@ int main(int argc, char** argv)
         fs::create_directories(root);
         const auto v = volume();
         metadata();
+        localShards(root);
         local(root, v);
         if (!sftp_fixture::install(root)) {
             std::cout << "metadata and local groups passed; no OpenSSH sftp-server for remote cases\n";
             return 0;
         }
         remote(root, v);
+        localShards(root, true);
         std::cout << "metadata, local groups, remote decoded/VC3D caches online and offline passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
