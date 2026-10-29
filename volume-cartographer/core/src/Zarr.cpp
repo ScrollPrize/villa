@@ -47,8 +47,7 @@ template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, siz
 
 template <typename T>
 void buildPyramidLevel(const std::filesystem::path& outDir, int level,
-                       size_t CH, size_t CW,
-                       int numParts, int partId)
+                       size_t rowStart, size_t rowEnd)
 {
     auto src = vcr::zarr::openArray((outDir / std::to_string(level - 1)).string(), {});
     auto dst = vcr::zarr::Writer::open(outDir / std::to_string(level));
@@ -66,9 +65,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
     size_t dstChunksY = (ds[1] + dc[1] - 1) / dc[1];
     size_t dstChunksX = (ds[2] + dc[2] - 1) / dc[2];
 
-    size_t rowsPerPart = (dstChunksY + size_t(numParts) - 1) / size_t(numParts);
-    size_t rowStart = size_t(partId) * rowsPerPart;
-    size_t rowEnd = std::min(rowStart + rowsPerPart, dstChunksY);
+    rowEnd = std::min(rowEnd, dstChunksY);
+    rowStart = std::min(rowStart, rowEnd);
     size_t myTiles = (rowEnd - rowStart) * dstChunksX;
     std::atomic<size_t> done{0};
 
@@ -121,8 +119,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
     if (myTiles > 0) std::cout << std::endl;
 }
 
-template void buildPyramidLevel<uint8_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
-template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint8_t>(const std::filesystem::path&, int, size_t, size_t);
+template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, size_t, size_t);
 
 // ============================================================
 // createPyramidDatasets

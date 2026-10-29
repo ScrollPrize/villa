@@ -282,7 +282,7 @@ void checkPyramidRoundTrip()
     // Remove the zero chunk so the build also has to handle absent data.
     l0.removeChunk({0, 0, 0});
     createPyramidDatasets(d, {3, 19, 21}, 8, 8, u16, "zstd", -1, "/");
-    buildPyramidLevel<T>(d, 1, 8, 8);
+    buildPyramidLevel<T>(d, 1);
     auto l1 = vcr::zarr::openArray((d / "1").string(), {});
     REQUIRE(l1.meta.shape == vcr::Index{3, 10, 11});
     std::vector<T> output(3 * 10 * 11);

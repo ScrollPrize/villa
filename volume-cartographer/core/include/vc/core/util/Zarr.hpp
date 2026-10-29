@@ -13,28 +13,6 @@
 // Callers of buildMultiscales() include utils/Json.hpp themselves.
 namespace utils { class Json; }
 
-// Map a tile index through rotation + flip (pure integer tile coordinate transform).
-// Used by both zarr and tif writers.
-inline void mapTileIndex(int tx, int ty, int tilesX, int tilesY,
-                         int quadRot, int flipType,
-                         int& outTx, int& outTy, int& outTilesX, int& outTilesY)
-{
-    bool swap = (quadRot % 2) == 1;
-    int rTX = swap ? tilesY : tilesX, rTY = swap ? tilesX : tilesY;
-    int rx = tx, ry = ty;
-    switch (quadRot) {
-        case 1: rx = ty;              ry = tilesX - 1 - tx; break;
-        case 2: rx = tilesX - 1 - tx; ry = tilesY - 1 - ty; break;
-        case 3: rx = tilesY - 1 - ty; ry = tx;              break;
-        default: break;
-    }
-    int fx = rx, fy = ry;
-    if (flipType == 0)      fy = rTY - 1 - ry;
-    else if (flipType == 1) fx = rTX - 1 - rx;
-    else if (flipType == 2) { fx = rTX - 1 - rx; fy = rTY - 1 - ry; }
-    outTx = fx; outTy = fy; outTilesX = rTX; outTilesY = rTY;
-}
-
 // 2×2×1 mean downsample from src tile into a sub-region of dst at (dstOffY, dstOffX).
 // Z is preserved (no decimation in Z), while Y/X are downsampled by factor 2.
 // dst layout: dstZ × dstY × dstX (row-major). Writes at offset within the Y×X plane.
@@ -44,12 +22,11 @@ void downsampleTileIntoPreserveZ(const T* src, size_t srcZ, size_t srcY, size_t 
                                 size_t srcActualZ, size_t srcActualY, size_t srcActualX,
                                 size_t dstOffY, size_t dstOffX);
 
-// Build one pyramid level (2x mean downsample) via readChunk/writeChunk + OMP.
-// numParts/partId partition the output tile-rows across VMs (1/0 = no partitioning).
+// Build chunk rows [rowStart, rowEnd) of one pyramid level (2x mean downsample of
+// the level below on disk) in parallel; rows past the level's end are ignored.
 template <typename T>
 void buildPyramidLevel(const std::filesystem::path& outFile, int level,
-                       size_t CH, size_t CW,
-                       int numParts = 1, int partId = 0);
+                       size_t rowStart = 0, size_t rowEnd = SIZE_MAX);
 
 // Create pyramid level datasets L1-L5 (metadata only, no data).
 // Called by --pre so that multi-part workers can open existing datasets.

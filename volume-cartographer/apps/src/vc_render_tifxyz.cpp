@@ -31,7 +31,6 @@
 #include <exception>
 #include <thread>
 #include <optional>
-#include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
 #ifndef _WIN32
@@ -462,15 +461,6 @@ static size_t usableMemoryBytes()
     return bytes;
 }
 
-static bool pathsEquivalent(const std::filesystem::path& a, const std::filesystem::path& b)
-{
-    std::error_code ecA, ecB;
-    auto ca = std::filesystem::weakly_canonical(a, ecA);
-    auto cb = std::filesystem::weakly_canonical(b, ecB);
-    if (!ecA && !ecB) return ca == cb;
-    return a.lexically_normal() == b.lexically_normal();
-}
-
 // Accumulates the sampled layers into one image per output slice.
 template <typename T>
 static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int numSlices,
@@ -492,35 +482,32 @@ static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int 
 }
 
 // ============================================================
-// TIFF row writer
+// Rendering: OMP-parallel over the output tiles (the zarr chunks and TIFF tiles)
 // ============================================================
 
-// Writes full-width output rows starting at source row rowY0 into each slice's TIFF.
-static void writeTifRows(std::vector<TiffWriter>& writers,
-                          const std::vector<cv::Mat>& slices,
-                          uint32_t rowY0, uint32_t tiffTileH,
-                          uint32_t srcHeight, int rotQuad, int flipAxis)
+// The source pixels (the unrotated render) that land in output pixels [x0, x1] x
+// [y0, y1] after rotation (quarter turns counter-clockwise) and flip.
+static cv::Rect sourceRect(int x0, int y0, int x1, int y1, const cv::Size& source, int rotQuad, int flipAxis)
 {
-    uint32_t numTiffTiles = (srcHeight + tiffTileH - 1) / tiffTileH;
-    for (size_t zi = 0; zi < slices.size(); zi++) {
-        for (uint32_t ty = 0; ty < uint32_t(slices[zi].rows); ty += tiffTileH) {
-            uint32_t tdy = std::min(tiffTileH, uint32_t(slices[zi].rows) - ty);
-            cv::Mat sub = slices[zi](cv::Rect(0, ty, slices[zi].cols, tdy));
-            int dstBx, dstBy, rBX, rBY;
-            uint32_t srcTileIdx = (rowY0 + ty) / tiffTileH;
-            mapTileIndex(0, int(srcTileIdx), 1, int(numTiffTiles),
-                         std::max(rotQuad, 0), flipAxis, dstBx, dstBy, rBX, rBY);
-            writers[zi].writeTile(0, uint32_t(dstBy) * tiffTileH, sub);
+    const bool swap = rotQuad == 1 || rotQuad == 3;
+    const int W = swap ? source.height : source.width, H = swap ? source.width : source.height;
+    auto back = [&](int x, int y) {
+        if (flipAxis == 0 || flipAxis == 2) y = H - 1 - y;
+        if (flipAxis == 1 || flipAxis == 2) x = W - 1 - x;
+        switch (rotQuad) {
+            case 1: return cv::Point(source.width - 1 - y, x);
+            case 2: return cv::Point(source.width - 1 - x, source.height - 1 - y);
+            case 3: return cv::Point(y, source.height - 1 - x);
+            default: return cv::Point(x, y);
         }
-    }
+    };
+    const cv::Point a = back(x0, y0), b = back(x1, y1);
+    return {std::min(a.x, b.x), std::min(a.y, b.y), std::abs(a.x - b.x) + 1, std::abs(a.y - b.y) + 1};
 }
 
-
-// ============================================================
-// Rendering: OMP-parallel over 128x128 output tiles, written to the zarr
-// chunks and/or assembled into TIFF rows
-// ============================================================
-
+// Renders output tiles [tileRows) of `tiles` (CH x CW pixels each, in output
+// space after rotation/flip): samples each tile's source pixels, then writes the
+// tile to the zarr level 0 and/or each slice's TIFF.
 template <typename T>
 static void renderTiles(
     QuadSurface* surf, vcr::Array& volume, const vcr::ElementType& type, const LevelMap& levelMap,
@@ -531,327 +518,108 @@ static void renderTiles(
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
     const vcr::composite::Options& compositeMethod,
-    int rotQuad, int flipAxis,
-    int numParts, int partId,
-    int cvType,
-    // Zarr output (null: TIFF only); chunks0 is the tile shape either way
-    vcr::zarr::Writer* dsOut, const std::vector<size_t>& chunks0,
-    size_t tilesXSrc, size_t tilesYSrc,
-    // Pyramid datasets L1-L5 (empty = no inline pyramid)
-    const std::vector<vcr::zarr::Writer*>& pyramidDs,
-    // TIF output (optional)
-    std::vector<TiffWriter>* tifWriters, uint32_t tiffTileH,
-    bool quickTif,
-    bool resume)
+    int rotQuad, int flipAxis, int cvType,
+    size_t CH, size_t CW, size_t tilesX, uint32_t rowStart, uint32_t rowEnd,
+    vcr::zarr::Writer* dsOut,                 // null: no zarr output
+    std::vector<TiffWriter>* tifWriters,      // null: no TIFF output
+    bool quickTif, bool resume)
 {
-    const size_t CH = chunks0[1], CW = chunks0[2];
-    const uint32_t numTileRows = static_cast<uint32_t>(tilesYSrc);
-    const uint32_t numTileCols = static_cast<uint32_t>(tilesXSrc);
-
     // Pre-warm validMask cache (thread-safety: subsequent calls are read-only)
     surf->validMask();
 
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
+    const auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
     const auto compositeOffsets = isComposite
         ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
         : std::vector<float>{};
+    const bool swap = rotQuad == 1 || rotQuad == 3;
+    const cv::Size outSize = swap ? cv::Size(tgtSize.height, tgtSize.width) : tgtSize;
+    const size_t numZ = isComposite ? 1 : size_t(std::max(1, numSlices));
+    std::vector<std::mutex> tifLocks(tifWriters ? tifWriters->size() : 0);
 
-    const bool wantTif = tifWriters && !tifWriters->empty();
-    const bool useU16 = (cvType == CV_16UC1);
-
-    auto wallStart = std::chrono::steady_clock::now();
+    const long long count = (long long)(rowEnd - rowStart) * (long long)tilesX;
+    std::atomic<long long> done{0};
+    std::atomic<bool> failed{false};
+    std::exception_ptr error;
+    const auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
 
-    // Contiguous block assignment: each part gets a contiguous range of tile rows
-    // for better spatial locality (avoids all VMs reading the same volume region)
-    uint32_t rowsPerPart = (numTileRows + uint32_t(numParts) - 1) / uint32_t(numParts);
-    // Align to 32 tile-rows for multi-VM pyramid (2^5 = 32 covers L1..L5)
-    if (numParts > 1 && !pyramidDs.empty()) {
-        constexpr uint32_t kPyrAlign = 32;
-        rowsPerPart = ((rowsPerPart + kPyrAlign - 1) / kPyrAlign) * kPyrAlign;
-    }
-    uint32_t tyStart = uint32_t(partId) * rowsPerPart;
-    uint32_t tyEnd = std::min(tyStart + rowsPerPart, numTileRows);
-
-    // ---- Pyramid accumulation buffers (L1..L5) ----
-    // At level L, one 128×128 pyramid chunk covers 2^L × 2^L L0 tiles.
-    // pyrAccum[li] has one buffer per pyramid chunk column for the current row-group.
-    struct PyrAccumLevel {
-        size_t chZ, chY, chX;          // chunk dims at this level
-        size_t pyrChunksX;             // number of pyramid chunk columns
-        std::vector<std::vector<T>> bufs;  // one per pyramid chunk column
-    };
-    std::vector<PyrAccumLevel> pyrAccum;
-    if (!pyramidDs.empty()) {
-        pyrAccum.resize(pyramidDs.size());
-        for (size_t li = 0; li < pyramidDs.size(); li++) {
-            const auto& pc = pyramidDs[li]->meta().chunks;
-            pyrAccum[li].chZ = pc[0];
-            pyrAccum[li].chY = pc[1];
-            pyrAccum[li].chX = pc[2];
-            // Number of pyramid chunk columns at this level
-            const auto& ps = pyramidDs[li]->meta().shape;
-            pyrAccum[li].pyrChunksX = (ps[2] + pc[2] - 1) / pc[2];
-            pyrAccum[li].bufs.resize(pyrAccum[li].pyrChunksX);
-            for (auto& b : pyrAccum[li].bufs)
-                b.assign(pc[0] * pc[1] * pc[2], T(0));
-        }
-    }
-
-    for (uint32_t ty = tyStart; ty < tyEnd; ty++) {
-        uint32_t y0 = ty * uint32_t(CH);
-        uint32_t dy = std::min(uint32_t(CH), uint32_t(tgtSize.height) - y0);
-
-        // TIF row buffer: one tile-column's worth of slices per tx
-        // tifRowBuf[tx] = vector of cv::Mat (one per output slice), each 128xdx
-        std::vector<std::vector<cv::Mat>> tifRowBuf;
-        if (wantTif) tifRowBuf.resize(numTileCols);
-
-        // A throw inside the OpenMP tile loop (a remote chunk fetch that failed
-        // after its retries, for instance) would end in std::terminate. Keep the
-        // first failure and rethrow it once every tile of this row has stopped.
-        std::atomic<bool> rowFailed{false};
-        std::exception_ptr rowError;
-        #pragma omp parallel for schedule(dynamic)
-        for (uint32_t tx = 0; tx < numTileCols; tx++) {
-            if (rowFailed.load(std::memory_order_relaxed)) continue;
-            try {
-                // Resume: skip tile if L0 chunk already exists on disk
-                if (resume && dsOut) {
-                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-                    int dTx = int(tx), dTy = int(ty), dTX, dTY;
-                    if (needsRotFlip)
-                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                     std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
-                    if (dsOut->chunkExists({0, dTy, dTx})) {
-                        // Still need to scatter into pyramid accum buffers
-                        // No rotation when inline pyramid is active
-                        if (!pyrAccum.empty()) {
-                            size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
-                            std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
-                            const auto existing = dsOut->reader().chunk({0, dTy, dTx});
-                            if (existing) {
-                                if (existing->size() != existingBuf.size() * sizeof(T))
-                                    throw std::runtime_error("resume chunk has unexpected dtype or size");
-                                std::memcpy(existingBuf.data(), existing->data(), existing->size());
-                            }
-                            uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
-                            size_t dy_actual = std::min(chunkY, size_t(dy));
-                            size_t dx_actual = std::min(chunkX, size_t(dxTile));
-                            size_t numZ = isComposite ? 1 : size_t(std::max(1, numSlices));
-                            size_t l1cx = size_t(tx) >> 1;
-                            size_t halfCH = CH / 2, halfCW = CW / 2;
-                            size_t offY = (size_t(ty) & 1) * halfCH;
-                            size_t offX = (size_t(tx) & 1) * halfCW;
-                            auto& pa = pyrAccum[0];
-                            if (l1cx < pa.bufs.size()) {
-                                downsampleTileIntoPreserveZ(
-                                    existingBuf.data(), chunkZ, chunkY, chunkX,
-                                    pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
-                                    numZ, dy_actual, dx_actual,
-                                    offY, offX);
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                uint32_t x0 = tx * uint32_t(CW);
-                uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
-
-                // 1. Generate surface for this tile
-                float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-                u0 += float(crop.x) + float(x0);
-                v0 += float(crop.y) + float(y0);
-                cv::Mat_<cv::Vec3f> tilePts, tileNrm;
-                genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
-
-                // 2. Prepare base coords and step directions
-                cv::Mat_<cv::Vec3f> base, dirs;
-                prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, levelMap, hasAffine, aff, base, dirs);
-
-                // 3. Sample all slices for this tile
-                std::vector<cv::Mat_<T>> raw;
-                if (isComposite) {
-                    // Composite mode: always u8 (the caller rejects uint16 sources).
-                    if constexpr (std::is_same_v<T, uint8_t>)
-                        raw = {sampleComposite(volume, base, dirs, compositeOffsets, compositeMethod)};
-                } else {
-                    raw = sampleLayers<T>(volume, type, base, dirs, allOffsets);
-                }
-
-                // Accumulate (no rotation: applied per zarr chunk and per TIFF row separately).
-                // A composite is one image already.
-                std::vector<cv::Mat> slices = isComposite
-                    ? std::vector<cv::Mat>(raw.begin(), raw.end())
-                    : processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType);
-
-                // 4. Pack into zarr chunk (with rotation applied to pixel data)
-                if (dsOut) {
-                    size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
-                    size_t numZ = slices.size();
-                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-
-                    // Only clone+rotate when rotation/flip is active
-                    const std::vector<cv::Mat>* zarrSlices = &slices;
-                    std::vector<cv::Mat> rotSlices;
-                    if (needsRotFlip) {
-                        rotSlices.resize(numZ);
-                        for (size_t zi = 0; zi < numZ; zi++) {
-                            rotSlices[zi] = slices[zi].clone();
-                            rotateFlipIfNeeded(rotSlices[zi], rotQuad, flipAxis);
-                        }
-                        zarrSlices = &rotSlices;
-                    }
-
-                    int dstTx = int(tx), dstTy = int(ty), dTX, dTY;
-                    if (needsRotFlip)
-                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                     std::max(rotQuad, 0), flipAxis, dstTx, dstTy, dTX, dTY);
-
-                    std::vector<T> chunkBuf(chunkZ * chunkY * chunkX, T(0));
-                    size_t dy_actual = std::min(chunkY, size_t((*zarrSlices)[0].rows));
-                    size_t dx_actual = std::min(chunkX, size_t((*zarrSlices)[0].cols));
-                    for (size_t zi = 0; zi < numZ; zi++) {
-                        size_t sliceOff = zi * chunkY * chunkX;
-                        for (size_t yy = 0; yy < dy_actual; yy++) {
-                            const T* row = (*zarrSlices)[zi].ptr<T>(int(yy));
-                            std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
-                        }
-                    }
-                    dsOut->writeChunkSkipEmpty({0, dstTy, dstTx},
-                                               reinterpret_cast<const uint8_t*>(chunkBuf.data()), chunkBuf.size() * sizeof(T));
-
-                    // Scatter L0 tile into L1 pyramid accumulation buffer
-                    // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
-                    // L0 tile (ty, tx) maps to L1 pyramid chunk (ty/2, tx/2)
-                    // at sub-offset ((ty%2)*halfCH, (tx%2)*halfCW) within the L1 chunk
-                    if (!pyrAccum.empty()) {
-                        size_t l1cx = size_t(tx) >> 1;
-                        size_t halfCH = CH / 2, halfCW = CW / 2;
-                        size_t offY = (size_t(ty) & 1) * halfCH;
-                        size_t offX = (size_t(tx) & 1) * halfCW;
-                        auto& pa = pyrAccum[0];
-                        if (l1cx < pa.bufs.size()) {
-                            downsampleTileIntoPreserveZ(
-                                chunkBuf.data(), chunkZ, chunkY, chunkX,
-                                pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
-                                numZ, dy_actual, dx_actual,
-                                offY, offX);
-                        }
-                    }
-                }
-
-                // 5. Store unrotated slices for TIF assembly
-                if (wantTif) {
-                    tifRowBuf[tx] = std::move(slices);
-                }
-            } catch (...) {
-                #pragma omp critical(render_tile_error)
-                {
-                    if (!rowError) rowError = std::current_exception();
-                }
-                rowFailed.store(true, std::memory_order_relaxed);
+    #pragma omp parallel for schedule(dynamic)
+    for (long long i = 0; i < count; i++) {
+        if (failed.load(std::memory_order_relaxed)) continue;
+        try {
+            const int ty = int(rowStart + uint32_t(i / (long long)tilesX)), tx = int(i % (long long)tilesX);
+            // Resume: a tile whose zarr chunk exists is done, unless TIFFs need it too.
+            if (resume && dsOut && !tifWriters && dsOut->chunkExists({0, ty, tx})) {
+                ++done;
+                continue;
             }
-        }
-        if (rowError) std::rethrow_exception(rowError);
+            const int x0 = tx * int(CW), y0 = ty * int(CH);
+            const int w = std::min(int(CW), outSize.width - x0), h = std::min(int(CH), outSize.height - y0);
+            const cv::Rect src = sourceRect(x0, y0, x0 + w - 1, y0 + h - 1, tgtSize, rotQuad, flipAxis);
 
-        // After all tx done for this ty: assemble TIF if needed
-        if (wantTif) {
-            int outSlices = isComposite ? 1 : numSlices;
-            // Assemble full-width unrotated rows from tile columns
-            std::vector<cv::Mat> fullWidthSlices(outSlices);
-            for (int zi = 0; zi < outSlices; zi++) {
-                fullWidthSlices[zi] = cv::Mat(int(dy), tgtSize.width, cvType, cv::Scalar(0));
-                for (uint32_t tx = 0; tx < numTileCols; tx++) {
-                    uint32_t x0t = tx * uint32_t(CW);
-                    const cv::Mat& tileMat = tifRowBuf[tx][zi];
-                    tileMat.copyTo(fullWidthSlices[zi](cv::Rect(int(x0t), 0, tileMat.cols, tileMat.rows)));
+            float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
+            u0 += float(crop.x + src.x);
+            v0 += float(crop.y + src.y);
+            cv::Mat_<cv::Vec3f> tilePts, tileNrm;
+            genTile(surf, src.size(), renderScale, u0, v0, tilePts, tileNrm);
+            cv::Mat_<cv::Vec3f> base, dirs;
+            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, levelMap, hasAffine, aff, base, dirs);
+
+            std::vector<cv::Mat> slices;
+            if (isComposite) {
+                // Composite mode: always u8 (the caller rejects uint16 sources).
+                if constexpr (std::is_same_v<T, uint8_t>)
+                    slices = {sampleComposite(volume, base, dirs, compositeOffsets, compositeMethod)};
+            } else {
+                auto raw = sampleLayers<T>(volume, type, base, dirs, allOffsets);
+                slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType);
+            }
+            for (auto& slice : slices)
+                rotateFlipIfNeeded(slice, rotQuad, flipAxis);
+
+            if (dsOut) {
+                std::vector<T> chunkBuf(numZ * CH * CW, T(0));
+                for (size_t zi = 0; zi < numZ; zi++)
+                    for (int yy = 0; yy < h; yy++)
+                        std::memcpy(&chunkBuf[(zi * CH + size_t(yy)) * CW], slices[zi].ptr<T>(yy), size_t(w) * sizeof(T));
+                dsOut->writeChunkSkipEmpty({0, ty, tx}, reinterpret_cast<const uint8_t*>(chunkBuf.data()),
+                                           chunkBuf.size() * sizeof(T));
+            }
+            if (tifWriters) {
+                for (size_t zi = 0; zi < tifWriters->size(); zi++) {
+                    if (quickTif && cvType == CV_8UC1)
+                        slices[zi] &= cv::Scalar(0xF0);
+                    std::lock_guard lock(tifLocks[zi]);
+                    (*tifWriters)[zi].writeTile(uint32_t(x0), uint32_t(y0), slices[zi]);
                 }
-                // Apply rotation/flip to assembled full-width row
-                rotateFlipIfNeeded(fullWidthSlices[zi], rotQuad, flipAxis);
             }
 
-            if (quickTif && !useU16) {
-                for (auto& s : fullWidthSlices)
-                    for (int r = 0; r < s.rows; r++) {
-                        auto* row = s.ptr<uint8_t>(r);
-                        for (int c = 0; c < s.cols; c++)
-                            row[c] &= 0xF0;
-                    }
-            }
-            writeTifRows(*tifWriters, fullWidthSlices, y0, tiffTileH, uint32_t(tgtSize.height), rotQuad, flipAxis);
-        }
-
-        // ---- Pyramid row-group flush ----
-        // At each level L (1..5), a pyramid chunk covers 2^L tile rows.
-        // When the current tile-row completes a group, flush & cascade.
-        if (!pyrAccum.empty()) {
-            // No rotation/flip when inline pyramid is active (ensured by caller),
-            // so tile-row ty maps directly to dest tile-row ty.
-            uint32_t relRow = ty - tyStart + 1;
-            bool isLastRow = (ty == tyEnd - 1);
-
-            for (size_t li = 0; li < pyrAccum.size(); li++) {
-                uint32_t groupSize = 1u << (li + 1);  // L1=2, L2=4, L3=8, L4=16, L5=32
-                bool groupComplete = (relRow % groupSize == 0) || isLastRow;
-                if (!groupComplete) continue;
-
-                auto& pa = pyrAccum[li];
-                // tile-row ty divided by 2^(li+1) gives the pyramid chunk row
-                size_t pyrChunkRow = size_t(ty) >> (li + 1);
-
-                // Write each column's accumulation buffer as a zarr chunk
-                for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                    pyramidDs[li]->writeChunkSkipEmpty({0, int64_t(pyrChunkRow), int64_t(cx)},
-                        reinterpret_cast<const uint8_t*>(pa.bufs[cx].data()), pa.bufs[cx].size() * sizeof(T));
+            const long long d = ++done;
+            #pragma omp critical(render_progress)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - lastPrint).count() >= 1.0 || d == count) {
+                    lastPrint = now;
+                    const double elapsed = std::chrono::duration<double>(now - wallStart).count();
+                    const double eta = elapsed * (double(count) / double(d) - 1.0);
+                    logPrintf(stderr, "%stile %lld/%lld (%d%%)  %.1f tiles/s  %dm%02ds  eta %dm%02ds%s",
+                              g_logFile ? "  " : "\r  ", d, count, int(100.0 * double(d) / double(count)),
+                              elapsed > 0 ? double(d) / elapsed : 0.0, int(elapsed) / 60, int(elapsed) % 60,
+                              int(eta) / 60, int(eta) % 60, g_logFile ? "\n" : "");
                 }
-
-                // Cascade: scatter this level's buffers into the next level's accum
-                if (li + 1 < pyrAccum.size()) {
-                    auto& nextPa = pyrAccum[li + 1];
-                    size_t halfY = pa.chY / 2, halfX = pa.chX / 2;
-                    for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                        size_t nextCx = cx >> 1;
-                        size_t offY = (pyrChunkRow & 1) * halfY;
-                        size_t offX = (cx & 1) * halfX;
-                        if (nextCx < nextPa.bufs.size()) {
-                            downsampleTileIntoPreserveZ(
-                                pa.bufs[cx].data(), pa.chZ, pa.chY, pa.chX,
-                                nextPa.bufs[nextCx].data(), nextPa.chZ, nextPa.chY, nextPa.chX,
-                                pa.chZ, pa.chY, pa.chX,
-                                offY, offX);
-                        }
-                    }
-                }
-
-                // Clear this level's buffers for next group
-                for (auto& b : pa.bufs)
-                    std::fill(b.begin(), b.end(), T(0));
             }
-        }
-
-        // Progress (throttled to ~1/sec)
-        auto now = std::chrono::steady_clock::now();
-        double since = std::chrono::duration<double>(now - lastPrint).count();
-        uint32_t tileRowsThis = tyEnd - tyStart;
-        uint32_t done = ty - tyStart + 1;
-        if (since >= 1.0 || done == tileRowsThis) {
-            lastPrint = now;
-            double elapsed = std::chrono::duration<double>(now - wallStart).count();
-            double eta = done > 0 ? elapsed * (double(tileRowsThis) / done - 1.0) : 0.0;
-            // Chunks written this part: done tile-rows × numTileCols chunks per row
-            double chunksWritten = double(done) * double(numTileCols);
-            double chunksPerSec = elapsed > 0 ? chunksWritten / elapsed : 0.0;
-            const char* prefix = g_logFile ? "  " : "\r  ";
-            const char* suffix = g_logFile ? "\n" : "";
-            logPrintf(stderr, "%stile-row %u/%u (%d%%)  %.1f chunks/s  %dm%02ds  eta %dm%02ds%s",
-                prefix, done, tileRowsThis, int(100.0 * done / tileRowsThis),
-                chunksPerSec,
-                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
+        } catch (...) {
+            // A throw out of the OpenMP loop (a remote chunk fetch that failed after
+            // its retries, for instance) would end in std::terminate: keep the first.
+            #pragma omp critical(render_tile_error)
+            {
+                if (!error) error = std::current_exception();
+            }
+            failed.store(true, std::memory_order_relaxed);
         }
     }
-    if (!g_logFile) std::fprintf(stderr, "\n");
+    if (error) std::rethrow_exception(error);
+    if (!g_logFile && count > 0) std::fprintf(stderr, "\n");
 }
 
 
@@ -1625,23 +1393,20 @@ int main(int argc, char *argv[])
         const bool useU16 = output_is_u16 && !isCompositeMode;
         const int cvType = useU16 ? CV_16UC1 : CV_8UC1;
 
-        // ---- Output tiles: the zarr chunks, also when only TIFFs are written ----
+        // ---- Output tiles: the zarr chunks (and TIFF tiles) of the rotated output ----
         const size_t CH = 128, CW = 128;
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
-        std::vector<size_t> chunks0 = {baseZ, std::min(CH, size_t(tgt_size.height)), std::min(CW, size_t(tgt_size.width))};
-        const size_t tilesYSrc = (tgt_size.height + CH - 1) / CH;
-        const size_t tilesXSrc = (tgt_size.width  + CW - 1) / CW;
+        cv::Size outXY = tgt_size;
+        if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(outXY.width, outXY.height);
+        const std::vector<size_t> shape0 = {baseZ, size_t(outXY.height), size_t(outXY.width)};
+        const std::vector<size_t> chunks0 = {baseZ, std::min(CH, shape0[1]), std::min(CW, shape0[2])};
+        const size_t tilesY = (shape0[1] + chunks0[1] - 1) / chunks0[1];
+        const size_t tilesX = (shape0[2] + chunks0[2] - 1) / chunks0[2];
         std::unique_ptr<vcr::zarr::Writer> dsOut;
         std::filesystem::path outFilePath(wantZarr ? zarrOutputArg : "/dev/null");
 
         if (wantZarr) {
-            cv::Size zarrXY = tgt_size;
-            if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
-            size_t baseY = zarrXY.height, baseX = zarrXY.width;
-
             outFilePath = zarrOutputArg;
-            std::vector<size_t> shape0 = {baseZ, baseY, baseX};
-            chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
             vcr::zarr::CreateOptions outputOptions;
             outputOptions.shape.assign(shape0.begin(), shape0.end());
             outputOptions.chunks.assign(chunks0.begin(), chunks0.end());
@@ -1659,10 +1424,8 @@ int main(int argc, char *argv[])
                     createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
                                           zarrCompressor, zarrCompressionLevel, zarrSeparator);
 
-                cv::Size attrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               accum_type_str, accumOffsets.size(), outXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
@@ -1682,11 +1445,8 @@ int main(int argc, char *argv[])
 
         // ---- TIF setup (if requested) ----
         std::vector<TiffWriter> tifWriters;
-        uint32_t tiffTileH = 16;
 
         if (wantTif) {
-            int outW = (rotQuad >= 0 && rotQuad % 2 == 1) ? tgt_size.height : tgt_size.width;
-            int outH = (rotQuad >= 0 && rotQuad % 2 == 1) ? tgt_size.width  : tgt_size.height;
             int tifSlices = isCompositeMode ? 1 : num_slices;
 
             auto makePath = [&](int zi) -> std::filesystem::path {
@@ -1726,37 +1486,26 @@ int main(int argc, char *argv[])
                 }
             }
             if (!tifSkip) {
-                uint32_t tiffTileW = (uint32_t(outW) + 15u) & ~15u;
+                // TIFF tiles are the render tiles (TIFF needs multiples of 16: 128).
                 uint16_t tifComp = quickTif ? COMPRESSION_PACKBITS : COMPRESSION_LZW;
                 for (int z = 0; z < tifSlices; z++)
-                    tifWriters.emplace_back(makePartPath(z), uint32_t(outW), uint32_t(outH), cvType, tiffTileW, tiffTileH, 0.0f, tifComp, tifDpi);
+                    tifWriters.emplace_back(makePartPath(z), uint32_t(outXY.width), uint32_t(outXY.height), cvType,
+                                            uint32_t(CW), uint32_t(CH), 0.0f, tifComp, tifDpi);
             }
         }
 
-        // ---- Create pyramid datasets before render ----
-        const bool hasRotFlip = (rotQuad >= 0 || flip_axis >= 0);
-        // Inline pyramid only works without rotation/flip (accumulation assumes
-        // source tile-rows map 1:1 to destination tile-rows for row-group flushing)
-        const bool inlinePyramid = wantZarr && wantPyramid && !pre_flag && !hasRotFlip;
-        std::vector<vcr::zarr::Writer*> pyramidDs;
-        std::vector<std::unique_ptr<vcr::zarr::Writer>> pyramidOwned;
-        if (wantZarr && wantPyramid && !pre_flag) {
-            // Single-part: create datasets now; multi-part/resume: already created them
-            if (numParts <= 1 && !resumeFlag) {
-                cv::Size zarrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
-                std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
-                                      zarrCompressor, zarrCompressionLevel, zarrSeparator);
-            }
-            if (inlinePyramid) {
-                for (int level = 1; level <= 5; level++) {
-                    pyramidOwned.push_back(std::make_unique<vcr::zarr::Writer>(
-                        vcr::zarr::Writer::open(outFilePath / std::to_string(level))));
-                    pyramidDs.push_back(pyramidOwned.back().get());
-                }
-            }
-        }
+        // Single-part: create the pyramid datasets now; multi-part/resume: --pre created them.
+        if (wantZarr && wantPyramid && !pre_flag && numParts <= 1 && !resumeFlag)
+            createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                                  zarrCompressor, zarrCompressionLevel, zarrSeparator);
+
+        // Each part renders a contiguous range of tile rows. With a pyramid the
+        // ranges are multiples of 32 rows, so a part builds levels 1-5 of its rows alone.
+        uint32_t rowsPerPart = uint32_t((tilesY + size_t(numParts) - 1) / size_t(numParts));
+        if (numParts > 1 && wantZarr && wantPyramid)
+            rowsPerPart = (rowsPerPart + 31u) / 32u * 32u;
+        const uint32_t rowStart = std::min(uint32_t(partId) * rowsPerPart, uint32_t(tilesY));
+        const uint32_t rowEnd = std::min(rowStart + rowsPerPart, uint32_t(tilesY));
 
         // ---- Render pass ----
         {
@@ -1766,37 +1515,36 @@ int main(int argc, char *argv[])
                     full_size, crop, tgt_size, float(render_scale), scale_seg,
                     hasAffine, affineTransform, num_slices, slice_step,
                     accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                    compositeMethod, rotQuad, flip_axis, numParts, partId, cvType,
-                    dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
-                    pyramidDs, tifs, tiffTileH, quickTif, resumeFlag);
+                    compositeMethod, rotQuad, flip_axis, cvType,
+                    chunks0[1], chunks0[2], tilesX, rowStart, rowEnd,
+                    dsOut.get(), tifs, quickTif, resumeFlag);
             else
                 renderTiles<uint8_t>(surf.get(), volume, sourceType, levelMap,
                     full_size, crop, tgt_size, float(render_scale), scale_seg,
                     hasAffine, affineTransform, num_slices, slice_step,
                     accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                    compositeMethod, rotQuad, flip_axis, numParts, partId, cvType,
-                    dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
-                    pyramidDs, tifs, tiffTileH, quickTif, resumeFlag);
+                    compositeMethod, rotQuad, flip_axis, cvType,
+                    chunks0[1], chunks0[2], tilesX, rowStart, rowEnd,
+                    dsOut.get(), tifs, quickTif, resumeFlag);
             tifWriters.clear();
         }
 
         // ---- Zarr pyramid + attrs ----
         if (wantZarr && !pre_flag) {
-            // Rotation/flip: pyramid couldn't be built inline, build from L0 on disk
-            if (wantPyramid && hasRotFlip) {
+            // Levels 1-5 of this part's rows, each from the level below on disk.
+            if (wantPyramid) {
                 logPrintf(stdout, "[pyramid] building from L0...\n");
                 for (int level = 1; level <= 5; level++) {
-                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, CH, CW, numParts, partId);
-                    else        buildPyramidLevel<uint8_t>(outFilePath, level, CH, CW, numParts, partId);
+                    const size_t first = rowStart >> level, last = (size_t(rowEnd) + (1u << level) - 1) >> level;
+                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, first, last);
+                    else        buildPyramidLevel<uint8_t>(outFilePath, level, first, last);
                 }
             }
 
             // --pre already writes attrs for multi-part; single-part writes here
             if (numParts <= 1) {
-                cv::Size attrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               accum_type_str, accumOffsets.size(), outXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale);
             }
         }
