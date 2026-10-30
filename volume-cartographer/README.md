@@ -132,6 +132,12 @@ After dependencies are installed, rebuilds can use:
 scripts/build_macos.sh
 ```
 
+The macOS PR and release workflows use this same helper with
+`--install-deps --sccache`, installing missing dependencies directly from
+Homebrew on the runner. They do not restore a `vc3d-deps` Homebrew snapshot.
+Compiler outputs are still cached; dependency versions follow the runner's
+Homebrew formulae.
+
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
