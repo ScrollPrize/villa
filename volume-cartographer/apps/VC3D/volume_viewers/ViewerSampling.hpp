@@ -6,6 +6,8 @@
 #include <vc_reader/grid.hpp>
 
 #include <array>
+#include <atomic>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -23,6 +25,9 @@ namespace vc3d {
 // shared OpenedVolumes. Index: working level; an absent level has no array.
 struct ViewerLevels {
     std::vector<OpenedVolumes::Level> levels;
+    // Set by a failed GPU frame: these levels render on the CPU from then on. Device bricks
+    // never load after a failure, so a cached-only GPU frame would stay empty.
+    std::shared_ptr<std::atomic_bool> gpuFailed = std::make_shared<std::atomic_bool>(false);
 
     int count() const { return static_cast<int>(levels.size()); }
     bool has(int level) const;

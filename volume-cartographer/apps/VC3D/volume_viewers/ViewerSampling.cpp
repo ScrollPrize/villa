@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <exception>
 
 namespace vc3d {
 
@@ -139,9 +140,20 @@ vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, cons
         for (const auto& level : levels.levels)
             if (level.array && level.array->array.get() == wanted.array && level.cuda)
                 readers.push_back(level.cuda.get());
-    if (!readers.empty() && readers.size() == request.levels.size())
-        return plane ? vcr::grid::cuda::sample(*plane, request, readers)
-                     : vcr::grid::cuda::sample(*surface, raster, request, readers);
+    if (!levels.gpuFailed->load() && !readers.empty() && readers.size() == request.levels.size()) {
+        try {
+            return plane ? vcr::grid::cuda::sample(*plane, request, readers)
+                         : vcr::grid::cuda::sample(*surface, raster, request, readers);
+        } catch (const std::exception& e) {
+            // Device memory, a frame over the brick budget or a device failure, as when many
+            // volumes fill the card: give these levels' bricks back and render on the CPU. The
+            // backend is ours to choose; the frame must still appear.
+            if (!levels.gpuFailed->exchange(true))
+                Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", e.what());
+            for (auto* reader : readers)
+                reader->clear();
+        }
+    }
 #else
     (void)levels;
 #endif

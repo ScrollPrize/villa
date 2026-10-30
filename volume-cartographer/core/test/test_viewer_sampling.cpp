@@ -167,6 +167,30 @@ TEST_CASE("pixels outside the volume read as fill and are not read in the backgr
     CHECK(r.values[0] == float(f.at0(3, 3, 28)));
 }
 
+TEST_CASE("a GPU frame that fails renders on the CPU")
+{
+    if (!vcr::cuda::available())
+        return;
+    Fixture f;
+    OpenedVolumes cpu(64 << 20);
+    OpenedVolumes tooSmall(64 << 20, 1);  // no brick fits this device budget
+    const auto expected = openLevels(cpu, *f.volume);
+    const auto levels = openLevels(tooSmall, *f.volume);
+    REQUIRE(levels->levels[0].cuda);
+    vc3d::ViewerGeometry g;
+    g.plane = vcr::grid::Plane{{0, 0, 6}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 16, 16};
+    const auto rendered = [&](const std::shared_ptr<const vc3d::ViewerLevels>& from) {
+        vc3d::ViewerSample what{from, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+        vc3d::ViewerLoad load;
+        vc3d::sampleCached(g, what, &load);
+        vc3d::loadPending(load, [] { return true; });
+        return vc3d::sampleCached(g, what, nullptr).values;
+    };
+    const auto values = rendered(levels);
+    CHECK(!values.empty());
+    CHECK(values == rendered(expected));
+}
+
 TEST_CASE("vertex spacing is the working level's voxel shape")
 {
     Fixture f;
