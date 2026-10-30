@@ -18,6 +18,7 @@ from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
     FlatPatchReader,
+    build_lowres_block_mask,
     choose_pyramid_array,
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
@@ -77,6 +78,46 @@ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog
     assert mask.shape == (3, 2)
     assert "Requested input level 0 was not found; using level 1" in caplog.text
     assert "Mask shape (2, 3) did not match Zarr shape (3, 2)" in caplog.text
+
+
+def _floored_pyramid(path, level0, levels):
+    """Write a surface-volume pyramid that keeps every layer and floors Y/X."""
+
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        group = zarr.open_group(path, mode="w", zarr_format=2)
+        create = group.create_array
+    else:
+        group = zarr.open_group(path, mode="w")
+        create = group.create_dataset
+    data = level0
+    for level in range(levels):
+        if level:
+            depth, height, width = data.shape
+            data = data[:, : height // 2 * 2, : width // 2 * 2]
+            data = data.reshape(depth, height // 2, 2, width // 2, 2).max(axis=(2, 4))
+        chunks = (data.shape[0], min(64, data.shape[1]), min(64, data.shape[2]))
+        create(str(level), shape=data.shape, chunks=chunks, dtype="u1")
+        group[str(level)][:] = data
+    return group
+
+
+def test_user_mask_fits_a_pyramid_that_floors_odd_sizes(tmp_path):
+    # Level 3 is floored (81 -> 40 -> 20 -> 10 rows) while the
+    # any-pooled user mask has ceil(81 / 8) = 11 rows.
+    level0 = np.zeros((6, 81, 200), dtype=np.uint8)
+    level0[:, :, 96:160] = 7
+    root = _floored_pyramid(tmp_path / "odd.zarr", level0, 4)
+    user_mask = np.zeros((81, 200), dtype=bool)
+    user_mask[:, 100:140] = True
+
+    occupancy, scale, _ = build_lowres_block_mask(
+        root, height=81, width=200, user_mask=user_mask
+    )
+
+    assert scale == (8, 8)
+    assert occupancy.shape == (10, 25)
+    assert occupancy[:, 12:18].all()
+    assert occupancy.sum() == 10 * 6
 
 
 def test_flat_preprocessing_accepts_exact_training_contracts():
