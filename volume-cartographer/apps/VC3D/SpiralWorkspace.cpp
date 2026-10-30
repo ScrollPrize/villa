@@ -620,7 +620,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _panel->setLossMapLegend({});
                 _overlay->publishRunDiff({}, {});
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
-                loadInputSurfaces(paths, static_cast<quint64>(generation));
+                resetSessionSurfaces(static_cast<quint64>(generation));
             });
     synchronizeVolume(_mainState ? _mainState->currentVolume() : nullptr);
 }
@@ -647,82 +647,16 @@ QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
     return QDir::toNativeSeparators(local + rest);
 }
 
-void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64 generation)
+void SpiralWorkspace::resetSessionSurfaces(quint64 generation)
 {
     if (_shuttingDown || generation < _inputSurfaceGeneration) return;
     _inputSurfaceGeneration = generation;
-    // Input surfaces are loaded from viewer-local paths. On a remote profile
-    // they are translated through the optional path mapping; categories with
-    // no local mapping are marked unavailable without blocking the generated
-    // preview or geometry display.
-    QJsonObject paths;
-    QStringList unavailable;
-    for (const char* key : {"outer_shell"}) {
-        const QString servicePath = servicePaths.value(QString::fromLatin1(key)).toString();
-        if (servicePath.isEmpty()) continue;
-        const QString local = mapServicePath(servicePath);
-        if (local.isEmpty()) unavailable.push_back(QString::fromLatin1(key));
-        else paths[QString::fromLatin1(key)] = local;
-    }
-    if (!unavailable.isEmpty())
-        statusBar()->showMessage(
-            tr("Input surface overlays unavailable without a local path mapping: %1")
-                .arg(unavailable.join(QStringLiteral(", "))), 15000);
-    auto* watcher = new QFutureWatcher<InputSurfaceLoadResult>(this);
-    connect(watcher, &QFutureWatcher<InputSurfaceLoadResult>::finished, this,
-            [this, watcher, generation]() {
-                const auto result = watcher->result();
-                watcher->deleteLater();
-                if (!_shuttingDown && generation == _inputSurfaceGeneration)
-                    installInputSurfaces(result, generation);
-            });
-    watcher->setFuture(QtConcurrent::run([paths, generation]() {
-        InputSurfaceLoadResult result;
-        // A new session drops the previous one's drafted surfaces too.
-        result.categories = {QStringLiteral("shell"), QStringLiteral("brush"),
-                             QStringLiteral("ephemeral")};
-        const std::pair<const char*, const char*> inputs[] = {
-            {"shell", "outer_shell"},
-        };
-        for (const auto& [categoryText, pathKey] : inputs) {
-            const QString category = QString::fromLatin1(categoryText);
-            const QString rootPath = paths.value(QString::fromLatin1(pathKey)).toString();
-            if (rootPath.isEmpty()) continue;
-            QStringList candidates;
-            const QFileInfo root(rootPath);
-            if (root.isDir() && QFileInfo(QDir(rootPath).filePath(QStringLiteral("meta.json"))).isFile()) {
-                candidates.push_back(root.absoluteFilePath());
-            } else if (root.isDir()) {
-                const QFileInfoList children = QDir(rootPath).entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const QFileInfo& child : children)
-                    if (QFileInfo(QDir(child.absoluteFilePath()).filePath(QStringLiteral("meta.json"))).isFile())
-                        candidates.push_back(child.absoluteFilePath());
-            }
-            if (candidates.isEmpty()) {
-                result.warnings.push_back(QObject::tr("No TIFXYZ surfaces found for %1 at %2")
-                                              .arg(category, rootPath));
-                continue;
-            }
-            for (int index = 0; index < candidates.size(); ++index) {
-                try {
-                    auto surface = std::make_shared<QuadSurface>(
-                        std::filesystem::path(candidates[index].toStdString()));
-                    const QString id = QStringLiteral("spiral/%1/g%2/%3-%4")
-                        .arg(category).arg(generation)
-                        .arg(QFileInfo(candidates[index]).fileName()).arg(index);
-                    surface->id = id.toStdString();
-                    result.surfaces.push_back({category, id,
-                                               QFileInfo(candidates[index]).fileName(),
-                                               std::move(surface)});
-                } catch (const std::exception& error) {
-                    result.warnings.push_back(QObject::tr("Failed to load %1: %2")
-                                                  .arg(candidates[index], QString::fromUtf8(error.what())));
-                }
-            }
-        }
-        return result;
-    }));
+    // A new session drops the previous one's shell and drafted surfaces; its
+    // outer shell arrives with its fit inputs (installFitInputs).
+    InputSurfaceLoadResult cleared;
+    cleared.categories = {QStringLiteral("shell"), QStringLiteral("brush"),
+                          QStringLiteral("ephemeral")};
+    installInputSurfaces(cleared, generation);
 }
 
 void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation)
@@ -1945,7 +1879,7 @@ void SpiralWorkspace::clearFitInputs(const QString& reason)
     }
     _fitFibers.clear();
     InputSurfaceLoadResult cleared;
-    cleared.categories = {QStringLiteral("verified")};
+    cleared.categories = {QStringLiteral("verified"), QStringLiteral("shell")};
     installInputSurfaces(cleared, _inputSurfaceGeneration);
     refreshFitOverlays();
     if (!reason.isEmpty()) statusBar()->showMessage(reason, 15000);
@@ -2020,9 +1954,11 @@ void SpiralWorkspace::installFitInputs(
     _installedFitInputGeneration = generation;
     updateInputFreshness();
     InputSurfaceLoadResult surfaces;
-    surfaces.categories = {QStringLiteral("verified")};
+    surfaces.categories = {QStringLiteral("verified"), QStringLiteral("shell")};
     for (const auto& entry : inputs->surfaces)
         if (entry.surface) surfaces.surfaces.push_back(fitSurfaceEntry(entry));
+    if (inputs->outerShell && inputs->outerShell->surface)
+        surfaces.surfaces.push_back(fitSurfaceEntry(*inputs->outerShell, QStringLiteral("shell")));
     installInputSurfaces(surfaces, _inputSurfaceGeneration);
     rebuildFitPclDocuments();
     rebuildFitFibers();
@@ -2031,16 +1967,17 @@ void SpiralWorkspace::installFitInputs(
     if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
 }
 
-SpiralWorkspace::InputSurfaceEntry SpiralWorkspace::fitSurfaceEntry(const vc3d::spiral::FitSurface& entry) const
+SpiralWorkspace::InputSurfaceEntry SpiralWorkspace::fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
+                                                                    const QString& category) const
 {
     const QString uuid = QString::fromStdString(entry.pin.uuid);
     // Keyed and coloured by object UUID, which survives renames.
-    const QString id = QStringLiteral("spiral/verified/%1/%2")
-                           .arg(QString::fromStdString(_fitInputs->digest).left(12), uuid);
+    const QString id = QStringLiteral("spiral/%1/%2/%3")
+                           .arg(category, QString::fromStdString(_fitInputs->digest).left(12), uuid);
     // The CState key is display-specific, but store queries need the actual
     // object UUID. Do not turn a committed input into a session draft.
     entry.surface->id = entry.pin.uuid;
-    return {QStringLiteral("verified"), id, uuid, entry.surface};
+    return {category, id, uuid, entry.surface};
 }
 
 void SpiralWorkspace::rebuildFitPclDocuments()

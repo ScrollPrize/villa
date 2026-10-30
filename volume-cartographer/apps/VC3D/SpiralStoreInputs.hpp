@@ -90,6 +90,9 @@ struct FitRelationship {
 struct FitInputs {
     std::string digest, storeUuid, volumeUuid;
     std::vector<FitSurface> surfaces;
+    // The outer shell the fit read (the store's surface tagged
+    // spiral-outer-shell), apart from the patches; unset when it read none.
+    std::optional<FitSurface> outerShell;
     std::vector<FitPointCollection> pointCollections;
     std::vector<FitFiber> fibers;
     std::vector<FitRelationship> relationships;
@@ -105,7 +108,8 @@ struct FitInputs {
     // Every input and relationship is as the fit read it.
     bool unchanged() const
     {
-        return problems.empty() && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
+        return problems.empty() && (!outerShell || outerShell->state == InputState::Fitted)
+            && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
                                                                    + fibers.size()
             && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }

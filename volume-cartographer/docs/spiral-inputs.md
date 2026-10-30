@@ -20,7 +20,8 @@ inputs" in the README). The fit uses the entry of the volume its inputs
 name; import an umbilicus for that volume (File > Import Umbilicus) and
 select the Lasagna dataset before building. For a volume outside the
 catalog, choose the spiral's *Outward sense* in the panel (a fit setting).
-The panel's *Scroll* and *Store layout* lines show the session's scroll,
+The outer shell is the store's surface tagged `spiral-outer-shell`, shown
+from the fit's inputs. The panel's *Scroll* and *Store layout* lines show the session's scroll,
 volume, umbilicus revision and Lasagna dataset. Line annotation reads its
 normals from the same selected dataset.
 

@@ -253,6 +253,14 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     auto inputs = fixture.read(document);
     require(inputs.unchanged(), "the fixture holds its inputs as fitted");
     require(inputs.count(InputState::Fitted) == 3, "every input is as fitted");
+    require(!inputs.outerShell, "a fit that read no outer shell has none");
+    // The manifest's outer shell is read as a surface, apart from the patches.
+    auto withShell = document;
+    withShell["manifest"]["outer_shell"] = document["manifest"]["objects"][0];
+    const auto shelled = fixture.read(withShell);
+    require(shelled.outerShell && shelled.outerShell->state == InputState::Fitted
+                && shelled.outerShell->surface && shelled.surfaces.size() == 1,
+            "the outer shell is read beside the patches");
 
     const auto& surface = *inputs.surfaces.at(0).surface;
     require(surface.id == fixture.surface, "input geometry retains its store UUID for viewer queries");

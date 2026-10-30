@@ -181,7 +181,8 @@ private:
     // replace only their overlays (vc3d::spiral::readFitInputChanges).
     void loadFitInputChanges();
     void installFitInputChanges(vc3d::spiral::FitInputChanges changes);
-    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry) const;
+    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
+                                      const QString& category = QStringLiteral("verified")) const;
     void rebuildFitPclDocuments();
     void rebuildFitFibers();
     void showFitInputProblems(const vc3d::spiral::FitInputs& inputs);
@@ -208,7 +209,7 @@ private:
     void clearSurfaceDrafts();
     void installPreviewAlias(const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
                              qint64 generation, quint64 revision, bool preserveFocus);
-    void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
+    void resetSessionSurfaces(quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void finalizeBrushPaint();
     void finalizeLineAnnotationDraft();

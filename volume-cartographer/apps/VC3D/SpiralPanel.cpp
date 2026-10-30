@@ -367,7 +367,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     }
     updateTrackSamplingUi();
 
-    addPathRow(pathsForm, "outer_shell", tr("Outer shell"), true);
 
     auto* lasagnaSection = makeSection(tr("Lasagna inputs"),
                                        QStringLiteral("spiralLasagnaInputsGroup"),

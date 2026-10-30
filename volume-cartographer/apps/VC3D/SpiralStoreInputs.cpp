@@ -338,18 +338,24 @@ std::size_t FitInputs::count(LinkState state) const
                                      [state](const auto& entry) { return entry.state == state; }));
 }
 
+namespace {
+StoreInputPin objectPin(const Json& object)
+{
+    StoreInputPin pin;
+    pin.uuid = object.at("uuid").get<std::string>();
+    pin.kind = object.at("kind").get<std::string>();
+    pin.name = object.value("name", std::string());
+    pin.geometryRevision = object.at("geometry_revision").get<std::string>();
+    pin.metadata = valueOrNull(object, "metadata");
+    return pin;
+}
+}
+
 std::vector<StoreInputPin> manifestPins(const Json& document)
 {
     std::vector<StoreInputPin> pins;
-    for (const auto& object : document.at("manifest").value("objects", Json::array())) {
-        StoreInputPin pin;
-        pin.uuid = object.at("uuid").get<std::string>();
-        pin.kind = object.at("kind").get<std::string>();
-        pin.name = object.value("name", std::string());
-        pin.geometryRevision = object.at("geometry_revision").get<std::string>();
-        pin.metadata = valueOrNull(object, "metadata");
-        pins.push_back(std::move(pin));
-    }
+    for (const auto& object : document.at("manifest").value("objects", Json::array()))
+        pins.push_back(objectPin(object));
     return pins;
 }
 
@@ -378,6 +384,12 @@ FitInputs readFitInputs(const ObjectStore& db, const Txn& txn, const Json& docum
     if (!sameStore(db, txn, document, result)) return result;
     const auto pins = manifestPins(document);
     for (const auto& pin : pins) readObject(db, txn, pin, result.volumeUuid, result);
+    // The outer shell: read as a surface, held apart from the patches.
+    if (const Json shell = valueOrNull(document.at("manifest"), "outer_shell"); shell.is_object()) {
+        FitInputs read;
+        readObject(db, txn, objectPin(shell), result.volumeUuid, read);
+        result.outerShell = std::move(read.surfaces.front());
+    }
     compareRelationships(db, txn, document.at("manifest"), pins, nullptr, result);
     return result;
 }
