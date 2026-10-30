@@ -99,6 +99,7 @@ Curation commands use the same preprocessing module namespace:
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.validate_segments ROOT
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.clean_labels ROOT
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.merge_predictions ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.suggest_label_tiles SEGMENT/preds --output-dir OUT
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_from_zarr --input-root ROOT --method max
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_required_zarr_chunks --datasets-root DATASETS --volumes-json VOLUMES.json --output-root OUTPUT --dry-run
 ```
@@ -169,6 +170,16 @@ Train, infer, inspect the probability TIFF, extend the segment's ink and
 supervision images, run `create_label_zarrs`, and retrain. Versioned label
 assets use `_v<N>` before the extension; an explicit `label_version` requires
 matching ink and supervision versions.
+
+To choose where to look first, `suggest_label_tiles` ranks a segment's tiles
+by how unsure its predictions are (the non-merged predictions in a `preds`
+folder, or files on one grid) and writes the top 20 as `label_suggestions.png`,
+beside `random_tiles.png` and `suggestions.json`. It reads no labels. The
+default `edge` measure scores each tile's share of predicted ink edge, where
+the predictions' combined call flips; `margin` (mean probability near the cut)
+and `vote` (how evenly two or more predictions split) are the alternatives.
+`--direction forward` or `reverse` keeps one layer order from a folder that
+holds both.
 
 ## Tests
 
