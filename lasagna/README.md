@@ -24,7 +24,8 @@ python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
 AMD GPUs use the ROCm 7.2 build, which detection never selects: pass
 `--backend rocm` (Linux x86_64 only). It needs read/write access to `/dev/kfd`
 and `/dev/dri` (usually membership of the `render` and `video` groups), and
-checks that the wheel has kernels for the GPU's gfx target.
+runs a smoke kernel on the default GPU, reporting GPU and wheel gfx targets
+if the kernel fails.
 
 Verify the selected PyTorch build and GPU access:
 

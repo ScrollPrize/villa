@@ -22,6 +22,8 @@ class TorchBuild:
     index_url: str
 
 
+# Include the wheel backend in GPU pins so an installed build for another
+# backend cannot satisfy the requirement when reusing a venv.
 TORCH_BUILDS = {
     "cpu": TorchBuild(
         backend="cpu",
@@ -31,22 +33,22 @@ TORCH_BUILDS = {
     ),
     "cu128": TorchBuild(
         backend="cu128",
-        torch="2.11.0",
-        torchvision="0.26.0",
+        torch="2.11.0+cu128",
+        torchvision="0.26.0+cu128",
         index_url="https://download.pytorch.org/whl/cu128",
     ),
     "cu130": TorchBuild(
         backend="cu130",
-        torch="2.13.0",
-        torchvision="0.28.0",
+        torch="2.13.0+cu130",
+        torchvision="0.28.0+cu130",
         index_url="https://download.pytorch.org/whl/cu130",
     ),
     # Opt-in only (--backend rocm); auto never selects it. The rocm7.2 index
     # ships manylinux_2_28_x86_64 wheels only.
     "rocm": TorchBuild(
         backend="rocm",
-        torch="2.13.0",
-        torchvision="0.28.0",
+        torch="2.13.0+rocm7.2",
+        torchvision="0.28.0+rocm7.2",
         index_url="https://download.pytorch.org/whl/rocm7.2",
     ),
 }
@@ -284,52 +286,39 @@ def environment_check_script(backend: str, skip_cuda_check: bool) -> str:
         " 'cuda_available': torch.cuda.is_available(),"
         " 'fiber_infer': fiber_infer.__file__}))",
     ]
+    if backend == "rocm":
+        lines.append("assert torch.version.hip, 'Expected a ROCm PyTorch build'")
     if backend != "cpu" and not skip_cuda_check:
-        lines.append("ok = torch.cuda.is_available()")
-        if backend == "rocm":
-            # is_available() is also True on an AMD GPU whose gfx target the
-            # wheel has no kernels for; its first kernel then fails with
-            # "invalid device function". Compare the targets first (exit 2).
-            lines += [
-                "import os",
-                "wheel = sorted({a.split(':')[0] for a in torch.cuda.get_arch_list()})",
-                "gpus = [torch.cuda.get_device_properties(i).gcnArchName.split(':')[0]"
-                " for i in range(torch.cuda.device_count())] if ok else []",
-                "missing = [f'{i}:{a}' for i, a in enumerate(gpus) if wheel and a not in wheel]",
-                "if missing:",
-                "    print('GPU gfx target without kernels in this ROCm wheel:',"
-                " ' '.join(missing), '| wheel targets:', ' '.join(wheel))",
-                "    if not os.environ.get('HSA_OVERRIDE_GFX_VERSION'):",
-                "        raise SystemExit(2)",
-                "    print('HSA_OVERRIDE_GFX_VERSION is set; running the smoke test anyway')",
-            ]
         api = "ROCm" if backend == "rocm" else "CUDA"
         lines += [
+            "ok = torch.cuda.is_available()",
             "if ok:",
             "    try:",
             "        (torch.ones(8, device='cuda') * 2).sum().item()",
             "    except Exception as exc:",
             f"        print('{api} smoke test failed:', exc)",
+        ]
+        if backend == "rocm":
+            lines += [
+                "        try:",
+                "            print('GPU gfx target:', torch.cuda.get_device_properties(0).gcnArchName,",
+                "                  '| wheel targets:', ' '.join(torch.cuda.get_arch_list()))",
+                "        except Exception as diagnostic_exc:",
+                "            print('Could not query ROCm targets:', diagnostic_exc)",
+            ]
+        lines += [
             "        ok = False",
             "raise SystemExit(0 if ok else 1)",
         ]
     return "\n".join(lines)
 
 
-def check_failure_message(backend: str, returncode: int) -> str:
+def check_failure_message(backend: str) -> str:
     """Error for a failed environment check, worded for the installed backend."""
     if backend != "rocm":
         return (
             "PyTorch installed, but CUDA is unavailable. Check nvidia-smi/driver access "
             "or rerun with --backend cpu."
-        )
-    if returncode == 2:
-        return (
-            "PyTorch installed, but the AMD GPU's gfx target has no kernels in the "
-            "ROCm wheel (targets listed above). If the card is ISA-compatible with a "
-            "listed target, set HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0 for gfx1100) and "
-            "rerun; hide unsupported GPUs with HIP_VISIBLE_DEVICES; or rerun with "
-            "--backend cpu."
         )
     return (
         "PyTorch installed, but the AMD GPU is unavailable through ROCm. Check that "
@@ -425,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         env=check_environment,
     )
     if result.returncode != 0:
-        raise SystemExit(check_failure_message(backend, result.returncode))
+        raise SystemExit(check_failure_message(backend))
     print(f"Lasagna environment ready: {venv}", flush=True)
     return 0
 
