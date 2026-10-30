@@ -28,6 +28,7 @@ from .auth import Access, is_remote, split_s3
 from .disk_cache import VC3D, atomic_write, cached_node_dirs, cached_source_zarray, decoded_cache_path
 from .zarr_reader import MemoryCache, ZarrReader, _make_spec
 from .transport import cache_url, read_node_file
+from .store_metadata import StoreMetadata, level_scale, read_store_metadata
 
 class ZarrGroup:
     """A Zarr v2/v3 group opened for reading. Use :meth:`open`."""
@@ -38,6 +39,7 @@ class ZarrGroup:
         self.access = access
         self.memory_cache = cache
         self.attrs: dict[str, Any] = attrs
+        self._metadata: StoreMetadata | None = None
         self.version = version
         self._options = options
         self._nodes: dict[str, tuple[str, dict | None] | None] = {}  # child -> ("array", .zarray) / ("group", None)
@@ -104,16 +106,36 @@ class ZarrGroup:
             attrs = json.loads(zattrs) if zattrs else {}
             if remote and cache_writes and spec["cache_dirs"]:
                 _cache_group_metadata(spec["cache_dirs"], cache_url(loc, access), zgroup, zattrs)
-        return cls(loc, options, cache, access, attrs, version)
+        group = cls(loc, options, cache, access, attrs, version)
+        _ = group.metadata
+        return group
+
+    @property
+    def _metadata_settings(self) -> dict[str, Any]:
+        return {"cache_dirs": self._options["cache_dir"], "offline": self._options["offline"],
+                "cache_writes": self._options["cache_writes"]}
+
+    @property
+    def metadata(self) -> StoreMetadata:
+        """What the store's ``meta.json`` / ``metadata.json`` say, read when it was opened."""
+        if self._metadata is None:
+            self._metadata = read_store_metadata(self.location, self.access, self._metadata_settings)
+        return self._metadata
+
+    @property
+    def voxel_size(self) -> float | None:
+        """Micrometers per voxel of level 0; ``None`` when the store does not say."""
+        return self.metadata.voxel_size_um
 
     def __getstate__(self):
-        return {"location": self.location, "options": self._options, "memory_cache": self.memory_cache,
+        return {"location": self.location, "metadata": self._metadata, "options": self._options, "memory_cache": self.memory_cache,
                 "access": self.access, "attrs": self.attrs, "nodes": self._nodes,
                 "consolidated": self._consolidated, "version": self.version}
 
     def __setstate__(self, state):
         self.__init__(state["location"], state["options"], state["memory_cache"],
                       state["access"], state["attrs"], state['version'])
+        self._metadata = state["metadata"]
         self._nodes = state["nodes"]
         self._consolidated = state["consolidated"]
 
@@ -236,6 +258,8 @@ class ZarrGroup:
             raise KeyError(f"no array {key!r} in {self.location}")
         spec, _ = _make_spec(f"{self.location}/{key}", group=self.location, auth=self.access, meta=node[1],
                              **self._options)
+        spec["store_metadata"] = self.metadata
+        spec["level_scale"] = level_scale(self.attrs, key)
         reader = ZarrReader(spec, self.memory_cache)
         consolidated = self._consolidated_metadata()
         if consolidated is not None:

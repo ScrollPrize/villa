@@ -253,6 +253,23 @@ NB_MODULE(_reader, m)
         return vcr::zarr::decodedCachePath(cache_dir, url).string();
     }, "cache_dir"_a, "url"_a);
     m.def("vc3d_volume_id", &vcr::zarr::vc3dVolumeId, "url"_a);
+    m.def("store_metadata_json",
+          [](const std::string& location, std::function<std::optional<std::string>(const std::string&, const std::string&)> read) {
+              const auto m = vcr::zarr::storeMetadata(location, read);
+              const auto optional = [](const auto& value) { return value ? vcr::zarr::Json(*value) : vcr::zarr::Json(); };
+              return vcr::zarr::Json{{"voxel_size_um", optional(m.voxelSizeUm)},
+                                     {"energy_kev", optional(m.energyKeV)},
+                                     {"detector_distance_mm", optional(m.detectorDistanceMm)},
+                                     {"beamline", m.beamline},
+                                     {"scan_name", m.scanName},
+                                     {"acquisition_date", m.acquisitionDate},
+                                     {"value_window", optional(m.valueWindow)},
+                                     {"z_crop", optional(m.zCrop)},
+                                     {"documents", m.documents}}.dump();
+          },
+          "location"_a, "read"_a,
+          "What the store's sidecar documents say, as JSON; read(location, name) returns a document's "
+          "text or None.");
     m.def("vc3d_cache_root", []() -> std::optional<std::string> {
         const auto root = vcr::zarr::vc3dCacheRoot();
         return root ? std::optional<std::string>(root->string()) : std::nullopt;

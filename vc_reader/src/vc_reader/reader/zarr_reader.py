@@ -54,6 +54,7 @@ _INHERITED: list[Any] = []
 
 
 from .transport import read_node_file, cache_url
+from .store_metadata import StoreMetadata, level_scale, read_group_attrs, read_store_metadata
 
 
 def _read_zarray(location: str, access: Access) -> ArrayMeta:
@@ -230,13 +231,44 @@ class ZarrReader:
                                  compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
                                  memory_cache=memory_cache, threads=threads, connections=connections,
                                  read_mode=read_mode, auth=auth, offline=offline)
-        return cls(spec, cache)
+        reader = cls(spec, cache)
+        settings = reader._spec
+        store = settings["group"] or reader.location
+        settings["store_metadata"] = read_store_metadata(store, reader.access, settings)
+        if settings["group"]:
+            settings["level_scale"] = level_scale(read_group_attrs(store, reader.access, settings), settings["level_key"])
+        return reader
 
     def __getstate__(self):
         return {"spec": dict(self._spec, attrs=self._attrs), "memory_cache": self.memory_cache}
 
     def __setstate__(self, state):
         self.__init__(state["spec"], state["memory_cache"])
+
+    @property
+    def metadata(self) -> StoreMetadata:
+        """What the store's ``meta.json`` / ``metadata.json`` say, read when it was opened."""
+        metadata = self._spec.get("store_metadata")
+        if metadata is None:
+            metadata = self._spec["store_metadata"] = read_store_metadata(
+                self._spec.get("group") or self.location, self.access, self._spec)
+        return metadata
+
+    @property
+    def voxel_size_zyx(self) -> tuple[float, float, float] | None:
+        """Micrometers per voxel of this array along Z, Y, X; ``None`` when the store does not say."""
+        base = self.metadata.voxel_size_um
+        if base is None:
+            return None
+        scale = self._spec.get("level_scale") or (1.0, 1.0, 1.0)
+        return tuple(base * s for s in scale)
+
+    @property
+    def voxel_size(self) -> float | None:
+        """Micrometers per voxel of this array; ``None`` when the store does not say or its
+        voxels are not cubic (see :attr:`voxel_size_zyx`)."""
+        size = self.voxel_size_zyx
+        return size[0] if size is not None and size[0] == size[1] == size[2] else None
 
     def __repr__(self) -> str:
         return f"ZarrReader({self.location!r}, shape={self.shape}, chunks={self.chunks}, dtype={self.dtype})"

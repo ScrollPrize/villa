@@ -345,6 +345,38 @@ private:
 Json readAttributes(const std::filesystem::path& node);
 void writeAttributes(const std::filesystem::path& node, const Json& attributes);
 
+// ---- store metadata -------------------------------------------------------------------
+
+// Micrometers per voxel of level 0, from a store's sidecar document (meta.json or
+// metadata.json, as published). By exact path, since these documents also record
+// unrelated scales. In order: a top-level voxelsize (or voxel_size_um, voxelSizeUm,
+// pixel_size_um, pixelSizeUm, resolution_um); scan.voxelsize; the acquisition record
+// [scan.]tomo.acquisition.detector.samplePixelSize (millimeters); and for a derived
+// store that record under source.metadata scaled by 2^source.resolution, which is then
+// required. Only positive finite numbers count.
+std::optional<double> voxelSizeUm(const Json& document);
+
+// What a store's sidecar documents say about its volume, each field from the first
+// document stating it (meta.json before metadata.json).
+struct StoreMetadata {
+    std::optional<double> voxelSizeUm;         // level 0, see voxelSizeUm()
+    std::optional<double> energyKeV;           // acquisition.energy
+    std::optional<double> detectorDistanceMm;  // acquisition.sampleDetectorDistance
+    std::string beamline, scanName, acquisitionDate;  // beamline, scanRadix or scan_name, date
+    // zarr_export: the source values the stored range spans, and the Z range kept.
+    std::optional<std::array<double, 2>> valueWindow;
+    std::optional<std::array<std::int64_t, 2>> zCrop;
+    Json documents = Json::object();  // file name -> the document as published
+};
+// The metadata of the store at `location` (or a numbered level of one). A missing,
+// unreadable or malformed document does not end the search; this never throws. The
+// default reader reads local stores and anonymous remote ones.
+StoreMetadata storeMetadata(const std::string& location, const MetadataReader& read = {});
+inline std::optional<double> storeVoxelSizeUm(const std::string& location, const MetadataReader& read = {})
+{
+    return storeMetadata(location, read).voxelSizeUm;
+}
+
 // ---- writing pyramids -----------------------------------------------------------------
 
 // Numbered levels <root>/0, /1, ...: each level is the block mean of the level below,
