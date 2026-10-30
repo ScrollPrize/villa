@@ -125,46 +125,6 @@ static std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
 }
 
 // ============================================================
-// Geometry helpers
-// ============================================================
-
-static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
-                                  cv::Mat_<cv::Vec3f>& normals,
-                                  const Affine& T)
-{
-    const auto normalTransform = T.normalTransform();
-
-    for (int y = 0; y < points.rows; y++)
-        for (int x = 0; x < points.cols; x++) {
-            cv::Vec3f& pt = points(y, x);
-            if (std::isnan(pt[0])) continue;
-            const auto q = T.apply({pt[0], pt[1], pt[2]});
-            pt = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
-        }
-
-    for (int y = 0; y < normals.rows; y++)
-        for (int x = 0; x < normals.cols; x++) {
-            cv::Vec3f& n = normals(y, x);
-            if (std::isnan(n[0])) continue;
-            const auto q = normalTransform.mapDirection({n[0], n[1], n[2]});
-            n = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
-        }
-}
-
-static void normalizeNormals(cv::Mat_<cv::Vec3f>& nrm)
-{
-    for (int y = 0; y < nrm.rows; y++)
-        for (int x = 0; x < nrm.cols; x++) {
-            auto& v = nrm(y, x);
-            if (std::isnan(v[0])) continue;
-            const float L2 = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
-            if (L2 > 0) {
-                v /= std::sqrt(L2);
-            }
-        }
-}
-
-// ============================================================
 // Rotation / flip helpers
 // ============================================================
 
@@ -197,16 +157,6 @@ static void computeCanvasOrigin(const cv::Size& size, float& u0, float& v0)
     v0 = -0.5f * (size.height - 1.0f);
 }
 
-static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
-                    float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
-{
-    surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
-    // NOTE: do NOT mutate `normals` here. gen() returns a view into a scratch
-    // buffer it reuses across calls (thread_local per worker), so the next
-    // gen() on this thread overwrites it. --flip-normals is applied later in
-    // prepareBaseAndDirs() on the thread-private clone instead.
-}
-
 // Surface coordinates (working-level voxels, XYZ) to indices of the rendered
 // pyramid level: index = scale * c + offset per axis, from the two levels' placements.
 struct LevelMap {
@@ -215,138 +165,90 @@ struct LevelMap {
 
 static LevelMap mapToLevel(const vcr::zarr::LevelPlacement& working, const vcr::zarr::LevelPlacement& rendered)
 {
+    const auto m = rendered.indexMapFrom(working);
     LevelMap map;
     for (int a = 0; a < 3; ++a) {
-        const int zyx = 2 - a;
-        map.scale[a] = float(working.scale[zyx] / rendered.scale[zyx]);
-        map.offset[a] = float((working.offset[zyx] - rendered.offset[zyx]) / rendered.scale[zyx]);
+        map.scale[a] = float(m.scale[2 - a]);
+        map.offset[a] = float(m.offset[2 - a]);
     }
     return map;
 }
 
-static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
-                                float scale_seg, const LevelMap& level,
-                                bool hasAffine, const Affine& aff,
-                                cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
-{
-    base = pts.clone(); base *= scale_seg;
-    dirs = nrm.clone();
-    // --flip-normals: negate on the private clone (safe under OpenMP), never on
-    // gen()'s shared scratch view. Negation commutes with the affine + the
-    // subsequent normalization, so applying it here is identical to flipping
-    // the raw geometric normal. (-NaN stays NaN, so invalid pixels are intact.)
-    if (g_flipNormals) dirs *= -1.0f;
-    if (hasAffine) applyAffineTransform(base, dirs, aff);
-    normalizeNormals(dirs);
-    for (auto& p : base)
-        for (int a = 0; a < 3; ++a)
-            p[a] = p[a] * level.scale[a] + level.offset[a];
-}
+// The surface with its vertices in rendered-level index space (XYZ): the segmentation
+// scale, the affine and the level placement applied to each vertex once. Bilinear and
+// Hermite patches commute with affine maps, so positions are those of the mapped
+// vertex grid; normals are its patch normals and offsets along them are in
+// rendered-level voxels.
+struct RenderSurface {
+    cv::Mat_<cv::Vec3f> vertices;
+    std::unique_ptr<vcr::grid::Surface> grid;
+};
 
-// The ZYX points of every pixel at every offset along its normal, layer-major
-// (point k * n + p), computed in float as the renders always have.
-static std::vector<double> samplePoints(const cv::Mat_<cv::Vec3f>& base, const cv::Mat_<cv::Vec3f>& dirs,
-                                        const std::vector<float>& offsets)
+static RenderSurface renderSurface(const QuadSurface& surf, vcr::grid::Interpolation interpolation, float scaleSeg,
+                                   bool hasAffine, const Affine& aff, const LevelMap& level)
 {
-    const std::size_t n = base.total();
-    std::vector<double> points(3 * n * offsets.size());
-    double* out = points.data();
-    for (const float off : offsets)
-        for (std::size_t p = 0; p < n; ++p, out += 3) {
-            const cv::Vec3f& b = base(int(p));
-            const cv::Vec3f& d = dirs(int(p));
-            out[0] = b[2] + d[2] * off;
-            out[1] = b[1] + d[1] * off;
-            out[2] = b[0] + d[0] * off;
+    RenderSurface r;
+    r.vertices = surf.rawPointsPtr()->clone();
+    for (auto& v : r.vertices) {
+        if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
+            v = cv::Vec3f(NAN, NAN, NAN);
+            continue;
         }
-    return points;
+        v *= scaleSeg;
+        if (hasAffine) {
+            const auto q = aff.apply({v[0], v[1], v[2]});
+            v = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
+        }
+        for (int a = 0; a < 3; ++a)
+            v[a] = v[a] * level.scale[a] + level.offset[a];
+    }
+    auto options = surf.gridOptions();
+    options.interpolation = interpolation;
+    r.grid = std::make_unique<vcr::grid::Surface>(
+        vcr::grid::Vertices{reinterpret_cast<const float*>(r.vertices.ptr()), r.vertices.rows, r.vertices.cols,
+                            r.vertices.step1()},
+        std::move(options));
+    return r;
 }
 
-// One trilinear image per offset. Pixels without a surface read 0; uint8 truncates
-// and uint16 rounds, as the renders always have.
-template <typename T>
-static std::vector<cv::Mat_<T>> sampleLayers(vcr::Array& volume, const vcr::ElementType& type,
-                                             const cv::Mat_<cv::Vec3f>& base, const cv::Mat_<cv::Vec3f>& dirs,
-                                             const std::vector<float>& offsets)
+// A tile's layers at `offsets` along the (--flip-normals: negated) normal, linear or
+// nearest, optionally reduced to one image; NaN where the surface has no point.
+static vcr::grid::Result sampleTile(const RenderSurface& surface, const vcr::grid::Raster& raster,
+                                    vcr::Array& volume, const vcr::ElementType& type, const std::vector<float>& offsets,
+                                    int order, const std::optional<vcr::composite::Options>& composite)
 {
-    const std::size_t n = base.total();
-    const auto points = samplePoints(base, dirs, offsets);
-    std::vector<float> values(n * offsets.size());
-    volume.sample_linear(points.data(), values.size(), type, false, values.data());
-    std::vector<cv::Mat_<T>> out(offsets.size());
+    vcr::grid::Request request;
+    request.levels = {vcr::grid::Level{&volume, type}};
+    request.order = order;
+    request.offsets = offsets;
+    if (g_flipNormals)
+        for (auto& o : request.offsets)
+            o = -o;
+    request.composite = composite;
+    return vcr::grid::sample(*surface.grid, raster, request);
+}
+
+// One image of a result: pixels without a value read 0; uint8 truncates and uint16
+// rounds, as the renders always have.
+template <typename T>
+static cv::Mat toImage(const vcr::grid::Result& result, int layer)
+{
+    cv::Mat_<T> out(result.height, result.width);
+    const std::size_t n = std::size_t(result.width) * std::size_t(result.height);
+    const float* v = result.values.data() + std::size_t(layer) * n;
     constexpr float maxValue = float(std::numeric_limits<T>::max());
     constexpr float rounding = std::is_same_v<T, uint16_t> ? 0.5f : 0.0f;
-    for (std::size_t k = 0; k < offsets.size(); ++k) {
-        out[k].create(base.rows, base.cols);
-        const float* v = values.data() + k * n;
-        T* dst = out[k][0];
-        for (std::size_t p = 0; p < n; ++p)
-            dst[p] = std::isnan(v[p]) ? T(0) : T(std::clamp(v[p], 0.0f, maxValue) + rounding);
-    }
-    return out;
-}
-
-// The composite of every pixel's nearest-voxel layers of a uint8 volume; pixels
-// without a surface or a remaining layer are 0.
-static cv::Mat_<uint8_t> sampleComposite(vcr::Array& volume, const cv::Mat_<cv::Vec3f>& base,
-                                         const cv::Mat_<cv::Vec3f>& dirs, const std::vector<float>& offsets,
-                                         const vcr::composite::Options& method)
-{
-    const std::size_t n = base.total();
-    const auto points = samplePoints(base, dirs, offsets);
-    std::vector<uint8_t> voxels(n * offsets.size());
-    volume.sample_nearest(points.data(), voxels.size(), voxels.data());
-    std::vector<float> layers(voxels.size());
-    for (std::size_t i = 0; i < voxels.size(); ++i) {
-        const double* q = &points[3 * i];
-        layers[i] = std::isfinite(q[0]) && std::isfinite(q[1]) && std::isfinite(q[2])
-            ? float(voxels[i]) : std::numeric_limits<float>::quiet_NaN();
-    }
-    std::vector<float> values(n);
-    vcr::composite::reduce(layers.data(), offsets.size(), n, method, values.data());
-    cv::Mat_<uint8_t> out(base.rows, base.cols);
-    uint8_t* dst = out[0];
+    T* dst = out[0];
     for (std::size_t p = 0; p < n; ++p)
-        dst[p] = std::isnan(values[p]) ? uint8_t(0) : uint8_t(std::clamp(values[p], 0.0f, 255.0f));
+        dst[p] = std::isnan(v[p]) ? T(0) : T(std::clamp(v[p], 0.0f, maxValue) + rounding);
     return out;
 }
 
 // ============================================================
-// Accumulation (max / mean / median) — templated for u8 & u16
+// Reducers: --accum sub-steps per slice (max / mean / median) and composites
 // ============================================================
 
 enum class AccumType { Max, Mean, Median, Alpha, BeerLambert };
-
-template <typename T>
-static cv::Mat accumulate(const std::vector<cv::Mat>& samples, size_t start, size_t count, AccumType type, int cvType)
-{
-    if (count == 1) return samples[start];
-    if (type == AccumType::Max) {
-        cv::Mat out = samples[start].clone();
-        for (size_t j = 1; j < count; ++j) cv::max(out, samples[start + j], out);
-        return out;
-    }
-    if (type == AccumType::Mean) {
-        cv::Mat sum; samples[start].convertTo(sum, CV_64F);
-        for (size_t j = 1; j < count; ++j) { cv::Mat t; samples[start+j].convertTo(t, CV_64F); sum += t; }
-        sum /= double(count);
-        cv::Mat out; sum.convertTo(out, cvType);
-        return out;
-    }
-    // Median
-    int rows = samples[start].rows, cols = samples[start].cols;
-    cv::Mat out(rows, cols, cvType);
-    std::vector<T> vals(count);
-    for (int y = 0; y < rows; y++)
-        for (int x = 0; x < cols; x++) {
-            for (size_t i = 0; i < count; i++) vals[i] = samples[start + i].at<T>(y, x);
-            std::sort(vals.begin(), vals.end());
-            out.at<T>(y, x) = (count % 2 == 1)
-                ? vals[count / 2]
-                : T((uint32_t(vals[count/2 - 1]) + uint32_t(vals[count/2]) + 1) / 2);
-        }
-    return out;
-}
 
 // ============================================================
 // Sample offsets along the surface normal
@@ -461,26 +363,6 @@ static size_t usableMemoryBytes()
     return bytes;
 }
 
-// Accumulates the sampled layers into one image per output slice.
-template <typename T>
-static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int numSlices,
-                                              const std::vector<float>& accumOffsets,
-                                              AccumType accumType, int cvType)
-{
-    size_t sps = std::max<size_t>(1, accumOffsets.size());
-    std::vector<cv::Mat> result(numSlices);
-    for (int zi = 0; zi < numSlices; zi++) {
-        if (accumOffsets.empty()) {
-            result[zi] = raw[zi];
-        } else {
-            // Gather samples into a generic vector
-            std::vector<cv::Mat> samps(raw.begin() + zi * sps, raw.begin() + zi * sps + sps);
-            result[zi] = accumulate<T>(samps, 0, sps, accumType, cvType);
-        }
-    }
-    return result;
-}
-
 // ============================================================
 // Rendering: OMP-parallel over the output tiles (the zarr chunks and TIFF tiles)
 // ============================================================
@@ -510,10 +392,9 @@ static cv::Rect sourceRect(int x0, int y0, int x1, int y1, const cv::Size& sourc
 // tile to the zarr level 0 and/or each slice's TIFF.
 template <typename T>
 static void renderTiles(
-    QuadSurface* surf, vcr::Array& volume, const vcr::ElementType& type, const LevelMap& levelMap,
+    const QuadSurface& surf, const RenderSurface& surface, vcr::Array& volume, const vcr::ElementType& type,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
-    float renderScale, float scaleSeg,
-    bool hasAffine, const Affine& aff,
+    float renderScale,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -524,10 +405,16 @@ static void renderTiles(
     std::vector<TiffWriter>* tifWriters,      // null: no TIFF output
     bool quickTif, bool resume)
 {
-    // Pre-warm validMask cache (thread-safety: subsequent calls are read-only)
-    surf->validMask();
-
     const auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
+    const std::size_t sps = std::max<std::size_t>(1, accumOffsets.size());
+    // --accum: each slice reduces its sub-steps.
+    std::optional<vcr::composite::Options> accumMethod;
+    if (!accumOffsets.empty()) {
+        accumMethod.emplace();
+        accumMethod->method = accumType == AccumType::Max    ? vcr::composite::Method::Max
+                            : accumType == AccumType::Median ? vcr::composite::Method::Median
+                                                             : vcr::composite::Method::Mean;
+    }
     const auto compositeOffsets = isComposite
         ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
         : std::vector<float>{};
@@ -557,22 +444,27 @@ static void renderTiles(
             const int w = std::min(int(CW), outSize.width - x0), h = std::min(int(CH), outSize.height - y0);
             const cv::Rect src = sourceRect(x0, y0, x0 + w - 1, y0 + h - 1, tgtSize, rotQuad, flipAxis);
 
+            // The tile's framebuffer pixels, the top-left one at canvas offset (u0, v0).
             float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
             u0 += float(crop.x + src.x);
             v0 += float(crop.y + src.y);
-            cv::Mat_<cv::Vec3f> tilePts, tileNrm;
-            genTile(surf, src.size(), renderScale, u0, v0, tilePts, tileNrm);
-            cv::Mat_<cv::Vec3f> base, dirs;
-            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, levelMap, hasAffine, aff, base, dirs);
+            const auto raster = surf.gridRaster(double(u0 / renderScale), double(v0 / renderScale), renderScale,
+                                                src.size());
 
             std::vector<cv::Mat> slices;
             if (isComposite) {
-                // Composite mode: always u8 (the caller rejects uint16 sources).
-                if constexpr (std::is_same_v<T, uint8_t>)
-                    slices = {sampleComposite(volume, base, dirs, compositeOffsets, compositeMethod)};
+                // Composite mode: nearest voxels, always u8 (the caller rejects uint16 sources).
+                slices = {toImage<uint8_t>(sampleTile(surface, raster, volume, type, compositeOffsets, 0, compositeMethod), 0)};
+            } else if (accumMethod) {
+                for (int zi = 0; zi < numSlices; ++zi) {
+                    const std::vector<float> steps(allOffsets.begin() + std::ptrdiff_t(zi * sps),
+                                                   allOffsets.begin() + std::ptrdiff_t((zi + 1) * sps));
+                    slices.push_back(toImage<T>(sampleTile(surface, raster, volume, type, steps, 1, accumMethod), 0));
+                }
             } else {
-                auto raw = sampleLayers<T>(volume, type, base, dirs, allOffsets);
-                slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType);
+                const auto layers = sampleTile(surface, raster, volume, type, allOffsets, 1, std::nullopt);
+                for (int zi = 0; zi < numSlices; ++zi)
+                    slices.push_back(toImage<T>(layers, zi));
             }
             for (auto& slice : slices)
                 rotateFlipIfNeeded(slice, rotQuad, flipAxis);
@@ -1002,10 +894,10 @@ int main(int argc, char *argv[])
     std::string surf_interp_str = parsed["surface-interpolation"].as<std::string>();
     std::transform(surf_interp_str.begin(), surf_interp_str.end(), surf_interp_str.begin(),
                    [](unsigned char c){ return char(std::tolower(c)); });
-    GenInterpolation genInterp;
-    if      (surf_interp_str == "linear") genInterp = GenInterpolation::Linear;
+    vcr::grid::Interpolation interpolation;
+    if      (surf_interp_str == "linear") interpolation = vcr::grid::Interpolation::Linear;
     else if (surf_interp_str == "smooth" || surf_interp_str == "bicubic")
-        genInterp = GenInterpolation::Smooth;
+        interpolation = vcr::grid::Interpolation::Smooth;
     else { logPrintf(stderr, "Error: invalid --surface-interpolation\n"); return EXIT_FAILURE; }
 
     // alpha/beerlambert reducers only make sense over collapsed layers, so they always imply
@@ -1015,8 +907,8 @@ int main(int argc, char *argv[])
     const bool isCompositeMode = requestComposite
         || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
 
-    // Without layers to reduce, processRawSlices passes each raw slice through and never reads
-    // accumType, so an explicit max/mean/median here changes nothing. Say so rather than stay quiet.
+    // Without layers to reduce, the slices are the sampled layers and accumType is never
+    // read, so an explicit max/mean/median here changes nothing. Say so rather than stay quiet.
     if (accum_step <= 0 && !isCompositeMode
         && parsed.count("accum-type") > 0 && !parsed["accum-type"].defaulted())
         logPrintf(stderr, "Warning: --accum-type %s has no effect without --accum or --composite-collapse\n",
@@ -1295,7 +1187,7 @@ int main(int argc, char *argv[])
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
     if (g_flipNormals) logPrintf(stdout, "Flip normals: on\n");
-    if (genInterp == GenInterpolation::Smooth)
+    if (interpolation == vcr::grid::Interpolation::Smooth)
         logPrintf(stdout, "Surface interpolation: smooth (bicubic)\n");
 
     if (wantZarr) {
@@ -1328,7 +1220,6 @@ int main(int argc, char *argv[])
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
-        surf->setGenInterpolation(genInterp);
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();
@@ -1509,19 +1400,18 @@ int main(int argc, char *argv[])
 
         // ---- Render pass ----
         {
+            const auto surface = renderSurface(*surf, interpolation, scale_seg, hasAffine, affineTransform, levelMap);
             auto* tifs = tifWriters.empty() ? nullptr : &tifWriters;
             if (useU16)
-                renderTiles<uint16_t>(surf.get(), volume, sourceType, levelMap,
-                    full_size, crop, tgt_size, float(render_scale), scale_seg,
-                    hasAffine, affineTransform, num_slices, slice_step,
+                renderTiles<uint16_t>(*surf, surface, volume, sourceType,
+                    full_size, crop, tgt_size, float(render_scale), num_slices, slice_step,
                     accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                     compositeMethod, rotQuad, flip_axis, cvType,
                     chunks0[1], chunks0[2], tilesX, rowStart, rowEnd,
                     dsOut.get(), tifs, quickTif, resumeFlag);
             else
-                renderTiles<uint8_t>(surf.get(), volume, sourceType, levelMap,
-                    full_size, crop, tgt_size, float(render_scale), scale_seg,
-                    hasAffine, affineTransform, num_slices, slice_step,
+                renderTiles<uint8_t>(*surf, surface, volume, sourceType,
+                    full_size, crop, tgt_size, float(render_scale), num_slices, slice_step,
                     accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                     compositeMethod, rotQuad, flip_axis, cvType,
                     chunks0[1], chunks0[2], tilesX, rowStart, rowEnd,

@@ -1560,14 +1560,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // QuadSurface::gen's view: surface UV (ptr - half the viewport) at `scale`
         // framebuffer pixels per surface unit, in grid units.
         auto* quad = static_cast<QuadSurface*>(ctx.surf.get());
-        const cv::Vec3f center = quad->center();
-        const cv::Vec2f gridScale = quad->scale();
         const double u0 = double(ctx.surfacePtrX) - (double(ctx.fbW) * 0.5 + margins.left) / double(ctx.scale);
         const double v0 = double(ctx.surfacePtrY) - (double(ctx.fbH) * 0.5 + margins.top) / double(ctx.scale);
         geometry.surface = ctx.gridSurface;
-        geometry.raster = {(u0 + center[0]) * gridScale[0], (v0 + center[1]) * gridScale[1],
-                           double(gridScale[0]) / double(ctx.scale), double(gridScale[1]) / double(ctx.scale),
-                           width, height};
+        geometry.raster = quad->gridRaster(u0, v0, double(ctx.scale), {width, height});
         return geometry;
     };
     const auto geometry = frameGeometry({});

@@ -584,7 +584,6 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
         points,
         cv::Vec2f{static_cast<float>(1.0 / alongSpacing),
                   static_cast<float>(1.0 / crossSpacing)});
-    surface->setStrictQuadRenderValidity(true);
     return surface;
 }
 

@@ -33,13 +33,8 @@ std::array<double, 3> ViewerLevels::voxelExtent(int level) const
 vcr::grid::Level ViewerLevels::gridLevel(int level) const
 {
     const auto& l = levels[std::size_t(level)];
-    vcr::grid::Level g{l.array->array.get(), l.array->meta.type, {}, {}};
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        // index = (working.toLevel0(c) - offset) / scale, as one affine map
-        g.scale[axis] = l.working.scale[axis] / l.array->placement.scale[axis];
-        g.offset[axis] = (l.working.offset[axis] - l.array->placement.offset[axis]) / l.array->placement.scale[axis];
-    }
-    return g;
+    const auto map = l.array->placement.indexMapFrom(l.working);
+    return {l.array->array.get(), l.array->meta.type, map.scale, map.offset};
 }
 
 ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume)
@@ -113,15 +108,10 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     const auto* points = surface.rawPointsPtr();
     if (!points || points->empty())
         return nullptr;
-    vcr::grid::SurfaceOptions options;
-    options.interpolation = surface.genInterpolation() == GenInterpolation::Smooth
-        ? vcr::grid::Interpolation::Smooth
-        : vcr::grid::Interpolation::Linear;
-    options.components = surface.components();
     return std::make_shared<const vcr::grid::Surface>(
         vcr::grid::Vertices{reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
                             points->step1()},
-        std::move(options));
+        surface.gridOptions());
 }
 
 vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request) const

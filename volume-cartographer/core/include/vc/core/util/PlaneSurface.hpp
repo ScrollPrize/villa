@@ -22,7 +22,6 @@ public:
     ~PlaneSurface() override;
     PlaneSurface(cv::Vec3f origin_, cv::Vec3f normal_);
 
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
 
     float pointDist(cv::Vec3f wp);
     cv::Matx33d frame();

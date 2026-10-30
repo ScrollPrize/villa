@@ -1,6 +1,7 @@
 #include "utils/Json.hpp"
 
 
+#include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
 
 #include <opencv2/imgcodecs.hpp>
@@ -136,17 +137,17 @@ struct DSReader {
     float scale;
 };
 
-// Trilinear samples at volume XYZ coordinates (mapped through the levels'
-// placements), truncated to 8 bits.
+// Trilinear samples at volume XYZ points (mapped through the levels' placements),
+// truncated to 8 bits.
 static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz)
 {
-    const auto& to = reader.level.placement;
+    const auto map = reader.level.placement.indexMapFrom(reader.base);
     const std::size_t n = xyz.total();
     std::vector<double> zyx(3 * n);
     for (std::size_t i = 0; i < n; ++i) {
         const cv::Vec3f& p = xyz(int(i));
-        for (int a = 0; a < 3; ++a)
-            zyx[3 * i + std::size_t(2 - a)] = to.fromLevel0(2 - a, reader.base.toLevel0(2 - a, p[a]));
+        for (std::size_t a = 0; a < 3; ++a)
+            zyx[3 * i + a] = map.scale[a] * double(p[2 - int(a)]) + map.offset[a];
     }
     std::vector<float> values(n);
     reader.level.array->sample_linear(zyx.data(), n, reader.level.meta.type, false, values.data());
@@ -156,29 +157,41 @@ static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz
     return out;
 }
 
+// The opacity-weighted offset along `normal` of the volume around `point`: the layers
+// of a d x d plane patch (pixel (0, 0) at the point, steps of the plane's basis / scale)
+// sampled linearly at start, start + step, ... stop, truncated to 8 bits, blurred and
+// composited front to back at the patch's centre pixel.
 float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r)
 {
     int d = 2*r+1;
     cv::Size size = {d,d};
     cv::Point2i c = {r,r};
 
+    float s = copysignf(1.0,step);
+    std::vector<float> offsets;
+    for(double off=start;off*s<=stop*s;off+=step)
+        offsets.push_back(float(off));
+
+    const PlaneSurface plane(point, normal);
+    const float m = 1.0f / reader.scale;
+    const cv::Vec3f dx = plane.basisX() * m, dy = plane.basisY() * m;
+    const auto map = reader.level.placement.indexMapFrom(reader.base);
+    vcr::grid::Request request;
+    request.levels = {{reader.level.array.get(), reader.level.meta.type, map.scale, map.offset}};
+    request.offsets = offsets;
+    const auto layers = vcr::grid::sample(vcr::grid::Plane{{point[0], point[1], point[2]}, {dx[0], dx[1], dx[2]},
+                                                           {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]}, d, d},
+                                          request);
+
     float transparent = 1;
     cv::Mat_<float> blur(size, 0);
     float integ_z = 0;
-
-    cv::Mat_<cv::Vec3f> coords;
-    PlaneSurface plane(point, normal);
-    plane.gen(&coords, nullptr, size, cv::Vec3f(0,0,0), reader.scale, {0,0,0});
-
-    float s = copysignf(1.0,step);
-
-    for(double off=start;off*s<=stop*s;off+=step) {
-        cv::Mat_<cv::Vec3f> offmat(size, normal*off);
-        const cv::Mat_<cv::Vec3f> offsetCoords = coords + offmat;
-        const cv::Mat_<uint8_t> slice = sample(reader, offsetCoords);
-
-        cv::Mat floatslice;
-        slice.convertTo(floatslice, CV_32F, 1/255.0);
+    cv::Mat_<float> floatslice(size);
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        for (int i = 0; i < d * d; ++i) {
+            const float v = layers.values[k * std::size_t(d * d) + std::size_t(i)];
+            floatslice(i) = float(std::isnan(v) ? uint8_t(0) : uint8_t(std::clamp(v, 0.0f, 255.0f))) / 255.0f;
+        }
 
         cv::GaussianBlur(floatslice, blur, {d,d}, 0);
         cv::Mat_<float> opaq_slice = blur;
@@ -188,7 +201,7 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
         opaq_slice = cv::max(opaq_slice,0);
 
         float joint = transparent*opaq_slice(c);
-        integ_z += joint * off;
+        integ_z += joint * offsets[k];
         transparent = transparent-joint;
     }
 

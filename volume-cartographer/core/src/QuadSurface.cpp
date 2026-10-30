@@ -1,6 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "vc/core/util/CubicInterpolation.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -490,453 +489,6 @@ cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
 
 } // namespace
 
-// Axis-aligned src-sample warps used by QuadSurface::gen().  The original
-// code built an affine via cv::getAffineTransform(srcf, dstf) and called
-// cv::warpAffine, but the srcf/dstf construction only encodes a scale +
-// translate (no rotation / shear), so the dst→src mapping is:
-//     src_x = ox + dx * sx
-//     src_y = oy + dy * sy
-// Writing it inline buys two things the OpenCV path doesn't:
-//   1. Zero per-call heap allocation.  cv::warpAffine internally allocates
-//      coord lookup maps (heaptrack caught ~27 MiB × 92 calls per session
-//      of churn on the render path).  These helpers only touch the pooled
-//      dst buffer the caller passes in.
-//   2. Straight-line hot loops that the compiler auto-vectorises on ARM
-//      NEON — OpenCV's CV_32FC3 bilinear path is scalar on aarch64.
-// Parallelised with OpenMP on the outer row loop, matching the rest of
-// the file's existing style.
-namespace {
-
-// The bilinear cell evaluation shared by the two bilinear warps and by the
-// bicubic warp's fallback branch. Same expression, same operand order, so every
-// caller produces bit-identical results.
-inline cv::Vec3f bilerpVec3f(const cv::Vec3f& p00, const cv::Vec3f& p01,
-                             const cv::Vec3f& p10, const cv::Vec3f& p11,
-                             float wx, float wy)
-{
-    const float iwx = 1.0f - wx, iwy = 1.0f - wy;
-    return (p00 * iwx + p01 * wx) * iwy
-         + (p10 * iwx + p11 * wx) * wy;
-}
-
-void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
-                                cv::Mat_<cv::Vec3f>& dst,
-                                double ox, double oy,
-                                double sx, double sy)
-{
-    const int sc = src.cols, sr = src.rows;
-    if (sc <= 0 || sr <= 0) return;
-    const int dw = dst.cols, dh = dst.rows;
-    const float sxmax = float(sc - 1);
-    const float symax = float(sr - 1);
-    const float fox = float(ox);
-    const float foy = float(oy);
-    const float fsx = float(sx);
-    const float fsy = float(sy);
-    // The mapping is separable: the source x sample (x0,x1,wx) depends only on
-    // dx, not dy. Precompute the x axis once per call instead of recomputing it
-    // for every one of the dh rows. Bit-identical to the per-pixel form (same
-    // float ops, same order). Filled single-threaded before the parallel row
-    // loop, which then only reads these (shared) arrays.
-    std::vector<int> x0v(dw), x1v(dw);
-    std::vector<float> wxv(dw);
-    for (int dx = 0; dx < dw; ++dx) {
-        float fx = fox + float(dx) * fsx;
-        fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
-        int x0 = int(fx);
-        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
-    }
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        float fy = foy + float(dy) * fsy;
-        fy = fy < 0.0f ? 0.0f : (fy > symax ? symax : fy);
-        int y0 = int(fy);                  // floor since fy >= 0
-        int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
-        const float wy = fy - float(y0);
-        const cv::Vec3f* row0 = src[y0];
-        const cv::Vec3f* row1 = src[y1];
-        cv::Vec3f* orow = dst[dy];
-        for (int dx = 0; dx < dw; ++dx) {
-            const int x0 = x0v[dx], x1 = x1v[dx];
-            const float wx = wxv[dx];
-            orow[dx] = bilerpVec3f(row0[x0], row0[x1], row1[x0], row1[x1], wx, wy);
-        }
-    }
-}
-
-void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
-                        cv::Mat_<uint8_t>& dst,
-                        double ox, double oy,
-                        double sx, double sy,
-                        uint8_t border)
-{
-    const int sc = src.cols, sr = src.rows;
-    const int dw = dst.cols, dh = dst.rows;
-    const float fox = float(ox), foy = float(oy);
-    const float fsx = float(sx), fsy = float(sy);
-    // Separable: precompute the nearest source x index per column once, instead
-    // of an std::lround per pixel (dw lrounds vs dw*dh). Bit-identical.
-    std::vector<int> sxv(dw);
-    for (int dx = 0; dx < dw; ++dx)
-        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        const int sy_i = int(std::lround(foy + float(dy) * fsy));
-        uint8_t* orow = dst[dy];
-        if (sy_i < 0 || sy_i >= sr) {
-            std::memset(orow, border, size_t(dw));
-            continue;
-        }
-        const uint8_t* srow = src[sy_i];
-        for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = sxv[dx];
-            orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
-        }
-    }
-}
-
-void warpQuadValidityConstU8(const cv::Mat_<uint8_t>& vertexValidity,
-                             cv::Mat_<uint8_t>& dst,
-                             double ox, double oy,
-                             double sx, double sy,
-                             uint8_t border)
-{
-    const int sc = vertexValidity.cols;
-    const int sr = vertexValidity.rows;
-    const int dw = dst.cols;
-    const int dh = dst.rows;
-    if (sc < 2 || sr < 2) {
-        dst.setTo(border);
-        return;
-    }
-
-    const double maxX = static_cast<double>(sc - 1);
-    const double maxY = static_cast<double>(sr - 1);
-#pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        const double fy = oy + static_cast<double>(dy) * sy;
-        uint8_t* output = dst[dy];
-        if (fy < 0.0 || fy > maxY) {
-            std::memset(output, border, static_cast<std::size_t>(dw));
-            continue;
-        }
-        const int row = std::min(static_cast<int>(std::floor(fy)), sr - 2);
-        const uint8_t* top = vertexValidity[row];
-        const uint8_t* bottom = vertexValidity[row + 1];
-        for (int dx = 0; dx < dw; ++dx) {
-            const double fx = ox + static_cast<double>(dx) * sx;
-            if (fx < 0.0 || fx > maxX) {
-                output[dx] = border;
-                continue;
-            }
-            const int col = std::min(static_cast<int>(std::floor(fx)), sc - 2);
-            output[dx] = top[col] && top[col + 1]
-                              && bottom[col] && bottom[col + 1]
-                ? uint8_t{255}
-                : uint8_t{0};
-        }
-    }
-}
-
-void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
-                           cv::Mat_<cv::Vec3f>& dst,
-                           double ox, double oy,
-                           double sx, double sy,
-                           const cv::Vec3f& border)
-{
-    const int sc = src.cols, sr = src.rows;
-    const int dw = dst.cols, dh = dst.rows;
-    const float fox = float(ox), foy = float(oy);
-    const float fsx = float(sx), fsy = float(sy);
-    // Separable: precompute the nearest source x index per column once (dw
-    // lrounds vs dw*dh per-pixel). Bit-identical.
-    std::vector<int> sxv(dw);
-    for (int dx = 0; dx < dw; ++dx)
-        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        const int sy_i = int(std::lround(foy + float(dy) * fsy));
-        cv::Vec3f* orow = dst[dy];
-        if (sy_i < 0 || sy_i >= sr) {
-            for (int dx = 0; dx < dw; ++dx) orow[dx] = border;
-            continue;
-        }
-        const cv::Vec3f* srow = src[sy_i];
-        for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = sxv[dx];
-            orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
-        }
-    }
-}
-
-void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
-                            cv::Mat_<cv::Vec3f>& dst,
-                            double ox, double oy,
-                            double sx, double sy,
-                            const cv::Vec3f& border)
-{
-    const int sc = src.cols, sr = src.rows;
-    if (sc <= 0 || sr <= 0) {
-        dst.setTo(border);
-        return;
-    }
-    const int dw = dst.cols, dh = dst.rows;
-    const float sxmax = float(sc - 1);
-    const float symax = float(sr - 1);
-    const float fox = float(ox);
-    const float foy = float(oy);
-    const float fsx = float(sx);
-    const float fsy = float(sy);
-    // Separable: precompute the x axis once per call (x0=-1 marks an
-    // out-of-range column -> border). Bit-identical to the per-pixel form.
-    std::vector<int> x0v(dw), x1v(dw);
-    std::vector<float> wxv(dw);
-    for (int dx = 0; dx < dw; ++dx) {
-        float fx = fox + float(dx) * fsx;
-        if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
-        int x0 = int(fx);
-        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
-    }
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        float fy = foy + float(dy) * fsy;
-        cv::Vec3f* orow = dst[dy];
-        if (fy < 0.0f || fy > symax) {
-            for (int dx = 0; dx < dw; ++dx) orow[dx] = border;
-            continue;
-        }
-        int y0 = int(fy);
-        int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
-        const float wy = fy - float(y0);
-        const cv::Vec3f* row0 = src[y0];
-        const cv::Vec3f* row1 = src[y1];
-        for (int dx = 0; dx < dw; ++dx) {
-            const int x0 = x0v[dx];
-            if (x0 < 0) { orow[dx] = border; continue; }
-            const int x1 = x1v[dx];
-            const float wx = wxv[dx];
-            orow[dx] = bilerpVec3f(row0[x0], row0[x1], row1[x0], row1[x1], wx, wy);
-        }
-    }
-}
-
-// Cubic Hermite basis for a unit cell. `p` weights endpoint values and `m`
-// weights endpoint derivatives; the d* fields are their derivatives with
-// respect to t.
-struct HermiteBasis {
-    float p0, m0, p1, m1;
-    float dp0, dm0, dp1, dm1;
-};
-
-inline HermiteBasis hermiteBasis(float t)
-{
-    const float t2 = t * t;
-    const float t3 = t2 * t;
-    return {
-        2.f*t3 - 3.f*t2 + 1.f,
-        t3 - 2.f*t2 + t,
-        -2.f*t3 + 3.f*t2,
-        t3 - t2,
-        6.f*t2 - 6.f*t,
-        3.f*t2 - 4.f*t + 1.f,
-        -6.f*t2 + 6.f*t,
-        3.f*t2 - 2.f*t
-    };
-}
-
-inline bool completeQuad(const cv::Mat_<uint8_t>& valid, int y0, int x0)
-{
-    if (valid.empty() || y0 < 0 || x0 < 0 ||
-        y0 + 1 >= valid.rows || x0 + 1 >= valid.cols)
-        return false;
-    return valid(y0, x0) && valid(y0, x0 + 1) &&
-           valid(y0 + 1, x0) && valid(y0 + 1, x0 + 1);
-}
-
-// Smooth-mode warp. Every complete 2x2 quad is a bicubic Hermite patch whose
-// corner derivatives come from a shared source-grid cache. Adjacent patches
-// therefore use exactly the same edge values, tangents and cross-tangents: the
-// position and its first derivatives agree at the edge (C1), including where
-// centered interior differences change to one-sided border/hole differences.
-//
-// The four position values plus the three derivatives at each corner are the
-// same 16 Vec3 reads as the old 4x4 Catmull-Rom kernel. In a fully supported
-// interior the cached derivatives are centered differences, making this the
-// same Catmull-Rom surface expressed in Hermite form.
-template <bool kConstBorder>
-void warpHermiteVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
-                          const cv::Mat_<uint8_t>& valid,
-                          const cv::Mat_<cv::Vec3f>& du,
-                          const cv::Mat_<cv::Vec3f>& dv,
-                          const cv::Mat_<cv::Vec3f>& duv,
-                          cv::Mat_<cv::Vec3f>& dstCoords,
-                          cv::Mat_<cv::Vec3f>* dstNormals,
-                          double ox, double oy, double sx, double sy,
-                          const cv::Vec3f& border)
-{
-    const int sc = src.cols, sr = src.rows;
-    if (sc <= 0 || sr <= 0) {
-        dstCoords.setTo(border);
-        if (dstNormals) dstNormals->setTo(border);
-        return;
-    }
-    const int dw = dstCoords.cols, dh = dstCoords.rows;
-    const float sxmax = float(sc - 1);
-    const float symax = float(sr - 1);
-    const float fox = float(ox), foy = float(oy);
-    const float fsx = float(sx), fsy = float(sy);
-    const bool wantNormals = (dstNormals != nullptr);
-
-    // Separable mapping: precompute the source cell and Hermite basis once per
-    // output column. At the replicated right edge use the final real cell at
-    // t=1 rather than a zero-width [last,last] cell.
-    std::vector<int> x0v(dw), x1v(dw);
-    std::vector<float> wxv(dw);
-    std::vector<HermiteBasis> bxv(dw);
-    for (int dx = 0; dx < dw; ++dx) {
-        const float fxRaw = fox + float(dx) * fsx;
-        float fx = fxRaw;
-        if (kConstBorder) {
-            if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
-        } else {
-            fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
-        }
-        int x0 = int(fx);
-        if (sc >= 2 && x0 >= sc - 1) x0 = sc - 2;
-        int x1 = std::min(x0 + 1, sc - 1);
-        x0v[dx] = x0; x1v[dx] = x1;
-        const float f = fx - float(x0);
-        wxv[dx] = f;
-        bxv[dx] = hermiteBasis(f);
-    }
-
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int dy = 0; dy < dh; ++dy) {
-        const float fyRaw = foy + float(dy) * fsy;
-        cv::Vec3f* crow = dstCoords[dy];
-        cv::Vec3f* nrow = wantNormals ? (*dstNormals)[dy] : nullptr;
-
-        float fy = fyRaw;
-        if (kConstBorder) {
-            if (fy < 0.0f || fy > symax) {
-                for (int dx = 0; dx < dw; ++dx) {
-                    crow[dx] = border;
-                    if (nrow) nrow[dx] = border;
-                }
-                continue;
-            }
-        } else {
-            fy = fy < 0.0f ? 0.0f : (fy > symax ? symax : fy);
-        }
-        int y0 = int(fy);
-        if (sr >= 2 && y0 >= sr - 1) y0 = sr - 2;
-        int y1 = std::min(y0 + 1, sr - 1);
-        const float wy = fy - float(y0);
-        const HermiteBasis by = hermiteBasis(wy);
-
-        const cv::Vec3f* row0 = src[y0];
-        const cv::Vec3f* row1 = src[y1];
-
-        for (int dx = 0; dx < dw; ++dx) {
-            const int x0 = x0v[dx];
-            if (kConstBorder && x0 < 0) {
-                crow[dx] = border;
-                if (nrow) nrow[dx] = border;
-                continue;
-            }
-            const int x1 = x1v[dx];
-
-            if (sc >= 2 && sr >= 2 && completeQuad(valid, y0, x0)) {
-                const HermiteBasis& bx = bxv[dx];
-                const cv::Vec3f& p00 = row0[x0];
-                const cv::Vec3f& p01 = row0[x1];
-                const cv::Vec3f& p10 = row1[x0];
-                const cv::Vec3f& p11 = row1[x1];
-
-                const cv::Vec3f q0 = p00*bx.p0 + du(y0,x0)*bx.m0
-                                   + p01*bx.p1 + du(y0,x1)*bx.m1;
-                const cv::Vec3f q1 = p10*bx.p0 + du(y1,x0)*bx.m0
-                                   + p11*bx.p1 + du(y1,x1)*bx.m1;
-                const cv::Vec3f r0 = dv(y0,x0)*bx.p0 + duv(y0,x0)*bx.m0
-                                   + dv(y0,x1)*bx.p1 + duv(y0,x1)*bx.m1;
-                const cv::Vec3f r1 = dv(y1,x0)*bx.p0 + duv(y1,x0)*bx.m0
-                                   + dv(y1,x1)*bx.p1 + duv(y1,x1)*bx.m1;
-                const cv::Vec3f q0u = p00*bx.dp0 + du(y0,x0)*bx.dm0
-                                    + p01*bx.dp1 + du(y0,x1)*bx.dm1;
-                const cv::Vec3f q1u = p10*bx.dp0 + du(y1,x0)*bx.dm0
-                                    + p11*bx.dp1 + du(y1,x1)*bx.dm1;
-                const cv::Vec3f r0u = dv(y0,x0)*bx.dp0 + duv(y0,x0)*bx.dm0
-                                    + dv(y0,x1)*bx.dp1 + duv(y0,x1)*bx.dm1;
-                const cv::Vec3f r1u = dv(y1,x0)*bx.dp0 + duv(y1,x0)*bx.dm0
-                                    + dv(y1,x1)*bx.dp1 + duv(y1,x1)*bx.dm1;
-
-                const cv::Vec3f P = q0*by.p0 + r0*by.m0 + q1*by.p1 + r1*by.m1;
-                const cv::Vec3f Pu = q0u*by.p0 + r0u*by.m0 + q1u*by.p1 + r1u*by.m1;
-                const cv::Vec3f Pv = q0*by.dp0 + r0*by.dm0 + q1*by.dp1 + r1*by.dm1;
-                crow[dx] = P;
-                if (nrow) {
-                    cv::Vec3f n{
-                        Pu[1]*Pv[2] - Pu[2]*Pv[1],
-                        Pu[2]*Pv[0] - Pu[0]*Pv[2],
-                        Pu[0]*Pv[1] - Pu[1]*Pv[0]
-                    };
-                    const float len2 = n[0]*n[0] + n[1]*n[1] + n[2]*n[2];
-                    if (len2 == 0.0f || len2 != len2) {
-                        nrow[dx] = cv::Vec3f(std::numeric_limits<float>::quiet_NaN(),
-                                             std::numeric_limits<float>::quiet_NaN(),
-                                             std::numeric_limits<float>::quiet_NaN());
-                    } else {
-                        const float inv = 1.0f / std::sqrt(len2);
-                        nrow[dx] = cv::Vec3f(n[0]*inv, n[1]*inv, n[2]*inv);
-                    }
-                }
-                continue;
-            }
-
-            // An incomplete 2x2 cell cannot define a surface patch. Preserve
-            // the legacy coordinate behavior; the validity pass normally masks
-            // these samples. There is deliberately no fallback between complete
-            // renderable cells, which is what prevents a new seam.
-            const float wx = wxv[dx];
-            crow[dx] = bilerpVec3f(row0[x0], row0[x1], row1[x0], row1[x1], wx, wy);
-            if (nrow) nrow[dx] = border;
-        }
-    }
-}
-
-void warpHermiteReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
-                               const cv::Mat_<uint8_t>& valid,
-                               const cv::Mat_<cv::Vec3f>& du,
-                               const cv::Mat_<cv::Vec3f>& dv,
-                               const cv::Mat_<cv::Vec3f>& duv,
-                               cv::Mat_<cv::Vec3f>& dstCoords,
-                               cv::Mat_<cv::Vec3f>* dstNormals,
-                               double ox, double oy, double sx, double sy,
-                               const cv::Vec3f& normalBorder)
-{
-    warpHermiteVec3fImpl<false>(src, valid, du, dv, duv, dstCoords, dstNormals,
-                                ox, oy, sx, sy, normalBorder);
-}
-
-void warpHermiteConstVec3f(const cv::Mat_<cv::Vec3f>& src,
-                           const cv::Mat_<uint8_t>& valid,
-                           const cv::Mat_<cv::Vec3f>& du,
-                           const cv::Mat_<cv::Vec3f>& dv,
-                           const cv::Mat_<cv::Vec3f>& duv,
-                           cv::Mat_<cv::Vec3f>& dstCoords,
-                           cv::Mat_<cv::Vec3f>* dstNormals,
-                           double ox, double oy, double sx, double sy,
-                           const cv::Vec3f& border)
-{
-    warpHermiteVec3fImpl<true>(src, valid, du, dv, duv, dstCoords, dstNormals,
-                               ox, oy, sx, sy, border);
-}
-
-} // namespace
-
-//NOTE we have 3 coordiante systems. Nominal (voxel volume) coordinates, internal relative (ptr) coords (where _center is at 0/0) and internal absolute (_points) coordinates where the upper left corner is at 0/0.
 static cv::Vec3f internal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal, const cv::Vec2f &scale)
 {
     return internal + cv::Vec3f(nominal[0]*scale[0], nominal[1]*scale[1], nominal[2]);
@@ -947,19 +499,6 @@ static cv::Vec3f nominal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal
     return nominal + cv::Vec3f(internal[0]/scale[0], internal[1]/scale[1], internal[2]);
 }
 
-namespace {
-std::atomic<bool> gStrictQuadRenderValidityDefault{false};
-} // namespace
-
-void QuadSurface::setStrictQuadRenderValidityDefault(bool enabled)
-{
-    gStrictQuadRenderValidityDefault.store(enabled, std::memory_order_relaxed);
-}
-
-bool QuadSurface::strictQuadRenderValidityDefault()
-{
-    return gStrictQuadRenderValidityDefault.load(std::memory_order_relaxed);
-}
 
 QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale)
 {
@@ -1145,6 +684,19 @@ cv::Vec2f QuadSurface::scale() const
 cv::Vec3f QuadSurface::center() const
 {
     return _center;
+}
+
+vcr::grid::SurfaceOptions QuadSurface::gridOptions() const
+{
+    vcr::grid::SurfaceOptions options;
+    options.components = _components;
+    return options;
+}
+
+vcr::grid::Raster QuadSurface::gridRaster(double u0, double v0, double scale, cv::Size size) const
+{
+    const cv::Vec2d origin = surfaceToGrid({u0, v0});
+    return {origin[0], origin[1], double(_scale[0]) / scale, double(_scale[1]) / scale, size.width, size.height};
 }
 
 cv::Vec2d QuadSurface::surfaceToGrid(const cv::Vec2d& surface) const
@@ -1365,11 +917,6 @@ void QuadSurface::unloadCaches()
     {
         std::lock_guard<std::mutex> cacheLock(_cacheMutex);
         _validMaskCache = cv::Mat_<uint8_t>();
-        _validMaskAllValid = false;
-        _normalCache = cv::Mat_<cv::Vec3f>();
-        _smoothDuCache.release();
-        _smoothDvCache.release();
-        _smoothDuvCache.release();
     }
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
@@ -1380,26 +927,17 @@ void QuadSurface::unloadCaches()
 
 cv::Mat_<uint8_t> QuadSurface::validMask() const
 {
-    return validMaskSnapshot(nullptr);
-}
-
-cv::Mat_<uint8_t> QuadSurface::validMaskSnapshot(bool* allValid) const
-{
     const_cast<QuadSurface*>(this)->ensureLoaded();
-    if (allValid) *allValid = false;
     if (!_points || _points->empty()) {
         return cv::Mat_<uint8_t>();
     }
 
-    // Guard the lazy build: gen() calls this concurrently from the renderer's
-    // OMP tile loop, so an unguarded build would race on _validMaskCache (the
-    // cv::Mat assignment is not atomic) and on _validMaskAllValid.
+    // Callers may ask from several threads; the lazy build is guarded.
     std::lock_guard<std::mutex> cacheLock(_cacheMutex);
 
     if (!_validMaskCache.empty() &&
         _validMaskCache.rows == _points->rows &&
         _validMaskCache.cols == _points->cols) {
-        if (allValid) *allValid = _validMaskAllValid;
         return _validMaskCache;
     }
 
@@ -1407,157 +945,20 @@ cv::Mat_<uint8_t> QuadSurface::validMaskSnapshot(bool* allValid) const
     const int cols = _points->cols;
     cv::Mat_<uint8_t> mask(rows, cols);
 
-    // Tight per-row loop:
-    //  - NaN check via self-inequality (NaN != NaN) — no math.h call, branchless.
-    //  - Sentinel check is a contiguous-byte equality against (-1, -1, -1).
-    //  - Bitwise & / | so the compiler emits straight-line NEON, no early exit.
-    // Inf is treated as valid here (was rejected by std::isfinite); coordinates
-    // never go to ±Inf in the surface pipeline, so this is a safe relaxation.
-    // Per-row "any invalid" accumulator for the all-valid fast path in
-    // gen() below. OR-reduced across threads after the loop.
-    std::vector<uint8_t> anyInvalidPerRow(rows, 0);
+    // A vertex is invalid when a coordinate is NaN or it is the (-1, -1, -1) sentinel.
 #pragma omp parallel for schedule(dynamic, 16)
     for (int j = 0; j < rows; ++j) {
         const cv::Vec3f* __restrict__ row = (*_points)[j];
         uint8_t* __restrict__ dst = mask[j];
-        uint8_t rowAnyInvalid = 0;
         for (int i = 0; i < cols; ++i) {
             const float a = row[i][0], b = row[i][1], c = row[i][2];
             const int nan = (a != a) | (b != b) | (c != c);
             const int sent = (a == -1.f) & (b == -1.f) & (c == -1.f);
-            const uint8_t invalid = (nan | sent) ? uint8_t(1) : uint8_t(0);
-            dst[i] = invalid ? uint8_t(0) : uint8_t(255);
-            rowAnyInvalid |= invalid;
+            dst[i] = (nan | sent) ? uint8_t(0) : uint8_t(255);
         }
-        anyInvalidPerRow[j] = rowAnyInvalid;
     }
-    uint8_t anyInvalid = 0;
-    for (uint8_t v : anyInvalidPerRow) anyInvalid |= v;
-    _validMaskAllValid = (anyInvalid == 0);
     _validMaskCache = mask;
-    if (allValid) *allValid = _validMaskAllValid;
     return mask;
-}
-
-void QuadSurface::smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
-                                            cv::Mat_<cv::Vec3f>& dv,
-                                            cv::Mat_<cv::Vec3f>& duv) const
-{
-    const_cast<QuadSurface*>(this)->ensureLoaded();
-    if (!_points || _points->empty()) {
-        du.release(); dv.release(); duv.release();
-        return;
-    }
-    const cv::Mat_<uint8_t> valid = validMaskSnapshot(nullptr);
-
-    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-    if (!_smoothDuCache.empty() && _smoothDuCache.size() == _points->size()) {
-        du = _smoothDuCache; dv = _smoothDvCache; duv = _smoothDuvCache;
-        return;
-    }
-
-    const int rows = _points->rows, cols = _points->cols;
-    _smoothDuCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
-    _smoothDvCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
-    _smoothDuvCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
-
-    // Component bounds per column. Unlisted columns in a component-described
-    // surface stay disabled, so no derivative can cross a component seam.
-    std::vector<int> compBegin(cols, 0), compEnd(cols, cols);
-    if (!_components.empty()) {
-        std::fill(compBegin.begin(), compBegin.end(), -1);
-        std::fill(compEnd.begin(), compEnd.end(), -1);
-        for (const auto& [raw0, raw1] : _components) {
-            const int c0 = std::clamp(raw0, 0, cols);
-            const int c1 = std::clamp(raw1, 0, cols);
-            for (int c = c0; c < c1; ++c) {
-                compBegin[c] = c0;
-                compEnd[c] = c1;
-            }
-        }
-    }
-
-    auto isValid = [&](int r, int c) {
-        return r >= 0 && r < rows && c >= 0 && c < cols &&
-               compBegin[c] >= 0 && valid(r,c) != 0;
-    };
-
-    // First derivatives. A complete quad guarantees that each corner has at
-    // least one neighbor on both axes; isolated valid vertices retain zero and
-    // are never consumed by the Hermite warp.
-#pragma omp parallel for schedule(dynamic, 16)
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            if (!isValid(r,c)) continue;
-            const cv::Vec3f& p = (*_points)(r,c);
-            const bool left = c > compBegin[c] && isValid(r,c-1);
-            const bool right = c + 1 < compEnd[c] && isValid(r,c+1);
-            if (left && right)
-                _smoothDuCache(r,c) = ((*_points)(r,c+1) - (*_points)(r,c-1)) * 0.5f;
-            else if (right)
-                _smoothDuCache(r,c) = (*_points)(r,c+1) - p;
-            else if (left)
-                _smoothDuCache(r,c) = p - (*_points)(r,c-1);
-
-            const bool up = isValid(r-1,c);
-            const bool down = isValid(r+1,c);
-            if (up && down)
-                _smoothDvCache(r,c) = ((*_points)(r+1,c) - (*_points)(r-1,c)) * 0.5f;
-            else if (down)
-                _smoothDvCache(r,c) = (*_points)(r+1,c) - p;
-            else if (up)
-                _smoothDvCache(r,c) = p - (*_points)(r-1,c);
-        }
-    }
-
-    // Mixed derivatives are also shared per vertex. The diagonal fast path is
-    // the standard Catmull-Rom central mixed difference. Near missing support,
-    // differentiate du along rows and dv along columns using the same
-    // centered/one-sided rule, then average the available estimates.
-#pragma omp parallel for schedule(dynamic, 16)
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            if (!isValid(r,c)) continue;
-            const bool left = c > compBegin[c] && isValid(r,c-1);
-            const bool right = c + 1 < compEnd[c] && isValid(r,c+1);
-            const bool up = isValid(r-1,c);
-            const bool down = isValid(r+1,c);
-            if (left && right && up && down &&
-                isValid(r-1,c-1) && isValid(r-1,c+1) &&
-                isValid(r+1,c-1) && isValid(r+1,c+1)) {
-                _smoothDuvCache(r,c) =
-                    ((*_points)(r+1,c+1) - (*_points)(r+1,c-1)
-                     - (*_points)(r-1,c+1) + (*_points)(r-1,c-1)) * 0.25f;
-                continue;
-            }
-
-            cv::Vec3f sum(0,0,0);
-            int count = 0;
-            if (up && down) {
-                sum += (_smoothDuCache(r+1,c) - _smoothDuCache(r-1,c)) * 0.5f;
-                ++count;
-            } else if (down) {
-                sum += _smoothDuCache(r+1,c) - _smoothDuCache(r,c);
-                ++count;
-            } else if (up) {
-                sum += _smoothDuCache(r,c) - _smoothDuCache(r-1,c);
-                ++count;
-            }
-            if (left && right) {
-                sum += (_smoothDvCache(r,c+1) - _smoothDvCache(r,c-1)) * 0.5f;
-                ++count;
-            } else if (right) {
-                sum += _smoothDvCache(r,c+1) - _smoothDvCache(r,c);
-                ++count;
-            } else if (left) {
-                sum += _smoothDvCache(r,c) - _smoothDvCache(r,c-1);
-                ++count;
-            }
-            if (count) _smoothDuvCache(r,c) = sum * (1.0f / float(count));
-        }
-    }
-
-    du = _smoothDuCache; dv = _smoothDvCache; duv = _smoothDuvCache;
 }
 
 void QuadSurface::writeValidMask(const cv::Mat& img)
@@ -1590,276 +991,6 @@ void QuadSurface::invalidateCache()
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     std::lock_guard<std::mutex> cacheLock(_cacheMutex);
     _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
-    _smoothDuCache.release();
-    _smoothDvCache.release();
-    _smoothDuvCache.release();
-}
-
-void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
-                      cv::Mat_<cv::Vec3f>* normals,
-                      cv::Size size,
-                      const cv::Vec3f& ptr,
-                      float scale,
-                      const cv::Vec3f& offset) const
-{
-    const_cast<QuadSurface*>(this)->ensureLoaded();
-    const bool need_normals = (normals != nullptr) || offset[2] || ptr[2];
-
-    const cv::Vec3f ul = internal_loc(offset/scale + _center, ptr, _scale);
-    const int w = size.width, h = size.height;
-
-    cv::Mat_<cv::Vec3f> coords_local, normals_local;
-    if (!coords)  coords  = &coords_local;
-    if (!normals) normals = &normals_local;
-
-    coords->create(size + cv::Size(8, 8));
-
-    // --- build mapping  ---------------------------------
-    // Axis-aligned scale+translate; see the bespoke warp helpers above.
-    const double sx = static_cast<double>(_scale[0]) / static_cast<double>(scale);
-    const double sy = static_cast<double>(_scale[1]) / static_cast<double>(scale);
-    const double ox = static_cast<double>(ul[0]) - 4.0 * sx;
-    const double oy = static_cast<double>(ul[1]) - 4.0 * sy;
-
-    // --- build a source validity mask (255 if point is valid) -------------
-    // Retain the mask and its matching fast-path flag before cache eviction.
-    bool skipValidity = false;
-    cv::Mat_<uint8_t> valid_src = validMaskSnapshot(&skipValidity);
-    // Strict mode must still evaluate cell support on an all-valid vertex
-    // mask so degenerate one-row/one-column components cannot render.
-    skipValidity = skipValidity && !_strictQuadRenderValidity;
-
-    // --- warp coords and validity ----------------------------------------
-    // Per-call scratch is thread_local: gen() runs concurrently per-tile from
-    // the renderer's OMP loop, and the returned coords/normals are views into
-    // these buffers (see crop step below). Sharing them across threads raced
-    // on realloc -> SIGSEGV. thread_local keeps the per-frame reuse per-thread.
-    thread_local cv::Mat_<cv::Vec3f> coords_scratch_tls;
-    thread_local cv::Mat_<uint8_t>  valid_scratch_tls;
-    cv::Mat_<cv::Vec3f>& coords_big = coords_scratch_tls;
-    cv::Mat_<uint8_t>& valid_big = valid_scratch_tls;
-
-    // Interpolation mode is carried on the surface (see setGenInterpolation).
-    const bool smooth = (_genInterpolation == GenInterpolation::Smooth);
-    cv::Mat_<cv::Vec3f> smooth_du, smooth_dv, smooth_duv;
-    if (smooth)
-        smoothDerivativeSnapshots(smooth_du, smooth_dv, smooth_duv);
-    const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
-                          std::numeric_limits<float>::quiet_NaN(),
-                          std::numeric_limits<float>::quiet_NaN());
-
-    // --- normals: source-grid normal cache ---------------------------
-    // Linear mode warps cached vertex normals separately. Smooth mode derives
-    // normals from the Hermite surface and never builds this cache.
-    thread_local cv::Mat_<cv::Vec3f> normals_scratch_tls;
-    cv::Mat_<cv::Vec3f>& normals_big = normals_scratch_tls;
-    cv::Mat_<cv::Vec3f> normal_src;
-    if (need_normals && !smooth) {
-        // Build source-grid normal cache once per surface. Subsequent gen()
-        // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
-        // a different surface becomes active. Snapshot under the same mutex
-        // as construction and eviction, then warp without holding the lock.
-        {
-            std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-            if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-                _normalCache.create(_points->rows, _points->cols);
-                const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
-                                   std::numeric_limits<float>::quiet_NaN(),
-                                   std::numeric_limits<float>::quiet_NaN());
-                const int rows = _points->rows;
-                const int cols = _points->cols;
-                // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
-                if (rows > 0) {
-                    cv::Vec3f* top = _normalCache[0];
-                    cv::Vec3f* bot = _normalCache[rows - 1];
-                    for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
-                }
-                #pragma omp parallel for schedule(dynamic, 16)
-                for (int r = 1; r < rows - 1; r++) {
-                    cv::Vec3f* dst = _normalCache[r];
-                    const cv::Vec3f* row = (*_points)[r];
-                    dst[0] = qn;
-                    dst[cols - 1] = qn;
-                    for (int c = 1; c < cols - 1; c++) {
-                        if (row[c][0] == -1.f) {
-                            dst[c] = qn;
-                        } else {
-                            dst[c] = grid_normal_int(*_points, r, c);
-                        }
-                    }
-                }
-            }
-            normal_src = _normalCache;
-        }
-    }
-    if (need_normals) normals_big.create(h + 8, w + 8);
-    cv::Mat_<cv::Vec3f>* normals_out = need_normals ? &normals_big : nullptr;
-
-    if (!_components.empty()) {
-        // Multi-component surface: warp each component separately with
-        // constant NaN border so no interpolation across component boundaries.
-        const cv::Vec3f nanV(std::numeric_limits<float>::quiet_NaN(),
-                             std::numeric_limits<float>::quiet_NaN(),
-                             std::numeric_limits<float>::quiet_NaN());
-        coords_big.create(h + 8, w + 8);
-        coords_big.setTo(nanV);
-        valid_big.create(h + 8, w + 8);
-        valid_big.setTo(0);
-
-        const int rows = _points->rows;
-        cv::Mat_<cv::Vec3f> compCoords;
-        cv::Mat_<uint8_t> compValidBig;
-        cv::Mat_<cv::Vec3f> compNormals;
-        if (smooth && need_normals) {
-            normals_big.setTo(nanV);
-        }
-        for (const auto& [c0, c1] : _components) {
-            const int cw = c1 - c0;
-            if (cw <= 0 || c0 < 0 || c1 > _points->cols) continue;
-
-            cv::Mat_<cv::Vec3f> compPts = (*_points)(cv::Rect(c0, 0, cw, rows));
-            compCoords.create(h + 8, w + 8);
-            if (smooth) {
-                // Smooth mode produces coords and normals in one pass, per
-                // component, so neither the cubic stencil nor the normal ever
-                // reads across a seam. (The Linear path below still warps
-                // normals from the whole-grid cache, as it always has.)
-                if (need_normals) compNormals.create(h + 8, w + 8);
-                const cv::Rect compRect(c0, 0, cw, rows);
-                warpHermiteConstVec3f(compPts, valid_src(compRect),
-                                      smooth_du(compRect), smooth_dv(compRect),
-                                      smooth_duv(compRect), compCoords,
-                                      need_normals ? &compNormals : nullptr,
-                                      ox - c0, oy, sx, sy, nanV);
-            } else {
-                warpBilinearConstVec3f(compPts, compCoords, ox - c0, oy, sx, sy, nanV);
-            }
-
-            if (!skipValidity) {
-                cv::Mat_<uint8_t> compValid = valid_src(cv::Rect(c0, 0, cw, rows));
-                compValidBig.create(h + 8, w + 8);
-                if (_strictQuadRenderValidity) {
-                    warpQuadValidityConstU8(
-                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
-                } else {
-                    warpNearestConstU8(
-                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
-                }
-                compCoords.copyTo(coords_big, compValidBig);
-                if (smooth && need_normals)
-                    compNormals.copyTo(normals_big, compValidBig);
-                cv::bitwise_or(valid_big, compValidBig, valid_big);
-            } else {
-                // All-valid source: composite non-NaN pixels directly
-                const bool alsoNormals = smooth && need_normals;
-                for (int r = 0; r < coords_big.rows; r++) {
-                    const cv::Vec3f* s = compCoords[r];
-                    cv::Vec3f* d = coords_big[r];
-                    const cv::Vec3f* sn = alsoNormals ? compNormals[r] : nullptr;
-                    cv::Vec3f* dn = alsoNormals ? normals_big[r] : nullptr;
-                    for (int ci = 0; ci < coords_big.cols; ci++) {
-                        // Keep coords and normals in lockstep: a pixel belongs
-                        // to this component iff its coord came out finite.
-                        if (std::isfinite(s[ci][0])) {
-                            d[ci] = s[ci];
-                            if (dn) dn[ci] = sn[ci];
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        // Single component: replicate coords, constant-0 validity.
-        // Always warp validity even when all source points are valid —
-        // the 4px halo around the crop region needs 0s so the
-        // invalidation pass below sets them to NaN (black edges).
-        coords_big.create(h + 8, w + 8);
-        if (smooth) {
-            warpHermiteReplicateVec3f(*_points, valid_src,
-                                      smooth_du, smooth_dv, smooth_duv,
-                                      coords_big, normals_out,
-                                      ox, oy, sx, sy, qnVec);
-        } else {
-            warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
-        }
-        valid_big.create(h + 8, w + 8);
-        if (_strictQuadRenderValidity) {
-            warpQuadValidityConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
-        } else {
-            warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
-        }
-        skipValidity = false;  // force invalidation pass below
-    }
-
-    // Linear mode resamples the per-vertex normals nearest-neighbour. Smooth
-    // mode already produced them above, differentiated from the same cubic
-    // basis as the positions, so there is nothing to warp here.
-    if (need_normals && !smooth) {
-        warpNearestConstVec3f(normal_src, normals_big, ox, oy, sx, sy, qnVec);
-    }
-
-
-    // --- crop away the 4px halo ----------------------------------------
-    // Take views, not clones: ref-counted buffers stay alive via the shared
-    // Mat header. Skips ~48MB/frame of memcpy for a 1920x1080 composite.
-    cv::Rect inner(4, 4, w, h);
-    *coords = coords_big(inner);
-    if (need_normals) {
-        *normals = normals_big(inner);
-    }
-
-    // --- invalidate out-of-footprint pixels (kill GUI leakage) ----------
-    // When the source mask is all-valid the cropped image has no 0s, so
-    // skip the invalidation pass entirely. Otherwise walk coords + normals
-    // once together (fused vs OpenCV's valid==0 + setTo pair of passes).
-    const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN());
-    if (!skipValidity) {
-        cv::Mat valid = valid_big(inner);
-        const bool doNormals = need_normals;
-        for (int j = 0; j < h; ++j) {
-            const uint8_t* __restrict__ v = valid.ptr<uint8_t>(j);
-            cv::Vec3f* __restrict__ crow = coords->ptr<cv::Vec3f>(j);
-            cv::Vec3f* __restrict__ nrow = doNormals
-                ? normals->ptr<cv::Vec3f>(j) : nullptr;
-            for (int i = 0; i < w; ++i) {
-                if (!v[i]) {
-                    crow[i] = qnan;
-                    if (doNormals) nrow[i] = qnan;
-                }
-            }
-        }
-    }
-
-    // --- apply offset along normals only where normals are valid --------
-    if (need_normals && ul[2] != 0.0f) {
-        const float off = ul[2];
-        // Bitwise isnan: exponent all-ones + non-zero mantissa. Safe under
-        // -ffast-math which otherwise folds `x == x` to constant true.
-        auto isNanBitwise = [](float f) {
-            uint32_t bits;
-            std::memcpy(&bits, &f, sizeof(bits));
-            return (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu) != 0;
-        };
-        for (int j = 0; j < h; ++j) {
-            // Row pointers skip cv::Mat::at()'s bounds-check overhead and
-            // let the compiler hoist the row-base arithmetic out of the
-            // inner loop. This runs per rendered pixel every frame.
-            const cv::Vec3f* nrow = normals->ptr<cv::Vec3f>(j);
-            cv::Vec3f* crow = coords->ptr<cv::Vec3f>(j);
-            for (int i = 0; i < w; ++i) {
-                const cv::Vec3f& n = nrow[i];
-                if (!isNanBitwise(n[0]) && !isNanBitwise(n[1]) && !isNanBitwise(n[2])) {
-                    crow[i][0] += n[0] * off;
-                    crow[i][1] += n[1] * off;
-                    crow[i][2] += n[2] * off;
-                }
-            }
-        }
-    }
 }
 
 static inline float sdist(const cv::Vec3f &a, const cv::Vec3f &b)
@@ -2200,7 +1331,6 @@ void QuadSurface::invalidateMask()
     {
         std::lock_guard<std::mutex> cacheLock(_cacheMutex);
         _validMaskCache = cv::Mat_<uint8_t>();
-        _validMaskAllValid = false;
     }
 
     // Delete from disk

@@ -75,22 +75,6 @@ TEST_CASE("invalidateMask with empty path is safe")
     CHECK(true);
 }
 
-TEST_CASE("gen() with ptr[2] non-zero offsets along normals")
-{
-    auto pts = grid(16, 16, /*z=*/0.f);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<cv::Vec3f> normals;
-    // ptr[2] non-zero triggers the normal-offset branch in gen.
-    qs.gen(&coords, &normals, cv::Size(8, 8),
-           /*ptr=*/cv::Vec3f(0, 0, 2.0f),
-           /*scale=*/1.0f, /*offset=*/cv::Vec3f(0, 0, 0));
-    CHECK(coords.rows == 8);
-    CHECK(coords.cols == 8);
-    fs::path d = tmpDir("placeholder");
-    fs::remove_all(d);
-}
-
 TEST_CASE("save with extra channels writes ch_a.tif and ch_b.tif")
 {
     auto root = tmpDir("save_ch");

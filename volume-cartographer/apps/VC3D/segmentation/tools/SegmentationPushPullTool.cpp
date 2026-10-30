@@ -1060,23 +1060,43 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
-// Trilinear samples of an opened level at volume XYZ coordinates, mapped through the
-// levels' placements and truncated to 8 bits as before.
-static void sampleLevel(const OpenedVolumes::Level& level, const cv::Mat_<cv::Vec3f>& xyz, cv::Mat_<uint8_t>& out)
+// The layers of a size x size plane patch at `offsets` along `normal`: pixel (0, 0) at
+// `origin`, steps of the plane's basis / scale, sampled linearly from an opened level and
+// truncated to 8 bits as before.
+static std::vector<cv::Mat_<uint8_t>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& origin,
+                                                        const cv::Vec3f& normal, cv::Size size, float scale,
+                                                        const std::vector<float>& offsets)
 {
-    const auto& to = level.array->placement;
-    const std::size_t n = xyz.total();
-    std::vector<double> zyx(3 * n);
-    for (std::size_t i = 0; i < n; ++i) {
-        const cv::Vec3f& p = xyz(int(i));
-        for (int a = 0; a < 3; ++a)
-            zyx[3 * i + std::size_t(2 - a)] = to.fromLevel0(2 - a, level.working.toLevel0(2 - a, p[a]));
+    const PlaneSurface plane(origin, normal);
+    const float step = 1.0f / scale;
+    const cv::Vec3f dx = plane.basisX() * step, dy = plane.basisY() * step;
+    const auto map = level.array->placement.indexMapFrom(level.working);
+    vcr::grid::Request request;
+    request.levels = {{level.array->array.get(), level.array->meta.type, map.scale, map.offset}};
+    request.offsets = offsets;
+    const auto r = vcr::grid::sample(vcr::grid::Plane{{origin[0], origin[1], origin[2]}, {dx[0], dx[1], dx[2]},
+                                                      {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]},
+                                                      size.width, size.height},
+                                     request);
+    std::vector<cv::Mat_<uint8_t>> layers(offsets.size());
+    const std::size_t n = std::size_t(size.area());
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        layers[k].create(size);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float v = r.values[k * n + i];
+            layers[k](int(i)) = std::isnan(v) ? uint8_t(0) : uint8_t(std::clamp(v, 0.0f, 255.0f));
+        }
     }
-    std::vector<float> values(n);
-    level.array->array->sample_linear(zyx.data(), n, level.array->meta.type, false, values.data());
-    out.create(xyz.size());
-    for (std::size_t i = 0; i < n; ++i)
-        out(int(i)) = std::isnan(values[i]) ? uint8_t(0) : uint8_t(std::clamp(values[i], 0.0f, 255.0f));
+    return layers;
+}
+
+// The offsets start, start + step, ... up to stop, as the alpha loops step them.
+static std::vector<float> alphaOffsets(float start, float stop, float step)
+{
+    std::vector<float> offsets;
+    for (float offset = start; offset <= stop + 1e-4f; offset += step)
+        offsets.push_back(offset);
+    return offsets;
 }
 
 SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTargetsStatic(
@@ -1121,9 +1141,9 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
     std::vector<float> transparent(inputs.size(), 1.0f);
     std::vector<float> integ(inputs.size(), 0.0f);
 
-    cv::Mat_<cv::Vec3f> baseCoords(static_cast<int>(inputs.size()) * kernel, kernel);
-    cv::Mat_<cv::Vec3f> patchCoords;
     std::string firstNoTargetReason;
+    const auto offsets = alphaOffsets(cfg.start, cfg.stop, std::fabs(cfg.step));
+    cv::Mat floatPatch(patchSize, CV_32F);
 
     for (std::size_t i = 0; i < inputs.size(); ++i) {
         cv::Vec3f orientedNormal = inputs[i].normal * static_cast<float>(direction);
@@ -1138,56 +1158,9 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
         normals[i] = orientedNormal;
         valid[i] = 1;
 
-        PlaneSurface plane(inputs[i].baseWorld, orientedNormal);
-        plane.gen(&patchCoords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-        patchCoords.copyTo(baseCoords.rowRange(static_cast<int>(i) * kernel,
-                                               static_cast<int>(i + 1) * kernel));
-    }
-
-    const float start = cfg.start;
-    const float stop = cfg.stop;
-    const float step = std::fabs(cfg.step);
-
-    cv::Mat_<cv::Vec3f> offsetCoords(baseCoords.size());
-    cv::Mat_<uint8_t> slice;
-    cv::Mat floatPatch(patchSize, CV_32F);
-
-    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
-            const int row0 = static_cast<int>(i) * kernel;
-            auto dstBlock = offsetCoords.rowRange(row0, row0 + kernel);
-            auto srcBlock = baseCoords.rowRange(row0, row0 + kernel);
-            const int total = kernel * kernel;
-            const auto* src = srcBlock.ptr<cv::Vec3f>();
-            auto* dst = dstBlock.ptr<cv::Vec3f>();
-            if (valid[i]) {
-                const cv::Vec3f delta = normals[i] * offset;
-                for (int p = 0; p < total; ++p) {
-                    dst[p] = src[p] + delta;
-                }
-            } else {
-                for (int p = 0; p < total; ++p) {
-                    dst[p] = src[p];
-                }
-            }
-        }
-
-        sampleLevel(level, offsetCoords, slice);
-        if (slice.empty()) {
-            if (firstNoTargetReason.empty()) {
-                firstNoTargetReason = "Alpha push/pull sampled an empty volume slice.";
-            }
-            continue;
-        }
-
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
-            if (!valid[i] || transparent[i] <= 1e-3f) {
-                continue;
-            }
-
-            const int row0 = static_cast<int>(i) * kernel;
-            const cv::Mat srcBlock(slice, cv::Rect(0, row0, kernel, kernel));
-            srcBlock.convertTo(floatPatch, CV_32F, 1.0 / 255.0);
+        const auto layers = samplePatchLayers(level, inputs[i].baseWorld, orientedNormal, patchSize, scale, offsets);
+        for (std::size_t k = 0; k < offsets.size() && transparent[i] > 1e-3f; ++k) {
+            layers[k].convertTo(floatPatch, CV_32F, 1.0 / 255.0);
             cv::GaussianBlur(floatPatch, floatPatch, cv::Size(kernel, kernel), 0);
 
             cv::Mat_<float> opaq = floatPatch;
@@ -1197,7 +1170,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
 
             const float centerOpacity = opaq(centerIndex);
             const float joint = transparent[i] * centerOpacity;
-            integ[i] += joint * offset;
+            integ[i] += joint * offsets[k];
             transparent[i] -= joint;
         }
     }
@@ -1296,36 +1269,17 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     const int kernel = radius * 2 + 1;
     const cv::Size patchSize(kernel, kernel);
 
-    PlaneSurface plane(centerWorld, orientedNormal);
-    cv::Mat_<cv::Vec3f> coords;
-    plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-
     const cv::Point2i centerIndex(radius, radius);
     const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
 
     float transparent = 1.0f;
     float integ = 0.0f;
 
-    const float start = cfg.start;
-    const float stop = cfg.stop;
-    const float step = std::fabs(cfg.step);
-
-    // Pre-allocate mats reused across loop iterations to avoid per-tick allocations
-    cv::Mat_<cv::Vec3f> offsetMat(patchSize);
-    cv::Mat_<cv::Vec3f> offsetCoords(patchSize);
-    cv::Mat_<uint8_t> slice(patchSize);
+    const auto offsets = alphaOffsets(cfg.start, cfg.stop, std::fabs(cfg.step));
+    const auto layers = samplePatchLayers(level, centerWorld, orientedNormal, patchSize, scale, offsets);
     cv::Mat sliceFloat(patchSize, CV_32F);
-
-    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        offsetMat.setTo(orientedNormal * offset);
-        cv::add(coords, offsetMat, offsetCoords);
-        sampleLevel(level, offsetCoords, slice);
-        if (slice.empty()) {
-            setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull sampled an empty volume slice.");
-            continue;
-        }
-
-        slice.convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        layers[k].convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
         cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
 
         cv::Mat_<float> opaq = sliceFloat;
@@ -1335,7 +1289,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
 
         const float centerOpacity = opaq(centerIndex);
         const float joint = transparent * centerOpacity;
-        integ += joint * offset;
+        integ += joint * offsets[k];
         transparent -= joint;
 
         if (transparent <= 1e-3f) {

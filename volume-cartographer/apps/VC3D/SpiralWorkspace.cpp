@@ -2084,7 +2084,6 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             // compact display surface.
             auto surface = std::make_shared<QuadSurface>(surfacePath.toStdString());
             surface->id = surfaceId.toStdString();
-            surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
             const QJsonArray gridShape =
                 manifest.value(QStringLiteral("grid_shape")).toArray();
@@ -2717,7 +2716,6 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 cv::Mat windingDepth;
                 windingRegion.convertTo(windingDepth, CV_32F);
                 loaded->setChannel("d", windingDepth);
-                loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
                 return std::shared_ptr<QuadSurface>{};

@@ -1437,29 +1437,20 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
         REQUIRE(sample.valid());
         const auto expected=cv::Vec3f(5,0,float(z));
         CHECK(cv::norm(sample.volume-expected)<1e-5);
-        for (float scale : {0.5f,2.0f}) {
-            cv::Mat_<cv::Vec3f> coords,normals;
-            surface->gen(&coords,&normals,{1,1},{0,0,0},scale,
-                          {float(uv[0]*scale),float(uv[1]*scale),0});
-            CHECK(cv::norm(coords(0,0)-sample.volume)<1e-4);
-            CHECK(cv::norm(normals(0,0))==doctest::Approx(1));
+        const auto* points=surface->rawPointsPtr();
+        const vcr::grid::Surface grid({reinterpret_cast<const float*>(points->ptr()),points->rows,points->cols,
+                                       points->step1()},surface->gridOptions());
+        for (double scale : {0.5,2.0}) {
+            float p[3],n[3];
+            grid.resample(surface->gridRaster(uv[0],uv[1],scale,{1,1}),p,n);
+            CHECK(cv::norm(cv::Vec3f(p[0],p[1],p[2])-sample.volume)<1e-4);
+            CHECK(cv::norm(cv::Vec3f(n[0],n[1],n[2]))==doctest::Approx(1));
         }
         cv::Vec3f ptr{float(uv[0]*surface->scale()[0]),float(uv[1]*surface->scale()[1]),0};
         CHECK(cv::norm(surface->coord(ptr)-sample.volume)<1e-4);
         CHECK(surface->pointTo(ptr,expected,0.01f)<0.001f);
         CHECK(cv::norm(surface->coord(ptr)-expected)<0.001f);
         CHECK_FALSE(surface->sampleAtSurface(surface->gridToSurface({-1,3})).valid());
-        // Off-center depth sampling must use the same geometry-derived normals
-        // as an ordinary surface, not a centerline frame extended across rows.
-        QuadSurface reference(*surface->rawPointsPtr(), surface->scale());
-        reference.shiftSurfaceOrigin({123,-17});
-        const auto edgeUV = surface->gridToSurface({col, 4.5});
-        cv::Mat_<cv::Vec3f> actualCoords, actualNormals, expectedCoords, expectedNormals;
-        const cv::Vec3f offset{float(edgeUV[0]), float(edgeUV[1]), 3.0f};
-        surface->gen(&actualCoords, &actualNormals, {1,1}, {0,0,0}, 1, offset);
-        reference.gen(&expectedCoords, &expectedNormals, {1,1}, {0,0,0}, 1, offset);
-        CHECK(cv::norm(actualCoords, expectedCoords) < 1e-5);
-        CHECK(cv::norm(actualNormals, expectedNormals) < 1e-5);
     }
 }
 

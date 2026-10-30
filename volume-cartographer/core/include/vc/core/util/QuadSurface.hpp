@@ -21,6 +21,7 @@ namespace vc::objects { class TransformedGeometryView; }
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "Rect3D.hpp"
+#include <vc_reader/grid.hpp>
 
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
@@ -32,10 +33,6 @@ namespace vc::objects { class TransformedGeometryView; }
 // Forward declarations
 class QuadSurface;
 class SurfacePatchIndex;
-
-// Interpolation used by QuadSurface::gen() when resampling the point grid.
-// See QuadSurface::setGenInterpolation() for what each mode does.
-enum class GenInterpolation { Linear, Smooth };
 
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
@@ -321,7 +318,6 @@ public:
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
     cv::Vec3f gridNormal(int row, int col) const;
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr) override;
     cv::Size size();
@@ -344,40 +340,11 @@ public:
     // surfaces, never on disk-backed ones.
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
-
-    // How gen() resamples the point grid into the output raster.
-    //
-    // Linear  — bilinear positions, nearest-neighbour normals resampled from
-    //           the per-vertex normal cache. The source grid is typically much
-    //           coarser than the render (scale 0.05 => one cell spans ~20x20
-    //           output pixels), so the normal is piecewise-constant over those
-    //           blocks and any surface offset along it steps at cell edges.
-    // Smooth  — bicubic Hermite positions with the normal differentiated from
-    //           the same basis. Centered derivatives reproduce Catmull-Rom in
-    //           the interior; shared one-sided derivatives keep the surface C1
-    //           next to holes, grid borders and component boundaries.
-    //
-    // Set this before any concurrent gen(); like setStrictQuadRenderValidity it
-    // is not synchronized against in-flight renders.
-    void setGenInterpolation(GenInterpolation m) { _genInterpolation = m; }
-    [[nodiscard]] GenInterpolation genInterpolation() const { return _genInterpolation; }
-
-    // The legacy renderer treats native vertex validity as pixel coverage.
-    // Spiral's drawn-input view opts into the stricter contract that a rendered
-    // location must be backed by a complete bilinear quad. The default remains
-    // false so existing QuadSurface consumers retain their current behavior.
-    //
-    // Under the legacy contract a pixel whose bilinear cell touches an invalid
-    // (-1, -1, -1) vertex is still covered, and gen() blends its coordinate
-    // toward that sentinel: along ragged mask edges those points streak across
-    // the volume toward the origin.
-    void setStrictQuadRenderValidity(bool enabled) { _strictQuadRenderValidity = enabled; }
-    [[nodiscard]] bool strictQuadRenderValidity() const { return _strictQuadRenderValidity; }
-    // Process-wide initial value of strictQuadRenderValidity() for surfaces
-    // constructed afterwards. Applications set it once at startup, before
-    // loading surfaces (VC3D enables it); libraries and tools keep false.
-    static void setStrictQuadRenderValidityDefault(bool enabled);
-    [[nodiscard]] static bool strictQuadRenderValidityDefault();
+    // The vertex grid as vcr::grid sees it: the options of a vcr::grid::Surface over
+    // rawPointsPtr() (its pieces; linear patches), and the raster of `size` pixels whose
+    // top-left pixel sits at surface coordinate (u0, v0), `scale` pixels per unit.
+    [[nodiscard]] vcr::grid::SurfaceOptions gridOptions() const;
+    [[nodiscard]] vcr::grid::Raster gridRaster(double u0, double v0, double scale, cv::Size size) const;
 
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
@@ -413,7 +380,7 @@ public:
     // Drop derived caches (validity mask, etc.) without unloading _points.
     // Called when this surface is no longer the active editing target so
     // RAM is reserved for the segment the user is currently working on.
-    // In-flight gen()/validMask() calls retain their derived-cache snapshots.
+    // In-flight validMask() calls keep the mask they returned.
     // Concurrent channel access, point unloading and geometry edits still
     // require external synchronization.
     void unloadCaches();
@@ -427,10 +394,6 @@ public:
     void setComponents(std::vector<std::pair<int, int>> components)
     {
         _components = std::move(components);
-        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-        _smoothDuCache.release();
-        _smoothDvCache.release();
-        _smoothDuvCache.release();
     }
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
@@ -477,29 +440,8 @@ public:
     void writeValidMask(const cv::Mat& img = cv::Mat());
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
-    // Set when _validMaskCache contains no 0s — gen() can skip the
-    // validity warp + per-pixel invalidation pass entirely. Atomic
-    // because gen() can be called from concurrent OMP threads.
-    mutable std::atomic<bool> _validMaskAllValid{false};
-    mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // Per-vertex derivatives for the Smooth Hermite surface. Adjacent patches
-    // share these values, which makes both position and first derivatives agree
-    // at their common edge. Built lazily and only in Smooth mode.
-    mutable cv::Mat_<cv::Vec3f> _smoothDuCache;
-    mutable cv::Mat_<cv::Vec3f> _smoothDvCache;
-    mutable cv::Mat_<cv::Vec3f> _smoothDuvCache;
-    // Guards derived-cache construction, invalidation and snapshot acquisition.
-    // Readers retain immutable, reference-counted Mat snapshots after unlocking,
-    // so unloadCaches() can evict the cache without freeing in-flight data.
+    // Guards the validity mask's lazy construction and invalidation.
     mutable std::mutex _cacheMutex;
-    // NOTE: gen()'s per-call coords/normals/valid scratch buffers used to live
-    // here as members and were reused across render ticks to avoid per-frame
-    // reallocation (at 1920×1080 each coords/normals Mat is ~170 MiB of
-    // cv::Vec3f). But gen() is called concurrently per-tile from the renderer's
-    // OMP loop, and sharing those buffers (plus returning views into them)
-    // raced -> SIGSEGV. They are now thread_local inside gen(): each thread
-    // keeps its own buffers, so the per-frame reuse is preserved per-thread
-    // while staying race-free.
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
@@ -541,17 +483,9 @@ protected:
     // Column ranges of disconnected surface components (meta "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
-    bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
-    GenInterpolation _genInterpolation = GenInterpolation::Linear;
     float dpi_ = 0.f;
 
 private:
-    cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
-    // Lazily build and acquire ref-counted snapshots of the Smooth derivative
-    // caches. All three outputs have the same shape as _points.
-    void smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
-                                   cv::Mat_<cv::Vec3f>& dv,
-                                   cv::Mat_<cv::Vec3f>& duv) const;
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");

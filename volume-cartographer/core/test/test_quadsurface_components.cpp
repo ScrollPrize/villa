@@ -35,13 +35,13 @@ cv::Mat_<cv::Vec3f> grid(int rows, int cols, float z = 0.f)
 
 } // namespace
 
-TEST_CASE("QuadSurface(path,json) with components: gen() uses multi-component warp")
+TEST_CASE("QuadSurface(path,json) with components: the grid is never interpolated across them")
 {
     auto root = tmpDir("multi_comp");
     auto segDir = root / "seg";
     // Seed a 16-wide grid on disk.
     {
-        QuadSurface seed(grid(16, 16), cv::Vec2f(1.f, 1.f));
+        QuadSurface seed(grid(16, 16, 5.f), cv::Vec2f(1.f, 1.f));
         seed.save(segDir);
     }
     // Build meta with two components covering [0,8) and [8,16).
@@ -59,23 +59,31 @@ TEST_CASE("QuadSurface(path,json) with components: gen() uses multi-component wa
     qs.ensureLoaded();
     REQUIRE(qs.rawPointsPtr());
     CHECK(qs.rawPointsPtr()->cols == 16);
+    const auto options = qs.gridOptions();
+    REQUIRE(options.components.size() == 2);
+    CHECK(options.components[0] == std::pair{0, 8});
+    CHECK(options.components[1] == std::pair{8, 16});
 
-    // gen() with normals + a non-zero offset triggers the multi-component
-    // warp path (line 766+) inside QuadSurface::gen.
-    cv::Mat_<cv::Vec3f> coords, normals;
-    qs.gen(&coords, &normals, cv::Size(8, 8),
-           cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 1));
-    CHECK(coords.rows == 8);
-    CHECK(coords.cols == 8);
+    // Grid columns 6.5, 7.5 (the seam cell) and 8.5 of row 3.
+    const auto* points = qs.rawPointsPtr();
+    const vcr::grid::Surface surface({reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
+                                      points->step1()},
+                                     options);
+    const auto origin = qs.gridToSurface({6.5, 3.0});
+    float xyz[9];
+    surface.resample(qs.gridRaster(origin[0], origin[1], 1.0, cv::Size(3, 1)), xyz, nullptr);
+    CHECK(xyz[0] == doctest::Approx(6.5f));
+    CHECK(std::isnan(xyz[3]));
+    CHECK(xyz[6] == doctest::Approx(8.5f));
     fs::remove_all(root);
 }
 
-TEST_CASE("components-meta with degenerate ranges is filtered out")
+TEST_CASE("components-meta ranges are clamped to the grid and empty ones ignored")
 {
     auto root = tmpDir("bad_comp");
     auto segDir = root / "seg";
     {
-        QuadSurface seed(grid(8, 8), cv::Vec2f(1.f, 1.f));
+        QuadSurface seed(grid(8, 8, 5.f), cv::Vec2f(1.f, 1.f));
         seed.save(segDir);
     }
     auto j = utils::Json::object();
@@ -94,10 +102,16 @@ TEST_CASE("components-meta with degenerate ranges is filtered out")
 
     QuadSurface qs(segDir, j);
     qs.ensureLoaded();
-    cv::Mat_<cv::Vec3f> coords, normals;
-    qs.gen(&coords, &normals, cv::Size(4, 4),
-           cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 1));
-    CHECK(coords.rows == 4);
+    // [0, 100) clamps to every column: one piece, interpolated everywhere.
+    const auto* points = qs.rawPointsPtr();
+    const vcr::grid::Surface surface({reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
+                                      points->step1()},
+                                     qs.gridOptions());
+    const auto origin = qs.gridToSurface({0.5, 3.0});
+    float xyz[7 * 3];
+    surface.resample(qs.gridRaster(origin[0], origin[1], 1.0, cv::Size(7, 1)), xyz, nullptr);
+    for (int i = 0; i < 7; ++i)
+        CHECK(xyz[3 * i] == doctest::Approx(0.5f + float(i)));
     fs::remove_all(root);
 }
 
