@@ -112,6 +112,8 @@ def generate_patch_caches(
         unlabeled_fg_bbox_threshold=float(
             getattr(mgr, "unlabeled_foreground_bbox_threshold", 0.15)
         ),
+        primary_target=target_names[0],
+        unlabeled_fg_volume_ids=getattr(mgr, "unlabeled_foreground_volumes", None),
     )
 
     # Check if cache already exists
@@ -255,9 +257,12 @@ def _resolve_valid_patch_value(
     targets = getattr(mgr, "targets", {})
     for target in target_names:
         info = targets.get(target) or {}
-        value = info.get("valid_patch_value")
-        if value is not None:
-            return value
+        if "valid_patch_value" in info:
+            value = info["valid_patch_value"]
+            if value is not None:
+                return value
+            # Explicit null chooses dataset fallback, just as the loader does.
+            break
     dataset_cfg = getattr(mgr, "dataset_config", {}) or {}
     dataset_value = dataset_cfg.get("valid_patch_value")
     if dataset_value is not None:
