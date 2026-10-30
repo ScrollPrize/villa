@@ -1,6 +1,7 @@
 // Parsing of published catalog records into typed fields, and the catalog's
 // own rules over them: surfaces of a segment, ink images, timestamps, origins.
 #include "vc_reader/catalog.hpp"
+#include "vc_reader/registrations.hpp"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -171,6 +172,20 @@ int main()
         require(atL0 && atL0->level == 0, "published source path");
         require(!atL0->sameGrid(*atL2) && atL2->sameGrid(*manifest.volumeAt(zarrUrl, 2)), "a level is its own grid");
         require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
+
+        const auto metadata = manifest.volumeMetadataAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
+        require(metadata && metadata->sampleId == "PHerc0139" && metadata->volumeId == "vol1" &&
+                    metadata->scanId == "scan-a" && metadata->voxelSizeUm == 7.91 && metadata->energyKeV == 88.0 &&
+                    metadata->detectorDistanceMm == 12.5 && metadata->dataFormat == "uint8" &&
+                    metadata->raw.value("id", "") == "vol1",
+                "volume metadata at a location");
+        require(!manifest.volumeMetadataAt("https://example.test/other.zarr"), "no metadata for an unknown volume");
+        const auto& sample0 = *manifest.findSample("PHerc0139");
+        const auto direct = resolveVolumeTransform(sample0, "vol1", "vol2");
+        require(direct && direct->derivationPath == "vol1-vol2" && direct->forward(0, 3) == 10, "direct volume transform");
+        const auto inverse = resolveVolumeTransform(sample0, "vol2", "vol1");
+        require(inverse && inverse->derivationPath.empty() && inverse->forward(0, 0) == 2, "inverse volume transform");
+        require(!resolveVolumeTransform(sample0, "vol1", "nowhere"), "no route");
         // The transform and the supersession only: a pyramid level is a scale of its volume.
         require(registrations.registrations().size() == 2, "no level registrations");
 

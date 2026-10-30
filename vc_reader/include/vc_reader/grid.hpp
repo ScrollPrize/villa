@@ -105,6 +105,10 @@ struct Level {
     std::optional<std::array<double, 9>> linear;
 };
 
+// A level placed by a row-major 3x4 map, index (ZYX) = linear * p (XYZ) + offset: the
+// scale form when the map only scales each axis, otherwise `linear`.
+Level levelFromMap(Array& array, ElementType type, const std::array<double, 12>& map);
+
 struct Request {
     // In order of preference (e.g. the view's level, finer ones, then coarser): each
     // sample comes from the first level that holds it.

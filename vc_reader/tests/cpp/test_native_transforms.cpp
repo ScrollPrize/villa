@@ -22,6 +22,10 @@ int main()
         require(std::memcmp(actual, replay.sample.at("image").array.data(), 12 * sizeof(float)) == 0,
                 "serialized native replay must reproduce values");
         require(values[0] == 1.f, "borrowed/copied inputs remain unchanged");
+        require(make_seed({}) == UINT64_C(14695981039346656037), "seed of nothing");
+        require(make_seed({seed_part(std::int64_t{1}), seed_part("a")}) == UINT64_C(10903677741198114521), "stable seed");
+        require(make_seed({seed_part(std::int64_t{-5})}) == UINT64_C(11174910008215009199), "negative seed part");
+        require(make_seed({seed_part("1")}) != make_seed({seed_part(std::int64_t{1})}), "integers and strings differ");
         std::cout << "Native transform pipeline and replay passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

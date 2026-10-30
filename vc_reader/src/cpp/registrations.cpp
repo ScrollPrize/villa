@@ -107,4 +107,12 @@ std::string RegistrationGraph::describe(const std::vector<std::string>& path) co
     }
     return text;
 }
+std::optional<VolumeTransform> resolveVolumeTransform(const OpenDataSample& sample,const std::string& source,const std::string& target){
+    RegistrationGraph graph;graph.addSample(sample);
+    const auto resolution=graph.resolve(source,target);
+    if(resolution.status==TransformStatus::Unavailable)return std::nullopt;
+    VolumeTransform out{resolution.resolved().forward,{}};
+    for(const auto& g:sample.volumeTransforms)if(g.fromVolumeId==source)for(const auto& t:g.transforms)if(t.toVolumeId==target)out.derivationPath=t.derivationPath;
+    return out;
+}
 }

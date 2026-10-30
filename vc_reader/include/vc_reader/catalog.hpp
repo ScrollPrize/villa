@@ -335,6 +335,14 @@ struct OpenDataVolumeView {
     }
 };
 
+// What the catalog says about the volume a zarr shows; voxelSizeUm is that of the
+// dataset's own level 0 (a dataset derived on a coarser level has that level's voxels).
+struct OpenDataVolumeMetadata {
+    std::string sampleId, volumeId, scanId, name, createdAt, dataFormat;
+    std::optional<double> voxelSizeUm, energyKeV, detectorDistanceMm;
+    nlohmann::json raw;
+};
+
 struct OpenDataManifest {
     std::string manifestUrl;
     std::vector<OpenDataSample> samples;
@@ -347,6 +355,8 @@ struct OpenDataManifest {
     // parameters.level added to the base level). URLs compare without trailing
     // slashes, as resolved or as published.
     [[nodiscard]] std::optional<OpenDataVolumeView> volumeAt(std::string_view url, int baseLevel = 0) const;
+    // The volume at any spelling of a public location (s3:// or https://).
+    [[nodiscard]] std::optional<OpenDataVolumeMetadata> volumeMetadataAt(const std::string& url) const;
 };
 
 // The manifest in a cache file (loadCatalog's cacheFile), parsed once per file

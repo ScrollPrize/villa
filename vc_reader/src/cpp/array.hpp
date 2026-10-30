@@ -88,6 +88,31 @@ struct RebasedCoordinates : Coordinates {
 };
 using FloatAffine = RebasedCoordinates<BasicAffineCoordinates<float>>;
 
+// An integer origin for (n, 3) points to be sampled in local float32 coordinates: the
+// floor of their low corner. nullopt when they span too far for that to keep local
+// rounding below 1/4096 voxel, independent of point order. Non-finite points do not count.
+template <class T>
+std::optional<std::array<std::int64_t, 3>> pointOrigin(const T* points, std::size_t n)
+{
+    T low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (std::size_t i = 0; i < n; ++i, points += 3) {
+        if (!std::isfinite(points[0]) || !std::isfinite(points[1]) || !std::isfinite(points[2]))
+            continue;
+        for (int a = 0; a < 3; ++a) {
+            low[a] = std::min(low[a], points[a]);
+            high[a] = std::max(high[a], points[a]);
+        }
+    }
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    if (std::isfinite(low[0]))
+        for (int a = 0; a < 3; ++a) {
+            base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(low[a])), 0., double(1LL << 30)));
+            if (double(low[a]) - base[a] < -4096 || double(high[a]) - base[a] > 4096)
+                return std::nullopt;
+        }
+    return base;
+}
+
 // A chunk an offline read needs is in none of the disk layers.
 struct CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;

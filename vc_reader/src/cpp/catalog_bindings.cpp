@@ -5,6 +5,7 @@
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 #include "vc_reader/catalog.hpp"
+#include "vc_reader/registrations.hpp"
 #include "catalog_io.hpp"
 namespace nb=nanobind;
 using namespace vcr::catalog;
@@ -96,28 +97,19 @@ NB_MODULE(_catalog,m) {
     auto catalog=nb::class_<OpenDataManifest>(m,"Catalog");
     catalog.def_ro("samples",&OpenDataManifest::samples).def_ro("models",&OpenDataManifest::models)
         .def("volume_at",[](const OpenDataManifest& c,const std::string& url)->nb::object {
-            const auto view=c.volumeAt(resolveOpenDataUrl(url));
-            if(!view)return nb::none();
-            const auto* sample=c.findSample(view->sampleId);
-            const auto* volume=sample?sample->findVolume(view->volumeId):nullptr;
-            if(!volume)return nb::none();
-            nlohmann::json out{{"sample_id",view->sampleId},{"volume_id",view->volumeId},{"scan_id",volume->scanId},
-                {"name",volume->suffix},{"created_at",volume->createdAt},{"data_format",volume->dataFormat},
-                {"energy_kev",nullptr},{"detector_distance_mm",nullptr},{"voxel_size_um",nullptr},{"raw",volume->raw}};
-            if(volume->energyKeV)out["energy_kev"]=*volume->energyKeV;
-            if(volume->detectorDistanceMm)out["detector_distance_mm"]=*volume->detectorDistanceMm;
-            // A dataset derived on a coarser level has that level's voxels.
-            if(volume->pixelSizeUm)out["voxel_size_um"]=std::ldexp(*volume->pixelSizeUm,view->level);
-            return pyJson(out);
+            const auto v=c.volumeMetadataAt(url);
+            if(!v)return nb::none();
+            const auto number=[](const std::optional<double>& x){return x?nlohmann::json(*x):nlohmann::json(nullptr);};
+            return pyJson({{"sample_id",v->sampleId},{"volume_id",v->volumeId},{"scan_id",v->scanId},
+                {"name",v->name},{"created_at",v->createdAt},{"data_format",v->dataFormat},
+                {"energy_kev",number(v->energyKeV)},{"detector_distance_mm",number(v->detectorDistanceMm)},
+                {"voxel_size_um",number(v->voxelSizeUm)},{"raw",v->raw}});
         },nb::arg("url"),"What the catalog says about the volume a remote zarr shows; None if it does not list it.")
         .def("transform",[](const OpenDataManifest& c,const std::string& sample,const std::string& source,const std::string& target)->nb::object {
             const auto* s=c.findSample(sample);if(!s)return nb::none();
-            RegistrationGraph graph;graph.addSample(*s);const auto resolution=graph.resolve(source,target);
-            if(resolution.status==TransformStatus::Unavailable)return nb::none();
-            const auto& candidate=resolution.resolved();
-            std::string derivation;
-            for(const auto& g:s->volumeTransforms)if(g.fromVolumeId==source)for(const auto& t:g.transforms)if(t.toVolumeId==target)derivation=t.derivationPath;
-            return pyJson({{"matrix",candidate.forward.json()},{"derivation_path",derivation.empty()?nlohmann::json(nullptr):nlohmann::json(derivation)}});
+            const auto transform=resolveVolumeTransform(*s,source,target);
+            if(!transform)return nb::none();
+            return pyJson({{"matrix",transform->forward.json()},{"derivation_path",transform->derivationPath.empty()?nlohmann::json(nullptr):nlohmann::json(transform->derivationPath)}});
         });metadata(catalog);
     m.def("parse",[](const std::string& text){return parseOpenDataManifest(text);});
     m.def("parse_artifacts",[](const nb::object& entries){return parseCatalogArtifacts(json(entries));});

@@ -20,6 +20,31 @@
 
 namespace vcr::grid {
 
+Level levelFromMap(Array& array, ElementType type, const std::array<double, 12>& map)
+{
+    Level L{&array, type};
+    bool aligned = true;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 4; ++b) {
+            if (!std::isfinite(map[std::size_t(4 * a + b)]))
+                throw std::invalid_argument("nonfinite level map");
+            aligned &= b == 3 || b == 2 - a || map[std::size_t(4 * a + b)] == 0;
+        }
+    for (int a = 0; a < 3; ++a)
+        L.offset[std::size_t(a)] = map[std::size_t(4 * a + 3)];
+    if (aligned) {
+        for (int a = 0; a < 3; ++a)
+            L.scale[std::size_t(a)] = map[std::size_t(4 * a + 2 - a)];
+    } else {
+        std::array<double, 9> linear;
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b)
+                linear[std::size_t(3 * a + b)] = map[std::size_t(4 * a + b)];
+        L.linear = linear;
+    }
+    return L;
+}
+
 namespace {
 
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();

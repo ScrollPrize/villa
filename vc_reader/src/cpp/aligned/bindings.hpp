@@ -2,14 +2,6 @@
 #include "plan.hpp"
 #include <nanobind/stl/array.h>
 namespace vcr::aligned {
-inline Field make_field(std::array<float,9> matrix,std::array<float,3> translation,std::array<int,3> components,bool normalize,bool normal) {
-    auto sorted=components; std::sort(sorted.begin(),sorted.end());
-    if(sorted!=std::array<int,3>{0,1,2}) throw nb::value_error("component order must permute XYZ");
-    Field f;
-    std::copy(matrix.begin(),matrix.end(),f.matrix); std::copy(translation.begin(),translation.end(),f.translation);
-    std::copy(components.begin(),components.end(),f.component); f.normalize=normalize; f.normal=normal; f.enabled=true;
-    return f;
-}
 inline void check_bytes(const Plan& p,std::size_t output,std::size_t valid,std::size_t item) {
     if(output!=p.grid.output_count*p.grid.channels*(p.grid.order ? 4 : item) || valid!=p.grid.output_count)
         throw nb::value_error("aligned output buffer size mismatch");

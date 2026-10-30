@@ -371,6 +371,21 @@ int main()
             a0->sample_linear(below, 1, u8, false, &expected);
             require(near(r.values[64 + q], expected, 1e-3f), "surface layer along the normal");
         }
+
+        // Placement maps: scale form when axis aligned, otherwise general.
+        const auto scaled = vcr::grid::levelFromMap(*a0, u8, {0, 0, 2, 1, 0, 3, 0, 2, 4, 0, 0, 3});
+        require(!scaled.linear && scaled.scale == std::array<double, 3>{2, 3, 4} &&
+                    scaled.offset == std::array<double, 3>{1, 2, 3},
+                "axis-aligned level map");
+        const auto general = vcr::grid::levelFromMap(*a0, u8, {1, 0, 2, 1, 0, 3, 0, 2, 4, 0, 0, 3});
+        require(general.linear && (*general.linear)[0] == 1 && (*general.linear)[8] == 0, "general level map");
+        bool rejected = false;
+        try {
+            vcr::grid::levelFromMap(*a0, u8, {NAN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        require(rejected, "nonfinite level map");
         std::cout << "Native grid surfaces and sampling passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

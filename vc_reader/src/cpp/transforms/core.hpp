@@ -90,6 +90,17 @@ inline std::uint64_t split_seed(std::uint64_t base, const std::string& name) {
     for (unsigned char c : name) { base ^= c; base *= UINT64_C(1099511628211); }
     Random r{base}; return r.next();
 }
+// A seed from identifiers (epoch, sample index, path...), each an integer in decimal or a
+// string. Stable like split_seed; an integer and a string with the same text differ.
+struct SeedPart { bool text = false; std::string value; };
+inline SeedPart seed_part(std::string value) { return {true, std::move(value)}; }
+inline SeedPart seed_part(std::int64_t value) { return {false, std::to_string(value)}; }
+inline std::uint64_t make_seed(const std::vector<SeedPart>& parts) {
+    std::uint64_t value = UINT64_C(14695981039346656037);
+    for (const auto& part : parts)
+        value = split_seed(value, (part.text ? "s" : "i") + std::to_string(part.value.size()) + ":" + part.value);
+    return value;
+}
 struct Uniform { double low, high; };
 struct Normal { double mean = 0, std = .1; };
 struct Choice { std::vector<double> values; };

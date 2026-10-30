@@ -27,32 +27,6 @@ using LayerTuple = std::tuple<std::string, std::string, std::string, std::string
 using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
 using HostPoints = nb::ndarray<nb::ro, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
-template<class T> static nb::object point_origin(const HostPoints& points)
-{
-    const auto* p = static_cast<const T*>(points.data());
-    T low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
-    {
-        nb::gil_scoped_release release;
-        for (std::size_t i = 0; i < points.shape(0); ++i, p += 3) {
-            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
-            for (int a = 0; a < 3; ++a) {
-                low[a] = std::min(low[a], p[a]);
-                high[a] = std::max(high[a], p[a]);
-            }
-        }
-    }
-    vcr::Index base(3, 0);
-    if (std::isfinite(low[0])) {
-        for (int a = 0; a < 3; ++a) {
-            base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(low[a])), 0., double(1LL << 30)));
-            // Keep local rounding below 1/4096 voxel, independent of point order.
-            if (double(low[a]) - base[a] < -4096 || double(high[a]) - base[a] > 4096)
-                return nb::none();
-        }
-    }
-    return nb::cast(base);
-}
-
 template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& points,
                                               const vcr::Index& offset, Bytes out, int order)
 {
@@ -117,8 +91,16 @@ NB_MODULE(_reader, m)
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
     m.def("_point_origin", [](HostPoints points) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
-        if (points.dtype() == nb::dtype<float>()) return point_origin<float>(points);
-        if (points.dtype() == nb::dtype<double>()) return point_origin<double>(points);
+        const auto origin = [&](const auto* p) -> nb::object {
+            std::optional<std::array<std::int64_t, 3>> base;
+            {
+                nb::gil_scoped_release release;
+                base = vcr::pointOrigin(p, points.shape(0));
+            }
+            return base ? nb::cast(vcr::Index(base->begin(), base->end())) : nb::none();
+        };
+        if (points.dtype() == nb::dtype<float>()) return origin(static_cast<const float*>(points.data()));
+        if (points.dtype() == nb::dtype<double>()) return origin(static_cast<const double*>(points.data()));
         throw nb::type_error("expected float32 or float64 points");
     });
 #ifdef VC_READER_CUDA

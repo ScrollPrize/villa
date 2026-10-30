@@ -113,4 +113,80 @@ void contains_cuda(const CudaVoxels&,const float*,const std::int64_t*,bool*,std:
 void dense_cuda(const CudaVoxels&,std::uint8_t*);
 void keys_cuda(const CudaVoxels&,std::int64_t*,std::size_t);
 #endif
+
+// Batches over a curve bank or voxel set, on the CPU (device < 0) or the CUDA device
+// holding the arrays. Outputs may not overlap inputs. Returns once the results are ready.
+template<class F> void on_device(int id,F f){
+    if(id<0){f();return;}
+#ifdef VC_READER_CUDA
+    device::Guard guard(id);
+    try{f();}catch(...){cudaStreamSynchronize(device::stream());throw;}
+#else
+    throw std::runtime_error("geometry CUDA operations require a CUDA build");
+#endif
+}
+#ifdef VC_READER_CUDA
+#define VCR_GEOMETRY_CUDA(call) call
+#else
+#define VCR_GEOMETRY_CUDA(call)
+#endif
+inline void gather_batch(const CurvesView& view,int id,const std::int64_t* ids,bool segments,float* out,float* arcs,std::int64_t* owners,bool* valid,std::size_t n){
+    const std::size_t width=segments?2:1;
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i)gather(view,ids[i],segments,out+3*width*i,arcs+width*i,owners+i,valid+i);}else{
+        VCR_GEOMETRY_CUDA(gather_cuda(view,ids,segments,out,arcs,owners,valid,n);)
+    }});
+}
+inline void interpolate_batch(const CurvesView& view,int id,const std::int64_t* ids,const float* s,float* out,bool* valid,std::size_t n){
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i)interpolate(view,ids[i],s[i],out+3*i,valid+i);}else{
+        VCR_GEOMETRY_CUDA(interpolate_cuda(view,ids,s,out,valid,n);)
+    }});
+}
+// planes: (n, 4). spans: optional (n, 2) arclength intervals. direction: -1, 0 or 1.
+inline void intersect_batch(const CurvesView& view,int id,const std::int64_t* ids,const float* planes,const float* spans,int direction,float* out,float* arcs,std::int64_t* index,bool* valid,std::size_t n){
+    if(direction< -1||direction>1)throw std::invalid_argument("direction must be -1, 0 or 1");
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i)intersect(view,ids[i],planes+4*i,spans?spans+2*i:nullptr,direction,out+3*i,arcs+i,index+i,valid+i);}else{
+        VCR_GEOMETRY_CUDA(intersect_cuda(view,ids,planes,spans,direction,out,arcs,index,valid,n);)
+    }});
+}
+// ids: optional, one curve per point (otherwise any curve).
+inline void nearest_batch(const CurvesView& view,int id,const float* points,const std::int64_t* ids,float limit,float* out,float* distance,float* arcs,std::int64_t* index,std::int64_t* owner,bool* valid,std::size_t n){
+    if(!(limit>=0))throw std::invalid_argument("max_distance must be nonnegative");
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i)closest(view,vector(points+3*i),ids?ids[i]:-1,limit,out+3*i,distance+i,arcs+i,index+i,owner+i,valid+i);}else{
+        VCR_GEOMETRY_CUDA(closest_cuda(view,points,ids,limit,out,distance,arcs,index,owner,valid,n);)
+    }});
+}
+// out: (n, capacity) ids of what each box holds.
+inline void boxes_batch(const CurvesView& view,int id,const float* lower,const float* upper,const std::int64_t* ids,int capacity,std::int64_t* out,std::int64_t* counts,bool* valid,std::size_t n){
+    if(capacity<1)throw std::invalid_argument("capacity must be positive");
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i)query_box(view,vector(lower+3*i),vector(upper+3*i),ids?ids[i]:-1,capacity,out+i*capacity,counts+i,valid+i);}else{
+        VCR_GEOMETRY_CUDA(boxes_cuda(view,lower,upper,ids,capacity,out,counts,valid,n);)
+    }});
+}
+// matrices: `count` row-major 3x4 transforms, one or one per point. Vectors skip translation.
+inline void transform_batch(int id,const float* points,const float* matrices,std::size_t count,bool vectors,float* out,std::size_t n){
+    if(count!=1&&count!=n)throw std::invalid_argument("provide one transform or one per point");
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i){auto m=matrices+(count==1?0:12*i);auto v=vector(points+3*i);store(out+3*i,vectors?linear(m,v):transform(m,v));}}else{
+        VCR_GEOMETRY_CUDA(transform_cuda(points,matrices,count,vectors,out,n);)
+    }});
+}
+inline VoxelGrid voxel_grid(std::array<std::int64_t,3> shape,std::int64_t batches){
+    VoxelGrid g{{shape[0],shape[1],shape[2]},batches,1};
+    if(batches<1)throw std::invalid_argument("batches must be positive");
+    for(auto n:shape){if(n<1||n>(1<<24)||g.volume>(INT64_MAX-1)/n)throw std::invalid_argument("invalid voxel shape");g.volume*=n;}
+    if(g.volume>(INT64_MAX-1)/batches)throw std::invalid_argument("voxel keys overflow int64");
+    return g;
+}
+inline void contains_batch(const Voxels& voxels,const float* points,const std::int64_t* ids,bool* out,std::size_t n){
+    for(std::size_t i=0;i<n;++i)out[i]=contains(voxels.keys.data(),voxels.keys.size(),voxel_key(vector(points+3*i),ids?ids[i]:0,voxels.grid));
+}
+// The present keys in order, then missing_key up to the output's capacity.
+inline void copy_keys(const Voxels& voxels,std::int64_t* out,std::size_t capacity){
+    if(capacity<voxels.keys.size())throw std::invalid_argument("key output capacity is too small");
+    std::copy(voxels.keys.begin(),voxels.keys.end(),out);std::fill(out+voxels.keys.size(),out+capacity,missing_key);
+}
+// out: uint8 (batches, *shape), 1 at present voxels.
+inline void fill_dense(const Voxels& voxels,std::uint8_t* out){
+    std::fill_n(out,voxels.grid.batches*voxels.grid.volume,0);for(auto k:voxels.keys)out[k]=1;
+}
+#undef VCR_GEOMETRY_CUDA
 }

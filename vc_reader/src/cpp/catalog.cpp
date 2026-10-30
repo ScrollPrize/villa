@@ -691,6 +691,20 @@ std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view ur
     return std::nullopt;
 }
 
+std::optional<OpenDataVolumeMetadata> OpenDataManifest::volumeMetadataAt(const std::string& url) const
+{
+    const auto view = volumeAt(resolveOpenDataUrl(url));
+    if (!view) return std::nullopt;
+    const auto* sample = findSample(view->sampleId);
+    const auto* volume = sample ? sample->findVolume(view->volumeId) : nullptr;
+    if (!volume) return std::nullopt;
+    OpenDataVolumeMetadata out{view->sampleId, view->volumeId, volume->scanId, volume->suffix,
+                               volume->createdAt, volume->dataFormat, std::nullopt, volume->energyKeV,
+                               volume->detectorDistanceMm, volume->raw};
+    if (volume->pixelSizeUm) out.voxelSizeUm = std::ldexp(*volume->pixelSizeUm, view->level);
+    return out;
+}
+
 std::shared_ptr<const OpenDataManifest> cachedManifest(const std::filesystem::path& cacheFile)
 {
     struct Entry {

@@ -324,12 +324,11 @@ NB_MODULE(_transforms, m) {
             return export_result(std::move(result), false, inputs);
         });
     m.def("seed", [](nb::args parts) {
-        std::uint64_t value = UINT64_C(14695981039346656037);
+        std::vector<SeedPart> values;
         for (auto part : parts) {
             require(nb::isinstance<nb::int_>(part) || nb::isinstance<nb::str>(part), "seed identifiers must be integers or strings");
-            auto text = nb::cast<std::string>(nb::str(part));
-            value = split_seed(value, (nb::isinstance<nb::str>(part) ? "s" : "i") + std::to_string(text.size()) + ":" + text);
+            values.push_back({nb::isinstance<nb::str>(part), nb::cast<std::string>(nb::str(part))});
         }
-        return value;
+        return make_seed(values);
     });
 }

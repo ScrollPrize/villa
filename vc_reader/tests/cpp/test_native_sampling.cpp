@@ -52,6 +52,55 @@ int main()
         float output[3]{};
         vcr::geometry::interpolate(curves.view(false), 0, 1.f, output, &valid);
         require(valid && output[0] == 1.f && output[1] == 0.f, "curve interpolation");
+
+        const float near_points[]{10.5f, 20.f, 30.f, NAN, 0.f, 0.f, 12.f, 21.f, 33.f};
+        const auto origin = vcr::pointOrigin(near_points, 3);
+        require(origin && *origin == std::array<std::int64_t, 3>{10, 20, 30}, "point origin");
+        const double dispersed[]{0., 0., 0., 5000., 0., 0.};
+        require(!vcr::pointOrigin(dispersed, 2), "dispersed points have no shared origin");
+        const float none[]{NAN, NAN, NAN};
+        require(*vcr::pointOrigin(none, 1) == std::array<std::int64_t, 3>{0, 0, 0}, "no finite point");
+
+        const auto moved = vcr::aligned::make_field({1,0,0,0,1,0,0,0,1}, {1,2,3}, {2,1,0}, false, false);
+        require(moved.enabled && moved.component[0] == 2 && moved.translation[2] == 3.f, "aligned field");
+        bool rejected = false;
+        try { vcr::aligned::make_field({}, {}, {0,0,1}, false, false); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "field components must permute XYZ");
+
+        namespace geo = vcr::geometry;
+        const std::int64_t ids[]{0, 0}, missing_id[]{5};
+        const float arcs[]{0.f, 2.f};
+        float points_out[6], gathered_arcs[2], distance[1], nearest_arc[1], plane_arc[1];
+        std::int64_t owners[2], index[1], owner[1];
+        bool valids[2];
+        geo::gather_batch(curves.view(false), -1, ids, false, points_out, gathered_arcs, owners, valids, 2);
+        require(valids[0] && points_out[0] == 0.f && owners[1] == 0, "gather batch");
+        geo::interpolate_batch(curves.view(false), -1, ids, arcs, points_out, valids, 2);
+        require(valids[1] && points_out[3] == 2.f, "interpolate batch");
+        geo::interpolate_batch(curves.view(false), -1, missing_id, arcs, points_out, valids, 1);
+        require(!valids[0], "interpolate batch reports a missing curve");
+        const float query[]{1.f, 1.f, 0.f}, x_plane[]{1.f, 0.f, 0.f, 1.f};
+        geo::nearest_batch(curves.view(false), -1, query, nullptr, 10.f, points_out, distance, nearest_arc, index, owner, valids, 1);
+        require(valids[0] && distance[0] == 1.f && points_out[0] == 1.f, "nearest batch");
+        geo::intersect_batch(curves.view(false), -1, ids, x_plane, nullptr, 0, points_out, plane_arc, index, valids, 1);
+        require(valids[0] && plane_arc[0] == 1.f, "intersect batch");
+        const float shift[]{1,0,0,5, 0,1,0,6, 0,0,1,7};
+        geo::transform_batch(-1, query, shift, 1, false, points_out, 1);
+        require(points_out[0] == 6.f && points_out[2] == 7.f, "transform batch");
+        geo::transform_batch(-1, query, shift, 1, true, points_out, 1);
+        require(points_out[0] == 1.f, "vectors skip translation");
+        const auto grid = geo::voxel_grid({2, 2, 2}, 1);
+        const float voxel[]{1.f, 0.f, 0.f};
+        const geo::Voxels voxels(voxel, nullptr, 1, grid);
+        bool inside = false;
+        geo::contains_batch(voxels, voxel, nullptr, &inside, 1);
+        require(inside, "contains batch");
+        std::int64_t keys[2];
+        geo::copy_keys(voxels, keys, 2);
+        require(keys[1] == geo::missing_key, "keys pad with the missing key");
+        std::uint8_t dense[8];
+        geo::fill_dense(voxels, dense);
+        require(dense[0] + dense[1] + dense[2] + dense[3] + dense[4] + dense[5] + dense[6] + dense[7] == 1, "dense voxels");
         std::cout << "Native array, sampling and geometry APIs passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

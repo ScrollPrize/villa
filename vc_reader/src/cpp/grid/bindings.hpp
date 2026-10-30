@@ -41,33 +41,6 @@ inline Input input(const Floats& xyz, const Floats& normals, std::array<float, 3
                                                           raster[4], raster[5]}};
 }
 
-// map: row-major 3x4, index (ZYX) = linear * p (XYZ) + offset; the scale form when the
-// map only scales each axis.
-inline Level toLevel(Array& array, const std::string& kind, std::size_t item, bool swap, const std::array<double, 12>& map)
-{
-    Level L{&array, sample_type(kind, item, swap)};
-    bool aligned = true;
-    for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 4; ++b) {
-            if (!std::isfinite(map[std::size_t(4 * a + b)]))
-                throw nb::value_error("nonfinite level map");
-            aligned &= b == 3 || b == 2 - a || map[std::size_t(4 * a + b)] == 0;
-        }
-    for (int a = 0; a < 3; ++a)
-        L.offset[std::size_t(a)] = map[std::size_t(4 * a + 3)];
-    if (aligned) {
-        for (int a = 0; a < 3; ++a)
-            L.scale[std::size_t(a)] = map[std::size_t(4 * a + 2 - a)];
-    } else {
-        std::array<double, 9> linear;
-        for (int a = 0; a < 3; ++a)
-            for (int b = 0; b < 3; ++b)
-                linear[std::size_t(3 * a + b)] = map[std::size_t(4 * a + b)];
-        L.linear = linear;
-    }
-    return L;
-}
-
 inline void store(const Result& result, Floats& values, Bytes& level)
 {
     std::copy(result.values.begin(), result.values.end(), values.data());
@@ -96,7 +69,7 @@ inline void bind(nb::module_& m)
              Offsets offsets, Floats values, Bytes level) {
               auto in = input(xyz, normals, spacing, raster, width, height);
               Request request;
-              request.levels = {toLevel(array, kind, item, swap, map)};
+              request.levels = {levelFromMap(array, sample_type(kind, item, swap), map)};
               request.order = order;
               request.offsets = std::move(offsets);
               const std::size_t pixels = std::size_t(width) * std::size_t(height);
@@ -114,7 +87,7 @@ inline void bind(nb::module_& m)
              Offsets offsets, Floats values, Bytes level, reader_cuda::Reader& reader) {
               auto in = input(xyz, normals, spacing, raster, width, height);
               Request request;
-              request.levels = {toLevel(array, kind, item, swap, map)};
+              request.levels = {levelFromMap(array, sample_type(kind, item, swap), map)};
               request.order = order;
               request.offsets = std::move(offsets);
               const std::size_t pixels = std::size_t(width) * std::size_t(height);

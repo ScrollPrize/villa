@@ -9,6 +9,16 @@
 #include <stdexcept>
 namespace vcr::aligned {
 using Triple=std::array<std::int64_t,3>;
+// A geometric field: vectors moved by matrix and translation, optionally normalized.
+// `components` is the order of XYZ among the array's channels.
+inline Field make_field(std::array<float,9> matrix,std::array<float,3> translation,std::array<int,3> components,bool normalize,bool normal) {
+    auto sorted=components; std::sort(sorted.begin(),sorted.end());
+    if(sorted!=std::array<int,3>{0,1,2}) throw std::invalid_argument("component order must permute XYZ");
+    Field f;
+    std::copy(matrix.begin(),matrix.end(),f.matrix); std::copy(translation.begin(),translation.end(),f.translation);
+    std::copy(components.begin(),components.end(),f.component); f.normalize=normalize; f.normal=normal; f.enabled=true;
+    return f;
+}
 struct Plan {
     Grid grid;
     std::vector<std::int64_t> keys;

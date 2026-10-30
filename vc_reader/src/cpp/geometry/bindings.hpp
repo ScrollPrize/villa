@@ -14,13 +14,7 @@ inline void disjoint(std::initializer_list<Array> inputs,std::initializer_list<A
 }
 template<class F> void execute(int id,F f){
     nb::gil_scoped_release release;
-    if(id<0){f();return;}
-#ifdef VC_READER_CUDA
-    device::Guard guard(id);
-    try{f();}catch(...){cudaStreamSynchronize(device::stream());throw;}
-#else
-    throw std::runtime_error("geometry CUDA operations require a CUDA build");
-#endif
+    on_device(id,f);
 }
 struct Bank {CurvesView view;int device;};
 inline Bank bank(nb::handle obj,bool vertices=false){
@@ -30,12 +24,6 @@ inline Bank bank(nb::handle obj,bool vertices=false){
 #else
     throw nb::value_error("expected geometry curve storage");
 #endif
-}
-inline VoxelGrid grid(std::array<std::int64_t,3> shape,std::int64_t batches){
-    VoxelGrid g{{shape[0],shape[1],shape[2]},batches,1};
-    if(batches<1)throw nb::value_error("batches must be positive");
-    for(auto n:shape){if(n<1||n>(1<<24)||g.volume>(INT64_MAX-1)/n)throw nb::value_error("invalid voxel shape");g.volume*=n;}
-    if(g.volume>(INT64_MAX-1)/batches)throw nb::value_error("voxel keys overflow int64");return g;
 }
 inline int array_device(Array a){if(a.device_type()==1)return -1;if(a.device_type()==2)return a.device_id();throw nb::value_error("geometry supports CPU and CUDA arrays");}
 inline void bind(nb::module_& m){
@@ -58,54 +46,37 @@ inline void bind(nb::module_& m){
     });
 #endif
     m.def("_geometry_gather",[](nb::object obj,Array ids,bool segments,Array out,Array arc,Array owners,Array valid){
-        auto b=bank(obj);auto n=ids.size();std::size_t width=segments?2:1;
+        auto b=bank(obj);auto n=ids.size();
         check(ids,nb::dtype<std::int64_t>(),{n},b.device);
         check(out,nb::dtype<float>(),segments?std::vector<std::size_t>{n,2,3}:std::vector<std::size_t>{n,3},b.device);
         check(arc,nb::dtype<float>(),segments?std::vector<std::size_t>{n,2}:std::vector<std::size_t>{n},b.device);
         check(owners,nb::dtype<std::int64_t>(),{n},b.device);check(valid,nb::dtype<bool>(),{n},b.device);disjoint({ids},{out,arc,owners,valid});
-        auto ip=static_cast<const std::int64_t*>(ids.data());auto p=static_cast<float*>(out.data());auto a=static_cast<float*>(arc.data());auto own=static_cast<std::int64_t*>(owners.data());auto v=static_cast<bool*>(valid.data());
-        execute(b.device,[&]{if(b.device<0){for(std::size_t i=0;i<n;++i)gather(b.view,ip[i],segments,p+3*width*i,a+width*i,own+i,v+i);}else{
-#ifdef VC_READER_CUDA
-            gather_cuda(b.view,ip,segments,p,a,own,v,n);
-#endif
-        }});
+        nb::gil_scoped_release release;
+        gather_batch(b.view,b.device,static_cast<const std::int64_t*>(ids.data()),segments,static_cast<float*>(out.data()),static_cast<float*>(arc.data()),static_cast<std::int64_t*>(owners.data()),static_cast<bool*>(valid.data()),n);
     });
     m.def("_geometry_interpolate",[](nb::object obj,Array ids,Array s,Array out,Array valid){
         auto b=bank(obj);auto n=ids.size();check(ids,nb::dtype<std::int64_t>(),{n},b.device);check(s,nb::dtype<float>(),{n},b.device);
         check(out,nb::dtype<float>(),{n,3},b.device);check(valid,nb::dtype<bool>(),{n},b.device);disjoint({ids,s},{out,valid});
-        auto ip=static_cast<const std::int64_t*>(ids.data());auto sp=static_cast<const float*>(s.data());auto op=static_cast<float*>(out.data());auto vp=static_cast<bool*>(valid.data());
-        execute(b.device,[&]{if(b.device<0){for(std::size_t i=0;i<n;++i)interpolate(b.view,ip[i],sp[i],op+3*i,vp+i);}else{
-#ifdef VC_READER_CUDA
-            interpolate_cuda(b.view,ip,sp,op,vp,n);
-#endif
-        }});
+        nb::gil_scoped_release release;
+        interpolate_batch(b.view,b.device,static_cast<const std::int64_t*>(ids.data()),static_cast<const float*>(s.data()),static_cast<float*>(out.data()),static_cast<bool*>(valid.data()),n);
     });
     m.def("_geometry_intersect",[](nb::object obj,Array ids,Array planes,Array intervals,int direction,Array out,Array arc,Array index,Array valid){
         auto b=bank(obj);auto n=ids.size();check(ids,nb::dtype<std::int64_t>(),{n},b.device);check(planes,nb::dtype<float>(),{n,4},b.device);
-        check(intervals,nb::dtype<float>(),{intervals.size()?n:0,2},b.device);if(direction< -1||direction>1)throw nb::value_error("direction must be -1, 0 or 1");
+        check(intervals,nb::dtype<float>(),{intervals.size()?n:0,2},b.device);
         check(out,nb::dtype<float>(),{n,3},b.device);check(arc,nb::dtype<float>(),{n},b.device);check(index,nb::dtype<std::int64_t>(),{n},b.device);check(valid,nb::dtype<bool>(),{n},b.device);
         disjoint({ids,planes,intervals},{out,arc,index,valid});
-        auto ip=static_cast<const std::int64_t*>(ids.data());auto p=static_cast<const float*>(planes.data());auto span=intervals.size()?static_cast<const float*>(intervals.data()):nullptr;
-        auto o=static_cast<float*>(out.data());auto a=static_cast<float*>(arc.data());auto ix=static_cast<std::int64_t*>(index.data());auto v=static_cast<bool*>(valid.data());
-        execute(b.device,[&]{if(b.device<0){for(std::size_t i=0;i<n;++i)intersect(b.view,ip[i],p+4*i,span?span+2*i:nullptr,direction,o+3*i,a+i,ix+i,v+i);}else{
-#ifdef VC_READER_CUDA
-            intersect_cuda(b.view,ip,p,span,direction,o,a,ix,v,n);
-#endif
-        }});
+        nb::gil_scoped_release release;
+        intersect_batch(b.view,b.device,static_cast<const std::int64_t*>(ids.data()),static_cast<const float*>(planes.data()),intervals.size()?static_cast<const float*>(intervals.data()):nullptr,direction,
+                        static_cast<float*>(out.data()),static_cast<float*>(arc.data()),static_cast<std::int64_t*>(index.data()),static_cast<bool*>(valid.data()),n);
     });
     m.def("_geometry_nearest",[](nb::object obj,Array points,Array ids,bool vertices,float limit,Array out,Array distance,Array arc,Array index,Array owner,Array valid){
         auto b=bank(obj,vertices);auto n=points.shape(0);check(points,nb::dtype<float>(),{n,3},b.device);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},b.device);
-        if(!(limit>=0))throw nb::value_error("max_distance must be nonnegative");
         check(out,nb::dtype<float>(),{n,3},b.device);check(distance,nb::dtype<float>(),{n},b.device);check(arc,nb::dtype<float>(),{n},b.device);
         check(index,nb::dtype<std::int64_t>(),{n},b.device);check(owner,nb::dtype<std::int64_t>(),{n},b.device);check(valid,nb::dtype<bool>(),{n},b.device);
         disjoint({points,ids},{out,distance,arc,index,owner,valid});
-        auto p=static_cast<const float*>(points.data());auto ip=ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr;auto o=static_cast<float*>(out.data());auto d=static_cast<float*>(distance.data());
-        auto a=static_cast<float*>(arc.data());auto ix=static_cast<std::int64_t*>(index.data());auto own=static_cast<std::int64_t*>(owner.data());auto v=static_cast<bool*>(valid.data());
-        execute(b.device,[&]{if(b.device<0){for(std::size_t i=0;i<n;++i)closest(b.view,vector(p+3*i),ip?ip[i]:-1,limit,o+3*i,d+i,a+i,ix+i,own+i,v+i);}else{
-#ifdef VC_READER_CUDA
-            closest_cuda(b.view,p,ip,limit,o,d,a,ix,own,v,n);
-#endif
-        }});
+        nb::gil_scoped_release release;
+        nearest_batch(b.view,b.device,static_cast<const float*>(points.data()),ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr,limit,static_cast<float*>(out.data()),static_cast<float*>(distance.data()),
+                      static_cast<float*>(arc.data()),static_cast<std::int64_t*>(index.data()),static_cast<std::int64_t*>(owner.data()),static_cast<bool*>(valid.data()),n);
     });
     m.def("_geometry_boxes",[](nb::object obj,Array lower,Array upper,Array ids,bool vertices,int capacity,Array out,Array counts,Array valid){
         auto b=bank(obj,vertices);auto n=lower.shape(0);
@@ -113,26 +84,18 @@ inline void bind(nb::module_& m){
         check(lower,nb::dtype<float>(),{n,3},b.device);check(upper,nb::dtype<float>(),{n,3},b.device);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},b.device);
         check(out,nb::dtype<std::int64_t>(),{n,std::size_t(capacity)},b.device);check(counts,nb::dtype<std::int64_t>(),{n},b.device);check(valid,nb::dtype<bool>(),{n},b.device);
         disjoint({lower,upper,ids},{out,counts,valid});
-        auto lo=static_cast<const float*>(lower.data());auto hi=static_cast<const float*>(upper.data());auto ip=ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr;
-        auto o=static_cast<std::int64_t*>(out.data());auto c=static_cast<std::int64_t*>(counts.data());auto v=static_cast<bool*>(valid.data());
-        execute(b.device,[&]{if(b.device<0){for(std::size_t i=0;i<n;++i)query_box(b.view,vector(lo+3*i),vector(hi+3*i),ip?ip[i]:-1,capacity,o+i*capacity,c+i,v+i);}else{
-#ifdef VC_READER_CUDA
-            boxes_cuda(b.view,lo,hi,ip,capacity,o,c,v,n);
-#endif
-        }});
+        nb::gil_scoped_release release;
+        boxes_batch(b.view,b.device,static_cast<const float*>(lower.data()),static_cast<const float*>(upper.data()),ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr,capacity,
+                    static_cast<std::int64_t*>(out.data()),static_cast<std::int64_t*>(counts.data()),static_cast<bool*>(valid.data()),n);
     });
     m.def("_geometry_transform",[](Array points,Array matrices,bool vectors,Array out){
         int id=array_device(points);auto n=points.shape(0),count=matrices.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(matrices,nb::dtype<float>(),{count,3,4},id);check(out,nb::dtype<float>(),{n,3},id);
-        if(count!=1&&count!=n)throw nb::value_error("provide one transform or one per point");disjoint({points,matrices},{out});
-        auto p=static_cast<const float*>(points.data());auto mat=static_cast<const float*>(matrices.data());auto o=static_cast<float*>(out.data());
-        execute(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i){auto m=mat+(count==1?0:12*i);auto v=vector(p+3*i);store(o+3*i,vectors?linear(m,v):transform(m,v));}}else{
-#ifdef VC_READER_CUDA
-            transform_cuda(p,mat,count,vectors,o,n);
-#endif
-        }});
+        disjoint({points,matrices},{out});
+        nb::gil_scoped_release release;
+        transform_batch(id,static_cast<const float*>(points.data()),static_cast<const float*>(matrices.data()),count,vectors,static_cast<float*>(out.data()),n);
     });
     m.def("_geometry_voxelize",[](Array points,Array ids,std::array<std::int64_t,3> shape,std::int64_t batches)->nb::object{
-        int id=array_device(points);auto n=points.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},id);auto g=grid(shape,batches);
+        int id=array_device(points);auto n=points.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},id);auto g=voxel_grid(shape,batches);
         auto p=static_cast<const float*>(points.data());auto ip=ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr;
         if(id<0){std::unique_ptr<Voxels> result;execute(id,[&]{result=std::make_unique<Voxels>(p,ip,n,g);});return nb::cast(result.release(),nb::rv_policy::take_ownership);}
 #ifdef VC_READER_CUDA
@@ -144,7 +107,7 @@ inline void bind(nb::module_& m){
     m.def("_geometry_contains",[](nb::object obj,Array points,Array ids,Array out){
         int id=array_device(points);auto n=points.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},id);check(out,nb::dtype<bool>(),{n},id);disjoint({points,ids},{out});
         auto p=static_cast<const float*>(points.data());auto ip=ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr;auto o=static_cast<bool*>(out.data());
-        if(id<0){auto& v=nb::cast<const Voxels&>(obj);execute(id,[&]{for(std::size_t i=0;i<n;++i)o[i]=contains(v.keys.data(),v.keys.size(),voxel_key(vector(p+3*i),ip?ip[i]:0,v.grid));});}
+        if(id<0){auto& v=nb::cast<const Voxels&>(obj);execute(id,[&]{contains_batch(v,p,ip,o,n);});}
 #ifdef VC_READER_CUDA
         else{auto& v=nb::cast<const CudaVoxels&>(obj);if(v.device!=id)throw nb::value_error("voxel device mismatch");execute(id,[&]{contains_cuda(v,p,ip,o,n);});}
 #endif
@@ -152,9 +115,7 @@ inline void bind(nb::module_& m){
     m.def("_geometry_keys",[](nb::object obj,Array out){
         int id=array_device(out);auto n=out.size();check(out,nb::dtype<std::int64_t>(),{n},id);
         auto o=static_cast<std::int64_t*>(out.data());
-        if(id<0){auto& v=nb::cast<const Voxels&>(obj);
-            if(n<v.keys.size())throw nb::value_error("key output capacity is too small");
-            execute(id,[&]{std::copy(v.keys.begin(),v.keys.end(),o);std::fill(o+v.keys.size(),o+n,missing_key);});}
+        if(id<0){auto& v=nb::cast<const Voxels&>(obj);execute(id,[&]{copy_keys(v,o,n);});}
 #ifdef VC_READER_CUDA
         else{auto& v=nb::cast<const CudaVoxels&>(obj);
             if(v.device!=id)throw nb::value_error("voxel device mismatch");
@@ -169,7 +130,7 @@ inline void bind(nb::module_& m){
         else{auto& v=nb::cast<const CudaVoxels&>(obj);if(v.device!=id)throw nb::value_error("voxel device mismatch");g=v.grid;}
 #endif
         check(out,nb::dtype<std::uint8_t>(),{std::size_t(g.batches),std::size_t(g.shape[0]),std::size_t(g.shape[1]),std::size_t(g.shape[2])},id);auto o=static_cast<std::uint8_t*>(out.data());
-        if(id<0){auto& v=nb::cast<const Voxels&>(obj);execute(id,[&]{std::fill_n(o,g.batches*g.volume,0);for(auto k:v.keys)o[k]=1;});}
+        if(id<0){auto& v=nb::cast<const Voxels&>(obj);execute(id,[&]{fill_dense(v,o);});}
 #ifdef VC_READER_CUDA
         else{auto& v=nb::cast<const CudaVoxels&>(obj);execute(id,[&]{dense_cuda(v,o);});}
 #endif
