@@ -49,7 +49,7 @@ already link them. The Python extensions link those same CUDA libraries.
 
 | Header | API | CPU and CUDA coverage |
 | --- | --- | --- |
-| `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
+| `vc_reader/reader.hpp` | `vcr::sheetNormals`: sheet normals of an opened uint8 or float32 array; Zarr metadata normalization | CPU; `sheet_normal::sample_cuda` on the device |
 | `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2/v3 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/composite.hpp` | `vcr::composite::reduce`: one value per pixel from a stack of sampled layers (mean, max, min, median, minabs, alpha, Beer-Lambert), with an iso cutoff | CPU and `composite::cuda` (device inputs and outputs) |
 | `vc_reader/computed.hpp` | `vcr::computed::open`: an `Array` whose chunks a callback computes from other data, persisted in a decoded disk cache named by the computation's identity | Register with the service and sample like any array, on CPU and CUDA |
@@ -57,7 +57,7 @@ already link them. The Python extensions link those same CUDA libraries.
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `surface::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surfaces, curves and voxel membership |
 | `vc_reader/transforms.hpp` | All `transforms::Op` alternatives, parameter types, `Pipeline`, `Sample`, `Plan`, `save_plan`, `load_plan` | Full transform catalog; `cpu`, `cuda` and `auto` pipeline backends |
-| `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions | CUDA only |
+| `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions, device sample and batch runs | CUDA only |
 | `vc_reader/cuda_reader.hpp` | `reader_cuda::Reader`, region/affine grids, point plans, resident sampling, cache statistics; CUDA sampling declarations | CUDA only |
 
 The `vc_reader/native/` include tree contains the underlying typed APIs,
@@ -74,9 +74,8 @@ CUDA dispatch checks every operator at compile/link time.
 
 The general array API accepts an `ArraySpec`. This exposes the existing cache,
 authentication, storage-layer and sampling controls directly. Catalog lookup,
-Python DLPack wrappers and Python object orchestration are not C++ types.
-`CtReader` is a convenient opener for three-dimensional uint8 local/anonymous
-HTTP/S3 and `sftp://` arrays; other dtypes and authenticated sources use `ArraySpec`.
+Python DLPack wrappers are not C++ types. `vcr::zarr::openPyramidLevel` opens a
+level of local, HTTP/S3 and `sftp://` arrays of any dtype, with the access in its options.
 
 `sftp://[user@]host[:port]/path` (and the `ssh://` alias) work wherever an
 HTTP URL does, including `ArraySpec::remote_url` and `source_root`. Requests
@@ -175,16 +174,20 @@ Host-input CUDA pipelines handle upload/download. Resident pipelines accept
 `cuda::DeviceInput` maps through `cuda::begin_device`, then pass the returned
 session to `Pipeline::run` or `replay`. Retain that session while accessing
 `cuda::device_outputs` and `device_pyramids`. Caller-owned device buffers must
-remain alive until the work completes.
+remain alive until the work completes. `cuda::run_device` validates device inputs and does
+this for one sample; `cuda::run_batch` runs one invocation per leading-axis sample in shared
+launches, with outputs in storage from the caller's allocator.
 
 ## CT reads and normals
 
 ```cpp
 #include <vc_reader/reader.hpp>
+#include <vc_reader/zarr.hpp>
 
-vcr::CtReader volume("/data/scroll.zarr", 0);
+auto volume = vcr::zarr::openPyramidLevel("/data/scroll.zarr", 0, {});
 std::array<double, 3> point{3000.25, 4000.5, 5000.75}; // XYZ in selected level
-const auto normal = volume.sheetNormals(std::span(&point, 1)).front();
+std::array<float, 4> normal{};
+vcr::sheetNormals(volume, point.data(), 1, normal.data());
 // normal = XYZ unit vector, then relative eigengap. Invalid support is zero.
 ```
 
@@ -201,9 +204,9 @@ kernels, and compares their output. Build it with `VC_READER_BUILD_EXAMPLES=ON`:
 build-native/vc_reader_ct_normals /data/scroll.zarr 0 3000.25 4000.5 5000.75
 ```
 
-`CtReader::array()` returns a borrowed `Array&`. Both a `reader_cuda::Reader`
-constructed from it and any work in progress must finish before the `CtReader`
-is destroyed. CUDA reader results own their device storage independently.
+A `reader_cuda::Reader` borrows the opened `Array`: it and any work in progress
+must finish before the `OpenedArray` is destroyed. CUDA reader results own their
+device storage independently.
 
 Low-level sampling APIs take explicit pointer/shape/dtype descriptors; callers
 must supply buffers of the declared sizes and the correct host/device placement.

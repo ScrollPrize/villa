@@ -106,70 +106,6 @@ std::string normalizeZarrMetadata(const std::string& text)
             {"shard_chunks", ratios}, {"index_end", indexEnd}, {"index_crc", indexCrc}}}}.dump();
 }
 
-struct CtReader::Impl {
-    zarr::OpenedArray opened;
-    std::array<int64_t, 3> shape;
-};
-
-CtReader::CtReader(const std::string& input, int level, size_t cacheBytes)
-    : impl_(std::make_unique<Impl>())
-{
-    if (level < 0) throw std::invalid_argument("negative CT level");
-    std::string location = input;
-    while (location.size() > 1 && location.back() == '/') location.pop_back();
-    if (location.empty()) throw std::invalid_argument("empty CT location");
-    location = catalog::resolveOpenDataUrl(location);
-    zarr::OpenOptions options;
-    options.memoryCache = std::make_shared<MemoryCache>(cacheBytes);
-    options.metadata = zarr::metadataReader(options.access);
-    const bool array = options.metadata(location, ".zarray") ||
-                       [&] {
-                           const auto node = options.metadata(location, "zarr.json");
-                           return node && Json::parse(*node).value("node_type", "") == "array";
-                       }();
-    if (array) {
-        if (level != 0) throw std::invalid_argument("array source has only level zero");
-        impl_->opened = zarr::openArray(location, options);
-    } else {
-        auto group = zarr::Group::open(location, options);
-        std::string key = std::to_string(level);
-        if (!group.multiscales().empty()) {
-            const auto levels = group.levels();
-            if (size_t(level) >= levels.size()) throw std::invalid_argument("CT level missing");
-            key = levels[size_t(level)];
-        }
-        impl_->opened = group.array(key);
-    }
-    const auto& meta = impl_->opened.meta;
-    if (meta.type.kind != 'u' || meta.itemsize() != 1)
-        throw std::invalid_argument("CT normals require uint8 CT");
-    if (meta.shape.size() != 3)
-        throw std::invalid_argument("CT must be three dimensional");
-    for (int axis = 0; axis < 3; ++axis) impl_->shape[axis] = meta.shape[axis];
-}
-
-CtReader::~CtReader() = default;
-CtReader::CtReader(CtReader&&) noexcept = default;
-CtReader& CtReader::operator=(CtReader&&) noexcept = default;
-
-std::array<int64_t, 3> CtReader::shape() const { return impl_->shape; }
-Array& CtReader::array() { return *impl_->opened.array; }
-
-void CtReader::readRegion(std::array<int64_t, 3> start, std::array<int64_t, 3> shape,
-                          std::span<uint8_t> out)
-{
-    size_t count = 1;
-    for (int axis = 0; axis < 3; ++axis) {
-        const auto size = shape[axis];
-        if (size < 0 || (size && count > SIZE_MAX / uint64_t(size)) || start[axis] > INT64_MAX - size)
-            throw std::invalid_argument("invalid CT region");
-        count *= size;
-    }
-    if (out.size() != count) throw std::invalid_argument("CT buffer size mismatch");
-    impl_->opened.array->read_many({Index(start.begin(), start.end())},
-                           {Index(shape.begin(), shape.end())}, {out.data()});
-}
-
 template<class T>
 void normals(std::span<const T> patches, std::span<const std::array<float, 4>> centers,
              std::span<std::array<float, 4>> out)
@@ -177,12 +113,6 @@ void normals(std::span<const T> patches, std::span<const std::array<float, 4>> c
     if (centers.size() > SIZE_MAX / (109 * 109 * 109) ||
         patches.size() != centers.size() * 109 * 109 * 109 || out.size() != centers.size()) {
         throw std::invalid_argument("sheet normal buffer sizes differ");
-    }
-    for (const auto& center : centers) {
-        for (int axis = 0; axis < 3; ++axis) {
-            if (!std::isfinite(center[axis]) || center[axis] < 48 || center[axis] >= 51)
-                throw std::invalid_argument("invalid sheet-normal center");
-        }
     }
     if (!centers.empty())
         sheet_normal::cpu(patches.data(), centers.front().data(), out.front().data(), centers.size());
@@ -200,11 +130,15 @@ void sheetNormalsCpu(std::span<const float> patches, std::span<const std::array<
     normals(patches, centers, out);
 }
 
-std::vector<std::array<float, 4>> CtReader::sheetNormals(std::span<const std::array<double, 3>> xyz)
+void sheetNormals(zarr::OpenedArray& array, const double* xyz, std::size_t count, float* out)
 {
-    std::vector<std::array<float, 4>> out(xyz.size());
-    if (!xyz.empty())
-        sheet_normal::sample<std::uint8_t>(*impl_->opened.array, impl_->shape.data(), xyz.front().data(), xyz.size(), out.front().data());
-    return out;
+    const auto& meta = array.meta;
+    if (meta.shape.size() != 3) throw std::invalid_argument("sheet normals read a three-dimensional array");
+    const bool bytes = meta.type.kind == 'u' && meta.itemsize() == 1;
+    if (!bytes && !(meta.type.kind == 'f' && meta.itemsize() == 4)) throw std::invalid_argument("sheet normals read uint8 or float32 CT");
+    const std::int64_t shape[3]{meta.shape[0], meta.shape[1], meta.shape[2]};
+    if (!count) return;
+    if (bytes) sheet_normal::sample<std::uint8_t>(*array.array, shape, xyz, count, out);
+    else sheet_normal::sample<float>(*array.array, shape, xyz, count, out);
 }
 } // namespace vcr

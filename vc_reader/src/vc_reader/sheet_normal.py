@@ -87,6 +87,4 @@ def sample_sheet_normals(reader, points_xyz, *, out=None):
         return DeviceArray(_reader._sample_sheet_normals_cuda(reader._engine, shape, points),
                            (len(points), 4), np.float32, reader.device)
     reader._ready()
-    if reader.dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
-        raise ValueError("sheet normals read uint8 or float32 CT")
-    return _reader._sample_sheet_normals(reader._array, tuple(reader.shape), reader.dtype == np.float32, points)
+    return _reader._sample_sheet_normals(reader._opened, points)

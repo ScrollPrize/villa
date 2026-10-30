@@ -1,5 +1,7 @@
 #include "vc_object_store/CtSheetNormal.hpp"
+#include <vc_reader/array.hpp>
 #include <vc_reader/reader.hpp>
+#include <vc_reader/zarr.hpp>
 
 #include <cmath>
 #include <deque>
@@ -9,14 +11,21 @@
 
 namespace vc {
 struct CtSheetNormalSampler::Impl {
-    vcr::CtReader reader;
+    vcr::zarr::OpenedArray ct;
     double scale;
     std::mutex mutex;
     std::map<std::array<double, 3>, CtSheetNormal> cache;
     std::deque<std::array<double, 3>> order;
 
     Impl(const std::filesystem::path& path, int level, double scale)
-        : reader(path.string(), level), scale(scale) {}
+        : ct(vcr::zarr::openPyramidLevel(path.string(), level, options())), scale(scale) {}
+
+    static vcr::zarr::OpenOptions options()
+    {
+        vcr::zarr::OpenOptions out;
+        out.memoryCache = std::make_shared<vcr::MemoryCache>(std::size_t(64) << 20);
+        return out;
+    }
 };
 
 CtSheetNormalSampler::CtSheetNormalSampler(const std::filesystem::path& path, int level, double scale)
@@ -42,7 +51,8 @@ CtSheetNormal CtSheetNormalSampler::sampleNormal(const cv::Vec3d& xyz,
         if (!std::isfinite(coordinate)) throw std::invalid_argument("CT query must be finite");
     }
     if (auto found = impl_->cache.find(point); found != impl_->cache.end()) return found->second;
-    const auto sample = impl_->reader.sheetNormals(std::span(&point, 1)).front();
+    std::array<float, 4> sample{};
+    vcr::sheetNormals(impl_->ct, point.data(), 1, sample.data());
     cancelled();
     CtSheetNormal result{{sample[0], sample[1], sample[2]}, sample[3] > 0, sample[3],
                          sample[3] > 0 ? "" : "invalid tensor or insufficient CT support"};

@@ -1,5 +1,6 @@
 // Zarr arrays read over sftp:// through the production transport (see sftp_fixture.hpp).
-#include "vc_reader/reader.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/native/array.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/native/http.hpp"
 #include "sftp_fixture.hpp"
@@ -60,10 +61,10 @@ std::vector<uint8_t> chunk_of(const std::vector<uint8_t>& v, int cz, int cy, int
 
 void check(const std::string& location, const std::vector<uint8_t>& v, const std::string& what)
 {
-    vcr::CtReader reader(location);
-    require(reader.shape() == std::array<int64_t, 3>{4, 4, 4}, what + ": shape");
+    auto reader = vcr::zarr::openPyramidLevel(location, 0, {});
+    require(reader.meta.shape == vcr::Index{4, 4, 4}, what + ": shape");
     std::vector<uint8_t> out(64);
-    reader.readRegion({0, 0, 0}, {4, 4, 4}, out);
+    reader.array->read_many({{0, 0, 0}}, {{4, 4, 4}}, {out.data()});
     for (int z = 0; z < 4; ++z)
         for (int y = 0; y < 4; ++y)
             for (int x = 0; x < 4; ++x) {

@@ -10,6 +10,7 @@
 #undef emit
 #undef slots
 #undef signals
+#include "vc_reader/array.hpp"
 #include "vc_reader/reader.hpp"
 #include <filesystem>
 #include <fstream>
@@ -29,15 +30,22 @@ int main(){
         std::vector<uint8_t> data(109*109*109);
         for(size_t i=0;i<data.size();++i)data[i]=uint8_t(120+70*std::sin((int(i%109)-54)*.3));
         {std::ofstream out(path/"0/0.0.0",std::ios::binary);out.write(reinterpret_cast<const char*>(data.data()),data.size());}
-        vcr::CtReader reader(path.string());require(reader.shape()==std::array<int64_t,3>{109,109,109},"shape");
-        std::array<uint8_t,8> crop{};reader.readRegion({-1,-1,-1},{2,2,2},crop);
+        vcr::zarr::OpenOptions options;options.memoryCache=std::make_shared<vcr::MemoryCache>(64<<20);
+        auto ct=vcr::zarr::openPyramidLevel(path.string(),0,options);require(ct.meta.shape==vcr::Index{109,109,109},"shape");
+        std::array<uint8_t,8> crop{};ct.array->read_many({{-1,-1,-1}},{{2,2,2}},{crop.data()});
         require(crop[0]==7&&crop[7]==data[0],"clipping/fill");
-        bool rejected=false;try{reader.readRegion({0,0,0},{3,3,3},crop);}catch(const std::invalid_argument&){rejected=true;}require(rejected,"output size validation");
         std::array<std::array<double,3>,3> points{{{54,54,54},{55.25,56.5,54.125},{53.99,54,54}}};
-        auto result=reader.sheetNormals(points);
-        for(int i=0;i<2;++i){require(std::abs(result[i][0])>.999f&&std::abs(result[i][1])<1e-5&&std::abs(result[i][2])<1e-5,"normal direction");require(result[i][3]>.99f,"eigengap");}
+        std::array<std::array<float,4>,3> result{};
+        vcr::sheetNormals(ct,points.front().data(),points.size(),result.front().data());
+        for(int i=0;i<2;++i){require(std::abs(result[i][0])>.999f&&std::abs(result[i][1])<1e-5&&std::abs(result[i][2])<1e-5,"normal direction");require(result[i][3]>.99f,"gap");}
         require(result[2]==std::array<float,4>{},"support validity");
-        require(reader.sheetNormals({}).empty(),"empty batch");
+        vcr::sheetNormals(ct,nullptr,0,nullptr);
+        fs::create_directories(path.parent_path()/(path.filename().string()+"-u16"));
+        const auto wide=path.parent_path()/(path.filename().string()+"-u16");
+        std::ofstream(wide/".zarray")<<R"({"zarr_format":2,"shape":[2,2,2],"chunks":[2,2,2],"dtype":"<u2","compressor":null,"filters":null,"fill_value":0,"order":"C"})";
+        auto u16=vcr::zarr::openArray(wide.string(),options);
+        bool refused=false;try{float out[4];vcr::sheetNormals(u16,points.front().data(),1,out);}catch(const std::invalid_argument&){refused=true;}
+        fs::remove_all(wide);require(refused,"sheet normals read uint8 or float32");
         std::cout<<"Native reader regions, pyramid resolution, support and normals passed\n";
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

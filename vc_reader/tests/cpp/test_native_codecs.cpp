@@ -1,6 +1,7 @@
 // Chunks compressed with zlib, gzip and volcomp read back through the native reader,
 // from Zarr v2 compressors and Zarr v3 codec pipelines (plain and sharded).
-#include "vc_reader/reader.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/native/array.hpp"
 
 #include <volcomp_lib.h>
 #include <zlib.h>
@@ -67,10 +68,10 @@ constexpr int64_t kEdge = 128;
 
 void check(const fs::path& array, const std::vector<uint8_t>& data, const std::string& what)
 {
-    vcr::CtReader reader(array.string());
-    require(reader.shape() == std::array<int64_t, 3>{kEdge, kEdge, 2 * kEdge}, what + ": shape");
+    auto reader = vcr::zarr::openPyramidLevel(array.string(), 0, {});
+    require(reader.meta.shape == vcr::Index{kEdge, kEdge, 2 * kEdge}, what + ": shape");
     std::vector<uint8_t> out(kEdge * kEdge * 2 * kEdge);
-    reader.readRegion({0, 0, 0}, {kEdge, kEdge, 2 * kEdge}, out);
+    reader.array->read_many({{0, 0, 0}}, {{kEdge, kEdge, 2 * kEdge}}, {out.data()});
     for (int64_t z = 0; z < kEdge; ++z)
         for (int64_t y = 0; y < kEdge; ++y)
             for (int64_t x = 0; x < 2 * kEdge; ++x) {

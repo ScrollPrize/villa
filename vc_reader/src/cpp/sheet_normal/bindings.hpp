@@ -43,16 +43,14 @@ inline void bind(nb::module_& m) {
         auto* ptr=out.release();nb::capsule owner(ptr,[](void* p) noexcept {delete[] static_cast<float*>(p);});
         return nb::ndarray<nb::numpy,float>(ptr,{n,std::size_t(4)},owner);
     },"offsets"_a,"valid"_a);
-    m.def("_sample_sheet_normals",[check_points](Array& array,Shape shape,bool floating,Points points) {
-        check_points(points,shape);
+    m.def("_sample_sheet_normals",[](zarr::OpenedArray& array,Points points) {
+        if(points.shape(1)!=3) throw nb::value_error("points_xyz must be finite (B,3)");
         const auto n=points.shape(0);
         auto out=std::make_unique<float[]>(n*4);
-        { nb::gil_scoped_release release;
-          if(floating) sample<float>(array,shape.data(),points.data(),n,out.get());
-          else sample<std::uint8_t>(array,shape.data(),points.data(),n,out.get()); }
+        { nb::gil_scoped_release release; sheetNormals(array,points.data(),n,out.get()); }
         auto* ptr=out.release();nb::capsule owner(ptr,[](void* p) noexcept {delete[] static_cast<float*>(p);});
         return nb::ndarray<nb::numpy,float>(ptr,{n,std::size_t(4)},owner);
-    },"array"_a,"shape"_a,"floating"_a,"points"_a);
+    },"array"_a,"points"_a);
 #ifdef VC_READER_CUDA
     m.def("_sample_sheet_normals_cuda",[check_points](reader_cuda::Reader& reader,Shape shape,Points points) {
         check_points(points,shape);

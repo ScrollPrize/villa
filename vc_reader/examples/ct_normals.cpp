@@ -1,4 +1,7 @@
+#include <vc_reader/array.hpp>
 #include <vc_reader/reader.hpp>
+#include <vc_reader/sampling.hpp>
+#include <vc_reader/zarr.hpp>
 #ifdef VC_READER_CUDA
 #include <vc_reader/cuda_reader.hpp>
 #endif
@@ -13,34 +16,21 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
-        vcr::CtReader volume(argv[1], std::stoi(argv[2]));
+        vcr::zarr::OpenOptions options;
+        options.memoryCache = std::make_shared<vcr::MemoryCache>(64 * 1024 * 1024);
+        auto volume = vcr::zarr::openPyramidLevel(argv[1], std::stoi(argv[2]), options);
         const std::array<double, 3> point{std::stod(argv[3]), std::stod(argv[4]), std::stod(argv[5])};
-        const auto cpu = volume.sheetNormals(std::span(&point, 1)).front();
+        std::array<float, 4> cpu{};
+        vcr::sheetNormals(volume, point.data(), 1, cpu.data());
         std::cout << "CPU XYZ/gap: " << cpu[0] << ' ' << cpu[1] << ' ' << cpu[2] << ' ' << cpu[3] << '\n';
 #ifdef VC_READER_CUDA
         int devices = 0;
         vcr::device::check(cudaGetDeviceCount(&devices));
         if (!devices) throw std::runtime_error("no CUDA device available");
-        std::array<int64_t, 3> start{};
-        float center[4]{0, 0, 0, 1};
-        for (int axis = 0; axis < 3; ++axis) {
-            const double lattice = std::floor(point[axis] / 3) * 3;
-            start[2 - axis] = int64_t(lattice) - 54;
-            center[axis] = std::min(float(point[axis] - lattice) + 48.f, std::nextafter(51.f, 48.f));
-            center[3] *= start[2 - axis] >= 0 && start[2 - axis] + 109 <= volume.shape()[2 - axis];
-        }
-        if (!center[3]) throw std::invalid_argument("point requires complete 109-cubed CT support");
         // The CUDA reader borrows the Array; volume must outlive it.
-        vcr::reader_cuda::Reader gpu(volume.array(), 64 * 1024 * 1024, 0);
-        vcr::reader_cuda::Grid request;
-        request.count = 109 * 109 * 109;
-        for (int axis = 0; axis < 3; ++axis) {
-            request.base[axis] = start[axis];
-            request.shape[axis] = 109;
-        }
-        // kind=0 denotes an integer region, order=0 a byte-exact read.
-        auto patch = gpu.grids({request}, 0, 0, false, "chunks");
-        auto result = vcr::sheet_normal::cuda(patch.storage->ptr, false, center, 1, 0);
+        vcr::reader_cuda::Reader gpu(*volume.array, 64 * 1024 * 1024, 0);
+        const std::int64_t shape[3]{volume.meta.shape[0], volume.meta.shape[1], volume.meta.shape[2]};
+        auto result = vcr::sheet_normal::sample_cuda(gpu, shape, point.data(), 1, 0);
         std::array<float, 4> cuda{};
         vcr::device::check(cudaMemcpyAsync(cuda.data(), result->ptr, sizeof(cuda),
                                           cudaMemcpyDeviceToHost, vcr::device::stream()));
