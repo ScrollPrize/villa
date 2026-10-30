@@ -588,6 +588,12 @@ class Config:
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
         self.loss_weight_unattached_pcl_dt = 4.0
+        # Anneal of both unattached-strip weights: 1 until the ramp starts, then
+        # linear to scale_final over ramp_steps steps, scale_final afterwards.
+        # The default scale_final of 1 leaves both weights unchanged.
+        self.loss_weight_unattached_pcl_scale_final = 1.0
+        self.loss_weight_unattached_pcl_ramp_start_step = 0
+        self.loss_weight_unattached_pcl_ramp_steps = 1
         # Probability of hopping onto the linked fiber at each junction while
         # sampling a chain walk through a link component in the
         # unattached-strip loss.
