@@ -290,9 +290,10 @@ def resolve_access(location: str, auth: Any = "auto", *, offline: bool = False) 
     if offline and s3 and (auth in ("auto", "aws") or isinstance(auth, S3Credentials)):
         return _ANON
     if auth == "auto":
-        from ..artifacts import to_https
+        from ..artifacts import to_https, to_s3
 
-        if not s3 or to_https(location) is not None:
+        # to_s3 keeps any s3:// URL: resolve first, so only public channels count.
+        if not s3 or to_s3(to_https(location)) is not None:
             return _ANON
         source = _AwsSource()
         if source.current() is None:  # no credentials: anonymous, as for a public bucket

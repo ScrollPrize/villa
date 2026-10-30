@@ -395,6 +395,15 @@ class RemoteFixtureCase(FixtureCase):
 
 
 class RemoteTests(RemoteFixtureCase):
+    def test_auto_signs_private_buckets_and_keeps_public_channels_anonymous(self):
+        from vc_reader.reader.auth import resolve_access
+        keys = dict(AWS_ACCESS_KEY_ID='example', AWS_SECRET_ACCESS_KEY='test-secret', AWS_REGION='us-east-1')
+        with patch.dict('os.environ', keys), patch('vc_reader.reader.auth.bucket_region', return_value='us-east-1'):
+            self.assertEqual(resolve_access('s3://my-private-bucket/volume.zarr').kind, 's3')
+            for public in ('s3://vesuvius-challenge-open-data/volume.zarr', 's3://vesuvius-challenge/volume.zarr',
+                           'https://example.com/volume.zarr'):
+                self.assertEqual(resolve_access(public).kind, 'anonymous')
+
     def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
         from vc_reader.reader import ZarrGroup
         from vc_reader.reader.auth import Access
