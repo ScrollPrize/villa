@@ -256,6 +256,13 @@ class ZarrTask(ABC):
         pass
 
 
+def _positive_worker_count(value: str) -> int:
+    count = int(value)
+    if count <= 0:
+        raise argparse.ArgumentTypeError("number of workers must be positive")
+    return count
+
+
 def get_base_parser() -> argparse.ArgumentParser:
     """Create base argument parser with common options.
 
@@ -284,7 +291,7 @@ def get_base_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-n",
         "--num-workers",
-        type=int,
+        type=_positive_worker_count,
         default=None,
         help="Number of worker processes (default: number of CPU cores)",
     )
