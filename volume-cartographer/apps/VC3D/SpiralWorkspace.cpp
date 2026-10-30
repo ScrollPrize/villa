@@ -1,5 +1,7 @@
 #include "SpiralWorkspace.hpp"
 
+#include <vc_reader/zarr.hpp>
+
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
@@ -215,41 +217,27 @@ std::optional<int> omeScaledownForGroup(
 }
 
 // Shape of an OME store's level-zero array, the grid its group scaledowns
-// are relative to. Reads the array metadata directly (Zarr v2 ``.zarray`` or
-// v3 ``zarr.json``) so it needs no chunk access.
+// are relative to, from its metadata alone.
 std::optional<std::array<std::size_t, 3>> omeLevelZeroShapeZYX(
     const QString& rootPath, QString* errorMessage)
 {
-    const QDir level(QDir(rootPath).filePath(QStringLiteral("0")));
-    for (const QString& name : {QStringLiteral(".zarray"), QStringLiteral("zarr.json")}) {
-        QFile metadataFile(level.filePath(name));
-        if (!metadataFile.open(QIODevice::ReadOnly)) continue;
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(
-            metadataFile.readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            if (errorMessage) *errorMessage = QObject::tr("Malformed Zarr metadata at %1: %2")
-                .arg(metadataFile.fileName(), parseError.errorString());
+    try {
+        for (const auto& level : vcr::zarr::pyramidLevels(rootPath.toStdString(), {})) {
+            if (level.level != 0) continue;
+            if (level.meta.shape.size() == 3 &&
+                std::all_of(level.meta.shape.begin(), level.meta.shape.end(), [](auto size) { return size > 0; }))
+                return std::array<std::size_t, 3>{std::size_t(level.meta.shape[0]), std::size_t(level.meta.shape[1]),
+                                                  std::size_t(level.meta.shape[2])};
+            if (errorMessage) *errorMessage = QObject::tr(
+                "Zarr level zero below %1 must declare a three-axis positive shape").arg(rootPath);
             return std::nullopt;
         }
-        const QJsonArray shape = document.object().value(QStringLiteral("shape")).toArray();
-        std::array<std::size_t, 3> result{};
-        if (shape.size() == 3) {
-            bool valid = true;
-            for (int axis = 0; axis < 3; ++axis) {
-                const double value = shape.at(axis).toDouble(-1.0);
-                if (!(value > 0.0) || value != std::floor(value)) { valid = false; break; }
-                result[axis] = static_cast<std::size_t>(value);
-            }
-            if (valid) return result;
-        }
         if (errorMessage) *errorMessage = QObject::tr(
-            "Zarr metadata at %1 must declare a three-axis positive shape")
-            .arg(metadataFile.fileName());
-        return std::nullopt;
+            "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr(
+            "Malformed Zarr metadata below %1: %2").arg(rootPath, QString::fromUtf8(error.what()));
     }
-    if (errorMessage) *errorMessage = QObject::tr(
-        "Cannot read level-zero Zarr array metadata below %1").arg(rootPath);
     return std::nullopt;
 }
 

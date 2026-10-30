@@ -13,7 +13,6 @@ A `Volume` represents a 3D image dataset with:
 
 - Volume metadata such as name, UUID, dimensions, voxel size, dtype, and format.
 - Local or remote zarr pyramid access.
-- Cached sampling through `vc::render::ChunkCache`.
 - Typed region reads in `uint8_t` and `uint16_t`.
 - Raw local zarr chunk reads for tools that need chunk-level control.
 
@@ -36,10 +35,6 @@ The `meta.json` dimension fields are:
 
 Use `shape()` and `shape(level)` for storage order `{z, y, x}`. Use
 `shapeXyz()` when UI or coordinate-order code needs `{x, y, z}`.
-
-`Array3D<T>` is also indexed and shaped as `{z, y, x}`. The `readXYZ()` helpers
-accept offsets in `{x, y, z}` order, but the `Array3D` payload remains
-`{z, y, x}`.
 
 ## Factory Methods
 
@@ -69,7 +64,6 @@ VC3D.
 | `id()` | `std::string` | Volume UUID from metadata |
 | `name()` | `std::string` | Display name from metadata |
 | `metadata()` | `const utils::Json&` | Current volume metadata |
-| `rootAttributes()` | `utils::Json` | Read local root `.zattrs`, or `{}` if absent |
 | `path()` | `std::filesystem::path` | Local volume path; empty for remote volumes |
 | `isRemote()` | `bool` | Whether the volume is backed by a remote zarr store |
 | `remoteUrl()` | `const std::string&` | Normalized remote URL for remote volumes |
@@ -86,84 +80,30 @@ VC3D.
 | `shape(int level)` | `std::array<int, 3>` | Present scale shape as `{z, y, x}` |
 | `shapeXyz()` | `std::array<int, 3>` | Base shape as `{x, y, z}` |
 | `voxelSize()` | `double` | Physical voxel size from metadata |
-| `dtype()` | `vc::render::ChunkDtype` | Volume dtype |
+| `dtype()` | `const std::string&` | NumPy typestr of the source (`\|u1`, `<u2`, `<f4`) |
 | `numScales()` | `size_t` | Number of scale slots known to the volume |
 | `baseScaleLevel()` | `int` | Working level: the source pyramid level opened as level 0 (remote `#vc-base-scale=N`), else `0`; the ID does not change with it |
 | `hasScaleLevel(int level)` | `bool` | Whether a physical zarr array exists for the level |
 | `presentScaleLevels()` | `std::vector<int>` | Physical scale levels |
-| `firstPresentScaleLevel()` | `int` | Finest available physical scale |
-| `finestPresentScaleLevelAtOrBelow(int level)` | `int` | Finer source level for virtual downsampling |
 
 `numScales()` can include missing scale slots. Check `hasScaleLevel()` or
 `presentScaleLevels()` before reading a specific level.
 
-### Cache and Sampling
+### Opening the Source
 
-All normal volumes use the core-owned process `ChunkCacheService`. Configure
-that service directly before or during use:
+`Volume` holds project metadata, not a reader. To read or sample, open the source
+with vc_reader. Working level `L` is physical pyramid level `L + baseScaleLevel()`.
 
-| Process API | Description |
-|-------------|-------------|
-| `vc::render::processChunkCacheService()` | Return the process-lifetime regular cache service |
-| `configureDecodedByteCapacity(bytes)` | Change the global decoded RAM ceiling in place |
-| `configureFetchConcurrency(count, adaptive)` | Change global remote-download admission in place; local source reads retain their independent 16-worker default |
+```cpp
+auto options = volume->sourceOpenOptions();          // credentials, cache directory and limits
+options.memoryCache = std::make_shared<vcr::MemoryCache>(bytes);
+auto level = vcr::zarr::openPyramidLevel(volume->sourceLocation(),
+                                         volume->baseScaleLevel() + L, options);
+level.array->read_many(...);                         // or sample_linear, vcr::grid::sample
+```
 
-Python exposes the equivalent module-level functions
-`vc.set_chunk_cache_budget(bytes)` and
-`vc.set_chunk_cache_io_threads(count)`. The latter selects fixed admission.
-Cache policy is deliberately not configured through a `Volume` instance.
-
-For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
-mirror: metadata and fetched storage objects keep their source-relative paths
-and exact encoded bytes. Sharded arrays cache one complete outer shard and fan
-out requested inner-chunk decodes from that shared payload. Adjacent `.empty`
-markers represent missing whole objects. Existing legacy
-`level_N/z/y/x.<ext>` caches are detected automatically and remain readable and
-writable without migration; no new decoded-cache recompression is performed.
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `chunkedCache()` | `vc::render::IChunkedArray*` | Shared chunked cache for local or remote reads |
-| `sharedChunkCache()` | `std::shared_ptr<ChunkCache>` | Shared process cache handle for this source |
-| `invalidateCache()` | `void` | Drop decoded/read cache state |
-| `sample(Mat_<uint8_t>&, coords, params)` | `void` | Sample into an 8-bit image |
-| `sample(Mat_<uint16_t>&, coords, params)` | `void` | Sample into a 16-bit image |
-
-`sample()` reads through the chunked cache and supports `vc::Sampling::Nearest`,
-`Trilinear`, `Tricubic`, and `Lanczos` through `vc::SampleParams`.
-
-### Typed Region Reads
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `readZYX(Array3D<uint8_t>&, offsetZYX, level, policy)` | `bool` | Read an 8-bit region using `{z, y, x}` offset |
-| `readZYX(Array3D<uint16_t>&, offsetZYX, level, policy)` | `bool` | Read a 16-bit region using `{z, y, x}` offset |
-| `readXYZ(Array3D<uint8_t>&, offsetXYZ, level, policy)` | `bool` | Read an 8-bit region using `{x, y, z}` offset |
-| `readXYZ(Array3D<uint16_t>&, offsetXYZ, level, policy)` | `bool` | Read a 16-bit region using `{x, y, z}` offset |
-| `static readZYX(..., IChunkedArray&, level)` | `void` | Read from an explicit chunked array/cache |
-
-Region reads are available for local and remote volumes. Out-of-bounds portions
-are filled with the zarr fill value. The output array shape determines the read
-size.
-
-When a requested level is missing, `MissingScaleLevelPolicy` controls behavior:
-
-| Policy | Behavior |
-|--------|----------|
-| `Error` | Throw for the missing scale level |
-| `AllFill` | Fill the output with the zarr fill value and return `true` |
-| `Empty` | Leave the output unchanged and return `false` |
-| `VirtualDownsample` | Read the finest available lower level and downsample into the output |
-
-### Raw Chunk Reads
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `readChunk(level, chunkZYX)` | `std::optional<std::vector<std::byte>>` | Read a local raw chunk, or `std::nullopt` when absent |
-| `readChunkOrFill(level, chunkZYX)` | `std::vector<std::byte>` | Read a local raw chunk, or synthesize fill bytes |
-| `chunkExists(level, chunkZYX)` | `bool` | Check local chunk presence |
-Chunk coordinates are `{z, y, x}` chunk indices. Payloads are raw,
-uncompressed chunk bytes, exactly `chunk_elems * dtype_size` long.
+VC3D tools and viewers share opened levels and one memory cache through
+`OpenedVolumes`.
 
 ### Utilities
 
@@ -221,80 +161,3 @@ if (volume->isRemote()) {
     std::cout << volume->remoteUrl() << std::endl;
 }
 ```
-
-### Reading a Region
-
-```cpp
-#include "vc/core/types/Array3D.hpp"
-#include "vc/core/types/Volume.hpp"
-
-auto volume = Volume::New("/path/to/volume");
-
-Array3D<uint16_t> block({64, 128, 128});  // {z, y, x}
-volume->readZYX(block, {100, 200, 300});  // offset {z, y, x}, level 0
-
-uint16_t value = block(10, 20, 30);
-```
-
-### Reading with XYZ Offsets
-
-```cpp
-Array3D<uint8_t> block({32, 64, 64});     // data is still {z, y, x}
-volume->readXYZ(block, {300, 200, 100});  // offset is {x, y, z}
-```
-
-### Handling Missing Scale Levels
-
-```cpp
-Array3D<uint8_t> tile({64, 64, 64});
-bool ok = volume->readZYX(
-    tile,
-    {0, 0, 0},
-    3,
-    Volume::MissingScaleLevelPolicy::VirtualDownsample);
-
-if (!ok) {
-    // Only possible with MissingScaleLevelPolicy::Empty.
-}
-```
-
-### Sampling a Slice
-
-```cpp
-#include "vc/core/types/SampleParams.hpp"
-#include "vc/core/types/Volume.hpp"
-
-cv::Mat_<cv::Vec3f> coords(1000, 1000);
-for (int y = 0; y < coords.rows; ++y) {
-    for (int x = 0; x < coords.cols; ++x) {
-        coords(y, x) = cv::Vec3f(500.0f, y + 100.0f, x + 100.0f);
-    }
-}
-
-vc::SampleParams params;
-params.level = 0;
-params.method = vc::Sampling::Trilinear;
-
-cv::Mat_<uint8_t> slice;
-volume->sample(slice, coords, params);
-```
-
-Coordinates passed to `sample()` are base-scale coordinates in zarr order
-`(z, y, x)`. When `params.level > 0`, `Volume` scales them to the requested
-level before sampling.
-
-## Implementation Notes
-
-- Shape validation checks physical zarr level shapes against metadata dimensions
-  using power-of-two level indices, with limited per-level padding tolerance.
-- Local zarr arrays may be stored as scale directories (`0`, `1`, `2`, ...)
-  or as a root array for level 0.
-- Remote `s3://` URLs are resolved to HTTPS and opened anonymously first. AWS
-  SigV4 credentials are used when anonymous access is denied.
-- `processChunkCacheService()` retains regular source state for the process.
-  Capacity and concurrency changes preserve source identity and all
-  queued/running work. A capacity reduction evicts globally oldest decoded
-  entries but does not cancel fetch/decode work. Acquiring a volume source
-  never changes either policy. Low-level standalone cache factories create a
-  fully independent service and budget; normal `Volume` users cannot attach a
-  private or partially shared service.
