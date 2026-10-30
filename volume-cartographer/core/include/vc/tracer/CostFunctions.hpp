@@ -1179,8 +1179,8 @@ struct NormalConstraintPlane {
         // }
 
         // Calculate normal loss for both grid planes and interpolate.
-        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
-        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
+        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_query->grid1, 0);
+        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
@@ -1189,9 +1189,9 @@ struct NormalConstraintPlane {
 
         T interpolated_loss;
         if (invert_dir)
-            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, grid_ptr, 0);
         else
-            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_ptr, 0);
 
         // Calculate angular weight.
         double v1[3], v2[3];
@@ -1301,7 +1301,9 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, const std::shared_ptr<const vc::core::util::GridStore>& current_grid, int grid_idx) const {
+    T calculate_normal_snapping_loss(const T* p1, const T* p2, const std::shared_ptr<const vc::core::util::GridStore>& current_grid, int grid_idx) const {
+        const auto& normal_grid = *current_grid;
+
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
