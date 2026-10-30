@@ -3529,10 +3529,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
 
         if (!used_area_fully_valid) {
-            // Irregular resumed patches should fill holes within the existing grid before
-            // growing the bounding rectangle. For right growth, this means every valid
-            // point with an invalid point immediately to its right contributes that
-            // invalid point as a candidate; the other directions follow the same rule.
+            // Offer interior candidates first, then outward neighbours on resume. Collect
+            // both in one traversal while preserving the interior-before-outward order.
+            std::vector<cv::Vec2i> outward_candidates;
             for (int j = used_area.y; j < used_area.br().y; ++j) {
                 for (int i = used_area.x; i < used_area.br().x; ++i) {
                     const cv::Vec2i p{j, i};
@@ -3544,9 +3543,15 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                         const cv::Vec2i candidate = p + n;
                         if (is_inside_used_area(candidate)) {
                             append_candidate(candidate);
+                        } else if (resume_surf &&
+                                   resume_growth_limit.contains(cv::Point(candidate[1], candidate[0]))) {
+                            outward_candidates.push_back(candidate);
                         }
                     }
                 }
+            }
+            for (const auto& candidate : outward_candidates) {
+                append_candidate(candidate);
             }
         } else {
             // For a rectangular patch, keep the existing fast frontier behavior.
@@ -3557,34 +3562,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
-        if (resume_surf) {
-            // Interior candidates that fail (e.g. at x/y/z limits) remain PROCESSING, and
-            // the hole-filling branch above never offers cells outside used_area. Offer
-            // the outward neighbours of the edge in the same generation, so that every
-            // untried cell next to the surface is offered and the trace ends only when
-            // none is left.
-            for (int j = used_area.y; j < used_area.br().y; ++j) {
-                for (int i = used_area.x; i < used_area.br().x; ++i) {
-                    if (j != used_area.y && j != used_area.br().y - 1 &&
-                        i != used_area.x && i != used_area.br().x - 1) {
-                        continue;
-                    }
-                    const cv::Vec2i p{j, i};
-                    if (!is_loc_valid(p)) {
-                        continue;
-                    }
-                    for (const auto& n : neighs) {
-                        const cv::Vec2i candidate = p + n;
-                        if (!is_inside_used_area(candidate) &&
-                            resume_growth_limit.contains(cv::Point(candidate[1], candidate[0]))) {
-                            append_candidate(candidate);
-                        }
-                    }
-                }
-            }
-            if (cands.empty()) {
-                break;
-            }
+        if (resume_surf && cands.empty()) {
+            break;
         }
 
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
