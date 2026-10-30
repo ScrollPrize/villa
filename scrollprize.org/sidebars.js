@@ -13,29 +13,20 @@
 
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
-  // Single, unified menu used across the whole site so every important page is
-  // reachable from one coherent navigation surface. External links (Discord,
-  // Substack, X, Donate) live in the navbar Community dropdown + footer, not
-  // here. Requires `sidebarCollapsible: true` in the docs preset so the
-  // `collapsed: true` categories below actually start collapsed.
-  overviewSidebar: [
-    {
-      type: 'category',
-      label: 'Overview',
-      collapsible: true,
-      collapsed: false,
-      link: { type: 'doc', id: 'landing' },
-      items: [
-        { type: 'doc', id: 'get_started' },
-        { type: 'doc', id: 'prizes' },
-        { type: 'doc', id: '2026_open_problems', label: 'Open Problems' },
-      ],
-    },
+  // One sidebar per navbar section; the sidebar is a "within this section"
+  // nav, not a second copy of the site menu. Docs that aren't listed in any
+  // sidebar (landing, get_started, prizes, open problems, faq, press, jobs,
+  // villa_model, livestream) render standalone with no left sidebar.
+  // Retired pages stay reachable inside the section they belong to, in a
+  // collapsed archive group, because journals and Discord still link them.
+  // A navbar item opens a section via `type: 'docSidebar'` (or, for the
+  // Tutorials dropdown, src/theme/NavbarItem/DropdownNavbarItem), which also
+  // keeps the item highlighted on every page of its sidebar.
+  tutorialsSidebar: [
     {
       type: 'category',
       label: 'Tutorials & In-depth',
-      collapsible: true,
-      collapsed: false,
+      collapsible: false,
       items: [
         { type: 'doc', id: 'tutorial_VC3D' },
         { type: 'doc', id: 'tutorial_spiral' },
@@ -50,21 +41,37 @@ const sidebars = {
     },
     {
       type: 'category',
-      label: 'Data',
+      label: 'Older tutorials',
       collapsible: true,
-      collapsed: false,
+      collapsed: true,
+      items: [
+        { type: 'doc', id: 'tutorial' },
+        { type: 'doc', id: 'tutorial1' },
+        { type: 'doc', id: 'tutorial2' },
+        { type: 'doc', id: 'tutorial3' },
+        { type: 'doc', id: 'segmentation' },
+        { type: 'doc', id: 'unwrapping' },
+        { type: 'doc', id: 'tutorial_VC' },
+      ],
+    },
+  ],
+  dataSidebar: [
+    {
+      type: 'category',
+      label: 'Data',
+      collapsible: false,
       items: [
         { type: 'doc', id: 'data_browser' },
         { type: 'doc', id: 'data' },
         { type: 'doc', id: 'data_datasets' },
       ],
     },
-    { type: 'doc', id: 'faq' },
+  ],
+  milestonesSidebar: [
     {
       type: 'category',
       label: 'Milestones & Results',
-      collapsible: true,
-      collapsed: true,
+      collapsible: false,
       items: [
         { type: 'doc', id: 'winners', label: 'Prize Winners' },
         { type: 'doc', id: 'firstscroll' },
@@ -75,35 +82,18 @@ const sidebars = {
     },
     {
       type: 'category',
-      label: 'Extra',
+      label: 'Past prize rounds',
       collapsible: true,
       collapsed: true,
       items: [
-        { type: 'doc', id: 'villa_model' },
-        { type: 'doc', id: 'livestream' },
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Archive',
-      collapsible: true,
-      collapsed: true,
-      items: [
-        { type: 'doc', id: 'master_plan' },
-        { type: 'doc', id: 'tutorial' },
-        { type: 'doc', id: 'tutorial1' },
-        { type: 'doc', id: 'tutorial2' },
-        { type: 'doc', id: 'tutorial3' },
-        { type: 'doc', id: 'segmentation' },
-        { type: 'doc', id: 'unwrapping' },
-        { type: 'doc', id: 'tutorial_VC' },
+        { type: 'doc', id: '30_2024_gp_submissions' },
+        { type: 'doc', id: '28_2024_prizes' },
+        { type: 'doc', id: 'submissions_closed' },
         { type: 'doc', id: 'grand_prize' },
-        { type: 'doc', id: 'ink_detection' },
         { type: 'doc', id: 'open_source_prizes' },
         { type: 'doc', id: 'private_prizes' },
-        { type: 'doc', id: '28_2024_prizes' },
-        { type: 'doc', id: '30_2024_gp_submissions' },
-        { type: 'doc', id: 'submissions_closed' },
+        { type: 'doc', id: 'ink_detection' },
+        { type: 'doc', id: 'master_plan' },
       ],
     },
   ],

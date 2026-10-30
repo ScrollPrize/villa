@@ -281,6 +281,23 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     }
 }
 
+void StatusDockPanelHost::showDock(QDockWidget* dock)
+{
+    Item* item = itemForDock(dock);
+    if (!item) {
+        return;
+    }
+    if (item->detached) {
+        dock->show();
+        dock->raise();
+        return;
+    }
+    setItemVisibleInBar(*item, true);
+    if (_currentIndex != itemIndex(*item)) {
+        expandItem(*item);
+    }
+}
+
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
     if (auto* button = qobject_cast<QPushButton*>(watched)) {

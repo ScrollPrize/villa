@@ -5,11 +5,13 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
+#include <map>
 #include <optional>
 #include <filesystem>
 #include <functional>
 
 #include "utils/Json.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace vc {
 struct PointRef
@@ -73,6 +75,7 @@ public:
         float autoFillConstant = 0.0f;
         std::unordered_map<std::string, std::string> tags;
         std::vector<uint64_t> windings_linked;
+        std::string uuid = vc::objects::util::newUuid();
     };
 
     PointCollections() = default;
@@ -93,10 +96,8 @@ public:
     void setCollectionMetadata(uint64_t collectionId, const CollectionMetadata& metadata);
     void setCollectionColor(uint64_t collectionId, const cv::Vec3f& color);
     void setCollectionAnchor2d(uint64_t collectionId, const std::optional<cv::Vec2f>& anchor);
-    std::optional<cv::Vec2f> getCollectionAnchor2d(uint64_t collectionId) const;
     void setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value);
     void removeCollectionTag(uint64_t collectionId, const std::string& key);
-    std::optional<std::string> getCollectionTag(uint64_t collectionId, const std::string& key) const;
     void setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds);
     std::optional<ColPoint> getPoint(vc::PointRef point) const;
     std::vector<vc::PointRef> findPointRefs(uint64_t pointId) const;
@@ -106,21 +107,23 @@ public:
     void resetWindingNumbers();
     void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
     WindingFillMode getAutoFillMode(uint64_t collectionId) const;
-    float getAutoFillConstant(uint64_t collectionId) const;
     float computeAutoFillValue(uint64_t collectionId) const;
 
    bool saveToJSON(const std::string& filename) const;
    bool loadFromJSON(const std::string& filename);
 
-   // Top-level metadata describing the coordinate space shared by every
-   // point in a saved file. VC3D updates this from the active source volume.
-   void setFileMetadata(const utils::Json& metadata);
-   [[nodiscard]] const utils::Json& fileMetadata() const;
-
-   // Path-based persistence for segment-specific corrections
-   // Only saves collections with anchor2d set (2D anchored points only)
-   bool saveToSegmentPath(const std::filesystem::path& segmentPath) const;
-   bool loadFromSegmentPath(const std::filesystem::path& segmentPath);
+   // Segment-specific corrections: the collections anchored on a surface
+   // (anchor2d set), as collection JSON by collection id.
+   [[nodiscard]] std::map<uint64_t, utils::Json> anchoredCollections() const;
+   // Replace the anchored collections with `collections` (collection JSON by
+   // id). Parses every collection before installing any; collections without
+   // anchor2d are skipped. Returns false (changing nothing) on malformed input.
+   bool replaceAnchoredCollections(const std::map<uint64_t, utils::Json>& collections);
+   // Replace the collections without anchor2d (a volume's) with
+   // `collections` (collection JSON, new runtime ids; points keep theirs).
+   // Parses every collection before installing any; anchored ones are skipped.
+   // Returns false (changing nothing) on malformed input.
+   bool replaceUnanchoredCollections(const std::vector<utils::Json>& collections);
 
    // Apply grid offset to all anchor2d values (for surface growth remapping)
    void applyAnchorOffset(float offsetX, float offsetY);
@@ -137,6 +140,8 @@ protected:
     virtual void onPointsRemoved(const std::vector<vc::PointRef>&) {}
 
 private:
+    // Remove the anchored (or unanchored) collections and install `parsed`.
+    void installCollections(bool anchored, std::vector<Collection> parsed);
     uint64_t getNextPointId();
     uint64_t getNextCollectionId();
 
@@ -144,7 +149,6 @@ private:
     uint64_t findOrCreateCollectionByName(const std::string& name);
 
     std::unordered_map<uint64_t, Collection> _collections;
-    utils::Json _fileMetadata = utils::Json::object();
     uint64_t _next_point_id = 1;
     uint64_t _next_collection_id = 1;
 };

@@ -42,7 +42,7 @@ namespace {
 [[nodiscard]] int32_t checkedNodeId(uint64_t value)
 {
     if (value > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
-        throw std::runtime_error("Maxflow graph exceeds int32 node id range required by ECL-MaxFlow");
+        throw std::runtime_error("Maxflow graph exceeds the int32 node id range");
     }
     return static_cast<int32_t>(value);
 }
@@ -50,7 +50,7 @@ namespace {
 void checkDirectedEdges(uint64_t value)
 {
     if (value > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
-        throw std::runtime_error("Maxflow graph exceeds int32 edge count required by ECL-MaxFlow");
+        throw std::runtime_error("Maxflow graph exceeds the int32 edge count");
     }
 }
 

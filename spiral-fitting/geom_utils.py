@@ -113,3 +113,60 @@ def interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-1, e
     indices = torch.searchsorted(xp.squeeze(-1), x) - 1
     indices = torch.clamp(indices, 0, len(m) - 1)
     return m[indices] * x[..., None] + b[indices]
+
+
+def grid_sample_border(input, grid):
+    """``F.grid_sample(input, grid, mode='bilinear', padding_mode='border',
+    align_corners=True)`` for 4-D and 5-D inputs.
+
+    MPS implements grid_sample's forward but not its backward, so there, when
+    autograd needs the backward, the same interpolation is built from gathers
+    (whose backward MPS has). Every other case calls grid_sample itself.
+    """
+    if (input.device.type != 'mps' or not torch.is_grad_enabled()
+            or not (input.requires_grad or grid.requires_grad)):
+        return torch.nn.functional.grid_sample(
+            input, grid, mode='bilinear', padding_mode='border',
+            align_corners=True)
+    return gather_grid_sample_border(input, grid)
+
+
+def gather_grid_sample_border(input, grid):
+    """grid_sample_border's interpolation from gathers, on any device.
+
+    A NaN coordinate is handled as CUDA's grid sampler handles it: the
+    forward pass samples index 0 along that axis, and the point adds nothing
+    to either gradient.
+    """
+    n, channels = input.shape[:2]
+    spatial = input.shape[2:]
+    # grid's last axis is (x, y[, z]); spatial is ([z,] y, x).
+    coords = grid.reshape(n, -1, len(spatial)).flip(-1)
+    corners = []
+    nan = None
+    stride = 1
+    for axis in reversed(range(len(spatial))):
+        size = spatial[axis]
+        position = (coords[..., axis] + 1) * 0.5 * (size - 1)
+        is_nan = torch.isnan(position)
+        nan = is_nan if nan is None else nan | is_nan
+        position = position.nan_to_num(nan=0.0).clamp(0, size - 1)
+        low = position.floor()
+        high_weight = position - low
+        low = low.to(torch.int64)
+        high = (low + 1).clamp(max=size - 1)
+        corners.append(((low * stride, 1 - high_weight), (high * stride, high_weight)))
+        stride *= size
+    flat = input.reshape(n, channels, -1)
+    out = None
+    for choice in range(1 << len(spatial)):
+        index, weight = None, None
+        for bit, pair in enumerate(corners):
+            offset, factor = pair[(choice >> bit) & 1]
+            index = offset if index is None else index + offset
+            weight = factor if weight is None else weight * factor
+        values = flat.gather(2, index[:, None, :].expand(n, channels, -1))
+        term = values * weight[:, None, :]
+        out = term if out is None else out + term
+    out = torch.where(nan[:, None, :], out.detach(), out)
+    return out.reshape(n, channels, *grid.shape[1:-1])

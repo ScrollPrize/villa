@@ -7,7 +7,7 @@ assertion can check:
 
   * the correct bridge method name + params land on the wire
     (``received_requests[-1]``);
-  * the false onlyLoaded default and optional filter reach the wire correctly;
+  * no params reach the wire by default, and the optional filter when given;
   * a "filter" dict is forwarded to the wire verbatim;
   * the bridge's result is passed through unchanged.
 
@@ -45,41 +45,19 @@ class ReviewToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req["method"], method)
         self.assertEqual(req["params"], params)
 
-    async def test_no_args_sends_default_scope(self) -> None:
+    async def test_no_args_sends_no_filter(self) -> None:
         await vc3d_review_segments()
-        self._assert_wire("segments.review", {"onlyLoaded": False})
-
-    async def test_only_loaded_forwarded(self) -> None:
-        await vc3d_review_segments(only_loaded=True)
-        self._assert_wire("segments.review", {"onlyLoaded": True})
-
-    async def test_only_loaded_false_is_not_none_so_forwarded(self) -> None:
-        # False is a meaningful value (distinct from omitted); _strip_none must
-        # only drop None, not falsy values.
-        await vc3d_review_segments(only_loaded=False)
-        self._assert_wire("segments.review", {"onlyLoaded": False})
+        self._assert_wire("segments.review", {})
 
     async def test_filter_dict_forwarded_verbatim(self) -> None:
         filt = {"unreviewed": True, "hideDefective": True}
-        await vc3d_review_segments(filter=filt)
-        self._assert_wire(
-            "segments.review",
-            {"onlyLoaded": False, "filter": filt},
-        )
-
-    async def test_only_loaded_and_filter_both_forwarded(self) -> None:
-        filt = {"approved": True}
-        result = await vc3d_review_segments(only_loaded=True, filter=filt)
-        self._assert_wire("segments.review", {"onlyLoaded": True, "filter": filt})
+        result = await vc3d_review_segments(filter=filt)
+        self._assert_wire("segments.review", {"filter": filt})
         # Response passthrough: the tool returns the bridge's result unchanged.
         self.assertEqual(
             result,
-            {
-                "echoedMethod": "segments.review",
-                "echoedParams": {"onlyLoaded": True, "filter": filt},
-            },
+            {"echoedMethod": "segments.review", "echoedParams": {"filter": filt}},
         )
-
 
 if __name__ == "__main__":
     unittest.main()

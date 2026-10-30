@@ -32,6 +32,25 @@ class Vc3dFiberFormatAdapterTests(unittest.TestCase):
                 sys.modules.pop("vc3d_fiber_format", None)
 
             self.assertTrue(callable(module.parse_vc3d_fiber_format))
+            self.assertTrue(callable(module.validate_fiber_uuid))
+
+    def test_present_fiber_uuid_must_be_canonical(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from vc3d_fiber_format_adapter import (parse_vc3d_fiber_format,
+                                               validate_fiber_uuid)
+        doc = {"type": "vc3d_fiber", "version": 1,
+               "line_points": [[0, 0, 0], [1, 0, 0]],
+               "control_points": [[0, 0, 0], [1, 0, 0]]}
+        parse_vc3d_fiber_format(doc)  # legacy: uuid optional
+        doc["uuid"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
+        parsed = parse_vc3d_fiber_format(doc)
+        self.assertEqual(parsed.metadata["uuid"], doc["uuid"])
+        for bad in ("fiber_name", "", None, 3, doc["uuid"].replace("-", "")):
+            bad_doc = dict(doc, uuid=bad)
+            with self.assertRaisesRegex(ValueError, "invalid uuid"):
+                parse_vc3d_fiber_format(bad_doc)
+            with self.assertRaisesRegex(ValueError, "invalid uuid"):
+                validate_fiber_uuid(bad_doc)
 
 
 if __name__ == "__main__":

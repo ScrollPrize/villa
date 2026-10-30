@@ -23,7 +23,6 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    void collectDirectionHints(VolumeViewerBase* viewer, OverlayBuilder& builder) const;
     void collectSurfaceNormals(VolumeViewerBase* viewer, OverlayBuilder& builder) const;
 
     CState* _state;

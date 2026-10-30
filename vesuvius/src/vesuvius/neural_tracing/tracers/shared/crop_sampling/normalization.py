@@ -1,0 +1,99 @@
+"""Per-crop z-score normalization and persisted volume provenance."""
+import json
+from pathlib import Path
+import numba
+import numpy as np
+
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import open_ct_array
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write
+
+ZSCORE_METHOD = 'crop_zscore_v1'
+ZSCORE_EPSILON = 1e-6
+
+
+def volume_key(spec):
+    source = str(spec.ct_zarr).rstrip('/')
+    if '://' not in source:
+        source = str(Path(source).resolve())
+    return source+'::'+str(spec.ct_level)
+
+
+def array_identity(ct):
+    return dict(shape=list(ct.shape), chunks=list(ct.chunks), dtype=ct.dtype.str)
+
+
+def validate_record(record, spec):
+    if record is None or record.get('method') != ZSCORE_METHOD:
+        raise ValueError('Only per-crop z-score CT normalization is supported')
+    if record.get('volume') != volume_key(spec) or record.get('epsilon') != ZSCORE_EPSILON:
+        raise ValueError('Invalid z-score normalization record or different volume')
+    return record
+
+
+def prepare_normalization(out, specs, *, known=None):
+    """Persist z-score provenance and bind it to readers.
+
+    Checkpoints embed the document too (``known``), allowing a missing JSON to be restored. A record that differs
+    from the checkpoint's, or from the current CT array, is reported and replaced by the current one.
+    """
+    path = Path(out)/'ct_normalization.json'
+    document = json.loads(path.read_text()) if path.exists() else dict(method=ZSCORE_METHOD, volumes={})
+    if document.get('method') != ZSCORE_METHOD:
+        raise ValueError('Unsupported CT normalization policy')
+    if known is not None and document['method'] != known['method']:
+        print('Warning: the CT normalization method differs from the checkpoint', flush=True)
+    # Do not mutate an embedded checkpoint document while adding an inference volume.
+    document = json.loads(json.dumps(document))
+    for spec in specs:
+        key = volume_key(spec)
+        ct = open_ct_array(spec, 32 << 20)
+        if (known is not None and key in known['volumes'] and key in document['volumes']
+                and known['volumes'][key] != document['volumes'][key]):
+            print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)
+        if key not in document['volumes']:
+            if known is not None and key in known['volumes']:
+                record = known['volumes'][key]
+            else:
+                record = dict(method=ZSCORE_METHOD, volume=key, epsilon=ZSCORE_EPSILON, **array_identity(ct))
+            document['volumes'][key] = record
+        record = validate_record(document['volumes'][key], spec)
+        if record['method'] != document['method']:
+            raise ValueError('CT record and document normalization methods differ')
+        if any(record[k] != v for k, v in array_identity(ct).items()):
+            print(f'Warning: CT array metadata changed since calibration; recording the current array: {key}', flush=True)
+            record = dict(record, **array_identity(ct))
+            document['volumes'][key] = record
+        spec.ct_normalization = dict(record)
+        print(f'CT per-crop z-score, epsilon {ZSCORE_EPSILON:g}: {key}', flush=True)
+    if not path.exists() or json.loads(path.read_text()) != document:
+        atomic_write(path, (json.dumps(document, indent=2)+'\n').encode())
+    return document
+
+
+def normalize_ct(image, record):
+    """Normalize a sampled crop in place, including all values without clipping."""
+    if record is None or record.get('method') != ZSCORE_METHOD:
+        raise ValueError('A z-score normalization record is required before sampling model inputs')
+    if image.dtype != np.float32 or image.ndim != 3 or not image.flags.c_contiguous:
+        raise ValueError('CT normalization requires a contiguous float32 3D crop')
+    mean = image.mean(dtype=np.float32)  # float32 statistics, as the GPU sampler's zscore_crops
+    # Any nonfinite value makes the sum nonfinite (finite crop values are bounded; the sum cannot overflow).
+    if not np.isfinite(mean):
+        raise ValueError('Z-score CT crop contains nonfinite values')
+    std = image.std(dtype=np.float32, mean=mean)  # numpy's own std, without summing the mean again
+    _center_scale(image.reshape(-1), mean, np.float32(max(float(std), ZSCORE_EPSILON)))
+
+
+@numba.njit(cache=True, fastmath=False, nogil=True)
+def _center_scale(values, mean, scale):
+    """``values -= mean; values /= scale`` in one pass: the same float32 operations."""
+    for p in range(len(values)):
+        values[p] = (values[p] - mean) / scale
+
+
+def zscore_crops(crops):
+    """Per-crop z-score of torch crops (..., D, H, W) (population statistics in the crops' dtype, ``ZSCORE_EPSILON``):
+    the GPU sampler's counterpart of ``normalize_ct``."""
+    mean = crops.mean((-3, -2, -1), keepdim=True)
+    std = crops.std((-3, -2, -1), keepdim=True, unbiased=False)
+    return (crops-mean)/std.clamp_min(ZSCORE_EPSILON)

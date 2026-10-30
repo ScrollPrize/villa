@@ -3,17 +3,18 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
-#include "vc/flattening/ABFFlattening.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/Json.hpp"
 #include "utils/http_fetch.hpp"
+#include <vc_reader/affine.hpp>
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -42,6 +43,7 @@
 
 namespace po = boost::program_options;
 using Json = utils::Json;
+using Affine = vcr::catalog::Affine;
 
 // ============================================================
 // Logging infrastructure
@@ -107,74 +109,7 @@ static void stopLogFlusher()
 // Affine transform utilities
 // ============================================================
 
-struct AffineTransform {
-    cv::Mat_<double> matrix = cv::Mat_<double>::eye(4, 4);
-};
-
-static bool invertAffineInPlace(AffineTransform& T)
-{
-    cv::Mat A(3, 3, CV_64F), Ainv;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            A.at<double>(r, c) = T.matrix(r, c);
-    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-10) return false;
-
-    cv::Matx33d Ai;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            Ai(r, c) = Ainv.at<double>(r, c);
-    cv::Vec3d t(T.matrix(0,3), T.matrix(1,3), T.matrix(2,3));
-    cv::Vec3d ti = -(Ai * t);
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) T.matrix(r, c) = Ai(r, c);
-        T.matrix(r, 3) = ti(r);
-    }
-    T.matrix(3,0) = T.matrix(3,1) = T.matrix(3,2) = 0.0;
-    T.matrix(3,3) = 1.0;
-    return true;
-}
-
-static AffineTransform loadAffineTransform(const std::string& filename)
-{
-    AffineTransform transform;
-    std::ifstream file(filename);
-    if (!file.is_open())
-        throw std::runtime_error("Cannot open affine transform file: " + filename);
-    try {
-        Json j = Json::parse_file(filename);
-        if (j.contains("transformation_matrix")) {
-            auto mat = j["transformation_matrix"];
-            if (mat.size() != 3 && mat.size() != 4)
-                throw std::runtime_error("Affine matrix must have 3 or 4 rows");
-            for (int row = 0; row < (int)mat.size(); row++) {
-                if (mat[row].size() != 4)
-                    throw std::runtime_error("Each row must have 4 elements");
-                for (int col = 0; col < 4; col++)
-                    transform.matrix(row, col) = mat[row][col].get_double();
-            }
-            if (mat.size() == 4) {
-                if (std::abs(transform.matrix(3,0)) > 1e-12 ||
-                    std::abs(transform.matrix(3,1)) > 1e-12 ||
-                    std::abs(transform.matrix(3,2)) > 1e-12 ||
-                    std::abs(transform.matrix(3,3) - 1.0) > 1e-12)
-                    throw std::runtime_error("Bottom affine row must be [0,0,0,1]");
-            }
-        }
-    } catch (const std::exception&) {
-        throw std::runtime_error("Error parsing affine transform file: " + filename);
-    }
-    return transform;
-}
-
-static AffineTransform composeAffine(const AffineTransform& A, const AffineTransform& B)
-{
-    AffineTransform R;
-    cv::Mat tmp = B.matrix * A.matrix;
-    tmp.copyTo(R.matrix);
-    return R;
-}
-
-static void printMat4x4(const cv::Mat_<double>& M, const char* header)
+static void printMat4x4(const Affine& M, const char* header)
 {
     if (header) logPrintf(stdout, "%s\n", header);
     for (int r = 0; r < 4; ++r) {
@@ -197,43 +132,26 @@ static std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
 // Geometry helpers
 // ============================================================
 
-static cv::Vec3f applyAffineToPoint(const cv::Vec3f& pt, const AffineTransform& T)
-{
-    double x = pt[0], y = pt[1], z = pt[2];
-    return cv::Vec3f(
-        float(T.matrix(0,0)*x + T.matrix(0,1)*y + T.matrix(0,2)*z + T.matrix(0,3)),
-        float(T.matrix(1,0)*x + T.matrix(1,1)*y + T.matrix(1,2)*z + T.matrix(1,3)),
-        float(T.matrix(2,0)*x + T.matrix(2,1)*y + T.matrix(2,2)*z + T.matrix(2,3)));
-}
-
 static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
                                   cv::Mat_<cv::Vec3f>& normals,
-                                  const AffineTransform& T)
+                                  const Affine& T)
 {
-    cv::Matx33d A(T.matrix(0,0), T.matrix(0,1), T.matrix(0,2),
-                  T.matrix(1,0), T.matrix(1,1), T.matrix(1,2),
-                  T.matrix(2,0), T.matrix(2,1), T.matrix(2,2));
-    cv::Matx33d invAT = A.inv().t();
+    const auto normalTransform = T.normalTransform();
 
     for (int y = 0; y < points.rows; y++)
         for (int x = 0; x < points.cols; x++) {
             cv::Vec3f& pt = points(y, x);
             if (std::isnan(pt[0])) continue;
-            pt = applyAffineToPoint(pt, T);
+            const auto q = T.apply({pt[0], pt[1], pt[2]});
+            pt = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
         }
 
     for (int y = 0; y < normals.rows; y++)
         for (int x = 0; x < normals.cols; x++) {
             cv::Vec3f& n = normals(y, x);
             if (std::isnan(n[0])) continue;
-            double nx = invAT(0,0)*n[0] + invAT(0,1)*n[1] + invAT(0,2)*n[2];
-            double ny = invAT(1,0)*n[0] + invAT(1,1)*n[1] + invAT(1,2)*n[2];
-            double nz = invAT(2,0)*n[0] + invAT(2,1)*n[1] + invAT(2,2)*n[2];
-            const double len2 = nx*nx + ny*ny + nz*nz;
-            if (len2 > 0) {
-                const double invLen = 1.0 / std::sqrt(len2);
-                n = cv::Vec3f(float(nx*invLen), float(ny*invLen), float(nz*invLen));
-            }
+            const auto q = normalTransform.mapDirection({n[0], n[1], n[2]});
+            n = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
         }
 }
 
@@ -295,7 +213,7 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
                                 float scale_seg, float ds_scale,
-                                bool hasAffine, const AffineTransform& aff,
+                                bool hasAffine, const Affine& aff,
                                 cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
 {
     base = pts.clone(); base *= scale_seg;
@@ -460,21 +378,6 @@ static size_t usableMemoryBytes()
     return bytes;
 }
 
-static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
-{
-    auto markerPath = volumePath / ".remote_source.json";
-    std::ifstream file(markerPath);
-    if (!file.is_open()) return {};
-
-    try {
-        Json marker = Json::parse_file(markerPath);
-        if (marker.contains("url") && marker["url"].is_string())
-            return marker["url"].get_string();
-    } catch (...) {
-    }
-    return {};
-}
-
 // Sparse pyramids (e.g. lasagna prediction zarrs holding only their scaledown
 // level) keep absent levels as {0,0,0} placeholders, so a pure range check on
 // numLevels() passes and every read at such a level comes back as fill value.
@@ -519,7 +422,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     float scaleSeg,
     float dsScale,
     bool hasAffine,
-    const AffineTransform& aff,
+    const Affine& aff,
     uint32_t rowStart,
     uint32_t rowEnd,
     uint32_t bandH,
@@ -630,7 +533,7 @@ static void renderBands(
     vc::render::IChunkedArray* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
-    bool hasAffine, const AffineTransform& aff,
+    bool hasAffine, const Affine& aff,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -780,7 +683,7 @@ static void renderTiles(
     vc::render::IChunkedArray* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
-    bool hasAffine, const AffineTransform& aff,
+    bool hasAffine, const Affine& aff,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -1267,7 +1170,7 @@ int main(int argc, char *argv[])
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
-        ("volume,v", po::value<std::string>()->required(), "Path to the OME-Zarr volume")
+        ("volume,v", po::value<std::string>(), "Local OME-Zarr volume directory, or a remote OME-Zarr URL (http(s)://, s3://) to stream; remote chunks persist in the shared remote cache")
         ("scale", po::value<float>()->required(), "Pixels per level-g voxel (Pg)")
         ("group-idx,g", po::value<int>()->required(), "OME-Zarr group index");
 
@@ -1276,8 +1179,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
-        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
+        ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch the chunks this render reads into the shared remote cache before rendering instead of streaming them during the render")
+        ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1292,8 +1195,6 @@ int main(int argc, char *argv[])
         ("auto-crop", po::bool_switch()->default_value(false), "Auto-crop to valid surface bbox")
         ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(), "Affine JSON files (append :inv to invert)")
         ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(), "0-based indices to invert")
-        ("affine-transform", po::value<std::string>(), "[DEPRECATED] Single affine JSON")
-        ("invert-affine", po::bool_switch()->default_value(false), "[DEPRECATED] Invert single affine")
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
@@ -1321,9 +1222,6 @@ int main(int argc, char *argv[])
         ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
-        ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
-        ("flatten-iterations", po::value<int>()->default_value(10), "ABF++ iterations")
-        ("flatten-downsample", po::value<int>()->default_value(1), "ABF++ downsample factor")
         ("alpha-min", po::value<float>()->default_value(0.0f), "Alpha min (0-255)")
         ("alpha-max", po::value<float>()->default_value(255.0f), "Alpha max (0-255)")
         ("alpha-opacity", po::value<float>()->default_value(230.0f), "Alpha opacity (0-255)")
@@ -1350,6 +1248,10 @@ int main(int argc, char *argv[])
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
         ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
+    StoreToolOptions::add(optional, "Object store holding the --surface to render; with --volume-uuid it is read in "
+                                    "that volume's voxels through the store's view of it (its binding or a "
+                                    "registration), replacing --affine and --scale-segmentation",
+                          {.surfaces = true, .creates = false});
     // clang-format on
 
     po::options_description all("Usage");
@@ -1428,22 +1330,46 @@ int main(int argc, char *argv[])
         return mergeTiffParts(tifOutputArg, numParts) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    std::filesystem::path vol_path = parsed["volume"].as<std::string>();
-    const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
-    std::string remoteUrl = parsed.count("remote-url") ? parsed["remote-url"].as<std::string>() : "";
-    if (remoteUrl.empty()) {
-        remoteUrl = loadCachedRemoteUrl(vol_path);
-        if (!remoteUrl.empty())
-            logPrintf(stdout, "Detected cached remote source: %s\n", remoteUrl.c_str());
+    std::string volumeSource = parsed.count("volume") ? parsed["volume"].as<std::string>() : "";
+    if (parsed.count("remote-url")) {
+        const std::string remoteUrlArg = parsed["remote-url"].as<std::string>();
+        if (volumeSource.empty()) {
+            volumeSource = remoteUrlArg;
+        } else if (volumeSource != remoteUrlArg) {
+            logPrintf(stderr, "Error: --volume (%s) and --remote-url (%s) name different sources; --remote-url is deprecated, pass the remote URL as --volume\n",
+                      volumeSource.c_str(), remoteUrlArg.c_str());
+            return EXIT_FAILURE;
+        }
+        logPrintf(stderr, "Warning: --remote-url is deprecated, pass the remote URL as --volume\n");
     }
+    if (volumeSource.empty()) { logPrintf(stderr, "Error: --volume required\n"); return EXIT_FAILURE; }
+    std::filesystem::path vol_path = volumeSource;
+    const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
+    const std::string remoteUrl = volumeSource.find("://") != std::string::npos ? volumeSource : std::string{};
     const bool useRemoteCache = !remoteUrl.empty();
     if (prefetchRemote && !useRemoteCache) {
-        logPrintf(stderr, "Error: --prefetch-remote requires --remote-url or a cached remote source marker under --volume\n");
+        logPrintf(stderr, "Error: --prefetch-remote requires a remote --volume URL\n");
         return EXIT_FAILURE;
     }
 
-    if (!parsed.count("segmentation")) { logPrintf(stderr, "Error: --segmentation required\n"); return EXIT_FAILURE; }
-    std::filesystem::path seg_path = parsed["segmentation"].as<std::string>();
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::from(parsed);
+    } catch (const std::exception& e) {
+        logPrintf(stderr, "Error: %s\n", e.what());
+        return EXIT_FAILURE;
+    }
+    const bool store_mode = store_options.has_value();
+    if (store_mode ? store_options->surfaces.size() != 1 || parsed.count("segmentation") : !parsed.count("segmentation")) {
+        logPrintf(stderr, "Error: give --segmentation, or --store with one --surface\n");
+        return EXIT_FAILURE;
+    }
+    const std::optional<vc::objects::VolumeVoxels> view_volume = store_mode ? store_options->volume : std::nullopt;
+    if (view_volume && (parsed.count("affine") || parsed.count("affine-invert") || !parsed["scale-segmentation"].defaulted())) {
+        logPrintf(stderr, "Error: --volume-uuid replaces --affine and --scale-segmentation\n");
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path seg_path = store_mode ? store_options->surfaces.front() : parsed["segmentation"].as<std::string>();
 
     float tgt_scale = parsed["scale"].as<float>();
     int group_idx = parsed["group-idx"].as<int>();
@@ -1542,16 +1468,12 @@ int main(int argc, char *argv[])
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
-    AffineTransform affineTransform;
+    Affine affineTransform;
     bool hasAffine = false;
     std::vector<std::pair<std::string,bool>> affineSpecs;
     if (parsed.count("affine"))
         for (const auto& s : parsed["affine"].as<std::vector<std::string>>())
             affineSpecs.push_back(parseAffineSpec(s));
-    if (parsed.count("affine-transform")) {
-        affineSpecs.emplace_back(parsed["affine-transform"].as<std::string>(), parsed["invert-affine"].as<bool>());
-        logPrintf(stdout, "[deprecated] Using --affine-transform; prefer --affine.\n");
-    }
     if (parsed.count("affine-invert") && !affineSpecs.empty()) {
         std::set<int> inv;
         for (int idx : parsed["affine-invert"].as<std::vector<int>>()) {
@@ -1561,19 +1483,18 @@ int main(int argc, char *argv[])
         for (int k = 0; k < int(affineSpecs.size()); k++) if (inv.count(k)) affineSpecs[k].second = true;
     }
     if (!affineSpecs.empty()) {
-        AffineTransform composed;
+        Affine composed;
         for (int k = 0; k < int(affineSpecs.size()); k++) {
             auto& [path, inv] = affineSpecs[k];
             try {
-                auto T = loadAffineTransform(path);
+                auto T = Affine::loadTransformJson(path);
                 logPrintf(stdout, "Loaded affine[%d]: %s%s\n", k, path.c_str(), inv ? " (invert)" : "");
-                if (inv && !invertAffineInPlace(T)) { logPrintf(stderr, "Error: non-invertible affine[%d]\n", k); return EXIT_FAILURE; }
-                composed = composeAffine(composed, T);
+                composed = (inv ? T.inverse() : T) * composed;
             } catch (const std::exception& e) { logPrintf(stderr, "Error loading affine[%d]: %s\n", k, e.what()); return EXIT_FAILURE; }
         }
         hasAffine = true;
         affineTransform = composed;
-        printMat4x4(affineTransform.matrix, "Final composed affine:");
+        printMat4x4(affineTransform, "Final composed affine:");
     }
 
     // Resolved below from the same CLI/metadata value used for OME-Zarr.
@@ -1794,25 +1715,13 @@ int main(int argc, char *argv[])
         }
 
         std::unique_ptr<QuadSurface> surf;
-        try { surf = load_quad_from_tifxyz(seg_folder); }
+        try {
+            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
+                              : load_quad_from_tifxyz(seg_folder);
+        }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
-        if (parsed["flatten"].as<bool>()) {
-            logPrintf(stdout, "Applying ABF++ flattening...\n");
-            vc::ABFConfig cfg;
-            cfg.maxIterations = size_t(parsed["flatten-iterations"].as<int>());
-            cfg.downsampleFactor = parsed["flatten-downsample"].as<int>();
-            cfg.useABF = true; cfg.scaleToOriginalArea = true;
-            if (auto* fs = vc::abfFlattenToNewSurface(*surf, cfg)) {
-                surf.reset(fs);
-                logPrintf(stdout, "Flattened: %dx%d\n", surf->rawPointsPtr()->cols, surf->rawPointsPtr()->rows);
-            } else {
-                logPrintf(stderr, "Warning: ABF++ failed, using original\n");
-            }
-        }
-
-        // Set the surface resampling mode here, AFTER the --flatten block above
-        // (which does surf.reset() and would drop it) and BEFORE both the
+        // Set the surface resampling mode here, BEFORE both the
         // prefetch planning pass and the render pass. The planner re-runs
         // gen() itself to work out which chunks the render will touch, so if
         // this moved below it the planner and the sampler would disagree
@@ -1838,14 +1747,7 @@ int main(int argc, char *argv[])
         cv::Size full_size = raw_points->size();
 
         // Compute render scale
-        double sA = 1.0;
-        if (hasAffine) {
-            cv::Matx33d A(affineTransform.matrix(0,0), affineTransform.matrix(0,1), affineTransform.matrix(0,2),
-                          affineTransform.matrix(1,0), affineTransform.matrix(1,1), affineTransform.matrix(1,2),
-                          affineTransform.matrix(2,0), affineTransform.matrix(2,1), affineTransform.matrix(2,2));
-            double d = cv::determinant(cv::Mat(A));
-            if (std::isfinite(d) && std::abs(d) > 1e-18) sA = std::cbrt(std::abs(d));
-        }
+        const double sA = hasAffine ? affineTransform.lengthScale() : 1.0;
         double render_scale = double(tgt_scale) * (double(scale_seg) * sA * double(ds_scale));
 
         {

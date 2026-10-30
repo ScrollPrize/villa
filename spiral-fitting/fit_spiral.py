@@ -31,7 +31,6 @@ import numpy as np
 import scipy.ndimage
 import scipy.sparse
 import scipy.sparse.csgraph
-import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -50,6 +49,7 @@ from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
                     SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
+from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
@@ -76,7 +76,7 @@ from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
-from geom_utils import bilinear_atlas_lookup, interp1d
+from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
 from point_collection import (
     PatchLinkOptions,
     SIDE_BEHIND,
@@ -326,12 +326,9 @@ class ShellPolarMap:
         z_normalised = (scan_zyx[..., 0] - self.z_min) / (self.z_max - self.z_min) * 2 - 1
         theta_normalised = theta / (2 * torch.pi) * 2 - 1
         grid = torch.stack([theta_normalised, z_normalised], dim=-1).view(1, -1, 1, 2)
-        sampled = F.grid_sample(
+        sampled = grid_sample_border(
             self.lookup_table[None],
             grid,
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True,
         ).view(2, -1)
         target_radius = sampled[0].view(scan_zyx.shape[:-1])
         confidence = sampled[1].view(scan_zyx.shape[:-1])
@@ -363,6 +360,10 @@ def _make_patch_sampling_atlas(masks):
             f'PatchSamplingAtlas is missing {", ".join(missing)}; rebuild and '
             'install the Spiral native extensions')
     return atlas
+
+
+# Host staging bound for one PatchAtlas geometry upload, in bytes.
+PATCH_ATLAS_STAGING_BYTES = 256 * (1 << 20)
 
 
 class PatchAtlas:
@@ -440,7 +441,7 @@ class PatchAtlas:
         # Amortise transfers without ever concatenating the whole atlas on
         # the host.  256 MiB bounds the temporary independently of dataset
         # size while preserving the exact float32 bytes and patch order.
-        staging_limit = 256 * (1 << 20) // (3 * 4)
+        staging_limit = PATCH_ATLAS_STAGING_BYTES // (3 * 4)
         pieces = []
         staged = 0
         offset = 0
@@ -451,7 +452,7 @@ class PatchAtlas:
                 return
             staging = torch.cat(pieces, dim=0)
             resident[offset:offset + staged].copy_(
-                staging, non_blocking=True)
+                staging, non_blocking=device.type == 'cuda')
             offset += staged
             pieces = []
             staged = 0
@@ -464,7 +465,7 @@ class PatchAtlas:
             # advertised staging bound is not exceeded.
             if len(piece) > staging_limit:
                 resident[offset:offset + len(piece)].copy_(
-                    piece, non_blocking=True)
+                    piece, non_blocking=device.type == 'cuda')
                 offset += len(piece)
             else:
                 pieces.append(piece)
@@ -634,9 +635,13 @@ class PatchAtlas:
                 bottom = bl + (br - bl) * dj
                 output[selected] = top + (bottom - top) * di
             return output.reshape(*shape, 3).to(self.device)
+        # MPS reads a pageable host source after a non_blocking copy returns,
+        # and these sources are often freed temporaries; CUDA stages them first.
+        non_blocking = self.zyxs_flat.device.type == 'cuda'
         patch_idx_per_sample = patch_idx_per_sample.to(
-            device=self.zyxs_flat.device, dtype=torch.int64, non_blocking=True)
-        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=True)
+            device=self.zyxs_flat.device, dtype=torch.int64,
+            non_blocking=non_blocking)
+        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=non_blocking)
         if len(self._geometry_chunks) == 1:
             chunk = self._geometry_chunks[0]
             return bilinear_atlas_lookup(
@@ -1305,7 +1310,8 @@ class FitContext:
                  progress=None, resume_path=None,
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
-                 render_volume_scale=16, dist_context=None):
+                 render_volume_scale=16, dist_context=None,
+                 input_bindings=None):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
@@ -1354,6 +1360,9 @@ class FitContext:
         # explicitly configured sources for subsequent enables.
         self._configured_pcl_sources = tuple(paths.pcls)
         self.interactive_driver = interactive_driver
+        # Editing-workspace records a resident build binds before its first
+        # derivation (see _bind_input_records). None outside a workspace.
+        self.input_bindings = tuple(input_bindings or ())
         self.progress = progress
         self.resume_path = resume_path or None
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
@@ -1367,6 +1376,8 @@ class FitContext:
         # single-rank context when nothing joined one). Nothing below reads
         # RANK/WORLD_SIZE from the environment.
         self.dist = dist_context or process_context()
+        # The device every session tensor lives on (devices.fit_device).
+        self.device = fit_device()
 
         # Scroll physical facts.
         self.scroll_name = scroll.name
@@ -1963,6 +1974,8 @@ class FitContext:
 
     def check_cuda_ready(self):
         """Create the CUDA context before input reads increase host cache pressure."""
+        if self.device.type != 'cuda':
+            return
         progress_or_null(self.progress).begin('loading', 'Checking CUDA availability')
         try:
             # Use the current device selected by the distributed driver. Keep
@@ -2160,6 +2173,19 @@ class FitContext:
                 pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
             }
             self._source_verified_patches = dict(verified_patches)
+            if self.input_bindings:
+                # Bind the editing workspace's identities before the one
+                # derivation, so the service need not replay the unchanged
+                # baseline through a second full relink after the build.
+                self._workspace_membership = {}
+                self.next_id = next_id
+                self._bind_input_records(self.input_bindings)
+                next_id = self.next_id
+                verified_patches = {
+                    pid: patch for pid, patch in verified_patches.items()
+                    if pid in self._source_verified_patches}
+                point_collections, fiber_point_collections = \
+                    self._enabled_point_inputs()
         self._derive_point_inputs(
             verified_patches, point_collections, fiber_point_collections)
         unattached_pcl_strips = self.unattached_pcl_strips
@@ -2251,7 +2277,7 @@ class FitContext:
         # run has no verified patches.  Device setup and theta-topology
         # registration deliberately consume an empty atlas without special
         # casing, and interactive patch incorporation can append to it later.
-        patch_atlas = PatchAtlas(verified_patches, device='cuda')
+        patch_atlas = PatchAtlas(verified_patches, device=self.device)
         if verified_patches:
             print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
             topology_stats = patch_atlas.topology_memory_stats()
@@ -2840,7 +2866,7 @@ class FitContext:
         if not stats and not clip_stats:
             return lines, payload
         ranges = (self.spiral_and_transform.flow_max_corner_zyx
-                  - self.spiral_and_transform.flow_min_corner_zyx).to(torch.float64).cpu()
+                  - self.spiral_and_transform.flow_min_corner_zyx).cpu().to(torch.float64)
         cylindrical = self.config['model_flow_field_type'] in ('cylindrical', 'bspline_cylindrical')
         component_names = ('z', 'r', 't') if cylindrical else ('z', 'y', 'x')
         # Component 0 is z; the in-plane components (radial and tangential,
@@ -2977,6 +3003,7 @@ class FitContext:
             lasagna_scale=self.lasagna_scale,
             storage_backend=self.lasagna_storage_backend,
             cache_directory=self.cache_path,
+            device=self.device,
             progress=progress,
         )
         if interactive_driver is not None and self.lasagna_volume:
@@ -2995,10 +3022,11 @@ class FitContext:
                     self.winding_inference_path)))
             self.winding_inference = load_winding_inference_store(
                 self.winding_inference_path,
-                torch.device('cuda'),
+                self.device,
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
                 z_range=(self.z_begin, self.z_end),
+                z_to_umbilicus_yx=self.umbilicus_z_to_yx(),
             )
             print(
                 'loaded winding inference: '
@@ -3006,7 +3034,9 @@ class FitContext:
                 f"({self.winding_inference.num_z_eligible_rays:,} intersect "
                 f"z-range [{self.z_begin}, {self.z_end})), "
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
-                'crossings')
+                'crossings, '
+                f"{self.winding_inference.num_inward_rays:,} inward rays "
+                'flipped')
 
         self._density_inactive_warned = set()
 
@@ -3116,6 +3146,10 @@ class FitContext:
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.verified_patches[patch_id]
+            # Live input batches rebuild their patch set from the resident
+            # sources. Dropping the patch there too keeps every later batch
+            # from linking against it only to reject it again and relink.
+            getattr(self, '_source_verified_patches', {}).pop(patch_id, None)
 
         # Preserve list identities where possible because resident-session
         # loss closures may already hold them.
@@ -3199,7 +3233,6 @@ class FitContext:
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
 
-        self.device = torch.device('cuda')
         progress.begin(
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(self.verified_patches):,} patches')
@@ -3526,6 +3559,8 @@ class FitContext:
         # replacements rather than peaking at twice the model.
         gc.collect()
         torch.cuda.empty_cache()
+        if self.device.type == 'mps':
+            torch.mps.empty_cache()
         self._build_model_state()
 
     # ==========================================================================
@@ -3578,6 +3613,8 @@ class FitContext:
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            **({'torch_mps_rng_state': torch.mps.get_rng_state()}
+               if self.device.type == 'mps' else {}),
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -3895,6 +3932,9 @@ class FitContext:
                       f'{min(len(saved_cuda_states), local_device_count)}')
             for device_index, state in enumerate(saved_cuda_states[:local_device_count]):
                 torch.cuda.set_rng_state(state, device_index)
+        if (checkpoint.get('torch_mps_rng_state') is not None
+                and self.device.type == 'mps'):
+            torch.mps.set_rng_state(checkpoint['torch_mps_rng_state'])
 
     def load_checkpoint(self, checkpoint):
         checkpoint, _ = tolerate_checkpoint_config(checkpoint)
@@ -4022,6 +4062,7 @@ class FitContext:
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
+        mps_state = torch.mps.get_rng_state() if self.device.type == 'mps' else None
         try:
             # The preview surface must land in true scroll space, so after
             # any constraint bake it is pulled back through the composed
@@ -4173,6 +4214,8 @@ class FitContext:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
+            if mps_state is not None:
+                torch.mps.set_rng_state(mps_state)
             self._release_export_arena()
 
     def _release_export_arena(self):
@@ -4191,6 +4234,15 @@ class FitContext:
         amount is printed because it is the only way to know whether the
         contention this avoids was worth avoiding.
         """
+        if self.device.type == 'mps':
+            driver_before = torch.mps.driver_allocated_memory()
+            gc.collect()
+            torch.mps.empty_cache()
+            print(
+                f'preview export: released '
+                f'{(driver_before - torch.mps.driver_allocated_memory()) / 1024 ** 3:.2f} GiB '
+                f'of cached MPS memory before publication', flush=True)
+            return
         if not torch.cuda.is_available():
             return
         reserved_before = torch.cuda.memory_reserved()
@@ -4206,6 +4258,139 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
+    def _bind_input_records(self, records):
+        """Apply workspace revision records to this context's resident sources.
+
+        Mutates ``_source_verified_patches``, ``_source_point_collections``,
+        ``_workspace_membership`` and ``next_id`` only; nothing is derived.
+        A baseline adoption (``adopt``) binds a workspace identity to the
+        geometry the initial loader already selected. Live batches call this
+        on a candidate copy; a resident build calls it on itself with the
+        workspace's adoption records before its one derivation.
+        """
+        seen = set()
+        for record in records:
+            logical_id = str(record['id'])
+            if logical_id in seen:
+                raise ValueError('A batch cannot contain two revisions of one input')
+            seen.add(logical_id)
+            kind = record['kind']
+            deleted = bool(record.get('deleted'))
+            adopt = bool(record.get('adopt'))
+            path = record.get('path')
+            source_id = str(record.get('source_id', logical_id))
+            if kind == 'patch':
+                source = self._source_verified_patches
+                if source_id != logical_id and source_id in source:
+                    # Preserve the dataset patch name for between-patch
+                    # annotations; catalog UUID is independent of that name.
+                    patch_id = source_id
+                else:
+                    patch_id = self._workspace_membership.get(logical_id, {}).get(
+                        'resident_id', source_id)
+                if deleted:
+                    source.pop(patch_id, None)
+                elif not adopt:
+                    # Baseline adoption only binds workspace identities.
+                    # The initial loader already selected usable geometry
+                    # (z range, erosion, name filter, and input toggles).
+                    # An absent baseline must stay excluded, not be read
+                    # again through the stricter live-revision loader.
+                    patch = load_tifxyz(path)
+                    patch._source_path = os.path.abspath(path)
+                    cells = patch.erosion_cells(self.config['patch_erode_patches'])
+                    valid = cells <= 0 or erode_patch_valid_region(patch, cells)
+                    intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
+                    if not valid or not intersects:
+                        reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
+                        raise ValueError(f'Patch {logical_id} {reason}')
+                    source[patch_id] = patch
+                resident_id = patch_id
+            elif kind in {'pcl', 'fiber'}:
+                source = self._source_point_collections
+                previous = self._workspace_membership.get(logical_id, {})
+                resident_id = previous.get('resident_id')
+                if resident_id is None:
+                    for cid, pcl in source.items():
+                        metadata = pcl.get('metadata', {})
+                        same_source = os.path.realpath(pcl.get('source_file', '')) == os.path.realpath(
+                            record.get('source_path') or path or '')
+                        if kind == 'fiber':
+                            match = metadata.get('logical_input_kind') == 'fiber' and (
+                                str(metadata.get('logical_input_id')) == source_id or same_source)
+                        else:
+                            match = (same_source and str(pcl.get('id')) == source_id
+                                     and metadata.get('input_role') == record.get('role'))
+                        if match:
+                            resident_id = cid
+                            break
+                if resident_id is None:
+                    resident_id = self.next_id
+                    self.next_id += 1
+                if deleted:
+                    source.pop(resident_id, None)
+                elif adopt and kind == 'fiber' and resident_id not in source:
+                    # Preserve startup exclusions (including disabled or
+                    # malformed fibers) while retaining workspace identity.
+                    pass
+                else:
+                    if adopt and resident_id in source:
+                        pcl = source[resident_id]
+                        if kind == 'fiber':
+                            pcl['source_file'] = path
+                    elif kind == 'fiber':
+                        pcl = load_fiber_point_collection(
+                            path, resident_id,
+                            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+                            base_shape_zyx=getattr(self, 'base_shape_zyx', None))
+                        if pcl is None:
+                            raise ValueError(f'Fiber {logical_id} has no usable control points')
+                        pcl['sampling_group'] = 'fibers'
+                        pcl['file_basename'] = f'{source_id}.json'
+                        pcl['source_file'] = path
+                        pcl.setdefault('metadata', {}).update(
+                            input_role='fiber', winding_is_absolute=False)
+                    else:
+                        loaded = load_point_collection(path) or {}
+                        if len(loaded) != 1:
+                            raise ValueError('A logical PCL input contains exactly one collection')
+                        pcl = next(iter(loaded.values()))
+                        stamp_loaded_pcl_metadata(
+                            pcl, record.get('source_path') or path, record.get('role'), resident_id)
+                    pcl.setdefault('metadata', {}).update({
+                        'workspace_input_id': logical_id,
+                        'logical_input_kind': kind,
+                        'logical_input_id': logical_id,
+                        'logical_input_revision': record.get('revision'),
+                    })
+                    source[resident_id] = pcl
+            else:
+                raise ValueError(f'Unknown input kind {kind!r}')
+            self._workspace_membership[logical_id] = {
+                'kind': kind, 'revision': record.get('revision'),
+                'resident_id': resident_id, 'deleted': deleted,
+            }
+
+    def _enabled_point_inputs(self):
+        """Private copies of the enabled resident point sources.
+
+        Returns ``(points, fibers)``: every enabled collection keyed by resident
+        id, and the fiber subset of the same objects.
+        """
+        points, fibers = {}, {}
+        for cid, pcl in self._source_point_collections.items():
+            metadata = pcl.get('metadata', {})
+            role = ('fiber' if metadata.get('logical_input_kind') == 'fiber'
+                    else metadata.get('input_role'))
+            enabled = (input_source_enabled(self.config, 'fibers') if role == 'fiber'
+                       else pcl_input_enabled(self.config, None if role == 'legacy' else role,
+                                              pcl.get('source_file', '')))
+            if enabled:
+                points[cid] = catalog_copy_of_pcl(pcl)
+                if role == 'fiber':
+                    fibers[cid] = points[cid]
+        return points, fibers
+
     def prepare_input_changes(self, records, *,
                               current_iteration=0, target_iteration=0):
         """Prepare a complete revision batch without changing active state.
@@ -4220,6 +4405,7 @@ class FitContext:
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
+        mps_state = torch.mps.get_rng_state() if self.device.type == 'mps' else None
         try:
             candidate = copy.copy(self)
             candidate._preparing_inputs = True
@@ -4231,108 +4417,7 @@ class FitContext:
             }
             candidate._workspace_membership = dict(getattr(self, '_workspace_membership', {}))
             candidate.next_id = self.next_id
-            seen = set()
-            for record in records:
-                logical_id = str(record['id'])
-                if logical_id in seen:
-                    raise ValueError('A batch cannot contain two revisions of one input')
-                seen.add(logical_id)
-                kind = record['kind']
-                deleted = bool(record.get('deleted'))
-                adopt = bool(record.get('adopt'))
-                path = record.get('path')
-                source_id = str(record.get('source_id', logical_id))
-                if kind == 'patch':
-                    source = candidate._source_verified_patches
-                    if source_id != logical_id and source_id in source:
-                        # Preserve the dataset patch name for between-patch
-                        # annotations; catalog UUID is independent of that name.
-                        patch_id = source_id
-                    else:
-                        patch_id = candidate._workspace_membership.get(logical_id, {}).get(
-                            'resident_id', source_id)
-                    if deleted:
-                        source.pop(patch_id, None)
-                    elif not adopt:
-                        # Baseline adoption only binds workspace identities.
-                        # The initial loader already selected usable geometry
-                        # (z range, erosion, name filter, and input toggles).
-                        # An absent baseline must stay excluded, not be read
-                        # again through the stricter live-revision loader.
-                        patch = load_tifxyz(path)
-                        patch._source_path = os.path.abspath(path)
-                        cells = patch.erosion_cells(self.config['patch_erode_patches'])
-                        valid = cells <= 0 or erode_patch_valid_region(patch, cells)
-                        intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
-                        if not valid or not intersects:
-                            reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
-                            raise ValueError(f'Patch {logical_id} {reason}')
-                        source[patch_id] = patch
-                    resident_id = patch_id
-                elif kind in {'pcl', 'fiber'}:
-                    source = candidate._source_point_collections
-                    previous = candidate._workspace_membership.get(logical_id, {})
-                    resident_id = previous.get('resident_id')
-                    if resident_id is None:
-                        for cid, pcl in source.items():
-                            metadata = pcl.get('metadata', {})
-                            same_source = os.path.realpath(pcl.get('source_file', '')) == os.path.realpath(
-                                record.get('source_path') or path or '')
-                            if kind == 'fiber':
-                                match = metadata.get('logical_input_kind') == 'fiber' and (
-                                    str(metadata.get('logical_input_id')) == source_id or same_source)
-                            else:
-                                match = (same_source and str(pcl.get('id')) == source_id
-                                         and metadata.get('input_role') == record.get('role'))
-                            if match:
-                                resident_id = cid
-                                break
-                    if resident_id is None:
-                        resident_id = candidate.next_id
-                        candidate.next_id += 1
-                    if deleted:
-                        source.pop(resident_id, None)
-                    elif adopt and kind == 'fiber' and resident_id not in source:
-                        # Preserve startup exclusions (including disabled or
-                        # malformed fibers) while retaining workspace identity.
-                        pass
-                    else:
-                        if adopt and resident_id in source:
-                            pcl = source[resident_id]
-                            if kind == 'fiber':
-                                pcl['source_file'] = path
-                        elif kind == 'fiber':
-                            pcl = load_fiber_point_collection(
-                                path, resident_id,
-                                min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
-                                base_shape_zyx=getattr(self, 'base_shape_zyx', None))
-                            if pcl is None:
-                                raise ValueError(f'Fiber {logical_id} has no usable control points')
-                            pcl['sampling_group'] = 'fibers'
-                            pcl['file_basename'] = f'{source_id}.json'
-                            pcl['source_file'] = path
-                            pcl.setdefault('metadata', {}).update(
-                                input_role='fiber', winding_is_absolute=False)
-                        else:
-                            loaded = load_point_collection(path) or {}
-                            if len(loaded) != 1:
-                                raise ValueError('A logical PCL input contains exactly one collection')
-                            pcl = next(iter(loaded.values()))
-                            stamp_loaded_pcl_metadata(
-                                pcl, record.get('source_path') or path, record.get('role'), resident_id)
-                        pcl.setdefault('metadata', {}).update({
-                            'workspace_input_id': logical_id,
-                            'logical_input_kind': kind,
-                            'logical_input_id': logical_id,
-                            'logical_input_revision': record.get('revision'),
-                        })
-                        source[resident_id] = pcl
-                else:
-                    raise ValueError(f'Unknown input kind {kind!r}')
-                candidate._workspace_membership[logical_id] = {
-                    'kind': kind, 'revision': record.get('revision'),
-                    'resident_id': resident_id, 'deleted': deleted,
-                }
+            candidate._bind_input_records(records)
 
             candidate.verified_patches = {
                 pid: copy.copy(patch) for pid, patch in candidate._source_verified_patches.items()
@@ -4344,18 +4429,7 @@ class FitContext:
             candidate.patch_atlas = self.patch_atlas.replaced(candidate.verified_patches)
             candidate._input_warnings = []
             while True:
-                points, fibers = {}, {}
-                for cid, pcl in candidate._source_point_collections.items():
-                    metadata = pcl.get('metadata', {})
-                    role = ('fiber' if metadata.get('logical_input_kind') == 'fiber'
-                            else metadata.get('input_role'))
-                    enabled = (input_source_enabled(self.config, 'fibers') if role == 'fiber'
-                               else pcl_input_enabled(self.config, None if role == 'legacy' else role,
-                                                      pcl.get('source_file', '')))
-                    if enabled:
-                        points[cid] = catalog_copy_of_pcl(pcl)
-                        if role == 'fiber':
-                            fibers[cid] = points[cid]
+                points, fibers = candidate._enabled_point_inputs()
                 candidate._derive_point_inputs(
                     candidate.verified_patches, points, fibers,
                     direction_source=candidate._desired_fiber_link_direction_source(current_iteration))
@@ -4403,6 +4477,8 @@ class FitContext:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
+            if mps_state is not None:
+                torch.mps.set_rng_state(mps_state)
 
     def install_input_changes(self, candidate):
         """Install a successfully prepared candidate on the fitter thread."""
@@ -4944,7 +5020,7 @@ class FitContext:
                     self.config['dt_target_floating_threshold'],
                 ))
             if compute_unattached_pcl_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
-                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
+                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, self.device)
                 if pcl_flat is not None:
                     unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
                         self.slice_to_spiral_transform, self.dr_per_winding,
@@ -5510,7 +5586,7 @@ if __name__ == '__main__':
     import argparse
 
     from fit_session import (conventional_input_paths, default_user_cache_dir,
-                             load_scroll_spec)
+                             load_scroll_spec, scroll_spec_config_defaults)
 
     parser = argparse.ArgumentParser(
         description='Headless Spiral fit over one dataset root.')
@@ -5541,6 +5617,9 @@ if __name__ == '__main__':
     maybe_init_distributed(dist_context)
     try:
         config = Config().as_dict()
+        # A winding count in spiral-scroll.json replaces the generic default;
+        # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
+        config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(get_env_config_overrides())
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',

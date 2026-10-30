@@ -33,15 +33,4 @@ double number_or(const utils::Json& m, const char* key, double def);
 // Returns a string if present and of string type, else def.
 std::string string_or(const utils::Json& m, const char* key, const std::string& def);
 
-// Returns tags object if present & object, else {} (by value).
-utils::Json tags_or_empty(const utils::Json& m);
-
-bool has_tag(const utils::Json& m, const char* tag);
-
-// Ensure meta is non-null and an object {}.
-void ensure_object(utils::Json& m);
-
-// Ensure meta is an object and meta["tags"] is an object; returns a ref.
-utils::Json& ensure_tags(utils::Json& m);
-
 } // namespace vc::json

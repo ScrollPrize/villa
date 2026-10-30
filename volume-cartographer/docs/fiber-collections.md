@@ -1,152 +1,207 @@
-# Automated Fiber Volumes (.afv)
+# Fibers in an object store
 
-An **Automated Fiber Volume** is a single read-only SQLite file holding a large
-fiber collection, such as the output of automated fiber tracing: exact geometry,
-per-fiber annotations and a spatial index over blocks of geometry. It is written
-outside VC3D, in the format described below. VC3D displays it next to the
-editable annotations without importing it. Opening a volume reads its metadata
-and one catalog page; each view then loads only the fibers crossing its visible
-slice.
+Fiber geometry, annotations, stable control point identities, revisions, and
+shared branch relationships live in an object store (`.vcobj`): by default the
+open project's. Another store can be attached beside the project (**File →
+Stores → Attach Store...**, or launch `VC3D --project p.vcobj --attach-store
+/data/fibers.vcobj`) and chosen for fibers with **File → Stores → Show Fibers
+From**, or with the fiber pane's store buttons. Stores attached beside a project
+and the store chosen for each kind are remembered with the project on this
+machine. Changing the fiber store cancels old background reads and closes the
+fiber panes after accepted writes finish.
 
-![A 61,486-fiber Automated Fiber Volume of PHerc. 0175A drawn on the XY and YZ CT slices with rainbow colors, next to its dock](images/fiber-collection-viewer.jpg)
+To share fibers with other people, keep the store as a hosted hub on a network
+share. **File → Stores → Clone Hosted Store...** copies the hub into a local
+replica and attaches it beside the project; **File → Clone Hosted Project...**
+opens it as the project itself, so the team also shares its volumes. VC3D syncs
+replicas in the background: every 15 s, and shortly after each local edit. The
+status bar shows the sync state. **File → Stores → Sync Hosted Stores Now** syncs
+immediately. Remote volumes (URLs) of a shared project are everyone's; a volume
+at a local path is listed only for the person who attached it.
 
-## Open
+Enabling editing of a fiber, and any edit, tag or retire action, first leases
+that fiber from the hub. If someone else holds the lease, VC3D reports who and
+the fiber stays read-only. Leases of fibers still open for editing are renewed.
+Other leases are released once their changes are pushed. When a fiber changed
+both here and on the hub, VC3D asks whether to use the hub's version or keep
+yours. See the store's [hosted hub
+guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas).
 
-```sh
-VC3D --volpkg scroll.volpkg.json --fiber-collection fibers.afv
-```
-
-or use **File → Open Automated Fiber Volume…**. The dock is under
-**View → Fibers**.
-
-## Viewer
-
-* **Catalog.** Fibers are listed 200 per page, longest first, with lengths in
-  millimeters and ties ordered by ID. In the main workspace, clicking a row
-  selects the fiber and centers the views on its middle point. In Line
-  Annotation, it opens the fiber's flattened view.
-* **Filters.** **Minimum length (mm)** uses the complete stored polyline
-  length (inclusive; 0 disables it). **Horizontal** and **Vertical** use the
-  stored H/V classification; with both enabled, unclassified fibers are shown
-  too. Filters apply to both the catalog and the overlay.
-* **Display.** **Max displayed fibers** (default 1,000; 0 shows all) limits
-  each viewport to that many fibers among those crossing its slice, chosen by
-  stable per-fiber priorities; a visible selected fiber is always included.
-  **Slice distance** is the half-thickness in native L0 voxels. Blue is H,
-  orange V, grey unclassified and yellow the selection; **Rainbow colors**
-  gives each fiber a stable color instead. Settings are remembered.
-* **Selection.** A plain left click on a trace selects it and reveals it in the
-  catalog; entering an ID does the same. Clicks used by collection points,
-  fiber annotation, segmentation editing or line placement keep their native
-  behavior, and drags are never treated as picks. The slider follows every
-  stored point of the selected fiber.
-* **Line Annotation.** **Open in Line Annotation** copies only the selected
-  fiber into the project's editable annotations and fits it in both strips;
-  opening it again reuses that copy. The `.afv` itself is never modified. If
-  the project has no Lasagna dataset, the cuts follow a frame transported
-  along the curve instead of measured sheet normals, and a notice says so.
-  This frame is used for display only; tracing and optimization still require
-  a dataset.
-* **Limits.** The overlay is drawn on planar CT views, axis-aligned or oblique.
-  Each viewport retains at most 8 MiB of visible geometry and shows
-  **Partial fiber view** beyond that; zoom in or raise the minimum length.
-
-## Coordinates
-
-Coordinates are native L0 XYZ. VC3D opens a volume only if its `frame`
-metadata names a `vc_open_data_coordinate_space` matching the coordinate
-identity of the current CT volume, and uses that identity to display it on
-volumes opened at another pyramid level. For a custom project, the volume entry
-must carry the `vc-open-data-coordinate-space:<identity>` and
-`vc-open-data-source-coordinate-level:<level>` tags and resolution metadata. A
-missing or mismatching identity is reported in the dock.
-
-## Project attachment
-
-One volume can be attached per project. Its path (relative when possible) and
-UUID are saved in `<project JSON>.fiber-collection.json`, or in
-`fiber-collection.json` inside a volume package directory. It reopens with the
-project without showing a hidden dock, and stays open when another volume of
-the same coordinate space is selected. A file replaced by
-one with a different UUID must be opened again explicitly. **Save Project As**
-does not copy this attachment. **Detach volume** removes the reference, not the
-data.
-
-## Format version 1
-
-A single SQLite database with RTree support, `PRAGMA application_id=0x56434643`
-(`VCFC`) and `PRAGMA user_version=1`:
-
-```sql
-CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE fibers(
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, family TEXT NOT NULL,
-  point_count INTEGER NOT NULL CHECK(point_count >= 2), length REAL NOT NULL,
-  min_x REAL NOT NULL, max_x REAL NOT NULL, min_y REAL NOT NULL, max_y REAL NOT NULL,
-  min_z REAL NOT NULL, max_z REAL NOT NULL, annotation TEXT NOT NULL);
-CREATE INDEX fibers_length ON fibers(length DESC, id);
-CREATE TABLE blocks(
-  id INTEGER PRIMARY KEY, fiber_id INTEGER NOT NULL REFERENCES fibers(id),
-  first_segment INTEGER NOT NULL, points BLOB NOT NULL,
-  UNIQUE(fiber_id, first_segment));
-CREATE VIRTUAL TABLE block_bounds USING rtree(id, min_x, max_x, min_y, max_y, min_z, max_z);
-```
-
-`metadata` values are JSON:
-
-| Key | Value |
-| --- | --- |
-| `complete` | `true` once the file is fully written; other files are refused |
-| `uuid` | a string identifying this file |
-| `frame` | an object with `vc_open_data_coordinate_space`, and optionally `vc_open_data_source_coordinate_level` (must be 0) and `vc_open_data_source_coordinate_scale_factor` (must be 1) |
-| `root` | an object with collection-level fields |
-| `fiber_count`, `point_count` | integers |
-
-The `coordinate_base_shape_zyx` and `vc_open_data_*` fields of `frame` and
-`root` are copied into fibers opened in Line Annotation. Either object may
-declare them; when both do, the values must match.
-
-* **fibers** has one row per fiber. `family` is `H`, `V` or empty. `length` is
-  the complete polyline length in native L0 voxels, and the bounds cover all
-  its points. `annotation` is the fiber as a VC3D fiber annotation object
-  (`"type": "vc3d_fiber"`) without `line_points`; **Open in Line Annotation**
-  adds the geometry to it. The `fibers_length` index keeps the length-sorted
-  catalog fast.
-* **blocks** stores the geometry as little-endian binary64 XYZ triples, in
-  point order. A block holds 2 to 257 points (at most 256 segments) starting
-  at segment `first_segment`, and shares its last point with the next block of
-  the same fiber, so a segment is identified by
-  `(uuid, fiber ID, first_segment + local index)`.
-* **block_bounds** holds the bounds of each block under its block ID.
-
-Coordinates must be finite. VC3D reads them exactly as stored and never
-simplifies them. The file is opened read-only and must not be modified while
-attached.
-
-## Reader
-
-`vc/core/types/FiberCollection.hpp` (CMake target `vc_fiber_collection`, which
-depends only on SQLite) provides the metadata, fiber summaries, the
-length-sorted catalog, view queries, ordered fiber blocks, point lookup and
-annotations. Each instance owns one read-only connection and must be used by
-one thread at a time.
-
-A view query takes candidate blocks from the RTree, then clips every segment
-exactly against the slice prism, so crossings without a vertex inside the slice
-are kept. Only the visible runs of segments are returned, with their original
-coordinates and indices. VC3D gives each view a 32 MiB cache of block bounds
-and decoded blocks; cached data never replaces the exact clipping, and a
-cancelled query never populates the cache.
-
-## Build and test
-
-SQLite development headers with RTree support are required: `libsqlite3-dev`
-on Debian/Ubuntu, `sqlite` on Homebrew, `sqlite3[rtree]` with vcpkg. With
-`-DVC_TESTING=ON`:
+Create the database outside VC3D, using the sibling object-store tools:
 
 ```sh
-cmake --build build --target VC3D test_fiber_collection
-ctest --test-dir build -R test_fiber_collection --output-on-failure
+vc_object_ingest --db /data/fibers.vcobj --author reviewer --fiber /data/native-fibers
 ```
 
-The test writes its own `.afv` files in the format above.
+Inspect the reported problems before proceeding. Ingestion preserves source UUIDs
+and imports a directory's branch graph atomically. Fiber transfer accepts the
+current version-4 format; there is no legacy-file conversion or refresh path. Native JSON import/export in
+VC3D is an explicit transfer operation; exported files are not live storage.
+Surfaces and the point collections attached to them (corrections, tool results)
+are objects of the same store; CT and inference volumes retain their existing
+storage.
+
+Open a CT volume and select a fiber in the **Fibers** panel of the status bar. When its
+coordinate identity or scale is missing, the binding dialog shows the active
+volume identity, dimensions and resolution, alongside known fiber metadata and
+bounds. Enter **stored fiber units per active-volume voxel**. For geometry in a
+level-0 grid viewed at level 2, this is 4. Only use that value when those frames
+are known to match. The assignment is a checked database edit. Unbound fibers
+remain listed but do not contribute to overlays or slice queries. Each displayed
+fiber uses its own binding to the viewer's actual volume, including hit testing.
+`meta.coordinates` is authoritative: `volume_uuid` stores the volume's `id` from
+open-data `metadata.json` verbatim (for example `20260411134726`). VC3D compares
+it directly with `Volume::id()`; it does not generate or canonicalize a UUID.
+Its scale must be finite and positive. Advisory labels cannot override a different
+volume ID. Existing derived-UUID bindings require an explicit metadata correction. Transfer preserves known and unknown coordinates for every
+geometry kind.
+
+Completed interactions and accepted solver results commit immediately. Save waits
+for outstanding work and writes; it is not required to persist an edit. Conflicts
+leave current database contents intact and refresh the affected working views.
+A superseded solver result is discarded and outstanding work restarts against the
+current revision. Split and merge publish their geometry, annotations, branch
+changes and source retirement together. Ordinary and adjacent branches retain
+their distinct winding semantics.
+
+Catalog, overlay and spatial requests use `ObjectStore` directly through the
+application's shared `ObjectStoreSession`. There is no fiber repository. Runtime
+numeric handles map to store/object UUIDs; names and transport paths are labels.
+Spiral requests
+serialize pinned revisions into temporary transport artifacts while retaining
+their existing wire formats; the Lasagna service reads surfaces from the store
+itself (`{type: "surface", uuid, revision}` references). Fiber transport uses UUID filenames, with
+display names stored separately. The object-store `fiberNetworkJson` exporter
+reads pinned relationship edges and resolves stable control-point IDs into wire
+indices, preserving reciprocal ordinary, adjacent, and pending branches. Adding
+fibers to Spiral stages their complete linked components before applying inputs.
+Changes refresh the tracked drafts; retirement removes the corresponding UUID
+input. Explicit collection export/import uses the same UUID identities, so equal
+display names do not collide. Service-only fibers are imported, with their linked
+component, into the attached store before editing. Existing object UUIDs retain
+their store contents. Reopened service inputs retain their service IDs through an
+explicit object UUID association. Discarding a service draft does not undo edits
+already committed to the object store.
+
+The shared `GeometryIngest.hpp` API accepts either native files or decoded batches.
+Generic `updateGeometryArrays` handles array/sequence edits across geometry kinds;
+VC3D retains editing semantics and UI state. The same coordinate and artifact helpers
+serve point collections and surfaces. Optional native
+fiber annotations remain optional; import/export preserves unknown metadata and
+branch identities, approval state, and stable control-point IDs.
+
+The object store is the only source of fiber data; VC3D keeps no loaded fiber
+set. The **Fibers** panel (status bar) is the single fiber UI: it attaches and
+detaches the store, filters by minimum length and H/V family, sets the display,
+and lists the store's fibers in pages of 200, longest first in the active
+volume's voxels, followed by fibers not bound to that volume. Each row's details
+(spans, metrics, H/V scores) are read from the store when it is selected or
+expanded. Every edit, tag and link action reads the fiber's current revision and
+commits a checked action; a link is one shared edge, so changing it never rewrites
+the fiber at the other end. Opening a fiber in Line Annotation reads it and its
+linked peers in one snapshot. Whole-store tools (detailed export, the fiber map)
+query the whole store when they run.
+
+VC3D queries in the active volume's voxels through the store's volume target
+(`ObjectSelection::volume`, `RegionOptions::volume`), which spans every
+coordinate frame bound to that volume; VC3D does not iterate frames itself.
+
+The viewers draw the store's fibers near each slice from bounded region
+queries: sampled lines, the control points of annotated fibers, and, with
+**Show linked**, link-component colours and pending/approved link rings. Curved
+surfaces (flattened and segmentation views) draw the control-point chains of
+annotated fibers within the surface's bounds. Right-clicking a drawn control
+point offers to open the fiber there. **Slice ±** is the one distance control.
+
+**Max displayed fibers** defaults to **5,000 per viewport**, persists in settings,
+and applies before geometry decoding. Zero means unlimited. Selected fibers have
+priority within the limit when they intersect the view. Work/byte budgets can
+return fewer fibers; the overlay reports partial coverage. Panning cancels obsolete
+requests and discards results from old attachments. Drawn geometry retains the
+same float64 values and exact clipping predicates.
+
+Slice queries apply UUID inclusion before priority/limits and report incomplete
+results for cancellation or resource/display limits. Their geometric clipping
+and acceptance predicates are shared with the existing numerical helpers.
+
+## Building and checking
+
+CMake uses an installed `vc_object_store` package or the sibling checkout selected
+by `VC_OBJECT_STORE_SOURCE`. It does not install or fetch that dependency.
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build -j2
+AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j6 VC3D \
+  test_viewer_overlay_surface_primitives test_line_annotation_structural_edits \
+  test_line_annotation_link_validation test_line_annotation_generated_views \
+  test_line_annotation_fiber_deletion test_spiral_input_workflow test_object_store_fiber_json
+ctest --test-dir build --output-on-failure
+PYTHONPATH=build/python python3 -m pytest tests/python -q
+ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
+```
+
+With `VC_TESTING` enabled, the production controller test can additionally use a
+**disposable** real database copy and CT volume:
+
+```sh
+QT_QPA_PLATFORM=offscreen \
+VC3D_OBJECT_STORE_SMOKE_DB=/tmp/fibers-test.vcobj \
+VC3D_OBJECT_STORE_SMOKE_CT=/tmp/ct-scale2 \
+../volume-cartographer/build/bin/VC3D --test-object-store
+```
+
+The test edits its database. The optional CT input is a normal VC volume whose
+base grid is the supplied level-2 data; its binding dialog is exercised with an
+explicit factor of 4. The harness checks immediate publication, stale conflicts,
+links, split/merge, retirement, pinned transport, shared workspace lifetime,
+coordinate assignment, a CT read, and reopening.
+
+Recorded datasets, exact commands, results and remaining platform/service checks
+are in [the verification record](object-store-verification.md).
+
+For a read-only large-store attachment check (no source database edits):
+
+```sh
+mkdir -p /tmp/vc3d-fiber-bench-config
+QT_QPA_PLATFORM=offscreen VC3D_CONFIG_DIR=/tmp/vc3d-fiber-bench-config \
+VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
+  build/bin/VC3D --test-object-store
+```
+
+Use fresh settings for the default-limit assertion. The check prints attachment,
+first-page and selected-fiber timings and verifies UI heartbeats, deferred line
+geometry, bounded catalog pages, and clearing runtime identities on detach.
+It also dispatches 20 status-only hub events against the loaded catalog and
+reports mean, median and p95 time until the catalog is ready, plus catalog,
+fiber-refresh and selection-reset counts. These events must preserve selection
+and warm fiber snapshots without reloading geometry. Use a local replica when
+testing a hosted store. This measures notification handling, not rendering FPS;
+the regular smoke test separately checks that actual commits refresh the views.
+
+The PHerc1451 save/cache regression uses the fixed 589-control fiber
+`6af54546-cad8-4696-9f4a-763334378476` and its real relationship neighbourhood.
+It clones and detaches the supplied local seed into a temporary directory;
+the source is not edited. Run from the repository root with `VC_TESTING=ON`:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D -j 6
+mkdir -p /tmp/vc3d-fiber-cache-config
+QT_QPA_PLATFORM=offscreen VC3D_CONFIG_DIR=/tmp/vc3d-fiber-cache-config \
+XDG_CONFIG_HOME=/tmp/vc3d-fiber-cache-config \
+VC3D_FIBER_CACHE_TEST_STORE="$PWD/local/benchmarks/pherc1451/seed/baseline.vcobj" \
+  volume-cartographer/build/bin/VC3D --test-object-store
+```
+
+Fiber transport artifacts and JSON exports use the core named-temporary-file
+atomic writer (fsync and rename), so publishing them does not require Linux
+`O_TMPFILE` linking through `/proc/self/fd`. The regression checks exact transport
+bytes on the real linked component, path reuse, and bundle creation/replacement.
+
+The check also covers unchanged saves with reordered branches, exact coordinate and
+annotation preservation, one-ULP edits, metadata and approval edits, stale
+revision conflicts, peer edits before event delivery, link deletion/creation,
+retirement, and transform invalidation. It compares cached reads with independent
+fresh reads and checks that unrelated decoded fibers and side-strip snapshots
+retain their allocations after a local edit. No CT sampling or solver runs are
+needed. Save comparisons use the existing batch canonicalization and exact
+values; decoded caches track peer generations and relationship identities.

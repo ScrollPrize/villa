@@ -1,7 +1,10 @@
 #pragma once
 
+namespace vc::objects { class TransformedGeometryView; }
+
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -14,6 +17,9 @@
 #include <string>
 
 #include "Surface.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "Rect3D.hpp"
 
 // Surface loading and channel flags
@@ -153,7 +159,7 @@ public:
 
         void advanceToValid() {
             while (_row < _points->rows) {
-                if ((*_points)(_row, _col)[0] != -1.f) {
+                if (vc::geometry::validSurfacePoint((*_points)(_row, _col))) {
                     return;
                 }
                 advance();
@@ -244,10 +250,10 @@ public:
         }
 
         bool isQuadValid() const {
-            return (*_points)(_row, _col)[0] != -1.f &&
-                   (*_points)(_row, _col + 1)[0] != -1.f &&
-                   (*_points)(_row + 1, _col)[0] != -1.f &&
-                   (*_points)(_row + 1, _col + 1)[0] != -1.f;
+            return vc::geometry::validSurfacePoint((*_points)(_row, _col)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row, _col + 1)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row + 1, _col)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row + 1, _col + 1));
         }
 
         MatPtr _points;
@@ -317,7 +323,7 @@ public:
     cv::Vec3f gridNormal(int row, int col) const;
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
-                  class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
+                  class SurfacePatchIndex* surfaceIndex = nullptr) override;
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;
@@ -376,10 +382,30 @@ public:
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
     [[nodiscard]] cv::Vec2f ptrToGrid(const cv::Vec3f& ptr) const;
+    // The pointer at a grid position (column, row): ptrToGrid's inverse.
+    [[nodiscard]] cv::Vec3f gridToPtr(const cv::Vec2f& grid) const;
 
-    void save(const std::filesystem::path &path, const std::string &uuid, bool force_overwrite = false);
+    // Save under this surface's persistent object UUID (meta["uuid"]),
+    // minting one when meta has none. Use for in-place edits, renames and
+    // replicas of the same object. The directory name is never the identity.
     void save(const std::filesystem::path &path, bool force_overwrite = false);
-    void save_meta();
+    // Save as a new object: always assigns a fresh object UUID first. Use for
+    // copies and derived outputs whose meta was taken from another surface.
+    // Removes catalog representation lookup metadata from the local copy.
+    void saveAsNew(const std::filesystem::path &path, bool force_overwrite = false);
+    // Save an edit of the surface read from `source`: writing back over
+    // `source` is an in-place edit (save), any other destination is a new
+    // object (saveAsNew).
+    void saveEdited(const std::filesystem::path &source,
+                    const std::filesystem::path &dest,
+                    bool force_overwrite = false);
+    // The object UUID is never passed alongside a path: set meta["uuid"]
+    // explicitly for a known identity. Deleted so a name argument cannot
+    // silently convert to force_overwrite.
+    void save(const std::filesystem::path&, const char*, bool = false) = delete;
+    void save(const std::filesystem::path&, const std::string&, bool = false) = delete;
+    // meta["uuid"], or empty when the surface has no persistent identity yet.
+    [[nodiscard]] std::string objectUuid() const;
     Rect3D bbox();
 
     bool isLoaded() const { return !_needsLoad; }
@@ -392,8 +418,8 @@ public:
     // require external synchronization.
     void unloadCaches();
 
-    // True iff this surface was loaded from disk and can be safely unloaded.
-    bool canUnload() const { return !path.empty(); }
+    // The surface's tags: its store record's, or a tifxyz meta.json's "tags" keys.
+    std::vector<std::string> tags;
 
     // Override disconnected component column ranges for an in-memory view.
     void setComponents(std::vector<std::pair<int, int>> components)
@@ -404,10 +430,6 @@ public:
         _smoothDvCache.release();
         _smoothDuvCache.release();
     }
-
-    // Drop _points and all derived caches; ensureLoaded() will re-read from
-    // disk on next access. No-op for in-memory-only surfaces.
-    void unloadPoints();
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
@@ -430,16 +452,16 @@ public:
         const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
             return false;
-        return (*_points)(row, col)[0] != -1.f;
+        return vc::geometry::validSurfacePoint((*_points)(row, col));
     }
     bool isQuadValid(int row, int col) const {
         const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows - 1 || col < 0 || col >= _points->cols - 1)
             return false;
-        return (*_points)(row, col)[0] != -1.f &&
-               (*_points)(row, col + 1)[0] != -1.f &&
-               (*_points)(row + 1, col)[0] != -1.f &&
-               (*_points)(row + 1, col + 1)[0] != -1.f;
+        return vc::geometry::validSurfacePoint((*_points)(row, col)) &&
+               vc::geometry::validSurfacePoint((*_points)(row, col + 1)) &&
+               vc::geometry::validSurfacePoint((*_points)(row + 1, col)) &&
+               vc::geometry::validSurfacePoint((*_points)(row + 1, col + 1));
     }
 
     // Counting helpers
@@ -480,39 +502,22 @@ public:
 
     void setChannel(const std::string& name, const cv::Mat& channel);
     cv::Mat channel(const std::string& name, int flags = 0);
+    // Loads a registered channel that has no data yet (e.g. from its stored
+    // geometry revision) on first access.
+    void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
     void invalidateCache();
     void saveOverwrite();
-    // Write a single ancillary channel to path/<name>.tif in place, without
-    // snapshotting or rewriting x/y/z. No-op if the channel is absent/empty.
-    void saveChannel(const std::string& name);
-    // Rotating backup under <backupRoot>/backups/<seg>/ (backupRoot defaults to
-    // the segment's parent dir; VolumePkg sets it to the volpkg.json's dir).
-    // Throttled to at most one snapshot per segment every couple minutes; pass
-    // force=true to bypass. maxBackups < 0 means "use the configured default".
+    // Rotating backup under <parent>/backups/<seg>/. Throttled to at most one
+    // snapshot per segment every couple minutes; pass force=true to bypass.
+    // maxBackups < 0 means the default (10).
     void saveSnapshot(int maxBackups = -1, bool force = false);
-
-    // App-configurable number of rotating snapshots kept per segment. VC3D
-    // wires this to a user setting; defaults to 10 so non-GUI tools behave as
-    // before. Used by saveOverwrite() and saveSnapshot()'s default.
-    static void setBackupCount(int count);
-    static int backupCount();
     void invalidateMask();
     std::vector<std::string> channelNames() const;
+    // Whether a registered channel holds data (a store channel loads on first use).
+    bool channelLoaded(const std::string& name) const;
 
     /** Rotate the surface by arbitrary angle (degrees). Expands canvas to fit. */
     void rotate(float angleDeg);
-
-    /** Resample the surface by a scale factor. factor > 1 increases density, < 1 decreases.
-     *  Uses bilinear interpolation by default (cv::INTER_LINEAR), matching rotate(). */
-    void resample(float factor, int interpolation = 1);  // 1 = cv::INTER_LINEAR
-    /** Resample the surface independently in X and Y. */
-    void resample(float factor_x, float factor_y, int interpolation);
-
-    /** Compute optimal rotation angle to place highest Z values at row 0 */
-    float computeZOrientationAngle() const;
-
-    /** Rotate to place highest Z values at top (row 0) */
-    void orientZUp();
 
     /** Flip the surface over the U axis (reverses rows/V direction) */
     void flipU();
@@ -520,32 +525,18 @@ public:
     /** Flip the surface over the V axis (reverses columns/U direction) */
     void flipV();
 
-    // Overlapping surfaces management (by ID/name)
-    const std::set<std::string>& overlappingIds() const { return _overlappingIds; }
-    void setOverlappingIds(const std::set<std::string>& ids) { _overlappingIds = ids; }
-    void addOverlappingId(const std::string& id) { _overlappingIds.insert(id); }
-    void removeOverlappingId(const std::string& id) { _overlappingIds.erase(id); }
-    void readOverlappingJson();   // Load from path/overlapping.json
-    void writeOverlappingJson() const;
-
-    // Mask timestamp caching
-    std::optional<std::filesystem::file_time_type> maskTimestamp() const { return _maskTimestamp; }
-    void refreshMaskTimestamp();
-    static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
-
     // DPI for TIFF output (0 = don't set). Set via setDpi() or voxelSizeToDpi().
     float dpi() const { return dpi_; }
     void setDpi(float d) { dpi_ = d; }
 
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
+    std::function<cv::Mat(const std::string&)> _channelLoader;
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _points;
     cv::Rect _bounds;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
-    std::set<std::string> _overlappingIds;
-    std::optional<std::filesystem::file_time_type> _maskTimestamp;
-    // Column ranges of disconnected surface components (from meta.json "components").
+    // Column ranges of disconnected surface components (meta "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
     bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
@@ -562,6 +553,8 @@ private:
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
+    void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
+    std::string objectUuidOrNew() const;
     // Write a single ancillary channel as dir/<name>.tif.
     void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path
@@ -571,14 +564,59 @@ private:
 
     // Serializes all on-disk writes targeting a given segment directory, keyed by
     // the directory path so it works across separate QuadSurface objects pointing
-    // at the same dir (e.g. the autosave worker's snapshot vs. the live surface).
-    // Without it, a worker-thread saveOverwrite() directory swap can delete a tmp
-    // file out from under a main-thread saveChannel() rename -> uncaught
-    // filesystem_error -> std::terminate. Recursive so a public entry point
-    // (saveOverwrite) can hold it across nested saveSnapshot()/save() calls on
-    // the same thread without self-deadlock.
+    // at the same dir. Recursive so a public entry point (saveOverwrite) can hold
+    // it across nested saveSnapshot()/save() calls on the same thread without
+    // self-deadlock.
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
+
+// --- vc_object_store surfaces ------------------------------------------------
+// The store equivalents of load_quad_from_tifxyz and save(). Callers own the
+// transactions and revision pins. Stored vertices whose `valid` channel is 0 load
+// as the (-1,-1,-1) sentinel and `valid` is exposed as the "mask" channel (255/0);
+// record tags appear as meta["tags"] keys;
+// writes touch only vertices that changed, so masked coordinates stay stored.
+
+// Column ranges [c0, c1) of disconnected components recorded as meta
+// "components" (Lasagna multi-component fits); empty for one component.
+std::vector<std::pair<int, int>> surface_components(const utils::Json& meta);
+// The tags a tifxyz meta.json records: the keys of its "tags" object.
+std::vector<std::string> tifxyz_tags(const utils::Json& meta);
+
+// A surface object's geometry revision (default: its current one). Other
+// channels are registered empty; set a loader (store_channel_loader) to read them.
+// Without applyValidity, masked vertices keep their coordinates (like SURF_LOAD_IGNORE_MASK).
+// Through `transformed` (a view of that revision), points are in the view's volume voxels.
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore&, const vc::objects::Txn&,
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt,
+    bool applyValidity = true, const vc::objects::TransformedGeometryView* transformed = nullptr);
+// Reads channels of an immutable geometry revision through a session on demand.
+std::function<cv::Mat(const std::string&)> store_channel_loader(
+    std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
+// Create surface object `uuid` holding `surface` (the caller's transaction
+// expects it absent) through the store's createSurface: bound by
+// `coordinates`, with `provenance`, keeping the surface's other meta.
+void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& uuid, QuadSurface&,
+    const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
+    const vc::objects::SurfaceProvenance& provenance);
+// The surface's grid as stored: points (missing vertices as the sentinel) and
+// validity from the "mask" channel (reduced to the grid: a vertex is valid only
+// if every mask pixel it covers is 255); no other channels. A store draft of it.
+vc::geometry::Surface quad_surface_grid(QuadSurface&);
+// Geometry for putGeometry: quad_surface_grid and the other channels.
+vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
+// Publish the vertices of `rect` (grid rows/columns) that differ from the stored
+// revision `expected` in one sparse edit: new coordinates also mark the vertex
+// valid; a vertex cleared to the sentinel loses its coordinates. `decide` answers
+// for relationships the edit affects. Returns the new (or unchanged) geometry revision.
+std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
+    QuadSurface&, const cv::Rect& rect, const std::string& expected,
+    const vc::objects::ObjectStoreSession::KeepRecorded& decide = {},
+    const vc::objects::TransformedGeometryView* transformed = nullptr);
+// Replace the named channels ("mask" is `valid`) with the surface's and remove `remove`.
+std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
+    QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,
+    const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.
@@ -595,19 +633,9 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 // Returns NAN if surface is null, "d" channel is missing, or coords are out of bounds.
 float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
-std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
 void set_space_tracing_use_cuda(bool enable);
 
-// Overlapping JSON file utilities
-void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names);
-std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path);
-
-// Surface overlap/containment tests
-bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000);
+// Surface containment tests
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
 bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
-bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
