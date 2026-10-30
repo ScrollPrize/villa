@@ -104,7 +104,7 @@ Additionally, the augmentations provided within this package are from another of
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs)**_
 ___
 
 
@@ -118,7 +118,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](docs/docs/images/napari_trainer.png)
+![alt text](docs/images/napari_trainer.png)
 
 ___
 
@@ -132,7 +132,7 @@ ___
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](docs/docs/images/proofreader.png)
+![alt text](docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 
