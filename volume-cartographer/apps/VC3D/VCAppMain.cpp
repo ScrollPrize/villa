@@ -31,7 +31,6 @@
 #include <iostream>
 #include <thread>
 #include <omp.h>
-#include <blosc.h>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -215,15 +214,6 @@ auto main(int argc, char* argv[]) -> int
 
     omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool, IOPool); OMP threads just spin-wait
     cv::setNumThreads(1);
-    blosc_set_nthreads(1);  // We parallelize at tile level; blosc internal threads just spin-wait
-
-    // VC3D's interactive renderer performs better without BlockPipeline's
-    // per-frame fetchInteractive dedup. Keep this app default scoped to VC3D,
-    // while allowing users to set VC_DISABLE_FETCHINTERACTIVE_DEDUP=0 to
-    // compare or debug the dedup path.
-    if (qEnvironmentVariableIsEmpty("VC_DISABLE_FETCHINTERACTIVE_DEDUP")) {
-        qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
-    }
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
