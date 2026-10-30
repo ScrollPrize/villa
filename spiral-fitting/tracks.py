@@ -1,6 +1,5 @@
 import colorsys
 import dbm
-import hashlib
 import importlib
 import itertools
 import json
@@ -24,6 +23,7 @@ from tqdm import tqdm
 import prefetch
 from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
 from spiral_progress import progress_or_null
+from service_http import sha256_file
 from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
@@ -39,7 +39,6 @@ TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
 TRACK_STORE_MAGIC = b'VCTRK01\0'
-_DB_DIGEST_CHUNK_BYTES = 16 << 20
 _DB_DIGEST_MEMO = {}
 
 
@@ -332,14 +331,11 @@ def _tracks_db_digest(path, signature):
         file_path = folder / name
         key = (os.fspath(file_path.resolve()), int(size), int(mtime_ns))
         if key not in _DB_DIGEST_MEMO:
-            hasher = hashlib.sha256()
-            with file_path.open('rb') as stream:
-                while chunk := stream.read(_DB_DIGEST_CHUNK_BYTES):
-                    hasher.update(chunk)
+            digest = sha256_file(file_path)
             stat = file_path.stat()
             if (stat.st_size, stat.st_mtime_ns) != key[1:]:
                 return None
-            _DB_DIGEST_MEMO[key] = 'sha256:' + hasher.hexdigest()
+            _DB_DIGEST_MEMO[key] = 'sha256:' + digest
         digests[name] = _DB_DIGEST_MEMO[key]
     return digests
 
