@@ -104,9 +104,7 @@ public:
 
     // Get vectors
     [[nodiscard]] std::vector<std::string> get_string_array() const;
-    [[nodiscard]] std::vector<int> get_int_array() const;
     [[nodiscard]] std::vector<double> get_double_array() const;
-    [[nodiscard]] std::vector<size_t> get_size_t_array() const;
 
     // -- Mutation --
     void update(const Json& other);   // merge object keys

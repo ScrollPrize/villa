@@ -6,15 +6,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers, file_sha256
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore
+from vesuvius.neural_tracing.tracers.shared.annotations.open_data import open_data_volume
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids, validate_split_policy
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
-from vesuvius.neural_tracing.tracers.shared.paths import moved_path, canonical_ct_url
+from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec, CTVolume
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
-from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
 from vesuvius.neural_tracing.tracers.fibers.data.seeds import make_seeds, read_manifest
 from vesuvius.neural_tracing.tracers.shared.io import jsonable
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
@@ -66,11 +67,11 @@ def parse_dataset_config(document, base):
             for key in PRIMARY_OPTIONS:
                 if key in source and key != 'val_z':
                     source[key] = resolve(source[key])
-        elif source['kind'] == 'afv':
+        elif source['kind'] == 'fibers':
             source['path'] = resolve(source['path'])
             source['ct'] = resolve(source['ct'])
-            if not source.get('sha256') or not source.get('coordinate_space'):
-                raise ValueError('AFV sources require a SHA256 and coordinate identity')
+            if not source.get('coordinate_space'):
+                raise ValueError('Fiber store sources require a coordinate identity')
         else:
             raise ValueError(f'Unknown dataset kind: {source["kind"]}')
     if len(set(names)) != len(names) or sum(s['kind'] == 'paris4' for s in document['sources']) != 1:
@@ -97,7 +98,7 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
         result[name+'_fibers'] = members
         seeds = []
         # Keep manifest generation bounded: reserve all IDs, but only generate
-        # monitor-sized seed subsets for calibration/final on large AFV catalogs.
+        # monitor-sized seed subsets for calibration/final on large fiber catalogs.
         for fi in members[:monitor_count]:
             candidates = make_seeds([fibers[fi]],seed_volume,per_fiber=1,seed=seed+fi)
             if candidates:
@@ -157,31 +158,25 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             yield batch
 
 
-def open_afv_source(source, cache_dir, normalization=None):
-    """Checked AFV training/validation fibers and CT spec for one dataset-config source.
+def open_fiber_source(source, cache_dir, normalization=None):
+    """Checked fiber-store training/validation fibers and CT spec for one dataset-config source.
 
-    Verifies the file checksum, coordinate space and that the configured CT is the recorded CT store.
-    Returns (training fibers, validation fibers, CT spec, sha256).
+    The fibers are those of the store bound to the volume ``coordinate_space`` (SAMPLE/VOLUME_ID) names, and the
+    configured CT must be that open-data volume. Returns (training fibers, validation fibers, CT spec).
     """
     path = Path(source['path'])
-    digest = file_sha256(path)
-    if digest != source['sha256']:
-        raise ValueError(f'AFV checksum changed: {path}')
-    scale = float(source['grid_scale'])
-    fibers = AFVFibers(path, scale, validation=source['validation'],sha256=digest)
-    validation_fibers = AFVFibers(path,scale,validation=source['validation'],split='validation',sha256=digest)
-    if fibers.metadata['frame']['vc_open_data_coordinate_space'] != source['coordinate_space']:
-        raise ValueError('AFV coordinate identity mismatch')
-    root = fibers.metadata['root']
-    native_url = root.get('vc_open_data_source_path', '').rstrip('/')
-    # The configured source must refer to the same recorded CT store.
+    volume = source['coordinate_space'].split('/')[-1]
     # A local copy of the CT (same coordinate frame, read at ct_grid_scale) names the store it mirrors.
-    if canonical_ct_url(source.get('ct_mirror_of', source['ct'])) != canonical_ct_url(native_url):
-        raise ValueError('AFV source CT differs from its embedded metadata')
+    ct = open_data_volume(source.get('ct_mirror_of', source['ct']))
+    if ct is None or f'{ct[0]}/{ct[1]}' != source['coordinate_space']:
+        raise ValueError(f'Fiber source CT is not the open-data volume {source["coordinate_space"]}')
+    scale = float(source['grid_scale'])
+    fibers = FiberStore(path, volume, scale, validation=source['validation'])
+    validation_fibers = FiberStore(path, volume, scale, validation=source['validation'], split='validation')
     spec = ct_source_spec(source, cache_dir)
     if normalization is not None:
         spec.ct_normalization = normalization['volumes'][volume_key(spec)]
-    return fibers, validation_fibers, spec, digest
+    return fibers, validation_fibers, spec
 
 
 def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, budget, out=None, resume=False,
@@ -192,22 +187,22 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             dataset = primary
             entry = dict(name=source['name'], kind='paris4', fibers=len(primary.fibers))
         else:
-            fibers, validation_fibers, spec, sha256 = open_afv_source(source, document['cache_dir'], normalization)
+            fibers, validation_fibers, spec = open_fiber_source(source, document['cache_dir'], normalization)
             scale = float(source['grid_scale'])
-            builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
+            builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=FiberBank(fibers))
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
             replay_paths = (own_replay_paths(json.loads(replay_index.read_text()), Path(out)/'dagger')
                             if resume and replay_index and replay_index.exists() else [])
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
             dataset = FollowDataset(fibers, spec, sample, chunk=loader_chunk(cfg, args.batch),
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
-                batch_builder=builder, budget=budget, length_power=args.afv_length_power,
+                batch_builder=builder, budget=budget, length_power=args.store_length_power,
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)
             dataset.validation_fibers = validation_fibers
             dataset.validation_manifest = validation_manifest(validation_fibers,spec,source['validation']['seed'])
-            entry = dict(name=source['name'], kind='afv', fibers=len(fibers),
-                excluded_fibers=fibers.metadata['fiber_count']-len(fibers),
-                sha256=sha256, coordinate_space=source['coordinate_space'],
+            entry = dict(name=source['name'], kind='fibers', fibers=len(fibers),
+                excluded_fibers=len(validation_fibers), digest=fibers.manifest_entries()[0]['digest'],
+                coordinate_space=source['coordinate_space'],
                 validation=source['validation'], grid_scale=scale)
         datasets.append(dataset)
         names.append(source['name'])

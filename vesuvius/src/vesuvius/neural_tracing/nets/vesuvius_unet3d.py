@@ -13,6 +13,14 @@ from vesuvius.models.utilities.utils import (
     DropPath,
     SqueezeExcite,
 )
+from vesuvius.neural_tracing.nets.output_lattice import output_stage_index
+
+
+def _group_norm_3d(num_channels, *, eps=1e-5, affine=True):
+    groups = min(8, int(num_channels))
+    while int(num_channels) % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, int(num_channels), eps=eps, affine=affine)
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -393,6 +401,23 @@ class PixelShuffle3dUpsample(nn.Module):
         )
 
 
+class Trilinear3dUpsample(nn.Module):
+    """Shared channel projection then resize; decoder blocks provide spatial convs."""
+
+    def __init__(self, input_channels, output_channels, scale_factor, *, conv_op, bias):
+        super().__init__()
+        self.scale = tuple(maybe_convert_scalar_to_list(conv_op, scale_factor))
+        self.proj = conv_op(input_channels, output_channels, 1, bias=bias)
+
+    def forward(self, x, size=None):
+        x = self.proj(x)
+        size = tuple(size) if size is not None else tuple(
+            n * s for n, s in zip(x.shape[-3:], self.scale))
+        if tuple(x.shape[-3:]) == size:
+            return x
+        return F.interpolate(x, size=size, mode='trilinear', align_corners=False)
+
+
 class Encoder(nn.Module):
     """3D U-Net Encoder with BasicBlockD residual blocks and timestep conditioning."""
     def __init__(self,
@@ -527,12 +552,23 @@ class Decoder(nn.Module):
                  nonlin_kwargs: dict = None,
                  conv_bias: bool = None,
                  time_emb_dim: int = None,
-                 keep_inactive_deep_supervision_layers: bool = True):
+                 keep_inactive_deep_supervision_layers: bool = True,
+                 output_stride: int = 1):
         super().__init__()
         
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
+
+        requested_output_stride = int(output_stride)
+        if requested_output_stride <= 0:
+            raise ValueError("output_stride must be > 0")
+        resolved_output_stage_index = output_stage_index(
+            encoder.strides,
+            requested_output_stride,
+        )
+        self.output_stride = requested_output_stride
+        self.output_stage_index = int(resolved_output_stage_index)
         
         n_stages_encoder = len(encoder.output_channels)
         if isinstance(n_conv_per_stage, int):
@@ -542,9 +578,9 @@ class Decoder(nn.Module):
             f"n_conv_per_stage must have {n_stages_encoder - 1} entries"
 
         upsample_mode = str(upsample_mode).lower()
-        if upsample_mode not in {'transpose', 'pixelshuffle'}:
+        if upsample_mode not in {'transpose', 'pixelshuffle', 'trilinear'}:
             raise ValueError(
-                "upsample_mode must be 'transpose' or 'pixelshuffle', "
+                "upsample_mode must be 'transpose', 'pixelshuffle' or 'trilinear', "
                 f"got {upsample_mode!r}"
             )
         self.upsample_mode = upsample_mode
@@ -562,13 +598,15 @@ class Decoder(nn.Module):
         transpconvs = []
         seg_layers = []
         
-        for s in range(1, n_stages_encoder):
+        decoder_stage_count = n_stages_encoder - 1 - self.output_stage_index
+        for s in range(1, decoder_stage_count + 1):
             input_features_below = encoder.output_channels[-s]
             input_features_skip = encoder.output_channels[-(s + 1)]
             stride_for_transpconv = encoder.strides[-s]
             
-            if self.upsample_mode == 'pixelshuffle':
-                transpconvs.append(PixelShuffle3dUpsample(
+            if self.upsample_mode in {'pixelshuffle', 'trilinear'}:
+                upsample_class = PixelShuffle3dUpsample if self.upsample_mode == 'pixelshuffle' else Trilinear3dUpsample
+                transpconvs.append(upsample_class(
                     input_features_below,
                     input_features_skip,
                     stride_for_transpconv,
@@ -610,22 +648,29 @@ class Decoder(nn.Module):
         self.transpconvs = nn.ModuleList(transpconvs)
         self.seg_layers = nn.ModuleList(seg_layers)
         
-        # Final transpose convolution to match input size
-        if self.upsample_mode == 'pixelshuffle':
-            self.final_transpconv = PixelShuffle3dUpsample(
-                encoder.output_channels[0],
-                encoder.output_channels[0],
-                encoder.strides[0],
-                conv_op=encoder.conv_op,
-                bias=encoder.conv_bias,
-            )
+        output_features = encoder.output_channels[self.output_stage_index]
+        # Preserve the stride-1 module layout and state keys exactly. Native
+        # lower-resolution models stop at an encoder skip and do not construct
+        # the omitted high-resolution upsampling work.
+        if self.output_stride == 1:
+            if self.upsample_mode in {'pixelshuffle', 'trilinear'}:
+                upsample_class = PixelShuffle3dUpsample if self.upsample_mode == 'pixelshuffle' else Trilinear3dUpsample
+                self.final_transpconv = upsample_class(
+                    encoder.output_channels[0],
+                    encoder.output_channels[0],
+                    encoder.strides[0],
+                    conv_op=encoder.conv_op,
+                    bias=encoder.conv_bias,
+                )
+            else:
+                self.final_transpconv = transpconv_op(
+                    encoder.output_channels[0], encoder.output_channels[0],
+                    encoder.strides[0], encoder.strides[0], bias=encoder.conv_bias
+                )
         else:
-            self.final_transpconv = transpconv_op(
-                encoder.output_channels[0], encoder.output_channels[0],
-                encoder.strides[0], encoder.strides[0], bias=encoder.conv_bias
-            )
-        
-        self.final_seg_layer = encoder.conv_op(encoder.output_channels[0], num_classes, 1, 1, 0, bias=True)
+            self.final_transpconv = None
+
+        self.final_seg_layer = encoder.conv_op(output_features, num_classes, 1, 1, 0, bias=True)
 
     def forward(self, skips, time_emb):
         """Forward pass with skip connections and timestep conditioning."""
@@ -633,7 +678,8 @@ class Decoder(nn.Module):
         seg_outputs = []
         
         for s in range(len(self.stages)):
-            x = self.transpconvs[s](lres_input)
+            x = (self.transpconvs[s](lres_input, size=skips[-(s + 2)].shape[-3:])
+                 if self.upsample_mode == 'trilinear' else self.transpconvs[s](lres_input))
             x = torch.cat((x, skips[-(s + 2)]), 1)
             x = self.stages[s](x, time_emb)
             
@@ -641,7 +687,8 @@ class Decoder(nn.Module):
                 seg_outputs.append(self.seg_layers[s](x))
             lres_input = x
 
-        lres_input = self.final_transpconv(lres_input)
+        if self.final_transpconv is not None:
+            lres_input = self.final_transpconv(lres_input)
         if not self.deep_supervision:
             return self.final_seg_layer(lres_input)
 
@@ -691,9 +738,12 @@ class Vesuvius3dUnetModel(nn.Module):
         elif normalization in {'batch', 'batchnorm', 'batch_norm'}:
             norm_op = nn.BatchNorm3d
             norm_op_kwargs = {'eps': 1e-5}
+        elif normalization in {'group', 'groupnorm', 'group_norm'}:
+            norm_op = _group_norm_3d
+            norm_op_kwargs = {'eps': 1e-5, 'affine': True}
         else:
             raise ValueError(
-                "model_config normalization must be 'instance', 'batch', or 'none', "
+                "model_config normalization must be 'instance', 'batch', 'group', or 'none', "
                 f"got {normalization!r}"
             )
         
@@ -711,6 +761,7 @@ class Vesuvius3dUnetModel(nn.Module):
         self.keep_inactive_deep_supervision_layers = model_config.get(
             'keep_inactive_deep_supervision_layers', True
         )
+        self.output_stride = int(model_config.get('output_stride', 1))
         
         # Timestep embedding
         self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim) if self.time_emb_dim else None
@@ -752,6 +803,7 @@ class Vesuvius3dUnetModel(nn.Module):
             keep_inactive_deep_supervision_layers=bool(
                 self.keep_inactive_deep_supervision_layers
             ),
+            output_stride=self.output_stride,
         )
 
     def _get_n_blocks_per_stage(self, num_stages):

@@ -2,7 +2,6 @@
 
 #include "SpiralArtifactCache.hpp"
 #include "SpiralArtifactPins.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralPreviewProvenance.hpp"
 #include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
@@ -98,19 +97,6 @@ QString formatEventRecord(const QJsonObject& event)
     if (kind == QLatin1String("error"))
         return QStringLiteral("[error] ") + text + rankSuffix;
     return text + rankSuffix;
-}
-
-QString stateName(SpiralServiceManager::ConnectionState state)
-{
-    switch (state) {
-    case SpiralServiceManager::ConnectionState::Disconnected: return QStringLiteral("Disconnected");
-    case SpiralServiceManager::ConnectionState::Starting: return QStringLiteral("Starting");
-    case SpiralServiceManager::ConnectionState::Connecting: return QStringLiteral("Connecting");
-    case SpiralServiceManager::ConnectionState::Ready: return QStringLiteral("Ready");
-    case SpiralServiceManager::ConnectionState::Reconnecting: return QStringLiteral("Reconnecting");
-    case SpiralServiceManager::ConnectionState::Failed: return QStringLiteral("Failed");
-    }
-    return QStringLiteral("Unknown");
 }
 } // namespace
 
@@ -219,8 +205,6 @@ void SpiralServiceManager::setConnectionState(ConnectionState state, const QStri
     if (_connectionState == state && message.isEmpty()) return;
     _connectionState = state;
     emit connectionStateChanged(state, message);
-    emit serviceStateChanged(message.isEmpty() ? stateName(state)
-                                               : stateName(state) + QStringLiteral(": ") + message);
 }
 
 QString SpiralServiceManager::endpointFingerprint() const
@@ -541,19 +525,6 @@ void SpiralServiceManager::reconnect()
         _synchronizedSessionId.clear();
         beginHandshake();
         return;
-    }
-    connectToService(_profile);
-}
-
-void SpiralServiceManager::ensureStarted()
-{
-    if (_connectionState == ConnectionState::Ready
-        || _connectionState == ConnectionState::Starting
-        || _connectionState == ConnectionState::Connecting) return;
-    if (_profile.id.isEmpty()) {
-        // Pick up the persisted local launch binding (dataset/output/cache).
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        _profile = SpiralServiceProfile::localhostProfile(&settings);
     }
     connectToService(_profile);
 }

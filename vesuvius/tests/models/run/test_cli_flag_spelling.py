@@ -177,3 +177,19 @@ def test_finalize_still_accepts_the_old_hyphenated_spellings(flag):
         ["in", "out", flag, "--threshold", "--threshold-value", "0.3"]
     )
     assert args.delete_intermediates is True and args.threshold_value == 0.3
+
+
+def test_predict_rejects_malformed_bbox_with_usage_error(monkeypatch, capsys):
+    # main() used to call parser.error() on a name it never bound, so a malformed
+    # --bbox crashed with NameError instead of the intended usage message.
+    import sys
+    from vesuvius.models.run import inference
+
+    monkeypatch.setattr(sys, "argv", [
+        "vesuvius.predict", "--model_path", "m", "--input_dir", "i", "--output_dir", "o",
+        "--bbox", "1,2,3",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        inference.main()
+    assert exc.value.code == 2
+    assert "bbox" in capsys.readouterr().err.lower()

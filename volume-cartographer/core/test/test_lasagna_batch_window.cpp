@@ -3,8 +3,10 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QStandardItemModel>
 #include <QStringList>
+#include <QTableView>
 
 #define private public
 #include "LasagnaBatchWindow.hpp"
@@ -37,7 +39,7 @@ QJsonObject job(const QString& id,
                 const QString& source,
                 const QString& config,
                 const QString& outputName = {},
-                const QString& outputDir = {},
+                const QJsonArray& outputSurfaces = {},
                 double progress = 0.0,
                 double submittedAt = 0.0,
                 const QString& error = {})
@@ -49,7 +51,7 @@ QJsonObject job(const QString& id,
     object[QStringLiteral("source")] = source;
     object[QStringLiteral("config_name")] = config;
     object[QStringLiteral("output_name")] = outputName;
-    object[QStringLiteral("output_dir")] = outputDir;
+    object[QStringLiteral("output_surfaces")] = outputSurfaces;
     object[QStringLiteral("overall_progress")] = progress;
     object[QStringLiteral("submitted_at")] = submittedAt;
     object[QStringLiteral("error")] = error;
@@ -94,11 +96,11 @@ int main(int argc, char** argv)
     const QJsonArray jobs{
         job(QStringLiteral("waiting-1"), QStringLiteral("waiting"), 1,
             QStringLiteral("local"), QStringLiteral("cfg-a"),
-            QStringLiteral("sheet_v001.tifxyz"), QStringLiteral("/tmp/ignored"),
+            QStringLiteral("sheet_v001.tifxyz"), {},
             0.0, 1.0),
         job(QStringLiteral("running-1"), QStringLiteral("running"), 0,
             QStringLiteral("remote"), QStringLiteral("cfg-b"),
-            {}, QStringLiteral("/tmp/from-dir.tifxyz"),
+            {}, {},
             0.426, 2.0),
         job(QStringLiteral("error-1"), QStringLiteral("error"), 0,
             QStringLiteral("local"), QStringLiteral("cfg-c"),
@@ -109,11 +111,10 @@ int main(int argc, char** argv)
     const QString submittedAtOne =
         QDateTime::fromSecsSinceEpoch(1).toString(Qt::ISODate);
     require(window._model->rowCount() == 3, "Unexpected rendered job count");
+    require(cell(window, 1, 3).isEmpty(), "A job without an output name shows none");
     require(rowTexts(window, 0).join('|') ==
                 QStringLiteral("1|local|cfg-a|sheet_v001.tifxyz|Waiting #1|") + submittedAtOne,
             "Waiting row text did not match expected order/source/config/output/progress/submitted values");
-    require(cell(window, 1, 3) == QStringLiteral("from-dir.tifxyz"),
-            "output_dir basename should be shown when output_name is missing");
     require(cell(window, 1, 4) == QStringLiteral("Running 42.6%"),
             "Running progress text did not include one decimal percent");
     require(cell(window, 2, 4) == QStringLiteral("Error: boom"),
@@ -148,6 +149,15 @@ int main(int argc, char** argv)
                 cell(window, 2, 0) == QStringLiteral("2") &&
                 cell(window, 3, 0) == QStringLiteral("3"),
             "Waiting queue positions should be renumbered after optimistic reorder");
+
+    // A finished job opens the first surface it created.
+    window.applyJobs(QJsonArray{job(QStringLiteral("done"), QStringLiteral("finished"), 0, QStringLiteral("s"),
+                                    QStringLiteral("cfg"), QStringLiteral("sheet_v004"),
+                                    QJsonArray{QStringLiteral("surface-a"), QStringLiteral("surface-b")})});
+    QSignalSpy activated(&window, &LasagnaBatchWindow::finishedOutputActivated);
+    emit window._table->doubleClicked(window._model->index(window.rowForJobId(QStringLiteral("done")), 0));
+    require(activated.count() == 1 && activated.front().front().toString() == QStringLiteral("surface-a"),
+            "Activating a finished job should name its first output surface");
 
     return 0;
 }
