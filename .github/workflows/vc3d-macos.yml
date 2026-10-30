@@ -40,7 +40,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -63,11 +62,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
     env:
+      AGENTS_AGENT_MODE: '1'
+      AGENTS_ALLOW_INSTALL: '1'
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-native-v1
     defaults:
       run:
         working-directory: volume-cartographer
@@ -76,30 +77,13 @@ jobs:
         with:
           ref: ${{ inputs.commit_sha || github.sha }}
 
-      - uses: actions/checkout@v4
-        with:
-          repository: ScrollPrize/vc3d-deps
-          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
-          path: vc3d-deps
-
-      - uses: oras-project/setup-oras@v1
-
-      - name: Restore prebuilt Homebrew dependencies
-        env:
-          GHCR_TOKEN: ${{ github.token }}
-        run: |
-          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
-          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
-          "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
-            "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
-
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
 
-      - name: Build
-        run: ./scripts/build_macos.sh --sccache
+      - name: Install Homebrew dependencies + build
+        run: ./scripts/build_macos.sh --install-deps --sccache
 
       - name: Package (DMG + ZIP)
         run: |
@@ -163,6 +147,18 @@ jobs:
             exit 1
           fi
 
+          # otool -L does not show LC_RPATH. A bundled Homebrew library can
+          # still load another copy from the host through an absolute rpath.
+          rpath_leaks=$(find smoke.app -type f \( -perm +111 -o -name '*.dylib' \) \
+                          -exec otool -l {} + 2>/dev/null \
+                          | awk '/cmd LC_RPATH/ { getline; getline; print }' \
+                          | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE" || true)
+          if [[ -n "$rpath_leaks" ]]; then
+            echo "::error::absolute library search paths leaked into the bundle:"
+            echo "$rpath_leaks"
+            exit 1
+          fi
+
           sudo mv /opt/homebrew /opt/homebrew.hidden
           trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
 
@@ -181,8 +177,29 @@ jobs:
           # platform plugin, not the offscreen plugin. --version exits without
           # showing a window while still exercising the packaged Qt framework
           # and native platform plugin lookup.
+          set +e
           QT_QPA_PLATFORM=cocoa "$bin/VC3D" --version
+          rc=$?
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::VC3D --version failed (exit $rc); collecting startup diagnostics"
+            # Keep Homebrew hidden during the diagnostic retry. LLDB prints
+            # the crashing thread and loaded images even when the app never
+            # reaches its own crash handler. Preserve the original failure.
+            QT_QPA_PLATFORM=cocoa QT_DEBUG_PLUGINS=1 /usr/bin/xcrun lldb \
+              --batch -o run -k 'thread backtrace all' -k 'image list' \
+              -- "$bin/VC3D" --version || true
+            exit "$rc"
+          fi
           echo "VC3D --version OK"
+
+      - name: Upload macOS crash reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-macos-crash-reports
+          path: ~/Library/Logs/DiagnosticReports/VC3D*
+          if-no-files-found: ignore
 
   release-macos:
     name: Attach macOS package to release
