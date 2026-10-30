@@ -695,6 +695,7 @@ vc_add_test(NAME test_plane_surface_branches)
 
 vc_add_test(NAME test_quadsurface_more)
 vc_add_test(NAME test_quadsurface_smooth)
+vc_add_test(NAME test_quadsurface_linear_normals)
 
 vc_add_test(NAME test_surface_cache_dependencies)
 vc_add_test(NAME test_surface_cache_region_edit)

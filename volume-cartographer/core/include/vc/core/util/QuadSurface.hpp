@@ -35,7 +35,7 @@ class SurfacePatchIndex;
 
 // Interpolation used by QuadSurface::gen() when resampling the point grid.
 // See QuadSurface::setGenInterpolation() for what each mode does.
-enum class GenInterpolation { Linear, Smooth };
+enum class GenInterpolation { Linear, Smooth, LinearBlendedNormals };
 
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
@@ -352,6 +352,7 @@ public:
     //           coarser than the render (scale 0.05 => one cell spans ~20x20
     //           output pixels), so the normal is piecewise-constant over those
     //           blocks and any surface offset along it steps at cell edges.
+    // LinearBlendedNormals: Linear, but each normal blends the 4 vertex normals bilinearly (opt in).
     // Smooth  — bicubic Hermite positions with the normal differentiated from
     //           the same basis. Centered derivatives reproduce Catmull-Rom in
     //           the interior; shared one-sided derivatives keep the surface C1

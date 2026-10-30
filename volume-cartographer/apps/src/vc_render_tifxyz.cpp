@@ -1211,6 +1211,7 @@ int main(int argc, char *argv[])
         // sampled along the normal (which is always trilinear here).
         ("surface-interpolation", po::value<std::string>()->default_value("linear"),
             "Surface resampling: linear (bilinear positions, nearest-neighbour normals) or "
+            "linear-blended-normals (bilinear positions, normals blended from the 4 vertex normals) or "
             "smooth/bicubic (Catmull-Rom positions with normals differentiated from the same "
             "basis). The source grid is far coarser than the render, so linear leaves the normal "
             "constant across each grid cell and every offset layer steps at the cell edges; "
@@ -1397,6 +1398,7 @@ int main(int argc, char *argv[])
                    [](unsigned char c){ return char(std::tolower(c)); });
     GenInterpolation genInterp;
     if      (surf_interp_str == "linear") genInterp = GenInterpolation::Linear;
+    else if (surf_interp_str == "linear-blended-normals") genInterp = GenInterpolation::LinearBlendedNormals;
     else if (surf_interp_str == "smooth" || surf_interp_str == "bicubic")
         genInterp = GenInterpolation::Smooth;
     else { logPrintf(stderr, "Error: invalid --surface-interpolation\n"); return EXIT_FAILURE; }
