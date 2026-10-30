@@ -37,6 +37,10 @@ struct NotFound : std::runtime_error {
 
 // http(s)://, s3://, s3+REGION:// and sftp:// / ssh:// locations.
 bool isRemote(const std::string& location);
+// Whether a local directory holds any Zarr v2 or v3 node metadata.
+bool isLocalZarrNode(const std::filesystem::path& directory);
+// Whether a local directory is a Zarr array (v2 .zarray, or a v3 array's zarr.json).
+bool isLocalZarrArray(const std::filesystem::path& directory);
 // The https:// URL of an s3:// location (public buckets only), otherwise unchanged.
 std::string httpUrl(const std::string& location);
 

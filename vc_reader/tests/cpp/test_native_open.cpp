@@ -307,6 +307,18 @@ int main()
         }
     } cleanup{root};
     try {
+        {
+            const auto dir = root / "markers";
+            fs::create_directories(dir);
+            require(!isLocalZarrNode(dir) && !isLocalZarrArray(dir), "an empty directory is no node");
+            std::ofstream(dir / "zarr.json") << R"({"node_type":"group"})";
+            require(isLocalZarrNode(dir) && !isLocalZarrArray(dir), "a v3 group");
+            std::ofstream(dir / "zarr.json") << R"({"node_type":"array"})";
+            require(isLocalZarrArray(dir), "a v3 array");
+            fs::remove(dir / "zarr.json");
+            std::ofstream(dir / ".zarray") << "{}";
+            require(isLocalZarrNode(dir) && isLocalZarrArray(dir), "a v2 array");
+        }
         access(root);
         errors(root);
         groups(root);

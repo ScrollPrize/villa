@@ -466,14 +466,6 @@ Json multiscalesOf(const Json& attributes)
     return ms.is_array() ? ms : Json::array();
 }
 
-bool isNodeDir(const fs::path& path)
-{
-    std::error_code ec;
-    for (const auto* name : {".zarray", ".zgroup", ".zattrs", "zarr.json"})
-        if (fs::is_regular_file(path / name, ec))
-            return true;
-    return false;
-}
 }  // namespace
 
 Json Group::multiscales() const
@@ -497,7 +489,7 @@ std::vector<std::string> Group::keys()
     const auto scan = [&](const fs::path& directory, bool skipHidden) {
         for (const auto& entry : fs::directory_iterator(directory)) {
             const auto name = entry.path().filename().string();
-            if (entry.is_directory() && !(skipHidden && name.starts_with(".")) && isNodeDir(entry.path()))
+            if (entry.is_directory() && !(skipHidden && name.starts_with(".")) && isLocalZarrNode(entry.path()))
                 names.insert(name);
         }
     };
@@ -643,6 +635,24 @@ std::vector<std::pair<int, std::string>> numberedLevels(Group& group, int probeL
 }
 
 }  // namespace
+
+bool isLocalZarrNode(const std::filesystem::path& directory)
+{
+    std::error_code ec;
+    for (const auto* name : {".zarray", ".zgroup", ".zattrs", "zarr.json"})
+        if (std::filesystem::is_regular_file(directory / name, ec)) return true;
+    return false;
+}
+
+bool isLocalZarrArray(const std::filesystem::path& directory)
+{
+    std::error_code ec;
+    if (std::filesystem::exists(directory / ".zarray", ec)) return true;
+    std::ifstream in(directory / "zarr.json");
+    if (!in) return false;
+    const auto node = Json::parse(in, nullptr, false);
+    return node.is_object() && node.value("node_type", "") == "array";
+}
 
 OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOptions& options,
                              int probeLevels)
