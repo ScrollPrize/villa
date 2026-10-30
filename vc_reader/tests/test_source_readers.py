@@ -298,6 +298,24 @@ class SourceReaderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'TIFF codec.*imagecodecs'):
                 reader.read((0, 0), (1, 1))
 
+    def test_readers_use_one_thread_only_in_loader_workers(self):
+        from types import SimpleNamespace
+        from test_source_storage import array
+        path = self.root / 'volume.zarr'
+        array(path, np.arange(64, dtype=np.uint8).reshape(4, 4, 4), {'_ARRAY_DIMENSIONS': ['z', 'y', 'x']})
+        source = Source('volume', Storage(str(path), 'zarr'))
+        with source.open() as reader:
+            self.assertIsNone(reader._options.get('threads'))  # the Zarr reader's own pool size
+        with source.open(threads=4) as reader:
+            self.assertEqual(reader._options['threads'], 4)
+        worker = SimpleNamespace(utils=SimpleNamespace(data=SimpleNamespace(get_worker_info=lambda: object())))
+        with patch.dict(sys.modules, {'torch': worker}):
+            with source.open() as reader:
+                self.assertEqual(reader._options['threads'], 1)
+                np.testing.assert_array_equal(reader.read((0, 0, 0), (1, 1, 2)), [[[0, 1]]])
+            with source.open(threads=4) as reader:
+                self.assertEqual(reader._options['threads'], 4)
+
     @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
     def test_fork_reopens_without_inherited_cache_lock(self):
         source, data = self.png()

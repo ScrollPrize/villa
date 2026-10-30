@@ -119,7 +119,8 @@ pickling, and creation inside an active PyTorch DataLoader worker.
 
 CPU readers serialize descriptors/options and reopen lazily after unpickling
 or fork. Read calls on one reader serialize; C++ I/O uses the configured
-reader threads, defaulting to one. Explicit shared `MemoryCache` and
+reader threads: by default 16 (local) or 32 (remote), and one inside a
+PyTorch DataLoader worker, whose processes already read in parallel. Explicit shared `MemoryCache` and
 `DecodedCache` objects retain their ownership semantics. Otherwise the sampler
 owns one shared cache of each kind across its source readers and clears them
 on close.
