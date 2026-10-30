@@ -205,6 +205,19 @@ jobs:
               "$ARCHIVE_REF" "$ARCHIVED_RELEASE_ID" "$ARCHIVED_ASSET_IDS"
           fi
 
+          # Even after atomic prestage, another actor can move latest before
+          # gh release create; --verify-tag checks existence, not source SHA.
+          # Only the exact staged/archived receipt permits this upload.
+          replay="$(python3 .github/scripts/vc3d_archive_zero_copy.py latest "$PACKAGE_SHA" --probe-only)"
+          replay_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$replay")"
+          case "$replay_status" in
+            REPAIR_RELEASE_ONLY) ;;
+            ALREADY_PUBLISHED)
+              echo "Latest release was published concurrently; skip duplicate."
+              exit 0 ;;
+            *) echo "::error::latest publication receipt changed: $replay_status" >&2; exit 1 ;;
+          esac
+
           # Archive step preserves old assets and their release ID without reupload.
           # The stable channel remains GitHub's designated latest release.
           gh release create latest release-assets/* \

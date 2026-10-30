@@ -202,6 +202,78 @@ class ArchiveLocalGit(unittest.TestCase):
         self.addCleanup(fixture.close)
         return fixture
 
+    def test_latest_publish_refuses_tag_race_after_atomic_prestage(self):
+        """Exercise actual latest publish Bash step and inject a local ref race.
+
+        The --verify-tag option confirms existence, not source commit. This fixture
+        changes the remote after real prestage but before the next command.
+        Git and gh are constrained to disposable local fixtures throughout.
+        """
+        workflow = SCRIPTS.parent / "workflows" / "vc3d-publish-latest.yml"
+        lines = workflow.read_text().splitlines()
+        marker = "      - name: Move latest tag and publish release"
+        self.assertIn(marker, lines)
+        start = lines.index(marker)
+        run = lines.index("        run: |", start)
+        indented = []
+        for line in lines[run + 1:]:
+            if line and not line.startswith("          "):
+                break
+            indented.append(line[10:] if line else "")
+        body = "\n".join(indented) + "\n"
+
+        for race in (False, True):
+            with self.subTest(tag_raced=race):
+                f = self.fixture("latest")
+                receipt = f.receipt(f.new)
+                f.env.update({
+                    "PACKAGE_SHA": f.new,
+                    "EXPECTED_OLD_TAG_OID": receipt["old_tag_object"],
+                    "ARCHIVE_REF": receipt["archive"],
+                    "ARCHIVED_RELEASE_ID": str(receipt["release_id"]),
+                    "ARCHIVED_ASSET_IDS": ",".join(map(str, receipt["asset_ids"])),
+                    "REPAIR_PUBLISH": "false",
+                })
+                scripts = f.work / ".github" / "scripts"
+                scripts.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(SCRIPTS / "vc3d_archive_zero_copy.py", scripts)
+                # Wrapper executes the UNMODIFIED real helper then simulates an
+                # external actor changing latest in the short pre-upload gap.
+                original_prestage = SCRIPTS / "vc3d_atomic_prestage.sh"
+                wrapper = scripts / "vc3d_atomic_prestage.sh"
+                wrapper.write_text(
+                    "#!/bin/bash\nset -e\n"
+                    + "bash " + shlex.quote(str(original_prestage)) + ' "$@"\n'
+                    + (
+                        "git tag -a actor \"$EXTERNAL_NEW_SHA\" -m 'External actor'\n"
+                        "git push --force origin refs/tags/actor:refs/tags/latest\n"
+                        if race else ""
+                    )
+                )
+                wrapper.chmod(0o700)
+                f.env["EXTERNAL_NEW_SHA"] = f.third
+                gh_script = f.root / "bin" / "gh"
+                marker_path = f.root / "latest-publish-attempted.log"
+                original_gh = gh_script.read_text()
+                gh_script.write_text(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = release ] && [ "$2" = create ]; then\n'
+                    "  printf '%s\\n' \"$*\" >> " + shlex.quote(str(marker_path)) + "\n"
+                    "  exit 0\nfi\n"
+                    + original_gh.split("\n", 1)[1]
+                )
+                gh_script.chmod(0o700)
+                (f.work / "release-assets").mkdir()
+                (f.work / "release-assets" / "synthetic.bin").write_bytes(b"fixture")
+                result = f.run("bash", "-c", body, check=False)
+                self.assertEqual(marker_path.exists(), not race,
+                                 f"rc={result.returncode} stdout={result.stdout} "
+                                 f"stderr={result.stderr}")
+                if race:
+                    self.assertNotEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_stable_publish_refuses_tag_race_after_archive_step(self):
         """Execute the actual stable publish Bash step with an offline gh sentinel.
 

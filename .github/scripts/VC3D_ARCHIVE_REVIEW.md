@@ -117,3 +117,29 @@ window; it does not make API and Git operations globally atomic or prove
 real GitHub permissions. No real GitHub release, tags or scroll data are used.
 
 The 30 October P141 candidate passed all **20 distinct public test methods** in one uninterrupted local run (8 metadata plus 12 local-Git integration methods), no skips. The new negative control on the old stable workflow failed as expected and passed after the read-only check. Repeating a method or running both channel subtests does not increase the method count. The test's GitHub CLI upload is a recording stub, not a real upload.
+
+## Latest release ref race after atomic prestage (P142, 30 October)
+
+The latest workflow's **single** "Move latest tag and publish release" Bash
+step still has a gap between the atomic Git tag push and
+`gh release create latest`. An external ref update in that gap could make
+`--verify-tag` accept a tag pointing at a different source commit.
+This is analogous to P141's stable risk but occurs *within* the latest step.
+
+Immediately before creating the latest release, the step now uses the existing
+read-only `--probe-only` helper to recheck the exact current annotated tag,
+its staged alias, the retained archives, and any hidden draft. Only
+`REPAIR_RELEASE_ONLY` permits upload; `ALREADY_PUBLISHED` exits without
+creating a duplicate. Missing or changed state blocks the upload. This still
+leaves the last check-to-POST race; it is not an atomic transaction.
+
+A new offline test runs the actual step's Bash body. A wrapper first invokes
+the **unmodified** real prestage helper, then changes the latest remote ref
+locally before the release-create sentinel. Before the fix, the sentinel was
+incorrectly reached despite that change; after the fix, it is blocked. An
+unchanged-tag control still reaches the sentinel. The new method passed, as
+did eight metadata methods and the prior stable race method in targeted local
+runs. A full sequential run was interrupted by the test-runtime limit and
+is **not** claimed to have passed in this pass. The earlier P141 run had
+20 distinct passing methods on the prior commit. No real GitHub releases,
+API permissions, Actions, assets, or scroll voxels were tested.
