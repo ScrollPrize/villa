@@ -8,6 +8,7 @@
 #include "hub/HubWorker.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
 #include <nlohmann/json.hpp>
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <thread>
 #include <future>
@@ -85,9 +87,10 @@ int fakeSsh(int argc, char** argv)
     };
     const char* latency = std::getenv("VC_SFTP_TEST_LATENCY_MS");
     const char* disconnect = std::getenv("VC_SFTP_TEST_DISCONNECT");
+    const char* replyLog = std::getenv("VC_SFTP_TEST_REPLY_LOG");
     if (const char* log = std::getenv("VC_SFTP_TEST_CONNECTION_LOG"))
         if (locked) std::ofstream(log, std::ios::app) << "locked\n";
-    if (latency || disconnect) {
+    if (latency || disconnect || replyLog) {
         // Delay replies or discard one after the server has executed a request.
         int out[2];
         if (pipe(out)) return 44;
@@ -98,7 +101,22 @@ int fakeSsh(int argc, char** argv)
         }
         close(out[1]);
         std::array<char, 65536> buffer;
+        std::string packets;
         for (ssize_t n; (n = read(out[0], buffer.data(), buffer.size())) > 0;) {
+            if (replyLog) {
+                packets.append(buffer.data(), size_t(n));
+                auto u32 = [&](size_t at) {
+                    uint32_t value = 0;
+                    for (size_t i = at; i < at + 4; ++i) value = (value << 8) | uint8_t(packets[i]);
+                    return value;
+                };
+                while (packets.size() >= 4 && packets.size() >= 4 + u32(0)) {
+                    const auto length = u32(0);
+                    std::ofstream(replyLog, std::ios::app) << int(uint8_t(packets[4])) << ' '
+                        << (uint8_t(packets[4]) == 103 ? u32(9) : 0) << '\n';
+                    packets.erase(0, 4 + length);
+                }
+            }
             if (disconnect && std::filesystem::exists(disconnect)) {
                 shutdown(0, SHUT_RDWR);
                 close(out[0]);
@@ -439,6 +457,94 @@ void hosting(const std::filesystem::path& root)
     }
 
 }
+void readAhead(const std::filesystem::path& root)
+{
+    using namespace vc::objects::detail;
+    // Exercise the actual VFS independently of SQLite's own page cache.
+    const auto path = root / "read-ahead.bin";
+    const auto url = "sftp://read-ahead@test-host" + sftp::encodePath(path.string());
+    const auto original = bytes(1024 * 1024 + 123, 19);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(original.data()), original.size());
+    remoteEnableProcessLock(url);
+    auto* vfs = sqlite3_vfs_find(sftpVfs());
+    auto close = [](sqlite3_file* file) {
+        if (file->pMethods) file->pMethods->xClose(file);
+        sqlite3_free(file);
+    };
+    using Handle = std::unique_ptr<sqlite3_file, decltype(close)>;
+    auto open = [&] {
+        Handle file(static_cast<sqlite3_file*>(sqlite3_malloc(vfs->szOsFile)), close);
+        require(bool(file), "allocate VFS handle");
+        std::memset(file.get(), 0, vfs->szOsFile);
+        require(vfs->xOpen(vfs, url.c_str(), file.get(), SQLITE_OPEN_READWRITE | SQLITE_OPEN_MAIN_DB, nullptr) == SQLITE_OK,
+                "open read-ahead fixture");
+        return file;
+    };
+    Handle reader(nullptr, close), writer(nullptr, close);
+    auto read = [&](size_t offset, size_t size) {
+        std::vector<std::byte> out(size, std::byte{0xff});
+        const auto available = offset < original.size() ? std::min(size, original.size() - offset) : 0;
+        require(reader->pMethods->xRead(reader.get(), out.data(), int(size), offset) ==
+                (available == size ? SQLITE_OK : SQLITE_IOERR_SHORT_READ), "VFS read status");
+        require(std::equal(out.begin(), out.begin() + available, original.begin() + std::min(offset, original.size())),
+                "VFS read bytes");
+        require(std::all_of(out.begin() + available, out.end(), [](auto b) { return b == std::byte{0}; }),
+                "short VFS read zero fills the remainder");
+    };
+    const auto log = root / "read-ahead-replies";
+    setenv("VC_SFTP_TEST_REPLY_LOG", log.c_str(), 1);
+    {
+        RemoteHubScope scope(url);
+        reader = open(); writer = open();
+        for (size_t offset = 0; offset < 128 * 1024; offset += 4096) read(offset, 4096);
+        std::ifstream packets(log);
+        int type = 0; size_t size = 0, dataReplies = 0;
+        while (packets >> type >> size) dataReplies += type == 103;
+        require(dataReplies <= 4, "32 SQLite page reads use at most four pipelined SFTP reads");
+        read(65536 - 31, 4096); // unaligned and crosses a block boundary
+        read(123, 200000); // a read larger than one block
+        for (size_t offset = 0; offset < 1024 * 1024; offset += 65536) read(offset, 4096);
+        read(0, 4096); // eviction followed by a reread
+        read(original.size() - 17, 4096);
+        read(original.size() + 100, 4096);
+
+        const auto patch = bytes(4096, 27);
+        require(writer->pMethods->xWrite(writer.get(), patch.data(), patch.size(), 0) == SQLITE_OK, "write through second handle");
+        std::vector<std::byte> out(patch.size());
+        require(reader->pMethods->xRead(reader.get(), out.data(), out.size(), 0) == SQLITE_OK && out == patch,
+                "cached reader sees another handle's queued write");
+        require(writer->pMethods->xWrite(writer.get(), original.data(), patch.size(), 0) == SQLITE_OK, "restore written bytes");
+        read(0, 4096);
+        require(writer->pMethods->xTruncate(writer.get(), 100) == SQLITE_OK, "truncate cached file");
+        require(reader->pMethods->xRead(reader.get(), out.data(), out.size(), 0) == SQLITE_IOERR_SHORT_READ &&
+                std::equal(out.begin(), out.begin() + 100, original.begin()) &&
+                std::all_of(out.begin() + 100, out.end(), [](auto b) { return b == std::byte{0}; }), "truncate invalidates cached bytes");
+        require(writer->pMethods->xWrite(writer.get(), original.data(), original.size(), 0) == SQLITE_OK, "regrow cached file");
+        read(0, 4096);
+        read(original.size() - 17, 4096); // short cached block must also be invalidated by growth
+    }
+    unsetenv("VC_SFTP_TEST_REPLY_LOG");
+    std::array<std::byte, 4096> out;
+    require(reader->pMethods->xRead(reader.get(), out.data(), out.size(), 0) == SQLITE_IOERR_READ,
+            "cache cannot serve reads outside the hub lock");
+    {
+        RemoteHubScope scope(url);
+        // Simulate another writer between operations, under the new lock.
+        const auto patch = bytes(out.size(), 31);
+        std::fstream(path, std::ios::binary | std::ios::in | std::ios::out).write(
+            reinterpret_cast<const char*>(patch.data()), patch.size());
+        require(reader->pMethods->xRead(reader.get(), out.data(), out.size(), 0) == SQLITE_OK &&
+                std::equal(out.begin(), out.end(), patch.begin()), "new lock generation discards read-ahead");
+        require(reader->pMethods->xLock(reader.get(), SQLITE_LOCK_SHARED) == SQLITE_OK, "mark unfinished transaction");
+    }
+    {
+        RemoteHubScope scope(url);
+        require(reader->pMethods->xRead(reader.get(), out.data(), out.size(), 0) == SQLITE_IOERR_READ,
+                "failed lock session cannot serve cached bytes under a new scope");
+        reader.reset(); writer.reset();
+    }
+}
+
 // Faults run against real OpenSSH sftp-server and the production flock command.
 void processLocks(const std::filesystem::path& root, const std::filesystem::path& realStore = {})
 {
@@ -700,6 +806,80 @@ void processLocks(const std::filesystem::path& root, const std::filesystem::path
     }
 }
 
+// Optional real-data benchmark: each empty replica pulls the same new fibers
+// through a cold hub handle. Setup and byte-for-byte validation are not timed.
+void benchmarkPull(const std::filesystem::path& root, const std::filesystem::path& sourcePath,
+                   int count, int iterations, int latencyMs)
+{
+    require(count > 0 && iterations > 0 && latencyMs >= 0, "invalid benchmark arguments");
+    auto options = as("benchmark-source"); options.readOnly = true;
+    auto source = ObjectStore::open(sourcePath, options);
+    std::vector<ObjectCopy> copies;
+    size_t payloadBytes = 0;
+    {
+        auto txn = source.read();
+        auto records = source.objectsByKind(txn, "fiber");
+        std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+        for (const auto& record : records) {
+            if (!source.currentGeometry(txn, record.uuid)) continue;
+            copies.push_back(readObjectCopy(source, txn, record.uuid, record.uuid));
+            for (const auto& array : copies.back().geometry->arrays) payloadBytes += array.bytes.size();
+            if (int(copies.size()) == count) break;
+        }
+    }
+    require(int(copies.size()) == count, "not enough real fibers for benchmark");
+    const auto path = root / "benchmark-hub.vcobj";
+    { auto store = ObjectStore::create(path, as("owner")); store.checkpoint(); }
+    initHub(path, "owner");
+    const auto url = "sftp://benchmark@test-host" + sftp::encodePath(path.string());
+    enableHubProcessLocking(url);
+    std::vector<std::filesystem::path> replicas;
+    for (int i = 0; i < iterations; ++i) {
+        replicas.push_back(root / ("benchmark-" + std::to_string(i) + ".vcobj"));
+        cloneHub(url, replicas.back(), as("reader-" + std::to_string(i)));
+    }
+    const auto publisherPath = root / "publisher.vcobj";
+    cloneHub(url, publisherPath, as("publisher"));
+    auto publisher = ObjectStore::open(publisherPath, as("publisher"));
+    {
+        auto txn = publisher.write();
+        for (const auto& copy : copies) writeObjectCopy(publisher, txn, copy);
+        txn.commit();
+    }
+    require(hubPush(publisher).pushed == count, "publish benchmark geometry");
+    std::cout << "fibers=" << count << " payload_bytes=" << payloadBytes << " reply_delay_ms=" << latencyMs << '\n';
+    for (int i = 0; i < iterations; ++i) {
+        auto replica = ObjectStore::open(replicas[i], as("reader-" + std::to_string(i)));
+        const auto log = root / ("replies-" + std::to_string(i));
+        setenv("VC_SFTP_TEST_REPLY_LOG", log.c_str(), 1);
+        setenv("VC_SFTP_TEST_LATENCY_MS", std::to_string(latencyMs).c_str(), 1);
+        const auto start = std::chrono::steady_clock::now();
+        require(hubPull(replica).pulled == count, "benchmark pull installs all fibers");
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        unsetenv("VC_SFTP_TEST_LATENCY_MS");
+        unsetenv("VC_SFTP_TEST_REPLY_LOG");
+        auto txn = replica.read();
+        for (const auto& copy : copies) {
+            const auto revision = replica.currentGeometry(txn, copy.record.uuid);
+            require(bool(revision), "pulled fiber has geometry");
+            const auto data = replica.readGeometryData(txn, revision->uuid);
+            require(data.arrays.size() == copy.geometry->arrays.size(), "pulled array count");
+            for (size_t j = 0; j < data.arrays.size(); ++j) {
+                const auto& expected = copy.geometry->arrays[j];
+                const auto& actual = data.arrays[j];
+                require(actual.name == expected.name && actual.dtype == expected.dtype &&
+                        actual.shape == expected.shape && actual.bytes == expected.bytes, "pulled geometry bytes unchanged");
+            }
+        }
+        size_t replies = 0, reads = 0, received = 0, size = 0;
+        int type = 0;
+        std::ifstream packets(log);
+        while (packets >> type >> size) { ++replies; reads += type == 103; received += size; }
+        std::cout << "pull_seconds=" << seconds << " replies=" << replies << " data_replies=" << reads
+                  << " data_bytes=" << received << std::endl;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -743,9 +923,14 @@ try {
     std::filesystem::create_symlink(std::filesystem::absolute(argv[0]), bin / "ssh");
     setenv("PATH", (bin.string() + ":" + std::getenv("PATH")).c_str(), 1);
     setenv("VC_SFTP_TEST_SERVER", server.c_str(), 1);
+    if (argc == 6 && std::string(argv[1]) == "--benchmark-pull") {
+        benchmarkPull(directory.path, argv[2], std::stoi(argv[3]), std::stoi(argv[4]), std::stoi(argv[5]));
+        return 0;
+    }
     session(directory.path);
     passwords(directory.path);
 #ifdef __linux__
+    readAhead(directory.path);
     hosting(directory.path);
     processLocks(directory.path, argc == 3 && std::string(argv[1]) == "--real-store" ? argv[2] : std::filesystem::path{});
 #else
