@@ -9,7 +9,7 @@
 
 class QDockWidget;
 class QFrame;
-class QHBoxLayout;
+class FlowLayout;
 class QPushButton;
 class QStackedWidget;
 class QToolButton;
@@ -92,7 +92,7 @@ private:
     QFrame* _panelFrame{nullptr};
     QStackedWidget* _stack{nullptr};
     QFrame* _barFrame{nullptr};
-    QHBoxLayout* _barLayout{nullptr};
+    FlowLayout* _barLayout{nullptr};
     std::vector<Item> _items;
     int _currentIndex{-1};
     bool _positioningPanel{false};

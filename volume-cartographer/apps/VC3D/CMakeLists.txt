@@ -21,6 +21,8 @@ set(srcs
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
     CWindowContextMenu.cpp
+    FlowLayout.cpp
+    FlowLayout.hpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
     FileWatcherService.cpp
