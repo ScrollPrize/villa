@@ -151,6 +151,14 @@ changing the input:
 /tmp/vc-hub-lock-build/bin/test_object_store_sftp --real-store /path/to/fibers.vcobj
 ```
 
+SFTP database reads use bounded read-ahead (eight 64 KiB blocks per handle)
+through the existing pipelined transport. Cached bytes are invalidated between
+hub-lock sessions and on writes/truncation; small header probes and journals
+remain unbuffered. The hub lock still protects one consistent SQLite snapshot.
+Incoming geometry is staged before taking the replica's write lock.
+See [read-ahead measurements and validation](docs/sftp-read-ahead.md) for the
+tradeoff between latency and extra bytes, and the optional real-fiber pull benchmark.
+
 ## Transformed geometry views
 
 Canonical geometry stays in its recorded volume. Request another coordinate frame
