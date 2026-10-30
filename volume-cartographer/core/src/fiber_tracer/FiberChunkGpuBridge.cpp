@@ -91,7 +91,7 @@ std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig& c,const 
 void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& source,
     const vc::lasagna::NormalSampler& normals,const FiberTraceConfig& cfg,
     const FiberChunkTraceConfig& c,double scale,const std::vector<Json>& gpuSeeds,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait)
+    const FiberChunkWait& wait)
 {
     if(c.gpuLibrary.empty())throw std::invalid_argument("GPU library required");
     auto& gpu=gpuChunks(c);
@@ -120,18 +120,9 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             for(int y=0;y<shape[1];++y) for(int x=0;x<shape[0];++x)
                 points.emplace_back((origin[0]+x)*spacing,(origin[1]+y)*spacing,(origin[2]+z)*spacing);
             vc::lasagna::LasagnaCornerBatch corners;
-            corners.values.resize(6);for(auto& channel:corners.values)channel.resize(points.size());
-            corners.fractionsXYZ.resize(points.size());corners.valid.resize(points.size());
-            auto visitor=[](void* context,size_t i,const cv::Vec3f& fraction,bool valid,
-                            std::span<const std::array<uint8_t,8>> values){
-                auto& c=*static_cast<vc::lasagna::LasagnaCornerBatch*>(context);
-                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
-                c.valid[i]=valid;c.fractionsXYZ[i]=fraction;
-                for(size_t k=0;k<6;++k)c.values[k][i]=values[k];
-            };
-            if(!field->visitCornerBatchWithNormals(*normalField,points,1,&corners,visitor,0,nullptr,pinned.get()))
+            if(!field->sampleCornerBatchWithNormals(*normalField,points,&corners,nullptr))
                 throw std::runtime_error("GPU fixture requires aligned native corner grids");
-            std::vector<float> widths;if(pinned)field->sampleWidths(points,widths,*pinned);else field->sampleWidths(points,widths);
+            std::vector<float> widths;field->sampleWidths(points,widths);
             for(size_t i=0;i<points.size();++i) {
                 if(!corners.valid[i] || cv::norm(corners.fractionsXYZ[i])>1e-6)
                     throw std::runtime_error("GPU fixture lattice mismatch/outside volume");

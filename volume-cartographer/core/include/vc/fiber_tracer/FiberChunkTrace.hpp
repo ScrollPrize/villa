@@ -34,7 +34,6 @@ struct FiberChunkTraceConfig {
     int onlineRefineIterations=0, onlineRefineWindow=0;
     double onlineRefineEpsilonBase=.25, onlineRefineStepBase=1, onlineRefineCapBase=8;
     std::filesystem::path benchmarkExport; // explicit fixture export, empty disables
-    bool pinSamplingRegion=true;
     // Reject accidentally enormous dense seed grids before allocating them.
     size_t maxGridSamples=64ULL*1024*1024;
 };

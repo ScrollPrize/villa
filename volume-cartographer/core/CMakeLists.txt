@@ -51,8 +51,6 @@ add_library(vc_core
         src/render/ChunkRequestScheduler.cpp
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
-        src/render/ChunkedPlaneSampler.cpp
-        src/render/PinnedChunkRegion.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp

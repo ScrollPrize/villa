@@ -11,7 +11,7 @@ namespace vc::fiber_tracer {
 std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig&,const FiberChunkWait&);
 void runFiberChunkGpu(FiberChunkPaths&,const FiberPredictionSource&,const vc::lasagna::NormalSampler&,
     const FiberTraceConfig&,const FiberChunkTraceConfig&,double,const std::vector<nlohmann::json>&,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>&,const FiberChunkWait&);
+    const FiberChunkWait&);
 namespace {
 using Json=nlohmann::json;
 constexpr double pi=3.14159265358979323846;
@@ -280,20 +280,7 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
     }
     if(!finite(out->lo)||!finite(out->hi)) throw std::invalid_argument("chunk bounds overflow");
     auto cfg=trace;cfg.profile=nullptr;cfg.parallelThreads=1;cfg.traceToBaseScale=scale;
-    cfg.pinnedRegion=nullptr;cfg.committedBounds.reset();
-    std::shared_ptr<vc::render::PinnedChunkRegion> pinned;
-    if(c.pinSamplingRegion) {
-        const auto* field=dynamic_cast<const FiberPredictionField*>(&source);
-        const auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normals);
-        if(field&&normalField) {
-            const double margin=trace.stepVoxels*std::max(1,trace.beamLookaheadSteps)*scale+
-                (c.onlineRefineIterations?c.onlineRefineCapBase+c.onlineRefineEpsilonBase:0);
-            const auto pad=cv::Vec3d::all(margin);
-            pinned=field->pinRegion((out->lo-pad)/scale,(out->hi+pad)/scale);
-            normalField->pinRegion(*pinned,(out->lo-pad)/scale,(out->hi+pad)/scale);
-            pinned->seal();cfg.pinnedRegion=pinned.get();
-        }
-    }
+    cfg.committedBounds.reset();
     auto idx=[&](int x,int y,int z){return (size_t(z)*side+y)*side+x;};
     auto point=[&](int x,int y,int z){return out->lo+cv::Vec3d(x,y,z)*c.gridBase;};
     std::vector<float> presence(size_t(side)*side*side);
@@ -362,7 +349,7 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
         out->seeds+=result.accepted;
         if(result.line.size()>=2) {out->lines.push_back(std::move(result.line));out->endReasons.push_back(result.reasons);}
     }
-    if(!c.gpuLibrary.empty())runFiberChunkGpu(*out,source,normals,cfg,c,scale,gpuSeeds,pinned,wait);
+    if(!c.gpuLibrary.empty())runFiberChunkGpu(*out,source,normals,cfg,c,scale,gpuSeeds,wait);
     out->timings["construction_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
     return out;
 }
@@ -433,7 +420,6 @@ nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
         {"join_angle_degrees",c.joinAngleDegrees},
         {"join_minimum_base",c.joinMinimumBase},
         {"join_width_weight",c.joinWidthWeight},
-        {"pin_sampling_region",c.pinSamplingRegion},
         {"max_grid_samples",c.maxGridSamples},
         {"initial_alignment_power",c.initialAlignmentPower},
         {"initial_normal_radius_base",c.initialNormalRadiusBase},
@@ -477,7 +463,6 @@ FiberChunkTraceConfig fiberChunkConfigFromJson(const Json& j) {
     if(j.contains("join_angle_degrees"))j.at("join_angle_degrees").get_to(c.joinAngleDegrees);
     if(j.contains("join_minimum_base"))j.at("join_minimum_base").get_to(c.joinMinimumBase);
     if(j.contains("join_width_weight"))j.at("join_width_weight").get_to(c.joinWidthWeight);
-    if(j.contains("pin_sampling_region"))j.at("pin_sampling_region").get_to(c.pinSamplingRegion);
     if(j.contains("max_grid_samples"))j.at("max_grid_samples").get_to(c.maxGridSamples);
     if(j.contains("initial_alignment_power"))j.at("initial_alignment_power").get_to(c.initialAlignmentPower);
     if(j.contains("initial_normal_radius_base"))j.at("initial_normal_radius_base").get_to(c.initialNormalRadiusBase);

@@ -10,7 +10,6 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
-#include "utils/zarr.hpp"
 
 #include <QSaveFile>
 
@@ -44,9 +43,8 @@ void writeMarker(const std::filesystem::path& path, const std::string& text)
 void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest,
                              const vc::lasagna::LasagnaChannelGroup& group)
 {
-    const auto array = vc::lasagna::openLasagnaChannelArray(manifest, group, 1);
-    const auto& meta = array.metadata();
-    if (meta.dtype != utils::ZarrDtype::uint8)
+    const auto meta = vc::lasagna::openLasagnaGroupArray(group, nullptr).meta;
+    if (meta.dtype != "|u1")
         throw std::runtime_error("Lasagna channel group '" + group.name +
                                  "' must be uint8");
     if (group.channels.size() != 1) {
@@ -63,8 +61,8 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     for (std::size_t axis = 0; axis < 3; ++axis) {
         const auto expected = static_cast<std::size_t>(std::ceil(
             static_cast<double>((*manifest.baseShapeZYX)[axis]) / spacing));
-        const auto actual = meta.shape[axis];
-        const auto padding = meta.chunks[axis];
+        const auto actual = static_cast<std::size_t>(meta.shape[axis]);
+        const auto padding = static_cast<std::size_t>(meta.chunks[axis]);
         if (actual < expected || actual > expected + padding) {
             throw std::runtime_error("Lasagna channel group '" + group.name +
                                      "' shape is incompatible with base_shape_zyx");

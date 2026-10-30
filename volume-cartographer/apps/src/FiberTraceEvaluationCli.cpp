@@ -16,7 +16,6 @@
 #include <vc_reader/array.hpp>
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
-#include "vc/core/render/ChunkCache.hpp"
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -54,8 +53,8 @@ vcr::zarr::OpenedArray openCtLevel(const std::string& locator, std::shared_ptr<v
     return vcr::zarr::Group::open(path.parent_path().string(), options).array(path.filename().string());
 }
 
-// The decoded-chunk budget, configured before binding: the chunk cache service of
-// the prediction and normal sources, and the render CT levels' MemoryCache.
+// The decoded-chunk budget: one MemoryCache of the prediction, normal and render
+// CT arrays.
 size_t configureEvaluationCache(const Json& settings)
 {
     if (settings.contains("cache_bytes_per_channel"))
@@ -81,7 +80,6 @@ size_t configureEvaluationCache(const Json& settings)
     }
     if (!bytes || bytes > std::numeric_limits<size_t>::max())
         throw std::invalid_argument("cannot determine decoded cache budget; set decoded_cache_bytes explicitly");
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(size_t(bytes));
     std::cout << "Shared decoded cache budget: " << bytes << " bytes" << std::endl;
     return size_t(bytes);
 }
@@ -165,14 +163,7 @@ Json caseProfileJson(size_t index, double elapsed, const FiberReadinessProfile& 
         {"trace", {{"generations", trace.generations}, {"candidates", trace.candidateTasks},
             {"candidate_score_seconds_inclusive", trace.candidateScoreSeconds},
             {"prediction_batch_seconds_inclusive", trace.predictionBatchSeconds},
-            {"readiness_plan_seconds", trace.readinessPlanSeconds},
-            {"readiness_plan_points", trace.readinessPlanPoints},
-            {"readiness_plan_dependencies", trace.readinessPlanDependencies},
-            {"corner_prepare_seconds", trace.predictionCornerPrepareSeconds},
-            {"corner_layout_seconds", trace.predictionCornerLayoutSeconds},
-            {"corner_pin_seconds", trace.predictionCornerPinSeconds},
-            {"corner_gather_seconds", trace.predictionCornerGatherSeconds},
-            {"corner_points", trace.cornerPointCount},
+            {"corner_seconds", trace.predictionCornerSeconds},
             {"normal_batch_seconds_inclusive", trace.normalBatchSeconds},
             {"frontier_seconds", trace.frontierSeconds}, {"prune_seconds", trace.pruneSeconds},
             {"lookahead_decision_seconds", trace.lookaheadDecisionSeconds}}}};
@@ -564,7 +555,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const size_t decodedCacheBytes = configureEvaluationCache(config);
     persistedConfig["decoded_cache_bytes"] = decodedCacheBytes;
     // Render CT levels share one cache of the configured budget.
-    const auto ctCache = std::make_shared<vcr::MemoryCache>(decodedCacheBytes);
+    const auto decodedCache = std::make_shared<vcr::MemoryCache>(decodedCacheBytes);
     const bool render = config.value("render", false) || renderFlag;
     persistedConfig["render"] = render;
     if (live) persistedConfig["live_endpoint"].erase("token");
@@ -608,7 +599,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         manifest.workingToBaseScale = source.traceScale;
         source.predictionManifest = manifest;
         source.predictions = std::make_unique<FiberPredictionField>(vc::lasagna::LasagnaDataset(std::move(manifest)),
-            FiberPredictionFieldOptions{.enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
+            FiberPredictionFieldOptions{.memoryCache = decodedCache, .enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
         options.workingToBaseScale = source.traceScale;
         if (referenceNormalMode == "lasagna") {
         const auto normals = vc::lasagna::LasagnaDataset::openLocation(normalLocation, options);
@@ -623,7 +614,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if ((a > b ? a - b : b - a) > 1)
                 throw std::invalid_argument("prediction and normal base shapes disagree");
         }
-        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normals);
+        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(
+            normals, vc::lasagna::LasagnaNormalSamplerOptions{.memoryCache = decodedCache});
         }
         const auto tracingNormalMode = entry.value("tracing_normals", std::string("lasagna"));
         if (tracingNormalMode != "lasagna" && tracingNormalMode != "fiber")
@@ -646,7 +638,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             normalManifest.raw["grad_mag_factor"] = 1.0;
             vc::lasagna::LasagnaDataset normalDataset(std::move(normalManifest));
             vc::lasagna::validateLasagnaNormalDatasetStructure(normalDataset);
-            source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normalDataset);
+            source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(
+                normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{.memoryCache = decodedCache});
         }
         source.provenance = entry;
         source.provenance["fiber_manifest"] = fiberLocation;
@@ -676,7 +669,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     ctOptions = volume->sourceOpenOptions();
                     working = volume->baseScaleLevel();
                 }
-                ctOptions.memoryCache = ctCache;
+                ctOptions.memoryCache = decodedCache;
                 auto base = std::make_shared<vcr::zarr::OpenedArray>(
                     vcr::zarr::openPyramidLevel(location, working, ctOptions));
                 if (base->meta.shape.size() != 3 || base->meta.type.kind != 'u' || base->meta.type.itemsize != 1)
@@ -700,7 +693,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             } else {
                 if (source.renderCt.find("://") != std::string::npos)
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
-                source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, ctCache));
+                source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, decodedCache));
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);
                 source.renderGridLevel = {source.renderLevel->array.get(), source.renderLevel->meta.type};
             }
@@ -1002,7 +995,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (bridge && (!resumeVisualization || renderThisCase)) {
                     livePredictions = std::make_unique<FiberPredictionField>(
                         vc::lasagna::LasagnaDataset(source.predictionManifest),
-                        FiberPredictionFieldOptions{.enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
+                        FiberPredictionFieldOptions{.memoryCache = decodedCache, .enableEmbeddings = trace.embeddingWeight > 0, .enableWidth = trace.widthRelativeTolerance > 0});
                     livePredictions->setReadinessGate([&](const auto& dependencies) {
                         readiness.await(dependencies, [&](const auto& missing) {
                             permit.suspend([&] { bridge->await(source.id, index, remaining.load(), missing,

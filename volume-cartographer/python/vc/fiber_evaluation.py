@@ -38,7 +38,7 @@ CHUNK_KEYS = (
     "tube_half_base", "tube_step_base", "tube_presence", "tube_turn_degrees",
     "tube_total_degrees", "rim_drop", "rim_normal_base", "rim_tangent_base",
     "join_distance_base", "join_angle_degrees", "join_minimum_base",
-    "join_width_weight", "pin_sampling_region", "max_grid_samples",
+    "join_width_weight", "max_grid_samples",
     "initial_alignment_power",
     "initial_normal_radius_base",
     "initial_tangential_radius_base",

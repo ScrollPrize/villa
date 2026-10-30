@@ -154,7 +154,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     }
     const double loadSeconds=seconds(loadStart);
     const vc::lasagna::LasagnaNormalSampler normals(dataset);
-    const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx").spacing;
+    vc::lasagna::LasagnaGroupArrays arrays(0);
+    const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx",arrays).spacing;
     std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
              <<" unsigned normals; no alignment"<<std::endl;
     FiberTraceConstraintConfig options;

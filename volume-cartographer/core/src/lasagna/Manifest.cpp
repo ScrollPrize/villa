@@ -153,7 +153,7 @@ int LasagnaChannelGroup::scaleFactor() const noexcept
 
 bool LasagnaChannelGroup::isRemote() const noexcept
 {
-    return !remoteZarrBaseUrl.empty();
+    return zarrPath.empty() && !sourceLocation.empty();
 }
 
 bool LasagnaChannelGroup::hasChannel(std::string_view channel) const noexcept

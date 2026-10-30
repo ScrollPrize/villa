@@ -14,6 +14,8 @@
 
 #include <vc_reader/zarr.hpp>
 
+#include <opencv2/core.hpp>
+
 #include <chrono>
 #include <cmath>
 #include <filesystem>

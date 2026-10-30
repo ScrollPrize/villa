@@ -135,8 +135,7 @@ TEST_CASE("Lasagna project volume tags preserve anonymous remote authentication"
 {
     vc::lasagna::LasagnaChannelGroup group;
     group.name = "pred";
-    group.remoteZarrBaseUrl =
-        "https://bucket.s3.us-east-1.amazonaws.com/artifact/pred.zarr";
+    group.sourceLocation = "s3://bucket/artifact/pred.zarr";
     group.discoverAwsCredentials = false;
 
     const auto tags = vc::lasagna::lasagnaProjectVolumeTags(

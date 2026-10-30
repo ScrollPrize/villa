@@ -24,27 +24,7 @@ struct NormalSampleWithDerivative {
     bool hasDerivative = false;
 };
 
-struct NormalPrefetchReport {
-    uint64_t requestedChunks = 0;
-    uint64_t chunksRead = 0;
-    double cornerPrepareSeconds = 0.0;
-    double cornerLayoutSeconds = 0.0;
-    double cornerPinSeconds = 0.0;
-    double cornerGatherSeconds = 0.0;
-    uint64_t cornerLayoutChunkRuns = 0;
-    uint64_t cornerBoundaryPoints = 0;
-    uint64_t cornerDependencies = 0;
-    uint64_t cornerPointCount = 0;
-    uint64_t cornerUniqueVoxelCubes = 0;
-    uint64_t cornerWorkerTasks = 0;
-    uint64_t cornerMaxCandidatesPerCube = 0;
-    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
-    std::vector<uint64_t> cornerDependencyIds;
-};
-
 struct NormalBatchReport {
-    NormalPrefetchReport prefetch;
-    double prefetchMs = 0.0;
     double materializeMs = 0.0;
 };
 
@@ -70,22 +50,14 @@ public:
     {
         return {sampleNormal(volumePoint), cv::Matx33d::zeros(), false};
     }
-    [[nodiscard]] virtual NormalPrefetchReport prefetchNormalSamples(
-        const std::vector<cv::Vec3d>& /*volumePoints*/,
-        bool /*withDerivative*/) const
-    {
-        return {};
-    }
     [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints,
         bool withDerivative,
         std::vector<NormalSampleWithDerivative>& samples) const
     {
         using Clock = std::chrono::steady_clock;
-        const auto prefetchStart = Clock::now();
+        const auto start = Clock::now();
         NormalBatchReport report;
-        report.prefetch = prefetchNormalSamples(volumePoints, withDerivative);
-        const auto prefetchEnd = Clock::now();
         samples.clear();
         samples.resize(volumePoints.size());
         for (size_t index = 0; index < volumePoints.size(); ++index) {
@@ -96,11 +68,8 @@ public:
                       cv::Matx33d::zeros(),
                       false};
         }
-        const auto materializeEnd = Clock::now();
-        report.prefetchMs = std::chrono::duration<double, std::milli>(
-            prefetchEnd - prefetchStart).count();
         report.materializeMs = std::chrono::duration<double, std::milli>(
-            materializeEnd - prefetchEnd).count();
+            Clock::now() - start).count();
         return report;
     }
 };

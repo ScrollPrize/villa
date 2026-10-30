@@ -1,5 +1,5 @@
 #include "vc/lasagna/PredictionPooling.hpp"
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/computed.hpp>
 #include <opencv2/core.hpp>
 #include <Eigen/Eigenvalues>
 #include <nlohmann/json.hpp>
@@ -9,13 +9,12 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <future>
-#include <list>
 #include <iostream>
 #include <mutex>
 #include <numeric>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #ifdef VC_POOLING_LAPACK
 extern "C" void dsyevd_(const char*,const char*,const int*,double*,const int*,double*,double*,const int*,int*,const int*,int*,size_t,size_t);
@@ -24,9 +23,8 @@ extern "C" void dsyevd_(const char*,const char*,const int*,double*,const int*,do
 namespace vc::lasagna {
 namespace {
 constexpr std::array<const char*,7> names{"presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"};
-using Bundle = std::array<std::vector<std::byte>,7>;
 using Index = std::array<size_t,3>;
-std::atomic<uint64_t> computations{0},hits{0},readNs{0},poolNs{0};
+std::atomic<uint64_t> computations{0},readNs{0},poolNs{0};
 using Clock=std::chrono::steady_clock;
 uint64_t elapsed(Clock::time_point start) {return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
 uint8_t quantize(float x) { return static_cast<uint8_t>(std::clamp(std::nearbyint(x),0.f,255.f)); }
@@ -34,57 +32,60 @@ cv::Vec3f axis(uint8_t x, uint8_t y) {
     const float a=(float(x)-128.f)/127.f,b=(float(y)-128.f)/127.f;
     return {a,b,std::sqrt(std::max(0.f,1.f-a*a-b*b))};
 }
+// The source channels a pooled channel reads: presence and its axis rank and
+// weight every voxel; nx/ny and sheet nx/ny pool as axis pairs.
+std::vector<size_t> inputsOf(size_t channel) {
+    switch(channel) {
+    case 0: case 1: case 2: return {0,1,2};
+    case 4: case 5: return {0,1,2,4,5};
+    default: return {0,1,2,channel};
+    }
+}
 struct Source {
-    std::array<std::unique_ptr<utils::ZarrArray>,7> arrays;
+    std::array<vcr::zarr::OpenedArray,7> arrays;
     Index shape{}, chunk{};
-    explicit Source(const std::filesystem::path& root,const nlohmann::json& config) {
+    Source(const std::filesystem::path& root,const nlohmann::json& config,std::shared_ptr<vcr::MemoryCache> cache) {
+        vcr::zarr::OpenOptions options;
+        options.memoryCache=std::move(cache);
         for(size_t c=0;c<7;++c) {
             const auto path=config.contains("channels")?
                 std::filesystem::path(config.at("channels").at(names[c]).get<std::string>()):
                 root/(std::string("fiber_")+names[c]+".ome.zarr")/config.value("source_level",std::string("1"));
-            const auto metadata=nlohmann::json::parse(utils::FileSystemStore(path).get_string(".zarray"));
-            if(metadata.value("order",std::string("C"))!="C")
+            arrays[c]=vcr::zarr::openArray(path.string(),options);
+            const auto& m=arrays[c].meta;
+            if(m.order!="C")
                 throw std::runtime_error("native pooling requires C-order source");
-            arrays[c]=std::make_unique<utils::ZarrArray>(utils::ZarrArray::open(
-                path,vc::buildZarrCodecRegistry(c==3?4:1)));
-            const auto& m=arrays[c]->metadata();
-            if(m.shape.size()!=3 || m.chunks.size()!=3 ||
-               m.dtype!=(c==3?utils::ZarrDtype::float32:utils::ZarrDtype::uint8))
+            if(m.shape.size()!=3 || m.chunks.size()!=3 || m.dtype!=(c==3?"<f4":"|u1"))
                 throw std::runtime_error("native pooling requires C-order 3D u8 channels and float32 width");
-            if(c==0) for(size_t d=0;d<3;++d) {shape[d]=m.shape[d];chunk[d]=m.chunks[d];}
+            if(c==0) for(size_t d=0;d<3;++d) {shape[d]=size_t(m.shape[d]);chunk[d]=size_t(m.chunks[d]);}
             for(size_t d=0;d<3;++d)
-                if(m.shape[d]!=shape[d] || m.chunks[d]!=chunk[d] || chunk[d]%2)
+                if(size_t(m.shape[d])!=shape[d] || size_t(m.chunks[d])!=chunk[d] || chunk[d]%2)
                     throw std::runtime_error("native pooling requires aligned even source chunks");
         }
     }
-    std::shared_ptr<const Bundle> compute(const Index& key) const {
+    // Pools one output chunk of `channel` (chunk/2 voxels per axis) from source chunk `key`.
+    void compute(const Index& key, size_t channel, uint8_t* out) const {
         const auto start=Clock::now();
-        Bundle input;
-        Index valid{}, out{};
+        std::array<std::vector<uint8_t>,7> input;
+        Index valid{}, half{};
         for(size_t d=0;d<3;++d) {
             if(key[d]*chunk[d]>=shape[d]) throw std::runtime_error("pooled chunk outside volume");
-            valid[d]=std::min(chunk[d],shape[d]-key[d]*chunk[d]); out[d]=chunk[d]/2;
+            valid[d]=std::min(chunk[d],shape[d]-key[d]*chunk[d]); half[d]=chunk[d]/2;
         }
-        const size_t size=out[0]*out[1]*out[2];
-        auto result=std::make_shared<Bundle>();
-        for(size_t c=0;c<7;++c) {
-            auto data=arrays[c]->read_chunk(key);
-            if(!data) throw std::runtime_error("unpublished native pooling source: "+arrays[c]->chunk_path(key).string());
-            input[c]=std::move(*data);
-            if(input[c].size()!=chunk[0]*chunk[1]*chunk[2]*(c==3?4:1))
-                throw std::runtime_error("invalid source chunk byte count");
-            (*result)[c].resize(size*(c==3?4:1));
-            // Match source fill for padding beyond the volume, not invented evidence.
-            if(c!=3) std::fill((*result)[c].begin(),(*result)[c].end(),
-                              static_cast<std::byte>(arrays[c]->metadata().fill_value.value_or(0)));
-            else {
-                const float fill=float(arrays[c]->metadata().fill_value.value_or(0));
-                for(size_t i=0;i<size;++i) std::memcpy((*result)[c].data()+i*4,&fill,4);
-            }
+        const size_t size=half[0]*half[1]*half[2];
+        const vcr::Index index{std::int64_t(key[0]),std::int64_t(key[1]),std::int64_t(key[2])};
+        for(const size_t c: inputsOf(channel)) {
+            input[c].resize(arrays[c].array->chunk_bytes());
+            if(!arrays[c].array->read_chunk(index,input[c].data(),input[c].size()))
+                throw std::runtime_error("unpublished native pooling source: "+arrays[c].location+" chunk "+
+                    std::to_string(key[0])+"/"+std::to_string(key[1])+"/"+std::to_string(key[2]));
         }
+        // Match source fill for padding beyond the volume, not invented evidence.
+        const auto& fill=arrays[channel].meta.fill;
+        for(size_t i=0;i<size;++i) std::memcpy(out+i*fill.size(),fill.data(),fill.size());
         readNs+=elapsed(start);
         const auto poolingStart=Clock::now();
-        auto byte=[&](size_t c,size_t i){return std::to_integer<uint8_t>(input[c][i]);};
+        auto byte=[&](size_t c,size_t i){return input[c][i];};
         for(size_t z=0;z<(valid[0]+1)/2;++z) for(size_t y=0;y<(valid[1]+1)/2;++y) for(size_t x=0;x<(valid[2]+1)/2;++x) {
             std::array<size_t,8> indices{}; std::array<cv::Vec3f,8> deltas{};
             size_t n=0;
@@ -95,7 +96,7 @@ struct Source {
             }
             std::array<size_t,8> rank{}; std::iota(rank.begin(),rank.end(),0);
             std::stable_sort(rank.begin(),rank.begin()+n,[&](size_t a,size_t b){return byte(0,indices[a])>byte(0,indices[b]);});
-            const size_t k=std::min(size_t(2),n), dst=(z*out[1]+y)*out[2]+x;
+            const size_t k=std::min(size_t(2),n), dst=(z*half[1]+y)*half[2]+x;
             auto ref=axis(byte(1,indices[rank[0]]),byte(2,indices[rank[0]]));
             ref*=1.f/std::max(std::sqrt(ref.dot(ref)),1e-12f);
             std::array<float,8> weights{};
@@ -106,20 +107,21 @@ struct Source {
             }
             float denom=0; for(size_t j=0;j<n;++j) denom+=weights[j];
             if(denom==0) {for(size_t j=0;j<k;++j) weights[rank[j]]=1.f;denom=float(k);}
-            // Keep ZYX float accumulation order, including unselected zero terms.
-            for(size_t c: {size_t(3),size_t(6)}) {
+            if(channel==3 || channel==6) {
+                // Keep ZYX float accumulation order, including unselected zero terms.
                 float sum=0;
                 for(size_t j=0;j<n;++j) {
                     float value;
-                    if(c==3) std::memcpy(&value,input[c].data()+indices[j]*4,4); else value=byte(c,indices[j]);
+                    if(channel==3) std::memcpy(&value,input[channel].data()+indices[j]*4,4); else value=byte(channel,indices[j]);
                     sum+=value*weights[j];
                 }
                 const float value=(sum/float(n))/std::max(denom/float(n),1e-12f);
-                if(c==3) std::memcpy((*result)[c].data()+dst*4,&value,4); else (*result)[c][dst]=std::byte(quantize(value));
-            }
-            float presence=0; for(size_t j=0;j<k;++j) presence+=byte(0,indices[rank[j]]);
-            (*result)[0][dst]=std::byte(quantize(presence/float(k)));
-            for(size_t c: {size_t(1),size_t(4)}) {
+                if(channel==3) std::memcpy(out+dst*4,&value,4); else out[dst]=quantize(value);
+            } else if(channel==0) {
+                float presence=0; for(size_t j=0;j<k;++j) presence+=byte(0,indices[rank[j]]);
+                out[dst]=quantize(presence/float(k));
+            } else {
+                const size_t c=channel==1 || channel==2 ? 1 : 4;
                 cv::Matx33f m=cv::Matx33f::zeros();
                 for(size_t j=0;j<n;++j) {
                     auto v=axis(byte(c,indices[j]),byte(c+1,indices[j]));
@@ -156,121 +158,75 @@ struct Source {
                 #endif
                 if(v[2]<0) v=-v;
                 v*=1.f/std::sqrt(std::max(v.dot(v),1e-12f));
-                (*result)[c][dst]=std::byte(quantize(v[0]*127.f+128.f));
-                (*result)[c+1][dst]=std::byte(quantize(v[1]*127.f+128.f));
+                out[dst]=quantize(v[channel==c?0:1]*127.f+128.f);
             }
         }
         poolNs+=elapsed(poolingStart);
         const auto count=++computations;
-        if(count%1024==0) std::clog<<"native-pool chunks="<<count<<" hits="<<hits.load()
+        if(count%1024==0) std::clog<<"native-pool chunks="<<count
             <<" read_task_wall_s="<<double(readNs.load())/1e9<<" pool_task_wall_s="<<double(poolNs.load())/1e9<<std::endl;
-        return result;
     }
 };
 
-// One process-wide bounded bundle LRU, shared across source and channel views.
-// Native ChunkCache owns the ordinary decoded per-channel cache separately.
-struct Cache {
-    struct Entry { std::shared_future<std::shared_ptr<const Bundle>> future; size_t bytes=0; std::list<std::string>::iterator lru; };
-    std::mutex mutex;
-    std::unordered_map<std::string,Entry> entries;
-    std::list<std::string> lru;
-    size_t bytes=0;
-    static constexpr size_t capacity=size_t(8)<<30;
-    std::shared_ptr<const Bundle> get(const std::string& id,const Source& source,const Index& key) {
-        std::shared_future<std::shared_ptr<const Bundle>> future;
-        std::shared_ptr<std::promise<std::shared_ptr<const Bundle>>> promise;
-        {
-            std::lock_guard lock(mutex);
-            if(auto it=entries.find(id);it!=entries.end()) {
-                ++hits;
-                future=it->second.future;
-                if(it->second.bytes) lru.splice(lru.begin(),lru,it->second.lru);
-            } else {
-                promise=std::make_shared<std::promise<std::shared_ptr<const Bundle>>>();
-                future=promise->get_future().share();entries.emplace(id,Entry{future,0,{}});
-            }
-        }
-        if(!promise) return future.get(); // no cache lock, owner computes inline
-        try {
-            auto bundle=source.compute(key);size_t count=0;for(const auto& v:*bundle)count+=v.size();
-            {
-                std::lock_guard lock(mutex);
-                lru.push_front(id);auto& entry=entries.at(id);entry.bytes=count;entry.lru=lru.begin();bytes+=count;
-                while(bytes>capacity && lru.size()>1) {
-                    const auto last=lru.back();bytes-=entries.at(last).bytes;entries.erase(last);lru.pop_back();
-                }
-            }
-            promise->set_value(bundle);return bundle;
-        } catch(...) {
-            promise->set_exception(std::current_exception());
-            std::lock_guard lock(mutex);entries.erase(id);throw;
-        }
-    }
-};
-Cache cache;
+// Channel views of one source share its opened arrays.
 std::mutex sourcesMutex;
 std::unordered_map<std::string,std::weak_ptr<Source>> sources;
-class PooledStore final:public utils::Store {
-    utils::FileSystemStore metadata;
-    std::shared_ptr<Source> source;
-    std::string identity;
-    size_t channel=0;
-public:
-    explicit PooledStore(const std::filesystem::path& path):metadata(path) {
-        const auto config=nlohmann::json::parse(metadata.get_string(".native_pool.json"));
-        if(config.at("revision")!=1 || config.at("factor")!=2 || config.at("mode")!="top2_spatial_comp")
-            throw std::runtime_error("unsupported native prediction pooling recipe");
-        const std::string name=config.at("channel");
-        auto it=std::find(names.begin(),names.end(),name);
-        if(it==names.end()) throw std::runtime_error("unknown native pooling channel");channel=it-names.begin();
-        const auto root=std::filesystem::canonical(config.at("source").get<std::string>());
-        auto sourceConfig=config;
-        if(sourceConfig.contains("channels"))
-            for(auto& [key,value]:sourceConfig["channels"].items()) {
-                auto p=std::filesystem::path(value.get<std::string>());
-                value=std::filesystem::canonical(p.is_absolute()?p:root/p).string();
-            }
-        identity=root.string()+"/"+sourceConfig.value("source_level",std::string("1"))+"/"+
-            sourceConfig.value("channels",nlohmann::json::object()).dump();
-        {
-            std::lock_guard lock(sourcesMutex);
-            source=sources[identity].lock();
-        }
-        if(!source) {
-            auto loaded=std::make_shared<Source>(root,sourceConfig);
-            std::lock_guard lock(sourcesMutex);
-            source=sources[identity].lock();
-            if(!source) {source=std::move(loaded);sources[identity]=source;}
-        }
-        const auto meta=nlohmann::json::parse(metadata.get_string(".zarray"));
-        if(meta.at("dtype")!=(channel==3?"<f4":"|u1"))
-            throw std::runtime_error("native pooled view dtype mismatch");
-        if(!meta.at("compressor").is_null() || !meta.at("filters").is_null() ||
-           meta.at("order")!="C" || meta.at("dimension_separator")!="/")
-            throw std::runtime_error("native pooled view requires raw C-order metadata");
-        for(size_t d=0;d<3;++d)
-            if(meta.at("shape")[d]!=(source->shape[d]+1)/2 || meta.at("chunks")[d]!=source->chunk[d]/2)
-                throw std::runtime_error("native pooled view geometry mismatch");
-        identity+="/top2_spatial_comp/v1/";
-    }
-    bool exists(const std::string& key)const override {return get_if_exists(key).has_value();}
-    std::optional<std::vector<std::byte>> get_if_exists(const std::string& key)const override {
-        if(key.empty() || key[0]=='.' || key=="zarr.json") return metadata.get_if_exists(key);
-        Index index{};std::istringstream stream(key);char a,b;
-        if(!(stream>>index[0]>>a>>index[1]>>b>>index[2]) || a!='/' || b!='/' || stream.peek()!=EOF)
-            throw std::runtime_error("invalid native pooled chunk key: "+key);
-        const auto bundle=cache.get(identity+key,*source,index);
-        return (*bundle)[channel];
-    }
-    std::vector<std::byte> get(const std::string& key)const override {
-        auto result=get_if_exists(key);if(!result)throw std::runtime_error("missing pooled metadata: "+key);return std::move(*result);
-    }
-    void set(const std::string&,std::span<const std::byte>)override {throw std::runtime_error("read-only pooled view");}
-    void erase(const std::string&)override {throw std::runtime_error("read-only pooled view");}
-};
+
+nlohmann::json readJson(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if(!in) throw std::runtime_error("cannot read "+path.string());
+    return nlohmann::json::parse(in);
 }
-std::shared_ptr<utils::Store> openPooledPredictionStore(const std::filesystem::path& path) {
-    return std::make_shared<PooledStore>(path);
+}
+
+vcr::zarr::OpenedArray openPooledPredictionArray(
+    const std::filesystem::path& path, std::shared_ptr<vcr::MemoryCache> cache) {
+    const auto config=readJson(path/".native_pool.json");
+    if(config.at("revision")!=1 || config.at("factor")!=2 || config.at("mode")!="top2_spatial_comp")
+        throw std::runtime_error("unsupported native prediction pooling recipe");
+    const std::string name=config.at("channel");
+    auto it=std::find(names.begin(),names.end(),name);
+    if(it==names.end()) throw std::runtime_error("unknown native pooling channel");
+    const size_t channel=size_t(it-names.begin());
+    const auto root=std::filesystem::canonical(config.at("source").get<std::string>());
+    auto sourceConfig=config;
+    if(sourceConfig.contains("channels"))
+        for(auto& [key,value]:sourceConfig["channels"].items()) {
+            auto p=std::filesystem::path(value.get<std::string>());
+            value=std::filesystem::canonical(p.is_absolute()?p:root/p).string();
+        }
+    const std::string identity=root.string()+"/"+sourceConfig.value("source_level",std::string("1"))+"/"+
+        sourceConfig.value("channels",nlohmann::json::object()).dump();
+    std::shared_ptr<Source> source;
+    {
+        std::lock_guard lock(sourcesMutex);
+        source=sources[identity].lock();
+        if(!source) {source=std::make_shared<Source>(root,sourceConfig,cache);sources[identity]=source;}
+    }
+    const auto meta=readJson(path/".zarray");
+    if(meta.at("dtype")!=(channel==3?"<f4":"|u1"))
+        throw std::runtime_error("native pooled view dtype mismatch");
+    if(!meta.at("compressor").is_null() || !meta.at("filters").is_null() ||
+       meta.at("order")!="C" || meta.at("dimension_separator")!="/")
+        throw std::runtime_error("native pooled view requires raw C-order metadata");
+    for(size_t d=0;d<3;++d)
+        if(meta.at("shape")[d]!=(source->shape[d]+1)/2 || meta.at("chunks")[d]!=source->chunk[d]/2)
+            throw std::runtime_error("native pooled view geometry mismatch");
+    vcr::zarr::OpenedArray opened;
+    opened.location=path.string();
+    opened.meta=vcr::zarr::parseArrayMeta(meta);
+    vcr::computed::Options options;
+    options.shape=opened.meta.shape;
+    options.chunks=opened.meta.chunks;
+    options.dtype=opened.meta.dtype;
+    options.fillValue=meta.at("fill_value");
+    // The memory-cache namespace of the view's chunks.
+    options.identity=identity+"/top2_spatial_comp/v1/"+name;
+    options.memoryCache=std::move(cache);
+    opened.array=vcr::computed::open(options,[source,channel](const vcr::Index& chunk,std::uint8_t* out) {
+        source->compute({size_t(chunk[0]),size_t(chunk[1]),size_t(chunk[2])},channel,out);
+        return true;
+    });
+    return opened;
 }
 }

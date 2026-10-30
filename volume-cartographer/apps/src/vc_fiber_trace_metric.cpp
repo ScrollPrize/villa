@@ -104,26 +104,6 @@ size_t percentileCount(const std::vector<size_t>& values, double quantile)
     return sorted[index];
 }
 
-size_t histogramPercentile(
-    const std::array<uint64_t, 65>& histogram,
-    double quantile)
-{
-    uint64_t total = 0;
-    for (const uint64_t count : histogram)
-        total += count;
-    if (total == 0)
-        return 0;
-    const uint64_t target = std::max<uint64_t>(
-        1, static_cast<uint64_t>(std::ceil(quantile * total)));
-    uint64_t cumulative = 0;
-    for (size_t index = 0; index < histogram.size(); ++index) {
-        cumulative += histogram[index];
-        if (cumulative >= target)
-            return index;
-    }
-    return histogram.size() - 1;
-}
-
 std::string requireValue(int& index, int argc, char** argv, const std::string& name)
 {
     if (index + 1 >= argc) {
@@ -544,56 +524,14 @@ int main(int argc, char** argv)
                   << percentileCount(profile.candidateDepth2BatchSizes, 0.50)
                   << " depth2_batch_p95="
                   << percentileCount(profile.candidateDepth2BatchSizes, 0.95)
-                  << " corner_points=" << profile.cornerPointCount
-                  << " corner_unique_cubes=" << profile.cornerUniqueVoxelCubes
-                  << " corner_points_per_cube="
-                  << (profile.cornerUniqueVoxelCubes > 0
-                          ? static_cast<double>(profile.cornerPointCount) /
-                                static_cast<double>(profile.cornerUniqueVoxelCubes)
-                          : 0.0)
-                  << " corner_cube_reuse_p50="
-                  << histogramPercentile(profile.cornerCubeOccupancyHistogram, 0.50)
-                  << " corner_cube_reuse_p95="
-                  << histogramPercentile(profile.cornerCubeOccupancyHistogram, 0.95)
-                  << " corner_cube_reuse_max="
-                  << profile.cornerMaxCandidatesPerCube
-                  << " corner_worker_tasks=" << profile.cornerWorkerTasks
-                  << " depth_dependency_overlap="
-                  << (profile.depthDependencyUnion > 0
-                          ? static_cast<double>(profile.depthDependencyShared) /
-                                static_cast<double>(profile.depthDependencyUnion)
-                          : 0.0)
-                  << " step_dependency_overlap="
-                  << (profile.stepDependencyUnion > 0
-                          ? static_cast<double>(profile.stepDependencyShared) /
-                                static_cast<double>(profile.stepDependencyUnion)
-                          : 0.0)
                   << " start_sample_s=" << profile.startSampleSeconds
                   << " task_build_s=" << profile.taskBuildSeconds
                   << " prediction_batch_s=" << profile.predictionBatchSeconds
-                  << " prediction_prepare_s=" << profile.predictionPrepareSeconds
-                  << " prediction_prefetch_s=" << profile.predictionPrefetchSeconds
-                  << " prediction_assign_s=" << profile.predictionAssignSeconds
                   << " prediction_materialize_s=" << profile.predictionMaterializeSeconds
                   << " prediction_corner_s=" << profile.predictionCornerSeconds
-                  << " prediction_corner_prepare_s="
-                  << profile.predictionCornerPrepareSeconds
-                  << " prediction_corner_layout_s="
-                  << profile.predictionCornerLayoutSeconds
-                  << " prediction_corner_pin_s="
-                  << profile.predictionCornerPinSeconds
-                  << " prediction_corner_gather_s="
-                  << profile.predictionCornerGatherSeconds
-                  << " prediction_corner_chunk_runs="
-                  << profile.predictionCornerLayoutChunkRuns
-                  << " prediction_corner_boundary_points="
-                  << profile.predictionCornerBoundaryPoints
-                  << " prediction_corner_dependencies="
-                  << profile.predictionCornerDependencies
                   << " prediction_decode_s=" << profile.predictionDecodeSeconds
                   << " normal_decode_s=" << profile.normalDecodeSeconds
                   << " normal_batch_s=" << profile.normalBatchSeconds
-                  << " normal_prefetch_s=" << profile.normalPrefetchSeconds
                   << " normal_materialize_s=" << profile.normalMaterializeSeconds
                   << " candidate_score_s=" << profile.candidateScoreSeconds
                   << " frontier_s=" << profile.frontierSeconds

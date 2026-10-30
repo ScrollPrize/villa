@@ -509,8 +509,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     REQUIRE(metricsDataset->manifest().groups.size() == 1);
     const auto& channel = metricsDataset->manifest().groups.front();
     CHECK(channel.isRemote());
-    CHECK(channel.remoteZarrBaseUrl == "https://example.test/manual");
-    CHECK(channel.remoteZarrKey == "nx.ome.zarr/4");
+    CHECK(channel.sourceLocation == "https://example.test/manual/nx.ome.zarr/4");
     CHECK(metricsDataset->manifest().workingToBaseScale == resolved->workingToBaseScale);
     CHECK(fetches == 1);
     qputenv("VC3D_CONFIG_DIR", previousConfigDir);

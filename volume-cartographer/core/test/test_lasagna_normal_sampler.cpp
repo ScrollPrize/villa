@@ -3,11 +3,10 @@
 
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 
-#include "utils/zarr.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <array>
 #include <cstddef>
@@ -41,23 +40,14 @@ void createU8Zarr(
     const std::vector<uint8_t>* payload,
     std::optional<double> fillValue = 0.0)
 {
-    utils::ZarrMetadata meta;
-    meta.version = utils::ZarrVersion::v2;
-    meta.shape = std::move(shape);
-    meta.chunks = std::move(chunks);
-    meta.dtype = utils::ZarrDtype::uint8;
-    meta.compressor_id.clear();
-    meta.fill_value = fillValue;
-    auto array = utils::ZarrArray::create(path, meta);
-    if (payload == nullptr) {
-        return;
-    }
-    std::vector<std::byte> bytes(payload->size());
-    for (size_t i = 0; i < payload->size(); ++i) {
-        bytes[i] = static_cast<std::byte>((*payload)[i]);
-    }
-    std::vector<size_t> zero(meta.shape.size(), 0);
-    array.write_chunk(zero, bytes);
+    vcr::zarr::CreateOptions options;
+    options.shape.assign(shape.begin(), shape.end());
+    options.chunks.assign(chunks.begin(), chunks.end());
+    options.compressor = "";
+    options.fillValue = fillValue ? nlohmann::json(*fillValue) : nlohmann::json();
+    auto writer = vcr::zarr::Writer::create(path, options);
+    if (payload != nullptr)
+        writer.writeChunk(vcr::Index(shape.size(), 0), payload->data(), payload->size());
 }
 
 void createConstantChunkedU8Zarr(
@@ -66,24 +56,15 @@ void createConstantChunkedU8Zarr(
     const std::array<size_t, 3>& chunks,
     uint8_t value)
 {
-    utils::ZarrMetadata meta;
-    meta.version = utils::ZarrVersion::v2;
-    meta.shape = {shape[0], shape[1], shape[2]};
-    meta.chunks = {chunks[0], chunks[1], chunks[2]};
-    meta.dtype = utils::ZarrDtype::uint8;
-    meta.compressor_id.clear();
-    meta.fill_value = 0.0;
-    auto array = utils::ZarrArray::create(path, meta);
-    std::vector<std::byte> bytes(chunks[0] * chunks[1] * chunks[2],
-                                 static_cast<std::byte>(value));
-    for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
-        for (size_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y) {
-            for (size_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x) {
-                const std::array<size_t, 3> indices{z, y, x};
-                array.write_chunk(indices, bytes);
-            }
-        }
-    }
+    auto writer = vcr::zarr::Writer::create(path, {
+        .shape = {int64_t(shape[0]), int64_t(shape[1]), int64_t(shape[2])},
+        .chunks = {int64_t(chunks[0]), int64_t(chunks[1]), int64_t(chunks[2])},
+        .compressor = ""});
+    const std::vector<uint8_t> bytes(chunks[0] * chunks[1] * chunks[2], value);
+    for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z)
+        for (size_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y)
+            for (size_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x)
+                writer.writeChunk({int64_t(z), int64_t(y), int64_t(x)}, bytes.data(), bytes.size());
 }
 
 void writeText(const fs::path& path, const std::string& text)
@@ -326,19 +307,13 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
         "y":{"zarr":"ny.zarr","scaledown":0,"channels":["ny"]},
         "w":{"zarr":"width.zarr","scaledown":0,"channels":["width"]}}})");
     auto dataset=LasagnaDataset::open(dir/"dataset.lasagna.json");
-    const auto m=bindLasagnaChannel(dataset.manifest(),"grad_mag");
-    const auto w=bindLasagnaChannel(dataset.manifest(),"width");
+    LasagnaGroupArrays arrays(1<<20);
+    const auto m=bindLasagnaChannel(dataset.manifest(),"grad_mag",arrays);
+    const auto w=bindLasagnaChannel(dataset.manifest(),"width",arrays);
     std::vector<std::vector<float>> out;
     sampleLasagnaVectorBatch({w},{{.5f,.5f,.5f},{1,1,1},{0,0,0}},out,false,&m);
     REQUIRE(out[0].size()==1); CHECK(out[0][0]==doctest::Approx(40));
     CHECK(out[1].empty()); REQUIRE(out[2].size()==1); CHECK(out[2][0]==doctest::Approx(40));
-    const auto expected=out;
-    vc::render::PinnedChunkRegion pinned;
-    pinLasagnaRegion(pinned,w,{0,0,0},{1,1,1});pinLasagnaRegion(pinned,m,{0,0,0},{1,1,1});pinned.seal();
-    {
-        sampleLasagnaVectorBatch({w},{{.5f,.5f,.5f},{1,1,1},{0,0,0}},out,false,&m,&pinned);
-        CHECK(out==expected);
-    }
     CHECK(*sampleLasagnaChannel(m,cv::Vec3d(.5,.5,.5))==doctest::Approx(255./8));
     LasagnaNormalSampler sampler(dataset);
     auto n=sampler.sampleNormal({.5,.5,.5});

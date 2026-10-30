@@ -26,15 +26,11 @@ struct LasagnaChannelGroup {
     // ordinary datasets and diagnostics.
     std::string relativeZarrKey;
     std::filesystem::path zarrPath;
-    // Authoritative local path or remote locator serialized into VC projects.
-    // Runtime endpoint and cache details remain separate below.
+    // Authoritative local path or remote locator serialized into VC projects;
+    // a remote group's array is opened at this URL.
     std::string sourceLocation;
-    // Non-empty when this group is opened through a remote read-through store.
-    // remoteZarrBaseUrl is either the manifest artifact root with
-    // remoteZarrKey naming the relative Zarr group, or the Zarr root itself
-    // with an empty remoteZarrKey for absolute remote group paths.
-    std::string remoteZarrBaseUrl;
-    std::string remoteZarrKey;
+    // Remote groups: the vc_reader disk cache directory of their chunks and
+    // how requests are signed (explicit keys, else AWS discovery when allowed).
     std::filesystem::path remoteCacheRoot;
     vc::HttpAuth remoteAuth;
     bool discoverAwsCredentials = true;

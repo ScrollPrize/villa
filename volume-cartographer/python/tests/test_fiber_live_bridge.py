@@ -200,6 +200,9 @@ def test_empty_cancellation_reason_still_fails():
 def test_field_publication_and_bridge_ownership(inputs):
     offline, normals = handles(inputs)
     cfg, chunks = trace_config(), chunk_config()
+    # Width scoring reads the width channel, whose chunks must then be published too.
+    cfg.width_relative_tolerance = .4
+    cfg.width_cosine_weight = True
     expected = ft.ChunkCache(offline, normals, cfg, chunks, str(inputs/"offline"), "fixture").get([0,0,0])
     with Coordinator(lambda s,c,r: s.ready(c,r)) as server:
         field, normals = handles(inputs)

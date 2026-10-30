@@ -1205,7 +1205,6 @@ void writeLineDebugJson(const std::string& eventName,
             {"converged", report->converged},
             {"normal_prefetch_calls", report->normalPrefetchCalls},
             {"ceres_solve_ms", report->ceresSolveMs},
-            {"normal_chunk_prefetch_ms", report->normalChunkPrefetchMs},
             {"normal_materialize_ms", report->normalMaterializeMs},
             {"total_ms", report->totalMs},
             {"message", report->message},
@@ -1354,7 +1353,6 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
             }
         };
         throwIfCancelled();
-        (void)sampler.prefetchNormalSamples({task.seedPoint}, false);
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
@@ -9671,8 +9669,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         pane->dialog->activateWindow();
     }
 
-    const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
-                                  session.optimizationReport.normalMaterializeMs;
+    const double prefetchPrepMs = session.optimizationReport.normalMaterializeMs;
     Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={} iterations={} residuals={} converged={} prefetch_calls={}",
                    resultEvent,
                    prefetchPrepMs,

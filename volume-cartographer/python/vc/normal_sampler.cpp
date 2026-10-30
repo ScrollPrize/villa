@@ -57,7 +57,7 @@ public:
 
 void bindNormalSampler(nb::module_& m) {
     nb::class_<NormalSampler>(m, "NormalSampler",
-        "Native Lasagna normals in base XYZ coordinates, using the shared chunk cache.")
+        "Native Lasagna normals in base XYZ coordinates, read through vc_reader.")
         .def(nb::init<const std::string&, const std::string&>(),
              "manifest"_a, "cache_root"_a="", nb::call_guard<nb::gil_scoped_release>())
         .def("sample", &NormalSampler::sample, "points_xyz"_a, "threads"_a=1,

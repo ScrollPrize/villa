@@ -42,7 +42,7 @@ public:
 FiberChunkTraceConfig chunkConfig() {
     FiberChunkTraceConfig c;c.coreBase=32;c.haloBase=8;c.gridBase=4;c.nmsBase=4;
     c.tubeHalfBase=4;c.tubeStepBase=4;c.rimNormalBase=4;c.rimTangentBase=4;
-    c.joinMinimumBase=8;c.pinSamplingRegion=false;return c;
+    c.joinMinimumBase=8;return c;
 }
 FiberTraceConfig traceConfig() {
     FiberTraceConfig c;c.stepVoxels=4;c.beamWidth=3;c.beamLookaheadSteps=2;

@@ -3,11 +3,11 @@
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
+#include <vc_reader/zarr.hpp>
+
 #include <filesystem>
 #include <string>
 #include <string_view>
-
-namespace utils { class ZarrArray; }
 
 namespace vc::lasagna {
 
@@ -54,11 +54,11 @@ private:
     LasagnaDatasetManifest manifest_;
 };
 
-// Open a channel group's Zarr through the local filesystem or, for a
-// manifest-backed catalog cache, through its persistent read-through store.
-[[nodiscard]] utils::ZarrArray openLasagnaChannelArray(
-    const LasagnaDatasetManifest& manifest,
-    const LasagnaChannelGroup& group,
-    std::size_t dtypeSize = 1);
+// A channel group's Zarr array opened through vc_reader, with `cache` as its
+// memory cache: a local array, the pooled view of a local prediction store
+// (.native_pool.json; see openPooledPredictionArray), or a remote array cached
+// under the group's remote cache root.
+[[nodiscard]] vcr::zarr::OpenedArray openLasagnaGroupArray(
+    const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache);
 
 } // namespace vc::lasagna

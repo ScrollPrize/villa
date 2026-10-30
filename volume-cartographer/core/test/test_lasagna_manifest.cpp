@@ -262,9 +262,6 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
     REQUIRE(dataset.manifest().groups.size() == 1);
     const auto& group = dataset.manifest().groups.front();
     CHECK(group.isRemote());
-    CHECK(group.remoteZarrBaseUrl ==
-          "https://bucket.s3.us-east-1.amazonaws.com/path/artifact");
-    CHECK(group.remoteZarrKey == "pred.zarr");
     CHECK(group.remoteCacheRoot == dir);
     CHECK(group.sourceLocation ==
           "s3://bucket/path/artifact/pred.zarr");
@@ -358,12 +355,8 @@ TEST_CASE("LasagnaDataset supports absolute remote group paths with explicit cac
     REQUIRE(dataset.manifest().groups.size() == 1);
     const auto& group = dataset.manifest().groups.front();
     CHECK(group.isRemote());
-    CHECK(group.remoteZarrBaseUrl ==
-          "https://bucket.s3.eu-west-2.amazonaws.com/other/pred.zarr");
-    CHECK(group.remoteZarrKey.empty());
-    CHECK(group.remoteCacheRoot ==
-          cacheRoot / "remote_sources" / "s3+eu-west-2" / "bucket" /
-              "other" / "pred.zarr");
+    // vc_reader lays out the cache by URL below the caller's cache root.
+    CHECK(group.remoteCacheRoot == fs::absolute(cacheRoot).lexically_normal());
     CHECK(group.sourceLocation ==
           "s3+eu-west-2://bucket/other/pred.zarr");
 
@@ -430,14 +423,11 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     CHECK(first.manifest().manifestIsRemote);
     CHECK(first.manifest().manifestLocation == location);
     REQUIRE(first.manifest().groups.size() == 1);
-    CHECK(first.manifest().groups.front().remoteZarrBaseUrl ==
-          "https://bucket.s3.eu-west-2.amazonaws.com/artifact");
-    CHECK(first.manifest().groups.front().remoteZarrKey == "pred.zarr");
     CHECK(first.manifest().groups.front().sourceLocation ==
           "s3+eu-west-2://bucket/artifact/pred.zarr");
     CHECK(first.manifest().groups.front().remoteAuth.access_key == "test-access");
     CHECK(first.manifest().groups.front().remoteCacheRoot ==
-          first.manifest().manifestPath.parent_path());
+          fs::absolute(dir).lexically_normal());
     CHECK(first.manifest().manifestPath ==
           dir / "remote_sources" / "s3+eu-west-2" / "bucket" /
               "artifact" / "fiber.lasagna.json");
@@ -473,11 +463,8 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
             location, options);
         const auto* presence = dataset.manifest().groupForChannel("presence");
         REQUIRE(presence != nullptr);
-        const auto array = vc::lasagna::openLasagnaChannelArray(
-            dataset.manifest(), *presence, 1);
-        CHECK(array.metadata().ndim() == 3);
-        CHECK(array.metadata().shape ==
-              std::vector<std::size_t>{9620, 3314, 3314});
+        const auto array = vc::lasagna::openLasagnaGroupArray(*presence, nullptr);
+        CHECK(array.meta.shape == vcr::Index{9620, 3314, 3314});
     } catch (const std::exception& error) {
         fs::remove_all(dir);
         FAIL("public S3 Lasagna fallback failed: " << error.what());
