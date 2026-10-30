@@ -22,6 +22,12 @@ over 1.8 times the mesh's 25th percentile band thickness, which is how two sheet
 An abstaining vertex may still move by an offset filled in from measured neighbors; nothing at that vertex vouches
 for it, so it is flagged.
 
+`--half 16 --fallback-half 12 --min-contrast 0` reads the same face on a +-16 voxel window, and again on +-12 where
++-16 abstains, with no contrast floor (`face.FACE_SNAP_WINDOW16`). The level comes from the window's 10th and 90th
+percentiles, so where a vertex sits deep in a thick band a +-12 window can hold too little gap and the face lands
+about a voxel inside the band; the wider window fixes most of those. These are the settings that were scored against
+a second registered scan of the same object; the defaults are unchanged.
+
 ## Outputs
 
 | File | Contents |

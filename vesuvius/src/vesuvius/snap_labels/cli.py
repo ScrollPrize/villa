@@ -4,6 +4,7 @@ every vertex where it could not.
     vesuvius.snap_labels LABEL.tifxyz --volume SCAN.zarr --out OUT
         (--umbilicus UMB.json | --axis-point X Y Z --axis-dir X Y Z | --recto-sign 1|-1)
         [--level 0] [--target recto|mid|verso] [--merged] [--max-move 4] [--face-sigma 1]
+        [--half 12] [--fallback-half H] [--min-contrast C]
         [--no-label] [--label-level 0] [--ignore-halo 4] [--label-step 0.5]
         [--review-min 4] [--review-max 500] [--self-check] [--json]
 
@@ -41,6 +42,12 @@ def build_parser():
                    help="abstain where the band is over 1.8 times the mesh's usual thickness (two sheets merged)")
     s.add_argument("--face-sigma", type=float, default=L.DEFAULTS["face_sigma"])
     s.add_argument("--max-move", type=float, help="largest move, voxels (default 4)")
+    s.add_argument("--half", type=float, help="profile half-length along the normal, voxels (default 12)")
+    s.add_argument("--fallback-half", type=float,
+                   help="measure a vertex that abstains on +-half again on this shorter window (default: none)")
+    s.add_argument("--min-contrast", type=float,
+                   help="contrast floor in CT units (default: a quarter of the mesh's 1st to 99th percentile range; "
+                        "0 turns it off)")
     s.add_argument("--no-label", action="store_true", help="skip the OME-Zarr surface label")
     s.add_argument("--label-level", type=int, default=0, help="the image level the label array matches")
     s.add_argument("--ignore-halo", type=float, help="ignore band along the normal, level-0 voxels (default max-move)")
@@ -83,7 +90,9 @@ def run_snap(args):
     xs, ys, zs, valid = load_mesh(args.surface)
     vol = Volume(args.volume)
     sampler = Sampler(vol, level=args.level)
-    extra = {"max_move": float(args.max_move)} if args.max_move is not None else None
+    extra = {k: float(v) for k, v in (("max_move", args.max_move), ("half", args.half),
+                                      ("fallback_half", args.fallback_half), ("min_contrast", args.min_contrast))
+             if v is not None} or None
     res = L.label_snap(xs, ys, zs, valid, sampler, axis=axis, recto_sign=args.recto_sign, target=args.target,
                        merged=bool(args.merged), face_sigma=args.face_sigma, extra_opts=extra)
     t_snap = time.time() - t0

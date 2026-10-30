@@ -215,6 +215,9 @@ def _band_at_level(t, ps, level, at=0.0, ambiguous=2.0):
 FACE_SNAP_DEFAULTS = {
     "target": "recto",     # "recto" (the band face toward the scroll axis), "mid" (the band midline) or "verso"
     "half": 12.0,          # profile half-length along the normal, voxels (the level is set from this window)
+    "fallback_half": None, # a shorter window, voxels: a vertex that abstains on +-half (missing data, low contrast,
+                           # no band, ambiguous or off the profile, too far) is measured again on +-fallback_half,
+                           # cut from the same profile; None: no second window
     "step": 0.25,          # profile sample step, voxels
     "max_move": 4.0,       # a band farther than this from the vertex abstains (0 when the vertex is inside it)
     "level": None,         # None: per-profile level (band.sheet_faces); a number: one global level
@@ -240,6 +243,13 @@ FACE_SNAP_PER_VERTEX = {"jump": 1e9, "min_support": 1}
 
 
 FACE_SNAP_PER_VERTEX_MERGED = {"jump": 1e9, "min_support": 1, "max_thick_ratio": 1.8}
+
+
+# The per-vertex face read on a +-16 voxel window, and on +-12 where +-16 abstains, with no contrast floor: the
+# settings scored against a second registered scan of PHercMANBp and PHerc0332 (--half 16 --fallback-half 12
+# --min-contrast 0). Where the published vertex sits deep in a thick band, a +-12 window holds too little gap, so the
+# 10th percentile lies in papyrus, the level is too high and the face lands about 1 voxel inside the band.
+FACE_SNAP_WINDOW16 = {"jump": 1e9, "min_support": 1, "half": 16.0, "fallback_half": 12.0, "min_contrast": 0.0}
 
 
 FACE_REASONS = {0: "measured", 1: "missing data", 2: "side not named", 3: "low contrast", 4: "no band",
@@ -275,7 +285,9 @@ def snap_face(xs, ys, zs, valid, sampler, axis=None, recto_sign=None, opts=None,
     runs off the profile, when its contrast is below a floor (min_contrast, or contrast_frac of the mesh's own
     window), when the band is more than max_move away, when the band is thicker than max_thick or than
     max_thick_ratio times a low percentile of the mesh's band thicknesses (two sheets merged by the blur), or, for a
-    face target, when its normal is nearly tangent to the radial direction. Returns a dict: the snapped grids,
+    face target, when its normal is nearly tangent to the radial direction. With opts["fallback_half"], a vertex that
+    abstains on the +-half window for any of these reasons but the side is measured again on the shorter window, cut
+    from the same profile (the contrast floor still comes from the +-half samples). Returns a dict: the snapped grids,
     offsets, report, record and per-vertex detail."""
     o = dict(FACE_SNAP_DEFAULTS)
     o.update(opts or {})
@@ -302,6 +314,12 @@ def snap_face(xs, ys, zs, valid, sampler, axis=None, recto_sign=None, opts=None,
         side_ok = np.ones(nv, bool)
     half, step = float(o["half"]), float(o["step"])
     t = np.arange(-half, half + 0.5 * step, step)
+    windows = [None]                      # None: the whole +-half profile; else a mask of the fallback window
+    if o.get("fallback_half") is not None:
+        fb = float(o["fallback_half"])
+        if not 0.0 < fb < half:
+            raise SnapError(f"fallback_half must be above 0 and below half ({half:g}), not {fb:g}")
+        windows.append((t >= -fb - 1e-6) & (t <= fb + 1e-6))
     prof = _profile(sampler, base, nvx, t, batch) if nv else np.zeros((0, len(t)))
     fo = dict(band.FACE_DEFAULTS)
     fo.update(face_opts or {})
@@ -322,41 +340,47 @@ def snap_face(xs, ys, zs, valid, sampler, axis=None, recto_sign=None, opts=None,
         why[reason] += 1
         code[i] = _FACE_REASON_CODE[reason]
 
-    for i in range(nv):
-        p = prof[i]
+    def measure(i, tt, p):
+        """(reason, lo, hi, contrast, separation) of vertex i on the profile window tt; reason None: measured."""
         if not np.isfinite(p).all():
-            skip(i, "missing data")
-            continue
+            return "missing data", None, None, np.nan, np.nan
         if not side_ok[i]:
-            skip(i, "side not named")
-            continue
+            return "side not named", None, None, np.nan, np.nan
         if o["level"] is None:
-            r = band.sheet_faces(t, p, rs[i], at=0.0, opts=fo)
-            vcon[i] = r["contrast"]
+            r = band.sheet_faces(tt, p, rs[i], at=0.0, opts=fo)
             if r["contrast"] < floor:
-                skip(i, "low contrast")
-                continue
+                return "low contrast", None, None, r["contrast"], np.nan
             if not r["ok"]:
-                skip(i, "no band" if r["why"] == "no band" else "ambiguous or off the profile")
-                continue
-            vsep[i] = r["second"] - r["dist"]
+                return ("no band" if r["why"] == "no band" else "ambiguous or off the profile"), None, None, \
+                    r["contrast"], np.nan
             lo, hi = (r["recto"], r["verso"]) if rs[i] > 0 else (r["verso"], r["recto"])
+            con, sep = r["contrast"], r["second"] - r["dist"]
         else:
             ps = band.smooth(p, fo["sigma"] / step)
-            vcon[i] = float(np.subtract(*np.percentile(ps, [90, 10])))
-            if vcon[i] < floor:
-                skip(i, "low contrast")
-                continue
-            lo, hi, good = _band_at_level(t, ps, float(o["level"]), 0.0, fo["ambiguous"])
+            con, sep = float(np.subtract(*np.percentile(ps, [90, 10]))), np.nan
+            if con < floor:
+                return "low contrast", None, None, con, np.nan
+            lo, hi, good = _band_at_level(tt, ps, float(o["level"]), 0.0, fo["ambiguous"])
             if not good:
-                skip(i, "ambiguous or off the profile")
-                continue
-        recto, verso = (lo, hi) if rs[i] > 0 else (hi, lo)
-        tgt = {"recto": recto, "verso": verso, "mid": 0.5 * (lo + hi)}[o["target"]]
+                return "ambiguous or off the profile", None, None, con, np.nan
         if (0.0 if lo <= 0.0 <= hi else min(abs(lo), abs(hi))) > o["max_move"]:
-            skip(i, "too far")
+            return "too far", None, None, con, sep
+        return None, lo, hi, con, sep
+
+    for i in range(nv):
+        for keep in windows:
+            reason, lo, hi, con, sep = measure(i, t, prof[i]) if keep is None else measure(i, t[keep], prof[i][keep])
+            if not np.isnan(con):
+                vcon[i] = con
+            if not np.isnan(sep):
+                vsep[i] = sep
+            if reason is None or reason == "side not named":
+                break                         # measured, or no window can name the side
+        if reason is not None:
+            skip(i, reason)                   # the last window's reason
             continue
-        d[i] = tgt
+        recto, verso = (lo, hi) if rs[i] > 0 else (hi, lo)
+        d[i] = {"recto": recto, "verso": verso, "mid": 0.5 * (lo + hi)}[o["target"]]
         thick[i] = hi - lo
     cap = float("inf")
     if o.get("max_thick") is not None:

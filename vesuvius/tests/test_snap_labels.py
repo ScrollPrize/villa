@@ -158,6 +158,81 @@ def test_far_band_tangent_normal_and_bad_target(tmp_path):
         F.snap_face(*m, sm, axis=BAND_AXIS, opts={"target": "edge"})
 
 
+def test_window16_reads_a_thick_band_the_default_window_cuts_off(tmp_path):
+    sm = sampler_of(tmp_path, band((64, 40, 40), [(26, 41)]))      # faces at 25.5 and 41.5
+    m = small_mesh(28.0)                                         # upper face 13.5 voxels up: off a +-12 profile
+    r = F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_PER_VERTEX))
+    assert r["report"]["abstained"]["ambiguous or off the profile"] == 81
+    assert not np.isfinite(r["detail"]["measured"]).any()
+    r = F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_WINDOW16))
+    assert r["apply"].all() and float(np.abs(r["zs"] - 25.5).max()) < 0.05
+    assert r["record"]["max_move"] == 20.0
+
+
+def test_fallback_window_measures_where_the_wide_one_runs_out_of_volume(tmp_path):
+    sm = sampler_of(tmp_path, band((64, 40, 40), [(46, 51)]))      # faces at 45.5 and 51.5
+    m = small_mesh(50.0)                                         # +16 reaches z 66, past the volume's end
+    wide = F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_PER_VERTEX, half=16.0, min_contrast=0.0))
+    assert wide["report"]["abstained"]["missing data"] == 81
+    narrow = F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_PER_VERTEX, half=12.0, min_contrast=0.0))
+    both = F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_WINDOW16))
+    assert both["apply"].all() and float(np.abs(both["zs"] - 45.5).max()) < 0.05
+    np.testing.assert_array_equal(both["detail"]["measured"], narrow["detail"]["measured"])
+    for fb in (16.0, 20.0, 0.0):
+        with pytest.raises(F.SnapError):
+            F.snap_face(*m, sm, recto_sign=1, opts=dict(F.FACE_SNAP_WINDOW16, fallback_half=fb))
+
+
+class ProfileSampler:
+    """Returns profile k of vertex (r, c) at (2c, 2r, t) on a flat grid at z 0 (normal +z): the samples exactly."""
+
+    def __init__(self, prof, W, half=16.0, step=0.25):
+        self.prof, self.W, self.half, self.step = prof, W, half, step
+
+    def trilinear(self, q):
+        q = np.asarray(q, dtype=np.float64)
+        c, r = np.rint(q[:, 0] / 2.0).astype(int), np.rint(q[:, 1] / 2.0).astype(int)
+        return self.prof[r * self.W + c, np.rint((q[:, 2] + self.half) / self.step).astype(int)]
+
+
+def random_profiles(rng, t, n):
+    """Blurred bands of random thickness, place and contrast, with noise and some missing samples."""
+    out = np.empty((n, len(t)))
+    for i in range(n):
+        p = np.full(len(t), rng.uniform(10, 80))
+        for _ in range(rng.integers(1, 4)):
+            lo, thick, s = rng.uniform(-20, 14), rng.uniform(0.5, 26), rng.uniform(0.3, 2.0)
+            p += rng.uniform(20, 200) * (0.5 * np.tanh((t - lo) / s) - 0.5 * np.tanh((t - lo - thick) / s))
+        p += rng.normal(0, rng.choice([0.0, 2.0, 8.0]), len(t))
+        if rng.random() < 0.1:
+            p[: rng.integers(1, 20)] = np.nan
+        out[i] = p
+    return out
+
+
+def test_window16_is_the_wide_window_else_the_fallback_on_random_profiles():
+    rng = np.random.default_rng(7)
+    t = np.arange(-16.0, 16.125, 0.25)
+    H, W = 12, 50
+    prof = random_profiles(rng, t, H * W)
+    rs = np.where(rng.random((H, W)) < 0.5, 1.0, -1.0)
+    r, c = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    mesh = ((2.0 * c).astype(np.float32), (2.0 * r).astype(np.float32), np.zeros((H, W), np.float32),
+            np.ones((H, W), bool))
+
+    def measured(opts):
+        res = F.snap_face(*mesh, ProfileSampler(prof, W), recto_sign=rs, opts=opts, face_opts={"sigma": 1.0})
+        return res["detail"]["measured"]
+
+    both = measured(dict(F.FACE_SNAP_WINDOW16))
+    wide = measured(dict(F.FACE_SNAP_PER_VERTEX, half=16.0, min_contrast=0.0))
+    narrow = measured(dict(F.FACE_SNAP_PER_VERTEX, half=12.0, min_contrast=0.0))
+    want = np.where(np.isfinite(wide), wide, narrow)
+    np.testing.assert_array_equal(both, want)
+    assert np.isfinite(wide).sum() > 100 and (np.isfinite(narrow) & ~np.isfinite(wide)).sum() > 10
+    assert (np.isfinite(wide) & np.isfinite(narrow) & (np.abs(wide - narrow) > 0.25)).any()   # the windows differ
+
+
 def test_invalid_vertices_stay(tmp_path):
     sm = sampler_of(tmp_path, band((48, 40, 40), [(20, 25)]))
     xs, ys, zs, valid = small_mesh(21.0)
@@ -352,6 +427,18 @@ def test_label_level_one_halves_the_coordinates(cli_run):
     _, blocks = L.read_label_chunks(out / "surface_label.zarr")
     zz = np.concatenate([np.nonzero(b == L.LABEL_SURFACE)[0] + cz * L.LABEL_CHUNK for (cz, _, _), b in blocks.items()])
     assert len(zz) and ((zz >= 13) & (zz <= 14)).all()          # recto face at level-0 z 27.5 is level-1 z 13.75
+
+
+def test_cli_window16_options_reach_the_record(cli_run):
+    root, _, _ = cli_run
+    out = root / "out_w16"
+    code = cli.main([str(root / "label"), "--volume", str(root / "ladder.zarr"), "--out", str(out), "--recto-sign",
+                     "1", "--half", "16", "--fallback-half", "12", "--min-contrast", "0", "--no-label"])
+    assert code == 0
+    opts = json.loads((out / "snap_labels.json").read_text())["opts"]
+    assert {k: opts[k] for k in F.FACE_SNAP_WINDOW16} == F.FACE_SNAP_WINDOW16
+    assert cli.main([str(root / "label"), "--volume", str(root / "ladder.zarr"), "--out", str(root / "out_bad"),
+                     "--recto-sign", "1", "--fallback-half", "12"]) == 2        # the fallback must be shorter
 
 
 def test_refusals(cli_run, capsys):
