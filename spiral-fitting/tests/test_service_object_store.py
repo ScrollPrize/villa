@@ -601,9 +601,9 @@ def test_the_scroll_is_the_projects_and_the_sense_a_fit_setting(dataset, store):
 
 
 def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
-    from lasagna_source import load_lasagna_source
-    lasagna = {'location': 'https://data.example/p.lasagna.json', 'identity': 'run-1',
-               'group': '3'}
+    from lasagna_source import load_lasagna_source, url_identity
+    # A remote dataset is identified by its URL, which VC3D sends alone.
+    lasagna = {'location': 'https://data.example/p.lasagna.json', 'group': '3'}
     for key in ('normal_x', 'normal_y', 'gradient_magnitude'):
         lasagna[key] = f'https://data.example/{key}.ome.zarr'
     body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
@@ -612,7 +612,7 @@ def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
     # be readable here.
     source = load_lasagna_source(paths.lasagna)
     assert (source.identity, source.group, source.location) == (
-        'run-1', '3', lasagna['location'])
+        url_identity(lasagna['location']), '3', lasagna['location'])
     assert source.stores['normal_x'] == lasagna['normal_x']
     assert scroll.lasagna_scale == 2
 
@@ -639,10 +639,19 @@ def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
     assert {(detail['field'], 'selects no Lasagna dataset' in detail['message'])
             for detail in refused.value.details} == {('lasagna', True)}
 
+    # A local dataset's identity is VC3D's; a remote one's cannot be.
+    local = {**lasagna, 'location': '/data/p.lasagna.json', 'identity': 'run-1'}
+    paths, _ = _built(service(dataset, store), initialize_body() | {
+        'project': project(lasagna=local, lasagna_scale=2)})
+    assert load_lasagna_source(paths.lasagna).identity == 'run-1'
+    with pytest.raises(ApiError, match='identified by its URL'):
+        service(dataset, store).initialize(initialize_body() | {
+            'project': project(lasagna={**lasagna, 'identity': 'run-1'}, lasagna_scale=2)})
+
 
 def test_fiber_directions_are_the_project_datasets_cached_samples(dataset, store):
-    from lasagna_source import fiber_directions_path
-    fibers = {'location': 'https://data.example/f.lasagna.json', 'identity': 'run-7'}
+    from lasagna_source import fiber_directions_path, url_identity
+    fibers = {'location': 'https://data.example/f.lasagna.json'}
     body = initialize_body() | {'project': project(fiber_inference=fibers, fiber_scale=4)}
     body['run']['config'].update(input_use_fiber_directions=True,
                                  loss_weight_fiber_directions=1.0)
@@ -655,7 +664,8 @@ def test_fiber_directions_are_the_project_datasets_cached_samples(dataset, store
     paths, _ = _built(service(dataset, store), optional)
     assert paths.fiber_directions == ''
 
-    cached = Path(fiber_directions_path(paths.cache_directory, 'run-7', 4))
+    cached = Path(fiber_directions_path(paths.cache_directory,
+                                        url_identity(fibers['location']), 4))
     cached.parent.mkdir(parents=True)
     cached.write_bytes(b'')
     paths, _ = _built(service(dataset, store), body)

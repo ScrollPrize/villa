@@ -1397,6 +1397,19 @@ scroll where the arrays had values. So a host needs only packs: the command-
 line fit builds the normals pack before refreshing, and a service without
 one refreshes centerline-only with a warning.
 
+Remote datasets by URL (still API 43). A remote dataset's identity is its
+manifest URL's, `url-` and a digest of the normalized URL
+(`lasagna_source.url_identity`; data at a URL is taken never to change),
+computed by the service alone: VC3D sends a remote dataset's location and no
+identity, and fetches no provenance record for it; a remote dataset sent with
+an identity is refused. Local datasets keep the run_uuid / SHA-256 identity
+VC3D computes. A local copy packs and fits as the remote dataset it was
+copied from with `pack_resident_pools.py --as <URL>` and
+`fit_spiral.py --lasagna-url <URL>` (the fit writes the dataset's source
+document beside its packs and reads that). Fiber directions are keyed by
+their `manifest_url`'s identity the same way, so extracting and adopting
+fetch nothing to name the artifact.
+
 ## Implementation and validation workflow
 
 Keep service and VC3D changes in reviewable patches, with their protocol changes

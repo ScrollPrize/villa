@@ -66,7 +66,8 @@ def _startup_resource_suffix(started_at=None):
 
 
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
-from lasagna_source import load_lasagna_source
+from lasagna_source import (LasagnaSourceError, load_lasagna_source,
+                            read_lasagna_manifest, write_lasagna_source)
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
@@ -4350,7 +4351,14 @@ if __name__ == '__main__':
         help='Directory for derived host caches, shared with the interactive '
              'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
              '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
+    parser.add_argument(
+        '--lasagna-url', default=None, metavar='URL',
+        help='The remote manifest URL the dataset\'s Lasagna manifest is a '
+             'local copy of: its packs are that dataset\'s, shared with a '
+             'service fitting the URL')
     cli_args = parser.parse_args()
+    cache_dir = (cli_args.cache or os.environ.get('FIT_SPIRAL_CACHE_DIR')
+                 or default_user_cache_dir())
 
     overrides = get_env_config_overrides()
     # The store is named on the command line only, as the service's
@@ -4366,6 +4374,19 @@ if __name__ == '__main__':
         cli_args.dataset, cli_args.scroll_spec,
         outward_sense=overrides.get('spiral_outward_sense'))
     input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)
+    if cli_args.lasagna_url:
+        # The fit reads the dataset as the copy of the URL's: its source
+        # document, written beside the packs, names that identity.
+        from dataclasses import replace
+        if not input_paths.lasagna:
+            parser.error('--lasagna-url names the remote dataset of a local '
+                         'manifest, and this dataset has none')
+        try:
+            source = read_lasagna_manifest(input_paths.lasagna, url=cli_args.lasagna_url)
+        except LasagnaSourceError as exc:
+            parser.error(str(exc))
+        input_paths = replace(input_paths, lasagna=write_lasagna_source(
+            source.dataset_directory(cache_dir), source))
 
     # The CLI is a torchrun rendezvous boundary: this is where RANK /
     # WORLD_SIZE / LOCAL_RANK are read, once, into an explicit context that is
@@ -4431,9 +4452,7 @@ if __name__ == '__main__':
             run_dir=os.environ.get('FIT_SPIRAL_RUN_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),
             run_name=wandb.run.name if wandb.run is not None else None,
-            cache_dir=(cli_args.cache
-                       or os.environ.get('FIT_SPIRAL_CACHE_DIR')
-                       or default_user_cache_dir()),
+            cache_dir=cache_dir,
             render_volume_scale=int(
                 os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '16')),
             dist_context=dist_context,

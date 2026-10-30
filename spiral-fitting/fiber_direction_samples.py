@@ -33,22 +33,6 @@ def _get_json(session, url):
     return response.json()
 
 
-def remote_manifest_identity(session, manifest_url):
-    """The manifest at ``manifest_url`` and its dataset identity
-    (lasagna_source.manifest_identity), its provenance record fetched beside
-    it when it names one."""
-    from lasagna_source import manifest_identity
-
-    response = session.get(manifest_url, timeout=60)
-    response.raise_for_status()
-    manifest = json.loads(response.content)
-    provenance = None
-    if isinstance(manifest.get("provenance"), str) and manifest["provenance"].strip():
-        provenance = _get_json(session, urljoin(manifest_url, manifest["provenance"]))
-    name = unquote(urlparse(manifest_url).path.rstrip("/").rsplit("/", 1)[-1])
-    return manifest, manifest_identity(response.content, name, provenance)
-
-
 def _chunk_url(array_url, index, metadata):
     separator = metadata.get("dimension_separator", ".")
     return f"{array_url.rstrip('/')}/{separator.join(map(str, index))}"
@@ -182,10 +166,11 @@ def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
     """Extract into ``output``, or with ``cache`` into the dataset's cached
     artifact; a ``z_roi`` of None is the prediction's whole height."""
     import requests
-    from lasagna_source import fiber_directions_path
+    from lasagna_source import fiber_directions_path, url_identity
 
+    identity = url_identity(manifest_url)
     with requests.Session() as session:
-        manifest, identity = remote_manifest_identity(session, manifest_url)
+        manifest = _get_json(session, manifest_url)
         output = Path(fiber_directions_path(cache, identity, output_scale)
                       if cache is not None else output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -314,17 +299,11 @@ def adopt(artifact, cache, *, overwrite=False):
     import os
     import shutil
 
-    import requests
-    from lasagna_source import fiber_directions_path
+    from lasagna_source import fiber_directions_path, url_identity
 
     artifact = Path(artifact)
     metadata = _artifact_metadata(artifact)
-    with requests.Session() as session:
-        _, identity = remote_manifest_identity(session, metadata["manifest_url"])
-    recorded = metadata.get("dataset_identity")
-    if recorded is not None and recorded != identity:
-        raise ValueError(f"{artifact} was extracted from dataset {recorded}, but "
-                         f"{metadata['manifest_url']} is now {identity}")
+    identity = url_identity(metadata["manifest_url"])
     target = Path(fiber_directions_path(cache, identity,
                                         metadata["output_scale_base_voxels"]))
     target.parent.mkdir(parents=True, exist_ok=True)

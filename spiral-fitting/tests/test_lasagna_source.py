@@ -4,9 +4,10 @@ import json
 
 import pytest
 
-from lasagna_source import (LasagnaSource, LasagnaSourceError, find_dataset_manifest,
-                            load_lasagna_source, manifest_identity,
-                            read_lasagna_manifest, write_lasagna_source)
+from lasagna_source import (LasagnaSource, LasagnaSourceError, dataset_url,
+                            find_dataset_manifest, load_lasagna_source,
+                            manifest_identity, read_lasagna_manifest, url_identity,
+                            write_lasagna_source)
 
 
 def write_manifest(directory, name='s.lasagna.json', **extra):
@@ -52,6 +53,30 @@ def test_a_named_but_missing_provenance_is_refused(tmp_path):
     path = write_manifest(tmp_path, provenance='inference.json')
     with pytest.raises(LasagnaSourceError, match='provenance record'):
         read_lasagna_manifest(path)
+
+
+def test_a_remote_dataset_is_identified_by_its_url():
+    url = 's3://Bucket/scroll/s.lasagna.json'
+    identity = url_identity(url)
+    assert identity.startswith('url-') and LasagnaSource(identity, '', '4').identity == identity
+    # One URL, however spelled; another URL is another dataset.
+    for spelling in ('S3://bucket/scroll/s.lasagna.json/', ' s3://BUCKET/scroll/s.lasagna.json#x'):
+        assert url_identity(spelling) == identity
+    assert dataset_url(url) == 's3://bucket/scroll/s.lasagna.json'
+    assert url_identity('https://bucket.s3.amazonaws.com/scroll/s.lasagna.json') != identity
+    assert url_identity('s3://bucket/scroll/S.lasagna.json') != identity
+    with pytest.raises(LasagnaSourceError, match='not a remote'):
+        url_identity('/data/s.lasagna.json')
+
+
+def test_a_local_copy_of_a_remote_dataset_is_that_dataset(tmp_path):
+    # Its provenance record need not have been copied: the URL identifies it.
+    path = write_manifest(tmp_path, provenance='inference.json')
+    url = 'https://data.example/s.lasagna.json'
+    source = read_lasagna_manifest(path, url=url)
+    assert (source.identity, source.location) == (url_identity(url), url)
+    assert source.stores['normal_x'] == str(tmp_path / 's_nx.ome.zarr')
+    assert source.dataset_directory('/cache') == f'/cache/lasagna/{url_identity(url)}'
 
 
 def test_channels_must_share_one_single_channel_array(tmp_path):

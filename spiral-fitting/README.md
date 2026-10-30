@@ -364,12 +364,23 @@ there is no other loading path). Pools are derived data in the fit's cache
 <cache>/lasagna/<identity>/grad_mag_g<array>/  grad_mag
 ```
 
-The identity is the `run_uuid` of the manifest's provenance record (its
-`"provenance"` file, e.g. `inference.json`, as published datasets carry), else
-`sha256-` and the SHA-256 of the manifest file. The same dataset reached by
-another path or host therefore shares its packs, and a host needs only the
-packs, not the arrays. A manifest whose named provenance record is missing is
-refused rather than identified differently.
+A remote dataset (an `s3://`, `http(s)://` or `sftp://` manifest URL) is
+identified by its URL: `url-` and a digest of the manifest URL, with the scheme
+and host lower-cased and any fragment or trailing slash dropped. Data at a URL
+is taken never to change; re-publishing different arrays at the same URL
+leaves stale packs. Another spelling of the same bucket (an `https://` S3
+endpoint for an `s3://` URL, a mirror) is another dataset.
+
+A local dataset's identity is the `run_uuid` of the manifest's provenance
+record (its `"provenance"` file, e.g. `inference.json`, as published datasets
+carry), else `sha256-` and the SHA-256 of the manifest file; a manifest whose
+named provenance record is missing is refused rather than identified
+differently. A local copy of a remote dataset is a different dataset unless
+you name the URL it was copied from: `pack_resident_pools.py --as <URL>` packs
+it, and `fit_spiral.py --lasagna-url <URL>` fits it, under that URL's
+identity, so a service fitting the URL finds its packs. Either way a host
+needs only the packs, not the arrays; the packer writes the dataset's source
+document (`lasagna-<identity>.json`, recording its location) beside them.
 
 The command-line fit builds a missing pool from the arrays (reporting chunk
 progress; in DDP only rank 0 builds). A service never builds one: it fits the
@@ -378,6 +389,7 @@ are not in its cache. Pack them where the arrays are and copy them over:
 
 ```sh
 python pack_resident_pools.py /path/to/dataset.lasagna.json \
+    --as https://example/dataset.lasagna.json \
     --cache ~/.cache/vc3d/spiral --what normals,grad_mag
 rsync -a ~/.cache/vc3d/spiral/lasagna/<identity>/ service-host:<cache>/lasagna/<identity>/
 ```
@@ -1410,8 +1422,9 @@ A fit refuses a z window outside the range an artifact was extracted over
 (its recorded `z_roi`).
 
 A service reads no dataset `fiber_directions.npz`: it reads the samples of the
-project's selected fiber-inference dataset, by that dataset's identity (see
-"Lasagna inputs must be packed first") and the fit volume's scale, from its
+project's selected fiber-inference dataset, by that dataset's identity (its
+manifest URL's, see "Lasagna inputs must be packed first") and the fit
+volume's scale, from its
 cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. Extract
 them there over the prediction's whole height (no `--z-roi`), or place an
 existing artifact there, and copy the file to the service's cache:

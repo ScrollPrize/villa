@@ -101,68 +101,21 @@ def test_a_window_outside_the_extraction_is_refused(tmp_path):
         load_fiber_direction_samples(tmp_path / "f.npz", 10, 30)
 
 
-class _Response:
-    def __init__(self, document):
-        self.content = json.dumps(document).encode()
-        self.status_code = 200
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return json.loads(self.content)
-
-
-class _Session:
-    def __init__(self, documents):
-        self.documents = documents
-
-    def get(self, url, **kwargs):
-        return _Response(self.documents[url])
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-def test_a_remote_manifest_is_identified_by_its_run():
-    import hashlib
-    from fiber_direction_samples import remote_manifest_identity
-
-    base = "https://data.example/fibers/"
-    manifest = {"version": 2, "groups": {}, "provenance": "inference.json"}
-    session = _Session({base + "f.lasagna.json": manifest,
-                        base + "inference.json": {"run_uuid": "run-9",
-                                                  "manifest": "f.lasagna.json"}})
-    assert remote_manifest_identity(session, base + "f.lasagna.json") == (manifest, "run-9")
-    bare = {"version": 2, "groups": {}}
-    digest = "sha256-" + hashlib.sha256(json.dumps(bare).encode()).hexdigest()
-    assert remote_manifest_identity(_Session({base + "g.lasagna.json": bare}),
-                                    base + "g.lasagna.json")[1] == digest
-
-
-def test_an_existing_artifact_is_adopted_into_the_cache(tmp_path, monkeypatch):
+def test_an_existing_artifact_is_adopted_into_the_cache(tmp_path):
     import pytest
-    import requests
     import fiber_direction_samples as module
+    from lasagna_source import url_identity
 
+    # The artifact's manifest_url names the dataset; nothing is fetched.
     url = "https://data.example/fibers/f.lasagna.json"
-    monkeypatch.setattr(requests, "Session", lambda: _Session({
-        url: {"version": 2, "groups": {}, "provenance": "inference.json"},
-        "https://data.example/fibers/inference.json": {"run_uuid": "run-9"}}))
     _write_artifact(tmp_path / "f.npz", manifest_url=url, output_scale_base_voxels=4.0,
                     z_roi=[0, 20])
     target = module.adopt(tmp_path / "f.npz", tmp_path / "cache")
-    assert target == tmp_path / "cache" / "fiber-directions" / "run-9" / "scale4.npz"
+    assert target == (tmp_path / "cache" / "fiber-directions" / url_identity(url)
+                      / "scale4.npz")
     assert load_fiber_direction_samples(target, 0, 10)["metadata"]["manifest_url"] == url
     with pytest.raises(FileExistsError):
         module.adopt(tmp_path / "f.npz", tmp_path / "cache")
-    _write_artifact(tmp_path / "g.npz", manifest_url=url, output_scale_base_voxels=4.0,
-                    dataset_identity="run-1")
-    with pytest.raises(ValueError, match="extracted from dataset run-1"):
-        module.adopt(tmp_path / "g.npz", tmp_path / "cache", overwrite=True)
 
 
 class _IdentityTransform(torch.nn.Module):

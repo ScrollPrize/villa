@@ -24,6 +24,11 @@ Usage (the cache is the fit's --cache, default ~/.cache/vc3d/spiral):
   python pack_resident_pools.py /path/to/dataset.lasagna.json \
       --cache ~/.cache/vc3d/spiral --ct /path/to/s1_ds2.zarr --ct-group 2 \
       --verify 2000
+
+A local copy of a remote dataset packs under the remote one's identity with
+``--as <its manifest URL>``, so a service fitting that URL finds the packs.
+The dataset's source document (lasagna-<identity>.json) is written beside its
+packs, recording where it came from.
 """
 from __future__ import annotations
 
@@ -469,6 +474,9 @@ def main(argv=None):
         description='Pack a Lasagna dataset into the resident pools a fit '
                     'loads, under <cache>/lasagna/<identity>/.')
     parser.add_argument('manifest', help='the dataset\'s local *.lasagna.json')
+    parser.add_argument('--as', dest='as_url', default=None, metavar='URL',
+                        help='the remote manifest URL this local copy is of: '
+                             'pack under that dataset\'s identity')
     parser.add_argument('--cache', required=True, metavar='DIR',
                         help='the fit\'s cache directory (fit_spiral.py and '
                              'spiral_service.py --cache)')
@@ -486,13 +494,17 @@ def main(argv=None):
                              'store against the source zarr')
     args = parser.parse_args(argv)
 
-    from lasagna_source import PACK_INPUTS, read_lasagna_manifest
+    from lasagna_source import (PACK_INPUTS, LasagnaSourceError, read_lasagna_manifest,
+                                write_lasagna_source)
     what = [w.strip() for w in args.what.split(',') if w.strip()]
     unknown = set(what) - set(PACK_INPUTS)
     if unknown:
         parser.error(f'unknown --what entries: {sorted(unknown)}')
-    source = read_lasagna_manifest(args.manifest)
-    print(f'Lasagna dataset {source.identity}, array {source.group}')
+    try:
+        source = read_lasagna_manifest(args.manifest, url=args.as_url)
+    except LasagnaSourceError as exc:
+        parser.error(str(exc))
+    print(f'Lasagna dataset {source.identity} ({source.location}), array {source.group}')
 
     built = []
     for kind in what:
@@ -506,6 +518,7 @@ def main(argv=None):
                     io_threads=args.io_threads, force=args.force,
                     lasagna_identity=source.identity)
         built.append(out)
+    write_lasagna_source(source.dataset_directory(args.cache), source)
 
     if args.verify:
         for out in built:

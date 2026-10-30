@@ -21,7 +21,8 @@ import zipfile
 from config import Config
 from lasagna_source import (LASAGNA_CHANNELS, LasagnaSource, LasagnaSourceError,
                             check_identity, fiber_directions_path,
-                            find_dataset_manifest, load_lasagna_source)
+                            find_dataset_manifest, is_remote_location,
+                            load_lasagna_source, url_identity)
 from surface_orientation import spiral_outward_sense_for
 
 
@@ -183,14 +184,16 @@ from surface_orientation import spiral_outward_sense_for
 # read with the selection (never a patch). /dataset no longer resolves an
 # outer_shell path; the input manifest carries "outer_shell" (its provenance,
 # or null) and input_summary its UUID.
-# 43: Lasagna datasets by identity. The project block's "lasagna" carries the
-# dataset's "identity" (its provenance run_uuid, else sha256-<the manifest's
-# SHA-256>) and may be remote; the fit reads the resident pools of that
-# identity from the service's cache (<cache>/lasagna/<identity>/) and never
-# builds them, refusing a build whose packs are missing. paths carries one
-# "lasagna" (the dataset's source document) instead of normal_x, normal_y and
-# gradient_magnitude. It also carries "fiber_inference" ({location, identity}
-# of the selected fiber-inference dataset, or {location, error}) and each
+# 43: Lasagna datasets by identity. The project block's "lasagna" carries a
+# local dataset's "identity" (its provenance run_uuid, else sha256-<the
+# manifest's SHA-256>); a remote one's is its manifest URL's, which the
+# service computes (lasagna_source.url_identity). The fit reads the resident
+# pools of that identity from the service's cache (<cache>/lasagna/<identity>/)
+# and never builds them, refusing a build whose packs are missing. paths
+# carries one "lasagna" (the dataset's source document) instead of normal_x,
+# normal_y and gradient_magnitude. It also carries "fiber_inference"
+# ({location, identity} of the selected fiber-inference dataset, identified
+# the same way, or {location, error}) and each
 # volume its "fiber_scale" (base voxels of that dataset per volume voxel); a
 # fit with the fiber-direction loss reads the samples extracted for that
 # identity and scale from the cache (<cache>/fiber-directions/), not the
@@ -1030,6 +1033,23 @@ class SpiralProject:
         return self.lasagna.error
 
 
+def _project_dataset_identity(value: Mapping[str, Any], source: str) -> str:
+    """A project dataset's identity: a remote one's is its URL's
+    (lasagna_source.url_identity), which VC3D does not send; a local one's
+    the identity VC3D sends."""
+    location = str(value.get("location") or "")
+    try:
+        if is_remote_location(location):
+            if value.get("identity") not in (None, url_identity(location)):
+                raise LasagnaSourceError(
+                    f"the remote dataset {location} is identified by its URL, not "
+                    f"{value.get('identity')!r}")
+            return url_identity(location)
+        return check_identity(value.get("identity"))
+    except LasagnaSourceError as exc:
+        raise ScrollSpecError(f"{source}: {exc}") from None
+
+
 def _checked_lasagna(value: Any) -> ProjectLasagna | None:
     if value is None:
         return None
@@ -1043,10 +1063,7 @@ def _checked_lasagna(value: Any) -> ProjectLasagna | None:
     group = str(value.get("group") or "")
     if not stores or not group:
         raise ScrollSpecError(f"{source} needs its stores and their array group")
-    try:
-        identity = check_identity(value.get("identity"))
-    except LasagnaSourceError as exc:
-        raise ScrollSpecError(f"{source}: {exc}") from None
+    identity = _project_dataset_identity(value, source)
     return ProjectLasagna(location=str(value.get("location") or ""), identity=identity,
                           stores=stores, group=group)
 
@@ -1060,11 +1077,8 @@ def _checked_fiber_inference(value: Any) -> ProjectFiberInference | None:
     location = str(value.get("location") or "")
     if value.get("error"):
         return ProjectFiberInference(location=location, error=str(value["error"]))
-    try:
-        identity = check_identity(value.get("identity"))
-    except LasagnaSourceError as exc:
-        raise ScrollSpecError(f"{source}: {exc}") from None
-    return ProjectFiberInference(location=location, identity=identity)
+    return ProjectFiberInference(location=location,
+                                 identity=_project_dataset_identity(value, source))
 
 
 def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:

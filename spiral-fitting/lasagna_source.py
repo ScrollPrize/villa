@@ -10,10 +10,16 @@ packs to fit:
     <cache>/lasagna/<identity>/normals_g<group>/    nx and ny, one pool
     <cache>/lasagna/<identity>/grad_mag_g<group>/   grad_mag
 
-A dataset's identity is the ``run_uuid`` its provenance record (the
-manifest's ``"provenance"`` file, e.g. inference.json) states for that
-manifest, else ``sha256-`` and the SHA-256 of the manifest file's bytes. VC3D
-computes the same from the same bytes (SpiralProjectInputs).
+A remote dataset (an ``s3://``, ``http(s)://`` or ``sftp://`` manifest; the
+data at a URL is taken never to change) is identified by its manifest's URL:
+``url-`` and a digest of the URL (``url_identity``), computed here only; VC3D
+sends the URL. A local copy of one is packed under that URL's identity by
+naming the URL (``read_lasagna_manifest(..., url=)``, pack_resident_pools.py
+``--as``, fit_spiral.py ``--lasagna-url``). Any other local dataset's identity
+is the ``run_uuid`` its provenance record (the manifest's ``"provenance"``
+file, e.g. inference.json) states for that manifest, else ``sha256-`` and the
+SHA-256 of the manifest file's bytes. VC3D computes the same from the same
+bytes (SpiralProjectInputs).
 
 A fit names its dataset with a ``*.lasagna.json`` manifest (the command-line
 fit) or with a source document a service writes from the project VC3D sends
@@ -34,6 +40,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 # The fit's Lasagna inputs by the manifest channel each reads.
 LASAGNA_CHANNELS = {"normal_x": "nx", "normal_y": "ny", "gradient_magnitude": "grad_mag"}
@@ -44,7 +51,7 @@ SOURCE_FORMAT = "spiral-lasagna-source"
 SOURCE_VERSION = 1
 MANIFEST_SUFFIX = ".lasagna.json"
 
-# An identity names a cache directory: a run UUID or sha256-<hex>.
+# An identity names a cache directory: a run UUID, sha256-<hex> or url-<hex>.
 _IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -74,12 +81,16 @@ class LasagnaSource:
         return {"identity": self.identity, "location": self.location,
                 "group": self.group, "stores": dict(sorted(self.stores.items()))}
 
+    def dataset_directory(self, cache_directory: str | os.PathLike[str]) -> str:
+        """Where a cache keeps this dataset's packs (and, written by the
+        command-line packer and fit, its source document)."""
+        return os.path.join(str(cache_directory), "lasagna", self.identity)
+
     def pack_directory(self, cache_directory: str | os.PathLike[str], kind: str) -> str:
         """The resident pool of pack ``kind`` (PACK_INPUTS) of this dataset."""
         if kind not in PACK_INPUTS:
             raise ValueError(f"unknown Lasagna pack {kind!r}")
-        return os.path.join(str(cache_directory), "lasagna", self.identity,
-                            f"{kind}_g{self.group}")
+        return os.path.join(self.dataset_directory(cache_directory), f"{kind}_g{self.group}")
 
     def arrays(self, kind: str) -> list[str]:
         """The source arrays pack ``kind`` holds, in channel order."""
@@ -97,6 +108,28 @@ def check_identity(identity: str) -> str:
     return identity
 
 
+def is_remote_location(location: str) -> bool:
+    """Whether ``location`` is a URL (vc::project::isLocationRemote)."""
+    scheme = urlsplit(str(location).strip()).scheme.lower()
+    return scheme in ("s3", "http", "https", "sftp") or scheme.startswith("s3+")
+
+
+def dataset_url(location: str) -> str:
+    """``location``, a remote dataset's manifest URL, in the one spelling its
+    identity is taken from: scheme and host lower-cased, no fragment, no
+    trailing slash."""
+    if not is_remote_location(location):
+        raise LasagnaSourceError(f"{location!r} is not a remote dataset URL")
+    parts = urlsplit(str(location).strip())
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                       parts.path.rstrip("/"), parts.query, ""))
+
+
+def url_identity(location: str) -> str:
+    """The identity of the remote dataset whose manifest is at ``location``."""
+    return "url-" + hashlib.sha256(dataset_url(location).encode()).hexdigest()[:32]
+
+
 def manifest_identity(manifest_bytes: bytes, manifest_name: str,
                       provenance: Mapping[str, Any] | None) -> str:
     """The identity of a manifest: its provenance's ``run_uuid`` when the
@@ -111,10 +144,13 @@ def manifest_identity(manifest_bytes: bytes, manifest_name: str,
     return "sha256-" + hashlib.sha256(manifest_bytes).hexdigest()
 
 
-def read_lasagna_manifest(path: str | os.PathLike[str]) -> LasagnaSource:
+def read_lasagna_manifest(path: str | os.PathLike[str],
+                          url: str | None = None) -> LasagnaSource:
     """A local ``*.lasagna.json`` manifest (version 1 or 2) as a
     LasagnaSource: each channel's store and the array name they share, which
-    must be one single-channel array per channel at one scaledown."""
+    must be one single-channel array per channel at one scaledown. With
+    ``url``, the manifest is a local copy of the remote dataset there, and has
+    that dataset's identity and location (its stores stay the local ones)."""
     path = Path(path)
     try:
         data = path.read_bytes()
@@ -128,7 +164,7 @@ def read_lasagna_manifest(path: str | os.PathLike[str]) -> LasagnaSource:
     # A provenance record the manifest names but that cannot be read is an
     # error, not a fallback: the identity must not depend on what was copied.
     provenance = None
-    if isinstance(document.get("provenance"), str) and document["provenance"].strip():
+    if url is None and isinstance(document.get("provenance"), str) and document["provenance"].strip():
         record = base / document["provenance"]
         try:
             provenance = json.loads(record.read_text())
@@ -161,6 +197,9 @@ def read_lasagna_manifest(path: str | os.PathLike[str]) -> LasagnaSource:
         group, scaledown = array.name, entry.get("scaledown")
     if not stores:
         raise LasagnaSourceError(f"{path} has no nx, ny or grad_mag channel")
+    if url is not None:
+        return LasagnaSource(identity=url_identity(url), location=dataset_url(url),
+                             group=group, stores=stores)
     return LasagnaSource(identity=manifest_identity(data, path.name, provenance),
                          location=str(path), group=group, stores=stores)
 
@@ -172,7 +211,7 @@ def write_lasagna_source(directory: str | os.PathLike[str], source: LasagnaSourc
     target.mkdir(parents=True, exist_ok=True)
     path = target / f"lasagna-{source.identity}.json"
     document = {"format": SOURCE_FORMAT, "version": SOURCE_VERSION, **source.manifest()}
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(document, indent=2) + "\n")
     os.replace(temporary, path)
     return str(path)
