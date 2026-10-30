@@ -1021,12 +1021,43 @@ def configure_single_model(
     )
 
 
-def _volume_axes(array: Any) -> tuple[bool, int, int, int, int, int]:
+def _volume_axes(
+    array: Any,
+    *,
+    root: Any = None,
+    resolution: str = "0",
+) -> tuple[bool, int, int, int, int, int]:
+    """Honor declared ZYX/YXZ axes; retain the shape guess for legacy arrays."""
     shape = tuple(int(value) for value in array.shape)
     if len(shape) != 3:
         raise ValueError(f"Flat input array must be rank 3, got {shape!r}")
     chunks = tuple(int(value) for value in (array.chunks or shape))
-    depth_first = int(np.argmin(shape)) == 0
+    declarations = []
+    array_axes = getattr(array, "attrs", {}).get("_ARRAY_DIMENSIONS")
+    if array_axes is not None:
+        declarations.append(array_axes)
+    if root is not None and not hasattr(root, "shape"):
+        for entry in root.attrs.get("multiscales", []):
+            if any(str(dataset.get("path")) == str(resolution)
+                   for dataset in entry.get("datasets", [])):
+                if "axes" in entry:
+                    declarations.append(entry["axes"])
+    declared = None
+    for axes in declarations:
+        if not isinstance(axes, (list, tuple)):
+            raise ValueError("Flat input axes must be a sequence")
+        names = tuple(
+            str(axis.get("name") if isinstance(axis, dict) else axis).lower()
+            for axis in axes
+        )
+        if names not in (("z", "y", "x"), ("y", "x", "z")):
+            raise ValueError(f"Flat input axes must be ZYX or YXZ, got {names!r}")
+        if declared is not None and names != declared:
+            raise ValueError("Conflicting array and multiscale axis declarations")
+        declared = names
+    depth_first = (
+        declared[0] == "z" if declared is not None else int(np.argmin(shape)) == 0
+    )
     if depth_first:
         depth, height, width = shape
         _, chunk_h, chunk_w = chunks
@@ -1050,7 +1081,9 @@ def infer_single_zarr(
     root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
-    depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
+    depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(
+        volume, root=root, resolution=resolution
+    )
     patch_size = configured_model.patch_size
     stride = resolve_patch_stride(
         patch_size=patch_size,
