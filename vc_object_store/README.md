@@ -50,6 +50,11 @@ link declared from both ends is imported once. Version 1 control points are
 bare XYZ arrays, and a missing `optimization_mode` reads as `lasagna`. A fiber
 file without a `uuid` is given a name-based (version 5) UUID derived from its
 file name, so separate imports of the same file agree on its identity.
+VC3D's own fiber files from before the store also say version 4 but link by
+`branch_file` alone, as the published fiber annotations do; ingest refuses them.
+`scripts/upgrade_vc3d_fibers.py IN_DIR OUT_DIR` copies such a folder into the
+transfer format by the same rules as version 3 import (`target_uuid` from the
+peer file, each link declared once, the level-0 binding), leaving ingest strict.
 
 ## Use
 
