@@ -45,6 +45,10 @@ inline std::optional<double> storeVoxelSizeUm(const std::string& location, const
 // sources as published now and replaces what was kept; if a source cannot be read, nothing
 // kept changes and the kept metadata is returned when there is one.
 StoreMetadata volumeMetadata(const std::string& location, const OpenOptions& options, bool refresh = false);
+// Micrometers per voxel of the array at `levelKey` of its store, along Z, Y, X: level 0's
+// voxel size scaled by where the store's OME metadata places that level. An empty key is
+// level 0. nullopt when the store does not state a voxel size.
+std::optional<std::array<double, 3>> levelVoxelSizeZYX(const StoreMetadata& metadata, const std::string& levelKey);
 // Drops what this process remembers (not what is kept on disk).
 void forgetVolumeMetadata();
 Json storeMetadataJson(const StoreMetadata& metadata);

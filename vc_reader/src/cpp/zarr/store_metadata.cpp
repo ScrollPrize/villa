@@ -285,6 +285,17 @@ std::shared_ptr<const catalog::OpenDataManifest> catalogManifest(bool offline, b
 }
 }  // namespace
 
+std::optional<std::array<double, 3>> levelVoxelSizeZYX(const StoreMetadata& metadata, const std::string& levelKey)
+{
+    if (!metadata.voxelSizeUm) return std::nullopt;
+    std::array<double, 3> scale{1, 1, 1};
+    if (!levelKey.empty()) {
+        const auto attributes = metadata.documents.find(".zattrs");
+        scale = levelPlacement(attributes == metadata.documents.end() ? Json::object() : *attributes, levelKey).scale;
+    }
+    return std::array<double, 3>{*metadata.voxelSizeUm * scale[0], *metadata.voxelSizeUm * scale[1], *metadata.voxelSizeUm * scale[2]};
+}
+
 void forgetVolumeMetadata()
 {
     std::lock_guard lock(knownMutex);

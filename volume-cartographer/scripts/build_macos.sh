@@ -99,6 +99,8 @@ required_formulae=(
   c-blosc
   boost
   libtiff
+  libpng
+  jpeg-turbo
   curl
   nlohmann-json
   sqlite

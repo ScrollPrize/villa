@@ -174,7 +174,7 @@ class ZarrGroup:
             raise KeyError(f"no array {key!r} in {self.location}")
         opened = self._group.array(key)
         settings = dict(self._settings, location=f"{self.location}/{key}", group=self.location, level_key=key,
-                        store_metadata=self.metadata, level_scale=tuple(opened.placement_scale))
+                        store_metadata=self.metadata)
         reader = ZarrReader(settings, self.memory_cache, opened)
         self._readers[key] = reader
         return reader

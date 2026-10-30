@@ -383,9 +383,12 @@ NB_MODULE(_reader, m)
     }, "location"_a, "options"_a, "refresh"_a = false,
        "What is known about the volume at a location, as JSON (see vcr::zarr::volumeMetadata).");
     m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
-    m.def("level_placement_scale", [](const nb::object& group_attributes, const std::string& path) {
-        return vcr::zarr::levelPlacement(to_json(group_attributes), path).scale;
-    }, "group_attributes"_a, "path"_a);
+    m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
+        vcr::zarr::StoreMetadata metadata;
+        metadata.voxelSizeUm = voxel_size;
+        metadata.documents = to_json(documents);
+        return vcr::zarr::levelVoxelSizeZYX(metadata, level_key);
+    }, "voxel_size"_a.none(), "documents"_a, "level_key"_a);
 
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,

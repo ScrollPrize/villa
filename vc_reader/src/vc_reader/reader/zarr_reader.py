@@ -199,16 +199,9 @@ class ZarrReader:
     @property
     def voxel_size_zyx(self) -> tuple[float, float, float] | None:
         """Micrometers per voxel of this array along Z, Y, X; ``None`` when the store does not say."""
-        base = self.metadata.voxel_size_um
-        if base is None:
-            return None
-        scale = self._settings["level_scale"]
-        if scale is None:
-            key = self._opened.level_key
-            scale = (_reader.level_placement_scale(self.metadata.documents.get(".zattrs", {}), key)
-                     if key else (1.0, 1.0, 1.0))
-            self._settings["level_scale"] = tuple(scale)
-        return tuple(base * s for s in scale)
+        metadata = self.metadata
+        size = _reader.level_voxel_size_zyx(metadata.voxel_size_um, metadata.documents, self._opened.level_key)
+        return None if size is None else tuple(size)
 
     @property
     def voxel_size(self) -> float | None:
@@ -731,7 +724,7 @@ def _make_settings(
                     cache_max_bytes=cache_max_bytes, compress_cache=compress_cache,
                     allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
                     read_mode=read_mode, meta=None, attrs=None, access=resolve_access(loc, auth, offline=offline),
-                    offline=offline, store_metadata=None, level_scale=None)
+                    offline=offline, store_metadata=None)
     return settings, _memory_cache(memory_cache)
 
 

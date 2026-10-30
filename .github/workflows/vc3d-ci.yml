@@ -180,7 +180,7 @@ jobs:
       - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -242,7 +242,7 @@ jobs:
       - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -303,7 +303,7 @@ jobs:
       - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -368,7 +368,7 @@ jobs:
       - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -439,7 +439,7 @@ jobs:
       - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0

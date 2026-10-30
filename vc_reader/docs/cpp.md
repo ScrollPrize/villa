@@ -22,8 +22,8 @@ For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 auto-detection when the option is omitted. The toolkit supplies CUDA Runtime
 and cuFFT. No Python development files are needed when Python is disabled.
 
-Reader dependencies are libcurl, c-blosc, zstd, zlib, LZ4, SQLite,
-nlohmann-json, and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
+Reader dependencies are libcurl, c-blosc, zstd, zlib, LZ4, SQLite, libtiff, libpng,
+libjpeg, nlohmann-json, and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
 revision. A transforms-only build uses `VC_READER_BUILD_READER=OFF` and needs
 none of these reader dependencies.
 

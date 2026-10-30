@@ -53,6 +53,8 @@ jobs:
             libopencv-contrib-dev \
             libopencv-dev \
             libsuitesparse-dev \
+            libjpeg-dev \
+            libpng-dev \
             libtiff-dev \
             libzstd-dev \
             ninja-build \
