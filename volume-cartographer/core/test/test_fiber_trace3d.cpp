@@ -1631,3 +1631,119 @@ TEST_CASE("native fiber extrapolation fails at invalid start or first step")
     REQUIRE(result.points.size() == 1);
     CHECK(result.points.front()[0] == doctest::Approx(4.0));
 }
+
+namespace {
+
+// Two axes everywhere: one in the sheet plane (normal +y) and a stronger one
+// that leaves it at about 11 degrees.
+class SheetDistractorPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        const double sign = referenceDirection[0] < 0.0 ? -1.0 : 1.0;
+        const cv::Vec3d off = cv::normalize(cv::Vec3d{1.0, 0.2, 0.0});
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({cv::Vec3d{sign, 0.0, 0.0}, 0.9, true});
+        out.options.push_back({sign * off, 1.0, true});
+        return out;
+    }
+};
+
+// Default smoothness (normal-aware terms on), a cone of candidate steps.
+vc::fiber_tracer::FiberTraceConfig sheetPlaneTestConfig(double weight)
+{
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 15.0;
+    config.beamWidth = 4;
+    config.sheetPlaneWeight = weight;
+    return config;
+}
+
+vc::fiber_tracer::FiberTraceOneWayResult traceSheetCase(
+    const vc::fiber_tracer::FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler* normals,
+    const vc::fiber_tracer::FiberTraceConfig& config,
+    double distance = 64.0)
+{
+    return vc::fiber_tracer::traceFiberExtrapolation(
+        predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, distance, config, normals);
+}
+
+void checkSamePoints(
+    const vc::fiber_tracer::FiberTraceOneWayResult& a,
+    const vc::fiber_tracer::FiberTraceOneWayResult& b)
+{
+    REQUIRE(a.points.size() == b.points.size());
+    for (size_t i = 0; i < a.points.size(); ++i) {
+        for (int axis = 0; axis < 3; ++axis)
+            CHECK(a.points[i][axis] == b.points[i][axis]);
+    }
+}
+
+} // namespace
+
+TEST_CASE("native fiber tracer sheet plane weight defaults to off")
+{
+    CHECK(vc::fiber_tracer::FiberTraceConfig{}.sheetPlaneWeight == 0.0);
+}
+
+TEST_CASE("native fiber tracer sheet plane weight keeps a trace near its sheet")
+{
+    SheetDistractorPrediction predictions;
+    ConstantNormalSampler normals;  // sheet normal +y
+
+    const auto stock = traceSheetCase(predictions, &normals, sheetPlaneTestConfig(0.0));
+    const auto sheet = traceSheetCase(predictions, &normals, sheetPlaneTestConfig(8.0));
+    REQUIRE(stock.reachedTraceLength);
+    REQUIRE(sheet.reachedTraceLength);
+    // Without the penalty the stronger off-sheet axis wins and the trace drifts
+    // about 11 voxels off the sheet over 64; with it the drift is a small fraction.
+    CHECK(stock.points.back()[1] > 10.0);
+    CHECK(std::abs(sheet.points.back()[1]) < 0.2 * stock.points.back()[1]);
+}
+
+TEST_CASE("native fiber tracer sheet plane weight zero leaves traces unchanged")
+{
+    SheetDistractorPrediction predictions;
+    ConstantNormalSampler normals;
+    auto explicitZero = sheetPlaneTestConfig(0.0);
+    vc::fiber_tracer::FiberTraceConfig defaults;
+    defaults.stepVoxels = explicitZero.stepVoxels;
+    defaults.coneAngleDegrees = explicitZero.coneAngleDegrees;
+    defaults.beamWidth = explicitZero.beamWidth;
+    checkSamePoints(traceSheetCase(predictions, &normals, explicitZero),
+                    traceSheetCase(predictions, &normals, defaults));
+}
+
+TEST_CASE("native fiber tracer sheet plane weight is free for in-sheet traces")
+{
+    // The prediction turns within the sheet (normal +z), so the best steps lie in
+    // it and even a large weight gives the same trace.
+    RecrossPrediction predictions;
+    ConstantNormalSampler normals({0.0, 0.0, 1.0});
+    checkSamePoints(traceSheetCase(predictions, &normals, sheetPlaneTestConfig(100.0), 32.0),
+                    traceSheetCase(predictions, &normals, sheetPlaneTestConfig(0.0), 32.0));
+}
+
+TEST_CASE("native fiber tracer validates the sheet plane weight")
+{
+    StraightPrediction predictions;
+    ConstantNormalSampler normals;
+    for (const double bad : {-0.5, std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::infinity()}) {
+        CHECK_THROWS_AS(traceSheetCase(predictions, &normals, sheetPlaneTestConfig(bad), 16.0),
+                        std::invalid_argument);
+    }
+    // Like the other normal-aware terms, it needs the Lasagna normals, also when
+    // it is the only one turned on.
+    auto onlySheet = sheetPlaneTestConfig(0.75);
+    onlySheet.smoothnessNormalWeight = 0.0;
+    onlySheet.smoothnessTangentWeight = 0.0;
+    onlySheet.cumulativeSmoothnessTangentWeight = 0.0;
+    CHECK_THROWS_WITH_AS(traceSheetCase(predictions, nullptr, onlySheet, 16.0),
+                         doctest::Contains("Lasagna normal sampler"),
+                         std::invalid_argument);
+}

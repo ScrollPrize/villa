@@ -144,3 +144,30 @@ def test_extrapolation_validates_config_and_required_normals(dataset):
         fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., config())
     with pytest.raises(ValueError, match='step voxels must be positive'):
         fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., config(step_voxels=0.))
+
+
+def test_sheet_plane_weight_config_and_validation(dataset):
+    _, field, normals = dataset
+    assert config().sheet_plane_weight == 0.
+    cfg = config(sheet_plane_weight=.75)
+    assert cfg.to_dict()['sheet_plane_weight'] == .75
+    assert fiber_trace.TraceConfig.from_dict(cfg.to_dict()).sheet_plane_weight == .75
+    for bad in (-.5, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., config(sheet_plane_weight=bad), normals)
+    only_sheet = config(sheet_plane_weight=.75, smoothness_normal_weight=0., smoothness_tangent_weight=0.,
+                        cumulative_smoothness_tangent_weight=0.)
+    with pytest.raises(ValueError, match='normal sampler is required'):
+        fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., only_sheet)
+
+
+def test_sheet_plane_weight_keeps_in_sheet_traces(dataset):
+    # The synthetic fiber runs along +x inside the sheet (normal +y), so the
+    # penalty is zero along it and the trace is unchanged.
+    _, field, normals = dataset
+    for sign in [-1., 1.]:
+        plain = fiber_trace.trace_extrapolation(field, (32.,8.,8.), (sign,0.,0.), 16., config(), normals)
+        sheet = fiber_trace.trace_extrapolation(field, (32.,8.,8.), (sign,0.,0.), 16.,
+                                                config(sheet_plane_weight=.75), normals)
+        assert sheet.reached_trace_length, sheet.reason
+        np.testing.assert_array_equal(sheet.points, plain.points)
