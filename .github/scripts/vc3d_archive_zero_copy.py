@@ -106,7 +106,7 @@ def annotated(oid, expected_commit):
         raise ArchiveError("annotated tag has wrong commit")
 
 
-def staged_archive(channel, source_sha, old_oid):
+def staged_archive(channel, source_sha, old_oid, bootstrap_release_id=None):
     """Find an alias PRE-STAGED while the tagged commit was eligible to publish.
 
     The source's annotated tag object itself must be retained: the archive
@@ -132,6 +132,10 @@ def staged_archive(channel, source_sha, old_oid):
         return hints[0]
     if len(matches) != 1:
         raise ArchiveError("missing or ambiguous pre-staged alias; maintainer bootstrap needed")
+    # An initial maintainer bootstrap uses the old Release ID as its suffix.
+    # Its mismatch must also block a new-commit promotion (not just no-op replay).
+    if bootstrap_release_id is not None and matches[0] != prefix + str(bootstrap_release_id):
+        raise ArchiveError("bootstrap alias suffix does not match original Release ID")
     return matches[0]
 
 
@@ -376,7 +380,7 @@ def main(channel, new_sha, repo, probe_only=False):
     if channel == "latest" and cmd("git", "merge-base", "--is-ancestor", old_sha, new_sha, check=False).returncode:
         raise ArchiveError("latest cannot move backward")
 
-    archive = staged_archive(channel, old_sha, old_oid)
+    archive = staged_archive(channel, old_sha, old_oid, bootstrap_release_id=rid)
     expected_obj = remote_object(archive)
     if expected_obj != old_oid:
         raise ArchiveError("pre-staged tag ref is missing or not original annotated tag object")

@@ -334,6 +334,23 @@ class ArchiveLocalGit(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_first_promotion_requires_bootstrap_alias_to_encode_release_id(self):
+        # A maintainer bootstrap alias must be named after its original Release ID,
+        # not an unrelated run number, even on the first *new-commit* promotion.
+        for channel in CHANNELS:
+            with self.subTest(channel=channel):
+                f = self.fixture(channel)
+                invalid = f"vc3d-archive-{channel}-{f.old[:12]}-999"
+                f.git("push", "origin", ":refs/tags/" + f.archive)
+                f.git("push", "origin", f"refs/tags/{channel}:refs/tags/{invalid}")
+                before, refs = f.load()["releases"], f.refs()
+                result = f.helper(f.new, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("bootstrap alias suffix", result.stderr)
+                self.assertEqual(f.patch_calls(), [])
+                self.assertEqual(f.load()["releases"], before)
+                self.assertEqual(f.refs(), refs)
+
     def test_two_promotions_preserve_original_ids_and_exact_tag_objects(self):
         for channel in CHANNELS:
             with self.subTest(channel=channel):
