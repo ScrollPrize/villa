@@ -13,15 +13,17 @@ be byte-occupied in a source store. Passing ``--ct`` zeroes every voxel whose
 size this drops the mask skin from the pool, and the zeros read back as
 no-data through the existing sampling contract.
 
-Sidecar layout (``<zarr>.respool_g<group>[_pair]/``):
+Pack layout (``<cache>/lasagna/<identity>/<normals|grad_mag>_g<group>/``, see
+lasagna_source):
   meta.json         format/version, shapes, brick grid, sources, ct_mask info
   table.npy         int32 (gz, gy, gx); 0 = absent, i >= 1 = pool row i
   brick_coords.npy  int32 (rows, 3) brick coords per row; row 0 = -1
   channel_<i>.u8    uint8 (rows, brick_voxels) raw pool; row 0 = zeros
 
-Usage (defaults match the fit_spiral input conventions):
-  python pack_resident_pools.py /path/to/lasagna_inputs \
-      --ct /path/to/s1_ds2.zarr --ct-group 2 --verify 2000
+Usage (the cache is the fit's --cache, default ~/.cache/vc3d/spiral):
+  python pack_resident_pools.py /path/to/dataset.lasagna.json \
+      --cache ~/.cache/vc3d/spiral --ct /path/to/s1_ds2.zarr --ct-group 2 \
+      --verify 2000
 """
 from __future__ import annotations
 
@@ -39,13 +41,6 @@ from pathlib import Path
 import numpy as np
 
 RESPOOL_FORMAT_VERSION = 2
-
-
-def sidecar_path(zarr_path: str, group: str, *, pair: bool = False) -> str:
-    """Canonical sidecar directory for a store; the pair suffix marks the
-    two-channel nx+ny pool that lives next to the nx zarr."""
-    suffix = f'.respool_g{group}' + ('_pair' if pair else '')
-    return str(zarr_path).rstrip('/') + suffix
 
 
 def _read_zarray_meta(array_dir: Path) -> dict:
@@ -245,13 +240,15 @@ def pack_arrays(
     ct_masker: CtMasker | None = None,
     io_threads: int = 16,
     force: bool = False,
+    lasagna_identity: str | None = None,
     progress_callback=None,
 ) -> str:
     """Pack one or more same-geometry uint8 zarr arrays (one per channel).
 
     ``brick_shape`` defaults to the source chunk shape and must divide it;
     bricks that are entirely zero across all channels (after CT masking) are
-    dropped from the pool.
+    dropped from the pool. ``lasagna_identity`` is recorded as the dataset
+    the arrays belong to (lasagna_source).
     """
     out_dir = Path(out_dir)
     meta_path = out_dir / 'meta.json'
@@ -392,6 +389,7 @@ def pack_arrays(
         'channels': [str(d) for d in array_dirs],
         'channel_names': [d.parent.name + '/' + d.name for d in array_dirs],
         'dtype': 'u1',
+        'lasagna_identity': lasagna_identity,
         'ct_mask': ct_masker.describe() if ct_masker is not None else None,
         'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
     }
@@ -466,72 +464,48 @@ def verify_pool(sidecar_dir: str, num_samples: int, seed: int = 0) -> None:
           f'({masked} differ only under the CT mask)')
 
 
-def _find_one(folder: str, pattern: str) -> str | None:
-    hits = sorted(glob.glob(os.path.join(folder, pattern)))
-    if not hits:
-        return None
-    if len(hits) > 1:
-        print(f'WARNING: multiple matches for {pattern}, using {hits[0]}')
-    return hits[0]
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Pack lasagna zarr stores into resident-pool sidecars.')
-    parser.add_argument('folder', help='lasagna_inputs directory holding the '
-                        '*_nx / *_ny / *_grad_mag ome.zarr stores')
+        description='Pack a Lasagna dataset into the resident pools a fit '
+                    'loads, under <cache>/lasagna/<identity>/.')
+    parser.add_argument('manifest', help='the dataset\'s local *.lasagna.json')
+    parser.add_argument('--cache', required=True, metavar='DIR',
+                        help='the fit\'s cache directory (fit_spiral.py and '
+                             'spiral_service.py --cache)')
     parser.add_argument('--what', default='normals,grad_mag',
                         help='comma list of normals,grad_mag (default all)')
-    parser.add_argument('--normal-group', default='4',
-                        help='group for both normals and grad_mag')
     parser.add_argument('--ct', default=None, metavar='ZARR',
                         help='CT zarr whose zero voxels are masked out of every '
                              'packed store (e.g. .../s1_ds2.zarr)')
     parser.add_argument('--ct-group', default='2')
     parser.add_argument('--io-threads', type=int, default=16)
     parser.add_argument('--force', action='store_true',
-                        help='rebuild sidecars that already exist')
+                        help='rebuild packs that already exist')
     parser.add_argument('--verify', type=int, default=0, metavar='N',
                         help='after packing, compare N random voxels per '
                              'store against the source zarr')
     args = parser.parse_args(argv)
 
-    what = {w.strip() for w in args.what.split(',') if w.strip()}
-    unknown = what - {'normals', 'grad_mag'}
+    from lasagna_source import PACK_INPUTS, read_lasagna_manifest
+    what = [w.strip() for w in args.what.split(',') if w.strip()]
+    unknown = set(what) - set(PACK_INPUTS)
     if unknown:
         parser.error(f'unknown --what entries: {sorted(unknown)}')
-
-    def masker_for(array_dir):
-        if args.ct is None:
-            return None
-        shape = _read_zarray_meta(Path(array_dir))['shape']
-        return CtMasker(args.ct, args.ct_group, shape)
+    source = read_lasagna_manifest(args.manifest)
+    print(f'Lasagna dataset {source.identity}, array {source.group}')
 
     built = []
-    if 'normals' in what:
-        nx = _find_one(args.folder, '*_nx.ome.zarr')
-        ny = _find_one(args.folder, '*_ny.ome.zarr')
-        if nx is None or ny is None:
-            print('missing *_nx/*_ny ome.zarr, skipping normals')
-        else:
-            arrays = [os.path.join(nx, args.normal_group),
-                      os.path.join(ny, args.normal_group)]
-            out = sidecar_path(nx, args.normal_group, pair=True)
-            pack_arrays(arrays, out, label='normals',
-                        ct_masker=masker_for(arrays[0]),
-                        io_threads=args.io_threads, force=args.force)
-            built.append(out)
-    if 'grad_mag' in what:
-        grad = _find_one(args.folder, '*_grad_mag.ome.zarr')
-        if grad is None:
-            print('no *_grad_mag.ome.zarr found, skipping grad_mag')
-        else:
-            array = os.path.join(grad, args.normal_group)
-            out = sidecar_path(grad, args.normal_group)
-            pack_arrays([array], out, label='grad_mag',
-                        ct_masker=masker_for(array),
-                        io_threads=args.io_threads, force=args.force)
-            built.append(out)
+    for kind in what:
+        arrays = source.arrays(kind)
+        masker = (CtMasker(args.ct, args.ct_group,
+                           _read_zarray_meta(Path(arrays[0]))['shape'])
+                  if args.ct is not None else None)
+        out = source.pack_directory(args.cache, kind)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        pack_arrays(arrays, out, label=kind, ct_masker=masker,
+                    io_threads=args.io_threads, force=args.force,
+                    lasagna_identity=source.identity)
+        built.append(out)
 
     if args.verify:
         for out in built:

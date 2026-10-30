@@ -1,0 +1,110 @@
+"""A fit's Lasagna dataset: its identity, its stores and its packs' place."""
+import hashlib
+import json
+
+import pytest
+
+from lasagna_source import (LasagnaSource, LasagnaSourceError, find_dataset_manifest,
+                            load_lasagna_source, manifest_identity,
+                            read_lasagna_manifest, write_lasagna_source)
+
+
+def write_manifest(directory, name='s.lasagna.json', **extra):
+    document = {'version': 2, 'groups': {
+        channel: {'zarr': f's_{channel}.ome.zarr/4', 'scaledown': 4, 'channels': [channel]}
+        for channel in ('nx', 'ny', 'grad_mag')}, **extra}
+    path = directory / name
+    path.write_text(json.dumps(document))
+    return path
+
+
+def test_a_manifest_without_provenance_is_identified_by_its_bytes(tmp_path):
+    path = write_manifest(tmp_path)
+    source = read_lasagna_manifest(path)
+    assert source.identity == 'sha256-' + hashlib.sha256(path.read_bytes()).hexdigest()
+    assert source.group == '4'
+    assert source.stores == {key: str(tmp_path / f's_{channel}.ome.zarr')
+                             for key, channel in (('normal_x', 'nx'), ('normal_y', 'ny'),
+                                                  ('gradient_magnitude', 'grad_mag'))}
+    # The same bytes anywhere are the same dataset.
+    copy = tmp_path / 'copy'
+    copy.mkdir()
+    (copy / 's.lasagna.json').write_bytes(path.read_bytes())
+    assert read_lasagna_manifest(copy / 's.lasagna.json').identity == source.identity
+
+
+def test_a_published_manifest_is_identified_by_its_run(tmp_path):
+    (tmp_path / 'inference.json').write_text(json.dumps(
+        {'run_uuid': '5b17ff6c-3c47-4f7f-8042-9326a683933b', 'manifest': 's.lasagna.json'}))
+    path = write_manifest(tmp_path, provenance='inference.json')
+    assert read_lasagna_manifest(path).identity == '5b17ff6c-3c47-4f7f-8042-9326a683933b'
+
+
+def test_a_run_of_another_manifest_does_not_identify_this_one():
+    data = b'{"version": 2}'
+    digest = 'sha256-' + hashlib.sha256(data).hexdigest()
+    assert manifest_identity(data, 's.lasagna.json', {'run_uuid': 'r', 'manifest': 'o.lasagna.json'}) == digest
+    assert manifest_identity(data, 's.lasagna.json', {'run_uuid': 'r'}) == 'r'
+    assert manifest_identity(data, 's.lasagna.json', {'run_uuid': '../r'}) == digest
+
+
+def test_a_named_but_missing_provenance_is_refused(tmp_path):
+    path = write_manifest(tmp_path, provenance='inference.json')
+    with pytest.raises(LasagnaSourceError, match='provenance record'):
+        read_lasagna_manifest(path)
+
+
+def test_channels_must_share_one_single_channel_array(tmp_path):
+    path = tmp_path / 'n.lasagna.json'
+    path.write_text(json.dumps({'version': 2, 'groups': {
+        'normals': {'zarr': 'n.zarr/0', 'scaledown': 2, 'channels': ['nx', 'ny']}}}))
+    with pytest.raises(LasagnaSourceError, match='single-channel'):
+        read_lasagna_manifest(path)
+    path.write_text(json.dumps({'version': 2, 'groups': {
+        'nx': {'zarr': 'nx.zarr/4', 'scaledown': 4, 'channels': ['nx']},
+        'ny': {'zarr': 'ny.zarr/3', 'scaledown': 3, 'channels': ['ny']}}}))
+    with pytest.raises(LasagnaSourceError, match='one array'):
+        read_lasagna_manifest(path)
+
+
+def test_a_service_s_source_document_round_trips(tmp_path):
+    source = LasagnaSource(identity='run-1', location='https://data/s.lasagna.json', group='4',
+                           stores={'normal_x': 'https://data/s_nx.ome.zarr'})
+    path = write_lasagna_source(tmp_path / 'project-inputs', source)
+    assert path.endswith('lasagna-run-1.json')
+    assert load_lasagna_source(path) == source
+    # A manifest loads through the same call.
+    assert load_lasagna_source(write_manifest(tmp_path)).group == '4'
+
+
+def test_packs_live_under_the_identity():
+    source = LasagnaSource(identity='run-1', location='', group='4',
+                           stores={'normal_x': '/nx', 'normal_y': '/ny'})
+    assert source.pack_directory('/cache', 'normals') == '/cache/lasagna/run-1/normals_g4'
+    assert source.arrays('normals') == ['/nx/4', '/ny/4']
+    with pytest.raises(LasagnaSourceError, match='grad_mag'):
+        source.arrays('grad_mag')
+    with pytest.raises(LasagnaSourceError, match='identity'):
+        LasagnaSource(identity='../x', location='', group='4')
+
+
+def test_a_dataset_s_one_manifest_is_found(tmp_path):
+    assert find_dataset_manifest(tmp_path) == ''
+    path = write_manifest(tmp_path)
+    assert find_dataset_manifest(tmp_path) == str(path)
+    write_manifest(tmp_path, name='t.lasagna.json')
+    assert find_dataset_manifest(tmp_path) == ''
+
+
+def test_the_link_refresh_reads_the_normals_pack_when_the_cache_has_it(tmp_path):
+    from fit_session import lasagna_normal_inputs
+    source = LasagnaSource(identity='run-1', location='', group='4',
+                           stores={'normal_x': '/nx', 'normal_y': '/ny'})
+    config = {'input_use_normals': True}
+    assert lasagna_normal_inputs(source, config, 4, tmp_path) is None
+    pack = tmp_path / 'lasagna' / 'run-1' / 'normals_g4'
+    pack.mkdir(parents=True)
+    (pack / 'meta.json').write_text('{}')
+    assert lasagna_normal_inputs(source, config, 4, tmp_path) == {'pool': str(pack), 'scale': 4}
+    assert lasagna_normal_inputs(source, {'input_use_normals': False}, 4, tmp_path) is None
+    assert lasagna_normal_inputs(None, config, 4, tmp_path) is None

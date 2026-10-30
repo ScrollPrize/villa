@@ -108,8 +108,7 @@ def test_refresh_failures_are_collected_and_stop_the_fit(store_path, tmp_path):
         put_fiber(db, [[12.0, 100.5, 40.0 + i] for i in range(30)], [0, 29], name='f')
     config = fit_config(store_path, pcl_link_window_points=1,
                         pcl_link_window_min_points=5)
-    lasagna = {'normal_x': str(tmp_path / 'absent_x'),
-               'normal_y': str(tmp_path / 'absent_y'), 'group': '4', 'scale': 4}
+    lasagna = {'pool': str(tmp_path / 'absent_pack'), 'scale': 4}
     with pytest.raises(osi.LinkRefreshError) as error:
         osi.load_fit_inputs(config, lasagna=lasagna, log=lambda line: None)
     text = '\n'.join(error.value.problems)
@@ -218,15 +217,14 @@ def test_normal_source_prefers_lasagna_then_ct_then_none():
     ct = osi.fiber_normal_source(config, volume_uuid=VOLUME)
     assert (ct.kind, ct.ct_volume, dict(ct.parameters)) == (
         'ct', '/ct.zarr/2', {'ct_level': 0, 'ct_to_base_scale': 4.0})
-    # The store reads the group array the fitter reads, by path, whatever
-    # levels the stores' multiscales list.
+    # The store reads the normals pack the fitter loads, never the arrays.
     lasagna = osi.fiber_normal_source(
-        config, {'normal_x': '/nx', 'normal_y': '/ny', 'group': 4, 'scale': 4},
+        config, {'pool': '/cache/lasagna/run-1/normals_g4', 'scale': 4},
         volume_uuid=VOLUME)
     assert lasagna.kind == 'lasagna' and lasagna.ct_volume == ''
     assert dict(lasagna.parameters) == {
-        'ct_level': 0, 'ct_to_base_scale': 4.0, 'normal_x_volume': '/nx/4',
-        'normal_y_volume': '/ny/4'}
+        'ct_level': 0, 'ct_to_base_scale': 4.0,
+        'normal_pool': '/cache/lasagna/run-1/normals_g4'}
     assert 'ignoring object_store_normal_ct_path' in lasagna.note
     assert lasagna.provenance()['kind'] == 'lasagna'
 
@@ -252,6 +250,53 @@ def test_fiber_refresh_records_the_chosen_normal_source(tmp_path):
     assert edge['meta']['normal_method'] == 'centerline'
     assert edge['meta']['normal_source'] is None
     assert inputs.counts['fiber attachments'] == 1
+
+
+def test_packed_normals_link_fibers_as_the_arrays_do(tmp_path, monkeypatch):
+    """The refresh reads the fit's normals pack; it links exactly as reading
+    the nx/ny arrays it was packed from."""
+    import zarr
+    from pack_resident_pools import pack_arrays
+
+    arrays = []
+    for name, value in (('nx', 128), ('ny', 255)):  # the patch plane's normal, +Y
+        array = zarr.open(str(tmp_path / f'{name}.zarr'), mode='w', shape=(192, 128, 224),
+                          chunks=(16, 16, 16), dtype='|u1', compressor=None, fill_value=0,
+                          zarr_format=2, dimension_separator='/')
+        array[:] = value
+        arrays.append(str(tmp_path / f'{name}.zarr'))
+    pack = pack_arrays(arrays, str(tmp_path / 'normals_g0'), label='normals',
+                       lasagna_identity='run-1')
+
+    stores = []
+    for name in ('arrays', 'pack'):
+        path = str(tmp_path / f'{name}.vcobj')
+        with ObjectStore.create(path, author='ingest', hostname='host') as db:
+            put_patch(db, _grid(size=40), (0.25, 0.25))
+            put_fiber(db, [[30.0, 100.0, 50.0 + i] for i in range(141)], [0, 140], name='lying')
+        stores.append(path)
+    original = osi.fiber_normal_source
+    monkeypatch.setattr(osi, 'fiber_normal_source', lambda config, lasagna, volume: osi.NormalSource(
+        'lasagna', '', (('ct_level', 0), ('ct_to_base_scale', 1.0),
+                        ('normal_x_volume', arrays[0]), ('normal_y_volume', arrays[1]))))
+    load(stores[0])
+    monkeypatch.setattr(osi, 'fiber_normal_source', original)
+    osi.load_fit_inputs(fit_config(stores[1]), lasagna={'pool': pack, 'scale': 1.0},
+                        log=lambda line: None)
+
+    def links(path):
+        # Each store's objects have their own UUIDs; the evidence is compared.
+        with ObjectStore.open(path, read_only=True) as db:
+            return [{key: (sorted(map(json.dumps, value['objects'].values()))
+                           if key == 'coordinate_frame' else value)
+                     for key, value in edge['meta'].items() if key != 'normal_source'}
+                    for edge in db.edges_by_kind('same-surface')]
+    from_arrays, from_pack = links(stores[0]), links(stores[1])
+    assert from_arrays and from_pack == from_arrays
+    assert from_pack[0]['normal_method'] == 'lasagna-nxny-u8-nearest-v1'
+    with ObjectStore.open(stores[1], read_only=True) as db:
+        [edge] = db.edges_by_kind('same-surface')
+    assert edge['meta']['normal_source'] == {'normal_pool': pack}
 
 
 # ---------------------------------------------------------------------------

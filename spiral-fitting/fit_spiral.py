@@ -46,8 +46,8 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS,
-                         input_source_enabled, lasagna_normal_inputs,
-                         outer_shell_required, shell_losses_enabled,
+                         input_source_enabled, lasagna_enabled,
+                         lasagna_normal_inputs, outer_shell_required, shell_losses_enabled,
                          winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
@@ -66,6 +66,7 @@ def _startup_resource_suffix(started_at=None):
 
 
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
+from lasagna_source import load_lasagna_source
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
@@ -966,14 +967,15 @@ class FitContext:
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None,
-                 object_store_inputs=None, input_log=None):
+                 object_store_inputs=None, input_log=None,
+                 build_lasagna_packs=True):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
         #
         # scroll is the frozen ScrollSpec: physical facts of the scanned
         # scroll (name, voxel size, outward sense, umbilicus coordinate
-        # scale, Lasagna group and scale). paths is the resolved
+        # scale, Lasagna scale). paths is the resolved
         # SpiralInputPaths for this fit: the interactive runtime passes the
         # service's per-session selection; the CLI resolves the conventional
         # dataset layout (fit_session.conventional_input_paths). Its patch,
@@ -1047,7 +1049,6 @@ class FitContext:
         self.spiral_outward_sense = scroll.spiral_outward_sense
         # Decides whether exports are flipped so the scroll top is row 0.
         self.z_direction_is_top_to_bottom = scroll.z_direction_is_top_to_bottom
-        self.normal_zarr_group = scroll.normal_zarr_group
         self.lasagna_scale = int(scroll.lasagna_scale)
         umbilicus_path = paths.umbilicus
         umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
@@ -1056,12 +1057,13 @@ class FitContext:
 
         # Resolved input paths ('' means absent).
         self.scroll_zarr_path = paths.scroll_zarr or None
-        use_normals = input_source_enabled(config, 'normals')
-        self.normal_nx_zarr_path = (paths.normal_x or None) if use_normals else None
-        self.normal_ny_zarr_path = (paths.normal_y or None) if use_normals else None
-        self.grad_mag_zarr_path = (
-            (paths.gradient_magnitude or None)
-            if input_source_enabled(config, 'gradient_magnitude') else None)
+        # The Lasagna dataset (lasagna_source): the fit loads its packs from
+        # the cache, building missing ones from its arrays only when
+        # build_lasagna_packs (the command-line fit; a service never does).
+        self.lasagna_source = (
+            load_lasagna_source(paths.lasagna)
+            if paths.lasagna and lasagna_enabled(config) else None)
+        self.build_lasagna_packs = bool(build_lasagna_packs)
         self.winding_inference_path = (
             (paths.winding_inference or None)
             if winding_inference_enabled(config) else None)
@@ -1676,12 +1678,16 @@ class FitContext:
                     'crossings from scaled coordinates')
         return scale
 
+    @property
+    def lasagna_group(self):
+        """The Lasagna arrays' name, or None when the fit reads no dataset."""
+        return self.lasagna_source.group if self.lasagna_source is not None else None
+
     def _lasagna_normal_inputs(self):
         """The fit's lasagna normals as object_store_inputs.fiber_normal_source
         takes them, or None when the fit loads none."""
         return lasagna_normal_inputs(
-            self.normal_nx_zarr_path, self.normal_ny_zarr_path,
-            self.normal_zarr_group, self.lasagna_scale)
+            self.lasagna_source, self.config, self.lasagna_scale, self.cache_path)
 
     def _external_input_frames(self):
         """Frames of the inputs read outside the object store, for the input
@@ -1690,8 +1696,9 @@ class FitContext:
         track_scale_factor; the others by their existing contract."""
         frames = {'umbilicus': {
             'coordinate_scale': float(self.scroll.umbilicus_coordinate_scale)}}
-        if self.normal_nx_zarr_path or self.grad_mag_zarr_path:
-            frames['lasagna'] = {'group': str(self.normal_zarr_group),
+        if self.lasagna_source is not None:
+            frames['lasagna'] = {'identity': self.lasagna_source.identity,
+                                 'group': self.lasagna_source.group,
                                  'downsampling': int(self.lasagna_scale)}
         if self.tracks_dbm_path:
             frames['tracks'] = {'scale_factor': self._object_store_track_scale()}
@@ -1705,6 +1712,14 @@ class FitContext:
         """Refresh and freeze this fit's object-store inputs
         (object_store_inputs.load_fit_inputs) and report them."""
         from object_store_inputs import load_fit_inputs
+        # The link refresh reads the normals pack: one that may be built is
+        # built first.
+        source = self.lasagna_source
+        if (source is not None and input_source_enabled(self.config, 'normals')
+                and source.stores.get('normal_x') and source.stores.get('normal_y')):
+            self._ensure_sparse_volume_stores(
+                use_normals=True, use_spacing=False,
+                progress=progress_or_null(self.progress))
         progress_or_null(self.progress).begin(
             'loading', 'Reading object-store inputs',
             detail=os.path.basename(str(self.config['object_store_path'])))
@@ -2014,8 +2029,11 @@ class FitContext:
         self._build_store_state()
         self._build_model_state()
 
-    def _ensure_sparse_volume_stores(self, *, use_normals, progress):
-        """Have rank zero build missing derived stores before any rank loads."""
+    def _ensure_sparse_volume_stores(self, *, use_normals, progress, use_spacing=None):
+        """Have rank zero build missing derived stores before any rank loads
+        (a fit that may build them, build_lasagna_packs)."""
+        if not self.build_lasagna_packs or self.lasagna_source is None:
+            return
         # The resident pools are derived inputs. A normal single-process fit
         # builds any missing ones itself; in DDP, rank zero builds once and
         # publishes any failure before the other ranks try to open the pools.
@@ -2023,12 +2041,11 @@ class FitContext:
         if not self.dist.is_distributed or self.dist.is_main_process:
             try:
                 ensure_fit_sparse_stores(
+                    source=self.lasagna_source,
+                    cache_directory=self.cache_path,
                     use_normals=use_normals,
-                    use_spacing=self.grad_mag_spacing_enabled,
-                    normal_nx_zarr_path=self.normal_nx_zarr_path,
-                    normal_ny_zarr_path=self.normal_ny_zarr_path,
-                    grad_mag_zarr_path=self.grad_mag_zarr_path,
-                    normal_zarr_group=self.normal_zarr_group,
+                    use_spacing=(self.grad_mag_spacing_enabled
+                                 if use_spacing is None else use_spacing),
                     progress=progress,
                 )
             except Exception as exc:
@@ -2070,15 +2087,12 @@ class FitContext:
             self.scroll_zarr,
             use_normals=use_normals,
             use_spacing=self.grad_mag_spacing_enabled,
-            normal_nx_zarr_path=self.normal_nx_zarr_path,
-            normal_ny_zarr_path=self.normal_ny_zarr_path,
-            grad_mag_zarr_path=self.grad_mag_zarr_path,
-            normal_zarr_group=self.normal_zarr_group,
+            source=self.lasagna_source,
+            cache_directory=self.cache_path,
             z_begin=self.z_begin,
             z_end=self.z_end,
             lasagna_scale=self.lasagna_scale,
             storage_backend=self.lasagna_storage_backend,
-            cache_directory=self.cache_path,
             device=self.device,
             progress=progress,
         )
@@ -2647,7 +2661,7 @@ class FitContext:
                 getattr(self.interactive_driver, 'requested_config', dict(self.config))),
             'resolved_config': dict(self.config),
             'lasagna_scale': self.lasagna_scale,
-            'lasagna_group': self.normal_zarr_group,
+            'lasagna_group': self.lasagna_group,
             'base_shape_zyx': (
                 list(self.base_shape_zyx)
                 if self.base_shape_zyx is not None else None),
@@ -2771,11 +2785,13 @@ class FitContext:
             reasons.append(
                 f'checkpoint lasagna_scale={checkpoint.get("lasagna_scale")!r} '
                 f'does not match this fit ({self.lasagna_scale!r})')
-        if checkpoint.get('lasagna_group') != self.normal_zarr_group:
+        # A fit that reads no Lasagna dataset has no group to compare.
+        if (self.lasagna_group is not None
+                and checkpoint.get('lasagna_group') != self.lasagna_group):
             reasons.append(
                 f'checkpoint Lasagna group '
                 f'{checkpoint.get("lasagna_group")!r} does not match '
-                f'requested group {self.normal_zarr_group!r}')
+                f'requested group {self.lasagna_group!r}')
         if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
             reasons.append(
                 f'checkpoint outward sense '

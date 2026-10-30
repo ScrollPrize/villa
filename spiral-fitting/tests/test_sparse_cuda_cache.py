@@ -10,8 +10,9 @@ import torch
 import zarr
 
 import lasagna_data
-from pack_resident_pools import _make_chunk_reader, pack_arrays, sidecar_path
+from pack_resident_pools import _make_chunk_reader, pack_arrays
 from lasagna_data import ensure_fit_sparse_stores
+from lasagna_source import LasagnaSource
 from sparse_cuda_cache import ResidentBrickPool
 
 
@@ -28,7 +29,7 @@ def write_array(path, data):
 def make_pool(tmp_path, arrays, name, **kwargs):
     paths = [write_array(tmp_path / f'{name}_{i}', a)
              for i, a in enumerate(arrays)]
-    out = pack_arrays(paths, sidecar_path(paths[0], '0'), label=name)
+    out = pack_arrays(paths, paths[0] + '.pool', label=name)
     return ResidentBrickPool(out, device='cpu', label=name, **kwargs)
 
 
@@ -107,22 +108,25 @@ def test_fit_builds_missing_sparse_stores_and_reports_progress(tmp_path):
         write_raw_pack_source(root / '4', data)
 
     progress = RecordingProgress()
+    source = LasagnaSource(
+        identity='run-1', location=str(tmp_path / 's.lasagna.json'), group='4',
+        stores={'normal_x': str(nx), 'normal_y': str(ny),
+                'gradient_magnitude': str(grad)})
+    cache = tmp_path / 'cache'
     kwargs = dict(
+        source=source,
+        cache_directory=str(cache),
         use_normals=True,
         use_spacing=True,
-        normal_nx_zarr_path=str(nx),
-        normal_ny_zarr_path=str(ny),
-        grad_mag_zarr_path=str(grad),
-        normal_zarr_group='4',
         progress=progress,
     )
     ensure_fit_sparse_stores(**kwargs)
 
-    expected = [
-        sidecar_path(str(nx), '4', pair=True),
-        sidecar_path(str(grad), '4'),
-    ]
-    assert all((Path(path) / 'meta.json').is_file() for path in expected)
+    # The packs are the cache's, keyed by the dataset's identity.
+    expected = [cache / 'lasagna' / 'run-1' / 'normals_g4',
+                cache / 'lasagna' / 'run-1' / 'grad_mag_g4']
+    assert all((path / 'meta.json').is_file() for path in expected)
+    assert json.loads((expected[0] / 'meta.json').read_text())['lasagna_identity'] == 'run-1'
     assert [stage for _, stage, _ in progress.begins] == [
         'Building Lasagna normal sparse store',
         'Building Lasagna gradient sparse store',
@@ -157,7 +161,7 @@ def test_missing_sparse_store_uses_windows_file_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(lasagna_data, 'pack_arrays', fake_pack_arrays)
 
     result = lasagna_data._ensure_sidecar(
-        [], str(sidecar), label='test', stage_name='test')
+        [], str(sidecar), identity='run-1', label='test', stage_name='test')
 
     assert result == str(sidecar)
     assert lock_calls == [(fake_msvcrt.LK_LOCK, 1),
@@ -227,7 +231,7 @@ def test_origin_and_z_roi_restriction(tmp_path):
         (64, 4, 4),
     ).copy()
     paths = [write_array(tmp_path / 'large_z', data)]
-    out = pack_arrays(paths, sidecar_path(paths[0], '0'), label='roi')
+    out = pack_arrays(paths, paths[0] + '.pool', label='roi')
     pool = ResidentBrickPool(
         out, device='cpu', label='roi', origin_zyx=(32, 0, 0), z_roi=(32, 64))
     full = ResidentBrickPool(out, device='cpu', label='full')
@@ -265,7 +269,7 @@ def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
 
     masker = CtMasker(tmp_path / 'ct', '2', data.shape)
     assert masker.ratio == (2, 2, 2)
-    out = pack_arrays([store], sidecar_path(store, '0'), label='masked',
+    out = pack_arrays([store], store + '.pool', label='masked',
                       brick_shape=(8, 8, 8), ct_masker=masker)
     verify_pool(out, 500)  # mask-aware: pool zeros are accepted iff CT == 0
 
@@ -278,3 +282,40 @@ def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
     assert int(inside[0, 0]) == int(data[3, 3, 3])
     assert outside[:, 0].tolist() == [0, 0]
 
+
+
+def test_a_fit_without_its_pack_is_told_how_to_build_it(tmp_path):
+    """A fit that may not build packs (a service) refuses a missing one, and
+    a pack of another dataset."""
+    source = LasagnaSource(identity='run-1', location='/data/s.lasagna.json', group='4',
+                           stores={'normal_x': '/data/nx', 'normal_y': '/data/ny'})
+    with pytest.raises(RuntimeError, match='no resident pool of Lasagna dataset run-1'):
+        lasagna_data._require_sidecar(source, str(tmp_path), 'normals')
+    pack = Path(source.pack_directory(tmp_path, 'normals'))
+    pack.mkdir(parents=True)
+    (pack / 'meta.json').write_text(json.dumps({'lasagna_identity': 'run-2'}))
+    with pytest.raises(RuntimeError, match='holds Lasagna dataset run-2'):
+        lasagna_data._require_sidecar(source, str(tmp_path), 'normals')
+    (pack / 'meta.json').write_text(json.dumps({'lasagna_identity': 'run-1'}))
+    assert lasagna_data._require_sidecar(source, str(tmp_path), 'normals') == str(pack)
+
+
+def test_packer_writes_a_manifest_s_packs_into_the_cache(tmp_path):
+    """pack_resident_pools.py packs the arrays a manifest names into the
+    cache, keyed by the manifest's identity."""
+    import pack_resident_pools
+    from lasagna_source import read_lasagna_manifest
+
+    data = np.ones((16, 16, 16), dtype=np.uint8)
+    for channel in ('nx', 'ny', 'grad_mag'):
+        write_raw_pack_source(tmp_path / f's_{channel}.ome.zarr' / '4', data)
+    manifest = tmp_path / 's.lasagna.json'
+    manifest.write_text(json.dumps({'version': 2, 'groups': {
+        channel: {'zarr': f's_{channel}.ome.zarr/4', 'scaledown': 4, 'channels': [channel]}
+        for channel in ('nx', 'ny', 'grad_mag')}}))
+    identity = read_lasagna_manifest(manifest).identity
+
+    built = pack_resident_pools.main([str(manifest), '--cache', str(tmp_path / 'cache')])
+    assert built == [str(tmp_path / 'cache' / 'lasagna' / identity / 'normals_g4'),
+                     str(tmp_path / 'cache' / 'lasagna' / identity / 'grad_mag_g4')]
+    assert json.loads((Path(built[0]) / 'meta.json').read_text())['lasagna_identity'] == identity

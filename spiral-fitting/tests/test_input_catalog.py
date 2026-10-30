@@ -3,7 +3,8 @@
 from config import Config
 from fit_session import (FIT_INPUT_CATALOG, RETIRED_PATH_OVERRIDE_KEYS,
                          SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
-                         fit_input, input_source_enabled, outer_shell_required,
+                         fit_input, input_source_enabled, lasagna_packs_required,
+                         outer_shell_required,
                          parse_scroll_spec, winding_inference_enabled)
 
 
@@ -52,29 +53,28 @@ def test_model_configuration_is_a_new_fit_change():
 
 
 def test_lasagna_store_predicates_reproduce_the_mode_contract():
-    # grad_mag requires the gradient store only with a positive spacing
+    # grad_mag requires the gradient pack only with a positive spacing
     # weight; normals are required only with a positive normals weight; an
     # invalid mode enables nothing.
     grad = {"dense_spacing_mode": "grad_mag",
             "loss_weight_dense_normals": 0.0}
-    assert fit_input("gradient_magnitude").required(grad) is True
-    assert fit_input("normal_x").required(grad) is False
-    assert fit_input("normal_x").required(
-        {**grad, "loss_weight_dense_normals": 100.0}) is True
-    assert fit_input("gradient_magnitude").required(
+    assert fit_input("lasagna").required(grad) is True
+    assert lasagna_packs_required(grad) == ["grad_mag"]
+    assert lasagna_packs_required(
+        {**grad, "loss_weight_dense_normals": 100.0}) == ["normals", "grad_mag"]
+    assert fit_input("lasagna").required(
         {**grad, "loss_weight_dense_spacing": 0.0}) is False
 
     winding_model = {"dense_spacing_mode": "winding_model",
                      "loss_weight_dense_normals": 0.0}
     assert fit_input("winding_inference").required(winding_model) is True
     assert fit_input("winding_inference").enabled(winding_model) is True
-    assert fit_input("normal_x").required(winding_model) is False
+    assert fit_input("lasagna").required(winding_model) is False
 
     invalid = {"dense_spacing_mode": "phase",
                "loss_weight_dense_normals": 0.0}
     assert not any(fit_input(key).required(invalid)
-                   for key in ("normal_x", "normal_y",
-                               "gradient_magnitude", "winding_inference"))
+                   for key in ("lasagna", "winding_inference"))
 
 
 def test_a_specification_naming_retired_patch_or_fiber_paths_still_parses(tmp_path):

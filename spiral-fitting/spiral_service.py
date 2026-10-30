@@ -83,11 +83,13 @@ from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
                          PROJECT_LASAGNA_INPUTS, VOLUME_INPUT_KEYS,
                          ScrollSpecError, SessionScroll, SessionState,
                          SpiralProject, default_user_cache_dir,
-                         input_source_enabled,
+                         fiber_directions_required, input_source_enabled,
+                         lasagna_enabled,
                          winding_inference_enabled,
                          scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request, write_project_umbilicus)
+from lasagna_source import load_lasagna_source, write_lasagna_source
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
@@ -1158,9 +1160,12 @@ class ServiceState:
         for key in (*(spec.key for spec in FIT_INPUT_CATALOG),
                     "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
-        # The Lasagna stores are the project's selected dataset's.
+        # The Lasagna dataset is the project's selected one, written as the
+        # source document the fit reads (its packs are this service's cache's).
         if project.lasagna is not None and not project.lasagna.error:
-            paths.update(project.lasagna.stores)
+            paths["lasagna"] = write_lasagna_source(
+                Path(paths["output_directory"]) / "project-inputs",
+                project.lasagna.source())
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
             allowed = set(resolution.get("detected_checkpoints", []))
@@ -1189,14 +1194,13 @@ class ServiceState:
         # and fitter all describe the same source set.
         selected_paths = {
             "tracks_dbm": "tracks_dbm",
-            "normal_x": "normals",
-            "normal_y": "normals",
-            "gradient_magnitude": "gradient_magnitude",
             "winding_inference": "winding_inference",
         }
         for path_key, source in selected_paths.items():
             if not input_source_enabled(config, source):
                 paths[path_key] = ""
+        if not lasagna_enabled(config):
+            paths["lasagna"] = ""
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
 
@@ -1267,7 +1271,8 @@ class ServiceState:
             if input_config is not None else run)
         # The project supplies the umbilicus once the fit volume is known.
         errors = validate_session_request(paths, validation_run,
-                                          supplied=VOLUME_INPUT_KEYS)
+                                          supplied=VOLUME_INPUT_KEYS,
+                                          build_lasagna_packs=False)
         # Lasagna stores the configuration needs and the project cannot give.
         if lasagna_error := project.lasagna_error():
             needed = [spec.key for spec in FIT_INPUT_CATALOG
@@ -1312,17 +1317,30 @@ class ServiceState:
     def _resolve_session_scroll(self, scroll, volume, paths, config):
         """Complete a build's SessionScroll for its fit volume: the scroll it
         fits (with ``config``'s spiral_outward_sense, and the Lasagna scale
-        when it reads the stores) and its umbilicus (the project's, written
-        under the output directory as the file the fit reads). The fit infers
+        when it reads the stores), its umbilicus (the project's, written
+        under the output directory as the file the fit reads) and, when its
+        losses need them, the fiber directions the cache holds for the
+        project's fiber-inference dataset at the volume's scale. The fit infers
         the same volume from the same inputs, and an input update that would
         read another is refused (InputReplacementRefused). Returns ``(paths,
         ScrollSpec)``; raises ScrollSpecError."""
         spec = scroll.resolve(volume, config.get("spiral_outward_sense"),
-                              lasagna=bool(paths.normal_x or paths.gradient_magnitude))
+                              lasagna=bool(paths.lasagna))
         umbilicus = write_project_umbilicus(
             Path(paths.output_directory) / "project-inputs", volume,
             scroll.umbilicus(volume))
-        return dataclasses.replace(paths, umbilicus=umbilicus), spec
+        # Loaded whenever enabled, as the CLI loads its dataset's, so a later
+        # run with the loss on finds them resident; required with the loss.
+        fiber_directions = ""
+        if fiber_directions_required(config):
+            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+        elif input_source_enabled(config, "fiber_directions"):
+            try:
+                fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+            except ScrollSpecError:
+                pass
+        return dataclasses.replace(paths, umbilicus=umbilicus,
+                                   fiber_directions=fiber_directions), spec
 
     def _bind_service_owned_config(self, request):
         """Refuse client values for SERVICE_OWNED_CONFIG_KEYS, then set them
@@ -1669,11 +1687,11 @@ class ServiceState:
             # resident inputs, and the refusal would come after the model was
             # released. The full rebuild reads the checkpoint's position.
             return "all"
-        # The project supplies the umbilicus once the build knows the fit
-        # volume; it and the scroll change with the project's facts of that
+        # The project supplies VOLUME_INPUT_KEYS once the build knows the fit
+        # volume; they and the scroll change with the project's facts of that
         # volume.
         live_paths = dict(current.get("paths") or {})
-        live_paths["umbilicus"] = ""
+        live_paths.update(dict.fromkeys(VOLUME_INPUT_KEYS, ""))
         if (paths.manifest() != live_paths
                 or preview.manifest() != current.get("preview")):
             return "all"
@@ -1870,8 +1888,8 @@ class ServiceState:
         from object_store_inputs import (fit_volume_at, prepare_position,
                                          request_from_config)
         lasagna = lasagna_normal_inputs(
-            paths.normal_x, paths.normal_y, scroll.normal_zarr_group,
-            int(scroll.lasagna_scale))
+            load_lasagna_source(paths.lasagna) if paths.lasagna else None,
+            config, int(scroll.lasagna_scale), paths.cache_directory)
         cache = (os.path.join(paths.cache_directory, "object_store_strips")
                  if paths.cache_directory else None)
 

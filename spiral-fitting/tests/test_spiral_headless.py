@@ -100,7 +100,6 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(spec.spiral_outward_sense, "CW")
             self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
-            self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
 
@@ -153,7 +152,7 @@ class ScrollSpecTests(unittest.TestCase):
 
 class ProjectScrollTests(unittest.TestCase):
     UMBILICUS = {"uuid": "u", "revision": "r", "points_zyx": [[0, 1, 2], [10, 1, 2]]}
-    LASAGNA = {"location": "/d/p.lasagna.json", "group": "4",
+    LASAGNA = {"location": "/d/p.lasagna.json", "identity": "run-1", "group": "4",
                "normal_x": "/d/nx.ome.zarr", "normal_y": "/d/ny.ome.zarr"}
 
     def scroll(self, lasagna=None, **facts):
@@ -165,15 +164,22 @@ class ProjectScrollTests(unittest.TestCase):
     def test_the_project_round_trips_and_rejects_malformed_blocks(self):
         project = SpiralProject.from_mapping({
             "name": "p", "lasagna": self.LASAGNA,
-            "volumes": {"v": {"voxel_size_um": 2.0, "lasagna_scale": 4,
+            "fiber_inference": {"location": "/d/f.lasagna.json", "identity": "run-2"},
+            "volumes": {"v": {"voxel_size_um": 2.0, "lasagna_scale": 4, "fiber_scale": 4,
                               "umbilicus": self.UMBILICUS}}})
+        self.assertEqual(project.volumes["v"].fiber_scale, 4.0)
         self.assertEqual(SpiralProject.from_mapping(project.to_mapping()), project)
         for block, message in (
                 ({"volumes": {}}, "project.name"),
                 ({"name": "p", "volumes": []}, "keyed by volume"),
                 ({"name": "p", "volumes": {"v": {"voxel_size_um": -1}}}, "positive"),
                 ({"name": "p", "volumes": {"v": {"lasagna_scale": 0.5}}}, "positive integer"),
+                ({"name": "p", "volumes": {"v": {"fiber_scale": 0}}}, "fiber_scale"),
+                ({"name": "p", "volumes": {}, "fiber_inference": {"location": "x"}},
+                 "fiber_inference"),
                 ({"name": "p", "volumes": {}, "lasagna": {"location": "x"}}, "stores"),
+                ({"name": "p", "volumes": {}, "lasagna": {**self.LASAGNA, "identity": "../x"}},
+                 "identity"),
                 ({"name": "p", "volumes": {"v": {"umbilicus": {
                     **self.UMBILICUS, "points_zyx": [[0, 1, 2]]}}}}, "two or more")):
             with self.subTest(message=message):
@@ -200,16 +206,16 @@ class ProjectScrollTests(unittest.TestCase):
         with self.assertRaisesRegex(ScrollSpecError, "not a volume of the project"):
             bare.resolve("w", "CW")
 
-    def test_a_fit_reading_lasagna_takes_the_projects_group_and_the_volumes_scale(self):
+    def test_a_fit_reading_lasagna_takes_the_volumes_scale(self):
         scroll = self.scroll(self.LASAGNA, voxel_size_um=3.0, lasagna_scale=8).resolve(
             "v", "CW", lasagna=True)
-        self.assertEqual((scroll.normal_zarr_group, scroll.lasagna_scale), ("4", 8))
+        self.assertEqual(scroll.lasagna_scale, 8)
         with self.assertRaisesRegex(ScrollSpecError, "no scale relative to the fit volume"):
             self.scroll(self.LASAGNA, voxel_size_um=3.0).resolve("v", "CW", lasagna=True)
         with self.assertRaisesRegex(ScrollSpecError, "selects no Lasagna dataset"):
             self.scroll(voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
-        with self.assertRaisesRegex(ScrollSpecError, "remote"):
-            self.scroll({"location": "s3://b/p.lasagna.json", "error": "remote"},
+        with self.assertRaisesRegex(ScrollSpecError, "multichannel"):
+            self.scroll({"location": "s3://b/p.lasagna.json", "error": "multichannel"},
                         voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
 
     def test_the_cli_takes_the_sense_setting_where_its_spec_does_not_decide(self):

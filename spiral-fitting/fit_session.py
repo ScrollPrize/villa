@@ -19,6 +19,9 @@ from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
 from config import Config
+from lasagna_source import (LASAGNA_CHANNELS, LasagnaSource, LasagnaSourceError,
+                            check_identity, fiber_directions_path,
+                            find_dataset_manifest, load_lasagna_source)
 from surface_orientation import spiral_outward_sense_for
 
 
@@ -180,7 +183,19 @@ from surface_orientation import spiral_outward_sense_for
 # read with the selection (never a patch). /dataset no longer resolves an
 # outer_shell path; the input manifest carries "outer_shell" (its provenance,
 # or null) and input_summary its UUID.
-API_VERSION = 42
+# 43: Lasagna datasets by identity. The project block's "lasagna" carries the
+# dataset's "identity" (its provenance run_uuid, else sha256-<the manifest's
+# SHA-256>) and may be remote; the fit reads the resident pools of that
+# identity from the service's cache (<cache>/lasagna/<identity>/) and never
+# builds them, refusing a build whose packs are missing. paths carries one
+# "lasagna" (the dataset's source document) instead of normal_x, normal_y and
+# gradient_magnitude. It also carries "fiber_inference" ({location, identity}
+# of the selected fiber-inference dataset, or {location, error}) and each
+# volume its "fiber_scale" (base voxels of that dataset per volume voxel); a
+# fit with the fiber-direction loss reads the samples extracted for that
+# identity and scale from the cache (<cache>/fiber-directions/), not the
+# dataset's fiber_directions.npz.
+API_VERSION = 43
 
 
 class SessionState(str, Enum):
@@ -291,7 +306,7 @@ def _normals_required(config: Mapping[str, Any]) -> bool:
             and float(config.get("loss_weight_dense_normals", 100.0)) > 0)
 
 
-def _fiber_directions_enabled(config: Mapping[str, Any]) -> bool:
+def fiber_directions_required(config: Mapping[str, Any]) -> bool:
     return (input_source_enabled(config, "fiber_directions")
             and float(config.get("loss_weight_fiber_directions", 0.0)) > 0)
 
@@ -300,6 +315,23 @@ def _grad_mag_required(config: Mapping[str, Any]) -> bool:
     return (input_source_enabled(config, "gradient_magnitude")
             and _dense_spacing_mode(config) == "grad_mag"
             and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
+
+
+def lasagna_enabled(config: Mapping[str, Any]) -> bool:
+    return (input_source_enabled(config, "normals")
+            or input_source_enabled(config, "gradient_magnitude"))
+
+
+def _lasagna_required(config: Mapping[str, Any]) -> bool:
+    return _normals_required(config) or _grad_mag_required(config)
+
+
+def lasagna_packs_required(config: Mapping[str, Any]) -> list[str]:
+    """The Lasagna packs (lasagna_source.PACK_INPUTS) a fit of ``config``
+    loads."""
+    return [kind for kind, required in (("normals", _normals_required(config)),
+                                        ("grad_mag", _grad_mag_required(config)))
+            if required]
 
 
 def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
@@ -330,7 +362,7 @@ class FitInputSpec:
 
     # SpiralInputPaths field name (and manifest/path-change key).
     key: str
-    # "file" | "directory" | "zarr-group" | "dbm".
+    # "file" | "directory" | "dbm" | "lasagna".
     kind: str
     # File contents must parse as JSON.
     json_content: bool = False
@@ -357,24 +389,15 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  resolve_required=True, required=_always),
     FitInputSpec("fiber_directions", "file",
                  conventional_relative="fiber_directions.npz",
-                 enabled=_fiber_directions_enabled,
-                 required=_fiber_directions_enabled),
+                 enabled=fiber_directions_required,
+                 required=fiber_directions_required),
     FitInputSpec("tracks_dbm", "dbm",
                  conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm",
                  enabled=_tracks_enabled),
-    FitInputSpec("normal_x", "zarr-group",
-                 conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
-                 enabled=lambda config: input_source_enabled(config, "normals"),
-                 required=_normals_required),
-    FitInputSpec("normal_y", "zarr-group",
-                 conventional_relative="lasagna_inputs/las_008_ny.ome.zarr",
-                 enabled=lambda config: input_source_enabled(config, "normals"),
-                 required=_normals_required),
-    FitInputSpec("gradient_magnitude", "zarr-group",
-                 conventional_relative="lasagna_inputs/las_008_grad_mag.ome.zarr",
-                 enabled=lambda config: input_source_enabled(
-                     config, "gradient_magnitude"),
-                 required=_grad_mag_required),
+    # The Lasagna dataset (lasagna_source): a *.lasagna.json manifest, by
+    # convention the one in lasagna_inputs/ (LASAGNA_MANIFEST_DIRECTORY).
+    FitInputSpec("lasagna", "lasagna",
+                 enabled=lasagna_enabled, required=_lasagna_required),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
@@ -396,9 +419,7 @@ class SpiralInputPaths:
     umbilicus: str = ""
     fiber_directions: str = ""
     tracks_dbm: str = ""
-    normal_x: str = ""
-    normal_y: str = ""
-    gradient_magnitude: str = ""
+    lasagna: str = ""
     winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
@@ -416,14 +437,18 @@ class SpiralInputPaths:
         return asdict(self)
 
 
-def lasagna_normal_inputs(normal_x, normal_y, group, scale):
+def lasagna_normal_inputs(source: LasagnaSource | None, config: Mapping[str, Any], scale,
+                          cache_directory: str | os.PathLike[str] | None):
     """A fit's lasagna normals as object_store_inputs.fiber_normal_source
-    takes them, or None when it loads none: the normal stores, their group
-    and its downsampling relative to the fit volume."""
-    if not (normal_x and normal_y):
+    takes them, or None when it has none (no dataset, input_use_normals off,
+    or no normals pack of the dataset in the cache): the pack and its
+    array's downsampling relative to the fit volume."""
+    if source is None or not cache_directory or not input_source_enabled(config, "normals"):
         return None
-    return {'normal_x': normal_x, 'normal_y': normal_y,
-            'group': group, 'scale': scale}
+    pack = source.pack_directory(cache_directory, "normals")
+    if not os.path.isfile(os.path.join(pack, "meta.json")):
+        return None
+    return {'pool': pack, 'scale': scale}
 
 
 # Run-block keys the scroll specification owns, mapped to the ScrollSpec field
@@ -433,7 +458,7 @@ def lasagna_normal_inputs(normal_x, normal_y, group, scale):
 SCROLL_SPEC_OWNED_RUN_KEYS = {
     "scroll_name": "name",
     "voxel_size_um": "voxel_size_um",
-    "lasagna_group": "normal_zarr_group",
+    "lasagna_group": "lasagna.group",
     "lasagna_scale": "lasagna_scale",
 }
 
@@ -522,6 +547,9 @@ SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(spec.key for spec in FIT_INPUT_CATALOG)
 # file-input service may still name them; they are ignored.
 RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers", "outer_shell")
 
+# The directory whose one *.lasagna.json is a dataset's Lasagna dataset.
+LASAGNA_MANIFEST_DIRECTORY = "lasagna_inputs"
+
 # Conventional dataset layout for the headless CLI, mirroring the historical
 # fit_spiral module-global defaults. resolve_dataset_root() shares the same
 # relative paths for the entries it discovers.
@@ -559,7 +587,8 @@ class ScrollSpec:
     # independent of physical voxel size and may be absent in legacy specs.
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
-    normal_zarr_group: str = "4"
+    # The Lasagna arrays' downsampling relative to the fit volume; the arrays
+    # themselves are the Lasagna dataset's (lasagna_source).
     lasagna_scale: int = 4
     # The scroll's winding count, when someone has estimated it. A default for
     # the fit, not a fact the scroll owns: see scroll_spec_config_defaults.
@@ -646,7 +675,9 @@ def _scroll_spec_fields(document: Any, dataset_root: str | os.PathLike[str],
             raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
 
     if "normal_zarr_group" in document:
-        fields["normal_zarr_group"] = str(document["normal_zarr_group"])
+        raise ScrollSpecError(
+            f"{source}: normal_zarr_group is retired: the Lasagna manifest "
+            "(paths.lasagna) names the arrays")
     if "lasagna_scale" in document:
         lasagna_scale = document["lasagna_scale"]
         if type(lasagna_scale) is not int or lasagna_scale <= 0:
@@ -726,7 +757,6 @@ def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str, *,
         left_handed_coordinates=catalog["left_handed_coordinates"],
         base_shape_zyx=fields.get("base_shape_zyx"),
         umbilicus_coordinate_scale=fields.get("umbilicus_coordinate_scale", 1.0),
-        normal_zarr_group=fields.get("normal_zarr_group", "4"),
         lasagna_scale=fields.get("lasagna_scale", 4),
         num_windings=fields.get("num_windings"),
         path_overrides=fields.get("path_overrides", ()),
@@ -804,12 +834,12 @@ def load_dataset_scroll_fields(dataset_root: str | os.PathLike[str]) -> tuple[di
 # full-resolution shape, say).
 PROJECT_VOLUME_FACTS = ("voxel_size_um", "base_shape_zyx",
                         "z_direction_is_top_to_bottom", "left_handed_coordinates")
-# The project's Lasagna stores, by fit input.
-PROJECT_LASAGNA_INPUTS = ("normal_x", "normal_y", "gradient_magnitude")
+# The project's Lasagna dataset, by fit input.
+PROJECT_LASAGNA_INPUTS = ("lasagna",)
 # Fit inputs a service session reads from the project instead of the dataset:
-# the Lasagna stores, and the fit volume's umbilicus once the build knows the
-# volume (VOLUME_INPUT_KEYS).
-VOLUME_INPUT_KEYS = ("umbilicus",)
+# the Lasagna dataset, and once the build knows the fit volume its umbilicus
+# and the fiber directions extracted at its scale (VOLUME_INPUT_KEYS).
+VOLUME_INPUT_KEYS = ("umbilicus", "fiber_directions")
 PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
 
 
@@ -834,20 +864,50 @@ class ProjectUmbilicus:
 @dataclass(frozen=True)
 class ProjectLasagna:
     """The project's selected Lasagna dataset as the fit reads it: its
-    manifest, the OME-Zarr stores of its nx, ny and grad_mag channels and the
-    array (pyramid group) of each that the dataset declares; ``error`` says
-    why the fit cannot read it (a remote or multichannel dataset)."""
+    identity (lasagna_source), its manifest's location, the OME-Zarr stores
+    of its nx, ny and grad_mag channels and the array (pyramid group) of each
+    that the dataset declares; ``error`` says why the fit cannot read it (a
+    multichannel dataset, say). The fit reads the identity's packs; the
+    stores are where VC3D found the dataset."""
 
     location: str = ""
-    stores: Mapping[str, str] = field(default_factory=dict)  # PROJECT_LASAGNA_INPUTS
+    identity: str = ""
+    stores: Mapping[str, str] = field(default_factory=dict)  # LASAGNA_CHANNELS
     group: str = ""
     error: str = ""
 
     def manifest(self) -> dict[str, Any]:
-        result = {"location": self.location, "group": self.group,
-                  **dict(sorted(self.stores.items()))}
+        result = {"location": self.location}
         if self.error:
             result["error"] = self.error
+        else:
+            result.update(identity=self.identity, group=self.group,
+                          **dict(sorted(self.stores.items())))
+        return result
+
+    to_mapping = manifest
+
+    def source(self) -> LasagnaSource:
+        return LasagnaSource(identity=self.identity, location=self.location,
+                             group=self.group, stores=dict(self.stores))
+
+
+@dataclass(frozen=True)
+class ProjectFiberInference:
+    """The project's selected fiber-inference dataset: its identity
+    (lasagna_source), keying the fiber-direction samples extracted from it;
+    ``error`` says why VC3D could not read it."""
+
+    location: str = ""
+    identity: str = ""
+    error: str = ""
+
+    def manifest(self) -> dict[str, Any]:
+        result = {"location": self.location}
+        if self.error:
+            result["error"] = self.error
+        else:
+            result["identity"] = self.identity
         return result
 
     to_mapping = manifest
@@ -857,17 +917,20 @@ class ProjectLasagna:
 class ProjectVolume:
     """What the project knows of one volume; None where it does not know it
     exactly. ``lasagna_scale`` is the project's Lasagna arrays' downsampling
-    relative to this volume's voxels."""
+    relative to this volume's voxels; ``fiber_scale`` the base voxels of the
+    project's fiber-inference dataset per voxel of this volume."""
 
     voxel_size_um: float | None = None
     base_shape_zyx: tuple[int, int, int] | None = None
     z_direction_is_top_to_bottom: bool | None = None
     left_handed_coordinates: bool | None = None
     lasagna_scale: int | None = None
+    fiber_scale: float | None = None
     umbilicus: ProjectUmbilicus | None = None
 
     def _facts(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in (*PROJECT_VOLUME_FACTS, "lasagna_scale")
+        return {key: getattr(self, key)
+                for key in (*PROJECT_VOLUME_FACTS, "lasagna_scale", "fiber_scale")
                 if getattr(self, key) is not None}
 
     def manifest(self) -> dict[str, Any]:
@@ -894,6 +957,7 @@ class SpiralProject:
     name: str
     volumes: Mapping[str, ProjectVolume]
     lasagna: ProjectLasagna | None = None
+    fiber_inference: ProjectFiberInference | None = None
 
     @classmethod
     def from_mapping(cls, value: Any) -> "SpiralProject":
@@ -923,12 +987,19 @@ class SpiralProject:
                 if type(scale) is not int or scale <= 0:
                     raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
                 facts["lasagna_scale"] = scale
+            if entry.get("fiber_scale") is not None:
+                scale = entry["fiber_scale"]
+                if (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                        or not (math.isfinite(scale) and scale > 0)):
+                    raise ScrollSpecError(f"{source}: fiber_scale must be a positive number")
+                facts["fiber_scale"] = float(scale)
             umbilicus = entry.get("umbilicus")
             if umbilicus is not None:
                 facts["umbilicus"] = _checked_umbilicus(umbilicus, source)
             volumes[str(uuid)] = ProjectVolume(**facts)
         return cls(name=name, volumes=volumes,
-                   lasagna=_checked_lasagna(value.get("lasagna")))
+                   lasagna=_checked_lasagna(value.get("lasagna")),
+                   fiber_inference=_checked_fiber_inference(value.get("fiber_inference")))
 
     def to_mapping(self) -> dict[str, Any]:
         """The request block ``from_mapping`` reads."""
@@ -937,6 +1008,8 @@ class SpiralProject:
                               for uuid, volume in sorted(self.volumes.items())}}
         if self.lasagna is not None:
             result["lasagna"] = self.lasagna.to_mapping()
+        if self.fiber_inference is not None:
+            result["fiber_inference"] = self.fiber_inference.to_mapping()
         return result
 
     def record(self, volume_uuid: str) -> dict[str, Any]:
@@ -945,6 +1018,8 @@ class SpiralProject:
                   **self.volumes[volume_uuid].manifest()}
         if self.lasagna is not None:
             result["lasagna"] = self.lasagna.manifest()
+        if self.fiber_inference is not None:
+            result["fiber_inference"] = self.fiber_inference.manifest()
         return result
 
     def lasagna_error(self) -> str:
@@ -964,12 +1039,32 @@ def _checked_lasagna(value: Any) -> ProjectLasagna | None:
     if value.get("error"):
         return ProjectLasagna(location=str(value.get("location") or ""),
                               error=str(value["error"]))
-    stores = {key: str(value[key]) for key in PROJECT_LASAGNA_INPUTS if value.get(key)}
+    stores = {key: str(value[key]) for key in LASAGNA_CHANNELS if value.get(key)}
     group = str(value.get("group") or "")
     if not stores or not group:
         raise ScrollSpecError(f"{source} needs its stores and their array group")
-    return ProjectLasagna(location=str(value.get("location") or ""), stores=stores,
-                          group=group)
+    try:
+        identity = check_identity(value.get("identity"))
+    except LasagnaSourceError as exc:
+        raise ScrollSpecError(f"{source}: {exc}") from None
+    return ProjectLasagna(location=str(value.get("location") or ""), identity=identity,
+                          stores=stores, group=group)
+
+
+def _checked_fiber_inference(value: Any) -> ProjectFiberInference | None:
+    if value is None:
+        return None
+    source = "project fiber_inference"
+    if not isinstance(value, Mapping):
+        raise ScrollSpecError(f"{source} must be an object")
+    location = str(value.get("location") or "")
+    if value.get("error"):
+        return ProjectFiberInference(location=location, error=str(value["error"]))
+    try:
+        identity = check_identity(value.get("identity"))
+    except LasagnaSourceError as exc:
+        raise ScrollSpecError(f"{source}: {exc}") from None
+    return ProjectFiberInference(location=location, identity=identity)
 
 
 def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
@@ -1014,10 +1109,9 @@ class SessionScroll:
         """The scroll of a fit of ``volume_uuid``: the project volume's facts
         and the project's name, with the configured ``outward_sense`` (the fit
         setting spiral_outward_sense) where the volume's orientation does not
-        decide it. With ``lasagna`` (the fit reads the Lasagna stores) the
-        project's Lasagna dataset gives the array group and the volume its
-        scale. The umbilicus is the project's, in the fit volume's own
-        voxels."""
+        decide it. With ``lasagna`` (the fit reads the Lasagna dataset) the
+        volume gives the dataset's scale. The umbilicus is the project's, in
+        the fit volume's own voxels."""
         volume = self.volume(volume_uuid)
         fields = {key: getattr(volume, key) for key in PROJECT_VOLUME_FACTS
                   if getattr(volume, key) is not None}
@@ -1031,11 +1125,38 @@ class SessionScroll:
                     f"the project's Lasagna dataset {self.project.lasagna.location} "
                     f"has no scale relative to the fit volume {volume_uuid} (neither "
                     "it nor the volume declares its full-resolution shape)")
-            fields["normal_zarr_group"] = self.project.lasagna.group
             fields["lasagna_scale"] = volume.lasagna_scale
         return _scroll_spec_from_fields(
             fields, f"project {self.project.name!r} (volume {volume_uuid})",
             outward_sense=outward_sense)
+
+    def fiber_directions(self, volume_uuid: str,
+                         cache_directory: str | os.PathLike[str]) -> str:
+        """The fiber-direction samples a fit of ``volume_uuid`` reads: those
+        extracted from the project's fiber-inference dataset at the volume's
+        scale, in the cache (fiber_direction_samples.py --cache)."""
+        dataset = self.project.fiber_inference
+        if dataset is None:
+            raise ScrollSpecError(
+                f"the project {self.project.name!r} selects no fiber-inference "
+                "dataset: attach one and select it")
+        if dataset.error:
+            raise ScrollSpecError(dataset.error)
+        scale = self.volume(volume_uuid).fiber_scale
+        if scale is None:
+            raise ScrollSpecError(
+                f"the fiber-inference dataset {dataset.location} has no scale relative "
+                f"to the fit volume {volume_uuid} (neither it nor the volume declares "
+                "its full-resolution shape)")
+        path = fiber_directions_path(cache_directory, dataset.identity, scale)
+        if not os.path.isfile(path):
+            raise ScrollSpecError(
+                f"no fiber directions of {dataset.location} (dataset {dataset.identity}) "
+                f"at scale {scale:g} in the cache: extract them with "
+                f"fiber_direction_samples.py {dataset.location} --cache <cache> "
+                f"--output-scale {scale:g} (or --adopt an existing artifact) and "
+                f"copy them to {path}")
+        return path
 
     def umbilicus(self, volume_uuid: str) -> ProjectUmbilicus:
         umbilicus = self.volume(volume_uuid).umbilicus
@@ -1125,9 +1246,8 @@ def conventional_input_paths(
         umbilicus=resolve("umbilicus"),
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
-        normal_x=resolve("normal_x"),
-        normal_y=resolve("normal_y"),
-        gradient_magnitude=resolve("gradient_magnitude"),
+        lasagna=(spec.path_override("lasagna")
+                 or find_dataset_manifest(f"{root}/{LASAGNA_MANIFEST_DIRECTORY}")),
         winding_inference=resolve("winding_inference"),
         checkpoint=_normalise_path(checkpoint) if checkpoint else "",
         output_directory=_normalise_path(output_directory) if output_directory else "",
@@ -1510,11 +1630,14 @@ def validate_session_request(
     run: SpiralRunConfig,
     *,
     supplied: Iterable[str] = (),
+    build_lasagna_packs: bool = True,
 ) -> list[dict[str, str]]:
     """Perform cheap, aggregate validation before any GPU allocation.
 
     ``supplied`` names inputs another source provides once the fit volume is
     known (a service session's PROJECT_INPUT_KEYS); they are not checked here.
+    Without ``build_lasagna_packs`` (a service) the Lasagna packs the fit
+    loads must already be in the cache directory.
     """
     supplied = frozenset(supplied)
     errors: list[dict[str, str]] = []
@@ -1538,15 +1661,43 @@ def validate_session_request(
         elif not os.access(path, os.R_OK):
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
+    def check_lasagna(value: str, field_name: str, required: bool) -> None:
+        if not value:
+            if required:
+                errors.append({"field": field_name, "message":
+                               f"No Lasagna dataset: put its *.lasagna.json in "
+                               f"{LASAGNA_MANIFEST_DIRECTORY}/ or set paths.lasagna"})
+            return
+        try:
+            source = load_lasagna_source(value)
+            packs = lasagna_packs_required(run.config)
+            for kind in packs:
+                source.arrays(kind)
+        except LasagnaSourceError as exc:
+            errors.append({"field": field_name, "message": str(exc)})
+            return
+        if build_lasagna_packs or not paths.cache_directory:
+            return
+        for kind in packs:
+            pack = source.pack_directory(paths.cache_directory, kind)
+            if not Path(pack, "meta.json").is_file():
+                errors.append({"field": field_name, "message":
+                               f"The {kind} pack of Lasagna dataset {source.identity} "
+                               f"({source.location}) is not in the cache: build it with "
+                               f"pack_resident_pools.py and copy it to {pack}"})
+
     def check_catalog_input(spec: FitInputSpec) -> None:
         if not spec.enabled(run.config) or spec.key in supplied:
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,
                          json_file=spec.json_content)
-        elif spec.kind in ("directory", "zarr-group"):
+        elif spec.kind == "directory":
             optional_dir(getattr(paths, spec.key), spec.key,
                          required=spec.required(run.config))
+        elif spec.kind == "lasagna":
+            check_lasagna(getattr(paths, spec.key), spec.key,
+                          required=spec.required(run.config))
         elif spec.kind == "dbm":
             value = getattr(paths, spec.key)
             if value and not resolve_logical_dbm(value):
@@ -1556,7 +1707,7 @@ def validate_session_request(
     # checked after the dense-spacing mode below, so an invalid mode errors
     # as itself rather than as missing-file errors.
     for spec in FIT_INPUT_CATALOG:
-        if spec.kind != "zarr-group":
+        if spec.kind != "lasagna":
             check_catalog_input(spec)
 
     if _dense_spacing_mode(run.config) is None:
@@ -1564,7 +1715,7 @@ def validate_session_request(
                        "message": "Must be grad_mag or winding_model"})
 
     for spec in FIT_INPUT_CATALOG:
-        if spec.kind == "zarr-group":
+        if spec.kind == "lasagna":
             check_catalog_input(spec)
 
     if _winding_model_enabled(run.config) and paths.winding_inference:
@@ -1603,10 +1754,7 @@ def validate_session_request(
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
 
-    lasagna_inputs_enabled = any(
-        spec.required(run.config) for spec in FIT_INPUT_CATALOG
-        if spec.kind == "zarr-group")
-    if lasagna_inputs_enabled and not paths.cache_directory:
+    if _lasagna_required(run.config) and not paths.cache_directory:
         errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():

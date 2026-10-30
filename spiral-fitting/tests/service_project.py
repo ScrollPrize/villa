@@ -15,7 +15,8 @@ FACTS = {"voxel_size_um": 9.6, "z_direction_is_top_to_bottom": False,
          "left_handed_coordinates": False}
 
 
-def project(volume=VOLUME, *, name="s1", umbilicus=UMBILICUS, lasagna=None, **facts):
+def project(volume=VOLUME, *, name="s1", umbilicus=UMBILICUS, lasagna=None,
+            fiber_inference=None, **facts):
     entry = {**FACTS, **facts}
     entry = {key: value for key, value in entry.items() if value is not None}
     if umbilicus is not None:
@@ -23,6 +24,8 @@ def project(volume=VOLUME, *, name="s1", umbilicus=UMBILICUS, lasagna=None, **fa
     block = {"name": name, "volumes": {volume: entry}}
     if lasagna is not None:
         block["lasagna"] = lasagna
+    if fiber_inference is not None:
+        block["fiber_inference"] = fiber_inference
     return block
 
 

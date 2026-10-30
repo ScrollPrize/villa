@@ -600,16 +600,36 @@ def test_the_scroll_is_the_projects_and_the_sense_a_fit_setting(dataset, store):
     assert 'contradicts the catalog' in failure['message']
 
 
-def test_the_lasagna_stores_are_the_projects(dataset, store, tmp_path):
-    lasagna = {'location': str(tmp_path / 'p.lasagna.json'), 'group': '3'}
+def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
+    from lasagna_source import load_lasagna_source
+    lasagna = {'location': 'https://data.example/p.lasagna.json', 'identity': 'run-1',
+               'group': '3'}
     for key in ('normal_x', 'normal_y', 'gradient_magnitude'):
-        (tmp_path / key).mkdir()
-        lasagna[key] = str(tmp_path / key)
+        lasagna[key] = f'https://data.example/{key}.ome.zarr'
     body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
     paths, scroll = _built(service(dataset, store), body)
-    assert (paths.normal_x, paths.gradient_magnitude) == (
-        lasagna['normal_x'], lasagna['gradient_magnitude'])
-    assert (scroll.normal_zarr_group, scroll.lasagna_scale) == ('3', 2)
+    # The fit reads the project's dataset by identity; its stores need not
+    # be readable here.
+    source = load_lasagna_source(paths.lasagna)
+    assert (source.identity, source.group, source.location) == (
+        'run-1', '3', lasagna['location'])
+    assert source.stores['normal_x'] == lasagna['normal_x']
+    assert scroll.lasagna_scale == 2
+
+    # A fit that needs normals reads their pack from the service's cache,
+    # which never builds one: without it the build is refused up front.
+    needs_normals = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
+    needs_normals['run']['config']['loss_weight_dense_normals'] = 1.0
+    with pytest.raises(ApiError) as refused:
+        service(dataset, store).initialize(needs_normals)
+    [detail] = refused.value.details
+    assert detail['field'] == 'lasagna' and 'not in the cache' in detail['message']
+    pack = Path(source.pack_directory(paths.cache_directory, 'normals'))
+    pack.mkdir(parents=True)
+    (pack / 'meta.json').write_text('{}')
+    paths, _ = _built(service(dataset, store), needs_normals)
+    assert load_lasagna_source(paths.lasagna) == source
+
     # A fit that needs normals the project cannot give is refused before
     # anything is linked.
     body = initialize_body()
@@ -617,7 +637,31 @@ def test_the_lasagna_stores_are_the_projects(dataset, store, tmp_path):
     with pytest.raises(ApiError) as refused:
         service(dataset, store).initialize(body)
     assert {(detail['field'], 'selects no Lasagna dataset' in detail['message'])
-            for detail in refused.value.details} == {('normal_x', True), ('normal_y', True)}
+            for detail in refused.value.details} == {('lasagna', True)}
+
+
+def test_fiber_directions_are_the_project_datasets_cached_samples(dataset, store):
+    from lasagna_source import fiber_directions_path
+    fibers = {'location': 'https://data.example/f.lasagna.json', 'identity': 'run-7'}
+    body = initialize_body() | {'project': project(fiber_inference=fibers, fiber_scale=4)}
+    body['run']['config'].update(input_use_fiber_directions=True,
+                                 loss_weight_fiber_directions=1.0)
+    # The loss needs them: without the cache's samples the build is refused.
+    failure = _built(service(dataset, store), body)
+    assert 'no fiber directions of https://data.example/f.lasagna.json' in failure['message']
+    # Enabled without the loss, they are read when the project can give them.
+    optional = initialize_body() | {'project': project()}
+    optional['run']['config'].update(input_use_fiber_directions=True)
+    paths, _ = _built(service(dataset, store), optional)
+    assert paths.fiber_directions == ''
+
+    cached = Path(fiber_directions_path(paths.cache_directory, 'run-7', 4))
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b'')
+    paths, _ = _built(service(dataset, store), body)
+    assert paths.fiber_directions == str(cached)
+    optional['project'] = project(fiber_inference=fibers, fiber_scale=4)
+    assert _built(service(dataset, store), optional)[0].fiber_directions == str(cached)
 
 
 def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(dataset, store):

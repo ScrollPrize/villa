@@ -879,7 +879,7 @@ class InteractiveFitSession:
             self._transition(SessionState.Loading, "Loading fit inputs and model")
             # The scroll specification is used exactly as the dataset root
             # states it: its physical facts (name, resolution, outward sense)
-            # and its Lasagna store layout. A session request may not restate
+            # and its Lasagna scale. A session request may not restate
             # any of them, so there is nothing left here to override.
             scroll = self.scroll
             # The runtime is the execution owner of the context: it constructs
@@ -900,7 +900,9 @@ class InteractiveFitSession:
                 storage_backend=self.run_config.storage_backend,
                 render_volume_scale=self.run_config.render_volume_scale,
                 dist_context=dist_context,
-                input_log=self._input_line)
+                input_log=self._input_line,
+                # A service fits from the packs its cache holds.
+                build_lasagna_packs=False)
             context.check_cuda_ready()
             context.load_host_inputs()
             context.prepare_output()

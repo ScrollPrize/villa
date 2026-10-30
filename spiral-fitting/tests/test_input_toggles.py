@@ -34,18 +34,14 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     paths = SpiralInputPaths(
         umbilicus="/inputs/umbilicus.json",
         tracks_dbm="/inputs/tracks.dbm",
-        normal_x="/inputs/nx.zarr",
-        normal_y="/inputs/ny.zarr",
-        gradient_magnitude="/inputs/grad.zarr",
+        lasagna="/inputs/s.lasagna.json",
         winding_inference="/inputs/winding",
     )
 
     context = make_context(config, paths)
 
     assert context.tracks_dbm_path is None
-    assert context.normal_nx_zarr_path is None
-    assert context.normal_ny_zarr_path is None
-    assert context.grad_mag_zarr_path is None
+    assert context.lasagna_source is None
     assert context.winding_inference_path is None
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234

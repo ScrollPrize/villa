@@ -1339,7 +1339,8 @@ Follow-up the same day (API 41):
   reports when the fit needs them. The service resolves the scroll from the
   fit volume the selection names before linking (the link refresh reads
   normals at its scale) and refuses a build whose linked inputs then name
-  another. Packed sidecars are still built next to the arrays.
+  another. Packed sidecars are still built next to the arrays (until API 43,
+  below).
 - Outward sense: the fit setting `spiral_outward_sense` (unset, CW, ACW), a
   new-fit key, set in the Spiral panel; the volume's catalog orientation
   decides the sense where known and refuses a disagreeing setting. The CLI
@@ -1365,6 +1366,36 @@ specification's `outer_shell` path override is ignored as retired). An input
 update changing it is refused. The service's shell-filtered-tracks rebuild
 rule reads the session's `input_summary.outer_shell`; VC3D shows the shell
 from the fit's manifest instead of loading the service's dataset path.
+
+Lasagna datasets by identity (API 43). A dataset's identity is its provenance
+record's `run_uuid` (the manifest's `"provenance"` file, as published
+datasets carry; existing files are never rewritten), else `sha256-` and the
+SHA-256 of the manifest's bytes; VC3D (`SpiralProjectInputs::lasagnaIdentity`)
+and `lasagna_source.manifest_identity` compute the same from the same bytes.
+The resident pools move out of the dataset into the fit's cache,
+`<cache>/lasagna/<identity>/{normals,grad_mag}_g<array>/`, so one dataset
+reached by different paths or hosts shares its packs and a host fits from the
+packs alone. The command-line fit names its dataset with a manifest
+(`lasagna_inputs/*.lasagna.json` or `paths.lasagna`; the three store paths
+and `normal_zarr_group` are retired) and builds missing pools; a service
+writes the project's dataset as `project-inputs/lasagna-<identity>.json`,
+never builds pools, and refuses a build whose pools its cache lacks. VC3D now
+sends remote datasets (their stores as remote locations). Fiber directions
+follow: the project block carries the selected fiber-inference dataset
+(`fiber_inference`: location and identity) and each volume its `fiber_scale`
+(that dataset's base voxels per volume voxel); a service reads
+`<cache>/fiber-directions/<identity>/scale<s>.npz` for the fit volume
+(`SessionScroll.fiber_directions`, a VOLUME_INPUT_KEY), never the dataset's
+`fiber_directions.npz`. `fiber_direction_samples.py --cache` extracts there
+over the whole height and records the identity; `--adopt` places an existing
+artifact; a fit refuses a window outside an artifact's `z_roi`. The startup
+link refresh reads the normals pack as well (`normal_pool`,
+`vc::PooledLasagnaSheetNormalSampler`: the raw sampler's nearest-voxel
+decoding over the pack's bricks), its fiber strip cache keyed by the pack's
+dataset identity and CT mask; a CT-masked pack reads no data outside the
+scroll where the arrays had values. So a host needs only packs: the command-
+line fit builds the normals pack before refreshing, and a service without
+one refreshes centerline-only with a warning.
 
 ## Implementation and validation workflow
 

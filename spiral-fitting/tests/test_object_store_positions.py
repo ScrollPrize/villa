@@ -356,7 +356,7 @@ def test_changed_link_parameters_or_normals_mark_links_stale(hub):
                          config['pcl_link_distance_tolerance'] * 2)
     [reason] = osi.stale_link_reasons(inputs.manifest, changed, none)
     assert reason.startswith('pcl_link_distance_tolerance changed')
-    lasagna = {'normal_x': '/x', 'normal_y': '/y', 'group': '4', 'scale': 4}
+    lasagna = {'pool': '/cache/lasagna/run-1/normals_g4', 'scale': 4}
     assert osi.stale_link_reasons(inputs.manifest, config, osi.fiber_normal_source(
         config, lasagna)) == ['the fiber-patch normal source changed']
 

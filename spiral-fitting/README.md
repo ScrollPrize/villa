@@ -137,17 +137,17 @@ direction of its cross-product normal, which renders correct with
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
 
-Also optional, and easy to get wrong silently: `normal_zarr_group`
-(default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr
-pyramid level the `normal_x`/`normal_y` lasagna stores are read at.
-**`lasagna_scale` must equal the actual downsample factor of whichever
-group you pick for this specific scroll's lasagna store** — read it from
-the store's own `.zattrs` multiscales metadata, do not assume it from
-another scroll's example or from a generic recommendation. A mismatched
-value either silently reads the wrong-resolution normal maps (no error) or
-throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
-large enough to push the requested z-range outside the (wrongly-scaled)
-store bounds.
+Also optional, and easy to get wrong silently: `lasagna_scale` (default `4`),
+the Lasagna arrays' downsampling relative to the fit volume. The arrays
+themselves are the ones the dataset's Lasagna manifest names (see "Lasagna
+inputs must be packed first"); `normal_zarr_group` is retired and refused.
+**`lasagna_scale` must equal the actual downsample factor of those arrays
+for this specific scroll** — read it from the store's own `.zattrs`
+multiscales metadata, do not assume it from another scroll's example or from
+a generic recommendation. A mismatched value either silently reads the
+wrong-resolution normal maps (no error) or throws `RuntimeError: lasagna
+z-ROI [...] is empty` if the mismatch is large enough to push the requested
+z-range outside the (wrongly-scaled) store bounds.
 
 Optional `num_windings`: the scroll's winding count, where someone has
 estimated it (an integer of at least 2). It replaces the generic default of
@@ -159,8 +159,7 @@ than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
 still override it, and `model_gap_expander_capacity_windings` is raised to
 `num_windings + 3` only when the count would not otherwise fit.
 
-Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
-specifically):
+Example (PHerc0826, whose Lasagna arrays are a 4x downsample of its fit volume):
 
 ```json
 {
@@ -168,7 +167,6 @@ specifically):
   "name": "PHerc0826",
   "voxel_size_um": 9.362,
   "spiral_outward_sense": "CW",
-  "normal_zarr_group": "2",
   "lasagna_scale": 4,
   "paths": {
     "tracks_dbm": "tracks/PHerc0826_20250821151701_surface_m7_L0_th0.2.dbm"
@@ -353,24 +351,35 @@ OBJECT_STORE_SMOKE_STORE=/scratch/dataset.vcobj OBJECT_STORE_SMOKE_Z=9000:9100 \
 
 ## Lasagna inputs must be packed first
 
-`fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
-through the resident-pool sidecars that `pack_resident_pools.py` writes
-(`lasagna_data.py`: there is no other loading path). Before the first fit on a
-dataset, pack the stores at the group named by `normal_zarr_group` in
-`spiral-scroll.json`:
+A fit's Lasagna dataset is a `*.lasagna.json` manifest: by convention the one
+in `<dataset>/lasagna_inputs/`, or `paths.lasagna` in `spiral-scroll.json`. The
+fit reads its `nx`, `ny` and `grad_mag` channels, which must be single-channel
+arrays sharing one array name (the manifest's `zarr` paths name it, e.g.
+`las_008_nx.ome.zarr/4`), only through resident pools (`lasagna_data.py`:
+there is no other loading path). Pools are derived data in the fit's cache
+(`--cache`, default `~/.cache/vc3d/spiral`), keyed by the dataset's identity:
+
+```
+<cache>/lasagna/<identity>/normals_g<array>/   nx and ny
+<cache>/lasagna/<identity>/grad_mag_g<array>/  grad_mag
+```
+
+The identity is the `run_uuid` of the manifest's provenance record (its
+`"provenance"` file, e.g. `inference.json`, as published datasets carry), else
+`sha256-` and the SHA-256 of the manifest file. The same dataset reached by
+another path or host therefore shares its packs, and a host needs only the
+packs, not the arrays. A manifest whose named provenance record is missing is
+refused rather than identified differently.
+
+The command-line fit builds a missing pool from the arrays (reporting chunk
+progress; in DDP only rank 0 builds). A service never builds one: it fits the
+project's dataset by the identity VC3D sends and refuses a build whose pools
+are not in its cache. Pack them where the arrays are and copy them over:
 
 ```sh
-python pack_resident_pools.py <dataset>/lasagna_inputs \
-    --what normals,grad_mag --normal-group 2
-```
-
-The packer looks for `*_nx.ome.zarr`, `*_ny.ome.zarr` and `*_grad_mag.ome.zarr`
-in that folder and writes `<store>.respool_g<group>_pair` (normals) and
-`<store>.respool_g<group>` (grad_mag) next to them. Without the sidecars the fit
-stops at input loading with
-
-```
-lasagna normals: resident-pool sidecar '.../PHercXXXX_nx.ome.zarr.respool_g2_pair' not found; build it with pack_resident_pools.py ...
+python pack_resident_pools.py /path/to/dataset.lasagna.json \
+    --cache ~/.cache/vc3d/spiral --what normals,grad_mag
+rsync -a ~/.cache/vc3d/spiral/lasagna/<identity>/ service-host:<cache>/lasagna/<identity>/
 ```
 
 The packer only iterates over chunk files that exist, so a store that holds only
@@ -575,12 +584,13 @@ is VC3D's and need not be readable on the service's host, so every initialize
 and rebuild carries a `project` block (`fit_session.SpiralProject`):
 
 - the project's name;
-- its selected Lasagna dataset as VC3D's manifest reader resolves it: the
-  OME-Zarr stores of the `nx`, `ny` and `grad_mag` channels (one-channel
-  arrays sharing one array name, e.g. `s_nx.ome.zarr/4`), or why the fit
-  cannot read it (a remote dataset, multichannel arrays). The stores are paths
-  on the service's host: a service on another machine needs them at the same
-  paths;
+- its selected Lasagna dataset as VC3D's manifest reader resolves it: its
+  identity (see "Lasagna inputs must be packed first"), the OME-Zarr stores
+  of the `nx`, `ny` and `grad_mag` channels (one-channel arrays sharing one
+  array name, e.g. `s_nx.ome.zarr/4`; local paths or remote locations), or
+  why the fit cannot read it (an unreadable dataset, multichannel arrays).
+  The fit and its startup link refresh read the identity's pools from the
+  service's cache, never the stores;
 - for each store volume its volumes' annotations are kept in (a catalog
   volume once, whatever its working level): the facts the project knows
   exactly (`voxel_size_um`; a catalog volume's `z_direction_is_top_to_bottom`,
@@ -597,10 +607,15 @@ the one its inputs were read in). The build fits that project volume:
   orientation is unknown (a volume outside the catalog) the fit setting
   `spiral_outward_sense` (the Spiral panel's *Outward sense*) gives the
   sense; where it is known, a setting that disagrees is refused.
-- **Lasagna.** The session reads the project's stores at their array, at
-  the volume's `lasagna_scale` (normals for the startup link refresh too). A
-  fit whose losses need normals or gradient magnitudes the project cannot
-  give is refused before anything is linked.
+- **Lasagna.** The project's selected dataset, local or remote, by its
+  identity: the service writes it as `project-inputs/lasagna-<identity>.json`
+  (the file the fit reads) and loads its pools from its cache at the volume's
+  `lasagna_scale` (see "Lasagna inputs must be packed first"). A fit whose
+  losses need normals or gradient magnitudes the project cannot give, or
+  whose pools the cache lacks, is refused before anything is linked. The
+  startup link refresh reads the normals pack too (`normal_pool`); without
+  one in the cache it refreshes fiber links centerline-only, with a warning.
+  The command-line fit builds its normals pack before refreshing.
 - **Umbilicus.** The project's, written under the output directory
   (`project-inputs/umbilicus-<revision>.json`) as the file the fit reads, at
   coordinate scale 1.
@@ -740,23 +755,24 @@ or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
 ### Resident sparse field pools
 
 Normals and gradient magnitude samples are served by fully
-resident device brick pools. Each store's occupied bricks are packed once
-into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
+resident device brick pools. Each pack's occupied bricks are packed once
+into the fit's cache by `pack_resident_pools.py` (see "Lasagna inputs must be
+packed first" for the layout):
 
 ```sh
-python pack_resident_pools.py /path/to/lasagna_inputs \
+python pack_resident_pools.py /path/to/dataset.lasagna.json --cache <cache> \
     --ct /path/to/<scroll>_ds2.zarr --ct-group 2 --verify 2000
 ```
 
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
 scroll) so those bricks drop out of the pool and sample as no-data. The
-fitter loads the sidecars restricted to the configured z-ROI in one
+fitter loads the pools restricted to the configured z-ROI in one
 sequential read per channel (for the full s1 ROI: ~10 GiB normals); after
 that every gather is pure device indexing with no I/O and no
-eviction. When a required sidecar is missing, the fitter builds it before GPU
-loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
-prepacking with `--ct` remains useful because the CT mask can substantially
-reduce the resident pool size.
+eviction. When a required pool is missing, the command-line fitter builds it
+before GPU loading and reports chunk progress. In DDP runs only rank 0 builds
+it. Manual prepacking with `--ct` remains useful because the CT mask can
+substantially reduce the resident pool size.
 Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
 assertions when debugging new sampling code.
 
@@ -1390,10 +1406,30 @@ The z ROI is half-open and expressed in the output/fitter coordinate system;
 `--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels. The
 extractor always covers the fiber volume's complete XY extent.
 
+A fit refuses a z window outside the range an artifact was extracted over
+(its recorded `z_roi`).
+
+A service reads no dataset `fiber_directions.npz`: it reads the samples of the
+project's selected fiber-inference dataset, by that dataset's identity (see
+"Lasagna inputs must be packed first") and the fit volume's scale, from its
+cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. Extract
+them there over the prediction's whole height (no `--z-roi`), or place an
+existing artifact there, and copy the file to the service's cache:
+
+```bash
+./.venv/bin/python fiber_direction_samples.py \
+  https://example/fibers.lasagna.json --cache ~/.cache/vc3d/spiral --output-scale 4
+./.venv/bin/python fiber_direction_samples.py \
+  --adopt /path/to/dataset/fiber_directions.npz --cache ~/.cache/vc3d/spiral
+```
+
+A build whose loss needs them refuses a cache without them before linking.
+
 Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
 to off/zero; set the toggle true and the weight above zero to enable the
-loss. The fitter then loads the conventional `fiber_directions.npz` artifact
-and samples `sample_count_fiber_direction_points` observations per step.
+loss. The command-line fitter then loads the conventional
+`fiber_directions.npz` artifact (a service, the cached one) and samples
+`sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
 

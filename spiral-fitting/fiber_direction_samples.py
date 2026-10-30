@@ -4,6 +4,11 @@ The extractor reads only Zarr chunks intersecting a requested z range, across
 the full XY extent. Within each fixed prediction-space cell it retains the
 highest-presence voxel, avoiding a full-volume download and most duplicate
 samples across a fiber's thickness.
+
+With ``--cache`` the artifact goes where a fit finds it by the fiber-inference
+dataset's identity (lasagna_source.fiber_directions_path), extracted over the
+prediction's whole height unless ``--z-roi`` narrows it; ``--adopt`` places an
+existing artifact there instead of extracting.
 """
 
 from __future__ import annotations
@@ -26,6 +31,22 @@ def _get_json(session, url):
     response = session.get(url, timeout=60)
     response.raise_for_status()
     return response.json()
+
+
+def remote_manifest_identity(session, manifest_url):
+    """The manifest at ``manifest_url`` and its dataset identity
+    (lasagna_source.manifest_identity), its provenance record fetched beside
+    it when it names one."""
+    from lasagna_source import manifest_identity
+
+    response = session.get(manifest_url, timeout=60)
+    response.raise_for_status()
+    manifest = json.loads(response.content)
+    provenance = None
+    if isinstance(manifest.get("provenance"), str) and manifest["provenance"].strip():
+        provenance = _get_json(session, urljoin(manifest_url, manifest["provenance"]))
+    name = unquote(urlparse(manifest_url).path.rstrip("/").rsplit("/", 1)[-1])
+    return manifest, manifest_identity(response.content, name, provenance)
 
 
 def _chunk_url(array_url, index, metadata):
@@ -156,16 +177,20 @@ def _cell_argmax(presence, global_begin, cell_size, threshold, valid_begin, vali
     return flat_indices[selected], coords[selected]
 
 
-def extract(manifest_url, z_roi, output, *, output_scale=1.0,
+def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
             threshold=160, cell_size=2, overwrite=False, workers=1):
+    """Extract into ``output``, or with ``cache`` into the dataset's cached
+    artifact; a ``z_roi`` of None is the prediction's whole height."""
     import requests
+    from lasagna_source import fiber_directions_path
 
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists() and not overwrite:
-        raise FileExistsError(f"output already exists: {output} (use --overwrite)")
     with requests.Session() as session:
-        manifest = _get_json(session, manifest_url)
+        manifest, identity = remote_manifest_identity(session, manifest_url)
+        output = Path(fiber_directions_path(cache, identity, output_scale)
+                      if cache is not None else output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"output already exists: {output} (use --overwrite)")
         groups = manifest["groups"]
         urls = {name: urljoin(manifest_url, groups[name]["zarr"])
                 for name in ("presence", "nx", "ny")}
@@ -190,6 +215,8 @@ def extract(manifest_url, z_roi, output, *, output_scale=1.0,
         prediction_to_base_scale = scales[0]
         prediction_to_output_scale = prediction_to_base_scale / output_scale
         shape = np.asarray(reference["shape"], dtype=np.int64)
+        if z_roi is None:
+            z_roi = (0, int(np.ceil(shape[0] * prediction_to_output_scale)))
         z_begin, z_end = z_roi
         begin = np.asarray((
             np.floor(z_begin / prediction_to_output_scale), 0, 0),
@@ -207,6 +234,7 @@ def extract(manifest_url, z_roi, output, *, output_scale=1.0,
             "artifact_type": "fiber_direction_samples",
             "format_version": FORMAT_VERSION,
             "manifest_url": manifest_url,
+            "dataset_identity": identity,
             "z_roi": list(z_roi),
             "output_scale_base_voxels": float(output_scale),
             "prediction_to_output_scale": prediction_to_output_scale,
@@ -279,8 +307,51 @@ def extract(manifest_url, z_roi, output, *, output_scale=1.0,
           f"{len(work):,} chunks to {output}")
 
 
+def adopt(artifact, cache, *, overwrite=False):
+    """Place an existing artifact where a fit finds it by its fiber-inference
+    dataset's identity (its manifest_url's) and scale: a hard link when the
+    cache is on the same filesystem, else a copy. Returns the cached path."""
+    import os
+    import shutil
+
+    import requests
+    from lasagna_source import fiber_directions_path
+
+    artifact = Path(artifact)
+    metadata = _artifact_metadata(artifact)
+    with requests.Session() as session:
+        _, identity = remote_manifest_identity(session, metadata["manifest_url"])
+    recorded = metadata.get("dataset_identity")
+    if recorded is not None and recorded != identity:
+        raise ValueError(f"{artifact} was extracted from dataset {recorded}, but "
+                         f"{metadata['manifest_url']} is now {identity}")
+    target = Path(fiber_directions_path(cache, identity,
+                                        metadata["output_scale_base_voxels"]))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not overwrite:
+            raise FileExistsError(f"{target} already exists (use --overwrite)")
+        target.unlink()
+    try:
+        os.link(artifact, target)
+    except OSError:
+        shutil.copy2(artifact, target)
+    print(f"adopted {artifact} as {target}")
+    return target
+
+
+def _artifact_metadata(artifact):
+    with np.load(artifact) as packed:
+        metadata = json.loads(str(packed["metadata_json"]))
+    if (metadata.get("artifact_type") != "fiber_direction_samples"
+            or metadata.get("format_version") != FORMAT_VERSION):
+        raise ValueError(f"unsupported fiber-direction artifact in {artifact}")
+    return metadata
+
+
 def load_fiber_direction_samples(path, z_begin, z_end):
-    """Load one packed artifact, filtering in the fitter's coordinate frame."""
+    """Load one packed artifact, filtering in the fitter's coordinate frame.
+    The fit's window must lie inside the z range it was extracted over."""
     if not path:
         return None
     artifact = Path(path)
@@ -289,6 +360,11 @@ def load_fiber_direction_samples(path, z_begin, z_end):
         if (metadata.get("artifact_type") != "fiber_direction_samples"
                 or metadata.get("format_version") != FORMAT_VERSION):
             raise ValueError(f"unsupported fiber-direction artifact in {artifact}")
+        extracted = metadata.get("z_roi")
+        if extracted is not None and not (extracted[0] <= z_begin and z_end <= extracted[1]):
+            raise ValueError(
+                f"{artifact} holds fiber directions for z [{extracted[0]}, "
+                f"{extracted[1]}), not the fit's [{z_begin}, {z_end})")
         position = packed["position_zyx"]
         keep = (position[:, 0] >= z_begin) & (position[:, 0] < z_end)
         if not keep.any():
@@ -309,10 +385,20 @@ def load_fiber_direction_samples(path, z_begin, z_end):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", help="HTTP(S) Lasagna fiber manifest")
-    parser.add_argument("output", type=Path, help="output packed .npz artifact")
-    parser.add_argument("--z-roi", required=True, type=_parse_z_roi,
-                        help="output-coordinate half-open z range BEGIN,END")
+    parser.add_argument("manifest", nargs="?",
+                        help="HTTP(S) Lasagna fiber manifest")
+    parser.add_argument("output", type=Path, nargs="?",
+                        help="output packed .npz artifact (or --cache)")
+    parser.add_argument("--cache", type=Path, default=None, metavar="DIR",
+                        help="write the artifact into a fit cache (fit_spiral.py "
+                             "and spiral_service.py --cache), keyed by the "
+                             "dataset's identity and --output-scale")
+    parser.add_argument("--adopt", type=Path, default=None, metavar="NPZ",
+                        help="place an existing artifact into --cache instead "
+                             "of extracting")
+    parser.add_argument("--z-roi", type=_parse_z_roi, default=None,
+                        help="output-coordinate half-open z range BEGIN,END "
+                             "(default: the prediction's whole height)")
     parser.add_argument(
         "--output-scale", type=float, default=1.0,
         help="base /0 voxels per output/fitter voxel (use 4 for pyramid /2)")
@@ -323,6 +409,13 @@ def main():
     parser.add_argument("--workers", type=int, default=1,
                         help="parallel chunk downloads (default: 1)")
     args = parser.parse_args()
+    if args.adopt is not None:
+        if args.cache is None or args.manifest or args.output:
+            parser.error("--adopt takes only --cache (and --overwrite)")
+        adopt(args.adopt, args.cache, overwrite=args.overwrite)
+        return
+    if not args.manifest or (args.output is None) == (args.cache is None):
+        parser.error("give the manifest and either an output path or --cache")
     if not 0 <= args.presence_threshold <= 255:
         parser.error("--presence-threshold must be in [0, 255]")
     if args.cell_size <= 0:
@@ -331,7 +424,7 @@ def main():
         parser.error("--output-scale must be positive")
     if args.workers <= 0:
         parser.error("--workers must be positive")
-    extract(args.manifest, args.z_roi, args.output,
+    extract(args.manifest, args.z_roi, args.output, cache=args.cache,
             output_scale=args.output_scale,
             threshold=args.presence_threshold, cell_size=args.cell_size,
             overwrite=args.overwrite, workers=args.workers)

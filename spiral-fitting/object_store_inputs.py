@@ -1513,9 +1513,10 @@ class NormalSource:
             return 'fiber-patch normals: none (centerline-only linking)'
         values = dict(self.parameters)
         if self.kind == 'lasagna':
+            where = (f'pack {values["normal_pool"]}' if 'normal_pool' in values
+                     else f'{values["normal_x_volume"]}, {values["normal_y_volume"]}')
             return (f'fiber-patch normals: lasagna at '
-                    f'scale {values["ct_to_base_scale"]:g} '
-                    f'({values["normal_x_volume"]}, {values["normal_y_volume"]})')
+                    f'scale {values["ct_to_base_scale"]:g} ({where})')
         return (f'fiber-patch normals: CT {self.ct_volume}, downsampling '
                 f'{values["ct_to_base_scale"]:g}')
 
@@ -1528,24 +1529,21 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
     """The fiber-patch normal source: lasagna, else normal CT, else none.
 
     ``lasagna`` describes the fit's lasagna normals when they are configured
-    (input_use_normals with normal stores, whether or not the dense-normal
-    loss is on):
-    ``{'normal_x', 'normal_y', 'group', 'scale'}``, ``scale`` being the
-    group's downsampling relative to the fit volume. The store reads the
-    same group arrays the fitter reads, addressed by path (an array is its
-    reader's only level, 0), so no pyramid metadata is consulted; a normal
-    CT's level likewise names its group. Lasagna and CT normals are
-    exclusive; a configured CT is then ignored with a note.
+    (input_use_normals with a dataset whose normals pack is at hand, whether
+    or not the dense-normal loss is on; fit_session.lasagna_normal_inputs):
+    ``{'pool', 'scale'}``, the pack the fitter loads (lasagna_source) and its
+    array's downsampling relative to the fit volume. The store reads the
+    pack, never the dataset's arrays; a normal CT's level names its group.
+    Lasagna and CT normals are exclusive; a configured CT is then ignored
+    with a note.
     """
     ct_path = config['object_store_normal_ct_path']
     if lasagna is not None:
-        group = str(lasagna['group'])
         return NormalSource(
             'lasagna', '', (
                 ('ct_level', 0),
                 ('ct_to_base_scale', float(lasagna['scale'])),
-                ('normal_x_volume', os.path.join(str(lasagna['normal_x']), group)),
-                ('normal_y_volume', os.path.join(str(lasagna['normal_y']), group))),
+                ('normal_pool', str(lasagna['pool']))),
             note=(f'ignoring object_store_normal_ct_path {ct_path!r}: the fit '
                   'loads lasagna normals') if ct_path else None)
     if not ct_path:
@@ -1677,8 +1675,9 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log):
     if (normal.kind == 'none' and snapshot.objects_of('fiber')
             and snapshot.objects_of('surface')):
         log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
-            'loads no lasagna normals (input_use_normals with normal_x/normal_y '
-            'stores) and object_store_normal_ct_path is unset')
+            'loads no lasagna normals (input_use_normals with a Lasagna dataset '
+            'whose normals pack is in the cache) and object_store_normal_ct_path '
+            'is unset')
     return refresh_report(refresh_links(store, snapshot, config, normal, cache_directory))
 
 
