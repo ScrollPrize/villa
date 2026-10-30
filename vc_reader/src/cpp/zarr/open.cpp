@@ -259,6 +259,8 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     if (out.writer >= 0 && !out.layers[out.writer].budgetRoot.empty()) {
         const auto& writer=out.layers[out.writer];
         spec.disk_cache = diskBudget(writer.budgetRoot, options.cacheMaxBytes);
+        if (options.cacheMinFreeBytes)
+            spec.disk_cache->set_min_free_bytes(*options.cacheMinFreeBytes);
         if (writer.kind.starts_with("vc3d-"))
             spec.disk_cache->adopt_chunks(writer.budgetRoot);
     }

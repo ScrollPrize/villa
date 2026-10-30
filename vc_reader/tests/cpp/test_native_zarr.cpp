@@ -3,6 +3,7 @@
 #include "vc_reader/zarr.hpp"
 #include "sftp_fixture.hpp"
 
+#include <limits>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -423,9 +424,23 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
         require(fs::exists(vdir/"0/.zarray") && fs::exists(vdir/"0/1.1.1.empty"),"budget preserves metadata and fill markers");
     }
 
+    // A free-space floor no disk can meet evicts everything and serves without caching.
+    {
+        auto floorOptions=vc3dOptions;
+        floorOptions.cacheMaxBytes=std::numeric_limits<std::int64_t>::max();
+        floorOptions.cacheMinFreeBytes=std::numeric_limits<std::int64_t>::max()/2;
+        auto a=vcr::zarr::Group::open(groupUrl,floorOptions).array("0");
+        expect_volume(read_all(*a.array),v,"read under a free-space floor");
+        a.array->flush();
+        require(a.array->last_write_error().empty(),"skipped cache writes are not errors");
+        require(!fs::exists(vdir/"0/0.1.0"),"the free-space floor evicted the oldest chunks");
+        require(vcr::zarr::diskBudget(a.layers[0].budgetRoot,std::nullopt)->total_bytes()==0,"nothing stays accounted");
+        vcr::zarr::diskBudget(a.layers[0].budgetRoot,std::nullopt)->set_min_free_bytes(0);
+    }
+
     // An owner-named VC3D directory is used as given (VC3D names caches by volume ID).
     const auto named = root / "named" / "my-volume";
-    fs::create_directories(named);
+    vcr::zarr::createVc3dVolumeDir(named, false);
     vcr::zarr::OpenOptions namedOptions;
     namedOptions.vc3dVolumeDir = named;
     {
@@ -439,7 +454,7 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
 
     // Budgeted Delta3D caches keep their format and reuse both data and fill.
     const auto delta=root/"delta-cache"/"my-volume";
-    write_text(delta/".vc_delta3d_cache","D3D1\n");
+    vcr::zarr::createVc3dVolumeDir(delta,true);
     vcr::zarr::OpenOptions deltaOptions;
     deltaOptions.vc3dVolumeDir=delta;
     deltaOptions.cacheMaxBytes=8192;

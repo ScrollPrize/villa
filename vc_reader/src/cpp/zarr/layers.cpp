@@ -266,6 +266,16 @@ std::string vc3dVolumeId(std::string url)
     return name + "-" + hex;
 }
 
+void createVc3dVolumeDir(const fs::path& volumeDir, bool delta3d)
+{
+    std::error_code ec;
+    if (fs::is_directory(volumeDir, ec))
+        return;
+    fs::create_directories(volumeDir);
+    if (delta3d)
+        atomicWrite(volumeDir / kDelta3dMarker, kDelta3dMarkerContents);
+}
+
 std::optional<fs::path> vc3dCacheRoot()
 {
     const char* configured = std::getenv("VC3D_CONFIG_DIR");

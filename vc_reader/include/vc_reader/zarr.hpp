@@ -104,6 +104,9 @@ MetadataReader metadataReader(const Access& access, int connections = 4);
 std::string vc3dVolumeId(std::string url);
 // VC3D's remote cache root as VC3D resolves it; nullopt if it does not exist.
 std::optional<std::filesystem::path> vc3dCacheRoot();
+// A new VC3D cache directory for a volume (opened through OpenOptions::vc3dVolumeDir),
+// storing chunks as Delta3D when asked. An existing directory keeps its format.
+void createVc3dVolumeDir(const std::filesystem::path& volumeDir, bool delta3d);
 // cache_dir/<scheme>/<host or bucket>/<path>; public buckets are keyed by their s3:// form.
 std::filesystem::path decodedCachePath(const std::filesystem::path& cacheDir, const std::string& url);
 // One SQLite eviction index per directory and process, shared by writers.
@@ -172,6 +175,7 @@ struct OpenOptions {
     std::optional<std::filesystem::path> vc3dVolumeDir;
     bool cacheWrites = true;
     std::optional<std::int64_t> cacheMaxBytes;
+    std::optional<std::int64_t> cacheMinFreeBytes;  // with cacheMaxBytes: disk space cache writes keep free
     bool compressCache = false, allowLossyCache = false;
     std::shared_ptr<MemoryCache> memoryCache;
     std::size_t threads = 0;  // 0: 32 remote, min(16, cores) local

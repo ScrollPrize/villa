@@ -5,6 +5,7 @@
 #include "chunk_io.hpp"
 #include "http.hpp"
 
+#include <atomic>
 #include <sqlite3.h>
 #include <algorithm>
 #include <mutex>
@@ -130,6 +131,15 @@ public:
         transaction([&] { set_limit(bytes); evict(); });
     }
 
+    // Keep this much of the disk free: writes evict the oldest chunks first, and
+    // are skipped (served without caching) when evicting cannot free enough.
+    void set_min_free_bytes(std::int64_t bytes)
+    {
+        if (bytes < 0)
+            throw std::invalid_argument("cache_min_free_bytes must be nonnegative");
+        min_free_bytes_.store(bytes, std::memory_order_relaxed);
+    }
+
     void write(const std::string& path, const std::uint8_t* data, std::size_t size)
     {
         check_path(path);
@@ -139,6 +149,8 @@ public:
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
             evict_to(available - static_cast<std::int64_t>(size));
+            if (!keep_free(size))
+                return;
             atomic_write(path, data, size);
             record(path, static_cast<std::int64_t>(size));
             evict();
@@ -149,6 +161,13 @@ public:
     {
         std::lock_guard lock(mutex_);
         return number("SELECT max_bytes FROM budget WHERE id=1");
+    }
+
+    // The bytes this budget accounts for.
+    std::int64_t total_bytes()
+    {
+        std::lock_guard lock(mutex_);
+        return number("SELECT total FROM budget WHERE id=1");
     }
 
     // A remote file cached at `path` (its URL's decoded-cache path, so mirrors
@@ -393,24 +412,43 @@ private:
         }
     }
 
+    // Removes the oldest chunk; false when none is left.
+    bool evict_oldest()
+    {
+        std::string path;
+        {
+            Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
+            if (!s.step())
+                return false;
+            path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        }
+        check_path(path);
+        std::filesystem::remove(path);  // unlink, never truncate a mapped file
+        Statement s(db_, "DELETE FROM chunks WHERE path=?");
+        s.text(1, path);
+        s.step();
+        Statement f(db_, "DELETE FROM files WHERE path=?");
+        f.text(1, path); f.step();
+        return true;
+    }
+
     void evict_to(std::int64_t limit)
     {
-        while (number("SELECT total FROM budget WHERE id=1") > limit) {
-            std::string path;
-            {
-                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
-                if (!s.step())
-                    throw std::runtime_error("disk cache accounting is inconsistent");
-                path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-            }
-            check_path(path);
-            std::filesystem::remove(path);  // unlink, never truncate a mapped file
-            Statement s(db_, "DELETE FROM chunks WHERE path=?");
-            s.text(1, path);
-            s.step();
-            Statement f(db_, "DELETE FROM files WHERE path=?");
-            f.text(1, path); f.step();
-        }
+        while (number("SELECT total FROM budget WHERE id=1") > limit)
+            if (!evict_oldest())
+                throw std::runtime_error("disk cache accounting is inconsistent");
+    }
+
+    // Whether `size` more bytes leave the configured free space, evicting as needed.
+    bool keep_free(std::size_t size)
+    {
+        const auto wanted = static_cast<std::uintmax_t>(min_free_bytes_.load(std::memory_order_relaxed));
+        if (wanted == 0)
+            return true;
+        while (std::filesystem::space(root_).available < wanted + size)
+            if (!evict_oldest())
+                return false;
+        return true;
     }
 
     void check_path(const std::string& path)
@@ -450,6 +488,7 @@ private:
     std::filesystem::path root_;
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
+    std::atomic<std::int64_t> min_free_bytes_{0};
 };
 
 }  // namespace vcr
