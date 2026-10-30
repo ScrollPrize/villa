@@ -184,7 +184,8 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
     H, W = zmeta["shape"][1], zmeta["shape"][2]
     levels = sorted(int(d) for d in os.listdir(out_zarr)
                     if d.isdigit() and int(d) > 0 and os.path.exists(os.path.join(out_zarr, d, ".zarray")))
-    img = torch.zeros((S, H, W), dtype=torch.uint8, device=dev) if levels else None
+    # level 0 is kept on the host for the pyramid so it doesn't sit on the GPU next to the chunk pool
+    img = torch.zeros((S, H, W), dtype=torch.uint8) if levels else None
 
     def write_chunk(ty, tx, arr, lvl=0, chunks=(CZ, CH, CW)):
         buf = np.zeros(chunks, np.uint8)
@@ -227,16 +228,12 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
             base, dirs = v
             og = torch.empty((S, base.shape[0]), dtype=torch.uint8, device=dev)
             kernel.sample_cuda(base, dirs, offs_t, pool.lut, pool.pool, *pool.shape, og)
-            if img is not None:
-                o = 0
-                for ty, tx, b, _ in tb:
-                    h, w = b.shape[:2]
-                    img[:, ty * CH:ty * CH + h, tx * CW:tx * CW + w] = og[:, o:o + h * w].view(S, h, w)
-                    o += h * w
             out = og.cpu().numpy()
             o = 0
             for ty, tx, b, _ in tb:
                 h, w = b.shape[:2]
+                if img is not None:
+                    img[:, ty * CH:ty * CH + h, tx * CW:tx * CW + w] =                         torch.from_numpy(out[:, o:o + h * w].reshape(S, h, w))
                 futs.append(wpool.submit(write_chunk, ty, tx, out[:, o:o + h * w].reshape(S, h, w)))
                 o += h * w
             if bi + 1 < len(batches):
@@ -245,7 +242,9 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
 
     # Pyramid L1..L5, as renderTiles builds it: L1 = rounded 2x2 mean of L0 with partial
     # windows at the image edge; L2+ cascade from zero-padded chunk buffers (count 4).
+    # L1 is built on the host from L0; L2+ (1/16 of L0 and smaller) on the GPU
     prev = img
+    del img
     for li, lvl in enumerate(levels):
         m = read_json(os.path.join(out_zarr, str(lvl), ".zarray"))
         _, lh, lw = m["shape"]
@@ -256,7 +255,7 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
         ssum = p.view(S, ph // 2, 2, pw // 2, 2).to(torch.int16).sum((2, 4), dtype=torch.int16)
         del p
         if li == 0:
-            one = torch.zeros((ph, pw), dtype=torch.int32, device=dev)
+            one = torch.zeros((ph, pw), dtype=torch.int32)
             one[:prev.shape[1], :prev.shape[2]] = 1
             cnt = one.view(ph // 2, 2, pw // 2, 2).sum((1, 3)).clamp(min=1)
             cur = ((ssum + cnt // 2) // cnt).to(torch.uint8)
@@ -268,8 +267,8 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
             for cx in range(0, lw, cw):
                 futs.append(wpool.submit(write_chunk, cy // ch, cx // cw,
                                          cn[:, cy:cy + ch, cx:cx + cw], lvl, (cz, ch, cw)))
-        prev = cur
-    del img, prev
+        prev = cur.to(dev)
+    del prev
 
     def finish():
         written = sum(f.result() for f in futs[:n_l0])

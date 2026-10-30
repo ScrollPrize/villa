@@ -41,7 +41,7 @@ while read -r S O; do
 done < "$LIST"
 
 render() {  # SURFACE OUT
-  "$BIN" -s "$1" -v "$V" -g 0 --scale 1 -n "$N" "${FLIP[@]}" --zarr-output "$2" --cache-gb 4 > "$2.log" 2>&1
+  "$BIN" -s "$1" -v "$V" -g 0 --scale 1 -n "$N" ${FLIP[@]+"${FLIP[@]}"} --zarr-output "$2" --cache-gb 4 > "$2.log" 2>&1
 }
 
 s0=$(date +%s.%N)
