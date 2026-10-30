@@ -175,7 +175,7 @@ struct OpenOptions {
     std::optional<std::filesystem::path> vc3dVolumeDir;
     bool cacheWrites = true;
     std::optional<std::int64_t> cacheMaxBytes;
-    std::optional<std::int64_t> cacheMinFreeBytes;  // with cacheMaxBytes: disk space cache writes keep free
+    std::optional<std::int64_t> cacheMinFreeBytes;  // with cacheMaxBytes: below this much free disk, stop caching (nothing is deleted)
     bool compressCache = false, allowLossyCache = false;
     std::shared_ptr<MemoryCache> memoryCache;
     std::size_t threads = 0;  // 0: 32 remote, min(16, cores) local
@@ -232,6 +232,16 @@ OpenedArray openArray(const std::string& location, const OpenOptions& options, A
 // Missing levels throw; no implicit renumbering or downsampling is performed.
 OpenedArray openPyramidLevel(const std::string& location, int level, const OpenOptions& options,
                              int probeLevels = 32);
+
+// The metadata of every physical pyramid level, numbered as openPyramidLevel numbers
+// them, without opening arrays or caches. Sorted by level.
+struct PyramidLevelInfo {
+    int level = 0;
+    std::string path;  // relative to the location; empty for a root array
+    ArrayMeta meta;
+};
+std::vector<PyramidLevelInfo> pyramidLevels(const std::string& location, const OpenOptions& options,
+                                            int probeLevels = 32);
 
 class Group {
 public:

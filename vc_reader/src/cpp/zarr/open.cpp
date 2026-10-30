@@ -446,44 +446,76 @@ LevelPlacement Group::placement(const std::string& path) const
     return p;
 }
 
+namespace {
+
+// A root array's metadata, when the location is one.
+std::optional<Json> rootArrayMetadata(const std::string& location, const OpenOptions& options)
+{
+    if (options.offline && isRemote(location))
+        return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
+                                  options.vc3dVolumeDir);
+    const auto read = reader(options);
+    auto root = readJsonNode(read, location, ".zarray");
+    if (!root) {
+        const auto v3 = readJsonNode(read, location, "zarr.json");
+        if (v3 && v3->value("node_type", "") == "array") root = v3;
+    }
+    return root;
+}
+
+// (level number, path) of a group's levels, in the group's order.
+std::vector<std::pair<int, std::string>> numberedLevels(Group& group, int probeLevels)
+{
+    const auto paths = group.levels(probeLevels);
+    const bool numeric = std::all_of(paths.begin(), paths.end(), digits);
+    std::set<int> seen;
+    std::vector<std::pair<int, std::string>> out;
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        const int number = numeric ? levelNumber(paths[i]) : static_cast<int>(i);
+        if (!seen.insert(number).second)
+            throw std::invalid_argument("duplicate pyramid level " + std::to_string(number));
+        out.emplace_back(number, paths[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
 OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOptions& options,
                              int probeLevels)
 {
     if (level < 0 || probeLevels < 0)
         throw std::invalid_argument("pyramid level and probeLevels must be nonnegative");
     const auto location = stripSlashes(input);
-    std::optional<Json> root;
-    if (options.offline && isRemote(location)) {
-        root = cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
-                                 options.vc3dVolumeDir);
-    } else {
-        const auto read = reader(options);
-        root = readJsonNode(read, location, ".zarray");
-        if (!root) {
-            const auto v3 = readJsonNode(read, location, "zarr.json");
-            if (v3 && v3->value("node_type", "") == "array") root = v3;
-        }
-    }
-    if (root) {
+    if (auto root = rootArrayMetadata(location, options)) {
         if (level != 0) throw std::out_of_range("a root array has only pyramid level 0");
         ArrayHints hints;
         hints.metadata = std::move(root);
         return openArray(location, options, std::move(hints));
     }
     auto group = Group::open(location, options);
-    const auto paths = group.levels(probeLevels);
-    const bool numeric = std::all_of(paths.begin(), paths.end(), digits);
-    std::set<int> seen;
-    std::optional<std::string> selected;
-    for (std::size_t i = 0; i < paths.size(); ++i) {
-        const int number = numeric ? levelNumber(paths[i]) : static_cast<int>(i);
-        if (!seen.insert(number).second)
-            throw std::invalid_argument("duplicate pyramid level " + std::to_string(number));
-        if (number == level) selected = paths[i];
+    for (const auto& [number, path] : numberedLevels(group, probeLevels))
+        if (number == level) return group.array(path);
+    throw std::out_of_range("pyramid level " + std::to_string(level) + " is not present in " + location);
+}
+
+std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const OpenOptions& options, int probeLevels)
+{
+    if (probeLevels < 0)
+        throw std::invalid_argument("probeLevels must be nonnegative");
+    const auto location = stripSlashes(input);
+    if (const auto root = rootArrayMetadata(location, options))
+        return {{0, "", parseArrayMeta(*root)}};
+    auto group = Group::open(location, options);
+    std::vector<PyramidLevelInfo> out;
+    for (const auto& [number, path] : numberedLevels(group, probeLevels)) {
+        const auto node = group.node(path);
+        if (!node || node->first != Group::NodeKind::Array)
+            throw std::runtime_error("pyramid level " + path + " of " + location + " is not an array");
+        out.push_back({number, path, parseArrayMeta(node->second)});
     }
-    if (!selected)
-        throw std::out_of_range("pyramid level " + std::to_string(level) + " is not present in " + location);
-    return group.array(*selected);
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.level < b.level; });
+    return out;
 }
 
 std::optional<Json> Group::consolidated()

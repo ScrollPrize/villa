@@ -6,6 +6,7 @@
 #include "http.hpp"
 
 #include <atomic>
+#include <iostream>
 #include <sqlite3.h>
 #include <algorithm>
 #include <mutex>
@@ -131,8 +132,9 @@ public:
         transaction([&] { set_limit(bytes); evict(); });
     }
 
-    // Keep this much of the disk free: writes evict the oldest chunks first, and
-    // are skipped (served without caching) when evicting cannot free enough.
+    // Keep this much of the disk free: a write that would leave less is skipped
+    // (served without caching) and nothing cached is removed. The first skip warns
+    // on stderr; low_space() reports the current state.
     void set_min_free_bytes(std::int64_t bytes)
     {
         if (bytes < 0)
@@ -148,9 +150,9 @@ public:
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
-            evict_to(available - static_cast<std::int64_t>(size));
-            if (!keep_free(size))
+            if (!leaves_free_space(size))
                 return;
+            evict_to(available - static_cast<std::int64_t>(size));
             atomic_write(path, data, size);
             record(path, static_cast<std::int64_t>(size));
             evict();
@@ -162,6 +164,9 @@ public:
         std::lock_guard lock(mutex_);
         return number("SELECT max_bytes FROM budget WHERE id=1");
     }
+
+    // Whether the last write was skipped to keep the disk's free space.
+    bool low_space() const noexcept { return low_space_.load(std::memory_order_relaxed); }
 
     // The bytes this budget accounts for.
     std::int64_t total_bytes()
@@ -412,43 +417,37 @@ private:
         }
     }
 
-    // Removes the oldest chunk; false when none is left.
-    bool evict_oldest()
-    {
-        std::string path;
-        {
-            Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
-            if (!s.step())
-                return false;
-            path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        }
-        check_path(path);
-        std::filesystem::remove(path);  // unlink, never truncate a mapped file
-        Statement s(db_, "DELETE FROM chunks WHERE path=?");
-        s.text(1, path);
-        s.step();
-        Statement f(db_, "DELETE FROM files WHERE path=?");
-        f.text(1, path); f.step();
-        return true;
-    }
-
     void evict_to(std::int64_t limit)
     {
-        while (number("SELECT total FROM budget WHERE id=1") > limit)
-            if (!evict_oldest())
-                throw std::runtime_error("disk cache accounting is inconsistent");
+        while (number("SELECT total FROM budget WHERE id=1") > limit) {
+            std::string path;
+            {
+                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
+                if (!s.step())
+                    throw std::runtime_error("disk cache accounting is inconsistent");
+                path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+            }
+            check_path(path);
+            std::filesystem::remove(path);  // unlink, never truncate a mapped file
+            Statement s(db_, "DELETE FROM chunks WHERE path=?");
+            s.text(1, path);
+            s.step();
+            Statement f(db_, "DELETE FROM files WHERE path=?");
+            f.text(1, path); f.step();
+        }
     }
 
-    // Whether `size` more bytes leave the configured free space, evicting as needed.
-    bool keep_free(std::size_t size)
+    bool leaves_free_space(std::size_t size)
     {
         const auto wanted = static_cast<std::uintmax_t>(min_free_bytes_.load(std::memory_order_relaxed));
         if (wanted == 0)
             return true;
-        while (std::filesystem::space(root_).available < wanted + size)
-            if (!evict_oldest())
-                return false;
-        return true;
+        const bool enough = std::filesystem::space(root_).available >= wanted + size;
+        if (!enough && !low_space_warned_.exchange(true, std::memory_order_relaxed))
+            std::cerr << "vc_reader: under " << wanted << " bytes free on the disk of " << root_.string()
+                      << "; no longer caching chunks there (reads continue from the network)\n";
+        low_space_.store(!enough, std::memory_order_relaxed);
+        return enough;
     }
 
     void check_path(const std::string& path)
@@ -489,6 +488,7 @@ private:
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
     std::atomic<std::int64_t> min_free_bytes_{0};
+    std::atomic<bool> low_space_{false}, low_space_warned_{false};
 };
 
 }  // namespace vcr

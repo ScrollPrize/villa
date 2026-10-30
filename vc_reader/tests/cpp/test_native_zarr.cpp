@@ -3,6 +3,7 @@
 #include "vc_reader/zarr.hpp"
 #include "sftp_fixture.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <array>
 #include <chrono>
@@ -234,6 +235,14 @@ void sparseLevels(const fs::path& root)
     auto selected = vcr::zarr::openPyramidLevel(path.string(), 10, {});
     require(selected.location == (path / "10").string(), "sparse physical selection");
     must_fail([&] { vcr::zarr::openPyramidLevel(path.string(), 0, {}); }, "sparse levels must not rebase");
+    {
+        const auto levels = vcr::zarr::pyramidLevels(path.string(), {});
+        require(levels.size() == 2 && levels[0].level == 3 && levels[1].level == 10 && levels[1].path == "10",
+                "pyramid levels keep their physical numbers");
+        require(levels[0].meta.shape == vcr::Index{4,4,4}, "pyramid level metadata");
+        const auto root = vcr::zarr::pyramidLevels((path / "3").string(), {});
+        require(root.size() == 1 && root[0].level == 0 && root[0].path.empty(), "root array is level zero");
+    }
     must_fail([&] { vcr::zarr::openPyramidLevel(path.string(), -1, {}); }, "negative level refused");
     require(vcr::zarr::openPyramidLevel((path / "3").string(), 0, {}).meta.shape == vcr::Index{4,4,4},
             "root array selection");
@@ -424,18 +433,29 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
         require(fs::exists(vdir/"0/.zarray") && fs::exists(vdir/"0/1.1.1.empty"),"budget preserves metadata and fill markers");
     }
 
-    // A free-space floor no disk can meet evicts everything and serves without caching.
+    // Under a free-space floor nothing is cached and nothing cached is removed.
     {
+        const auto files=[&] {
+            std::vector<std::string> names;
+            for(const auto& file:fs::directory_iterator(vdir/"0"))
+                names.push_back(file.path().filename().string());
+            std::sort(names.begin(),names.end());
+            return names;
+        };
+        const auto before=files();
         auto floorOptions=vc3dOptions;
         floorOptions.cacheMaxBytes=std::numeric_limits<std::int64_t>::max();
         floorOptions.cacheMinFreeBytes=std::numeric_limits<std::int64_t>::max()/2;
         auto a=vcr::zarr::Group::open(groupUrl,floorOptions).array("0");
+        const auto budget=vcr::zarr::diskBudget(a.layers[0].budgetRoot,std::nullopt);
+        const auto accounted=budget->total_bytes();
         expect_volume(read_all(*a.array),v,"read under a free-space floor");
         a.array->flush();
         require(a.array->last_write_error().empty(),"skipped cache writes are not errors");
-        require(!fs::exists(vdir/"0/0.1.0"),"the free-space floor evicted the oldest chunks");
-        require(vcr::zarr::diskBudget(a.layers[0].budgetRoot,std::nullopt)->total_bytes()==0,"nothing stays accounted");
-        vcr::zarr::diskBudget(a.layers[0].budgetRoot,std::nullopt)->set_min_free_bytes(0);
+        require(budget->low_space(),"the budget reports low space");
+        require(files()==before && budget->total_bytes()==accounted,"low space neither writes nor deletes");
+        budget->set_min_free_bytes(0);
+        budget->set_max_bytes(32);
     }
 
     // An owner-named VC3D directory is used as given (VC3D names caches by volume ID).
