@@ -397,8 +397,27 @@ def build_lowres_block_mask(
     scale_x = max(1, int(round(width / max(1, occupancy_w))))
     if user_mask is not None:
         pooled = downsample_mask_any(user_mask, scale_y, scale_x)
-        occupancy = pooled if occupancy is None else np.logical_and(occupancy, pooled)
+        if occupancy is None:
+            occupancy = pooled
+        else:
+            # A pyramid that floors odd sizes has one row/column fewer than
+            # the ceil-pooled mask; both grids start at the top-left pixel.
+            occupancy = np.logical_and(
+                occupancy, _fit_mask_to_shape(pooled, occupancy.shape)
+            )
     return occupancy, (scale_y, scale_x), occupancy_level
+
+
+def _fit_mask_to_shape(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Crop or False-pad a pooled mask to the occupancy grid (top-left aligned)."""
+
+    if mask.shape == tuple(shape):
+        return mask
+    fitted = np.zeros(shape, dtype=bool)
+    height = min(shape[0], mask.shape[0])
+    width = min(shape[1], mask.shape[1])
+    fitted[:height, :width] = mask[:height, :width]
+    return fitted
 
 
 class FlatPatchReader:
