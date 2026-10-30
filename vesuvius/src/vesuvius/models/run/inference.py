@@ -801,6 +801,8 @@ class Inferer():
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
         
         # Handle train.py model normalization scheme mapping
+        if self.model_normalization_scheme and normalization_scheme in ('minmax', 'rescale_to_01'):
+            normalization_scheme = 'instance_minmax'
         if self.model_normalization_scheme and normalization_scheme == 'zscore':
             # This is a train.py model with 'zscore' normalization
             if self.model_intensity_properties and 'mean' in self.model_intensity_properties and 'std' in self.model_intensity_properties:
