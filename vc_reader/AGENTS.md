@@ -1,4 +1,6 @@
 ### about this repo
+this package is intended as a c++ first app with python bindings available. behavior that is not python-specific should exist both in c++ and exposed to python via bindings.
+
 this package is intended to provide useful tools for working with the vesuvius challenge data
 - metadata browsing and parsing
 - volume and image data fetching and sampling
