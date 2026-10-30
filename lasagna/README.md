@@ -219,16 +219,16 @@ preprocessing commands above.
   - `0` → target intensity 0, contributes to loss.
   - `1` → target intensity 1, contributes to loss.
   - `2` → ignored (no loss contribution).
-- Train on random 256×256 crops (patches) sampled per layer to normalize varying input sizes; the patch size is configurable in [`TiffLayerDataset`](train_unet.py:11).
+- Train on random 256×256 crops (patches) sampled per layer to normalize varying input sizes; the patch size is configurable in [`TiffLayerDataset`](train_unet.py#L19).
 
 ## Project structure
 
 - [`train_unet.py`](train_unet.py)
-  - [`TiffLayerDataset`](train_unet.py:11): iterates over all layers in each multi-layer TIFF pair from `images/` and `labels/`, returning a random square patch (default `256×256`) per sample.
-  - [`UNet`](train_unet.py:94): small 2D U-Net for single-channel input and output (values in `[0, 1]`).
-  - [`masked_mse_loss`](train_unet.py:143): implements the label semantics (0 → 0, 1 → 1, 2 → ignore).
-  - [`train`](train_unet.py:170): basic training loop with Adam, masked MSE, and TensorBoard logging.
-  - [`main`](train_unet.py:215): CLI entry point for configuring paths and hyperparameters.
+  - [`TiffLayerDataset`](train_unet.py#L19): iterates over all layers in each multi-layer TIFF pair from `images/` and `labels/`, returning a random square patch (default `256×256`) per sample.
+  - [`UNet`](common.py#L26): small 2D U-Net for single-channel input and output (values in `[0, 1]`).
+  - [`masked_mse_loss`](train_unet.py#L126): implements the label semantics (0 → 0, 1 → 1, 2 → ignore).
+  - [`train`](train_unet.py#L584): basic training loop with Adam, masked MSE, and TensorBoard logging.
+  - [`main`](train_unet.py#L1129): CLI entry point for configuring paths and hyperparameters.
 
 Expected data layout (relative to the project root):
 

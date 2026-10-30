@@ -37,6 +37,8 @@ def _get_task_from_args(argv):
     for i, arg in enumerate(argv):
         if arg == "--task" and i + 1 < len(argv):
             return argv[i + 1]
+        if arg.startswith("--task="):
+            return arg.split("=", 1)[1]
     return "threshold"  # default
 
 
@@ -44,10 +46,12 @@ def main():
     """Main entry point for zarr tasks CLI."""
     # Quick check for --list-tasks before parsing
     if "--list-tasks" in sys.argv:
-        available_tasks = list_tasks()
         print("Available tasks:")
-        for task_name in available_tasks:
-            print(f"  {task_name}")
+        for task_name in list_tasks():
+            doc = (get_task(task_name).__doc__ or "").strip().splitlines()
+            summary = doc[0].rstrip(".") if doc else ""
+            print(f"  {task_name:<12} {summary}")
+        print("Run with --task NAME --help for a task's options.")
         return
 
     # Create base parser with common options
@@ -89,10 +93,22 @@ def main():
     # Validate task-specific arguments
     task_cls.validate_args(args)
 
+    if args.dry_run:
+        from .base import describe_plan
+
+        print("\n".join(describe_plan(task_cls, args)))
+        print("Dry run: nothing was written.")
+        return
+
     # Confirm overwrite for output
     if not args.inplace and args.output_zarr:
         output_path = Path(args.output_zarr)
-        if output_path.exists():
+        if output_path.exists() and not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit(
+                    f"Error: output path {output_path} already exists. "
+                    "Pass --yes to overwrite it without asking."
+                )
             response = input(
                 f"Output path {output_path} already exists. Overwrite? (y/n): "
             )

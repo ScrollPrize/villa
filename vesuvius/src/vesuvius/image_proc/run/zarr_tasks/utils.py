@@ -13,7 +13,7 @@ import json
 import shutil
 from multiprocessing import Pool
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import zarr
@@ -144,23 +144,74 @@ def create_level_dataset(
     )
 
 
+def read_level_scale(
+    group_path: str, level: str = "0"
+) -> Optional[Tuple[List[float], List[Optional[str]]]]:
+    """Voxel size and units of one level of an OME-Zarr group, if it records them.
+
+    Returns (scale, units) per axis, or None when the input is a bare array or its
+    multiscales metadata has no scale for that level.
+    """
+    try:
+        root = zarr.open_group(group_path, mode="r")
+        attrs = root.attrs.asdict() if hasattr(root.attrs, "asdict") else dict(root.attrs)
+    except Exception:
+        return None
+    multiscales = attrs.get("multiscales") or attrs.get("ome", {}).get("multiscales")
+    if not multiscales:
+        return None
+    ms = multiscales[0]
+    for dataset in ms.get("datasets", []):
+        if str(dataset.get("path")) != str(level):
+            continue
+        for transform in dataset.get("coordinateTransformations", []):
+            if transform.get("type") == "scale":
+                scale = [float(v) for v in transform["scale"]]
+                units = [axis.get("unit") if isinstance(axis, dict) else None
+                         for axis in ms.get("axes", [])]
+                if len(units) != len(scale):
+                    units = [None] * len(scale)
+                return scale, units
+    return None
+
+
 def write_multiscales_metadata(
-    root_group_path: str, axes_names: List[str], num_levels: int
+    root_group_path: str,
+    axes_names: List[str],
+    num_levels: int,
+    base_scale: Optional[Sequence[float]] = None,
+    units: Optional[Sequence[Optional[str]]] = None,
 ) -> None:
     """Write OME-Zarr multiscales metadata to .zattrs.
+
+    Every level gets the scale transform OME-Zarr 0.4 requires: ``base_scale``
+    (the voxel size of level 0, 1.0 per axis if unknown) doubled per level, as
+    :func:`build_pyramid` halves every axis per level.
 
     Args:
         root_group_path: Path to the root zarr group
         axes_names: List of axis names (e.g., ["z", "y", "x"])
         num_levels: Number of pyramid levels
+        base_scale: Voxel size of level 0 per axis, in ``units``
+        units: Unit per axis (e.g., "micrometer"), or None
     """
     root = zarr.open_group(root_group_path, mode="a")
+    base = [float(v) for v in base_scale] if base_scale is not None else [1.0] * len(axes_names)
     axes = []
-    for a in axes_names:
-        axes.append(
-            {"name": a, "type": "space" if a in ("x", "y", "z") else "unknown"}
-        )
-    datasets = [{"path": str(i)} for i in range(num_levels)]
+    for i, a in enumerate(axes_names):
+        axis = {"name": a, "type": "space" if a in ("x", "y", "z") else "unknown"}
+        if units is not None and units[i]:
+            axis["unit"] = units[i]
+        axes.append(axis)
+    datasets = [
+        {
+            "path": str(i),
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [v * 2**i for v in base]}
+            ],
+        }
+        for i in range(num_levels)
+    ]
     root.attrs["multiscales"] = [
         {
             "version": "0.4",

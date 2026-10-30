@@ -52,17 +52,40 @@ except ImportError:
 	from lasagna.live_omezarr_cache import LiveOmeZarrCache, selected_level_lock_for_input
 
 
+_CGROUP_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+
+
+def _available_cpus() -> int:
+	"""CPUs this process may use: its affinity mask, capped by a cgroup CPU quota.
+
+	os.cpu_count() reports every core on the host, so in a container limited to a
+	few CPUs the flush and accumulator pools started far more workers than it may run.
+	"""
+	try:
+		cpus = len(os.sched_getaffinity(0))
+	except (AttributeError, OSError):
+		cpus = os.cpu_count() or 1
+	try:  # cgroup v2: "max 100000" or "<quota> <period>"
+		with open(_CGROUP_CPU_MAX) as f:
+			quota, period = f.read().split()[:2]
+		if quota != "max":
+			cpus = min(cpus, max(1, -(-int(quota) // int(period))))
+	except (OSError, ValueError):
+		pass
+	return max(1, cpus)
+
+
 ChunkOriginZYX = tuple[int, int, int]
 RegionZYX = tuple[int, int, int, int, int, int]
 TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
-DEFAULT_FLUSH_WORKERS = min(64, max(1, os.cpu_count() or 1))
+DEFAULT_FLUSH_WORKERS = min(64, _available_cpus())
 DEFAULT_INPUT_READER = "tensorstore"
 DEFAULT_PREFETCH_TILES_PER_GPU = 4
 DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_INPUT_COPY_THREADS = 4
-DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
+DEFAULT_ACCUMULATOR_WORKERS = min(32, _available_cpus())
 DEFAULT_OME_COMPRESSOR = "blosc-zstd"
 OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
 _BLOSC_ZSTD_CONFIG = {

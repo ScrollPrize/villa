@@ -16,7 +16,8 @@ import zarr
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
-from ..utils import get_chunk_slices
+from ..utils import create_level_dataset, get_chunk_slices
+from vesuvius.data.utils import open_zarr_group
 
 # Try to import fastremap for efficient remapping
 try:
@@ -183,14 +184,14 @@ class RemapTask(ZarrTask):
             print("Output already exists, opening in r+ mode")
         else:
             print("Creating output zarr")
-            zarr.open(self.config.output_zarr, mode="w")
+            open_zarr_group(self.config.output_zarr, mode="w")
 
     def run(self) -> None:
         """Execute remap for all levels."""
         self.prepare()
 
         input_store = zarr.open(self.config.input_zarr, mode="r")
-        output_store = zarr.open(self.config.output_zarr, mode="a")
+        output_store = open_zarr_group(self.config.output_zarr, mode="a")
 
         for level in self._levels_to_process:
             print(f"\n{'='*60}")
@@ -205,13 +206,15 @@ class RemapTask(ZarrTask):
             print(f"Array dtype: {input_arr.dtype}")
 
             # Create output array with same properties
+            # zarr 3 removed Group.create_dataset; create_level_dataset works on both.
             if str(level) not in output_store:
-                output_store.create_dataset(
+                create_level_dataset(
+                    self.config.output_zarr,
                     str(level),
-                    shape=input_arr.shape,
-                    chunks=input_arr.chunks,
-                    dtype=input_arr.dtype,
-                    compressor=input_arr.compressor,
+                    input_arr.shape,
+                    input_arr.chunks,
+                    input_arr.dtype,
+                    input_arr.compressor,
                 )
 
             # Generate and process work items for this level
@@ -264,7 +267,7 @@ class RemapTask(ZarrTask):
     def finalize(self) -> None:
         """Copy metadata to output."""
         input_store = zarr.open(self.config.input_zarr, mode="r")
-        output_store = zarr.open(self.config.output_zarr, mode="a")
+        output_store = open_zarr_group(self.config.output_zarr, mode="a")
 
         # Copy metadata if present
         if ".zattrs" in input_store:

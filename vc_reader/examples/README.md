@@ -15,7 +15,18 @@ Saved outputs show an executed run on the published data.
 ## Run
 
 Install the package in the Python environment used by your Jupyter kernel.
-From the repository root, install the package with the extras used by the notebooks:
+The build compiles a native reader, so first install its C++ dependencies
+(libcurl, c-blosc, zstd, SQLite, nlohmann-json and pkg-config). On Debian or Ubuntu:
+
+```bash
+sudo apt-get install build-essential cmake pkg-config libcurl4-openssl-dev \
+  libblosc-dev libzstd-dev libsqlite3-dev nlohmann-json3-dev
+```
+
+On macOS: `brew install cmake pkg-config curl c-blosc zstd sqlite nlohmann-json`.
+
+Then, from the `vc_reader/` folder (not the villa repository root, which has no
+`pyproject.toml`), install the package with the extras used by the notebooks:
 
 ```bash
 python -m pip install -e '.[reader,labels,torch]'

@@ -8,14 +8,16 @@ and finalization.
 from __future__ import annotations
 
 import argparse
+import math
+import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import Pool
-from os import cpu_count
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
+import numpy as np
 import zarr
 from tqdm import tqdm
 
@@ -232,14 +234,27 @@ class ZarrTask(ABC):
         Returns:
             Zarr array
         """
+        return zarr.open(self._input_array_path(level), mode="r")
+
+    def _input_array_path(self, level: Optional[str] = None) -> str:
+        """Path of the input array that workers should open.
+
+        For an OME-Zarr group this is the level's array inside the group, not
+        the group root: zarr.open() on the root returns a Group, which cannot
+        be sliced or asked for its shape.
+        """
         opened = zarr.open(self.config.input_zarr, mode="r")
-
         if isinstance(opened, zarr.Group):
-            if level is not None:
-                return opened[level]
-            return opened["0"]
+            return f"{self.config.input_zarr}/{level if level is not None else '0'}"
+        return self.config.input_zarr
 
-        return opened
+    @classmethod
+    def planned_output(cls, args: argparse.Namespace, shape: Tuple[int, ...], dtype) -> Tuple[Tuple[int, ...], Any]:
+        """Level 0 shape and dtype this task would write, for --dry-run.
+
+        The default is the input's; tasks that change either override it.
+        """
+        return tuple(shape), dtype
 
     @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
@@ -254,6 +269,28 @@ class ZarrTask(ABC):
             SystemExit: If validation fails
         """
         pass
+
+
+_CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
+
+
+def available_cpus() -> int:
+    """CPUs this process may use: its affinity mask, capped by a cgroup CPU quota.
+
+    os.cpu_count() reports every core on the host, so in a container or batch job
+    limited to a few CPUs it starts far more workers than the job may run.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    try:  # cgroup v2: "max 100000" or "<quota> <period>"
+        quota, period = _CGROUP_CPU_MAX.read_text().split()[:2]
+        if quota != "max":
+            cpus = min(cpus, max(1, math.ceil(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return max(1, cpus)
 
 
 def get_base_parser() -> argparse.ArgumentParser:
@@ -286,7 +323,7 @@ def get_base_parser() -> argparse.ArgumentParser:
         "--num-workers",
         type=int,
         default=None,
-        help="Number of worker processes (default: number of CPU cores)",
+        help="Number of worker processes (default: the CPUs this job may use)",
     )
     parser.add_argument(
         "--inplace",
@@ -304,7 +341,52 @@ def get_base_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List available tasks and exit",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be read and written, with chunk counts and sizes, then exit",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Overwrite an existing output without asking (for scripts and batch jobs)",
+    )
     return parser
+
+
+def describe_plan(task_cls, args: argparse.Namespace) -> List[str]:
+    """What a run would read and write, without writing anything (for --dry-run)."""
+    level = str(args.level) if args.level is not None else "0"
+    opened = zarr.open(args.input_zarr, mode="r")
+    arr = opened[level] if isinstance(opened, zarr.Group) else opened
+    n_chunks = math.prod(math.ceil(s / c) for s, c in zip(arr.shape, arr.chunks))
+    out_shape, out_dtype = task_cls.planned_output(args, arr.shape, arr.dtype)
+    in_bytes = math.prod(arr.shape) * np.dtype(arr.dtype).itemsize
+    out_bytes = math.prod(out_shape) * np.dtype(out_dtype).itemsize
+    levels = getattr(args, "num_levels", None)
+    workers = args.num_workers or available_cpus()
+    lines = [
+        f"task       {args.task}",
+        f"input      {args.input_zarr}" + (f" (level {level})" if isinstance(opened, zarr.Group) else ""),
+        f"           shape {tuple(arr.shape)}, chunks {tuple(arr.chunks)}, {np.dtype(arr.dtype)}, "
+        f"{n_chunks} chunks, {_gb(in_bytes)} uncompressed",
+    ]
+    if args.output_zarr:
+        lines.append(f"output     {args.output_zarr}" + ("  (exists: would be replaced)"
+                                                         if Path(args.output_zarr).exists() else ""))
+        lines.append(f"           level 0 shape {tuple(out_shape)}, {np.dtype(out_dtype)}, "
+                     f"{_gb(out_bytes)} uncompressed" + (f", {levels} levels" if levels else ""))
+    elif args.inplace:
+        lines.append("output     in place")
+    lines.append(f"workers    {workers}, about {math.ceil(n_chunks / workers)} chunks each")
+    return lines
+
+
+def _gb(n: int) -> str:
+    if n >= 1e8:
+        return f"{n / 1e9:.2f} GB"
+    return f"{n / 1e6:.1f} MB" if n >= 1e5 else f"{n / 1e3:.1f} kB"
 
 
 def make_task_config(args: argparse.Namespace) -> TaskConfig:
@@ -319,7 +401,7 @@ def make_task_config(args: argparse.Namespace) -> TaskConfig:
     return TaskConfig(
         input_zarr=args.input_zarr,
         output_zarr=args.output_zarr,
-        num_workers=args.num_workers if args.num_workers else cpu_count(),
+        num_workers=args.num_workers if args.num_workers else available_cpus(),
         inplace=args.inplace,
         level=args.level,
     )

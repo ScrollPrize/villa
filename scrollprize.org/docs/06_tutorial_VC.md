@@ -219,7 +219,7 @@ rclone copy :http:/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/2023020518073
 If you wish to begin with a smaller portion of Scroll 1, rather than the entire scroll, you can download 1cm of scan data from the center using:
 
 ```bash
-for i in `seq 6000 7250`; do wget http://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0\$i.tif; done
+for i in `seq 6000 7250`; do wget https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0$i.tif; done
 ```
 
 Be sure to have the config.json file at the root of the `.volpkg` directory, and the meta.json file in the `volumes` directory so that VC can work with it.
