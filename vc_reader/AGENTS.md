@@ -12,6 +12,9 @@ performance must be prioritized for anything implemented in this repository. the
 - readme files and other repository files must not contain development notes unless they are relevant to the implementation (nonstandard implementation or gotcha that would be helpful to future developers). during development you are welcome to keep notes in a gitignored development_notes folder. 
 - you can access a nvidia-gpu on most development machines by elevating the request
 
+### c++ first, python binds
+- there must be absolutely zero behavior in vc_reader that exists only in python. everything vc_reader can do is implemented in c++ and available to c++ callers, and python binds that code. new functionality goes into c++ first.
+
 ### cuda implementations
 - vc_reader has two backends -- cpu and cuda -- for most things within vc_reader that operate on volumes or images, wherever a cpu implementation exists there should be a cuda implementation as well  
 
