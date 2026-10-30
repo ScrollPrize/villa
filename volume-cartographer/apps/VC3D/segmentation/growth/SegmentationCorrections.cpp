@@ -365,44 +365,6 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload(bool onlyActiveCol
     return payload;
 }
 
-SegmentationCorrectionsPayload CorrectionsState::buildPayloadForCollection(uint64_t collectionId) const
-{
-    SegmentationCorrectionsPayload payload;
-    if (!_collection) {
-        return payload;
-    }
-
-    const auto& collections = _collection->getAllCollections();
-    auto it = collections.find(collectionId);
-    if (it == collections.end()) {
-        return payload;
-    }
-
-    SegmentationCorrectionsPayload::Collection entry;
-    entry.id = it->second.id;
-    entry.name = it->second.name;
-    entry.metadata = it->second.metadata;
-    entry.color = it->second.color;
-    entry.anchor2d = it->second.anchor2d;
-
-    std::vector<ColPoint> points;
-    points.reserve(it->second.points.size());
-    for (const auto& pair : it->second.points) {
-        points.push_back(pair.second);
-    }
-    std::sort(points.begin(), points.end(), [](const ColPoint& a, const ColPoint& b) {
-        return a.id < b.id;
-    });
-    if (points.empty()) {
-        return payload;
-    }
-
-    entry.points = std::move(points);
-    payload.collections.push_back(std::move(entry));
-
-    return payload;
-}
-
 void CorrectionsState::onCollectionRemoved(uint64_t id)
 {
     if (!_collection) {

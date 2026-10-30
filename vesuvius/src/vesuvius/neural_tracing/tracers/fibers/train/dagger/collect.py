@@ -298,12 +298,13 @@ def supply_summary(rows, reasons, seconds, traced):
 
 
 def switch_detector(args, checkpoint, fibers, band, spec):
-    """Switch detection against neighboring annotations; AFV sources only (Paris 4 has no neighbor paths)."""
-    if not (args.dataset_name and hasattr(fibers, 'metadata')):
+    """Switch detection against neighboring annotations; fiber-store sources only (Paris 4 has no neighbor paths)."""
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore
+    if not (args.dataset_name and isinstance(fibers, FiberStore)):
         return None
-    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
     from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
-    return BankSwitchDetector([AFVBank(fibers)], args.bank_switch_tolerance, args.bank_own_tolerance)
+    return BankSwitchDetector([FiberBank(fibers)], args.bank_switch_tolerance, args.bank_own_tolerance)
 
 
 def load_dataset(args, checkpoint):
@@ -321,8 +322,8 @@ def load_dataset(args, checkpoint):
         spec = CTVolumeSpec.from_dict(checkpoint['vol_spec'])
         _,fibers,_,_ = load_primary_dataset(document,spec)
         return spec,fibers,None
-    from vesuvius.neural_tracing.tracers.fibers.data.datasets import open_afv_source
-    fibers, _, spec, _ = open_afv_source(source, document['cache_dir'], checkpoint['ct_normalization'])
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import open_fiber_source
+    fibers, _, spec = open_fiber_source(source, document['cache_dir'], checkpoint['ct_normalization'])
     return spec,fibers,None
 
 

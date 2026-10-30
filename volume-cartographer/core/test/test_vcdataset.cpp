@@ -1,5 +1,5 @@
 // Coverage for core/src/VcDataset.cpp through the direct (non-Volume) API:
-// createZarrDataset + writeChunk + readChunk + readRegion + openZarrLevels
+// createZarrDataset + writeChunk + readChunk + readRegion
 // + readZarrAttributes / writeZarrAttributes.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -153,36 +153,25 @@ TEST_CASE("createZarrDataset: blosc compressor metadata is numcodecs-compliant")
     fs::remove_all(d);
 }
 
-TEST_CASE("VcDataset: readRegion / writeRegion over a 2x2x2 chunk block")
+TEST_CASE("VcDataset: readRegion over a 2x2x2 chunk block")
 {
     auto d = tmpDir("region");
     auto ds = vc::createZarrDataset(d, "arr",
         /*shape=*/{8, 8, 8}, /*chunks=*/{4, 4, 4},
         vc::VcDtype::uint8, "none");
     REQUIRE(ds);
-    // Region covers all 8 chunks (2x2x2 grid).
-    std::vector<uint8_t> in(8 * 8 * 8);
-    for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i & 0xFF);
-    CHECK(ds->writeRegion({0, 0, 0}, {8, 8, 8}, in.data()));
-    std::vector<uint8_t> out(in.size(), 0);
+    // Each chunk holds its own linear chunk index; the region covers all 8.
+    for (size_t cz = 0; cz < 2; ++cz)
+        for (size_t cy = 0; cy < 2; ++cy)
+            for (size_t cx = 0; cx < 2; ++cx) {
+                std::vector<uint8_t> chunk(4 * 4 * 4, static_cast<uint8_t>(cz * 4 + cy * 2 + cx));
+                REQUIRE(ds->writeChunk(cz, cy, cx, chunk.data(), chunk.size()));
+            }
+    std::vector<uint8_t> out(8 * 8 * 8, 0xFF);
     CHECK(ds->readRegion({0, 0, 0}, {8, 8, 8}, out.data()));
-    CHECK(out[0] == in[0]);
-    CHECK(out[in.size() - 1] == in[in.size() - 1]);
-    fs::remove_all(d);
-}
-
-TEST_CASE("openZarrLevels: enumerates numerically-named subdirs with .zarray")
-{
-    auto d = tmpDir("levels");
-    // Create three levels: 0 (32^3), 1 (16^3), 2 (8^3)
-    vc::createZarrDataset(d, "0", {32, 32, 32}, {16, 16, 16}, vc::VcDtype::uint8, "none");
-    vc::createZarrDataset(d, "1", {16, 16, 16}, {8, 8, 8}, vc::VcDtype::uint8, "none");
-    vc::createZarrDataset(d, "2", {8, 8, 8}, {8, 8, 8}, vc::VcDtype::uint8, "none");
-    auto levels = vc::openZarrLevels(d);
-    CHECK(levels.size() == 3);
-    CHECK(levels[0]->shape()[0] == 32);
-    CHECK(levels[1]->shape()[0] == 16);
-    CHECK(levels[2]->shape()[0] == 8);
+    CHECK(out[0] == 0);
+    CHECK(out[out.size() - 1] == 7);
+    CHECK(out[(1 * 8 + 5) * 8 + 2] == 2);  // z=1, y=5, x=2 lies in chunk (0, 1, 0)
     fs::remove_all(d);
 }
 

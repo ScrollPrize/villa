@@ -1,0 +1,21 @@
+{
+  "fiber_split_weight_search": {
+    "base_config": "/configs/fiber-layout/base.json",
+    "dataset": "/data/fiber-layout/selected",
+    "baseline_root": "/data/fiber-layout/prepared",
+    "gt_root": "/data/fiber-layout/gt",
+    "output_root": "/data/fiber-layout/search",
+    "devices": ["0", "1"],
+    "initial_parameters": {"rejection_cost": 1, "continuation_weight": 1, "split_min_perpendicular": 3},
+    "weights": ["rejection_cost", "continuation_weight", "split_min_perpendicular"],
+    "bounds": {"rejection_cost": [0, 10], "continuation_weight": [0, 10], "split_min_perpendicular": [2, 6]},
+    "factor_grids": [[0.5, 2], [0.9, 1.1]],
+    "discrete_values": {"split_min_perpendicular": [2, 3, 6]},
+    "proposal_groups": [{
+      "name": "joint_costs",
+      "axes": [{"parameters": ["rejection_cost", "continuation_weight"], "mode": "factor", "values": [0.5, 2]}]
+    }],
+    "accepted_improvements": null,
+    "background": false
+  }
+}

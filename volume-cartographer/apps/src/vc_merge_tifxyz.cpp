@@ -11,11 +11,14 @@
 // anchor_bin_size) are hard-coded. For each edge: SurfacePatchIndex::locate-
 // based overlap, real-overlap mask, stratified anchors, RANSAC similarity.
 // Across all edges: joint per-surface affine bundle adjustment, per-surface
-// TPS RBF, N-way EDT blend, OBJ emit, and rasterization via
-// vc_obj2tifxyz_legacy.
+// TPS RBF, N-way EDT blend, and the merged mesh rasterized to a grid
+// (vc::meshing::StepUvRasterizer) and exported as OBJ.
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc_merge_tifxyz_grid.hpp"
@@ -356,6 +359,12 @@ constexpr int      kAnchorBinSize      = 1;
 
 struct GMConfig {
     fs::path paths_dir;
+    // Store mode: the grid names stored surface UUIDs and the result becomes a
+    // new surface object with these tags and volume binding.
+    StoreSurfaces* store{nullptr};
+    // The inputs are read in storeOptions->volume's voxels when it is given,
+    // and the merge is bound to the volume they were read through.
+    const StoreToolOptions* storeOptions{nullptr};
     std::string ref;            // empty => auto (largest by valid cells)
     // Per-edge RANSAC similarity (CLI-overridable).
     int      ransac_iters{3000};
@@ -409,9 +418,9 @@ struct GMSurface {
     int   valid{0};
 };
 
-GMSurface gmLoadSurface(const GMSurfaceSpec& spec)
+GMSurface gmLoadSurface(const GMSurfaceSpec& spec, StoreSurfaces* store, const StoreToolOptions* options)
 {
-    auto up = load_quad_from_tifxyz(spec.path.string());
+    auto up = store ? store->load(spec.path.string(), true, options->volume) : load_quad_from_tifxyz(spec.path);
     if (!up) throw std::runtime_error("failed to load surface: " + spec.path.string());
     GMSurface g;
     g.name = spec.name;
@@ -606,7 +615,7 @@ EdgeAnchors gmComputeEdgeAnchors(const std::shared_ptr<QuadSurface>& A,
 //   4. per-surface TPS RBF on union of incident midpoint residuals
 //   4.5 remap UVs into reference frame
 //   5. N-way EDT blend with Tukey-IRLS consensus
-//   6. emit OBJ + shell out to vc_obj2tifxyz_legacy
+//   6. build the merged mesh, rasterize it, export it as OBJ
 // -----------------------------------------------------------------------------
 
 inline cv::Vec2d gmApplyAffine(const cv::Matx23d& M, const cv::Vec2d& p)
@@ -1518,60 +1527,22 @@ gmEdtBlend(const std::vector<std::string>& names,
     return out;
 }
 
-int rasterizeObjToTifxyz(const fs::path& obj2tifxyz,
-                         const fs::path& obj,
-                         const fs::path& output,
-                         int step_size)
-{
-    // vc_obj2tifxyz_legacy refuses if `output` already exists, so we wipe it.
-    // Callers that want the OBJ inside `output` must write the OBJ to a
-    // sibling temp path, rasterize, then move the OBJ in afterwards.
-    if (fs::exists(output)) fs::remove_all(output);
-    std::ostringstream cmd;
-    cmd << "\"" << obj2tifxyz.string() << "\" "
-        << "\"" << obj.string() << "\" "
-        << "\"" << output.string() << "\" "
-        << step_size;
-    const int rc = std::system(cmd.str().c_str());
-    if (rc != 0) {
-        std::cerr << "vc_obj2tifxyz_legacy failed (rc=" << rc << ")\n";
-        return 1;
-    }
-    // vc_obj2tifxyz_legacy gives the rasterized surface its own fresh UUID.
-    return 0;
-}
-
-void reportTifxyzShape(const fs::path& dir, const std::string& label)
-{
-    cv::Mat ox = cv::imread((dir / "x.tif").string(), cv::IMREAD_UNCHANGED);
-    if (ox.empty() || ox.depth() != CV_32F) return;
-    int valid = 0;
-    for (int r = 0; r < ox.rows; ++r) {
-        const float* p = ox.ptr<float>(r);
-        for (int c = 0; c < ox.cols; ++c) if (p[c] != -1.0f) ++valid;
-    }
-    std::cout << label << ": (" << ox.rows << ", " << ox.cols
-              << "), valid=" << valid << "\n";
-}
-
-fs::path resolveObj2Tifxyz(const std::string& override_path, const char* argv0)
-{
-    if (!override_path.empty()) return override_path;
-    try {
-        const fs::path self = fs::canonical(argv0);
-        const fs::path adj  = self.parent_path() / "vc_obj2tifxyz_legacy";
-        if (fs::exists(adj)) return adj;
-    } catch (...) { /* fall through to PATH lookup */ }
-    return fs::path("vc_obj2tifxyz_legacy");
-}
+// The merged mesh, per input surface in emission order: vertex i has UV i.
+struct GMMesh {
+    struct Chunk { size_t v0, nv, f0, nf; };
+    std::vector<cv::Vec3f> v;
+    std::vector<cv::Vec2d> vt;
+    std::vector<vc::meshing::UvFace> f;
+    std::vector<Chunk> chunks;
+};
 
 std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
                               const Mat1b& mask,
                               const Mat1f& uc, const Mat1f& ur,
-                              std::ostream& obj,
-                              int v_offset, int vt_offset, int step_size)
+                              GMMesh& mesh, int step_size)
 {
     const int H = X.rows, W = X.cols;
+    const int64_t v_offset = (int64_t)mesh.v.size();
     std::vector<int64_t> idx((size_t)H * W, -1);
     auto IDX = [&](int r, int c) -> int64_t& { return idx[(size_t)r * W + c]; };
     int n_v = 0;
@@ -1586,9 +1557,7 @@ std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
             ++n_v;
         }
     }
-    std::ostringstream vbuf, vtbuf;
-    vbuf  << std::fixed << std::setprecision(4);
-    vtbuf << std::fixed << std::setprecision(4);
+    GMMesh::Chunk chunk{mesh.v.size(), (size_t)n_v, mesh.f.size(), 0};
     for (int r = 0; r < H; ++r) {
         const float* xp = X.ptr<float>(r);
         const float* yp = Y.ptr<float>(r);
@@ -1597,17 +1566,18 @@ std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
         const float* vv = ur.ptr<float>(r);
         for (int c = 0; c < W; ++c) {
             if (IDX(r, c) < 0) continue;
-            vbuf  << "v " << xp[c] << " " << yp[c] << " " << zp[c] << "\n";
-            vtbuf << "vt " << (double)uu[c] * step_size
-                  << " " << (double)vv[c] * step_size << "\n";
+            mesh.v.emplace_back(xp[c], yp[c], zp[c]);
+            mesh.vt.emplace_back((double)uu[c] * step_size, (double)vv[c] * step_size);
         }
     }
-    obj << vbuf.str();
-    obj << vtbuf.str();
+    auto face = [&](int64_t a, int64_t b, int64_t c) {
+        vc::meshing::UvFace f;
+        f.v[0] = f.vt[0] = (int)a;
+        f.v[1] = f.vt[1] = (int)b;
+        f.v[2] = f.vt[2] = (int)c;
+        mesh.f.push_back(f);
+    };
     int n_q = 0;
-    std::ostringstream fbuf;
-    auto vidx  = [&](int64_t a){ return a + 1; };
-    auto vtidx = [&](int64_t a){ return (a - v_offset) + vt_offset + 1; };
     for (int r = 0; r < H - 1; ++r) {
         for (int c = 0; c < W - 1; ++c) {
             const int64_t a = IDX(r, c);
@@ -1615,17 +1585,34 @@ std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
             const int64_t cc= IDX(r+1, c);
             const int64_t d = IDX(r+1, c+1);
             if (a < 0 || b < 0 || cc < 0 || d < 0) continue;
-            fbuf << "f " << vidx(a) << "/" << vtidx(a)
-                 << " "  << vidx(b) << "/" << vtidx(b)
-                 << " "  << vidx(d) << "/" << vtidx(d) << "\n";
-            fbuf << "f " << vidx(a) << "/" << vtidx(a)
-                 << " "  << vidx(d) << "/" << vtidx(d)
-                 << " "  << vidx(cc) << "/" << vtidx(cc) << "\n";
+            face(a, b, d);
+            face(a, d, cc);
             ++n_q;
         }
     }
-    obj << fbuf.str();
+    chunk.nf = 2 * (size_t)n_q;
+    mesh.chunks.push_back(chunk);
     return {n_v, 2 * n_q};
+}
+
+// The merged mesh as an OBJ export: per input surface its vertices, UVs and faces.
+void gmWriteObj(const GMMesh& mesh, const std::string& header, const fs::path& path)
+{
+    std::ofstream obj(path);
+    if (!obj) throw std::runtime_error("cannot open OBJ for writing: " + path.string());
+    obj << header << "\n" << std::fixed << std::setprecision(4);
+    for (const auto& chunk : mesh.chunks) {
+        for (size_t i = chunk.v0; i < chunk.v0 + chunk.nv; ++i)
+            obj << "v " << mesh.v[i][0] << " " << mesh.v[i][1] << " " << mesh.v[i][2] << "\n";
+        for (size_t i = chunk.v0; i < chunk.v0 + chunk.nv; ++i)
+            obj << "vt " << mesh.vt[i][0] << " " << mesh.vt[i][1] << "\n";
+        for (size_t i = chunk.f0; i < chunk.f0 + chunk.nf; ++i) {
+            const auto& f = mesh.f[i];
+            obj << "f " << f.v[0] + 1 << "/" << f.vt[0] + 1 << " " << f.v[1] + 1 << "/" << f.vt[1] + 1
+                << " " << f.v[2] + 1 << "/" << f.vt[2] + 1 << "\n";
+        }
+    }
+    if (!obj) throw std::runtime_error("failed writing OBJ: " + path.string());
 }
 
 // Scan paths_dir for any directory whose name is <base> or <base>_v<digits>.
@@ -1662,7 +1649,7 @@ std::string gmPickVersionSuffix(const fs::path& paths_dir,
 
 // -----------------------------------------------------------------------------
 // Top-level driver: load surfaces, run pairwise per edge in-memory, run all
-// global stages, emit OBJ + invoke vc_obj2tifxyz_legacy. Writes one summary
+// global stages, rasterize the merged mesh and export it. Writes one summary
 // JSON. Returns 0 on success.
 // -----------------------------------------------------------------------------
 
@@ -1697,8 +1684,7 @@ struct GMAlignState {
 };
 
 GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg);
-int gmBlendAndRasterize(GMAlignState& state, const fs::path& obj2tifxyz,
-                        int strip_cols);
+int gmBlendAndRasterize(GMAlignState& state, int strip_cols);
 
 // strip_cols controls phase 2 only. 0 (default) blends every surface in a
 // single shared raster (canonical single-pass behavior). >=1 splits the merge
@@ -1708,12 +1694,11 @@ int gmBlendAndRasterize(GMAlignState& state, const fs::path& obj2tifxyz,
 // the full grid, so all strips share the same reference frame and stitch
 // without further transforms.
 int gmRunGlobalMerge(const fs::path& merge_path,
-                     const fs::path& obj2tifxyz,
                      GMConfig cfg,
                      int strip_cols)
 {
     GMAlignState state = gmAlignAll(merge_path, std::move(cfg));
-    return gmBlendAndRasterize(state, obj2tifxyz, strip_cols);
+    return gmBlendAndRasterize(state, strip_cols);
 }
 
 // Phase 1: resolve grid → load surfaces → build patch index → per-edge anchors
@@ -1727,15 +1712,21 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
     // Preserve a caller-supplied paths_dir (e.g. --paths-dir from the CLI
     // or the GUI handler); fall back to <merge.parent>/paths only when
     // unset, matching the legacy default.
-    if (st.cfg.paths_dir.empty())
-        st.cfg.paths_dir = merge_path.parent_path() / "paths";
-    if (!fs::is_directory(st.cfg.paths_dir))
-        throw std::runtime_error("expected paths_dir " +
-            st.cfg.paths_dir.string() + " to be a directory (override "
-            "with --paths-dir, default is <merge.parent>/paths)");
+    if (st.cfg.store) {
+        // Stored inputs; the merge is stored as a new surface.
+        std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
+        gmResolveGrid(merge_path, {}, st.cfg.surfaces, st.cfg.edges);
+    } else {
+        if (st.cfg.paths_dir.empty())
+            st.cfg.paths_dir = merge_path.parent_path() / "paths";
+        if (!fs::is_directory(st.cfg.paths_dir))
+            throw std::runtime_error("expected paths_dir " +
+                st.cfg.paths_dir.string() + " to be a directory (override "
+                "with --paths-dir, default is <merge.parent>/paths)");
 
-    std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
-    gmResolveGrid(merge_path, st.cfg.paths_dir, st.cfg.surfaces, st.cfg.edges);
+        std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
+        gmResolveGrid(merge_path, st.cfg.paths_dir, st.cfg.surfaces, st.cfg.edges);
+    }
     std::cout << "  " << st.cfg.surfaces.size() << " surfaces, "
               << st.cfg.edges.size() << " auto-derived edges\n";
     gmCheckConnected(st.cfg.surfaces, st.cfg.edges);
@@ -1748,17 +1739,19 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
     for (const auto& s : st.cfg.surfaces)
         if (s.name < alpha_first) alpha_first = s.name;
     const std::string base_final = alpha_first + "_merged";
-    const std::string vsuffix    = gmPickVersionSuffix(st.cfg.paths_dir, base_final);
-    st.output_dir   = st.cfg.paths_dir / (base_final + vsuffix);
-    st.final_name   = st.output_dir.filename().string();
-    st.obj_out      = st.output_dir / (st.final_name + ".obj");
-    st.summary_path = st.output_dir / (st.final_name + "_summary.json");
-    std::cout << "  output: " << st.output_dir << "\n";
+    if (!st.cfg.store) {
+        const std::string vsuffix = gmPickVersionSuffix(st.cfg.paths_dir, base_final);
+        st.output_dir   = st.cfg.paths_dir / (base_final + vsuffix);
+        st.final_name   = st.output_dir.filename().string();
+        st.obj_out      = st.output_dir / (st.final_name + ".obj");
+        st.summary_path = st.output_dir / (st.final_name + "_summary.json");
+        std::cout << "  output: " << st.output_dir << "\n";
+    }
 
     std::cout << "[1/6] loading surfaces" << std::endl;
     st.names.reserve(st.cfg.surfaces.size());
     for (const auto& spec : st.cfg.surfaces) {
-        GMSurface s = gmLoadSurface(spec);
+        GMSurface s = gmLoadSurface(spec, st.cfg.store, st.cfg.storeOptions);
         std::cout << "  " << s.name << ": shape=(" << s.H << "," << s.W
                   << "), valid=" << s.valid << "\n";
         st.names.push_back(s.name);
@@ -1785,7 +1778,7 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
         for (const auto& n : st.names) all.push_back(st.surfs.at(n).qs);
         std::cout << "Building SurfacePatchIndex over " << all.size()
                   << " surfaces..." << std::endl;
-        patchIndex.rebuild(all);
+        patchIndex.rebuild(all, 0.0f, true);
     }
 
     std::cout << "[2/6] per-edge overlap+anchors+RANSAC similarity\n";
@@ -2099,14 +2092,12 @@ gmGroupSurfacesByStrip(const fs::path& merge_path,
 }
 
 // Phase 2: blend per-surface XYZ into the shared ref-frame raster (or one
-// raster per column-strip when strip_cols>=1), emit OBJ, shell out to
-// vc_obj2tifxyz_legacy to produce the final tifxyz, and write the summary
-// JSON. Striping splits the EDT-blend cost (W*H*N pixels) into smaller per-
+// raster per column-strip when strip_cols>=1), rasterize the merged mesh into
+// the result surface, export the mesh as OBJ, and write the summary JSON. Striping splits the EDT-blend cost (W*H*N pixels) into smaller per-
 // strip rasters with a smaller surface count, but reuses the single global
 // alignment so neighboring strips fit together without further
 // transformation.
-int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
-                        int strip_cols)
+int gmBlendAndRasterize(GMAlignState& st, int strip_cols)
 {
     const GMConfig& cfg = st.cfg;
 
@@ -2124,20 +2115,12 @@ int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
                   << "] V:[" << st.v_min << "," << st.v_max << "])\n";
     }
 
-    const fs::path target_dir = st.output_dir;
-    const fs::path target_obj = st.obj_out;
-    const fs::path obj_tmp    = cfg.paths_dir / target_obj.filename();
-    std::cout << "[6/6] writing OBJ to " << target_obj << "\n";
+    std::cout << "[6/6] building the merged mesh\n";
+    GMMesh mesh;
+    const std::string obj_header = "# Global merge: " + std::to_string(st.names.size()) + " surfaces, " +
+                                   std::to_string(strips.size()) + " strip(s), ref=" + st.ref;
     {
-        std::ofstream obj(obj_tmp);
-        if (!obj) {
-            std::cerr << "cannot open OBJ for writing: " << obj_tmp << "\n";
-            return 1;
-        }
-        obj << "# Global merge: " << st.names.size() << " surfaces, "
-            << strips.size() << " strip(s), ref=" << st.ref << "\n";
-
-        int v_off=0, vt_off=0, total_v=0, total_f=0;
+        int total_v=0, total_f=0;
         for (size_t si = 0; si < strips.size(); ++si) {
             const auto& strip_names = strips[si];
 
@@ -2197,22 +2180,29 @@ int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
                 const auto& bo = xyz_blended.at(n);
                 const GMUV& uv = st.uv_map.at(n);
                 auto [nv, nf] = gmEmitMesh(bo.X, bo.Y, bo.Z, s.mask, uv.uc, uv.ur,
-                                           obj, v_off, vt_off, kStepSize);
+                                           mesh, kStepSize);
                 std::cout << "  " << n << ": " << nv << " verts, " << nf << " tris\n";
-                v_off += nv; vt_off += nv;
                 total_v += nv; total_f += nf;
             }
         }
         std::cout << "  total: " << total_v << " verts, " << total_f << " tris\n";
     }
 
-    std::cout << "rasterizing OBJ -> " << target_dir
-              << " (step=" << kStepSize << ")\n";
-    if (const int rc = rasterizeObjToTifxyz(obj2tifxyz, obj_tmp, target_dir,
-                                            kStepSize); rc != 0)
-        return rc;
-    fs::rename(obj_tmp, target_obj);
-    reportTifxyzShape(target_dir, "output");
+    std::cout << "rasterizing the mesh (step=" << kStepSize << ")\n";
+    std::unique_ptr<QuadSurface> merged;
+    {
+        vc::meshing::StepUvRasterizer rasterizer;
+        std::vector<cv::Vec2f> uvs(mesh.vt.begin(), mesh.vt.end());
+        rasterizer.setMesh(mesh.v, std::move(uvs), mesh.f);
+        rasterizer.determineGridDimensions(kStepSize);
+        merged.reset(rasterizer.createQuadSurface());
+    }
+    {
+        int valid = 0;
+        for (const auto& p : *merged->rawPointsPtr()) if (p[0] != -1.0f) ++valid;
+        std::cout << "output: (" << merged->rawPointsPtr()->rows << ", " << merged->rawPointsPtr()->cols
+                  << "), valid=" << valid << "\n";
+    }
 
     json summary = {
         {"merge_json", st.merge_path.string()},
@@ -2253,11 +2243,33 @@ int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
             {"H", s.H}, {"W", s.W}, {"valid", s.valid},
         });
     }
-    {
-        std::ofstream f(st.summary_path);
+    auto writeSummary = [&](const fs::path& path) {
+        std::ofstream f(path);
         f << summary.dump(2) << std::endl;
-        std::cout << "wrote summary to " << st.summary_path << "\n";
+        std::cout << "wrote summary to " << path << "\n";
+    };
+    if (cfg.store) {
+        // The merge becomes a surface object; the OBJ and summary go to its artifact directory.
+        // Named after the first input, as the directory name is in tifxyz mode.
+        const auto& first = st.surfs.at(st.names.front()).qs->meta;
+        const std::string name = (first.contains("name") ? first["name"].get_string() : st.names.front()) + "_merged";
+        const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.storeOptions->tags);
+        const auto artifacts = cfg.store->objects().session()->artifactDirectory(cfg.store->objects().attachment(), uuid);
+        std::cout << "writing OBJ to " << artifacts / "merge.obj" << "\n";
+        gmWriteObj(mesh, obj_header, artifacts / "merge.obj");
+        summary["output"] = uuid;
+        summary["obj_out"] = (artifacts / "merge.obj").string();
+        writeSummary(artifacts / "merge_summary.json");
+        cfg.store->objects().finish();
+        std::cout << "surface_uuid: " << uuid << std::endl;
+        return 0;
     }
+    // A merge is a new object with its own UUID.
+    merged->meta["uuid"] = vc::objects::util::newUuid();
+    merged->save(st.output_dir);
+    std::cout << "writing OBJ to " << st.obj_out << "\n";
+    gmWriteObj(mesh, obj_header, st.obj_out);
+    writeSummary(st.summary_path);
     return 0;
 }
 
@@ -2325,7 +2337,7 @@ int main(int argc, char** argv)
         "runs), where <alpha_first> is the alphabetically smallest surface "
         "name in the grid. Runs per-edge overlap+anchor passes in-memory, "
         "RANSAC similarity, joint affine, per-surface TPS RBF, EDT blend, "
-        "OBJ emit, and vc_obj2tifxyz_legacy rasterization.");
+        "the merged mesh rasterized to a grid and exported as OBJ.");
     desc.add_options()
         ("help,h", "print help")
         ("merge,m", po::value<std::string>(),
@@ -2337,9 +2349,6 @@ int main(int argc, char** argv)
          "Defaults to <merge.json parent>/paths. Useful when the volpkg "
          "stores segments under a non-default name like paths_2um_ds2/ "
          "or traces/, or when the merge.json lives outside the data dir.")
-        ("obj2tifxyz", po::value<std::string>()->default_value(""),
-         "Path to vc_obj2tifxyz_legacy. Default: sibling binary next to "
-         "vc_merge_tifxyz, falling back to PATH lookup.")
         ("ref", po::value<std::string>()->default_value(""),
          "Reference surface name. Empty (default) = pick the surface with "
          "the largest valid-cell count.")
@@ -2396,6 +2405,9 @@ int main(int argc, char** argv)
          "blend cost scales with strip width instead of full grid width. "
          "0 = single-pass blend (default); >= num_grid_cols also collapses "
          "to single-pass.");
+    StoreToolOptions::add(desc, "Object store: the merge.json grid names stored surface UUIDs and the merge is "
+                                "stored as a new surface (prints surface_uuid:); OBJ and summary go to its artifact "
+                                "directory", {.surfaces = false, .creates = true});
 
     po::variables_map vm;
     try {
@@ -2412,8 +2424,6 @@ int main(int argc, char** argv)
     }
 
     const fs::path merge_path  = vm["merge"].as<std::string>();
-    const fs::path obj2tifxyz  = resolveObj2Tifxyz(
-        vm["obj2tifxyz"].as<std::string>(), argv[0]);
 
     GMConfig cfg;
     cfg.ref                   = vm["ref"].as<std::string>();
@@ -2436,7 +2446,16 @@ int main(int argc, char** argv)
     const int strip_cols      = vm["strip-cols"].as<int>();
 
     try {
-        return gmRunGlobalMerge(merge_path, obj2tifxyz, std::move(cfg), strip_cols);
+        const auto storeOptions = StoreToolOptions::from(vm);
+        std::optional<StoreSurfaces> store;
+        if (storeOptions) {
+            if (!vm["paths-dir"].as<std::string>().empty())
+                throw std::runtime_error("--paths-dir names tifxyz inputs; in store mode the grid names surface UUIDs");
+            store.emplace(storeOptions->store, "vc_merge_tifxyz");
+            cfg.store = &*store;
+            cfg.storeOptions = &*storeOptions;
+        }
+        return gmRunGlobalMerge(merge_path, std::move(cfg), strip_cols);
     } catch (const std::exception& e) {
         std::cerr << "global merge failed: " << e.what() << std::endl;
         return EXIT_FAILURE;

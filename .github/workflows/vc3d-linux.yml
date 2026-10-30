@@ -130,12 +130,12 @@ jobs:
           # Ceres closure against the bundled glibc. No-args prints usage and
           # exits 1; anything else means a load failure (missing lib / too-new
           # glibc reference).
-          ln -sf "$appimage" vc_tifxyz_trim
-          set +e; ./vc_tifxyz_trim; rc=$?; set -e
+          ln -sf "$appimage" vc_tifxyz2obj
+          set +e; ./vc_tifxyz2obj; rc=$?; set -e
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
-            echo "::error::vc_tifxyz_trim failed to start (exit $rc)"; exit 1
+            echo "::error::vc_tifxyz2obj failed to start (exit $rc)"; exit 1
           fi
-          echo "vc_tifxyz_trim OK (exit $rc)"
+          echo "vc_tifxyz2obj OK (exit $rc)"
 
           # GUI: initialize the real xcb Qt stack under a virtual display. VC3D
           # has no clean --version/--help exit on Linux, so assert a known

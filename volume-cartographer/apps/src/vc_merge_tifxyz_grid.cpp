@@ -84,6 +84,11 @@ void gmResolveGrid(const fs::path& merge_path,
                 grid[r][c] = name;  // duplicate cell -> same surface
                 continue;
             }
+            if (paths_dir.empty()) {  // stored surface UUIDs
+                name_to_path[name] = name;
+                grid[r][c] = name;
+                continue;
+            }
             const fs::path dir = paths_dir / name;
             if (!fs::is_directory(dir))
                 throw std::runtime_error(mj.string() + ": rows[" +
