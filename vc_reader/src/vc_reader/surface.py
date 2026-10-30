@@ -2,7 +2,6 @@
 
 NumPy, image decoders and compiled kernels load only when opening geometry.
 """
-from dataclasses import replace
 import math
 import operator
 import time
@@ -612,7 +611,7 @@ class Projection:
         return dict(label_target=self.label_target,label_id=self.selecting['source'].id,label_start_yx=self.start,
                     label_size_yx=self.size,surface_id=self.surface.id,pixel_to_uv=self.selecting['reader'].registration.pixel_to_uv,
                     reference_id=self.reader.reference.id,reference_frame=self.reader._reference_frame,
-                    selection=self.reader._reference_reader.resolved.selection.__dict__,origin_zyx=start,shape_zyx=size,
+                    selection=self.reader._reference_reader.resolved.selection.as_dict(),origin_zyx=start,shape_zyx=size,
                     crop_to_reference=_shift(tuple(reversed(start))).matrix,array_to_level0=self.reader._reference_map.matrix,
                     full_origin_zyx=self.origin,full_shape_zyx=self.shape,thickness_um=self.thickness,padding_um=self.padding,
                     annotation_extent='crop',preparation_seconds=self.preparation_seconds)

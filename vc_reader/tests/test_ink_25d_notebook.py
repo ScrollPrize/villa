@@ -1,6 +1,5 @@
 """Exercise the notebook's full-canvas split with real local paired readers."""
 from contextlib import redirect_stdout
-from dataclasses import replace
 import io
 import json
 from pathlib import Path
@@ -26,12 +25,12 @@ class InkNotebookTests(unittest.TestCase):
             return Source(name, Storage(str(path), 'zarr'), role=role, axes=axes)
 
         shape = supervision.shape
-        render = replace(source('ct', np.full((9, *shape), 127, np.uint8), ('z', 'y', 'x'), 'image'),
+        render = source('ct', np.full((9, *shape), 127, np.uint8), ('z', 'y', 'x'), 'image').replace(
                          artifact_kind='layers-zarr')
         ink = np.zeros(shape, np.uint8)
         ink[1::3, 2::4] = 255
         mask = source('supervision', supervision, ('y', 'x'), 'label')
-        label = replace(source('ink', ink, ('y', 'x'), 'label'),
+        label = source('ink', ink, ('y', 'x'), 'label').replace(
                         companions=(Companion('supervision', mask, True),))
         scroll = Catalog({'samples': {'s': {'sample': {'id': 's'}}}}).samples['s']
         scroll = scroll.with_source(render, kind='image')

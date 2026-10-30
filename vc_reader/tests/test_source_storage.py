@@ -1,7 +1,6 @@
 """Storage integration: Zarr metadata, file transport, caches, registration."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import base64
 import hashlib
 import http.server
@@ -173,7 +172,7 @@ class StorageTests(FixtureCase):
                     for result in pool.map(process_read, [reader, reader]):
                         np.testing.assert_array_equal(result, data[:3, :4])
             np.testing.assert_array_equal(reader.read_many([((0, 0), (3, 4))])[0], data[:3, :4])
-        encoded = replace(source, encoding=Encoding('integer', ((0, 0),), 'uint8', fallback=1))
+        encoded = source.replace(encoding=Encoding('integer', ((0, 0),), 'uint8', fallback=1))
         with encoded.open(max_decode_bytes=100) as reader:
             with self.assertRaisesRegex(MemoryError, 'max_decode_bytes'):
                 reader.read((0, 0), (5, 7))
@@ -237,7 +236,7 @@ class StorageTests(FixtureCase):
             self.assertEqual(out.dtype, np.dtype('uint64'))
             self.assertEqual(out[0, 0], 2**40+3)
             self.assertEqual(out[1, 1], 2**40+1)
-        with replace(source, fill_value=None).open() as reader:
+        with source.replace(fill_value=None).open() as reader:
             self.assertEqual(reader.fill_value, 2**40+1)
 
     def test_zarr_time_selection_without_channels(self):
@@ -282,7 +281,7 @@ class StorageTests(FixtureCase):
             source.with_selection(level=8).open()
         with self.assertRaisesRegex(ValueError, 'ambiguous'):
             source.open()
-        unknown = replace(source, registration=replace(reg, volume_spacing_um=None))
+        unknown = source.replace(registration=reg.replace(volume_spacing_um=None))
         with self.assertRaisesRegex(ValueError, 'volume_spacing_um'):
             unknown.with_selection(level=0).open()
 
@@ -298,12 +297,12 @@ class StorageTests(FixtureCase):
             self.assertEqual(reader.registration.affine, affine @ Affine.block_reduced(2))
             self.assertEqual(reader.registration.affine.translation[0], 2**26+1.25)
         self.assertNotEqual(np.float32(2**26+.25).item(), 2**26+.25)
-        placed = replace(source, registration=VolumeRegistration('s', 'v', affine=Affine.scale(3),
+        placed = source.replace(registration=VolumeRegistration('s', 'v', affine=Affine.scale(3),
                           mode='storage', storage_frame='physical', storage_units='micrometer'))
         with placed.with_selection(level=1).open() as reader:
             self.assertEqual(reader.registration.affine, Affine.scale(3) @ Affine.block_reduced(2))
         with self.assertRaisesRegex(ValueError, 'storage_units'):
-            replace(placed, registration=replace(placed.registration, storage_units=None)).open()
+            placed.replace(registration=placed.registration.replace(storage_units=None)).open()
         attrs = json.loads((path / '.zattrs').read_text())
         attrs['multiscales'][0]['axes'][0]['unit'] = 'unknown'
         (path / '.zattrs').write_text(json.dumps(attrs))
@@ -352,7 +351,7 @@ class StorageTests(FixtureCase):
                     tifffile.imwrite(path, data, compression='deflate', metadata={'axes': axes}, **kwargs, **options)
                     source = Source('tiff', Storage(str(path), 'tiff'))
                     if options:
-                        source = replace(source, encoding=Encoding('color', (((3, 7, 11), 2**40+1),), 'uint64'))
+                        source = source.replace(encoding=Encoding('color', (((3, 7, 11), 2**40+1),), 'uint64'))
                     with source.open() as reader:
                         output = reader.read((14, 13), (7, 8))
                         np.testing.assert_array_equal(output, 2**40+1 if options else data[14:21, 13:21])
@@ -366,7 +365,7 @@ class StorageTests(FixtureCase):
         source = Source('pages', Storage(str(path), 'tiff'), encoding=Encoding('color', (((3, 7, 11), 2**40),), 'uint64'))
         with source.open() as reader:
             np.testing.assert_array_equal(reader.read((7, 9), (5, 7)), 2**40)
-        stack = replace(source, storage=Storage(format='stack', locations=(str(path), str(path))),
+        stack = source.replace(storage=Storage(format='stack', locations=(str(path), str(path))),
                         axes=('z', 'c', 'y', 'x'))
         with stack.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 7, 9), (2, 5, 7)), 2**40)
@@ -628,18 +627,18 @@ class RemoteTests(RemoteFixtureCase):
         with source.open(cache_dir=self.cache) as reader:
             self.assertEqual(reader.stats()['remote_bytes'], 0)
         self.assertEqual(before, self.counts)  # A cached copy is trusted, never revalidated.
-        missing = replace(source, storage=Storage(self.url+'/missing.png', 'png'))
+        missing = source.replace(storage=Storage(self.url+'/missing.png', 'png'))
         with self.assertRaises(CacheMissError):
             missing.open(cache_dir=self.cache, offline=True)
-        alternate = replace(missing, storage=replace(missing.storage, alternatives=(source.storage.location,)))
+        alternate = missing.replace(storage=missing.storage.replace(alternatives=(source.storage.location,)))
         with alternate.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-        basic = replace(source, storage=Storage(self.url+'/basic/image.png', 'png', alternatives=(source.storage.location,)))
+        basic = source.replace(storage=Storage(self.url+'/basic/image.png', 'png', alternatives=(source.storage.location,)))
         with self.assertRaises(PermissionError):
             basic.open(cache_dir=self.cache)
         with basic.open(cache_dir=self.cache, auth=('user', 'password')) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-        s3 = replace(source, storage=Storage('s3://bucket/image.png', 'png'))
+        s3 = source.replace(storage=Storage('s3://bucket/image.png', 'png'))
         keys = S3Credentials('example', 'test-secret', region='us-east-1', endpoint_url=self.url)
         with s3.open(cache_dir=self.cache, auth=keys) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
@@ -674,7 +673,7 @@ class RemoteTests(RemoteFixtureCase):
         self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2*size)
         first = source.open(cache_dir=self.cache, cache_max_bytes=size)
         Image.fromarray(self.data+1).save(self.root/'other.png')
-        other = replace(source, storage=Storage(self.url+'/other.png', 'png'))
+        other = source.replace(storage=Storage(self.url+'/other.png', 'png'))
         with other.open(cache_dir=self.cache, cache_max_bytes=size) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data+1)
         # A previously opened reader can re-materialize an evicted file.

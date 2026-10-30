@@ -35,6 +35,7 @@ struct OpenDataCreation {
 struct OpenDataBounds {
     std::array<double, 3> low{0, 0, 0};
     std::array<double, 3> high{0, 0, 0};
+    bool operator==(const OpenDataBounds&) const = default;
 };
 
 struct OpenDataAccessRoot {
@@ -52,9 +53,13 @@ struct OpenDataOrigin {
     std::vector<OpenDataAccessRoot> accessRoots;
     nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
+
+    // This location under each of its access roots.
+    [[nodiscard]] std::vector<std::string> urls() const;
 };
 
 struct OpenDataArtifact {
+    std::optional<std::string> id;
     std::string type;
     std::vector<OpenDataOrigin> origins;
     nlohmann::json parameters = nlohmann::json::object();
@@ -108,6 +113,12 @@ struct OpenDataArtifact {
     // The artifact's URL: the resolved public URL, else its source path,
     // without trailing slashes. Empty when it has no public origin.
     [[nodiscard]] std::string url() const;
+    // Every location as listed, in metadata order.
+    [[nodiscard]] std::vector<std::string> urls() const;
+    // The preferred location in a scheme: "https" (anonymous HTTP), "s3", or empty to keep
+    // the location's own. The open-data bucket is preferred over other channels, then
+    // metadata order. Empty optional when it has none; std::invalid_argument on another scheme.
+    [[nodiscard]] std::optional<std::string> location(std::string_view scheme = "https") const;
 };
 
 std::vector<OpenDataArtifact> parseCatalogArtifacts(const nlohmann::json& entries);
@@ -194,6 +205,7 @@ struct OpenDataVolumeCoverage {
     OpenDataBounds bbox;       // bbox_transformed, in that volume's voxels
     double overlapRatio = 0;   // 0: the segment does not reach the volume
     std::string computedAt;
+    bool operator==(const OpenDataVolumeCoverage&) const = default;
 };
 
 // The original tifxyz recorded at segment creation (creation.metadata).

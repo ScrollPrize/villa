@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <nlohmann/json.hpp>
 
 namespace vcr::catalog {
@@ -144,5 +145,11 @@ private:
         const double s=1./n;
         return {v[0]*s,v[1]*s,v[2]*s};
     }
+};
+// An affine with the derivation path a catalog publishes for it (empty when it has none).
+struct VolumeTransform {
+    Affine forward;
+    std::string derivationPath;
+    bool operator==(const VolumeTransform&) const = default;
 };
 }

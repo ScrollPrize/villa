@@ -2,7 +2,6 @@
 import pickle
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 import numpy as np
 
@@ -107,7 +106,7 @@ class SurfaceTests(unittest.TestCase):
 
     def test_padding_preserves_existing_annotations_and_geometry_holes(self):
         xyz=self.xyz.copy();xyz[:,3,3]=np.nan
-        surf=replace(self.surface,geometry=self.source('hole',xyz,('c','y','x'),role='scalar').storage)
+        surf=self.surface.replace(geometry=self.source('hole',xyz,('c','y','x'),role='scalar').storage)
         ink=self.source('hole-label',np.ones((8,9),np.uint8),('y','x'),role='label',
                         registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         for backend in self.backends():
@@ -134,7 +133,7 @@ class SurfaceTests(unittest.TestCase):
     def test_geometric_hint_does_not_turn_missing_labels_into_negatives(self):
         ink=self.source('partial-label',np.ones((8,4),np.uint8),('y','x'),role='label',registration=self.label.registration)
         # This annotation has no pixels in this surface's UV range at all.
-        absent=replace(ink,id='absent',registration=SurfaceRegistration(self.surface,((1,0,1000),(0,1,1000))))
+        absent=ink.replace(id='absent',registration=SurfaceRegistration(self.surface,((1,0,1000),(0,1,1000))))
         for backend in self.backends():
             with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink,'absent':absent},backend=backend) as reader:
                 result=reader.project_surface(self.surface,(3,2),(1,1),label_target='ink',padding_um=3)
@@ -152,7 +151,7 @@ class SurfaceTests(unittest.TestCase):
         y,x=np.indices((8,130),dtype=np.float32)
         physical_x=np.where(x<=8,x+3,np.where(x>=121,132-x,100)).astype(np.float32)
         xyz=np.stack((physical_x,y+2,np.full_like(x,5)))
-        surf=replace(self.surface,geometry=self.source('returning-sheet',xyz,('c','y','x'),role='scalar').storage)
+        surf=self.surface.replace(geometry=self.source('returning-sheet',xyz,('c','y','x'),role='scalar').storage)
         ink=self.source('returning-label',(x>=121).astype(np.uint8),('y','x'),role='label',
                         registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         for backend in self.backends():
@@ -162,7 +161,7 @@ class SurfaceTests(unittest.TestCase):
                 self.assertTrue(host(result['ink'].masks['conflict']).any())  # remote fold carries ink
 
     def test_validation_budget_worker_and_zero_labels(self):
-        zero=replace(self.label,storage=self.source('zero',np.zeros((8,9),np.uint8),('y','x')).storage)
+        zero=self.label.replace(storage=self.source('zero',np.zeros((8,9),np.uint8),('y','x')).storage)
         with open_sample(self.reference,{'ink':zero}) as reader:
             result=reader.project_surface(self.surface,(2,2),(2,3),label_target='ink')
             self.assertEqual(int(result['ink'].valid.sum()),20);self.assertFalse(result['ink'].data.any())
@@ -175,7 +174,7 @@ class SurfaceTests(unittest.TestCase):
             with self.assertRaisesRegex(MemoryError,'iter_project_surface'):
                 reader.project_surface(self.surface,(2,2),(2,3),label_target='ink')
         with self.assertRaisesRegex(ValueError,'pixel_to_uv'):
-            open_sample(self.reference,{'ink':replace(self.label,registration=SurfaceRegistration(self.surface))})
+            open_sample(self.reference,{'ink':self.label.replace(registration=SurfaceRegistration(self.surface))})
 
     def test_tifxyz_xy_scale_holes_boundaries_and_normal_sign(self):
         import json,tifffile
@@ -183,7 +182,7 @@ class SurfaceTests(unittest.TestCase):
         for axis,values in zip('xyz',self.xyz):tifffile.imwrite(root/(axis+'.tif'),values)
         (root/'meta.json').write_text(json.dumps({'scale':[.5,.25]}))
         mask=np.ones((8,9),np.uint8);mask[3,3]=0;tifffile.imwrite(root/'mask.tif',mask)
-        surf=replace(self.surface,geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
+        surf=self.surface.replace(geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
         for backend in ('cpu',):
             with open_sample(self.reference,backend=backend) as reader:
                 result=reader.render_surface(surf,(4,2),(1,1),offsets_um=(1,))
@@ -192,7 +191,7 @@ class SurfaceTests(unittest.TestCase):
                 self.assertFalse(host(hole['image'].valid).any())
                 outside=reader.render_surface(surf,(29,17),(1,1))
                 self.assertFalse(host(outside['image'].valid).any())
-        reverse=replace(self.surface,pixel_to_uv=((-1,0,8),(0,1,0)))
+        reverse=self.surface.replace(pixel_to_uv=((-1,0,8),(0,1,0)))
         with open_sample(self.reference) as reader:
             result=reader.render_surface(reverse,(1,6),(1,1),offsets_um=(1,))
             np.testing.assert_allclose(result['image'].data,self.image[None,4:5,3:4,5:6])
@@ -200,9 +199,9 @@ class SurfaceTests(unittest.TestCase):
     def test_anisotropic_offsets_cross_volume_and_masks(self):
         from vc_reader import QueryContext,Frame
         mask=self.source('supervision',np.zeros((8,9),np.uint8),('y','x'),role='label')
-        label=replace(self.label,companions=(Companion('supervision',mask,same_grid=True),))
-        surf=replace(self.surface,spacing_um=(1,2,4))
-        label=replace(label,registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
+        label=self.label.replace(companions=(Companion('supervision',mask,same_grid=True),))
+        surf=self.surface.replace(spacing_um=(1,2,4))
+        label=label.replace(registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         for backend in self.backends():
             with open_sample(self.reference,{'ink':label},backend=backend) as reader:
                 if backend=='cpu':
@@ -211,14 +210,14 @@ class SurfaceTests(unittest.TestCase):
                 result=reader.project_surface(surf,(2,2),(2,3),label_target='ink')
                 self.assertTrue(host(result['ink'].valid).any())
                 self.assertFalse(host(result['ink'].masks['supervision']).any())
-        moved=replace(self.label,query=QueryContext(Frame('s','other'),'transform',Affine.from_rows(((1,0,0,1),(0,1,0,2),(0,0,1,1)))))
-        ref=replace(self.reference,registration=replace(self.reference.registration,volume_id='other'))
+        moved=self.label.replace(query=QueryContext(Frame('s','other'),'transform',Affine.from_rows(((1,0,0,1),(0,1,0,2),(0,0,1,1)))))
+        ref=self.reference.replace(registration=self.reference.registration.replace(volume_id='other'))
         with open_sample(ref,{'ink':moved}) as reader:
             result=reader.project_surface(self.surface,(2,2),(2,3),label_target='ink')
             self.assertEqual(result.metadata['projection']['origin_zyx'],(6,5,5))
 
     def test_rotated_patch_and_folded_conflicts(self):
-        rotated=replace(self.label,registration=SurfaceRegistration(self.surface,((.8,-.3,2),(.3,.8,1))))
+        rotated=self.label.replace(registration=SurfaceRegistration(self.surface,((.8,-.3,2),(.3,.8,1))))
         results=[]
         for backend in self.backends():
             with open_sample(self.reference,{'ink':rotated},backend=backend) as reader:
@@ -238,20 +237,20 @@ class SurfaceTests(unittest.TestCase):
 
     def test_invalid_geometry_and_unsupported_annotation(self):
         invalid=self.xyz.copy();invalid[:]=np.nan
-        bad=replace(self.surface,geometry=self.source('invalid',invalid,('c','y','x'),role='scalar').storage)
-        label=replace(self.label,registration=SurfaceRegistration(bad,((1,0,0),(0,1,0))))
+        bad=self.surface.replace(geometry=self.source('invalid',invalid,('c','y','x'),role='scalar').storage)
+        label=self.label.replace(registration=SurfaceRegistration(bad,((1,0,0),(0,1,0))))
         with open_sample(self.reference,{'ink':label}) as reader:
             with self.assertRaisesRegex(ValueError,'no valid nondegenerate'):
                 reader.project_surface(bad,(1,1),(2,2),label_target='ink')
-        other=replace(self.label,id='other',registration=SurfaceRegistration(self.surface,((1,0,1000),(0,1,1000))))
+        other=self.label.replace(id='other',registration=SurfaceRegistration(self.surface,((1,0,1000),(0,1,1000))))
         with open_sample(self.reference,{'ink':self.label,'other':other}) as reader:
             result=reader.project_surface(self.surface,(1,1),(2,2),label_target='ink')
             self.assertFalse(result['other'].valid.any());self.assertTrue(result['ink'].valid.any())
 
     def test_folded_overlap_exact_values_and_large_dense_output(self):
         xyz=self.xyz.copy();xyz[0]=np.abs(xyz[0]-7)+3
-        surf=replace(self.surface,geometry=self.source('fold',xyz,('c','y','x'),role='scalar').storage)
-        label=replace(self.label,registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
+        surf=self.surface.replace(geometry=self.source('fold',xyz,('c','y','x'),role='scalar').storage)
+        label=self.label.replace(registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         outputs=[]
         for backend in self.backends():
             with open_sample(self.reference,{'ink':label},backend=backend) as reader:
@@ -259,8 +258,8 @@ class SurfaceTests(unittest.TestCase):
                 self.assertTrue(host(result['ink'].masks['conflict']).any())
                 outputs.append(host(result['ink'].data))
         for output in outputs[1:]:np.testing.assert_array_equal(output,outputs[0])
-        big=replace(self.surface,xyz_to_volume=Affine.from_rows(((12,0,0,0),(0,1,0,0),(0,0,1,0))))
-        label=replace(self.label,registration=SurfaceRegistration(big,((1,0,0),(0,1,0))))
+        big=self.surface.replace(xyz_to_volume=Affine.from_rows(((12,0,0,0),(0,1,0,0),(0,0,1,0))))
+        label=self.label.replace(registration=SurfaceRegistration(big,((1,0,0),(0,1,0))))
         outputs=[]
         for backend in self.backends():
             with open_sample(self.reference,{'ink':label},backend=backend) as reader:
@@ -278,7 +277,7 @@ class SurfaceTests(unittest.TestCase):
             value_frame=ValueFrame(sample_id='s',volume_id='v',level=0),component_order=('x','y','z'))
         mask=np.ones((8,9),np.uint8);mask[3,3]=0
         mask=self.source('geometry-mask',mask,('y','x'),role='label',registration=SurfaceRegistration(self.surface,((1,0,0),(0,1,0))))
-        surf=replace(self.surface,normals=normal,mask=mask)
+        surf=self.surface.replace(normals=normal,mask=mask)
         for backend in ('cpu',):
             with open_sample(self.reference,backend=backend) as reader:
                 result=reader.render_surface(surf,(1,1),(1,1),offsets_um=(1,))
@@ -289,9 +288,9 @@ class SurfaceTests(unittest.TestCase):
     def test_render_sheared_uv_and_rotated_volume_frame(self):
         # Patch pixel (j, i) is UV (2 + i, 1 + j), the grid's column 1 + j and row 2 + i;
         # the mirrored UV grid flips the sheet normal.
-        transposed=replace(self.surface,pixel_to_uv=((0,1,0),(1,0,0)))
+        transposed=self.surface.replace(pixel_to_uv=((0,1,0),(1,0,0)))
         # Vertex (x, y, z) sits at volume (z, y, x): the sheet normal +z moves along volume x.
-        swapped=replace(self.surface,xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))))
+        swapped=self.surface.replace(xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))))
         with open_sample(self.reference) as reader:
             result=reader.render_surface(transposed,(1,2),(3,4),offsets_um=(0,1))
             for k,z in enumerate((5,4)):
@@ -336,8 +335,8 @@ class SurfaceTests(unittest.TestCase):
         root=self.root/'surface8';root.mkdir()
         for axis,values in zip('xyz',self.xyz):tifffile.imwrite(root/(axis+'.tif'),values)
         (root/'meta.json').write_text(json.dumps({'scale':[.5,.25]}))
-        tifxyz=replace(self.surface,geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
-        swapped=replace(self.surface,xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))),spacing_um=(1,2,1))
+        tifxyz=self.surface.replace(geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
+        swapped=self.surface.replace(xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))),spacing_um=(1,2,1))
         cases=((self.surface,{'seg':seg,'ink':self.label},(1,2),(3,4),(-1,0,2)),
                (tifxyz,{'seg':seg},(3,1),(20,30),(0,1.5)),(swapped,{'seg':seg},(1,2),(5,6),(0,.75)))
         for surface,targets,start,size,offsets in cases:
@@ -354,9 +353,9 @@ class SurfaceTests(unittest.TestCase):
 
     def test_face_contact_and_physical_band_metric(self):
         xyz=self.xyz.copy();xyz[2]+=.5
-        surf=replace(self.surface,geometry=self.source('face',xyz,('c','y','x'),role='scalar').storage)
-        label=replace(self.label,registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
-        ref=replace(self.reference,registration=replace(self.reference.registration,volume_spacing_um=(1,1,4)))
+        surf=self.surface.replace(geometry=self.source('face',xyz,('c','y','x'),role='scalar').storage)
+        label=self.label.replace(registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
+        ref=self.reference.replace(registration=self.reference.registration.replace(volume_spacing_um=(1,1,4)))
         for backend in self.backends():
             with open_sample(ref,{'ink':label},backend=backend) as reader:
                 zero=reader.project_surface(surf,(2,2),(2,3),label_target='ink')
@@ -371,7 +370,7 @@ class SurfaceTests(unittest.TestCase):
         from unittest.mock import patch
         y,x=np.indices((70,160),dtype=np.float32)
         xyz=np.stack((x/20+3,y/20+2,np.full_like(x,5)))
-        surf=replace(self.surface,geometry=self.source('wide-grid',xyz,('c','y','x'),role='scalar').storage)
+        surf=self.surface.replace(geometry=self.source('wide-grid',xyz,('c','y','x'),role='scalar').storage)
         labels=self.source('wide-labels',np.ones((70,160),np.uint8),('y','x'),role='label',registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         with open_sample(self.reference,{'ink':labels},plan_cache_bytes=64<<10,sampling_cache_bytes=2<<20) as reader:
             geom=next(iter(reader._geometries.values()))
@@ -411,11 +410,10 @@ class SurfaceTests(unittest.TestCase):
     def test_large_frame_origins_preserve_fractional_geometry(self):
         huge=2**26
         translation=Affine.from_rows(((1,0,0,huge+.25),(0,1,0,huge+.25),(0,0,1,huge+.25)))
-        reference=replace(self.reference,registration=replace(self.reference.registration,
-            affine=Affine.from_rows(((1,0,0,huge),(0,1,0,huge),(0,0,1,huge)))))
+        reference=self.reference.replace(registration=self.reference.registration.replace(affine=Affine.from_rows(((1,0,0,huge),(0,1,0,huge),(0,0,1,huge)))))
         uv=((1,0,huge),(0,1,huge))
-        surf=replace(self.surface,xyz_to_volume=translation,pixel_to_uv=uv)
-        label=replace(self.label,registration=SurfaceRegistration(surf,uv))
+        surf=self.surface.replace(xyz_to_volume=translation,pixel_to_uv=uv)
+        label=self.label.replace(registration=SurfaceRegistration(surf,uv))
         for backend in self.backends():
             with open_sample(reference,{'ink':label},backend=backend) as reader:
                 if backend=='cpu':

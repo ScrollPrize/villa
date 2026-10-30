@@ -42,9 +42,5 @@ private:
 };
 // The route from one of a sample's volumes to another, and the derivation path the
 // sample publishes for that direct pair (empty when it has none). nullopt: no route.
-struct VolumeTransform {
-    Affine forward;
-    std::string derivationPath;
-};
 std::optional<VolumeTransform> resolveVolumeTransform(const OpenDataSample&, const std::string& source, const std::string& target);
 }

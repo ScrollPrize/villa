@@ -3,7 +3,6 @@
 Local analytic arrays exercise registration. The published transfer recipe
 uses a catalog fixture to check discovery and serialization without data reads.
 """
-from dataclasses import replace
 import json
 from training_support import Array, ReadSpec, image_arrays, label_arrays
 
@@ -57,7 +56,7 @@ def local_inputs(root):
     layers = source('layers', np.stack((ct[3:6], ct[3:6] + 1000)), ('c', 'z', 'y', 'x'), role='image')
     ink = source('ink', (x[0] % 3).astype(np.uint8), ('y', 'x'), role='label')
     supervision = source('supervision', np.where(x[0] % 2 == 0, 128, 255).astype(np.uint8), ('y', 'x'), role='label')
-    ink = replace(ink, companions=(Companion('supervision', supervision, True),))
+    ink = ink.replace(companions=(Companion('supervision', supervision, True),))
     scroll = scroll.with_source(layers, kind='image', volume='a').with_source(ink, kind='label', volume='a', image=layers.id, same_grid=True)
     yy, xx = np.indices((8, 9), dtype=np.float32)
     xyz = source('geometry', np.stack((xx + 3, yy + 2, np.full_like(xx, 5))), ('c', 'y', 'x'), role='scalar')
@@ -113,10 +112,10 @@ def build_workflow(name, root, metadata=None):
         # convention missing from metadata. The optional TIFF mask is absent.
         scroll = catalog.samples['PHerc0009B']
         published = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
-        surface = replace(published.source.registration.surface, tifxyz_mask=False)
-        registration = replace(published.source.registration, surface=surface,
+        surface = published.source.registration.surface.replace(tifxyz_mask=False)
+        registration = published.source.registration.replace(surface=surface,
                                pixel_to_uv=((1, 0, .5), (0, 1, .5)), origin='explicit')
-        label = replace(published.source, id='user:training-surface-label', registration=registration)
+        label = published.source.replace(id='user:training-surface-label', registration=registration)
         scroll = scroll.with_source(label, kind='label', volume=published.volume.id,
                                     segment=published.segment.id)
         asset = scroll.labels[label.id]

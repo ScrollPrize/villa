@@ -1,6 +1,5 @@
 """Source descriptors over the existing Zarr group/array reader."""
 
-from dataclasses import replace
 
 from ..affine import Affine
 from ..errors import CacheMissError
@@ -150,8 +149,8 @@ class ZarrSource:
         declared = self._canonical(old_path, original)
         axes, _, transform, units = self._grid(path)
         _, _, old_transform, old_units = self._grid(old_path)
-        reg = replace(reg, declared_grid=declared)
-        source = replace(source, registration=reg)
+        reg = reg.replace(declared_grid=declared)
+        source = source.replace(registration=reg)
         if isinstance(reg, VolumeRegistration) and reg.mode == 'storage':
             selected = self.group.array(path) if self.group is not None else self.reader
             frames = [selected.attrs.get('coordinateSystem')]
@@ -184,7 +183,7 @@ class ZarrSource:
         if not have_transforms:
             if request.sublevel is None or request.sublevel < 0:
                 raise ValueError(f'no exact correspondence for requested reference level {reference.level}; select a source level explicitly')
-            path = self._path(replace(selection, corresponding=None, level=request.sublevel))
+            path = self._path(selection.replace(corresponding=None, level=request.sublevel))
             self.group.array(path)  # No fallback when the array does not exist.
             if not matches_reference(self.source, self._registration(path, selection), reference, self._grid(path)[0]):
                 raise ValueError(f'no exact correspondence for requested reference level {reference.level}; select a source level explicitly')

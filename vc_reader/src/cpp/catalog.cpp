@@ -240,6 +240,7 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         if (!itemJson.is_object()) continue;
         OpenDataArtifact artifact;
         artifact.raw = itemJson;
+        artifact.id = stringValue(itemJson, "id");
         artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
         artifact.creationInfo = objectOrEmpty(itemJson, "creation_info");
@@ -486,6 +487,30 @@ std::vector<OpenDataArtifact> parseCatalogArtifacts(const nlohmann::json& entrie
 bool OpenDataArtifact::hasResolvedUrl() const noexcept
 {
     return !resolvedUrl.empty();
+}
+
+std::vector<std::string> OpenDataOrigin::urls() const
+{
+    std::vector<std::string> out;
+    for (const auto& root : accessRoots) out.push_back(joinOpenDataUrl(root.url, path));
+    return out;
+}
+
+std::vector<std::string> OpenDataArtifact::urls() const
+{
+    std::vector<std::string> out;
+    for (const auto& origin : origins)
+        for (auto& url : origin.urls()) out.push_back(std::move(url));
+    return out;
+}
+
+std::optional<std::string> OpenDataArtifact::location(std::string_view scheme) const
+{
+    if (scheme != "https" && scheme != "s3" && !scheme.empty())
+        throw std::invalid_argument("unknown scheme '" + std::string(scheme) + "'; use 'https', 's3' or None");
+    if (scheme == "s3") return openDataS3Url(sourcePath);
+    const auto& value = scheme.empty() ? sourcePath : resolvedUrl;
+    return value.empty() ? std::nullopt : std::optional(value);
 }
 
 std::string OpenDataArtifact::url() const

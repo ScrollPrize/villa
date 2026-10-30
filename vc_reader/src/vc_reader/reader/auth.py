@@ -31,20 +31,16 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-
-def _native():
-    from .. import _reader
-
-    return _reader
+from .. import _reader
 
 
 def is_remote(location: str) -> bool:
-    return _native().is_remote(location)
+    return _reader.is_remote(location)
 
 
 def http_url(url: str) -> str:
     """https URL for an ``s3://`` URL, otherwise unchanged."""
-    return _native().http_url(url)
+    return _reader.http_url(url)
 
 
 @dataclass(frozen=True)
@@ -64,7 +60,7 @@ class S3Credentials:
 
 def resolve_access(location: str, auth: Any = "auto", *, offline: bool = False):
     """The native ``Access`` for a location and an ``auth`` argument (see the module docstring)."""
-    native = _native()
+    native = _reader
     if isinstance(auth, native.Access):
         return auth
     if not is_remote(location) or auth is None or auth == "anonymous":
@@ -92,7 +88,7 @@ def load_basic_auth(path: str | os.PathLike[str]) -> tuple[str, str]:
     The same file vesuvius reads for ``volume_auth_json``: the fields may sit
     under an ``"auth"`` object, and ``"user"`` is accepted for ``"username"``.
     """
-    return tuple(_native().load_basic_auth(os.fspath(path)))
+    return tuple(_reader.load_basic_auth(os.fspath(path)))
 
 
 __all__ = ["S3Credentials", "http_url", "is_remote", "load_basic_auth", "resolve_access"]

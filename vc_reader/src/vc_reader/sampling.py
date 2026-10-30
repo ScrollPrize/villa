@@ -2,7 +2,6 @@
 
 Importing this module does not import NumPy, compiled extensions, or PyTorch.
 """
-from dataclasses import asdict, replace
 import math
 import operator
 import os
@@ -209,7 +208,7 @@ class SampleReader(SamplingEngine):
                     transform = self._reference_map.inverse() @ self._between(source, (value.sample_id, value.volume_id)) @ value_map
                     metadata = dict(kind='volume', sample_id=self._reference_frame[0], volume_id=self._reference_frame[1],
                                     array_to_level0=self._reference_map.matrix, reference_id=self.reference.id,
-                                    selection=asdict(self._reference_reader.resolved.selection))
+                                    selection=self._reference_reader.resolved.selection.as_dict())
                 matrix = transform.linear
                 if source.role == 'normal':
                     inv = transform.inverse().linear

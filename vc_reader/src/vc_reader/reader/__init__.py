@@ -1,41 +1,14 @@
-"""Array and image readers, loaded only when their public names are used.
-
-Image decoding needs the ``labels`` extra. Zarr access additionally needs the
-C++ reader extension. Neither is imported merely to describe a source.
-"""
-
-from importlib import import_module
+"""Array and image readers (PNG/JPEG/TIFF decoding needs the ``labels`` extra)."""
 
 from ..errors import CacheMissError
+from .auth import S3Credentials, load_basic_auth
+from .decoded_cache import DecodedCache
+from .disk_cache import CacheLayer, vc3d_cache_root, vc3d_volume_id
+from .memory_cache import MemoryCache
+from .source_reader import SourceReader
+from .zarr_group import ZarrGroup, open_group
+from .zarr_meta import ArrayMeta
+from .zarr_reader import ZarrReader, open_zarr, output_pool_stats, set_output_pool_bytes
 
-_MODULES = {
-    "ArrayMeta": "zarr_meta",
-    "CacheLayer": "disk_cache",
-    "DecodedCache": "decoded_cache",
-    "MemoryCache": "memory_cache",
-    "S3Credentials": "auth",
-    "SourceReader": "source_reader",
-    "ZarrGroup": "zarr_group",
-    "ZarrReader": "zarr_reader",
-    "load_basic_auth": "auth",
-    "open_group": "zarr_group",
-    "open_zarr": "zarr_reader",
-    "output_pool_stats": "zarr_reader",
-    "set_output_pool_bytes": "zarr_reader",
-    "vc3d_cache_root": "disk_cache",
-    "vc3d_volume_id": "disk_cache",
-}
-
-__all__ = ["CacheMissError", *_MODULES]
-
-
-def __getattr__(name):
-    if name not in _MODULES:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(f".{_MODULES[name]}", __name__), name)
-    globals()[name] = value
-    return value
-
-
-def __dir__():
-    return sorted(set(globals()) | set(__all__))
+__all__ = ["ArrayMeta", "CacheLayer", "CacheMissError", "DecodedCache", "MemoryCache", "S3Credentials", "SourceReader", "ZarrGroup", "ZarrReader",
+           "load_basic_auth", "open_group", "open_zarr", "output_pool_stats", "set_output_pool_bytes", "vc3d_cache_root", "vc3d_volume_id"]

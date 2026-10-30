@@ -1,5 +1,4 @@
 """Flattened pair indexing, stored grids, exact categories, and worker lifetime."""
-from dataclasses import replace
 import json
 import math
 import multiprocessing
@@ -63,7 +62,7 @@ class PairedTests(unittest.TestCase):
         render = self.source('image', image, 'image')
         label = self.source('labels', labels, 'label')
         mask = self.source('mask', np.full((7, 9), 128, 'uint8'), 'label')
-        label = replace(label, companions=(Companion('supervision', mask, True),))
+        label = label.replace(companions=(Companion('supervision', mask, True),))
         asset = self.pair(render, label)
         for backend in self.backends():
             with asset.open_paired(image=asset.images.zarr(), layers=slice(1, 4), backend=backend) as reader:
@@ -153,11 +152,11 @@ class PairedTests(unittest.TestCase):
     def test_independent_pyramids_choose_matching_grid_or_sample_base(self):
         image = np.arange(3*8*10, dtype='uint16').reshape(3, 8, 10)
         labels = np.arange(8*10, dtype='uint16').reshape(8, 10)
-        render = replace(pyramid(self.root/'r', [image, image[:, ::2, ::2]], [1, 2]), role='image')
+        render = pyramid(self.root/'r', [image, image[:, ::2, ::2]], [1, 2]).replace(role='image')
         # Label level 1 is 4x; level 2 is 2x. Masks have only the base array.
-        label = replace(pyramid(self.root/'l', [labels, labels[::4, ::4], labels[::2, ::2]], [1, 4, 2]), role='label')
+        label = pyramid(self.root/'l', [labels, labels[::4, ::4], labels[::2, ::2]], [1, 4, 2]).replace(role='label')
         mask = self.source('mask', np.full((8, 10), 255, 'uint8'), 'label')
-        label = replace(label, companions=(Companion('validation', mask, True),))
+        label = label.replace(companions=(Companion('validation', mask, True),))
         asset = self.pair(render, label)
         for backend in self.backends():
             with asset.open_paired(level=1, backend=backend) as reader:
@@ -186,8 +185,8 @@ class PairedTests(unittest.TestCase):
         bad = self.source('bad', np.zeros((3, 5), 'uint8'), 'label')
         with self.assertRaisesRegex(ValueError, 'shapes'):
             self.pair(render, bad).open_paired()
-        render2 = replace(pyramid(self.root/'rp', [np.zeros((2, 4, 5), 'uint8')], [2]), role='image')
-        label2 = replace(pyramid(self.root/'lp', [np.zeros((4, 5), 'uint8')], [1]), role='label')
+        render2 = pyramid(self.root/'rp', [np.zeros((2, 4, 5), 'uint8')], [2]).replace(role='image')
+        label2 = pyramid(self.root/'lp', [np.zeros((4, 5), 'uint8')], [1]).replace(role='label')
         with self.assertRaisesRegex(ValueError, 'contradict'):
             self.pair(render2, label2).open_paired()
 
@@ -202,8 +201,8 @@ class PairedTests(unittest.TestCase):
         registration = VolumeRegistration('s', 'v', plane=Plane((0,0,0), (1,0,0), (0,1,0), (0,0,1)))
         label = Source('png-label', Storage(str(self.root/'label.png'), 'png'), role='label', axes=('y', 'x'), registration=registration)
         mask = self.source('mask-registered', np.full((2, 3), 128, 'uint8'), 'label')
-        mask = replace(mask, registration=replace(registration, plane=Plane((2,1,0), (1,0,0), (0,1,0), (0,0,1))))
-        label = replace(label, companions=(Companion('supervision', mask),))
+        mask = mask.replace(registration=registration.replace(plane=Plane((2,1,0), (1,0,0), (0,1,0), (0,0,1))))
+        label = label.replace(companions=(Companion('supervision', mask),))
         expected = np.zeros((1,7,9), 'uint8')
         expected[:,1:3,2:5] = 128
         for backend in self.backends():
@@ -220,7 +219,7 @@ class PairedTests(unittest.TestCase):
         scroll = self.scroll.with_source(source, kind='volume')
         volume = scroll.volumes['user:ct']
         representation = self.source('representation', data, 'scalar')
-        representation = replace(representation, registration=VolumeRegistration('s', volume.id, affine=Affine.identity()))
+        representation = representation.replace(registration=VolumeRegistration('s', volume.id, affine=Affine.identity()))
         scroll = scroll.with_source(representation, kind='representation', volume=volume)
         with volume.open() as reader:
             np.testing.assert_array_equal(reader[:], data)

@@ -16,19 +16,17 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
-# Catalog parsing and registrations use the native C++ catalog extension.
-# Array reading additionally requires numpy.
-dependencies = []
+dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-reader = ["numpy>=1.24"]
-labels = ["numpy>=1.24", "Pillow>=10.1", "tifffile"]
-transforms = ["numpy>=1.24"]
-torch = ["numpy>=1.24", "torch>=2.0"]
-previews = ["numpy>=1.24", "Pillow>=10.1"]
-bench = ["numpy>=1.24", "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "tifffile", "s3fs", "aiohttp"]
+reader = []
+labels = ["Pillow>=10.1", "tifffile"]
+transforms = []
+torch = ["torch>=2.0"]
+previews = ["Pillow>=10.1"]
+bench = ["tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "tifffile", "s3fs", "aiohttp"]
 all = [
-    "numpy>=1.24", "Pillow>=10.1", "tifffile", "torch>=2.0",
+    "Pillow>=10.1", "tifffile", "torch>=2.0",
     "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "s3fs", "aiohttp",
 ]
 

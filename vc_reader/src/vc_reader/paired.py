@@ -1,11 +1,10 @@
 """Read published or explicitly registered flattened image/label pairs."""
-from dataclasses import replace
 import math
 import operator
 
 from .affine import Affine
 from ._sampling_engine import SamplingEngine
-from .browsing import _select_level
+from ._catalog import select_level as _select_level
 from .sources import SampleResult, TargetResult, SurfaceRegistration, VolumeRegistration
 from .reader.source_resolution import array_placement, pixel_affine as _pixel_affine
 
@@ -103,8 +102,8 @@ class PairedReader(SamplingEngine):
                 raise ValueError('paired reading requires label and image source roles')
             # The original registration remains on public descriptors. A flattened
             # read uses its explicit pixel relationship, without projecting to 3D.
-            raw_image = replace(image, registration=None, companions=())
-            raw_label = replace(label, registration=None, companions=())
+            raw_image = image.replace(registration=None, companions=())
+            raw_label = label.replace(registration=None, companions=())
             image_base = self._open(_select_level(raw_image, 0))
             selected_image = self._open(_select_level(raw_image, level))
             if selected_image.spatial_axes != ('z', 'y', 'x'):
@@ -143,7 +142,7 @@ class PairedReader(SamplingEngine):
             self._targets['label'] = self._planar_target(raw_label, label_base, label_to_selected, level)
             self._masks = {}
             for companion in label.companions:
-                mask_source = replace(companion.source, registration=None, companions=())
+                mask_source = companion.source.replace(registration=None, companions=())
                 base = self._open(_select_level(mask_source, 0))
                 if base.spatial_axes != ('y', 'x'):
                     raise ValueError('flattened masks require YX spatial axes')
@@ -159,8 +158,8 @@ class PairedReader(SamplingEngine):
                         raise ValueError(f'{companion.name}: companion storage transforms contradict same_grid')
                 else:
                     # Resolve each declared grid before comparing placements.
-                    full_resolution_label = self._open(_select_level(replace(label, companions=()), 0))
-                    full_resolution_mask = self._open(_select_level(replace(companion.source, companions=()), 0))
+                    full_resolution_label = self._open(_select_level(label.replace(companions=()), 0))
+                    full_resolution_mask = self._open(_select_level(companion.source.replace(companions=()), 0))
                     mask_to_label = _companion_to_label(full_resolution_label.registration, full_resolution_mask.registration)
                 self._masks[companion.name] = self._planar_target(mask_source, base, label_to_selected @ mask_to_label, level)
             self.metadata = dict(image_id=image.id, label_id=label.id, image_selection=selected_image.resolved.selection,

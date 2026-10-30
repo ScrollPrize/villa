@@ -12,7 +12,6 @@ import numpy as np
 from ..errors import CacheMissError
 from ..sources import Source, Selection, VolumeRegistration
 from ..affine import Affine
-from dataclasses import replace
 from .encoded_files import EncodedFiles
 from .source_resolution import ResolvedSource, resolve_registration, spatial_selection, matches_reference
 from .decoded_cache import DecodedCache, DEFAULT_DECODE_BYTES
@@ -154,7 +153,7 @@ class SourceReader:
             try:
                 if self._is_zarr:
                     from .zarr_source import ZarrSource
-                    selected = replace(source, storage=replace(storage, location=location, alternatives=()))
+                    selected = source.replace(storage=storage.replace(location=location, alternatives=()))
                     self._backend = ZarrSource(selected, self._options)
                     info = self._backend.info
                 else:
@@ -222,7 +221,7 @@ class SourceReader:
         self.palette = None if self._is_zarr else first.palette
         if self._is_zarr:
             self.registration = self._backend.registration
-            self.resolved = replace(self._backend.resolved, axes=self.axes, shape=self.shape, dtype=str(self.dtype))
+            self.resolved = self._backend.resolved.replace(axes=self.axes, shape=self.shape, dtype=str(self.dtype))
         else:
             current = self._image_selection
             original = source.registration.declared_grid if source.registration is not None else None
@@ -233,7 +232,7 @@ class SourceReader:
                 if old.info.series != first.info.series:
                     raise ValueError('selected TIFF series has no declared connection to the original series; supply placement')
                 if old.info.level == first.info.level:
-                    placement_source = replace(source, registration=replace(source.registration, declared_grid=current))
+                    placement_source = source.replace(registration=source.registration.replace(declared_grid=current))
                 old_transform, old_units = old.storage_from_array, old.storage_units
             relative = None
             if isinstance(source.registration, VolumeRegistration) and source.registration.origin == 'catalog-fallback' and (
@@ -262,7 +261,7 @@ class SourceReader:
                         a.storage_units != b.storage_units or a.storage_from_array.matrix != b.storage_from_array.matrix):
                     raise ValueError(f'companion {companion.name} storage metadata contradicts same_grid binding')
                 reader.registration = self.registration
-                reader.resolved = replace(reader.resolved, registration=self.registration)
+                reader.resolved = reader.resolved.replace(registration=self.registration)
 
     @staticmethod
     def _index(value, length, name, names=()):
@@ -281,7 +280,7 @@ class SourceReader:
         reg = self.source.registration
         if self._stack or not isinstance(reg, VolumeRegistration):
             raise ValueError('corresponding image levels require a registered TIFF pyramid')
-        selection = replace(self.source.storage.selection, corresponding=None, level=0)
+        selection = self.source.storage.selection.replace(corresponding=None, level=0)
         base = ImageFile(self._locations[0], self.source.storage.format, selection, self._file_axes, self._encoded)
         if base.format != 'tiff':
             raise ValueError('corresponding levels require a TIFF pyramid or Zarr group')
@@ -291,7 +290,7 @@ class SourceReader:
         old = ImageFile(self._locations[0], base.format, original, self._file_axes, self._encoded)
         matches = []
         for level in range(base.level_count):
-            selected = replace(selection, level=level)
+            selected = selection.replace(level=level)
             image = ImageFile(self._locations[0], base.format, selected, self._file_axes, self._encoded)
             relative = None
             if image.storage_from_array is None and old.storage_from_array is None:

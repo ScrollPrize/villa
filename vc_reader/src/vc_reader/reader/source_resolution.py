@@ -1,6 +1,6 @@
 """Resolve selected storage grids without mutating their source declarations."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace as _replace
 import math
 
 from ..affine import Affine
@@ -30,9 +30,12 @@ class ResolvedSource:
     storage_from_array: Affine | None = None
     storage_units: str | None = None
 
+    def replace(self, **changes):
+        return _replace(self, **changes)
+
 
 def spatial_selection(selection):
-    return replace(selection, channels=None, time=None)
+    return selection.replace(channels=None, time=None)
 
 
 def axes_metadata(value):
@@ -105,19 +108,19 @@ def regrid(registration, original_from_selected, selection):
         return None
     if isinstance(registration, SurfaceRegistration):
         if registration.pixel_to_uv is None:
-            return replace(registration, declared_grid=selection)
+            return registration.replace(declared_grid=selection)
         r = original_from_selected.matrix
         uv = registration.pixel_to_uv
         mapped = tuple((row[0]*r[0][0]+row[1]*r[1][0], row[0]*r[0][1]+row[1]*r[1][1],
                         row[0]*r[0][3]+row[1]*r[1][3]+row[2]) for row in uv)
-        return replace(registration, pixel_to_uv=mapped, declared_grid=selection)
+        return registration.replace(pixel_to_uv=mapped, declared_grid=selection)
     if registration.plane is not None:
         plane, r = registration.plane, original_from_selected.matrix
         origin = tuple(o + r[0][3]*x + r[1][3]*y for o, x, y in zip(plane.origin, plane.basis_x, plane.basis_y))
         x = tuple(r[0][0]*a + r[1][0]*b for a, b in zip(plane.basis_x, plane.basis_y))
         y = tuple(r[0][1]*a + r[1][1]*b for a, b in zip(plane.basis_x, plane.basis_y))
-        return replace(registration, plane=Plane(origin, x, y, plane.thickness), declared_grid=selection)
-    return replace(registration, affine=registration.affine @ original_from_selected if registration.affine else None,
+        return registration.replace(plane=Plane(origin, x, y, plane.thickness), declared_grid=selection)
+    return registration.replace(affine=registration.affine @ original_from_selected if registration.affine else None,
                    declared_grid=selection)
 
 
@@ -135,7 +138,7 @@ def resolve_registration(source, selection, selected_transform=None, units=None,
             selected_transform = Affine.scale(1 / _UNITS[reg.storage_units]) @ selected_transform
         elif reg.storage_units is not None:
             raise ValueError('unitless storage metadata cannot resolve dimensional storage placement')
-        return replace(reg, affine=reg.affine @ selected_transform, mode='array', storage_frame=None,
+        return reg.replace(affine=reg.affine @ selected_transform, mode='array', storage_frame=None,
                        storage_units=None, declared_grid=selection)
     if isinstance(reg, VolumeRegistration) and reg.origin == 'catalog-fallback' and selected_transform is not None:
         if units is not None:
@@ -149,9 +152,9 @@ def resolve_registration(source, selection, selected_transform=None, units=None,
             if declared_transform is None or reg.affine is None:
                 raise ValueError('storage metadata has no connection to the declared volume grid')
             affine = reg.affine @ declared_transform.inverse() @ selected_transform
-        return replace(reg, affine=affine, declared_grid=selection, origin='storage-metadata')
+        return reg.replace(affine=affine, declared_grid=selection, origin='storage-metadata')
     if spatial_selection(reg.declared_grid or Selection()) == spatial_selection(selection):
-        return replace(reg, declared_grid=selection)
+        return reg.replace(declared_grid=selection)
     if relative is None and selected_transform is not None and declared_transform is not None:
         if units != declared_units:
             raise ValueError('selected and declared grids have incompatible units')
