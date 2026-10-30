@@ -18,6 +18,8 @@ import zarr
 from numcodecs import Blosc
 from tqdm import tqdm
 
+from vesuvius.data.utils import create_zarr_array, open_zarr_group
+
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import get_chunk_slices
@@ -292,8 +294,9 @@ class MergeTask(ZarrTask):
         output_path = Path(self.config.output_zarr)
         print(f"\nCreating output zarr at {output_path}")
 
-        root = zarr.open(str(output_path), mode="w")
-        root.create_dataset(
+        root = open_zarr_group(str(output_path), mode="w")
+        create_zarr_array(
+            root,
             "0",
             shape=self._shape,
             chunks=self._chunks,
@@ -324,7 +327,7 @@ class MergeTask(ZarrTask):
     def _generate_pyramid_levels(self) -> None:
         """Generate downsampled pyramid levels from level 0."""
         zarr_path = self.config.output_zarr
-        root = zarr.open(zarr_path, mode="r+")
+        root = open_zarr_group(zarr_path, mode="r+")
 
         for level in range(1, self.config.num_levels):
             prev_level = level - 1
@@ -341,7 +344,8 @@ class MergeTask(ZarrTask):
             print(f"Level {level}: {prev_shape} -> {out_shape}")
 
             # Create output array
-            root.create_dataset(
+            create_zarr_array(
+                root,
                 str(level),
                 shape=out_shape,
                 chunks=self._chunks,
