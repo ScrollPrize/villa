@@ -14,9 +14,15 @@ The scroll's facts, the umbilicus and the Lasagna stores are the open
 project's: every build request sends the service, which cannot read the
 project file, each project volume's voxel size, a catalog volume's
 orientation and full-resolution shape, the umbilicus the project's umbilicus
-store holds for it, and the selected Lasagna dataset's nx, ny and grad_mag
-stores with their scale relative to each volume (see "The VC3D project's
-inputs" in the README). The fit uses the entry of the volume its inputs
+store holds for it, and the selected Lasagna dataset's identity, its nx, ny
+and grad_mag stores and their scale relative to each volume (see "The VC3D
+project's inputs" in the README). The fit reads the dataset's packed pools
+from the service's cache by that identity: pack them with
+`pack_resident_pools.py` and copy them there first (see "Lasagna inputs must
+be packed first"). With the fiber-direction loss on, it reads the samples
+extracted from the selected fiber-inference dataset at the fit volume's scale,
+also from the service's cache by that dataset's identity
+(`fiber_direction_samples.py --cache`). The fit uses the entry of the volume its inputs
 name; import an umbilicus for that volume (File > Import Umbilicus) and
 select the Lasagna dataset before building. For a volume outside the
 catalog, choose the spiral's *Outward sense* in the panel (a fit setting).

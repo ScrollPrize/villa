@@ -374,12 +374,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* lasagnaContents = new QWidget(lasagnaSection->contentWidget());
     auto* lasagnaForm = new QFormLayout(lasagnaContents);
     lasagnaSection->contentLayout()->addWidget(lasagnaContents);
-    addPathRow(lasagnaForm, "normal_x", tr("Normal X"), true);
-    addPathRow(lasagnaForm, "normal_y", tr("Normal Y"), true);
-    addPathRow(lasagnaForm, "gradient_magnitude", tr("Gradient magnitude"), true);
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
-    // The project's selected Lasagna dataset: its array and the arrays'
-    // scale relative to the fit volume are reported rather than chosen.
+    // The project's selected Lasagna dataset: its identity, its array and
+    // the arrays' scale relative to the fit volume are reported rather than
+    // chosen. The fit reads the identity's packs from the service's cache.
     _lasagnaSummary = new QLabel(tr("No fit built yet"), lasagnaContents);
     _lasagnaSummary->setObjectName(QStringLiteral("spiralLasagnaSummary"));
     _lasagnaSummary->setWordWrap(true);
@@ -1969,9 +1967,13 @@ void SpiralPanel::applySessionScroll(const QJsonObject& request)
     _lasagnaSummary->setText(
         lasagna.isEmpty()
             ? tr("The project selects no Lasagna dataset")
-            : tr("%1 — array %2, %3 fit-volume voxels per array voxel")
+            : lasagna.contains(QStringLiteral("error"))
+            ? tr("%1 — %2").arg(lasagna.value(QStringLiteral("location")).toString(),
+                                lasagna.value(QStringLiteral("error")).toString())
+            : tr("%1 (%2) — array %3, %4 fit-volume voxels per array voxel")
                   .arg(lasagna.value(QStringLiteral("location")).toString(),
-                       scroll.value(QStringLiteral("normal_zarr_group")).toString())
+                       lasagna.value(QStringLiteral("identity")).toString(),
+                       lasagna.value(QStringLiteral("group")).toString())
                   .arg(scroll.value(QStringLiteral("lasagna_scale")).toInt()));
 }
 

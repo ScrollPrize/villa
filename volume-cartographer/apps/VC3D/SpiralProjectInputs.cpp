@@ -2,21 +2,46 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
+#include <QCryptographicHash>
 #include <QJsonArray>
+#include <QJsonDocument>
+#include <QRegularExpression>
 
 #include <cmath>
+#include <fstream>
+#include <iterator>
 
 namespace vc3d::spiral {
 
+std::string lasagnaIdentity(const std::string& manifestBytes, const std::string& manifestName,
+                            const std::string& provenance)
+{
+    static const QRegularExpression valid(QStringLiteral(R"(\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z)"));
+    if (!provenance.empty()) {
+        const QJsonObject record = QJsonDocument::fromJson(QByteArray::fromStdString(provenance)).object();
+        const QJsonValue named = record.value(QStringLiteral("manifest"));
+        const QString runUuid = record.value(QStringLiteral("run_uuid")).toString();
+        if (valid.match(runUuid).hasMatch()
+            && (named.isUndefined() || named.isNull()
+                || named.toString().toStdString() == manifestName))
+            return runUuid.toStdString();
+    }
+    return "sha256-" + QCryptographicHash::hash(QByteArray::fromStdString(manifestBytes),
+                                                QCryptographicHash::Sha256).toHex().toStdString();
+}
+
 ProjectLasagna projectLasagna(const vc::lasagna::LasagnaDatasetManifest& manifest,
-                              const std::string& location)
+                              const std::string& location, const std::string& identity)
 {
     ProjectLasagna result;
     result.location = location;
+    result.identity = identity;
     result.baseShapeZYX = manifest.baseShapeZYX;
     const std::pair<const char*, const char*> inputs[] = {
         {"normal_x", "nx"}, {"normal_y", "ny"}, {"gradient_magnitude", "grad_mag"}};
@@ -24,19 +49,17 @@ ProjectLasagna projectLasagna(const vc::lasagna::LasagnaDatasetManifest& manifes
     for (const auto& [input, channel] : inputs) {
         const auto* group = manifest.groupForChannel(channel);
         if (!group) continue;
-        if (group->isRemote()) {
-            result.error = "Spiral reads Lasagna stores from local paths; " + location + " is remote";
-            return result;
-        }
         if (group->channels.size() != 1) {
             result.error = "Spiral reads single-channel Lasagna arrays; " + location + "'s channel " +
                            channel + " shares group " + group->name;
             return result;
         }
-        // The group is an array of an OME-Zarr store: the fit reads
-        // <store>/<array>.
-        const auto store = group->zarrPath.parent_path().string();
-        const auto array = group->zarrPath.filename().string();
+        // The group is an array of an OME-Zarr store: <store>/<array>, a
+        // path or a remote location.
+        const auto source = vc::lasagna::lasagnaGroupSourceLocation(*group);
+        const auto slash = source.find_last_of('/');
+        const auto store = source.substr(0, slash);
+        const auto array = source.substr(slash + 1);
         if ((!result.group.empty() && array != result.group) || (scaledown && *scaledown != group->scaledown)) {
             result.error = "Spiral reads the Lasagna channels at one array; " + location +
                            " stores them at different ones";
@@ -53,25 +76,92 @@ ProjectLasagna projectLasagna(const vc::lasagna::LasagnaDatasetManifest& manifes
     return result;
 }
 
-std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg)
+namespace {
+std::string fileBytes(const std::filesystem::path& path)
 {
-    const std::string location = pkg.selectedLasagnaDataset();
-    if (location.empty()) return std::nullopt;
-    if (vc::project::isLocationRemote(location)) {
-        ProjectLasagna remote;
-        remote.location = location;
-        remote.error = "Spiral reads Lasagna stores from local paths; " + location + " is remote";
-        return remote;
-    }
-    const auto path = vc::project::resolveLocalPath(location, pkg.directory());
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot read " + path.string());
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+// The manifest's provenance record (its "provenance" file, beside it), empty
+// when it names none.
+std::string provenanceText(const vc::lasagna::LasagnaDatasetManifest& manifest,
+                           const std::filesystem::path& remoteCacheRoot)
+{
+    const auto name = manifest.raw.value("provenance", std::string{});
+    if (name.empty()) return {};
+    if (!manifest.manifestIsRemote) return fileBytes(manifest.baseDirectory / name);
+    const std::string location = manifest.remoteSourceBaseLocation + "/" + name;
+    namespace util = vc::core::util;
+    util::RemoteFileCacheOptions options;
+    options.cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
+    options.destination = util::remoteFileCachePath(location);
+    options.discoverAwsCredentials = manifest.discoverAwsCredentials;
+    return fileBytes(util::cacheRemoteFile(location, options).path);
+}
+} // namespace
+
+namespace {
+// A project dataset selection's location: a remote one as is, a local one
+// resolved against the project.
+std::string datasetLocation(const VolumePkg& pkg, const std::string& selected)
+{
+    return vc::project::isLocationRemote(selected)
+        ? selected
+        : vc::project::resolveLocalPath(selected, pkg.directory()).string();
+}
+
+struct OpenedDataset {
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    std::string identity;
+};
+
+OpenedDataset openDataset(const std::string& location, const std::filesystem::path& remoteCacheRoot)
+{
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = remoteCacheRoot;
+    auto manifest = vc::lasagna::LasagnaDataset::openLocation(location, options).manifest();
+    const auto file = std::filesystem::is_directory(manifest.manifestPath)
+        ? manifest.manifestPath / ".zattrs" : manifest.manifestPath;
+    auto identity = lasagnaIdentity(fileBytes(file), manifest.manifestPath.filename().string(),
+                                    provenanceText(manifest, remoteCacheRoot));
+    return {std::move(manifest), std::move(identity)};
+}
+} // namespace
+
+std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg,
+                                             const std::filesystem::path& remoteCacheRoot)
+{
+    const std::string selected = pkg.selectedLasagnaDataset();
+    if (selected.empty()) return std::nullopt;
+    const std::string location = datasetLocation(pkg, selected);
     try {
-        return projectLasagna(vc::lasagna::LasagnaDatasetManifest::parseFile(path), path.string());
+        const auto dataset = openDataset(location, remoteCacheRoot);
+        return projectLasagna(dataset.manifest, location, dataset.identity);
     } catch (const std::exception& error) {
         ProjectLasagna unreadable;
-        unreadable.location = path.string();
-        unreadable.error = "cannot read " + path.string() + ": " + error.what();
+        unreadable.location = location;
+        unreadable.error = "cannot read " + location + ": " + error.what();
         return unreadable;
     }
+}
+
+std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,
+                                                    const std::filesystem::path& remoteCacheRoot)
+{
+    const std::string selected = pkg.selectedFiberInferenceDataset();
+    if (selected.empty()) return std::nullopt;
+    ProjectDataset result;
+    result.location = datasetLocation(pkg, selected);
+    try {
+        const auto dataset = openDataset(result.location, remoteCacheRoot);
+        result.identity = dataset.identity;
+        result.baseShapeZYX = dataset.manifest.baseShapeZYX;
+    } catch (const std::exception& error) {
+        result.error = "cannot read " + result.location + ": " + error.what();
+    }
+    return result;
 }
 
 std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pkg)
@@ -109,10 +199,12 @@ std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pk
 QJsonObject projectBlock(const std::string& name,
                          const std::map<std::string, ProjectVolumeFacts>& volumes,
                          const std::optional<ProjectLasagna>& lasagna,
+                         const std::optional<ProjectDataset>& fiberInference,
                          vc::objects::ObjectStoreSession* session,
                          const std::optional<vc::objects::AttachmentIdentity>& umbilicusStore)
 {
     const bool readable = lasagna && lasagna->error.empty();
+    const bool fibers = fiberInference && fiberInference->error.empty();
     QJsonObject entries;
     for (const auto& [uuid, facts] : volumes) {
         QJsonObject entry;
@@ -133,6 +225,14 @@ QJsonObject projectBlock(const std::string& name,
                 const double scale = lasagna->baseVoxelsPerArrayVoxel / basePerVolumeVoxel;
                 if (scale >= 1 && scale == std::round(scale))
                     entry[QStringLiteral("lasagna_scale")] = qint64(scale);
+            } catch (const std::exception&) {
+            }
+        }
+        if (fibers && fiberInference->baseShapeZYX && facts.baseShapeZYX) {
+            // The fiber-direction samples are extracted at this scale.
+            try {
+                entry[QStringLiteral("fiber_scale")] = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+                    *facts.baseShapeZYX, *fiberInference->baseShapeZYX);
             } catch (const std::exception&) {
             }
         }
@@ -157,11 +257,20 @@ QJsonObject projectBlock(const std::string& name,
         if (!readable) {
             value[QStringLiteral("error")] = QString::fromStdString(lasagna->error);
         } else {
+            value[QStringLiteral("identity")] = QString::fromStdString(lasagna->identity);
             value[QStringLiteral("group")] = QString::fromStdString(lasagna->group);
             for (const auto& [input, store] : lasagna->stores)
                 value[QString::fromStdString(input)] = QString::fromStdString(store);
         }
         block[QStringLiteral("lasagna")] = value;
+    }
+    if (fiberInference) {
+        QJsonObject value{{QStringLiteral("location"), QString::fromStdString(fiberInference->location)}};
+        if (fibers)
+            value[QStringLiteral("identity")] = QString::fromStdString(fiberInference->identity);
+        else
+            value[QStringLiteral("error")] = QString::fromStdString(fiberInference->error);
+        block[QStringLiteral("fiber_inference")] = value;
     }
     return block;
 }

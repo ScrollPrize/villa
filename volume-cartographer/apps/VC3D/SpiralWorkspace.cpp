@@ -309,7 +309,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         const auto pkg = _state->vpkg();
         if (!pkg) throw std::runtime_error("no project is open");
         return vc3d::spiral::projectBlock(pkg->name(), vc3d::spiral::projectVolumeFacts(*pkg),
-                                          vc3d::spiral::projectLasagna(*pkg),
+                                          vc3d::spiral::projectLasagna(*pkg, vc3d::remoteCachePathFs()),
+                                          vc3d::spiral::projectFiberInference(*pkg, vc3d::remoteCachePathFs()),
                                           _state->objectStoreSession().get(),
                                           _state->storeFor("umbilicus"));
     });
