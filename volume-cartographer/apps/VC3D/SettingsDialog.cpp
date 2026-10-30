@@ -84,6 +84,9 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     spinRemoteCacheMinimumFreeGiB->setValue(static_cast<int>(settings.value(
         perf::REMOTE_CACHE_MIN_FREE_GIB, perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong()));
 
+    chkSessionRecovery->setChecked(
+        settings.value(backup::SESSION_RECOVERY, backup::SESSION_RECOVERY_DEFAULT).toBool());
+
     const bool automaticDownloads = settings.value(
         perf::REMOTE_DOWNLOAD_AUTOMATIC,
         perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
@@ -204,6 +207,8 @@ void SettingsDialog::accept()
     limits.minimumFreeBytes =
         static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
     vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
+
+    settings.setValue(backup::SESSION_RECOVERY, chkSessionRecovery->isChecked());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

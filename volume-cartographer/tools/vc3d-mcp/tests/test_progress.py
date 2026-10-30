@@ -392,7 +392,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
 
     # Assert the exact registered count so schema drift (added/removed tools) is caught.
-    EXPECTED_TOOL_COUNT = 98
+    EXPECTED_TOOL_COUNT = 113
 
     async def test_tool_surface_and_schemas(self) -> None:
         tools = await core.mcp.list_tools()
@@ -415,7 +415,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             by_name["vc3d_switch_workspace"]["properties"]["name"]["enum"],
-            ["main", "lasagna", "project"],
+            ["main", "lasagna", "spiral", "fiber-map", "project"],
         )
         self.assertEqual(
             by_name["vc3d_render_tifxyz"]["properties"]["output_format"]["enum"],

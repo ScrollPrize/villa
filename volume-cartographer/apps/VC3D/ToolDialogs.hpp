@@ -231,6 +231,7 @@ protected:
 
 private:
     QStringList collectGridNames() const;          // row-major, empties as ""
+    QVector<QStringList> collectGridRows() const;  // grid rows, empties as ""
     void rebuildPreview();
     void updateRefCombo();
     void resizeGrid(int newRows, int newCols);

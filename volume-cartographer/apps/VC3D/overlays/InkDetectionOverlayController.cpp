@@ -221,6 +221,7 @@ void InkDetectionOverlayController::setColormapId(const std::string& id)
         _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
         _selectedImage.colormapId = _colormapId;
     }
+    emit colormapChanged(QString::fromStdString(_colormapId));
     refreshAll();
 }
 

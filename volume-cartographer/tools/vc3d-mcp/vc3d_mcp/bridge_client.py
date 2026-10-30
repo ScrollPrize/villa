@@ -141,6 +141,10 @@ class BridgeClient:
         self._next_id = 1
         self._closed = False
         self._job_progress: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
+        # Latest state.changed revision and the fields named since the last
+        # take_state_changes(); best-effort like job.progress.
+        self._state_revision: int | None = None
+        self._state_changes: set[str] = set()
 
     @staticmethod
     def resolve_socket_path(configured: str) -> str:
@@ -212,6 +216,13 @@ class BridgeClient:
             subscribers.discard(queue)
             if not subscribers:
                 self._job_progress.pop(job_id, None)
+
+    def take_state_changes(self) -> tuple[int | None, list[str]]:
+        """Return the latest state.changed revision seen and the fields named
+        since the previous call, sorted, then forget those fields."""
+        fields = sorted(self._state_changes)
+        self._state_changes.clear()
+        return self._state_revision, fields
 
     async def close(self) -> None:
         self._closed = True
@@ -317,6 +328,17 @@ class BridgeClient:
                         if queue.full():
                             queue.get_nowait()
                         queue.put_nowait(params)
+            elif msg.get("method") == "state.changed":
+                params = msg.get("params")
+                if isinstance(params, dict):
+                    revision = params.get("revision")
+                    if isinstance(revision, int) and not isinstance(revision, bool):
+                        self._state_revision = revision
+                    changed = params.get("changed")
+                    if isinstance(changed, list):
+                        self._state_changes.update(
+                            name for name in changed if isinstance(name, str)
+                        )
             return
         fut = conn.pending.pop(msg["id"], None)
         if fut is None or fut.done():

@@ -1,5 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 #include "ProjectWorkspace.hpp"
 
 #include <QBuffer>
@@ -390,26 +391,35 @@ QJsonObject AgentBridgeServer::handleLasagnaRepeatLast(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    const QString name = p.value("name").toString();
+    const QString id = canonicalWorkspaceId(p.value("name").toString());
 
     // The Project tab also shows that no project is open.
-    if (name == QLatin1String("project")) {
+    if (id == QLatin1String("project")) {
+        const QString previous = currentWorkspaceId();
         if (_window && _window->_workspaceTabs && _window->_projectWorkspace)
             _window->_workspaceTabs->setCurrentWidget(_window->_projectWorkspace);
-        return QJsonObject{{"workspace", name}};
+        return QJsonObject{{"workspace", id},
+                           {"previous", previous.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                                           : QJsonValue(previous)}};
     }
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    if (name == QLatin1String("main")) {
-        _window->switchToMainWorkspace();
-    } else {
-        _window->switchToLasagnaWorkspace();
+    if (!workspacePage(id)) {
+        QJsonObject data;
+        data["kind"] = "workspace";
+        data["id"] = id;
+        throw AgentBridgeError{-32007, "Workspace not available", data};
     }
 
+    const QString previous = currentWorkspaceId();
+    setCurrentWorkspace(id);
+
     QJsonObject result;
-    result["workspace"] = name;
+    result["workspace"] = id;
+    result["previous"] = previous.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                            : QJsonValue(previous);
     return result;
 }

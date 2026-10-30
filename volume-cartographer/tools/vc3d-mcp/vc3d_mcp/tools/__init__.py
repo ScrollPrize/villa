@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from . import (  # noqa: F401  (imported for their registration side effects)
     catalog_volume,
+    editing_settings,
     fiber,
     flatten,
     jobs,
@@ -17,9 +18,11 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     points,
     review,
     seeding,
+    segment_ops,
     segmentation,
     session,
     surface_ops,
     viewer,
+    viewer_display,
     wrap,
 )

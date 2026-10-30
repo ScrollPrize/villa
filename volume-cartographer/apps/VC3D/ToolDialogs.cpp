@@ -1,4 +1,5 @@
 #include "ToolDialogs.hpp"
+#include "MergeTifxyzInputs.hpp"
 
 #include "VCSettings.hpp"
 #include "elements/JsonProfileEditor.hpp"
@@ -1944,78 +1945,23 @@ QStringList MergeSurfacesDialog::collectGridNames() const
     return out;
 }
 
+QVector<QStringList> MergeSurfacesDialog::collectGridRows() const
+{
+    QVector<QStringList> rows;
+    for (int r = 0; r < tblGrid_->rowCount(); ++r) {
+        QStringList row;
+        for (int c = 0; c < tblGrid_->columnCount(); ++c) {
+            auto* it = tblGrid_->item(r, c);
+            row << (it ? it->text().trimmed() : QString());
+        }
+        rows << row;
+    }
+    return rows;
+}
+
 QString MergeSurfacesDialog::mergeJsonText() const
 {
-    const int rows = tblGrid_->rowCount();
-    const int cols = tblGrid_->columnCount();
-
-    // Whitespace-delimited string rows can't represent interior empty
-    // cells -- the parser splits the row on whitespace and looks each
-    // token up as a surface, so a literal "" token would be searched
-    // for as the surface `""` and the run would fail. Switch to JSON array rows (with `null` for empty cells)
-    // whenever the grid has any blank, which is the form gmResolveGrid
-    // already handles. Solid grids keep the more compact string form.
-    bool hasEmpty = false;
-    for (int r = 0; r < rows && !hasEmpty; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            auto* it = tblGrid_->item(r, c);
-            if (!it || it->text().trimmed().isEmpty()) {
-                hasEmpty = true;
-                break;
-            }
-        }
-    }
-
-    QString out;
-    out += QStringLiteral("{\n  \"rows\": [\n");
-
-    if (hasEmpty) {
-        for (int r = 0; r < rows; ++r) {
-            QStringList cells;
-            cells.reserve(cols);
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                const QString name = it ? it->text().trimmed() : QString();
-                if (name.isEmpty()) {
-                    cells << QStringLiteral("null");
-                } else {
-                    cells << QStringLiteral("\"") + name + QLatin1Char('"');
-                }
-            }
-            out += QStringLiteral("    [")
-                 + cells.join(QStringLiteral(", "))
-                 + QLatin1Char(']');
-            if (r + 1 < rows) out += QLatin1Char(',');
-            out += QLatin1Char('\n');
-        }
-    } else {
-        // Pad each cell so visual columns line up in the preview.
-        QVector<int> widths(cols, 0);
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                int w = it ? static_cast<int>(it->text().trimmed().size()) : 0;
-                if (w > widths[c]) widths[c] = w;
-            }
-        }
-        for (int r = 0; r < rows; ++r) {
-            QStringList tokens;
-            tokens.reserve(cols);
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                const QString name = it ? it->text().trimmed() : QString();
-                tokens << name.leftJustified(std::max(widths[c], 1), ' ');
-            }
-            out += QStringLiteral("    \"")
-                 + tokens.join(' ').trimmed()
-                 + QLatin1Char('"');
-            if (r + 1 < rows) out += QLatin1Char(',');
-            out += QLatin1Char('\n');
-        }
-    }
-
-    out += QStringLiteral("  ]\n}\n");
-    return out;
+    return vc3d::merge_tifxyz::gridJsonText(collectGridRows());
 }
 
 void MergeSurfacesDialog::rebuildPreview()
@@ -2065,43 +2011,13 @@ int     MergeSurfacesDialog::ompThreads() const {
 
 void MergeSurfacesDialog::accept()
 {
-    // --- validate grid -----------------------------------------------------
-    QStringList names = collectGridNames();
-    QStringList unique;
-    int nonEmpty = 0;
-    for (const auto& n : names) {
-        if (n.isEmpty()) continue;
-        ++nonEmpty;
-        if (!unique.contains(n)) unique << n;
-    }
-    if (unique.size() < 2) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("Merge requires at least 2 distinct surfaces in the grid; "
-               "currently %1.").arg(unique.size()));
+    const QString invalid = vc3d::merge_tifxyz::validate(
+        collectGridRows(), _availableSurfaces.keys(), refSurface(),
+        spMin_->value(), spMax_->value());
+    if (!invalid.isEmpty()) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"), invalid);
         return;
     }
-    QStringList missing;
-    for (const auto& n : unique) {
-        if (!_availableSurfaces.contains(n)) missing << n;
-    }
-    if (!missing.isEmpty()) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("These are not surfaces of the current volume:\n  %1")
-                .arg(missing.join(QLatin1String(", "))));
-        return;
-    }
-    if (spMin_->value() >= spMax_->value()) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("RANSAC min threshold must be strictly less than max."));
-        return;
-    }
-    const QString ref = refSurface();
-    if (!ref.isEmpty() && !unique.contains(ref)) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("Reference '%1' is not in the grid.").arg(ref));
-        return;
-    }
-    (void)nonEmpty;
 
     updateSessionFromUI();
     QDialog::accept();
