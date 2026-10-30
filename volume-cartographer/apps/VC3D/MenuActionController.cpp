@@ -1020,18 +1020,7 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
         !volume->hasScaleLevel(logicalPrefillLevel)) {
         return;
     }
-    if (volume->remotePersistentCachePath().empty()) {
-        return;
-    }
-    if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
-            volume->remotePersistentCachePath(),
-            *volume,
-            logicalPrefillLevel)) {
-        Logger()->info(
-            "Open-data volume {} physical level {} (logical {}) already prefetched",
-            volume->id(),
-            vc3d::opendata::kOpenDataVolumePrefillLevel,
-            logicalPrefillLevel);
+    if (volume->remoteCacheRoot().empty()) {
         return;
     }
 
@@ -1042,15 +1031,6 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     _openDataPrefillCancelFlags.push_back(cancelFlag);
 
     const QString volumeId = QString::fromStdString(volume->id());
-    if (_window) {
-        _window->showStatusBarMessage(
-            QObject::tr("Caching remote volume %1 physical /%2 (logical /%3) in background...")
-                .arg(volumeId)
-                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel)
-                .arg(logicalPrefillLevel),
-            7000);
-    }
-
     connect(watcher,
             &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
             this,
@@ -1098,20 +1078,23 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                 using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
                 switch (result.status) {
                 case Status::Completed:
-                    _window->showStatusBarMessage(
-                        QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks.")
-                            .arg(QString::fromStdString(result.volumeId))
-                            .arg(result.physicalLevel)
-                            .arg(result.level)
-                            .arg(result.totalChunks),
-                        7000);
+                    if (result.fetchedChunks > 0) {
+                        _window->showStatusBarMessage(
+                            QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks fetched.")
+                                .arg(QString::fromStdString(result.volumeId))
+                                .arg(result.physicalLevel)
+                                .arg(result.level)
+                                .arg(result.fetchedChunks),
+                            7000);
+                    }
                     Logger()->info(
-                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={})",
+                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={}, fetched={})",
                         result.volumeId,
                         result.level,
                         result.totalChunks,
                         result.dataChunks,
-                        result.emptyChunks);
+                        result.emptyChunks,
+                        result.fetchedChunks);
                     break;
                 case Status::Failed:
                     _window->showStatusBarMessage(

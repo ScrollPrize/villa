@@ -1,244 +1,17 @@
 #include "OpenDataVolumePrefill.hpp"
 
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 
-#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
 
-#include <array>
-#include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <exception>
-#include <fstream>
-#include <future>
 #include <mutex>
-#include <system_error>
-#include <utility>
-#include <vector>
 
 namespace vc3d::opendata {
 namespace {
-
-constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v2";
 constexpr std::size_t kProgressIntervalChunks = 32;
-constexpr std::size_t kMaximumPrefillWorkers = 8;
-
-struct OpenDataVolumePrefillMarkerInfo {
-    std::string remoteUrl;
-    std::string remoteLocator;
-    std::string volumeId;
-    int level = kOpenDataVolumePrefillLevel;
-    int physicalLevel = kOpenDataVolumePrefillLevel;
-    std::array<int, 3> shape{};
-    std::array<int, 3> chunkShape{};
-    std::array<int, 3> chunkGridShape{};
-    std::size_t totalChunks = 0;
-};
-
-std::size_t chunkCountForGrid(const std::array<int, 3>& grid)
-{
-    return static_cast<std::size_t>(grid[0]) *
-           static_cast<std::size_t>(grid[1]) *
-           static_cast<std::size_t>(grid[2]);
-}
-
-OpenDataVolumePrefillMarkerInfo markerInfoForVolume(const Volume& volume, int level)
-{
-    OpenDataVolumePrefillMarkerInfo info;
-    info.remoteUrl = volume.remoteUrl();
-    info.remoteLocator = volume.remoteLocator();
-    info.volumeId = volume.id();
-    info.level = level;
-    info.physicalLevel = volume.baseScaleLevel() + level;
-    info.shape = volume.levelShape(level);
-    info.chunkShape = volume.chunkShape(level);
-    info.chunkGridShape = volume.chunkGridShape(level);
-    info.totalChunks = chunkCountForGrid(info.chunkGridShape);
-    return info;
-}
-
-nlohmann::json markerJsonForInfo(const OpenDataVolumePrefillMarkerInfo& info)
-{
-    return nlohmann::json{
-        {"version", kMarkerVersion},
-        {"remote_url", info.remoteUrl},
-        {"remote_locator", info.remoteLocator},
-        {"volume_id", info.volumeId},
-        {"level", info.level}, // retained for readers of the v1 logical field
-        {"logical_level", info.level},
-        {"physical_level", info.physicalLevel},
-        {"shape", info.shape},
-        {"chunk_shape", info.chunkShape},
-        {"chunk_grid_shape", info.chunkGridShape},
-        {"chunk_count", info.totalChunks},
-    };
-}
-
-std::filesystem::path uniqueMarkerTempPath(const std::filesystem::path& path)
-{
-    static std::atomic_uint64_t sequence{0};
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-    return std::filesystem::path(
-        path.string() + ".tmp." + std::to_string(stamp) + "." +
-        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
-}
-
-bool markerMatchesJson(const nlohmann::json& marker,
-                       const OpenDataVolumePrefillMarkerInfo& info)
-{
-    if (!marker.is_object()) {
-        return false;
-    }
-    const auto expected = markerJsonForInfo(info);
-    for (const char* key : {
-             "version",
-             "remote_url",
-             "remote_locator",
-             "volume_id",
-             "level",
-             "logical_level",
-             "physical_level",
-             "shape",
-             "chunk_shape",
-             "chunk_grid_shape",
-             "chunk_count",
-         }) {
-        const auto found = marker.find(key);
-        if (found == marker.end() || *found != expected.at(key)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool cancelled(const std::atomic<bool>* cancelFlag)
-{
-    return cancelFlag && cancelFlag->load(std::memory_order_acquire);
-}
-
-std::filesystem::path markerDirectoryForLayout(
-    const std::filesystem::path& cacheDir,
-    vc::render::PersistentCacheLayout layout)
-{
-    if (layout == vc::render::PersistentCacheLayout::ZarrMirror) {
-        return cacheDir.parent_path() / ".vc_cache_bookkeeping" /
-               cacheDir.filename();
-    }
-    return cacheDir;
-}
-
-std::filesystem::path openDataVolumePrefillMarkerPath(
-    const std::filesystem::path& cacheDir,
-    int level)
-{
-    return cacheDir / (".vc_prefill_level_" + std::to_string(level) + ".json");
-}
-
-bool openDataVolumePrefillMarkerMatches(const std::filesystem::path& cacheDir,
-                                        const OpenDataVolumePrefillMarkerInfo& info)
-{
-    if (cacheDir.empty()) {
-        return false;
-    }
-
-    std::ifstream file(openDataVolumePrefillMarkerPath(cacheDir, info.level));
-    if (!file) {
-        return false;
-    }
-
-    try {
-        const auto marker = nlohmann::json::parse(file, nullptr, false);
-        return !marker.is_discarded() && markerMatchesJson(marker, info);
-    } catch (...) {
-        return false;
-    }
-}
-
-
-bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
-                                      const OpenDataVolumePrefillMarkerInfo& info,
-                                      std::string* errorOut)
-{
-    if (errorOut) {
-        errorOut->clear();
-    }
-    if (cacheDir.empty()) {
-        if (errorOut) {
-            *errorOut = "remote cache directory is empty";
-        }
-        return false;
-    }
-
-    try {
-        std::error_code ec;
-        std::filesystem::create_directories(cacheDir, ec);
-        if (ec) {
-            if (errorOut) {
-                *errorOut = ec.message();
-            }
-            return false;
-        }
-
-        auto marker = markerJsonForInfo(info);
-        const auto now = std::chrono::system_clock::now().time_since_epoch();
-        marker["completed_at_unix_ms"] =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-
-        const auto path = openDataVolumePrefillMarkerPath(cacheDir, info.level);
-        const auto tmp = uniqueMarkerTempPath(path);
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                if (errorOut) {
-                    *errorOut = "could not open marker temp file";
-                }
-                return false;
-            }
-            out << marker.dump(2) << '\n';
-            if (!out) {
-                out.close();
-                std::filesystem::remove(tmp, ec);
-                if (errorOut) {
-                    *errorOut = "could not write marker temp file";
-                }
-                return false;
-            }
-        }
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            std::filesystem::remove(path, ec);
-            ec.clear();
-            std::filesystem::rename(tmp, path, ec);
-        }
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            if (errorOut) {
-                *errorOut = ec.message();
-            }
-            return false;
-        }
-        return true;
-    } catch (const std::exception& e) {
-        if (errorOut) {
-            *errorOut = e.what();
-        }
-        return false;
-    }
-}
-
-} // namespace
-
-bool openDataVolumePrefillMarkerMatches(const std::filesystem::path& cacheDir,
-                                        const Volume& volume,
-                                        int level)
-{
-    if (cacheDir.empty() || !volume.isRemote() || !volume.hasScaleLevel(level)) {
-        return false;
-    }
-    return openDataVolumePrefillMarkerMatches(cacheDir, markerInfoForVolume(volume, level));
 }
 
 OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
@@ -253,164 +26,82 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
         result.message = "no volume";
         return result;
     }
-
     result.volumeId = volume->id();
     result.physicalLevel = volume->baseScaleLevel() + level;
-    result.cacheDir = volume->remotePersistentCachePath();
-
     if (!volume->isRemote()) {
         result.message = "volume is local";
         return result;
     }
-    if (result.cacheDir.empty()) {
+    if (volume->remoteCacheRoot().empty()) {
         result.message = "remote persistent cache is not configured";
         return result;
     }
-    if (!volume->hasScaleLevel(level)) {
-        result.message = "remote volume does not have scale level " + std::to_string(level);
-        return result;
-    }
-    if (cancelled(cancelFlag)) {
-        result.status = OpenDataVolumePrefillResult::Status::Cancelled;
-        result.message = "cancelled";
-        return result;
-    }
+    const auto cancelled = [cancelFlag] {
+        return cancelFlag && cancelFlag->load(std::memory_order_acquire);
+    };
 
     try {
-        auto cache = volume->sharedChunkCache();
-        if (!cache) {
-            result.status = OpenDataVolumePrefillResult::Status::Failed;
-            result.message = "could not create chunk cache";
-            return result;
-        }
+        // No memory cache: fetched chunks go to the volume's disk cache only.
+        auto opened = vcr::zarr::openPyramidLevel(
+            volume->sourceLocation(), result.physicalLevel, volume->sourceOpenOptions());
+        auto& array = *opened.array;
+        const auto grid = array.chunk_grid();
+        result.totalChunks = 1;
+        for (const auto n : grid)
+            result.totalChunks *= static_cast<std::size_t>(n);
 
-        std::vector<vc::render::ChunkKey> requests;
-        if (cache->persistentCacheLayout() ==
-            vc::render::PersistentCacheLayout::ZarrMirror) {
-            requests = cache->storageObjectRepresentatives(level);
-        } else {
-            const auto grid = volume->chunkGridShape(level);
-            requests.reserve(chunkCountForGrid(grid));
-            for (int iz = 0; iz < grid[0]; ++iz) {
-                for (int iy = 0; iy < grid[1]; ++iy) {
-                    for (int ix = 0; ix < grid[2]; ++ix)
-                        requests.push_back({level, iz, iy, ix});
-                }
-            }
-        }
-        result.totalChunks = requests.size();
-        if (result.totalChunks == 0) {
-            result.status = OpenDataVolumePrefillResult::Status::Skipped;
-            result.message = "level has no chunks";
-            return result;
-        }
-
-        auto markerInfo = markerInfoForVolume(*volume, level);
-        markerInfo.totalChunks = result.totalChunks;
-        const auto markerDir = markerDirectoryForLayout(
-            result.cacheDir, cache->persistentCacheLayout());
-        if (openDataVolumePrefillMarkerMatches(markerDir, markerInfo)) {
-            result.status = OpenDataVolumePrefillResult::Status::Skipped;
-            result.resolvedChunks = result.totalChunks;
-            result.message = "level already prefetched";
-            return result;
-        }
-
-        // Keep several chunks in different pipeline stages at once: remote
-        // fetch, source decode, Delta3D compression, and the single ordered
-        // writer. The cap bounds retained payload memory while still allowing
-        // the cache service and its two compression workers to make progress in
-        // parallel.
-        const auto fetchConcurrency =
-            vc::render::processChunkCacheService()->fetchConcurrency();
-        const std::size_t workerCount = std::min<std::size_t>(
-            result.totalChunks,
-            std::max<std::size_t>(
-                1, std::min(kMaximumPrefillWorkers,
-                            fetchConcurrency.maxConcurrentReads)));
-        std::atomic<std::size_t> nextRequest{0};
         std::mutex resultMutex;
-        auto worker = [&] {
-            for (;;) {
-                if (cancelled(cancelFlag))
-                    return;
-                const auto requestIndex =
-                    nextRequest.fetch_add(1, std::memory_order_relaxed);
-                if (requestIndex >= requests.size())
-                    return;
-                const auto& key = requests[requestIndex];
-                const auto chunk = cache->persistChunkBlocking(
-                    level, key.iz, key.iy, key.ix,
-                    vc::render::ChunkCache::PersistentRequestMode::Ensure);
-
-                std::lock_guard lock(resultMutex);
-                ++result.resolvedChunks;
-                switch (chunk.status) {
-                case vc::render::ChunkCache::PersistentRequestStatus::Data:
-                    ++result.dataChunks;
-                    break;
-                case vc::render::ChunkCache::PersistentRequestStatus::Missing:
-                    ++result.emptyChunks;
-                    break;
-                case vc::render::ChunkCache::PersistentRequestStatus::Error:
-                    ++result.errorChunks;
-                    Logger()->warn(
-                        "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
-                        result.volumeId,
-                        level,
-                        key.iz,
-                        key.iy,
-                        key.ix,
-                        chunk.error);
-                    break;
-                }
-
-                if (progressCallback &&
-                    (result.resolvedChunks == result.totalChunks ||
-                     result.resolvedChunks % kProgressIntervalChunks == 0)) {
-                    progressCallback(result.resolvedChunks, result.totalChunks);
-                }
+        array.parallel_for(result.totalChunks, [&](std::size_t i) {
+            if (cancelled())
+                return;
+            vcr::Index idx(grid.size());
+            for (std::size_t d = grid.size(); d-- > 0;) {
+                idx[d] = static_cast<std::int64_t>(i % static_cast<std::size_t>(grid[d]));
+                i /= static_cast<std::size_t>(grid[d]);
             }
-        };
+            bool stored = false;
+            std::string error;
+            try {
+                stored = array.chunk(idx) != nullptr;
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+            std::lock_guard lock(resultMutex);
+            ++result.resolvedChunks;
+            if (!error.empty()) {
+                ++result.errorChunks;
+                Logger()->warn("Open-data volume prefill error for {} level {}: {}",
+                               result.volumeId, level, error);
+            } else if (stored) {
+                ++result.dataChunks;
+            } else {
+                ++result.emptyChunks;
+            }
+            if (progressCallback &&
+                (result.resolvedChunks == result.totalChunks ||
+                 result.resolvedChunks % kProgressIntervalChunks == 0)) {
+                progressCallback(result.resolvedChunks, result.totalChunks);
+            }
+        });
+        array.flush();
+        result.fetchedChunks = array.stats().remote_fetches.load();
 
-        std::vector<std::future<void>> workers;
-        workers.reserve(workerCount - 1);
-        for (std::size_t i = 1; i < workerCount; ++i)
-            workers.emplace_back(std::async(std::launch::async, worker));
-        worker();
-        for (auto& future : workers)
-            future.get();
-
-        cache->waitForPersistentWrites();
-        if (cancelled(cancelFlag) &&
-            result.resolvedChunks < result.totalChunks) {
+        if (cancelled() && result.resolvedChunks < result.totalChunks) {
             result.status = OpenDataVolumePrefillResult::Status::Cancelled;
             result.message = "cancelled";
-            return result;
-        }
-        if (result.errorChunks > 0) {
+        } else if (result.errorChunks > 0) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
             result.message = std::to_string(result.errorChunks) + " chunk(s) failed";
-            return result;
-        }
-
-        std::string markerError;
-        if (!writeOpenDataVolumePrefillMarker(
-                markerDir, markerInfo, &markerError)) {
+        } else if (array.stats().write_errors.load() > 0) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
-            result.message = "could not write prefill marker: " + markerError;
-            return result;
+            result.message = "cache write failed: " + array.last_write_error();
+        } else {
+            result.status = OpenDataVolumePrefillResult::Status::Completed;
+            result.message = "completed";
         }
-
-        result.status = OpenDataVolumePrefillResult::Status::Completed;
-        result.message = "completed";
-        return result;
     } catch (const std::exception& e) {
         result.status = OpenDataVolumePrefillResult::Status::Failed;
         result.message = e.what();
-    } catch (...) {
-        result.status = OpenDataVolumePrefillResult::Status::Failed;
-        result.message = "unknown error";
     }
     return result;
 }
