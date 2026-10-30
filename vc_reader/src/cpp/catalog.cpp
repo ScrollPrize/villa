@@ -691,6 +691,65 @@ std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view ur
     return std::nullopt;
 }
 
+std::optional<int> OpenDataArtifact::gridLevel() const
+{
+    if (type == "ome-zarr" || type == "ink-detection-3d-zarr") return 0;
+    if (type == "surface-prediction-zarr") return sourceCoordinateLevel;
+    return std::nullopt;
+}
+
+std::string sampleNameKey(std::string_view name)
+{
+    std::string key;
+    for (const unsigned char c : name)
+        if (std::isalnum(c) && c < 128) key += char(std::tolower(c));
+    // Zeros that only pad a number.
+    std::string out;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        const bool afterDigit = i > 0 && std::isdigit(static_cast<unsigned char>(key[i - 1]));
+        if (key[i] == '0' && !afterDigit) {
+            std::size_t end = i;
+            while (end < key.size() && key[end] == '0') ++end;
+            // A number that is only zeros keeps one.
+            i = end < key.size() && std::isdigit(static_cast<unsigned char>(key[end])) ? end : end - 1;
+        }
+        out += key[i];
+    }
+    return out;
+}
+
+std::vector<std::string> communityAliases(std::string_view sampleId)
+{
+    static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
+        {"Scroll 1", "PHercParis4"}, {"Scroll 2", "PHercParis3"}, {"Scroll 3", "PHerc0332"},
+        {"Scroll 4", "PHerc1667"},   {"Scroll 5", "PHerc0172"},
+    };
+    std::vector<std::string> out;
+    for (const auto& [alias, id] : aliases)
+        if (id == sampleId) out.emplace_back(alias);
+    return out;
+}
+
+std::vector<std::string> OpenDataManifest::samplesNamed(std::string_view name) const
+{
+    const auto named = [&](const std::string& key) {
+        std::vector<std::string> ids;
+        for (const auto& sample : samples) {
+            bool match = sampleNameKey(sample.id) == key;
+            for (const auto& alias : communityAliases(sample.id)) match |= sampleNameKey(alias) == key;
+            if (const auto it = sample.properties.find("description");
+                it != sample.properties.end() && it->is_string() && !it->get<std::string>().empty())
+                match |= sampleNameKey(it->get<std::string>()) == key;
+            if (match) ids.push_back(sample.id);
+        }
+        return ids;
+    };
+    const auto key = sampleNameKey(name);
+    auto ids = named(key);
+    if (ids.empty() && !key.starts_with("pherc")) ids = named("pherc" + key);
+    return ids;
+}
+
 std::optional<OpenDataVolumeMetadata> OpenDataManifest::volumeMetadataAt(const std::string& url) const
 {
     const auto view = volumeAt(resolveOpenDataUrl(url));

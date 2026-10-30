@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from .affine import Affine
 from .artifacts import Artifact, parse_artifacts
-from .names import COMMUNITY_ALIASES, SampleNameIndex
 DEFAULT_METADATA_URL = _catalog.DEFAULT_METADATA_URL
 DEFAULT_RESOLUTION_REL_TOL = 0.005
 PYRAMID_LEVELS = 6
@@ -140,7 +139,7 @@ class _SampleRecord:
         p = self.properties = native.properties
         self.type: str | None = native.type or None
         self.display_name: str | None = p.get('description')
-        self.aliases: tuple[str, ...] = tuple((a for a, sid in COMMUNITY_ALIASES.items() if sid == self.id))
+        self.aliases: tuple[str, ...] = tuple(_catalog.community_aliases(self.id))
         self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
         self.scans: dict[str, Scan] = {v.id: Scan(self, v) for v in native.scans}
         self.volumes: dict[str, _VolumeRecord] = {v.id: _VolumeRecord(self, v) for v in native.volumes}
@@ -175,9 +174,6 @@ class Catalog:
         self.source = source
         self.models: dict[str, Model] = {v.id: Model(v) for v in self._native.models}
         self._samples: dict[str, _SampleRecord] = {v.id: _SampleRecord(self, v) for v in self._native.samples}
-        self._names = SampleNameIndex()
-        for s in self._samples.values():
-            self._names.add(s.id, (s.display_name, *s.aliases))
 
     def __repr__(self) -> str:
         return f'Catalog(samples={len(self._samples)}, models={len(self.models)}, source={self.source!r})'

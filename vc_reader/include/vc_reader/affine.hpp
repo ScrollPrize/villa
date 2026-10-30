@@ -21,6 +21,13 @@ struct Affine {
         if (!std::isfinite(factor) || factor <= 0) throw std::invalid_argument("scale must be finite and positive");
         Affine a; a(0,0)=a(1,1)=a(2,2)=factor; return a;
     }
+    // Voxels of a pyramid level `factor` times coarser than a reference, block-reduced from
+    // it (as Open Data 2x2x2-mean pyramids are): voxel i is centred at factor * i + (factor - 1) / 2.
+    static Affine blockReduced(double factor) {
+        Affine a=scale(factor);
+        for(int r=0;r<3;++r)a(r,3)=(factor-1)/2;
+        return a;
+    }
     std::array<double,3> apply(const std::array<double,3>& p, bool vector=false) const {
         std::array<double,3> q{};
         for (int i=0;i<3;++i) q[i]=(*this)(i,0)*p[0]+(*this)(i,1)*p[1]+(*this)(i,2)*p[2]+(vector?0:(*this)(i,3));

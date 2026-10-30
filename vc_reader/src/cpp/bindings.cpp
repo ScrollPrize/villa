@@ -14,6 +14,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/array.h>
 
 #include <functional>
 #include <numeric>
@@ -96,20 +97,36 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 NB_MODULE(_reader, m)
 {
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
-    m.def("_point_origin", [](HostPoints points) -> nb::object {
+    m.def("_local_points", [](HostPoints points, std::optional<vcr::Index> origin) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
-        const auto origin = [&](const auto* p) -> nb::object {
-            std::optional<std::array<std::int64_t, 3>> base;
+        const auto local = [&](const auto* p) -> nb::object {
+            auto owned = std::make_unique<vcr::LocalPoints>();
             {
                 nb::gil_scoped_release release;
-                base = vcr::pointOrigin(p, points.shape(0));
+                *owned = vcr::localPoints(p, points.shape(0), origin);
             }
-            return base ? nb::cast(vcr::Index(base->begin(), base->end())) : nb::none();
+            if (owned->dispersed)
+                return nb::none();
+            const auto base = owned->base;
+            float* data = owned->local.data();
+            nb::capsule holder(owned.release(), [](void* q) noexcept { delete static_cast<vcr::LocalPoints*>(q); });
+            return nb::make_tuple(nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {points.shape(0), std::size_t(3)}, holder),
+                                  vcr::Index(base.begin(), base.end()));
         };
-        if (points.dtype() == nb::dtype<float>()) return origin(static_cast<const float*>(points.data()));
-        if (points.dtype() == nb::dtype<double>()) return origin(static_cast<const double*>(points.data()));
+        if (points.dtype() == nb::dtype<float>()) return local(static_cast<const float*>(points.data()));
+        if (points.dtype() == nb::dtype<double>()) return local(static_cast<const double*>(points.data()));
         throw nb::type_error("expected float32 or float64 points");
-    });
+    }, "points"_a, "origin"_a.none() = nb::none());
+    m.def("_check_crop_shape", [](const vcr::Index& shape) { return vcr::checkedCropShape(shape); }, "shape"_a);
+    m.def("_check_coordinate_origin", [](const vcr::Index& origin) { return vcr::checkedCoordinateOrigin(origin); }, "origin"_a);
+    m.def("_local_origin", [](nb::ndarray<nb::ro, nb::ndim<1>, nb::c_contig, nb::device::cpu> origin, std::optional<vcr::Index> coordinate_origin) {
+        if (origin.size() != 3) throw nb::value_error("origin and axes must be finite with shapes (3,) and (3, 3)");
+        const auto local = origin.dtype() == nb::dtype<float>()
+            ? vcr::localOrigin(static_cast<const float*>(origin.data()), coordinate_origin)
+            : origin.dtype() == nb::dtype<double>() ? vcr::localOrigin(static_cast<const double*>(origin.data()), coordinate_origin)
+                                                     : throw nb::type_error("expected a float32 or float64 origin");
+        return std::make_pair(local.base, local.origin);
+    }, "origin"_a, "coordinate_origin"_a.none() = nb::none());
 #ifdef VC_READER_CUDA
     vcr::reader_cuda::bind(m);
 #else

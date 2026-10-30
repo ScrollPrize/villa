@@ -101,6 +101,10 @@ struct OpenDataArtifact {
     std::string accessUsage;
 
     [[nodiscard]] bool hasResolvedUrl() const noexcept;
+    // The pyramid level of the source volume this artifact's own level 0 lies on, for
+    // OME-Zarr pyramids on the volume's grid; empty otherwise, and for a surface
+    // prediction whose level is unknown.
+    [[nodiscard]] std::optional<int> gridLevel() const;
     // The artifact's URL: the resolved public URL, else its source path,
     // without trailing slashes. Empty when it has no public origin.
     [[nodiscard]] std::string url() const;
@@ -357,7 +361,16 @@ struct OpenDataManifest {
     [[nodiscard]] std::optional<OpenDataVolumeView> volumeAt(std::string_view url, int baseLevel = 0) const;
     // The volume at any spelling of a public location (s3:// or https://).
     [[nodiscard]] std::optional<OpenDataVolumeMetadata> volumeMetadataAt(const std::string& url) const;
+    // The ids of the samples a person's name for one means: their id, description or
+    // community alias, compared by sampleNameKey, with or without the "PHerc" prefix.
+    [[nodiscard]] std::vector<std::string> samplesNamed(std::string_view name) const;
 };
+
+// Case-, punctuation- and zero-padding-insensitive key for a sample name: PHerc. Paris 4,
+// pherc paris 4 and PHercParis4 share one, as do PHerc 0332 and PHerc332.
+[[nodiscard]] std::string sampleNameKey(std::string_view name);
+// The community names of a sample (Scroll 1 is PHercParis4), as metadata.schema.json lists them.
+[[nodiscard]] std::vector<std::string> communityAliases(std::string_view sampleId);
 
 // The manifest in a cache file (loadCatalog's cacheFile), parsed once per file
 // version and shared; nullptr when the file is missing or invalid.

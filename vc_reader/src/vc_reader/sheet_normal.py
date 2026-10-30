@@ -34,17 +34,12 @@ def sheet_normals(patches, offsets_xyz=None, *, valid=None, out=None):
         raise ValueError("patches must have shape (B,109,109,109)")
     n = patches.shape[0]
     offsets = np.zeros((n, 3), np.float32) if offsets_xyz is None else np.asarray(offsets_xyz, np.float32)
-    if offsets.shape != (n, 3) or not np.isfinite(offsets).all() or np.any((offsets < 0) | (offsets >= 3)):
+    if offsets.shape != (n, 3):
         raise ValueError("offsets_xyz must be finite (B,3) values in [0,3)")
-    centers = np.ones((n, 4), np.float32)
-    centers[:, :3] = offsets + np.float32(48)
-    # Preserve the open upper bound after float32 addition near a lattice edge.
-    np.minimum(centers[:, :3], np.nextafter(np.float32(51), np.float32(48)), out=centers[:, :3])
-    if valid is not None:
-        mask = np.asarray(valid, bool)
-        if mask.shape != (n,):
-            raise ValueError("valid must have shape (B,)")
-        centers[:, 3] = mask
+    mask = np.ones(n, bool) if valid is None else np.asarray(valid, bool)
+    if mask.shape != (n,):
+        raise ValueError("valid must have shape (B,)")
+    centers = _reader._sheet_normal_centers(np.ascontiguousarray(offsets), np.ascontiguousarray(mask))
     if device:
         if out is not None:
             if not is_device_array(out):
@@ -68,18 +63,10 @@ def sheet_normal_regions(points_xyz, shape_zyx):
     this prevents loss of subvoxel precision in large scrolls. Image work and
     local offsets use float32.
     """
-    points = np.asarray(points_xyz, dtype=np.float64)
-    shape = np.asarray(shape_zyx)
-    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+    points = np.ascontiguousarray(points_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points_xyz must be finite (B,3)")
-    if shape.shape != (3,) or np.any(shape < 0):
-        raise ValueError("shape_zyx must have three nonnegative dimensions")
-    if np.any(np.abs(points) >= 2**52):
-        raise ValueError("query coordinates exceed exact integer lattice range")
-    lattice = np.floor(points / 3).astype(np.int64) * 3
-    starts = np.ascontiguousarray(lattice[:, ::-1] - 54)
-    valid = np.all((starts >= 0) & (starts + 109 <= shape), axis=1)
-    return starts, (points - lattice).astype(np.float32), valid
+    return _reader._sheet_normal_regions(points, tuple(int(n) for n in shape_zyx))
 
 
 def sample_sheet_normals(reader, points_xyz, *, out=None):
@@ -89,13 +76,17 @@ def sample_sheet_normals(reader, points_xyz, *, out=None):
     should be grouped by the caller (typically 4–32 queries) to bound memory.
     All 109³ context voxels must be inside the volume; padding is invalid.
     """
+    from .cuda import DeviceArray
     from .reader.cuda import CudaReader
-    cuda = isinstance(reader, CudaReader)
-    shape = reader.reader.shape if cuda else reader.shape
-    starts, offsets, valid = sheet_normal_regions(points_xyz, shape)
-    if cuda:
-        axes = np.broadcast_to(np.eye(3, dtype=np.float32), (len(starts), 3, 3))
-        patches = reader.read_affine_batch((109, 109, 109), starts, axes, order=0, source="chunks")
-    else:
-        patches = np.stack([reader.read_region(start, (109, 109, 109)) for start in starts]) if len(starts) else np.empty((0,109,109,109),np.uint8)
-    return sheet_normals(patches, offsets, valid=valid, out=out)
+    points = np.ascontiguousarray(points_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_xyz must be finite (B,3)")
+    if isinstance(reader, CudaReader):
+        reader._ready()
+        shape = tuple(reader.reader.shape)
+        return DeviceArray(_reader._sample_sheet_normals_cuda(reader._engine, shape, points),
+                           (len(points), 4), np.float32, reader.device)
+    reader._ready()
+    if reader.dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
+        raise ValueError("sheet normals read uint8 or float32 CT")
+    return _reader._sample_sheet_normals(reader._array, tuple(reader.shape), reader.dtype == np.float32, points)

@@ -1,4 +1,5 @@
 #include "vc_reader/reader.hpp"
+#include "sheet_normal/sample.hpp"
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
 #include "zarr/format.hpp"
@@ -202,36 +203,8 @@ void sheetNormalsCpu(std::span<const float> patches, std::span<const std::array<
 std::vector<std::array<float, 4>> CtReader::sheetNormals(std::span<const std::array<double, 3>> xyz)
 {
     std::vector<std::array<float, 4>> out(xyz.size());
-    constexpr size_t patchSize = 109 * 109 * 109, batchSize = 8;
-    for (size_t base = 0; base < xyz.size(); base += batchSize) {
-        const size_t count = std::min(batchSize, xyz.size() - base);
-        std::vector<uint8_t> patches(count * patchSize);
-        std::vector<std::array<float, 4>> centers(count);
-        std::vector<Index> starts, sizes;
-        std::vector<uint8_t*> buffers;
-        for (size_t i = 0; i < count; ++i) {
-            std::array<int64_t, 3> start{};
-            bool valid = true;
-            for (int axis = 0; axis < 3; ++axis) {
-                // Keep global coordinates precise until the lattice origin is removed.
-                const double point = xyz[base + i][axis];
-                if (!std::isfinite(point) || std::abs(point) >= 0x1p52)
-                    throw std::invalid_argument("invalid sheet-normal point");
-                const double lattice = std::floor(point / 3) * 3;
-                start[2 - axis] = int64_t(lattice) - 54;
-                centers[i][axis] = std::min(float(point - lattice) + 48.f, std::nextafter(51.f, 48.f));
-                valid &= start[2 - axis] >= 0 && start[2 - axis] <= impl_->shape[2 - axis] - 109;
-            }
-            centers[i][3] = valid;
-            if (valid) {
-                starts.emplace_back(start.begin(), start.end());
-                sizes.push_back({109, 109, 109});
-                buffers.push_back(patches.data() + i * patchSize);
-            }
-        }
-        if (!starts.empty()) impl_->opened.array->read_many(starts, sizes, buffers);
-        sheetNormalsCpu(patches, centers, std::span(out).subspan(base, count));
-    }
+    if (!xyz.empty())
+        sheet_normal::sample<std::uint8_t>(*impl_->opened.array, impl_->shape.data(), xyz.front().data(), xyz.size(), out.front().data());
     return out;
 }
 } // namespace vcr

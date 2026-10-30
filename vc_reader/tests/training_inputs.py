@@ -33,7 +33,7 @@ def local_inputs(root):
         (path / '.zattrs').write_text(json.dumps(dict(multiscales=[dict(axes=[dict(name=a, unit='micrometer') for a in 'zyx'],
             datasets=[dict(path='0', coordinateTransformations=[dict(type='scale', scale=[9.6]*3)])])])))
         volumes[name] = dict(id=name, properties=dict(pixel_size_um=9.6, shape=list(ct.shape)),
-            data=[dict(type='ome-zarr', id=name, origins=[dict(path=str(path), access_roots=[dict(url='')])])])
+            data=[dict(type='ome-zarr', id=name, origins=[dict(path=str(path).lstrip('/'), access_roots=[dict(url='/')])])])
     scroll = Catalog(dict(samples=dict(example=dict(sample=dict(id='example', properties=dict(type='scroll',
         volume_transforms=[dict(from_volume_id='a', transforms=[dict(to_volume_id='b', matrix=transform.matrix)])])),
         volumes=volumes)))).scrolls['example']

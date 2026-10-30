@@ -84,7 +84,7 @@ class SourceTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         code = f"""
 import sys
-sys.path[:0] = [{str(Path(__import__('vc_reader').__file__).resolve().parent.parent)!r}, {str(root / 'tests')!r}]
+sys.path[:0] = [{str(root / 'tests')!r}]
 from unittest.mock import patch
 from test_sources import catalog
 with patch('urllib.request.urlopen', side_effect=AssertionError('network request')):
@@ -94,7 +94,7 @@ with patch('urllib.request.urlopen', side_effect=AssertionError('network request
     c.samples['s'].volumes.at_resolution(8)
 assert not any(n in sys.modules for n in ('numpy', 'torch', 'PIL', 'tifffile', 'vc_reader._reader'))
 """
-        subprocess.run([sys.executable, '-S', '-c', code], check=True, capture_output=True, text=True)
+        subprocess.run([sys.executable, '-c', code], check=True, capture_output=True, text=True)
 
 
 if __name__ == '__main__':

@@ -113,6 +113,93 @@ std::optional<std::array<std::int64_t, 3>> pointOrigin(const T* points, std::siz
     return base;
 }
 
+// Points as float32 relative to an integer origin, the form the float32 CT paths take.
+// `dispersed`: they span too far to share one (see pointOrigin), and `local` is empty:
+// sample their own coordinates in float64. A given origin is used as it is.
+struct LocalPoints {
+    std::vector<float> local;
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    bool dispersed = false;
+};
+inline std::array<std::int64_t, 3> checkedCoordinateOrigin(const Index& origin)
+{
+    if (origin.size() != 3)
+        throw std::invalid_argument("coordinate_origin must have three integers in [0, 2**30]");
+    for (const auto v : origin)
+        if (v < 0 || v > (1LL << 30))
+            throw std::invalid_argument("coordinate_origin must have three integers in [0, 2**30]");
+    return {origin[0], origin[1], origin[2]};
+}
+template <class T>
+LocalPoints localPoints(const T* points, std::size_t n, const std::optional<Index>& origin = std::nullopt)
+{
+    LocalPoints out;
+    if (origin) {
+        out.base = checkedCoordinateOrigin(*origin);
+        out.local.resize(3 * n);
+        for (std::size_t i = 0; i < 3 * n; ++i)
+            out.local[i] = static_cast<float>(points[i]);
+        return out;
+    }
+    const auto base = pointOrigin(points, n);
+    if (!base) {
+        out.dispersed = true;
+        return out;
+    }
+    out.base = *base;
+    out.local.resize(3 * n);
+    for (std::size_t i = 0; i < 3 * n; ++i)
+        out.local[i] = static_cast<float>(points[i] - static_cast<T>(out.base[i % 3]));
+    return out;
+}
+
+// A crop shape the float32 CT paths accept.
+inline std::array<std::int64_t, 3> checkedCropShape(const Index& shape)
+{
+    std::int64_t count = 1;
+    bool ok = shape.size() == 3;
+    if (ok)
+        for (const auto n : shape) {
+            ok &= n >= 0 && n <= (1LL << 24);
+            if (ok && n && count > std::numeric_limits<std::int64_t>::max() / 4 / n)
+                ok = false;
+            else if (ok)
+                count *= n;
+        }
+    if (!ok)
+        throw std::invalid_argument("shape must have three nonnegative dimensions <= 2**24");
+    return {shape[0], shape[1], shape[2]};
+}
+
+// An oriented crop's first sample as float32 relative to an integer origin: the floor of
+// the sample (clamped to the volume's range), or the given origin.
+struct LocalOrigin {
+    std::array<std::int64_t, 3> base{0, 0, 0};
+    std::array<float, 3> origin{0, 0, 0};
+};
+template <class T>
+LocalOrigin localOrigin(const T* origin, const std::optional<Index>& coordinateOrigin = std::nullopt)
+{
+    LocalOrigin out;
+    for (int a = 0; a < 3; ++a)
+        if (!std::isfinite(origin[a]))
+            throw std::invalid_argument("origin and axes must be finite with shapes (3,) and (3, 3)");
+    if (coordinateOrigin) {
+        out.base = checkedCoordinateOrigin(*coordinateOrigin);
+        for (int a = 0; a < 3; ++a)
+            out.origin[a] = static_cast<float>(origin[a]);
+    } else {
+        for (int a = 0; a < 3; ++a) {
+            out.base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(origin[a])), 0., double(1LL << 30)));
+            out.origin[a] = static_cast<float>(origin[a] - static_cast<T>(out.base[a]));
+        }
+    }
+    for (const float v : out.origin)
+        if (!std::isfinite(v))
+            throw std::invalid_argument("origin overflows float32");
+    return out;
+}
+
 // A chunk an offline read needs is in none of the disk layers.
 struct CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;

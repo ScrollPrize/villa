@@ -36,6 +36,7 @@ NB_MODULE(_catalog,m) {
     auto artifact=nb::class_<OpenDataArtifact>(m,"Artifact");
     artifact.def_ro("type",&OpenDataArtifact::type).def_ro("origins",&OpenDataArtifact::origins)
         .def_ro("level",&OpenDataArtifact::sourceCoordinateLevel)
+        .def_prop_ro("grid_level",&OpenDataArtifact::gridLevel)
         .def_ro("target_volume_id",&OpenDataArtifact::targetVolumeId).def_ro("model_id",&OpenDataArtifact::modelId)
         .def_ro("render_level",&OpenDataArtifact::renderLevel).def_ro("downscale",&OpenDataArtifact::downscale)
         .def_ro("format",&OpenDataArtifact::format)
@@ -105,6 +106,7 @@ NB_MODULE(_catalog,m) {
                 {"energy_kev",number(v->energyKeV)},{"detector_distance_mm",number(v->detectorDistanceMm)},
                 {"voxel_size_um",number(v->voxelSizeUm)},{"raw",v->raw}});
         },nb::arg("url"),"What the catalog says about the volume a remote zarr shows; None if it does not list it.")
+        .def("samples_named",[](const OpenDataManifest& c,const std::string& name){return c.samplesNamed(name);})
         .def("transform",[](const OpenDataManifest& c,const std::string& sample,const std::string& source,const std::string& target)->nb::object {
             const auto* s=c.findSample(sample);if(!s)return nb::none();
             const auto transform=resolveVolumeTransform(*s,source,target);
@@ -132,6 +134,10 @@ NB_MODULE(_catalog,m) {
         if(url.starts_with("http://")||url.starts_with("https://")||url.starts_with("s3://")||url.starts_with("s3+"))return resolveOpenDataUrl(url);
         return std::nullopt;
     });
+    m.def("affine_rows",[](const nb::object& rows){return pyJson(Affine::fromJson(json(rows)).json());});
+    m.def("affine_scale",[](double s){return pyJson(Affine::scale(s).json());});
+    m.def("affine_block_reduced",[](double s){return pyJson(Affine::blockReduced(s).json());});
+    m.def("community_aliases",[](const std::string& id){return communityAliases(id);});
     m.def("affine_inverse",[](const nb::object& rows){return pyJson(Affine::fromJson(json(rows)).inverse().json());});
     m.def("affine_compose",[](const nb::object& a,const nb::object& b){return pyJson((Affine::fromJson(json(a))*Affine::fromJson(json(b))).json());});
     m.def("affine_apply",[](const nb::object& rows,const std::array<double,3>& point){return Affine::fromJson(json(rows)).apply(point);});

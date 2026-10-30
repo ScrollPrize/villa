@@ -50,16 +50,6 @@ class ArtifactType:
     INK_LABELS = "ink-labels"
 
 
-# Volume-level artifacts that are OME-Zarr pyramids on a grid of the source
-# volume's pyramid. The value says which source level the artifact's own level 0
-# sits on; None means "read it from parameters.level".
-_PYRAMID_GRID_LEVEL: dict[str, int | None] = {
-    ArtifactType.OME_ZARR: 0,
-    ArtifactType.INK_DETECTION_3D_ZARR: 0,
-    ArtifactType.SURFACE_PREDICTION_ZARR: None,
-}
-
-
 def join_url(root: str, path: str) -> str:
     return _catalog.join_url(root, path)
 
@@ -108,7 +98,7 @@ class Origin:
 def _native_values(native) -> dict[str, Any]:
     return dict(level=native.level, target=native.target_volume_id, model=native.model_id, url=native.url,
                 source_path=native.source_path, label_set=native.label_set, render_level=native.render_level,
-                arrays=tuple(native.arrays), supersedes=tuple(native.supersedes))
+                arrays=tuple(native.arrays), supersedes=tuple(native.supersedes), grid_level=native.grid_level)
 
 
 @dataclass(frozen=True, eq=False)
@@ -198,10 +188,7 @@ class Artifact:
         ``ink-detection-3d-zarr``, ``surface-prediction-zarr``); None otherwise,
         and for legacy surface predictions whose level is unknown.
         """
-        if self.type not in _PYRAMID_GRID_LEVEL:
-            return None
-        fixed = _PYRAMID_GRID_LEVEL[self.type]
-        return fixed if fixed is not None else self.level
+        return self._native_values()["grid_level"]
 
     # -- locations ----------------------------------------------------------
 

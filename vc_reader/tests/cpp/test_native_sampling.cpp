@@ -61,6 +61,27 @@ int main()
         const float none[]{NAN, NAN, NAN};
         require(*vcr::pointOrigin(none, 1) == std::array<std::int64_t, 3>{0, 0, 0}, "no finite point");
 
+        const auto local = vcr::localPoints(near_points, 1);
+        require(!local.dispersed && local.base == std::array<std::int64_t, 3>{10, 20, 30} && local.local[0] == .5f, "local points");
+        require(vcr::localPoints(dispersed, 2).dispersed, "dispersed points stay global");
+        const auto given = vcr::localPoints(near_points, 1, vcr::Index{1, 2, 3});
+        require(given.base == std::array<std::int64_t, 3>{1, 2, 3} && given.local[0] == 10.5f, "a given origin");
+        const double crop[]{5.25, 40.5, -3.5};
+        const auto placed = vcr::localOrigin(crop);
+        require(placed.base == std::array<std::int64_t, 3>{5, 40, 0} && placed.origin[0] == .25f && placed.origin[2] == -3.5f, "local origin");
+        bool invalid = false;
+        try { vcr::checkedCropShape({1, 1}); } catch (const std::invalid_argument&) { invalid = true; }
+        require(invalid, "crop shape rank");
+        const double start[]{55.25, 2., -1.};
+        const std::int64_t volume[]{200, 200, 200};
+        std::int64_t patch[3];
+        float offset[3], center[4];
+        bool supported;
+        vcr::sheet_normal::region(start, volume, patch, offset, &supported);
+        require(patch[2] == 0 && patch[1] == -54 && offset[0] == 1.25f && offset[2] == 2.f && !supported, "sheet normal region");
+        vcr::sheet_normal::center(offset, supported, center);
+        require(center[0] == 49.25f && center[3] == 0.f, "sheet normal center");
+
         const auto moved = vcr::aligned::make_field({1,0,0,0,1,0,0,0,1}, {1,2,3}, {2,1,0}, false, false);
         require(moved.enabled && moved.component[0] == 2 && moved.translation[2] == 3.f, "aligned field");
         bool rejected = false;

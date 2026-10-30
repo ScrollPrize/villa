@@ -253,7 +253,7 @@ class ResolutionTests(unittest.TestCase):
             attrs = json.loads((root/'ct'/'.zattrs').read_text())
             attrs['multiscales'][0]['datasets'][1]['coordinateTransformations'][0]['scale'][0] = 2
             (root/'ct'/'.zattrs').write_text(json.dumps(attrs))
-            data = dict(samples=dict(s=dict(sample=dict(id='s', properties=dict(type='scroll')), volumes=dict(v=dict(id='v', properties=dict(pixel_size_um=1, shape=[8, 8, 8]), data=[dict(type='ome-zarr', id='ct', origins=[dict(path=str(root/'ct'), access_roots=[dict(url='')])])])))))
+            data = dict(samples=dict(s=dict(sample=dict(id='s', properties=dict(type='scroll')), volumes=dict(v=dict(id='v', properties=dict(pixel_size_um=1, shape=[8, 8, 8]), data=[dict(type='ome-zarr', id='ct', origins=[dict(path=str(root/'ct').lstrip('/'), access_roots=[dict(url='/')])])])))))
             c = Catalog(data)
             candidate = c.scrolls.volumes.at_resolution(2).get()
             resolved = candidate.resolve()

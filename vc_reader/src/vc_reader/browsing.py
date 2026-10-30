@@ -157,7 +157,7 @@ class ScrollSource(_Context):
     """A sample with optional direct-volume context; navigation requests no arrays."""
     def __init__(self, scroll, volume=None, *, catalog=None):
         catalog = Catalog.load() if catalog is None else catalog
-        ids = catalog._names.resolve(scroll)
+        ids = set(catalog._native.samples_named(scroll))
         if scroll in catalog._samples:
             ids = {scroll}
         if not ids:

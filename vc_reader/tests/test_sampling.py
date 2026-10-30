@@ -291,15 +291,16 @@ class SamplingTests(unittest.TestCase):
         pyramid(path, scales=(1, 3, 6), units='micrometer')
         cat = Catalog({'samples': {'s': {'sample': {'id': 's'}, 'volumes': {'v': {
             'id': 'v', 'properties': {'pixel_size_um': 1}, 'data': [{'id': 'image', 'type': 'ome-zarr', 'origins': [
-                {'path': str(path), 'access_roots': [{'url': '', 'type': 'local'}]}]}]}}}}})
+                {'path': str(path).lstrip('/'), 'access_roots': [{'url': '/', 'type': 'local'}]}]}]}}}}})
         level = cat.samples['s'].volumes['v'].level(1)
         values = np.ones((3, 7, 8, 9), dtype='float32')
         field = self.source('level-field', values, role='vector', affine=Affine.scale(3),
                             component_order=('x', 'y', 'z'), normalize=False,
                             value_frame=ValueFrame(sample_id='s', volume_id='v', level=1))
         with open_sample(level, {'label': replace(self.ref, role='label'), 'vector': field}) as reader:
-            np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2))['vector'].data, 1)
-            self.assertEqual(reader._reference_map, Affine.scale(3))
+            # Vectors are moved through the reference map and back in float32.
+            np.testing.assert_allclose(reader.read((0, 0, 0), (2, 2, 2))['vector'].data, 1, atol=2e-7)
+            self.assertEqual(reader._reference_map, Affine.block_reduced(3))
             np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2))['image'].data, 2)
 
     def test_budget_eviction_repeated_requests_and_worker_reopening(self):
@@ -470,8 +471,8 @@ class SamplingTests(unittest.TestCase):
             open_sample(self.ref, {'image': self.ref})
         with self.assertRaisesRegex(ValueError, 'placement'):
             open_sample(replace(self.ref, registration=VolumeRegistration('s', 'v')))
-        with self.assertRaisesRegex(ValueError, 'singular'):
-            open_sample(self.ref, {'bad': replace(self.ref, registration=VolumeRegistration('s', 'v', affine=Affine.scale(0)))})
+        with self.assertRaisesRegex(ValueError, 'scale must be finite and positive'):
+            Affine.scale(0)
         with self.assertRaisesRegex(ValueError, 'relationship'):
             open_sample(self.ref, {'bad': replace(self.ref, registration=VolumeRegistration('s', 'other', affine=Affine.identity()))})
         with open_sample(self.ref) as reader:

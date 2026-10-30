@@ -173,6 +173,23 @@ int main()
         require(!atL0->sameGrid(*atL2) && atL2->sameGrid(*manifest.volumeAt(zarrUrl, 2)), "a level is its own grid");
         require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
 
+        require(sampleNameKey("PHerc. Paris 4") == "phercparis4" && sampleNameKey("PHerc 0332") == "pherc332" &&
+                    sampleNameKey("x100") == "x100" && sampleNameKey("000") == "0" && sampleNameKey("Scroll 1") == "scroll1",
+                "name keys");
+        require(communityAliases("PHercParis4") == std::vector<std::string>{"Scroll 1"} && communityAliases("x").empty(), "aliases");
+        require(manifest.samplesNamed("pherc 139") == std::vector<std::string>{"PHerc0139"}, "a padded id");
+        require(manifest.samplesNamed("0139") == std::vector<std::string>{"PHerc0139"}, "without the prefix");
+        require(manifest.samplesNamed("nothing").empty(), "no such sample");
+        require(Affine::blockReduced(4)(0, 3) == 1.5 && Affine::blockReduced(4)(1, 1) == 4, "block reduced");
+        OpenDataArtifact gridded;
+        gridded.type = "surface-prediction-zarr";
+        gridded.sourceCoordinateLevel = 2;
+        require(gridded.gridLevel() == 2, "prediction grid level");
+        gridded.type = "ome-zarr";
+        require(gridded.gridLevel() == 0, "volume grid level");
+        gridded.type = "lasagna";
+        require(!gridded.gridLevel(), "no grid level");
+
         const auto metadata = manifest.volumeMetadataAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
         require(metadata && metadata->sampleId == "PHerc0139" && metadata->volumeId == "vol1" &&
                     metadata->scanId == "scan-a" && metadata->voxelSizeUm == 7.91 && metadata->energyKeV == 88.0 &&
