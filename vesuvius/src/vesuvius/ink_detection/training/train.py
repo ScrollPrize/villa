@@ -35,6 +35,7 @@ from vesuvius.ink_detection.training.dilation import (
     resolve_dilation_distances,
 )
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.ink_detection.data.collation import ink_collate_fn
 from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
 from vesuvius.ink_detection.training.stitching import run_model_forward
 from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch, SamplingPolicy
@@ -482,6 +483,7 @@ def _run_training(request: TrainingRequest) -> int:
     )
 
     dataloader_kwargs = {
+        "collate_fn": ink_collate_fn(dataset_config.mode),
         "pin_memory": (
             accelerator.device.type == "cuda"
             if config.pin_memory is None
