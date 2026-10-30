@@ -172,7 +172,11 @@ def parse_args(argv: Sequence[str] | None = None):
             "--reader-memory-cache-mb must be >= 0",
         ),
         (
-            args.reader != "vc_reader" or importlib.util.find_spec("vc_reader.reader"),
+            args.reader != "vc_reader"
+            or (
+                importlib.util.find_spec("vc_reader") is not None
+                and importlib.util.find_spec("vc_reader.reader") is not None
+            ),
             "--reader vc_reader needs the vc_reader package (villa/vc_reader)",
         ),
         (
