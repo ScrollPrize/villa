@@ -66,6 +66,8 @@ To get started, we recommend these notebooks that jump right in:
 $ pip install vesuvius
 ```
 
+For `vesuvius.tifxyz` (read and write tifxyz surfaces) without torch or the C++ build, install the `tifxyz` extra: `pip install "vesuvius[tifxyz]"` or `uv sync --extra tifxyz`.
+
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
 `uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
 Python bindings from C++ source. Install their [native build prerequisites](../volume-cartographer/README.md#python-source-builds)

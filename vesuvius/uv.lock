@@ -4568,6 +4568,13 @@ render = [
 tests = [
     { name = "pytest" },
 ]
+tifxyz = [
+    { name = "imagecodecs" },
+    { name = "numba" },
+    { name = "opencv-python-headless" },
+    { name = "scipy" },
+    { name = "tifffile" },
+]
 volume-only = [
     { name = "fsspec" },
     { name = "numcodecs" },
@@ -4625,6 +4632,7 @@ requires-dist = [
     { name = "imagecodecs", marker = "extra == 'all'", specifier = ">=2026.3.6" },
     { name = "imagecodecs", marker = "extra == 'label-transfer'", specifier = ">=2024.6.1" },
     { name = "imagecodecs", marker = "extra == 'models'", specifier = ">=2026.3.6" },
+    { name = "imagecodecs", marker = "extra == 'tifxyz'", specifier = ">=2024.6.1" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
     { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
     { name = "libigl", marker = "extra == 'all'", specifier = ">=2.6.1" },
@@ -4649,6 +4657,7 @@ requires-dist = [
     { name = "nnunetv2", marker = "extra == 'models'", directory = "../segmentation/models/arch/nnunet" },
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.60.0" },
     { name = "numba", marker = "extra == 'models'", specifier = ">=0.60.0" },
+    { name = "numba", marker = "extra == 'tifxyz'", specifier = ">=0.60.0" },
     { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
     { name = "numcodecs", marker = "extra == 'volume-only'", specifier = ">=0.15.1,<0.17" },
     { name = "numpy", specifier = ">=2.0.2" },
@@ -4658,6 +4667,7 @@ requires-dist = [
     { name = "opencv-python-headless", marker = "extra == 'all'", specifier = ">=4.11.0.86" },
     { name = "opencv-python-headless", marker = "extra == 'models'", specifier = ">=4.11.0.86" },
     { name = "opencv-python-headless", marker = "extra == 'render'", specifier = ">=4.11.0.86" },
+    { name = "opencv-python-headless", marker = "extra == 'tifxyz'", specifier = ">=4.11.0.86" },
     { name = "pandas", marker = "extra == 'all'", specifier = ">=2.3.2" },
     { name = "pandas", marker = "extra == 'models'", specifier = ">=2.3.2" },
     { name = "pillow", specifier = ">=11.3.0" },
@@ -4687,6 +4697,7 @@ requires-dist = [
     { name = "scipy", marker = "extra == 'blending'", specifier = ">=1.13.1" },
     { name = "scipy", marker = "extra == 'label-transfer'", specifier = ">=1.13.1" },
     { name = "scipy", marker = "extra == 'models'", specifier = ">=1.13.1" },
+    { name = "scipy", marker = "extra == 'tifxyz'", specifier = ">=1.13.1" },
     { name = "setuptools", marker = "extra == 'all'", specifier = ">=80.9.0" },
     { name = "simpleitk", marker = "extra == 'all'", specifier = ">=2.5.2" },
     { name = "simpleitk", marker = "extra == 'render'", specifier = ">=2.5.2" },
@@ -4696,6 +4707,7 @@ requires-dist = [
     { name = "tifffile", marker = "extra == 'label-transfer'", specifier = ">=2024.8.30" },
     { name = "tifffile", marker = "extra == 'models'", specifier = ">=2024.8.30" },
     { name = "tifffile", marker = "extra == 'render'", specifier = ">=2024.8.30" },
+    { name = "tifffile", marker = "extra == 'tifxyz'", specifier = ">=2024.8.30" },
     { name = "timm", marker = "extra == 'all'", specifier = ">=1.0.20" },
     { name = "timm", marker = "extra == 'models'", specifier = ">=1.0.20" },
     { name = "torch", marker = "extra == 'all'", specifier = ">=2.12,<3" },
@@ -4721,7 +4733,7 @@ requires-dist = [
     { name = "zarr", specifier = ">=2.18.7,<4" },
     { name = "zarr", marker = "extra == 'volume-only'", specifier = ">=2.18.7,<4" },
 ]
-provides-extras = ["volume-only", "models", "render", "gui", "notebooks", "blending", "tests", "label-transfer", "all"]
+provides-extras = ["volume-only", "models", "render", "gui", "notebooks", "blending", "tests", "tifxyz", "label-transfer", "all"]
 
 [[package]]
 name = "villa-gpu-manager"
