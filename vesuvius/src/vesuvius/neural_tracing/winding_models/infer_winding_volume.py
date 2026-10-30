@@ -266,6 +266,47 @@ def _native_phase_cache_model_cfg(path):
 ANCHOR_TOLERANCE = 6.0  # max |t_peak - midpoint| for the seed anchor, samples
 EDGE_MARGIN = 8  # ignore peaks this close to the ray ends, samples
 TRANSFORM_CHUNK = 200_000  # points per SpiralAndTransform.inv call
+# Slabs per restartable --spiral-supervision-only part (fixed ranges of the
+# global ray order, independent of the GPU count).
+SUPERVISION_PART_RAYS = 256
+
+# Decode, raster, and probability options that only apply when derived
+# outputs are materialized; --native-phase-only and --spiral-supervision-only
+# reject them.
+_RECONSTRUCTION_OPTIONS = frozenset({
+    "--column-step", "--column-upsample", "--threshold",
+    "--min-distance", "--min-prob-keep", "--max-level",
+    "--prob-volume", "--archive-workers", "--prob-volume-floor",
+    "--prob-combine", "--prob-ray-margin", "--prob-column-margin",
+    "--merge-workers", "--prob-column-step",
+    "--prob-phase-level-half-life", "--prob-phase-max-level",
+    "--prob-phase-edge-taper", "--prob-phase-agreement-power",
+    "--prob-phase-min-observations",
+    "--prob-phase-min-effective-observations",
+    "--prob-phase-min-weight", "--prob-phase-band-sigma",
+    "--output-downsample", "--slab-center-width",
+    "--phase-cache-winding-stride",
+    "--phase-cache-allow-relocated-inputs",
+    "--phase-registration", "--phase-sync-radius",
+    "--phase-sync-neighbors", "--phase-sync-workers",
+    "--phase-sync-block-size", "--phase-sync-transverse-margin",
+    "--phase-sync-ray-margin", "--phase-sync-taper",
+    "--phase-sync-min-density", "--phase-sync-iterations",
+    "--phase-sync-huber", "--phase-sync-prior-weight",
+    "--phase-sync-prior-huber", "--phase-sync-max-correction",
+    "--phase-sync-recompute",
+    "--decode-workers",
+})
+
+
+def _supplied_options(options):
+    """The given options that appear on the command line."""
+    return sorted({
+        option
+        for token in sys.argv[1:]
+        for option in options
+        if token == option or token.startswith(option + "=")
+    })
 
 
 def parse_args():
@@ -506,6 +547,12 @@ def parse_args():
         "--phase-cache", default=None,
         help="reconstruct the normal output from a --native-phase-only Zarr, "
              "skipping volume extraction and neural-model inference")
+    modes.add_argument(
+        "--spiral-supervision-only", action="store_true",
+        help="write the compact Spiral supervision store to OUTPUT directly: "
+             "each slab's centre ray is decoded in memory exactly as "
+             "export_spiral_supervision.py decodes it from a native phase "
+             "cache, so no cache is written. Restartable from OUTPUT.partial")
     parser.add_argument(
         "--phase-cache-allow-relocated-inputs", action="store_true",
         help="allow --model-ckpt and --reference-zarr paths to differ from "
@@ -520,40 +567,18 @@ def parse_args():
              "the wider retained-anchor gap")
     args = parser.parse_args()
     if args.native_phase_only:
-        derived_options = {
-            "--column-step", "--column-upsample", "--threshold",
-            "--min-distance", "--min-prob-keep", "--max-level",
-            "--prob-volume", "--archive-workers", "--prob-volume-floor",
-            "--prob-combine", "--prob-ray-margin", "--prob-column-margin",
-            "--merge-workers", "--prob-column-step",
-            "--prob-phase-level-half-life", "--prob-phase-max-level",
-            "--prob-phase-edge-taper", "--prob-phase-agreement-power",
-            "--prob-phase-min-observations",
-            "--prob-phase-min-effective-observations",
-            "--prob-phase-min-weight", "--prob-phase-band-sigma",
-            "--output-downsample", "--slab-center-width",
-            "--phase-cache-winding-stride",
-            "--phase-cache-allow-relocated-inputs",
-            "--phase-registration", "--phase-sync-radius",
-            "--phase-sync-neighbors", "--phase-sync-workers",
-            "--phase-sync-block-size", "--phase-sync-transverse-margin",
-            "--phase-sync-ray-margin", "--phase-sync-taper",
-            "--phase-sync-min-density", "--phase-sync-iterations",
-            "--phase-sync-huber", "--phase-sync-prior-weight",
-            "--phase-sync-prior-huber", "--phase-sync-max-correction",
-            "--phase-sync-recompute",
-            "--decode-workers",
-        }
-        supplied = sorted({
-            option
-            for token in sys.argv[1:]
-            for option in derived_options
-            if token == option or token.startswith(option + "=")
-        })
+        supplied = _supplied_options(_RECONSTRUCTION_OPTIONS)
         if supplied:
             parser.error(
                 "--native-phase-only does not materialize derived outputs; "
                 "remove these reconstruction-only options: "
+                + ", ".join(supplied))
+    if args.spiral_supervision_only:
+        supplied = _supplied_options(_RECONSTRUCTION_OPTIONS)
+        if supplied:
+            parser.error(
+                "--spiral-supervision-only decodes only each slab's centre "
+                "ray; remove these reconstruction-only options: "
                 + ", ".join(supplied))
     return args
 
@@ -737,7 +762,9 @@ def build_seed_rays(args, device="cuda:0"):
                 "gap_expander_logit_resolution", "gap_expander_num_windings",
                 "gap_expander_lr_scale", "linear_z_resolution",
                 "initial_dr_per_winding"):
-        cfg.setdefault(f"model_{key}", cfg[key])
+        # Recent spiral-fitting checkpoints store only the model_ keys.
+        if key in cfg:
+            cfg.setdefault(f"model_{key}", cfg[key])
 
     z_begin, z_end = int(checkpoint["z_begin"]), int(checkpoint["z_end"])
     z_lo, z_hi = args.z_range if args.z_range else (z_begin, z_end)
@@ -1227,6 +1254,86 @@ class _NativePhaseCacheReader:
         return phase, valid, frame
 
 
+class _SpiralSupervisionWriter:
+    """Decode one GPU's slabs straight into compact Spiral supervision parts.
+
+    Takes the native phase/validity batches that --native-phase-only would
+    store and keeps only what export_spiral_supervision.py would read back
+    from them: each slab's decoded centre ray. Parts are fixed ranges of the
+    global ray order; main() hands each worker whole parts, so a part is
+    complete once a later part's slab (or the end of the shard) arrives.
+    """
+
+    def __init__(self, args, shard):
+        from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+            import CenterRayPart, center_ray_layout
+
+        self.part_type = CenterRayPart
+        config = args.spiral_supervision
+        self.signature = config["signature"]
+        self.attributes = config["attributes"]
+        self.part_rays = int(config["part_rays"])
+        self.parts_root = (
+            Path(config["partial"]) / "parts" / self.signature["name"])
+        self.parts_root.mkdir(parents=True, exist_ok=True)
+        self.global_index = np.asarray(shard["global_index"], dtype=np.int64)
+        self.seed_winding = np.asarray(shard["seed_winding"], dtype=np.int16)
+        self.pending = list(np.unique(self.global_index // self.part_rays))
+        (self.center, self.valid_center, self.transverse_center,
+         self.anchor) = center_ray_layout(
+            self.attributes["native_columns"],
+            self.attributes["column_stride"],
+            self.attributes["transverse_size"], self.attributes["ray_length"])
+        self.part = None
+        self.part_id = None
+
+    def _open(self, part_id):
+        start = int(part_id) * self.part_rays
+        end = min(start + self.part_rays, int(self.signature["hi"]))
+        self.part_id = int(part_id)
+        self.part = self.part_type(
+            end - start, anchor=self.anchor,
+            transverse_center=self.transverse_center,
+            spacing=self.attributes["spacing"],
+            edge_margin=self.signature["edge_margin"],
+            edge_trim=self.signature["edge_trim"])
+
+    def _write_through(self, part_id):
+        """Write every pending part before ``part_id`` (all slabs resolved)."""
+        while self.pending and self.pending[0] < part_id:
+            if self.part_id != self.pending[0]:
+                self._open(self.pending[0])  # every slab was unavailable
+            start = self.part_id * self.part_rays
+            end = start + self.part.num_source_rays
+            self.part.write(
+                self.parts_root / f"{start:08d}_{end:08d}", {
+                    "name": self.signature["name"],
+                    "part_start": start,
+                    "part_end": end,
+                    "source_signature": dict(
+                        self.signature, part_start=start, part_end=end),
+                })
+            self.pending.pop(0)
+            self.part = self.part_id = None
+
+    def add(self, indices, phase, valid, frames):
+        for sample, index in enumerate(indices):
+            part_id = int(self.global_index[index]) // self.part_rays
+            self._write_through(part_id)
+            if self.part_id != part_id:
+                self._open(part_id)
+            frame = frames[sample]
+            self.part.add(
+                phase[sample, self.center, self.center],
+                valid[sample][self.valid_center, self.valid_center],
+                np.stack([frame.origin, frame.axis_a, frame.axis_b,
+                          frame.direction]).astype(np.float64),
+                self.seed_winding[index])
+
+    def close(self):
+        self._write_through(np.inf)
+
+
 def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     """One inference process per GPU: extract slabs, run the model, decode."""
     import torch
@@ -1331,9 +1438,16 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
                 raise
             return index, None, None, None
 
-    phase_only = bool(getattr(args, "native_phase_only", False))
-    phase_writer = (
-        _NativePhaseCacheWriter(args.output, gpu) if phase_only else None)
+    # Direct Spiral supervision runs the --native-phase-only path up to the
+    # writer, which decodes the centre rays instead of storing the phase.
+    supervision_only = bool(getattr(args, "spiral_supervision_only", False))
+    phase_only = supervision_only or bool(
+        getattr(args, "native_phase_only", False))
+    if supervision_only:
+        phase_writer = _SpiralSupervisionWriter(args, shard)
+    else:
+        phase_writer = (
+            _NativePhaseCacheWriter(args.output, gpu) if phase_only else None)
     decoded_writer = None if phase_only else _DecodedShardWriter(result_path)
     # Prob-volume partials spill straight to compressed per-output-chunk files:
     # neither this worker nor the merge stage holds the full record set.
@@ -1516,6 +1630,8 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     compute_elapsed = time.time() - started
     if decoded_writer is not None:
         decoded_writer.close()
+    if supervision_only:
+        phase_writer.close()
     # Large arrays are already in bounded append-only streams.  The NPZ is
     # metadata only, so the parent never reloads a multi-hundred-GB shard.
     np.savez(
@@ -1554,10 +1670,10 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
         rays_group.create_array(
             key, data=value, chunks=(first_chunk, *value.shape[1:]))
 
-    ray_length = int(model_cfg.get("ray_length", 384))
-    transverse = int(model_cfg.get("transverse_size", 128))
-    column_stride = int(model_cfg.get("column_stride", 4))
-    native_columns = transverse // column_stride
+    attrs = _native_phase_attrs(args, rays, model_cfg)
+    ray_length = attrs["ray_length"]
+    transverse = attrs["transverse_size"]
+    native_columns = attrs["native_columns"]
     compressor = BloscCodec(
         cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)
     shards = []
@@ -1591,26 +1707,159 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
     group.attrs.update({
         "artifact_type": "winding_native_phase_cache",
         "format_version": 1,
+        **attrs,
+        "phase_shards": shards,
+        "complete": False,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+
+
+def _native_phase_attrs(args, rays, model_cfg):
+    """Model geometry and seed provenance of a native-phase run."""
+    transverse = int(model_cfg.get("transverse_size", 128))
+    column_stride = int(model_cfg.get("column_stride", 4))
+    return {
         "phase_dtype": "float32",
         "fit_checkpoint": str(Path(args.fit_checkpoint).resolve()),
         "model_ckpt": str(Path(args.model_ckpt).resolve()),
         "reference_zarr": str(Path(args.reference_zarr).resolve()),
         "volume_scale": int(args.volume_scale),
-        "ray_length": ray_length,
+        "ray_length": int(model_cfg.get("ray_length", 384)),
         "transverse_size": transverse,
         "column_stride": column_stride,
-        "native_columns": native_columns,
+        "native_columns": transverse // column_stride,
         "spacing": float(model_cfg.get("spacing", 1.0)),
         "sampling": str(model_cfg.get("sampling", "trilinear")),
         "crossing_sigma_wv": float(model_cfg.get("crossing_sigma_wv", 1.0)),
-        "phase_shards": shards,
         "z_range": [int(value) for value in rays["z_range"]],
         "seed_windings": [int(value) for value in rays["seed_windings"]],
         "dr_per_winding": float(rays["dr_per_winding"]),
         "umbilicus": str(rays["umbilicus_path"]),
-        "complete": False,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    })
+    }
+
+
+def _prepare_spiral_supervision(args, rays, model_cfg):
+    """Set up --spiral-supervision-only and return the slabs still to run.
+
+    The store is assembled under OUTPUT.partial. Parts left there by an
+    interrupted run of the same model, geometry, and seed rays are kept;
+    the returned mask selects every slab of the remaining parts.
+    """
+    import hashlib
+
+    from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+        import (
+            DEFAULT_EDGE_MARGIN, DEFAULT_EDGE_TRIM, _canonical_digest,
+            completed_part,
+        )
+
+    total = len(rays["seed_xyz"])
+    seed_digest = hashlib.sha256()
+    for key, dtype in (("seed_xyz", np.float32), ("direction_xyz", np.float32),
+                       ("seed_winding", np.int16)):
+        seed_digest.update(np.ascontiguousarray(rays[key], dtype=dtype).tobytes())
+    attributes = {
+        **_native_phase_attrs(args, rays, model_cfg),
+        "num_slabs": int(total),
+        "seed_rays_sha256": seed_digest.hexdigest(),
+    }
+    identity = _canonical_digest(attributes)
+    name = "shard_0"
+    signature = {
+        "root_identity": identity,
+        "name": name,
+        "lo": 0,
+        "hi": int(total),
+        "edge_margin": DEFAULT_EDGE_MARGIN,
+        "edge_trim": DEFAULT_EDGE_TRIM,
+    }
+    partial = Path(str(Path(args.output).resolve()) + ".partial")
+    part_rays = SUPERVISION_PART_RAYS
+    pending = np.ones(total, dtype=bool)
+    for start in range(0, total, part_rays):
+        end = min(total, start + part_rays)
+        if completed_part(
+                partial / "parts" / name / f"{start:08d}_{end:08d}",
+                dict(signature, part_start=start, part_end=end)) is not None:
+            pending[start:end] = False
+    args.spiral_supervision = {
+        "partial": str(partial),
+        "part_rays": part_rays,
+        "signature": signature,
+        "attributes": attributes,
+    }
+    if not pending.all():
+        print(f"[main] resuming {args.output}: "
+              f"{total - int(pending.sum()):,}/{total:,} slabs already "
+              f"exported", flush=True)
+    return pending
+
+
+def _part_aligned_bounds(global_index, bounds, part_rays):
+    """Move worker boundaries back to part starts so no part is split."""
+    parts = np.asarray(global_index, dtype=np.int64) // int(part_rays)
+    aligned = np.asarray(bounds).copy()
+    for slot in range(1, len(aligned) - 1):
+        if 0 < aligned[slot] < len(parts):
+            aligned[slot] = np.searchsorted(
+                parts, parts[aligned[slot]], side="left")
+    return np.maximum.accumulate(aligned)
+
+
+def _finish_spiral_supervision(args, workers, elapsed):
+    """Merge the finished parts and publish the compact store at OUTPUT."""
+    from vesuvius.neural_tracing.winding_models.export_spiral_supervision \
+        import (
+            FORMAT_NAME, FORMAT_VERSION, center_ray_layout, completed_part,
+            finish_store, merge_parts,
+        )
+
+    config = args.spiral_supervision
+    partial = Path(config["partial"])
+    signature = config["signature"]
+    attributes = config["attributes"]
+    name = signature["name"]
+    total = int(signature["hi"])
+    parts = []
+    for start in range(0, total, int(config["part_rays"])):
+        end = min(total, start + int(config["part_rays"]))
+        part = completed_part(
+            partial / "parts" / name / f"{start:08d}_{end:08d}",
+            dict(signature, part_start=start, part_end=end))
+        if part is None:
+            raise RuntimeError(
+                f"spiral supervision part {start}-{end} is missing; rerun the "
+                f"same command to resume")
+        parts.append(part)
+    shard = merge_parts(partial, name, parts, signature)
+    center, _, transverse_center, anchor = center_ray_layout(
+        attributes["native_columns"], attributes["column_stride"],
+        attributes["transverse_size"], attributes["ray_length"])
+    manifest = {
+        "artifact_type": FORMAT_NAME,
+        "format_version": FORMAT_VERSION,
+        "coordinate_order": "zyx",
+        "coordinate_space": "reference zarr scale-0 voxels",
+        "export_mode": "direct",
+        "source_cache": None,
+        "source_identity": signature["root_identity"],
+        "source_attributes": {
+            **attributes,
+            "num_available_slabs": int(shard["num_available_rays"]),
+        },
+        "center_native_column": center,
+        "center_transverse_sample": transverse_center,
+        "anchor_sample": anchor,
+        "edge_margin": int(signature["edge_margin"]),
+        "edge_trim": int(signature["edge_trim"]),
+        "export_workers": int(workers),
+        "rays_per_task": int(config["part_rays"]),
+        "num_rays": int(shard["num_retained_rays"]),
+        "num_crossings": int(shard["num_crossings"]),
+        "shards": [shard],
+        "elapsed_seconds": float(elapsed),
+    }
+    return finish_store(partial, Path(args.output).resolve(), manifest)
 
 
 def _load_native_phase_cache(args):
@@ -3864,11 +4113,14 @@ def main():
         else _load_checkpoint_cfg(args.model_ckpt).get("config", {}))
     args.phase_decode = not bool(
         (winding_model_cfg.get("model") or {}).get("use_crossing_head", True))
-    if (args.native_phase_only or args.phase_cache) and not args.phase_decode:
+    if ((args.native_phase_only or args.phase_cache
+         or args.spiral_supervision_only) and not args.phase_decode):
         raise ValueError(
-            "native phase caching currently requires a headless phase model; "
-            "this checkpoint has a separate crossing head that would also "
-            "need to be cached")
+            "native phase caching and direct Spiral supervision currently "
+            "require a headless phase model; this checkpoint has a separate "
+            "crossing head that would also need to be cached")
+    if args.spiral_supervision_only and Path(args.output).exists():
+        raise FileExistsError(f"output already exists: {args.output}")
     if args.prob_combine in ("phase", "phase-label") and not args.phase_decode:
         raise ValueError(
             "phase probability combine modes require a headless phase model")
@@ -4041,6 +4293,12 @@ def main():
         rays["phase_offset"] = phase_offset
     else:
         rays["phase_offset"] = np.zeros(total, dtype=np.float32)
+    if args.spiral_supervision_only:
+        pending = _prepare_spiral_supervision(args, rays, winding_model_cfg)
+        for key in ("seed_xyz", "direction_xyz", "seed_winding",
+                    "global_index", "phase_offset"):
+            rays[key] = rays[key][pending]
+        total = int(pending.sum())
     print(f"[main] {total:,} rays on {len(gpus)} GPU(s)", flush=True)
 
     # Shard contiguously: nearby rays share volume chunks, which keeps each
@@ -4052,6 +4310,9 @@ def main():
     progress_queue = context.Queue()
     shard_paths, result_paths, processes = [], [], []
     bounds = np.linspace(0, total, len(gpus) + 1).astype(int)
+    if args.spiral_supervision_only:
+        bounds = _part_aligned_bounds(
+            rays["global_index"], bounds, SUPERVISION_PART_RAYS)
     if args.native_phase_only:
         _initialize_native_phase_cache(
             args, rays, bounds, gpus, winding_model_cfg)
@@ -4096,6 +4357,18 @@ def main():
         for p in tqdm(result_paths, desc="loading shards", unit="shard")
     ]
     inference_elapsed = time.time() - started
+    if args.spiral_supervision_only:
+        manifest = _finish_spiral_supervision(
+            args, len(gpus), inference_elapsed)
+        print(
+            f"[main] wrote {manifest['num_crossings']:,} crossings on "
+            f"{manifest['num_rays']:,} rays from "
+            f"{manifest['source_attributes']['num_available_slabs']:,}/"
+            f"{manifest['source_attributes']['num_slabs']:,} slabs to "
+            f"{args.output} in {inference_elapsed:.0f}s", flush=True)
+        # The store is complete; the scratch only held shard inputs.
+        shutil.rmtree(scratch, ignore_errors=True)
+        return
     if args.native_phase_only:
         import zarr
 
