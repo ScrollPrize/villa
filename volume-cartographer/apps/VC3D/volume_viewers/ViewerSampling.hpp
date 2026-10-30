@@ -58,7 +58,8 @@ struct ViewerGeometry {
 
     int width() const { return plane ? plane->width : raster.width; }
     int height() const { return plane ? plane->height : raster.height; }
-    vcr::grid::Result sample(const vcr::grid::Request& request) const;
+    // On the GPU when every requested level of `levels` has a CUDA reader.
+    vcr::grid::Result sample(const vcr::grid::Request& request, const ViewerLevels& levels) const;
 };
 
 // A blocking read of what a frame could not sample from the caches: its geometry

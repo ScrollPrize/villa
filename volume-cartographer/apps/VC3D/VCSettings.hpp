@@ -190,6 +190,13 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
+    // Sample frames on the GPU (builds with CUDA, uint8 volumes). The cache is per
+    // pyramid level. Startup-only.
+    constexpr auto RENDER_CUDA = "perf/render_cuda";
+    constexpr bool RENDER_CUDA_DEFAULT = false;
+    constexpr auto RENDER_GPU_CACHE_GB = "perf/render_gpu_cache_gb";
+    constexpr int RENDER_GPU_CACHE_GB_DEFAULT = 4;
+
     // Startup-only persistent representation for remote-volume chunks.
     constexpr auto REMOTE_CACHE_DELTA3D = vc::settings::kRemoteCacheDelta3d;
     constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT =

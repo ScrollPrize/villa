@@ -21,4 +21,5 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
         void setupCacheActionControls();
 
         QCheckBox* _remoteCacheDelta3dCheckBox{nullptr};
+        QCheckBox* _renderCudaCheckBox{nullptr};
 };

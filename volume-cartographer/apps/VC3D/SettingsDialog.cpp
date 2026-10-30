@@ -125,6 +125,17 @@ void SettingsDialog::setupCacheActionControls()
 
     if (gridLayout_5)
         gridLayout_5->addWidget(_remoteCacheDelta3dCheckBox, 2, 0, 1, 3);
+
+#ifdef VC_READER_CUDA
+    _renderCudaCheckBox = new QCheckBox(tr("Sample viewer frames on the GPU (CUDA)."), groupBox_5);
+    _renderCudaCheckBox->setObjectName(QStringLiteral("chkRenderCuda"));
+    _renderCudaCheckBox->setToolTip(tr("Requires restart. uint8 volumes only; others keep sampling on the CPU."));
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    using namespace vc3d::settings;
+    _renderCudaCheckBox->setChecked(settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool());
+    if (gridLayout_5)
+        gridLayout_5->addWidget(_renderCudaCheckBox, 3, 0, 1, 3);
+#endif
 }
 
 void SettingsDialog::accept()
@@ -178,6 +189,9 @@ void SettingsDialog::accept()
         perf::REMOTE_DOWNLOAD_AUTOMATIC, automaticDownloads);
     settings.setValue(
         perf::REMOTE_DOWNLOAD_PARALLELISM, downloadParallelism);
+#ifdef VC_READER_CUDA
+    settings.setValue(perf::RENDER_CUDA, _renderCudaCheckBox->isChecked());
+#endif
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
     settings.sync();

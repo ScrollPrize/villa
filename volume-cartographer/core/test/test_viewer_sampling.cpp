@@ -17,6 +17,8 @@
 #include <opencv2/core.hpp>
 
 #include <chrono>
+#include <vc_reader/native/cuda_available.hpp>
+
 #include <cmath>
 #include <filesystem>
 #include <vector>
@@ -222,3 +224,41 @@ TEST_CASE("a zoomed-out frame takes resident finer data and does not read its ow
     CHECK(r.level[0] == 1);  // the second level of the request: level 0
     CHECK(r.values[7 * 32 + 9] == float(f.at0(5, 7, 9)));
 }
+
+#ifdef VC_READER_CUDA
+TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads load them")
+{
+    if (!vcr::cuda::available())
+        return;
+    Fixture f;
+    for (const auto sampling : {vc::Sampling::Nearest, vc::Sampling::Trilinear}) {
+        CAPTURE(int(sampling));
+        OpenedVolumes cpu(64 << 20), gpu(64 << 20, 64 << 20);
+        const auto cpuLevels = openLevels(cpu, *f.volume);
+        const auto gpuLevels = openLevels(gpu, *f.volume);
+        REQUIRE(gpuLevels->levels[0].cuda);
+        const auto geometry = planeAt(5.25f);
+        const vc3d::ViewerSample cpuWhat{cpuLevels, 0, 1, sampling, {0.0f, 1.0f}, std::nullopt};
+        const vc3d::ViewerSample gpuWhat{gpuLevels, 0, 1, sampling, {0.0f, 1.0f}, std::nullopt};
+
+        vc3d::ViewerLoad load;
+        for (const auto level : vc3d::sampleCached(geometry, gpuWhat, &load).level)
+            REQUIRE(level == vcr::grid::Result::kMissing);
+        REQUIRE(load.target.size() == 1);
+        vc3d::loadPending(load, [] { return true; });
+
+        vc3d::ViewerLoad again, cpuLoad, cpuAgain;
+        const auto onGpu = vc3d::sampleCached(geometry, gpuWhat, &again);
+        CHECK(again.empty());
+        vc3d::sampleCached(geometry, cpuWhat, &cpuLoad);
+        vc3d::loadPending(cpuLoad, [] { return true; });
+        const auto onCpu = vc3d::sampleCached(geometry, cpuWhat, &cpuAgain);
+        REQUIRE(onGpu.values.size() == onCpu.values.size());
+        CHECK(onGpu.level == onCpu.level);
+        float worst = 0.0f;
+        for (std::size_t i = 0; i < onCpu.values.size(); ++i)
+            worst = std::max(worst, std::abs(onGpu.values[i] - onCpu.values[i]));
+        CHECK(worst <= 1e-3f);
+    }
+}
+#endif

@@ -234,7 +234,11 @@ CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes
         using namespace vc3d::settings;
         const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
-        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30);
+        const auto gpuGib = settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool()
+            ? settings.value(perf::RENDER_GPU_CACHE_GB, perf::RENDER_GPU_CACHE_GB_DEFAULT).toULongLong()
+            : 0;
+        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30,
+                                                         std::size_t(gpuGib) << 30);
     }
     // Open Data surfaces are fetched from the catalog on the first read reaching them.
     if (!objectStoreOwner)

@@ -1,5 +1,9 @@
 #include "ViewerSampling.hpp"
 
+#ifdef VC_READER_CUDA
+#include <vc_reader/native/reader_cuda/reader.hpp>
+#endif
+
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -114,8 +118,20 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
         surface.gridOptions());
 }
 
-vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request) const
+vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const
 {
+#ifdef VC_READER_CUDA
+    std::vector<vcr::reader_cuda::Reader*> readers;
+    for (const auto& wanted : request.levels)
+        for (const auto& level : levels.levels)
+            if (level.array && level.array->array.get() == wanted.array && level.cuda)
+                readers.push_back(level.cuda.get());
+    if (!readers.empty() && readers.size() == request.levels.size())
+        return plane ? vcr::grid::cuda::sample(*plane, request, readers)
+                     : vcr::grid::cuda::sample(*surface, raster, request, readers);
+#else
+    (void)levels;
+#endif
     return plane ? vcr::grid::sample(*plane, request) : vcr::grid::sample(*surface, raster, request);
 }
 
@@ -143,7 +159,7 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
         add(level);
     if (request.levels.empty())
         return {};
-    auto result = geometry.sample(request);
+    auto result = geometry.sample(request, levels);
     if (!load)
         return result;
 
@@ -185,7 +201,7 @@ void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart)
         for (const auto& part : *parts) {
             auto request = part.request;
             request.pixels = part.pixels.data();
-            part.geometry.sample(request);
+            part.geometry.sample(request, *part.levels);
         }
         if (!parts->empty() && !afterPart())
             return;

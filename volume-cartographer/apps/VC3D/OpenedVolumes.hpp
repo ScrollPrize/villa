@@ -11,6 +11,8 @@
 
 class Volume;
 
+namespace vcr::reader_cuda { class Reader; }
+
 // The pyramid levels of volumes that VC3D's tools sample, each opened once and
 // shared, holding their decoded chunks in one memory cache.
 class OpenedVolumes {
@@ -18,9 +20,14 @@ public:
     struct Level {
         std::shared_ptr<vcr::zarr::OpenedArray> array;  // the opened physical level
         vcr::zarr::LevelPlacement working;              // placement of the volume's working level 0
+        // Samples the level on the GPU, when the render backend is CUDA and the
+        // level is uint8; null otherwise.
+        std::shared_ptr<vcr::reader_cuda::Reader> cuda;
     };
 
-    explicit OpenedVolumes(std::size_t cacheBytes);
+    // gpuCacheBytes > 0 samples frames on the GPU, keeping up to that many bytes of
+    // each level resident (builds with CUDA, when a device is present).
+    explicit OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes = 0);
 
     // Working level `level` of `volume` (physical level level + baseScaleLevel()),
     // opened on first use. Map volume coordinates to the level's indices with
@@ -38,5 +45,7 @@ private:
 
     std::mutex mutex_;
     std::shared_ptr<vcr::MemoryCache> cache_;
+    std::size_t gpuCacheBytes_ = 0;
     std::map<std::pair<std::string, int>, std::shared_ptr<vcr::zarr::OpenedArray>> levels_;  // (location, level)
+    std::map<const vcr::Array*, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
 };
