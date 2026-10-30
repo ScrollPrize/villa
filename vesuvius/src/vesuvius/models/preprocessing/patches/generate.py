@@ -20,6 +20,7 @@ from .cache import (
     PatchCacheParams,
     PatchEntry,
     build_cache_params,
+    background_cache_options,
     load_patch_cache,
     save_patch_cache,
 )
@@ -112,6 +113,10 @@ def generate_patch_caches(
         unlabeled_fg_bbox_threshold=float(
             getattr(mgr, "unlabeled_foreground_bbox_threshold", 0.15)
         ),
+        **background_cache_options(
+            bool(getattr(mgr, "bg_sampling_enabled", False)),
+            (getattr(mgr, "targets", {}) or {}).get(target_names[0]) or {},
+        ),
     )
 
     # Check if cache already exists
@@ -182,6 +187,9 @@ def generate_patch_caches(
         ),
         image_arrays=image_arrays if unlabeled_fg_enabled else None,
         collect_unlabeled_fg=unlabeled_fg_enabled,
+        collect_bg_only=cache_params.bg_sampling_enabled,
+        ignore_labels=([cache_params.bg_ignore_label] * len(label_arrays)
+                       if cache_params.bg_sampling_enabled else None),
         unlabeled_fg_threshold=cache_params.unlabeled_fg_threshold,
         unlabeled_fg_bbox_threshold=cache_params.unlabeled_fg_bbox_threshold,
     )
