@@ -6,7 +6,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc_reader/zarr.hpp"
 
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include <vc_object_store/objects/Project.hpp>
@@ -34,19 +34,30 @@ void preflightPredictionAndSource(const std::string& predictionUrl,
                                   const std::string& sourceUrl,
                                   int sourceLevel)
 {
-    auto prediction = vc::render::openHttpZarrPyramid(
-        predictionUrl, vc::HttpAuth{}, 0); // explicit zero requests strict validation
-    auto source = vc::render::openHttpZarrPyramid(
-        sourceUrl, vc::HttpAuth{}, sourceLevel);
-    if (prediction.shapes.empty() || source.shapes.empty())
-        throw std::runtime_error("prediction/source descriptor is empty");
-    if (prediction.shapes[0] != source.shapes[0])
+    const auto levelMeta = [](const std::string& url, int level) {
+        for (const auto& info : vcr::zarr::pyramidLevels(url, {}))
+            if (info.level == level)
+                return info.meta;
+        throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + url);
+    };
+    const auto prediction = levelMeta(predictionUrl, 0);
+    const auto source = levelMeta(sourceUrl, sourceLevel);
+    if (prediction.shape != source.shape)
         throw std::runtime_error("prediction /0 shape does not match source physical /" +
                                  std::to_string(sourceLevel));
     if (prediction.dtype != source.dtype)
         throw std::runtime_error("prediction/source dtype mismatch");
-    if (!prediction.physicalLevelZeroTransformIsIdentity)
-        throw std::runtime_error("prediction /0 coordinate scale must be identity");
+    // Level 0's own OME transform: placements are only relative to it.
+    const auto multiscales = vcr::zarr::Group::open(predictionUrl, {}).multiscales();
+    if (!multiscales.empty()) {
+        for (const auto& transform : multiscales.at(0).at("datasets").at(0).value("coordinateTransformations", vcr::zarr::Json::array())) {
+            const bool identity = transform.value("type", "") == "scale"
+                ? std::all_of(transform.at("scale").begin(), transform.at("scale").end(), [](const auto& v) { return v.template get<double>() == 1.0; })
+                : std::all_of(transform.at("translation").begin(), transform.at("translation").end(), [](const auto& v) { return v.template get<double>() == 0.0; });
+            if (!identity)
+                throw std::runtime_error("prediction /0 coordinate scale must be identity");
+        }
+    }
 }
 
 // An entry of the same Zarr, at any working level (#vc-base-scale).

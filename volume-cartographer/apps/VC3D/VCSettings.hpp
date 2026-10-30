@@ -197,36 +197,18 @@ namespace perf {
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
-    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
-    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
-    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
-    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+    constexpr auto REMOTE_CACHE_MAX_GIB = vc::settings::kRemoteCacheMaxGib;
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = vc::settings::kRemoteCacheMaxGibDefault;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = vc::settings::kRemoteCacheMinFreeGib;
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = vc::settings::kRemoteCacheMinFreeGibDefault;
 
-    // Process-wide remote source-download admission. Automatic mode adapts
-    // between 2 and the fixed worker capacity. Manual mode admits exactly the
-    // configured number of simultaneous downloads. Decode workers are managed
-    // separately.
-    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
-        "perf/remote_download_automatic";
-    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
-    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
-        "perf/remote_download_parallelism";
-    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    // Simultaneous remote downloads per opened array. Automatic mode leaves the
+    // choice to vc_reader.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC = vc::settings::kRemoteDownloadAutomatic;
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = vc::settings::kRemoteDownloadAutomaticDefault;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM = vc::settings::kRemoteDownloadParallelism;
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = vc::settings::kRemoteDownloadParallelismDefault;
     constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
-
-    // Reusable adaptive-download capacity model. Runtime probe phase and
-    // stability timing are reset on every launch.
-    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
-        "perf/remote_download_state/version";
-    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
-    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
-        "perf/remote_download_state/settled_admission";
-    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
-        "perf/remote_download_state/long_term_bytes_per_second";
-    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
-        "perf/remote_download_state/max_saturated_parallelism";
-    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
-        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
 
 }
 

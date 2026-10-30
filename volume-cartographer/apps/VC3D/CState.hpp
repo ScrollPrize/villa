@@ -45,7 +45,8 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr);
+    // cacheBytes sizes the opened volumes' memory cache (0: the RAM cache setting).
+    explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr, std::size_t cacheBytes = 0);
     ~CState();
 
     // One session for all object kinds; controllers share this handle.

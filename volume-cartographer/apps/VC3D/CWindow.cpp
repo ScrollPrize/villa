@@ -11,11 +11,9 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -862,9 +860,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        _cacheSizeBytes);
-    _state = new CState(this);
+    _state = new CState(this, nullptr, _cacheSizeBytes);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -1030,15 +1026,14 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
     auto updatePersistentCacheSpace = [this]() {
-        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(
-            vc3d::remoteCachePathFs());
-        if (!budget)
+        std::error_code spaceError;
+        const auto space = std::filesystem::space(vc3d::remoteCachePathFs(), spaceError);
+        if (spaceError)
             return;
-        const auto stats = budget->stats();
-        if (stats.lowSpace) {
-            const double freeGiB = static_cast<double>(stats.freeBytes) /
+        if (space.available < static_cast<std::uintmax_t>(vc::settings::remoteCacheMinFreeBytes())) {
+            const double freeGiB = static_cast<double>(space.available) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
+            const QString text = tr("Low disk space: %1 GiB free. Chunks are no longer being cached; downloads continue without caching. Nothing already cached was removed.")
                                      .arg(freeGiB, 0, 'f', 1);
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();

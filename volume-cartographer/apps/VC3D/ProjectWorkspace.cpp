@@ -5,9 +5,8 @@
 #include "OpenDataSampleProject.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc_object_store/objects/SurfaceTileCache.hpp"
@@ -83,15 +82,12 @@ QString volumeLocation(const Volume& volume)
     return trimmedLocation(QString::fromStdString(volume.isRemote() ? volume.remoteUrl() : volume.path().string()));
 }
 
-QString dtypeName(vc::render::ChunkDtype dtype)
+QString dtypeName(const std::string& dtype)
 {
-    switch (dtype) {
-    case vc::render::ChunkDtype::UInt8: return QStringLiteral("uint8");
-    case vc::render::ChunkDtype::UInt16: return QStringLiteral("uint16");
-    case vc::render::ChunkDtype::Float32: return QStringLiteral("float32");
-    case vc::render::ChunkDtype::Opaque: return QStringLiteral("opaque");
-    }
-    return {};
+    if (dtype == "|u1") return QStringLiteral("uint8");
+    if (dtype.ends_with("u2")) return QStringLiteral("uint16");
+    if (dtype.ends_with("f4")) return QStringLiteral("float32");
+    return QString::fromStdString(dtype);
 }
 
 void setBar(QProgressBar* bar, QLabel* text, quint64 used, std::optional<quint64> maximum, const QString& extra = {})
@@ -433,8 +429,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     addBar(0, tr("Volume chunks in memory"), tr("Decoded volume chunks held in memory, shared by every viewer."),
            _ramBar, _ramText);
     _diskCell = addBar(1, tr("Volume chunks on disk"),
-                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit, "
-                          "or when the disk runs low."),
+                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit; "
+                          "when the disk runs low, caching stops and nothing is removed."),
                        _diskBar, _diskText);
     addBar(2, tr("Surface geometry in memory"), tr("Decoded surface tiles kept for every open store."),
            _surfaceBar, _surfaceText);
@@ -769,27 +765,29 @@ void ProjectWorkspace::rebuildResources()
 void ProjectWorkspace::updateCaches()
 {
     if (!isVisible()) return;
-    if (const auto budget = vc::render::processChunkCacheService()->decodedByteBudget()) {
-        const auto stats = budget->stats();
-        setBar(_ramBar, _ramText, stats.decodedBytes, stats.maximumBytes);
-    }
+    const auto ram = _state->openedVolumes()->cacheStats();
+    setBar(_ramBar, _ramText, ram.bytes, ram.capacity);
     const auto root = vc3d::remoteCachePathFs();
     const auto rootText = QString::fromStdString(root.string());
     _revealCache->setToolTip(rootText);
-    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit, "
-                             "or when the disk runs low.").arg(rootText));
-    if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root)) {
-        const auto stats = budget->stats();
-        // Free space is measured with the first trim; until then it reads 0.
+    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit; "
+                             "when the disk runs low, caching stops and nothing is removed.").arg(rootText));
+    std::error_code rootError;
+    if (std::filesystem::is_regular_file(root / ".vc_reader_cache.sqlite3", rootError)) {
+        const auto budget = vcr::zarr::diskBudget(root.string(), std::nullopt);
+        const auto limit = vc::settings::remoteCacheMaxBytes();
+        const auto minimumFree = static_cast<std::uint64_t>(vc::settings::remoteCacheMinFreeBytes());
+        const auto space = std::filesystem::space(root, rootError);
+        const std::uint64_t freeBytes = rootError ? 0 : space.available;
+        const bool lowSpace = !rootError && freeBytes < minimumFree;
         QStringList extra;
-        if (stats.freeBytes || stats.lowSpace) extra << tr("%1 free").arg(bytes(stats.freeBytes));
-        if (stats.minimumFreeBytes) extra << tr("keeps %1 free").arg(bytes(stats.minimumFreeBytes));
-        if (stats.scanInFlight) extra << tr("counting...");
-        setBar(_diskBar, _diskText, stats.managedBytes,
-               stats.maximumBytes ? std::optional<quint64>(*stats.maximumBytes) : std::nullopt,
+        if (!rootError) extra << tr("%1 free").arg(bytes(freeBytes));
+        if (minimumFree) extra << tr("stops caching under %1 free").arg(bytes(minimumFree));
+        setBar(_diskBar, _diskText, static_cast<quint64>(budget->total_bytes()),
+               limit ? std::optional<quint64>(static_cast<quint64>(*limit)) : std::nullopt,
                extra.join(QStringLiteral(" · ")));
         // Overrides the dimmed palette while space is low.
-        _diskText->setStyleSheet(stats.lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+        _diskText->setStyleSheet(lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
     } else {
         _diskBar->setEnabled(false);
         _diskText->setText(tr("not in use"));

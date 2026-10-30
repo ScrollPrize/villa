@@ -36,7 +36,6 @@ inline uint32_t be32(uint32_t v) {
 
 
 #include <vc_reader/zarr.hpp>
-#include "vc/core/render/ChunkCache.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -1300,11 +1299,6 @@ void run_generate(const po::variables_map& vm) {
     const size_t cache_budget_bytes = std::min<size_t>(
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
-
-    std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
-              << " MiB" << std::endl;
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        cache_budget_bytes);
 
     struct DirectionShardPlan {
         SliceDirection dir;

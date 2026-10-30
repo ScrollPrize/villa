@@ -222,7 +222,7 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(QObject* parent, CState* objectStoreOwner)
+CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes)
     : QObject(parent)
 {
     _objectStoreOwner = objectStoreOwner;
@@ -234,7 +234,7 @@ CState::CState(QObject* parent, CState* objectStoreOwner)
         using namespace vc3d::settings;
         const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
-        _openedVolumes = std::make_shared<OpenedVolumes>(std::size_t(gib) << 30);
+        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30);
     }
     // Open Data surfaces are fetched from the catalog on the first read reaching them.
     if (!objectStoreOwner)

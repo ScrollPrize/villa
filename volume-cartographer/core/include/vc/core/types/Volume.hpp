@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -13,13 +12,8 @@
 #include "utils/Json.hpp"
 #include <opencv2/core/mat.hpp>
 
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
 
-namespace vc::render {
-class IChunkedArray;
-struct OpenedChunkedZarr;
-}
 namespace vcr::zarr { struct OpenOptions; }
 
 
@@ -60,13 +54,12 @@ public:
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
-    [[nodiscard]] utils::Json rootAttributes() const;
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
-    // Source identity before project/catalog metadata overrides, with the
-    // logical base level included. Annotation IDs do not rename disk caches.
+    // Source identity before project/catalog metadata overrides: annotation IDs
+    // and working levels do not rename disk caches.
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
@@ -82,16 +75,11 @@ public:
     // Zarr/storage order: [z, y, x] = [slices, height, width].
     [[nodiscard]] std::array<int, 3> shape() const noexcept;
     [[nodiscard]] std::array<int, 3> shape(int level) const;
-    [[nodiscard]] std::array<int, 3> levelShape(int level) const;
-    [[nodiscard]] std::array<int, 3> chunkShape(int level) const;
-    [[nodiscard]] std::array<int, 3> chunkGridShape(int level) const;
-    [[nodiscard]] size_t chunkCount(int level) const;
     // Coordinate/UI order: [x, y, z] = [width, height, slices].
     [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
-    [[nodiscard]] vc::render::ChunkDtype dtype() const noexcept { return zarrDtype_; }
-    [[nodiscard]] size_t dtypeSize() const noexcept;
-    [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
+    // NumPy typestr of the source: |u1, <u2, <f4, ...
+    [[nodiscard]] const std::string& dtype() const noexcept { return zarrDtype_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
     // The working level: the source pyramid level this volume opened as its
@@ -104,16 +92,6 @@ public:
     }
     [[nodiscard]] bool hasScaleLevel(int level) const noexcept;
     [[nodiscard]] std::vector<int> presentScaleLevels() const;
-    [[nodiscard]] int firstPresentScaleLevel() const;
-    [[nodiscard]] int finestPresentScaleLevelAtOrBelow(int level) const;
-
-    // --- Cache management ---
-
-    [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
-    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
-
-    // Drop decoded/read cache state. Writes call this automatically.
-    void invalidateCache();
 
 protected:
     std::filesystem::path path_;
@@ -125,19 +103,8 @@ protected:
     int _slices{0};
 
     std::vector<std::array<int, 3>> zarrLevelShapes_;
-    std::vector<std::array<int, 3>> zarrLevelChunkShapes_;
-    std::vector<std::array<int, 3>> zarrLevelStorageChunkShapes_;
-    vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
-    double zarrFillValue_ = 0.0;
+    std::string zarrDtype_ = "|u1";
     void zarrOpen();
-
-    // Cache ownership
-    mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
-    mutable std::mutex cacheMutex_;
-
-    std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
-        vc::render::ChunkCache::Options options) const;
-    [[nodiscard]] std::string chunkCacheSourceIdentity() const;
 
     void loadMetadata();
 
@@ -145,7 +112,6 @@ protected:
     bool isRemote_ = false;
     std::string remoteUrl_;
     std::string remoteLocator_;
-    std::string remoteCacheId_;
     std::string remoteSourceCacheId_;  // the cache of the physical (not rebased) pyramid
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;

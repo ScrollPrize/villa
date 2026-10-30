@@ -1,6 +1,7 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
 
+#include <charconv>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -226,12 +227,13 @@ fs::path remoteCachePath()
     return active;
 }
 
-bool remoteCacheDelta3dEnabled()
+namespace {
+
+bool iniBool(const char* key, bool fallback)
 {
-    const auto configured = configuredIniValue(
-        settingsFilePath(), "perf", "remote_cache_delta3d");
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
     if (configured.empty())
-        return kRemoteCacheDelta3dDefault;
+        return fallback;
 
     std::string normalized;
     normalized.reserve(configured.size());
@@ -240,6 +242,46 @@ bool remoteCacheDelta3dEnabled()
         [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
     return normalized == "1" || normalized == "true" || normalized == "yes" ||
            normalized == "on";
+}
+
+unsigned long long iniNumber(const char* key, unsigned long long fallback)
+{
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
+    unsigned long long value = fallback;
+    const auto* end = configured.data() + configured.size();
+    if (std::from_chars(configured.data(), end, value).ptr != end)
+        return fallback;
+    return value;
+}
+
+constexpr std::int64_t kGib = std::int64_t{1} << 30;
+
+}  // namespace
+
+bool remoteCacheDelta3dEnabled()
+{
+    return iniBool("remote_cache_delta3d", kRemoteCacheDelta3dDefault);
+}
+
+std::optional<std::int64_t> remoteCacheMaxBytes()
+{
+    const auto gib = iniNumber("remote_cache_max_gib", kRemoteCacheMaxGibDefault);
+    if (gib == 0)
+        return std::nullopt;
+    return static_cast<std::int64_t>(gib) * kGib;
+}
+
+std::int64_t remoteCacheMinFreeBytes()
+{
+    return static_cast<std::int64_t>(iniNumber("remote_cache_min_free_gib", kRemoteCacheMinFreeGibDefault)) * kGib;
+}
+
+std::optional<int> remoteDownloadParallelism()
+{
+    if (iniBool("remote_download_automatic", kRemoteDownloadAutomaticDefault))
+        return std::nullopt;
+    return static_cast<int>(std::clamp<unsigned long long>(
+        iniNumber("remote_download_parallelism", kRemoteDownloadParallelismDefault), 1, 64));
 }
 
 } // namespace vc::settings

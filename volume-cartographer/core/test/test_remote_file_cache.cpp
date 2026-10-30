@@ -2,7 +2,6 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/RemoteFileCache.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -96,37 +95,6 @@ TEST_CASE("remote file cache retains a valid entry when refresh fails")
     options.policy = vc::core::util::RemoteFileCachePolicy::CacheFirst;
     const auto hit = vc::core::util::cacheRemoteFile("https://example.test/file", options);
     CHECK(hit.cacheHit);
-    fs::remove_all(root);
-}
-
-TEST_CASE("managed arbitrary files participate in persistent cache accounting")
-{
-    namespace render = vc::render;
-    const auto root = temporaryDirectory("managed");
-    render::PersistentZarrCacheBudget::resetRegistryForTesting();
-    auto budget = render::PersistentZarrCacheBudget::configure(root, {});
-    budget->waitForIdle();
-
-    vc::core::util::RemoteFileCacheOptions options;
-    options.cacheRoot = root;
-    options.destination = "objects/model.weights";
-    options.accounting = vc::core::util::RemoteFileCacheAccounting::Managed;
-    options.fetcher = [](const std::string&, const fs::path& tmp) { std::ofstream(tmp, std::ios::binary) << "1234567"; };
-    {
-        auto result = vc::core::util::cacheRemoteFile("https://example.test/model.weights", options);
-        REQUIRE(result.readPin.has_value());
-        CHECK(budget->stats().managedBytes == 7);
-        result.readPin->complete();
-    }
-
-    render::PersistentZarrCacheBudget::resetRegistryForTesting();
-    budget = render::PersistentZarrCacheBudget::configure(root, {});
-    budget->waitForIdle();
-    CHECK(budget->stats().managedBytes == 7);
-    vc::core::util::invalidateRemoteFileCacheEntry(options);
-    CHECK(budget->stats().managedBytes == 0);
-
-    render::PersistentZarrCacheBudget::resetRegistryForTesting();
     fs::remove_all(root);
 }
 

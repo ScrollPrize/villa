@@ -1,5 +1,5 @@
-// Live S3 tests against PHerc 0172 and PHerc 0139 for Volume / Zarr / VcDataset
-// and catalog identity coverage. Set VC_TEST_REQUIRE_NETWORK=1 to make
+// Live S3 tests against PHerc 0172 and PHerc 0139 for Volume and catalog identity
+// coverage. Set VC_TEST_REQUIRE_NETWORK=1 to make
 // failures hard.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -110,7 +110,8 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
     CHECK(project->overlayCompatible(coarse->id(), coarse->id()));
     CHECK(coarse->voxelSize() == doctest::Approx(4 * 2.399));
-    CHECK(coarse->remotePersistentCachePath() != levelZeroCache);
+    // Every working level reads the physical pyramid's one cache.
+    CHECK(coarse->remotePersistentCachePath() == levelZeroCache);
     // Objects made on it are kept in the volume's own voxels, at its scale.
     const auto annotation = vc::project::annotationVolume(project.get(), *coarse);
     CHECK(annotation.volume == "20260102150214");

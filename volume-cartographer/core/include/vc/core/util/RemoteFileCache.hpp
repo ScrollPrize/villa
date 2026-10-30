@@ -2,7 +2,6 @@
 
 #include "vc/core/util/RemoteAuth.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -18,18 +17,12 @@ enum class RemoteFileCachePolicy {
     Refresh,
 };
 
-enum class RemoteFileCacheAccounting {
-    Unmanaged,
-    Managed,
-};
-
 using RemoteFileFetcher = std::function<void(const std::string& sourceLocation, const std::filesystem::path& temporaryPath)>;
 
 struct RemoteFileCacheOptions {
     std::filesystem::path cacheRoot;
     std::filesystem::path destination;
     RemoteFileCachePolicy policy = RemoteFileCachePolicy::CacheFirst;
-    RemoteFileCacheAccounting accounting = RemoteFileCacheAccounting::Unmanaged;
     vc::HttpAuth auth;
     // When false and auth is empty, S3 requests are always anonymous and the
     // machine's ambient AWS configuration is not consulted.
@@ -41,7 +34,6 @@ struct RemoteFileCacheResult {
     std::filesystem::path path;
     std::string normalizedEndpoint;
     bool cacheHit = false;
-    std::optional<vc::render::PersistentZarrCacheBudget::ReadPin> readPin;
 };
 
 [[nodiscard]] std::string normalizeRemoteFileLocation(const std::string& sourceLocation);

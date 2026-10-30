@@ -62,7 +62,7 @@ std::filesystem::path checkedDestination(const RemoteFileCacheOptions& options)
     return payload;
 }
 
-bool validCacheHit(const std::filesystem::path& payload, std::string_view source, RemoteFileCacheAccounting accounting)
+bool validCacheHit(const std::filesystem::path& payload, std::string_view source)
 {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(payload, ec) || ec)
@@ -74,7 +74,6 @@ bool validCacheHit(const std::filesystem::path& payload, std::string_view source
         std::ifstream input(sidecar);
         const auto metadata = nlohmann::json::parse(input);
         if (metadata.value("version", 0) != kSidecarVersion || metadata.value("source", std::string{}) != source ||
-            metadata.value("accounting", std::string{}) != (accounting == RemoteFileCacheAccounting::Managed ? "managed" : "unmanaged") ||
             !metadata.contains("size") || !metadata.at("size").is_number_unsigned()) {
             return false;
         }
@@ -99,7 +98,7 @@ void renameReplacing(const std::filesystem::path& source, const std::filesystem:
 }
 
 std::filesystem::path writeTemporarySidecar(
-    const std::filesystem::path& payload, const std::filesystem::path& temporaryPayload, std::string_view source, RemoteFileCacheAccounting accounting)
+    const std::filesystem::path& payload, const std::filesystem::path& temporaryPayload, std::string_view source)
 {
     const auto sidecar = sidecarPath(payload);
     const auto tmp = std::filesystem::path(sidecar.string() + ".tmp-" + std::to_string(gTemporarySerial.fetch_add(1)));
@@ -107,7 +106,6 @@ std::filesystem::path writeTemporarySidecar(
         {"version", kSidecarVersion},
         {"source", source},
         {"size", std::filesystem::file_size(temporaryPayload)},
-        {"accounting", accounting == RemoteFileCacheAccounting::Managed ? "managed" : "unmanaged"},
     };
     {
         std::ofstream output(tmp, std::ios::binary | std::ios::trunc);
@@ -121,19 +119,9 @@ std::filesystem::path writeTemporarySidecar(
     return tmp;
 }
 
-std::optional<vc::render::PersistentZarrCacheBudget::ReadPin> readPinFor(const std::filesystem::path& payload, RemoteFileCacheAccounting accounting)
+RemoteFileCacheResult makeResult(const std::filesystem::path& payload, const std::string& normalized, bool cacheHit)
 {
-    if (accounting != RemoteFileCacheAccounting::Managed)
-        return std::nullopt;
-    const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(payload);
-    if (!budget)
-        return std::nullopt;
-    return budget->pinRead(payload);
-}
-
-RemoteFileCacheResult makeResult(const std::filesystem::path& payload, const std::string& normalized, bool cacheHit, RemoteFileCacheAccounting accounting)
-{
-    return {payload, normalized, cacheHit, readPinFor(payload, accounting)};
+    return {payload, normalized, cacheHit};
 }
 
 struct RemoteClientDetails {
@@ -391,8 +379,8 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
     const auto payload = checkedDestination(options);
     const auto normalized = normalizeRemoteFileLocation(sourceLocation);
     const auto source = remoteFileCacheSource(sourceLocation);
-    if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source, options.accounting)) {
-        return makeResult(payload, normalized, true, options.accounting);
+    if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source)) {
+        return makeResult(payload, normalized, true);
     }
 
     const std::string flightKey = payload.string() + '\n' + source;
@@ -400,8 +388,8 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
     bool owner = false;
     {
         std::lock_guard lock(gInFlightMutex);
-        if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source, options.accounting)) {
-            return makeResult(payload, normalized, true, options.accounting);
+        if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source)) {
+            return makeResult(payload, normalized, true);
         }
         auto [it, inserted] = gInFlight.try_emplace(flightKey, std::make_shared<InFlight>());
         flight = it->second;
@@ -412,9 +400,9 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
         flight->finished.wait(lock, [&] { return flight->done; });
         if (flight->error)
             std::rethrow_exception(flight->error);
-        if (!validCacheHit(payload, source, options.accounting))
+        if (!validCacheHit(payload, source))
             throw std::runtime_error("remote file cache publication did not produce a valid entry");
-        return makeResult(payload, normalized, true, options.accounting);
+        return makeResult(payload, normalized, true);
     }
 
     std::exception_ptr error;
@@ -428,7 +416,6 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
         const auto sidecarBackup = std::filesystem::path(sidecar.string() + backupSuffix);
         bool payloadBackedUp = false;
         bool sidecarBackedUp = false;
-        std::optional<vc::render::PersistentZarrCacheBudget::WriteReservation> reservation;
         try {
             if (options.fetcher)
                 options.fetcher(sourceLocation, tmp);
@@ -437,16 +424,7 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
                              options.discoverAwsCredentials);
             if (!std::filesystem::is_regular_file(tmp))
                 throw std::runtime_error("remote file fetcher did not create its temporary file");
-            temporarySidecar = writeTemporarySidecar(payload, tmp, source, options.accounting);
-            if (options.accounting == RemoteFileCacheAccounting::Managed) {
-                if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(payload)) {
-                    auto reserved = budget->reserveWrite(payload, std::filesystem::file_size(tmp));
-                    if (!reserved)
-                        throw std::runtime_error("remote file cache budget rejected the managed payload");
-                    reservation.emplace(std::move(reserved));
-                }
-            }
-
+            temporarySidecar = writeTemporarySidecar(payload, tmp, source);
             std::error_code ec;
             if (std::filesystem::is_regular_file(payload, ec) && !ec) {
                 std::filesystem::rename(payload, payloadBackup);
@@ -461,8 +439,6 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
             renameReplacing(temporarySidecar, sidecar);
             std::filesystem::remove(payloadBackup, ec);
             std::filesystem::remove(sidecarBackup, ec);
-            if (reservation)
-                reservation->commit();
         } catch (...) {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
@@ -476,8 +452,6 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
                 std::filesystem::remove(sidecar, ec);
                 std::filesystem::rename(sidecarBackup, sidecar, ec);
             }
-            if (reservation)
-                reservation->cancel();
             throw;
         }
     } catch (...) {
@@ -493,25 +467,15 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
     flight->finished.notify_all();
     if (error)
         std::rethrow_exception(error);
-    return makeResult(payload, normalized, false, options.accounting);
+    return makeResult(payload, normalized, false);
 }
 
 void invalidateRemoteFileCacheEntry(const RemoteFileCacheOptions& options)
 {
     const auto payload = checkedDestination(options);
-    std::optional<vc::render::PersistentZarrCacheBudget::WriteReservation> reservation;
-    if (options.accounting == RemoteFileCacheAccounting::Managed) {
-        if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(payload)) {
-            auto reserved = budget->reserveWrite(payload, 0);
-            if (reserved)
-                reservation.emplace(std::move(reserved));
-        }
-    }
     std::error_code ec;
     std::filesystem::remove(payload, ec);
     std::filesystem::remove(sidecarPath(payload), ec);
-    if (reservation)
-        reservation->commit();
 }
 
 }  // namespace vc::core::util

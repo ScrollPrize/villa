@@ -24,19 +24,12 @@
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/types/VcDataset.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
-#include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
-#include "vc/core/render/IChunkedArray.hpp"
-#include "vc/core/render/ChunkFetch.hpp"
 #include "utils/hash.hpp"
-#include "utils/zarr.hpp"
 #include "vc_reader/zarr.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
@@ -82,10 +75,42 @@ void applyResolvedVoxelSize(utils::Json& metadata,
         description);
 }
 
-std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth)
+// Reads metadata objects for a remote location. Definite answers for objects
+// under the public channels persist in the remote metadata cache, so a warm
+// open makes no network requests.
+vcr::zarr::MetadataReader cachedMetadataReader(const vcr::zarr::Access& access)
 {
-    const auto normalize = [&](utils::Json json, const std::string& url) -> utils::Json {
+    return [read = vcr::zarr::metadataReader(access), access](
+               const std::string& location, const std::string& name) -> std::optional<std::string> {
+        const auto url = access.url(location + "/" + name);
+        if (!vc::core::util::RemoteMetadataCache::cacheable(url))
+            return read(location, name);
+        auto& cache = vc::core::util::remoteMetadataCache();
+        if (const auto answer = cache.lookup(url)) {
+            if (!*answer)
+                return std::nullopt;
+            return std::string(reinterpret_cast<const char*>((*answer)->data()), (*answer)->size());
+        }
+        auto text = read(location, name);
+        vc::core::util::RemoteMetadataCache::Answer record;
+        if (text) {
+            const auto* bytes = reinterpret_cast<const std::byte*>(text->data());
+            record.emplace(bytes, bytes + text->size());
+        }
+        cache.record(url, record);
+        return text;
+    };
+}
+
+std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& location,
+                                                    const vcr::zarr::MetadataReader& read)
+{
+    const auto load = [&](const std::string& name) -> std::optional<utils::Json> {
+        const auto body = read(location, name);
+        if (!body || body->empty())
+            return std::nullopt;
+        auto json = utils::Json::parse(*body);
+        const auto url = location + "/" + name;
         if (!json.is_object()) {
             throw std::runtime_error("remote volume metadata is not an object: " + url);
         }
@@ -101,33 +126,9 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
         applyResolvedVoxelSize(json, voxelSize, url);
         return json;
     };
-
-    const auto loadUrl = [&](const std::string& url) -> std::optional<utils::Json> {
-        auto& cache = vc::core::util::remoteMetadataCache();
-        std::string body;
-        if (const auto answer = cache.lookup(url)) {
-            if (*answer)
-                body.assign(reinterpret_cast<const char*>((*answer)->data()), (*answer)->size());
-        } else {
-            body = vc::httpGetString(url, auth);
-            if (vc::core::util::RemoteMetadataCache::cacheable(url)) {
-                std::vector<std::byte> bytes(body.size());
-                std::memcpy(bytes.data(), body.data(), body.size());
-                cache.record(url, body.empty()
-                    ? vc::core::util::RemoteMetadataCache::Answer{}
-                    : vc::core::util::RemoteMetadataCache::Answer{std::move(bytes)});
-            }
-        }
-        if (body.empty()) {
-            return std::nullopt;
-        }
-        return normalize(utils::Json::parse(body), url);
-    };
-
-    if (auto meta = loadUrl(vc::joinRemoteUrlPath(remoteUrl, METADATA_FILE.string()))) {
+    if (auto meta = load(METADATA_FILE.string()))
         return meta;
-    }
-    return loadUrl(vc::joinRemoteUrlPath(remoteUrl, METADATA_FILE_ALT.string()));
+    return load(METADATA_FILE_ALT.string());
 }
 
 std::string deriveRemoteVolumeId(const std::string& url)
@@ -172,32 +173,74 @@ std::string deriveLocalVolumeId(const std::filesystem::path& path)
     return out.str();
 }
 
-std::string deriveRebasedRemoteCacheId(const std::string& descriptiveId,
-                                       const std::string& sourceUrl,
-                                       int baseScaleLevel)
+int ceilDivPow2(int v, int level)
 {
-    const std::string identity = sourceUrl + "#vc-base-scale=" +
-                                 std::to_string(baseScaleLevel);
-    const auto hash = utils::fnv1a(std::string_view(identity));
-    std::ostringstream out;
-    out << descriptiveId << "-vc-base-" << baseScaleLevel << "-"
-        << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << hash;
-    return out.str();
+    const int64_t denom = int64_t{1} << level;
+    return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
 }
 
-std::vector<vc::render::ChunkCache::LevelInfo>
-makeChunkCacheLevelInfo(const vc::render::OpenedChunkedZarr& opened)
+bool paddedShapeOK(long long actual, long long expected, int padMultiple)
 {
-    std::vector<vc::render::ChunkCache::LevelInfo> levels;
-    levels.reserve(opened.fetchers.size());
-    for (std::size_t i = 0; i < opened.fetchers.size(); ++i) {
-        vc::render::ChunkCache::LevelInfo level;
-        level.shape = opened.shapes[i];
-        level.chunkShape = opened.chunkShapes[i];
-        level.transform = opened.transforms[i];
-        levels.push_back(level);
+    const long long maxPad = std::max(1, padMultiple);
+    return actual >= expected && actual - expected < maxPad;
+}
+
+// The signed form of a virtual-host S3 URL: https://BUCKET.s3[.REGION].amazonaws.com/KEY.
+std::string signedS3Location(const std::string& url)
+{
+    const auto scheme = url.find("://");
+    const std::string rest = scheme == std::string::npos ? url : url.substr(scheme + 3);
+    const auto slash = rest.find('/');
+    const std::string host = rest.substr(0, slash);
+    const auto s3 = host.find(".s3.");
+    if (s3 == std::string::npos || host.find(".amazonaws.com") == std::string::npos)
+        throw std::runtime_error("signed requests need an S3 virtual-host URL: " + url);
+    return "s3://" + host.substr(0, s3) + (slash == std::string::npos ? std::string() : rest.substr(slash));
+}
+
+std::array<int, 3> shape3(const vcr::Index& shape, const std::string& description)
+{
+    if (shape.size() != 3)
+        throw std::runtime_error("zarr array must be 3D: " + description);
+    return {static_cast<int>(shape[0]), static_cast<int>(shape[1]), static_cast<int>(shape[2])};
+}
+
+// One level's shape per level number, zero for absent numbers.
+std::vector<std::array<int, 3>> levelShapes(const std::vector<vcr::zarr::PyramidLevelInfo>& levels,
+                                            const std::string& description)
+{
+    std::vector<std::array<int, 3>> shapes;
+    for (const auto& level : levels) {
+        if (level.meta.dtype != levels.front().meta.dtype)
+            throw std::runtime_error("levels of " + description + " have different dtypes");
+        if (shapes.size() <= static_cast<std::size_t>(level.level))
+            shapes.resize(static_cast<std::size_t>(level.level) + 1, {0, 0, 0});
+        shapes[static_cast<std::size_t>(level.level)] = shape3(level.meta.shape, description);
     }
-    return levels;
+    return shapes;
+}
+
+// A working level is the coarse end of a gapless dyadic pyramid with one fill value.
+void validateWorkingLevel(const std::vector<vcr::zarr::PyramidLevelInfo>& levels, int base, const std::string& description)
+{
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (levels[index].level != static_cast<int>(index))
+            throw std::runtime_error("VC pyramid numeric groups contain a gap at /" + std::to_string(index) +
+                                     " of " + description);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const auto first = static_cast<int>(levels.front().meta.shape[axis]);
+            if (!paddedShapeOK(static_cast<long long>(levels[index].meta.shape[axis]),
+                               ceilDivPow2(first, static_cast<int>(index)),
+                               static_cast<int>(levels[index].meta.chunks[axis])))
+                throw std::runtime_error("VC pyramid group /" + std::to_string(index) +
+                                         " shape is not a dyadic downscale of /0 within storage-chunk padding tolerance");
+        }
+    }
+    if (base >= static_cast<int>(levels.size()))
+        throw std::runtime_error("requested VC pyramid base group /" + std::to_string(base) + " is unavailable");
+    for (std::size_t index = static_cast<std::size_t>(base); index < levels.size(); ++index)
+        if (levels[index].meta.fill != levels[static_cast<std::size_t>(base)].meta.fill)
+            throw std::runtime_error("VC pyramid retained groups must have one consistent fill value");
 }
 
 } // namespace
@@ -269,42 +312,21 @@ std::string Volume::name() const
     return metadata_["name"].get_string();
 }
 
-utils::Json Volume::rootAttributes() const
-{
-    if (isRemote())
-        throw std::runtime_error("Volume::rootAttributes is only supported for local zarr volumes");
-    const auto attrsPath = path_ / ".zattrs";
-    if (!std::filesystem::exists(attrsPath))
-        return utils::Json::object();
-    return utils::Json::parse_file(attrsPath);
-}
-
-static int ceilDivPow2(int v, int level)
-{
-    const int64_t denom = int64_t{1} << level;
-    return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
-}
-
-static bool paddedShapeOK(long long actual, long long expected, int padMultiple)
-{
-    const long long maxPad = std::max(1, padMultiple);
-    return actual >= expected && actual - expected < maxPad;
-}
-
 void Volume::zarrOpen()
 {
     if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
         return;
 
-    auto opened = vc::render::openLocalZarrPyramid(path_);
-    if (opened.shapes.empty()) {
+    const auto levels = vcr::zarr::pyramidLevels(path_.string(), {});
+    if (levels.empty()) {
         throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
     }
-    zarrLevelShapes_ = opened.shapes;
-    zarrLevelChunkShapes_ = opened.chunkShapes;
-    zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
-    zarrDtype_ = opened.dtype;
-    zarrFillValue_ = opened.fillValue;
+    zarrLevelShapes_ = levelShapes(levels, path_.string());
+    zarrDtype_ = levels.front().meta.dtype;
+    // The padding a level's shape may have over its downscaled dimensions.
+    std::vector<std::array<int, 3>> storageChunkShapes(zarrLevelShapes_.size(), {128, 128, 128});
+    for (const auto& level : levels)
+        storageChunkShapes[static_cast<std::size_t>(level.level)] = shape3(level.meta.chunks, path_.string());
 
     if (metadataAutoGenerated_) {
         bool hasReference = false;
@@ -331,9 +353,7 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(baseHeight, levelInt);
             const int expectedWidth = ceilDivPow2(baseWidth, levelInt);
 
-            const auto storageChunkShape = level < zarrLevelStorageChunkShapes_.size()
-                ? zarrLevelStorageChunkShapes_[level]
-                : std::array<int, 3>{128, 128, 128};
+            const auto& storageChunkShape = storageChunkShapes[level];
             if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
                 !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
                 !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
@@ -369,9 +389,7 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
 
-            const auto storageChunkShape = level < zarrLevelStorageChunkShapes_.size()
-                ? zarrLevelStorageChunkShapes_[level]
-                : std::array<int, 3>{128, 128, 128};
+            const auto& storageChunkShape = storageChunkShapes[level];
             if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
                 !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
                 !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
@@ -416,21 +434,58 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const utils::Json& metadata,
     bool discoverAwsCredentials)
 {
-    vc::render::RemoteZarrOpenOptions openOptions;
-    openOptions.auth = authIn;
-    openOptions.discoverAwsCredentials = discoverAwsCredentials;
-    auto remoteOpen = vc::render::openRemoteZarrPyramid(url, std::move(openOptions));
-    auto opened = std::move(remoteOpen.opened);
-    auto auth = std::move(remoteOpen.auth);
-    const auto& spec = remoteOpen.spec;
+    const auto spec = vc::parseRemoteVolumeSpec(url);
     const std::string& remoteUrl = spec.sourceUrl;
+    auto auth = authIn;
 
-    if (opened.shapes.empty())
+    // Recognized S3 sources are tried anonymously, then with the given or
+    // discovered credentials only when anonymous access fails.
+    const auto openLevels = [&](const vc::HttpAuth& requestAuth) {
+        vcr::zarr::OpenOptions options;
+        std::string location = remoteUrl;
+        if (!requestAuth.empty()) {
+            location = signedS3Location(remoteUrl);
+            options.access = vcr::zarr::s3Access(location,
+                vcr::Auth{"s3", requestAuth.access_key, requestAuth.secret_key,
+                          requestAuth.session_token, requestAuth.region});
+        }
+        options.metadata = cachedMetadataReader(options.access);
+        return std::pair{vcr::zarr::pyramidLevels(location, options), options.metadata};
+    };
+    decltype(openLevels(auth)) opened;
+    if (!spec.useAwsSigv4) {
+        opened = openLevels(auth);
+    } else {
+        try {
+            opened = openLevels({});
+            auth = {};
+        } catch (const std::exception&) {
+            if (auth.empty() && discoverAwsCredentials) {
+                if (const auto keys = vcr::zarr::awsCredentials()) {
+                    auth.access_key = keys->user;
+                    auth.secret_key = keys->secret;
+                    auth.session_token = keys->token;
+                    auth.region = keys->region.empty() ? spec.awsRegion : keys->region;
+                }
+            }
+            if (auth.empty())
+                throw;
+            opened = openLevels(auth);
+        }
+    }
+    auto& [allLevels, readMetadata] = opened;
+    if (allLevels.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
+    if (spec.baseScaleLevel > 0)
+        validateWorkingLevel(allLevels, spec.baseScaleLevel, remoteUrl);
+    const auto dtype = allLevels.front().meta.dtype;
+    auto shapes = levelShapes(allLevels, remoteUrl);
+    // A working level's voxels are its level 0: drop the finer physical levels.
+    shapes.erase(shapes.begin(), shapes.begin() + spec.baseScaleLevel);
 
     int firstPresentLevel = -1;
-    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
-        const auto& shape = opened.shapes[level];
+    for (std::size_t level = 0; level < shapes.size(); ++level) {
+        const auto& shape = shapes[level];
         if (shape[0] != 0 || shape[1] != 0 || shape[2] != 0) {
             firstPresentLevel = static_cast<int>(level);
             break;
@@ -447,13 +502,10 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->baseScaleLevel_ = spec.baseScaleLevel;
     vol->remoteAuth_ = auth;
     vol->remoteCacheRoot_ = vc::settings::remoteCachePath();
-    vol->remoteNumScales_ = opened.shapes.size();
-    vol->zarrLevelShapes_ = opened.shapes;
-    vol->zarrLevelChunkShapes_ = opened.chunkShapes;
-    vol->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
-    vol->zarrDtype_ = opened.dtype;
-    vol->zarrFillValue_ = opened.fillValue;
-    const auto& firstShape = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
+    vol->remoteNumScales_ = shapes.size();
+    vol->zarrLevelShapes_ = shapes;
+    vol->zarrDtype_ = dtype;
+    const auto& firstShape = shapes[static_cast<std::size_t>(firstPresentLevel)];
     const size_t firstScale = spec.baseScaleLevel > 0 ? 1 : size_t{1} << firstPresentLevel;
     vol->_slices = static_cast<int>(static_cast<size_t>(firstShape[0]) * firstScale);
     vol->_height = static_cast<int>(static_cast<size_t>(firstShape[1]) * firstScale);
@@ -473,7 +525,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(vol->sourceLocation(), readMetadata)) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
@@ -492,14 +544,12 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // Preserve the historical source cache name before project metadata can
     // replace the annotation UUID (for example, with an open-data catalog ID).
     // Upstream metadata UUIDs still name their existing caches; otherwise the
-    // name remains URL-derived. A working level keeps its own cache namespace
-    // (its chunk levels are renumbered), but not its own volume ID.
-    vol->remoteCacheId_ = vol->id();
-    vol->remoteSourceCacheId_ = vol->remoteCacheId_;
-    if (spec.baseScaleLevel > 0) {
-        vol->remoteCacheId_ = deriveRebasedRemoteCacheId(
-            vol->remoteCacheId_, remoteUrl, spec.baseScaleLevel);
-    }
+    // name remains URL-derived. Every working level shares the physical pyramid's
+    // cache. vc_reader caches a remote volume only under an existing directory.
+    vol->remoteSourceCacheId_ = vol->id();
+    if (!vol->remoteCacheRoot_.empty())
+        vcr::zarr::createVc3dVolumeDir(vol->remoteCacheRoot_ / vol->remoteSourceCacheId_,
+                                       vc::settings::remoteCacheDelta3dEnabled());
 
     if (metadata.is_object()) {
         if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
@@ -539,17 +589,7 @@ std::string Volume::sourceLocation() const
 {
     if (!isRemote_)
         return path_.string();
-    if (remoteAuth_.empty())
-        return remoteUrl_;
-    // Signed requests name the bucket: https://BUCKET.s3[.REGION].amazonaws.com/KEY.
-    const auto scheme = remoteUrl_.find("://");
-    const std::string rest = scheme == std::string::npos ? remoteUrl_ : remoteUrl_.substr(scheme + 3);
-    const auto slash = rest.find('/');
-    const std::string host = rest.substr(0, slash);
-    const auto s3 = host.find(".s3.");
-    if (s3 == std::string::npos || host.find(".amazonaws.com") == std::string::npos)
-        throw std::runtime_error("signed requests need an S3 virtual-host URL: " + remoteUrl_);
-    return "s3://" + host.substr(0, s3) + (slash == std::string::npos ? std::string() : rest.substr(slash));
+    return remoteAuth_.empty() ? remoteUrl_ : signedS3Location(remoteUrl_);
 }
 
 vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
@@ -561,8 +601,16 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
         options.access = vcr::zarr::s3Access(sourceLocation(),
             vcr::Auth{"s3", remoteAuth_.access_key, remoteAuth_.secret_key,
                       remoteAuth_.session_token, remoteAuth_.region});
-    if (!remoteCacheRoot_.empty())
+    options.metadata = cachedMetadataReader(options.access);
+    if (!remoteCacheRoot_.empty()) {
         options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;
+        options.cacheMaxBytes = vc::settings::remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
+        options.cacheMinFreeBytes = vc::settings::remoteCacheMinFreeBytes();
+    }
+    if (const auto parallelism = vc::settings::remoteDownloadParallelism()) {
+        options.connections = *parallelism;
+        options.threads = static_cast<std::size_t>(*parallelism);
+    }
     return options;
 }
 
@@ -570,7 +618,7 @@ std::filesystem::path Volume::remotePersistentCachePath() const
 {
     if (!isRemote_ || remoteCacheRoot_.empty())
         return {};
-    return remoteCacheRoot_ / remoteCacheId_;
+    return remoteCacheRoot_ / remoteSourceCacheId_;
 }
 
 int Volume::sliceWidth() const noexcept { return _width; }
@@ -596,46 +644,6 @@ std::array<int, 3> Volume::shape(int level) const
     throw std::out_of_range("Volume::shape level out of range");
 }
 
-std::array<int, 3> Volume::levelShape(int level) const
-{
-    return shape(level);
-}
-
-std::array<int, 3> Volume::chunkShape(int level) const
-{
-    if (level < 0) {
-        throw std::out_of_range("Volume::chunkShape level must be non-negative");
-    }
-    const auto index = static_cast<std::size_t>(level);
-    if (index >= zarrLevelChunkShapes_.size() || !hasScaleLevel(level)) {
-        throw std::out_of_range("Volume::chunkShape requested missing zarr scale level " + std::to_string(level));
-    }
-    const auto chunkShapeZYX = zarrLevelChunkShapes_[index];
-    if (chunkShapeZYX[0] <= 0 || chunkShapeZYX[1] <= 0 || chunkShapeZYX[2] <= 0) {
-        throw std::runtime_error("Volume::chunkShape encountered invalid zarr chunk shape");
-    }
-    return chunkShapeZYX;
-}
-
-std::array<int, 3> Volume::chunkGridShape(int level) const
-{
-    const auto levelShapeZYX = shape(level);
-    const auto chunkShapeZYX = chunkShape(level);
-    return {
-        (levelShapeZYX[0] + chunkShapeZYX[0] - 1) / chunkShapeZYX[0],
-        (levelShapeZYX[1] + chunkShapeZYX[1] - 1) / chunkShapeZYX[1],
-        (levelShapeZYX[2] + chunkShapeZYX[2] - 1) / chunkShapeZYX[2],
-    };
-}
-
-size_t Volume::chunkCount(int level) const
-{
-    const auto grid = chunkGridShape(level);
-    return static_cast<size_t>(grid[0]) *
-           static_cast<size_t>(grid[1]) *
-           static_cast<size_t>(grid[2]);
-}
-
 std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
@@ -644,17 +652,6 @@ double Volume::voxelSize() const
     // than throw from deep inside whatever asked for it.
     const double value = vc::json::number_or(metadata_, "voxelsize", 0.0);
     return std::isfinite(value) && value > 0.0 ? value : 0.0;
-}
-
-size_t Volume::dtypeSize() const noexcept
-{
-    switch (zarrDtype_) {
-    case vc::render::ChunkDtype::UInt8:
-        return 1;
-    case vc::render::ChunkDtype::UInt16:
-        return 2;
-    }
-    return 1;
 }
 
 size_t Volume::numScales() const noexcept {
@@ -683,118 +680,3 @@ std::vector<int> Volume::presentScaleLevels() const
     }
     return levels;
 }
-
-int Volume::firstPresentScaleLevel() const
-{
-    for (std::size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
-        if (hasScaleLevel(static_cast<int>(level)))
-            return static_cast<int>(level);
-    }
-    throw std::runtime_error("Volume has no present zarr scale levels");
-}
-
-int Volume::finestPresentScaleLevelAtOrBelow(int level) const
-{
-    if (level < 0)
-        throw std::out_of_range("scale level must be non-negative");
-    for (int candidate = level - 1; candidate >= 0; --candidate) {
-        if (hasScaleLevel(candidate))
-            return candidate;
-    }
-    throw std::out_of_range("no finer present zarr scale level available for virtual downsample");
-}
-
-// ============================================================================
-// Cache management
-// ============================================================================
-
-vc::render::IChunkedArray* Volume::chunkedCache()
-{
-    return sharedChunkCache().get();
-}
-
-std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (!chunkedCache_) {
-        vc::render::ChunkCache::Options options;
-        chunkedCache_ = createChunkCacheConfigured(std::move(options));
-        if (!chunkedCache_) {
-            throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
-        }
-    }
-    return chunkedCache_;
-}
-
-std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
-    vc::render::ChunkCache::Options options) const
-{
-    if (isRemote_ && !remoteCacheRoot_.empty())
-        options.persistentCachePath = remotePersistentCachePath();
-    if (options.persistentCachePath &&
-        vc::render::PersistentZarrCacheBudget::findForPath(*options.persistentCachePath)) {
-        options.persistentCacheBudgetRoot = remoteCacheRoot_;
-    }
-
-    vc::render::OpenedChunkedZarr opened;
-    if (isRemote_) {
-        opened = baseScaleLevel_ > 0
-            ? vc::render::openHttpZarrPyramid(
-                  remoteUrl_, remoteAuth_, baseScaleLevel_)
-            : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_);
-    } else {
-        opened = vc::render::openLocalZarrPyramid(path_);
-    }
-
-    if (opened.fetchers.empty()) {
-        return nullptr;
-    }
-
-    options.zarrMirrorMetadata = std::move(opened.zarrMirrorMetadata);
-    auto levels = makeChunkCacheLevelInfo(opened);
-    return vc::render::processChunkCacheService()->acquireSource(
-        chunkCacheSourceIdentity(), std::move(levels),
-        std::move(opened.fetchers), opened.fillValue, opened.dtype,
-        std::move(options));
-}
-
-std::string Volume::chunkCacheSourceIdentity() const
-{
-    if (isRemote_) {
-        const auto normalized = vc::core::util::remoteFileCacheSource(
-            vc::core::util::normalizeRemoteFileLocation(remoteUrl_));
-        std::string identity = "remote|" + normalized +
-            "|base=" + std::to_string(baseScaleLevel_);
-        auto persistentPath = remotePersistentCachePath();
-        if (!persistentPath.empty()) {
-            std::error_code ec;
-            const auto absolute = std::filesystem::absolute(persistentPath, ec);
-            if (!ec)
-                persistentPath = absolute;
-            identity += "|cache=" +
-                persistentPath.lexically_normal().generic_string();
-        }
-        return identity;
-    }
-    std::error_code ec;
-    auto sourcePath = std::filesystem::weakly_canonical(path_, ec);
-    if (ec)
-        sourcePath = std::filesystem::absolute(path_, ec);
-    if (ec)
-        sourcePath = path_;
-    return "local|" + sourcePath.lexically_normal().string() +
-           "|base=" + std::to_string(baseScaleLevel_);
-}
-
-void Volume::invalidateCache()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (chunkedCache_) {
-        chunkedCache_->invalidate();
-    } else {
-        vc::render::processChunkCacheService()->invalidateSource(
-            chunkCacheSourceIdentity());
-    }
-    chunkedCache_.reset();
-}
-

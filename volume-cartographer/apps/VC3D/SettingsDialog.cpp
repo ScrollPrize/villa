@@ -1,8 +1,6 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -180,22 +178,9 @@ void SettingsDialog::accept()
         perf::REMOTE_DOWNLOAD_AUTOMATIC, automaticDownloads);
     settings.setValue(
         perf::REMOTE_DOWNLOAD_PARALLELISM, downloadParallelism);
-    vc::render::processChunkCacheService()->configureFetchConcurrency(
-        automaticDownloads
-            ? static_cast<std::size_t>(perf::REMOTE_DOWNLOAD_WORKER_CAPACITY)
-            : static_cast<std::size_t>(downloadParallelism),
-        automaticDownloads);
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
     settings.sync();
-    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
-    vc::render::PersistentZarrCacheBudget::Limits limits;
-    if (spinRemoteCacheMaximumGiB->value() > 0)
-        limits.maximumBytes = static_cast<std::uint64_t>(spinRemoteCacheMaximumGiB->value()) * gib;
-    limits.minimumFreeBytes =
-        static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
-    vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
-
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
     QDialog::accept();
