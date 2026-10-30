@@ -32,8 +32,8 @@ struct Evaluator {
     std::unique_ptr<ceres::CostFunction> autodiff;
     Evaluator(const vc::core::util::NormalGridVolume& volume, double wn,
               double ws, bool invert, bool ad) {
-        if (ad) autodiff.reset(N::Create(volume, 0, wn, ws, nullptr, false, -1, -1, invert));
-        else direct = std::make_unique<N>(volume, 0, wn, ws, nullptr, false, -1, -1, invert);
+        if (ad) autodiff.reset(N::Create(volume, 0, wn, ws, false, -1, -1, invert));
+        else direct = std::make_unique<N>(volume, 0, wn, ws, false, -1, -1, invert);
     }
     Values operator()(const Quad& q) {
         const Quad before = q;
