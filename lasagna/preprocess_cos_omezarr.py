@@ -1607,7 +1607,7 @@ def run_preprocess_3d(
 			f"  base crop={crop_xyzwhd} → input crop={crop_input} (input_sd={input_sd})"
 		)
 
-	resolved_devices = resolve_inference_devices(device=device, devices=devices)
+	resolved_devices = resolve_inference_devices(device=device, devices=devices, auto_mps=True)
 	torch_device = resolved_devices[0]
 
 	print(
