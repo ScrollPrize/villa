@@ -828,7 +828,13 @@ class ZarrDataset(Dataset):
         patch = self._patches[index]
         vol = self._volumes[patch.volume_index]
         size = patch.patch_size
-        slices = tuple(slice(p, p + s) for p, s in zip(patch.position, size))
+        # Packed samples must be isolated before patch-local normalization.
+        # Post-normalization masking cannot remove a neighbor's statistics.
+        slices = tuple(
+            slice(p, min(p + s, patch.safe_boundary[axis])
+                  if patch.safe_boundary is not None else p + s)
+            for axis, (p, s) in enumerate(zip(patch.position, size))
+        )
         pad_or_crop = pad_or_crop_2d if self.is_2d else pad_or_crop_3d
 
         def mask_neighbor_intrusion(data: np.ndarray) -> np.ndarray:
