@@ -179,10 +179,25 @@ def test_beam_cancel_waiting_for_publication(inputs):
         client.cancel("close")
 
 
+# Valid annotation metadata, not a second implementation of selection.
+span_config = dict(step_voxels=1, cone_angle_degrees=30, cone_angle_step_degrees=5,
+    cone_grid_size=3, beam_width=1, beam_prune_distance_voxels=1, beam_lookahead_steps=0,
+    smoothness_weight=0, smoothness_normal_weight=0, smoothness_tangent_weight=0,
+    smoothness_free_angle_degrees=0, cumulative_smoothness_steps=0,
+    cumulative_smoothness_tangent_weight=0, initial_free_angle_degrees=0,
+    max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20)
+def span_metadata(mode):
+    return dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
+        interp_goal=mode, interp_mode=mode, metric=None, msg="", normal_manifest="", fiber_manifest="",
+        trace_to_base_scale=1, meeting_error_base_voxels=None, meeting_error_ratio=None,
+        meeting_source="", failure_code="", failure_detail="", lasagna_failure_code="",
+        lasagna_failure_detail="", config=span_config)
+
+
 def test_reference_selection_preserves_spans_and_direction(inputs):
-    annotation = dict(type="vc3d_fiber", version=1, optimization_mode="native_fiber_trace3d",
+    annotation = dict(uuid="00000000-0000-4000-8000-000000000001", type="vc3d_fiber", version=4, optimization_mode="native_fiber_trace3d",
                       line_points=[[0, 16, 16], [16, 16, 16], [100, 16, 16], [220, 16, 16], [240, 16, 16]],
-                      control_points=[[16, 16, 16], [220, 16, 16]])
+                      control_points=[dict(position=[16, 16, 16], segment_to_next=span_metadata("cspline")), dict(position=[220, 16, 16])])
     cases, plan = evaluation.reference_cases(annotation, "a")
     assert len(cases) == 2
     assert plan["eligible_length_base_voxels"] == 204
@@ -197,32 +212,19 @@ def test_reference_selection_preserves_spans_and_direction(inputs):
     result = evaluation.evaluate(cfg, base_directory=inputs)
     assert [r["id"] for r in result["cases"]] == ["a/run0/reverse"]
     assert result["reference_selection"][0]["sha256"]
-    annotation["optimization_mode"] = "lasagna"
+    annotation["control_points"][0]["segment_to_next"] = span_metadata("lasagna")
     assert evaluation.reference_cases(annotation, "a")[0] == []
-    annotation["control_points"][0][0] += .01
+    annotation["control_points"][0]["position"][0] += .01
     with pytest.raises(RuntimeError, match="exact line point"):
         evaluation.reference_cases(annotation, "a")
 
 
 def test_reference_selection_splits_at_lasagna_spans():
-    # Valid annotation metadata, not a second implementation of selection.
-    config = dict(step_voxels=1, cone_angle_degrees=30, cone_angle_step_degrees=5,
-        cone_grid_size=3, beam_width=1, beam_prune_distance_voxels=1, beam_lookahead_steps=0,
-        smoothness_weight=0, smoothness_normal_weight=0, smoothness_tangent_weight=0,
-        smoothness_free_angle_degrees=0, cumulative_smoothness_steps=0,
-        cumulative_smoothness_tangent_weight=0, initial_free_angle_degrees=0,
-        max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20)
-    def metadata(mode):
-        return dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
-            interp_goal=mode, interp_mode=mode, metric=None, msg="", normal_manifest="", fiber_manifest="",
-            trace_to_base_scale=1, meeting_error_base_voxels=None, meeting_error_ratio=None,
-            meeting_source="", failure_code="", failure_detail="", lasagna_failure_code="",
-            lasagna_failure_detail="", config=config)
     points = [[i * 10, 0, 0] for i in range(6)]
-    controls = [dict(position=p, segment_to_next=metadata(mode))
+    controls = [dict(position=p, segment_to_next=span_metadata(mode))
                 for p, mode in zip(points[1:4], ["cspline", "lasagna", "cspline"])]
     controls.append(dict(position=points[4]))
-    annotation = dict(type="vc3d_fiber", version=3, optimization_mode="native_fiber_trace3d",
+    annotation = dict(uuid="00000000-0000-4000-8000-000000000001", type="vc3d_fiber", version=4, optimization_mode="native_fiber_trace3d",
                       line_points=points, control_points=controls)
     cases, plan = evaluation.reference_cases(annotation, "mixed")
     assert len(cases) == 4

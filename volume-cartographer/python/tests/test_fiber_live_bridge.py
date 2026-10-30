@@ -265,7 +265,7 @@ def test_queued_publication_failure_cancels_siblings(inputs):
 
 
 def test_cached_paris4_live_replay(tmp_path):
-    from test_fiber_chunk_trace import test_real_paris4_chunk_replay
+    from test_fiber_chunk_trace import test_real_data_chunk_replay
     if not os.environ.get("VC_TEST_WIDTH_MANIFEST"):
         pytest.skip("set cached Paris4 fixture paths")
     original = ft.open_prediction_field
@@ -277,6 +277,6 @@ def test_cached_paris4_live_replay(tmp_path):
             return field
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr(ft, "open_prediction_field", opened)
-            test_real_paris4_chunk_replay(tmp_path)
+            test_real_data_chunk_replay(tmp_path)
         assert server.requests
         client.cancel()
