@@ -2440,6 +2440,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
 
 
+    constexpr int grid_margin_each_side = 25;
     int w, h;
     if (resume_surf) {
         cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
@@ -2467,7 +2468,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         const int grow_max_extra_rows = std::max(grow_extra_rows, params.value("grow_max_extra_rows", gen_diff));
         const int extra_cols = disable_grid_expansion ? grow_extra_cols : grow_max_extra_cols;
         const int extra_rows = disable_grid_expansion ? grow_extra_rows : grow_max_extra_rows;
-        constexpr int grid_margin_each_side = 25;
         w = resume_generations.cols + 2 * extra_cols + 2 * grid_margin_each_side;
         h = resume_generations.rows + 2 * extra_rows + 2 * grid_margin_each_side;
         std::cout << "GrowPatch work grid " << w << "x" << h
@@ -2484,6 +2484,10 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     }
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w,h);
+    // The extra margin is optimization context, not requested resume growth.
+    const cv::Rect resume_growth_bounds(grid_margin_each_side, grid_margin_each_side,
+                                        w - 2 * grid_margin_each_side,
+                                        h - 2 * grid_margin_each_side);
 
     int x0 = w/2;
     int y0 = h/2;
@@ -3492,6 +3496,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         auto append_candidate = [&](const cv::Vec2i& p) {
             if (!bounds.contains(cv::Point(p[1], p[0])) ||
+                (resume_surf && !resume_growth_bounds.contains(cv::Point(p[1], p[0]))) ||
                 (trace_params.state(p) & STATE_PROCESSING) != 0 ||
                 (trace_params.state(p) & STATE_LOC_VALID) != 0) {
                 return;
