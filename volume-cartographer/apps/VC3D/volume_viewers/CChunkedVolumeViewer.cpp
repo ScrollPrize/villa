@@ -470,6 +470,25 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setRenderHint(QPainter::Antialiasing, false);
     _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+    // The measurement overlays (histogram, profile, grid, loupe) read volume positions
+    // through these; the grid only draws on planes, where the mapping is affine.
+    _view->setVolumeMapping({
+        .sceneToVolume = [this](const QPointF& scenePoint) {
+            if (!currentSurface()) {
+                const float nan = std::numeric_limits<float>::quiet_NaN();
+                return cv::Vec3f(nan, nan, nan);
+            }
+            return sceneToVolume(scenePoint);
+        },
+        .planar = [this] { return dynamic_cast<PlaneSurface*>(currentSurface()) != nullptr; },
+        .extent = [this]() -> std::optional<cv::Vec3d> {
+            if (!_volume) {
+                return std::nullopt;
+            }
+            const auto xyz = _volume->shapeXyz();
+            return cv::Vec3d(xyz[0], xyz[1], xyz[2]);
+        },
+    });
 
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CChunkedVolumeViewer::onZoom);

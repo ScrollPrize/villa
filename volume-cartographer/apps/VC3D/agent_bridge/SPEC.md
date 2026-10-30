@@ -323,6 +323,11 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 - Viewer-manager settings remain meaningful with zero viewers. Per-viewer
   toggles are broadcast to every live base viewer and their persisted defaults
   are updated where applicable.
+- `viewer.set_hud` switches the measurement overlays for every viewer, like
+  View > Measurement Overlays, whose items follow it. A `profileLine` is given in fractions
+  of the target viewer's viewport, turns profile mode on and is read from the
+  rendered frame, so the values are display gray levels after the volume
+  window. The grid draws only on plane views.
 - Overlay updates are atomic. A clear request removes the overlay; explicit
   volumes must resolve in the open package. Intersection sets always include
   the segmentation surface and are not applied to the segmentation viewer
@@ -492,6 +497,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_select_volume` | `volume.select` |
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
+| `vc3d_set_hud` | `viewer.set_hud` | Turn the slice viewers' measurement overlays (histogram, line profile, coordinate grid, loupe) on or off; with a profile line, returns the gray values, peaks and length along it. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines viewers draw; stored surfaces (UUIDs) are drawn on every plane viewer. |
 | `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |

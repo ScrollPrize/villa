@@ -208,6 +208,27 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     }
     connect(_mirrorCursorAct, &QAction::toggled, this, &MenuActionController::toggleCursorMirroring);
 
+    // Measurement overlays for the slice views, off by default each session.
+    const auto makeHudAction = [this](const QString& text, const QString& tip) {
+        auto* action = new QAction(text, this);
+        action->setCheckable(true);
+        action->setToolTip(tip);
+        connect(action, &QAction::toggled, this, &MenuActionController::applyMeasurementOverlays);
+        return action;
+    };
+    _hudHistogramAct = makeHudAction(
+        QObject::tr("Histogram"),
+        QObject::tr("Histogram of the gray values in each slice view, with 1st and 99th percentiles and the share clipped to black or white"));
+    _hudLineProfileAct = makeHudAction(
+        QObject::tr("Line Profile (drag in a slice view)"),
+        QObject::tr("A left drag draws a line and plots the gray values along it; peaks mark bright crossings such as papyrus layers. A click clears it."));
+    _hudGridAct = makeHudAction(
+        QObject::tr("Coordinate Grid"),
+        QObject::tr("Labeled lines at round volume coordinates on plane views"));
+    _hudLoupeAct = makeHudAction(
+        QObject::tr("Loupe"),
+        QObject::tr("Magnified pixels under the cursor, with the value and volume position"));
+
     _surfaceFromSelectionAct = new QAction(QObject::tr("Surface from Selection"), this);
     connect(_surfaceFromSelectionAct, &QAction::triggered, this, &MenuActionController::surfaceFromSelection);
 
@@ -273,6 +294,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu = new QMenu(QObject::tr("&View"), qWindow);
     qWindow->populateDockToggleMenu(_viewMenu);
     _viewMenu->addAction(_mirrorCursorAct);
+    _measurementMenu = _viewMenu->addMenu(QObject::tr("Measurement Overlays"));
+    _measurementMenu->setToolTipsVisible(true);
+    _measurementMenu->addAction(_hudHistogramAct);
+    _measurementMenu->addAction(_hudLineProfileAct);
+    _measurementMenu->addAction(_hudGridAct);
+    _measurementMenu->addAction(_hudLoupeAct);
     _viewMenu->addSeparator();
     _viewMenu->addAction(_resetViewsAct);
     _viewMenu->addSeparator();
@@ -304,6 +331,25 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     menuBar->addMenu(_actionsMenu);
     menuBar->addMenu(_selectionMenu);
     menuBar->addMenu(_helpMenu);
+
+    // Keep the menu in step when an agent or script changes the overlays.
+    if (_window->_viewerManager) {
+        connect(_window->_viewerManager.get(), &ViewerManager::hudOptionsChanged, this,
+                [this](const vc3d::hud::Options& options) {
+                    const std::pair<QAction*, bool> actions[] = {
+                        {_hudHistogramAct, options.histogram},
+                        {_hudLineProfileAct, options.lineProfile},
+                        {_hudGridAct, options.grid},
+                        {_hudLoupeAct, options.loupe},
+                    };
+                    for (const auto& [action, on] : actions) {
+                        if (action && action->isChecked() != on) {
+                            QSignalBlocker blocker(action);
+                            action->setChecked(on);
+                        }
+                    }
+                });
+    }
 
     refreshRecentMenu();
 }
@@ -1441,6 +1487,21 @@ void MenuActionController::toggleDrawBBox(bool enabled)
             }
         }
     });
+}
+
+void MenuActionController::applyMeasurementOverlays()
+{
+    vc3d::hud::Options options;
+    options.histogram = _hudHistogramAct && _hudHistogramAct->isChecked();
+    options.lineProfile = _hudLineProfileAct && _hudLineProfileAct->isChecked();
+    options.grid = _hudGridAct && _hudGridAct->isChecked();
+    options.loupe = _hudLoupeAct && _hudLoupeAct->isChecked();
+    for (auto* manager : ViewerManager::allManagers()) {
+        if (manager) {
+            options.gridStep = manager->hudOptions().gridStep;
+            manager->setHudOptions(options);
+        }
+    }
 }
 
 void MenuActionController::toggleCursorMirroring(bool enabled)

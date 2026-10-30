@@ -34,6 +34,13 @@ class _Window(TypedDict):
     high: float
 
 
+class _ProfileLine(TypedDict):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
 class _OverlayComposite(TypedDict, total=False):
     enabled: bool
     method: Literal["max", "mean", "min"]
@@ -275,6 +282,53 @@ async def vc3d_set_render_settings(
                 "normalMaxArrows": normal_max_arrows,
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
                 "zScrollSensitivity": z_scroll_sensitivity,
+            }
+        ),
+    )
+
+
+@mcp.tool()
+async def vc3d_set_hud(
+    viewer: Optional[str] = None,
+    histogram: Optional[bool] = None,
+    line_profile: Optional[bool] = None,
+    grid: Optional[bool] = None,
+    loupe: Optional[bool] = None,
+    grid_step: Optional[float] = None,
+    profile_line: Optional[_ProfileLine] = None,
+    clear_profile: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Turn the slice viewers' measurement overlays on or off, and measure
+    gray values along a line. Same as View > Measurement Overlays; every
+    argument is optional and omitted ones are left unchanged.
+
+    histogram: histogram of the gray values on screen, with the 1st/99th
+    percentiles and the share clipped to black or white.
+    line_profile: profile mode (a left drag in a slice view draws the line).
+    grid: labeled lines at round volume coordinates on plane views;
+    grid_step sets their spacing in voxels (0 picks one from the zoom).
+    loupe: magnifier that follows the mouse.
+    profile_line: {"x1", "y1", "x2", "y2"} in fractions (0..1) of `viewer`'s
+    viewport; draws the line, turns profile mode on and returns the profile.
+    clear_profile: remove `viewer`'s line.
+
+    Returns {"hud": {...current switches}} and, with profile_line,
+    "viewer" and "profile": {"samples", "values" (gray 0..255 per pixel of
+    length, null outside the volume), "peaks" (fractions along the line where
+    a bright crossing such as a papyrus layer peaks), "length",
+    "lengthUnit" ("um" or "vx"), "min", "max", "mean"}."""
+    return await _call(
+        "viewer.set_hud",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "histogram": histogram,
+                "lineProfile": line_profile,
+                "grid": grid,
+                "loupe": loupe,
+                "gridStep": grid_step,
+                "profileLine": profile_line,
+                "clearProfile": clear_profile,
             }
         ),
     )

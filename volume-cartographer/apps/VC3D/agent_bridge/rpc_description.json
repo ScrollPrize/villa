@@ -2851,6 +2851,74 @@
         "type": "object"
       }
     },
+    "viewer.set_hud": {
+      "errors": [
+        -32602,
+        -32010,
+        -32002
+      ],
+      "mcp": {
+        "paramRenames": {
+          "clearProfile": "clear_profile",
+          "gridStep": "grid_step",
+          "lineProfile": "line_profile",
+          "profileLine": "profile_line"
+        },
+        "tool": "vc3d_set_hud"
+      },
+      "params": {
+        "properties": {
+          "clearProfile": {
+            "type": "boolean"
+          },
+          "grid": {
+            "type": "boolean"
+          },
+          "gridStep": {
+            "type": "number"
+          },
+          "histogram": {
+            "type": "boolean"
+          },
+          "lineProfile": {
+            "type": "boolean"
+          },
+          "loupe": {
+            "type": "boolean"
+          },
+          "profileLine": {
+            "properties": {
+              "x1": {
+                "type": "number"
+              },
+              "x2": {
+                "type": "number"
+              },
+              "y1": {
+                "type": "number"
+              },
+              "y2": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x1",
+              "y1",
+              "x2",
+              "y2"
+            ],
+            "type": "object"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
     "viewer.set_intersects": {
       "errors": [
         -32602,
