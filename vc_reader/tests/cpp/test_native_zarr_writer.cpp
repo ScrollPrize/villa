@@ -1,6 +1,7 @@
 // Native Zarr writes: every codec round-trips through the reader, empty chunks are
 // skipped, regions are read-modified-written, and attributes and metadata are kept.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/native/rounding.hpp"
 
 #include <algorithm>
 #include <barrier>
@@ -380,6 +381,104 @@ void concurrentShards(const fs::path& root)
                 chunk == std::vector<uint8_t>(8, uint8_t(1 + t + 8 * 19)), "concurrent distinct chunks retain every update");
     }
 }
+void pyramids(const fs::path& root)
+{
+    // A 2x2x1-style pyramid (Z kept) of an odd-shaped volume spanning output chunks.
+    const auto dir = root / "pyramid";
+    vcr::zarr::CreateOptions create;
+    create.shape = {2, 7, 9};
+    create.chunks = {2, 4, 4};
+    create.compressor = "zstd";
+    auto level0 = vcr::zarr::Writer::create(dir / "0", create);
+    std::vector<std::uint8_t> voxels(2 * 7 * 9);
+    for (std::size_t i = 0; i < voxels.size(); ++i)
+        voxels[i] = std::uint8_t(i * 3);
+    level0.writeRegion({0, 0, 0}, {2, 7, 9}, voxels.data());
+    vcr::zarr::PyramidOptions options;
+    options.levels = 2;
+    options.factors = {1, 2, 2};
+    vcr::zarr::createPyramidLevels(dir, create, options);
+    require(vcr::zarr::Writer::open(dir / "1").meta().shape == vcr::Index({2, 4, 5}), "level 1 shape rounds up");
+    require(vcr::zarr::Writer::open(dir / "2").meta().chunks == vcr::Index({2, 2, 3}), "chunks capped to the level");
+    require(vcr::zarr::Writer::open(dir / "1").meta().codec() == level0.meta().codec(), "levels keep the codec");
+
+    // Two disjoint chunk ranges write what one call would.
+    vcr::zarr::writePyramidLevel(dir, 1, options, vcr::zarr::ChunkRange{{0, 0, 0}, {1, 1, 99}});
+    vcr::zarr::writePyramidLevel(dir, 1, options, vcr::zarr::ChunkRange{{0, 1, 0}, {1, 99, 99}});
+    vcr::zarr::writePyramidLevel(dir, 2, options);
+    const auto at = [&](int z, int y, int x) { return int(voxels[std::size_t((z * 7 + y) * 9 + x)]); };
+    const auto mean = [](int sum, int count) { return int(vcr::divide_round_half_even(std::uint64_t(sum), std::uint64_t(count))); };
+    auto level1 = vcr::zarr::Writer::open(dir / "1");
+    const auto one = read(level1.reader(), {0, 0, 0}, {2, 4, 5}, 1);
+    for (int z = 0; z < 2; ++z)
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 5; ++x) {
+                int sum = 0, count = 0;
+                for (int j = 2 * y; j < std::min(2 * y + 2, 7); ++j)
+                    for (int i = 2 * x; i < std::min(2 * x + 2, 9); ++i) {
+                        sum += at(z, j, i);
+                        ++count;
+                    }
+                require(one[std::size_t((z * 4 + y) * 5 + x)] == mean(sum, count), "block mean, clipped at the edge");
+            }
+    require(vcr::divide_round_half_even(5, 2) == 2 && vcr::divide_round_half_even(7, 2) == 4 &&
+                vcr::divide_round_half_even(11, 4) == 3,
+            "integer means round to nearest, ties to even");
+    require([&] { auto l2 = vcr::zarr::Writer::open(dir / "2"); return read(l2.reader(), {0, 0, 0}, {1, 1, 1}, 1).size() == 1; }(), "level 2 written");
+
+    // Other dtypes, and chunks of pure fill are not stored.
+    for (const std::string dtype : {"<u2", "<f4"}) {
+        const auto other = root / ("pyramid" + dtype.substr(1));
+        vcr::zarr::CreateOptions c;
+        c.shape = {8, 8, 8};
+        c.chunks = {2, 2, 4};
+        c.dtype = dtype;
+        c.compressor = "";
+        auto base = vcr::zarr::Writer::create(other / "0", c);
+        vcr::zarr::PyramidOptions cubes;
+        cubes.levels = 1;
+        vcr::zarr::createPyramidLevels(other, c, cubes);
+        if (dtype == "<u2") {
+            const std::vector<std::uint16_t> values(16, 1000);
+            base.writeRegion({0, 0, 0}, {2, 2, 4}, reinterpret_cast<const std::uint8_t*>(values.data()));
+        } else {
+            const std::vector<float> values(16, 0.5f);
+            base.writeRegion({0, 0, 0}, {2, 2, 4}, reinterpret_cast<const std::uint8_t*>(values.data()));
+        }
+        vcr::zarr::writePyramidLevel(other, 1, cubes);
+        auto reduced = vcr::zarr::Writer::open(other / "1");
+        require(reduced.chunkExists({0, 0, 0}), "a chunk with data is stored");
+        const auto bytes = read(reduced.reader(), {0, 0, 0}, {1, 1, 1}, dtype == "<u2" ? 2 : 4);
+        if (dtype == "<u2") {
+            std::uint16_t value;
+            std::memcpy(&value, bytes.data(), 2);
+            require(value == 1000, "uint16 means");
+        } else {
+            float value;
+            std::memcpy(&value, bytes.data(), 4);
+            require(value == 0.5f, "float32 means");
+        }
+    }
+    {
+        auto reduced = vcr::zarr::Writer::open(root / "pyramidu2" / "1");
+        require(!reduced.chunkExists({1, 1, 0}) && !reduced.chunkExists({0, 1, 0}), "chunks of fill stay absent");
+    }
+
+    // Multiscales attributes: the reader places the levels where the means sit.
+    vcr::zarr::MultiscalesOptions ome;
+    ome.levels = 2;
+    ome.factors = {1, 2, 2};
+    ome.scale = {3.0, 0.5, 0.5};
+    ome.unit = "micrometer";
+    vcr::zarr::writeAttributes(dir, {{"multiscales", Json::array({vcr::zarr::omeMultiscales(ome)})}});
+    auto group = vcr::zarr::Group::open(dir.string(), {});
+    require(group.levels() == std::vector<std::string>({"0", "1", "2"}), "multiscales list the levels");
+    const auto placement = group.placement("2");
+    require(placement.scale[0] == 1 && placement.scale[1] == 4 && placement.offset[0] == 0 && placement.offset[1] == 1.5,
+            "a level 2 voxel covers 4 voxels in Y/X, centred on them, and keeps Z");
+    require(group.multiscales().at(0).at("axes").at(1).at("unit") == "micrometer", "axes carry the unit");
+}
+
 }  // namespace
 
 int main()
@@ -407,6 +506,7 @@ int main()
         mutableChunks(root / "sharded-mutable", 3, true);
         shardEditing(root);
         concurrentShards(root);
+        pyramids(root);
         std::cout << "every codec round-trips; skip-empty, regions, attributes and validation passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

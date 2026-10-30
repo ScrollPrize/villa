@@ -51,4 +51,11 @@ VCR_ROUNDING_HD double round_half_even(double v)
     return low + (fraction > .5 || (fraction == .5 && fmod(low, 2.) != 0));
 }
 
+// sum / count to the nearest integer, ties to even, in exact integer arithmetic.
+VCR_ROUNDING_HD std::uint64_t divide_round_half_even(std::uint64_t sum, std::uint64_t count)
+{
+    const std::uint64_t quotient = sum / count, twice = 2 * (sum % count);
+    return quotient + (twice > count || (twice == count && (quotient & 1)));
+}
+
 }  // namespace vcr

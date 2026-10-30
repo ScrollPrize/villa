@@ -345,4 +345,38 @@ private:
 Json readAttributes(const std::filesystem::path& node);
 void writeAttributes(const std::filesystem::path& node, const Json& attributes);
 
+// ---- writing pyramids -----------------------------------------------------------------
+
+// Numbered levels <root>/0, /1, ...: each level is the block mean of the level below,
+// reduced by `factors` (ZYX) per level.
+struct PyramidOptions {
+    int levels = 5;  // levels above level 0
+    std::array<int, 3> factors{2, 2, 2};
+    std::size_t threads = 0;  // output-chunk workers; 0: all cores
+};
+// Creates the arrays of levels 1..levels (metadata only) to go with a level 0 created
+// from `level0`: the same dtype, codec and chunks, chunks capped to each level's shape.
+void createPyramidLevels(const std::filesystem::path& root, const CreateOptions& level0, const PyramidOptions& options);
+// Output chunks [begin, end), clamped to the level's chunk grid.
+struct ChunkRange {
+    Index begin, end;
+};
+// Writes `level` from level - 1 on disk (uint8, uint16, float32). Chunks that come out
+// entirely fill are not stored. Separate processes may write disjoint ranges. Integer
+// means round to nearest, ties to even. `progress(done, total)` may run on any worker.
+void writePyramidLevel(const std::filesystem::path& root, int level, const PyramidOptions& options,
+                       const std::optional<ChunkRange>& range = std::nullopt,
+                       const std::function<void(std::size_t, std::size_t)>& progress = {});
+
+struct MultiscalesOptions {
+    std::string name = "image";
+    int levels = 5;  // levels above level 0
+    std::array<int, 3> factors{2, 2, 2};
+    std::array<double, 3> scale{1, 1, 1};  // level 0's voxel size per axis (ZYX); level factors without a unit
+    std::string unit;                      // axis unit of a physical scale; empty declares none
+};
+// One OME-NGFF 0.4 "multiscales" entry for such a pyramid, with each level's scale and
+// the translation that centres its voxels on the blocks they reduce.
+Json omeMultiscales(const MultiscalesOptions& options);
+
 }  // namespace vcr::zarr
