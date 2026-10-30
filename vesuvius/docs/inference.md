@@ -62,6 +62,8 @@ vesuvius.predict --model_path ... --num_parts 4 --part_id 1 --device cuda:0
 
 Each worker writes `logits_part_<id>.zarr` and `coordinates_part_<id>.zarr` into the output directory.
 
+For which GPU to rent, measured seconds per patch on five cards, and when splitting into more parts stops paying, see [Running villa on rented GPUs](cloud_gpu_guide.md).
+
 ### Region-of-interest inference
 
 `--bbox` restricts the sliding window to one region of the volume, given in **global voxel
