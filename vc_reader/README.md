@@ -15,6 +15,23 @@ training pipelines; its Zarr reader and transforms also work with your own data.
   transforms to 2D or 3D inputs while keeping images and labels aligned.
   `CudaLoader` adds GPU transforms and prefetching to a PyTorch DataLoader.
 
+
+### Volume metadata
+
+Opening a volume also gathers what is known about it, from the store's `meta.json` /
+`metadata.json` and the Open Data catalog, merged into one value per field (the store's
+own documents win). Remote stores do this on first open only; the result is kept in the
+disk cache.
+
+```python
+volume = ZarrReader.open(url, level=2, cache_dir=cache)
+volume.voxel_size        # micrometers per voxel of the opened level
+volume.voxel_size_zyx    # per axis, for non-cubic pyramids
+volume.metadata          # level-0 voxel_size_um, energy_kev, detector_distance_mm, beamline,
+                         # scan_name, acquisition_date, value_window, z_crop, sample_id,
+                         # volume_id, scan_id, name, created_at, data_format, documents
+```
+
 ## Quick start
 
 See [installation and notebook setup](examples/README.md#run). This example

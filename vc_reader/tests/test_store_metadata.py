@@ -4,10 +4,13 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
-from vc_reader.reader import ZarrReader, open_group
+from vc_reader import _catalog
+from vc_reader.reader import ZarrReader, open_group, store_metadata
+from vc_reader.reader.auth import Access
 
 
 def write_array(path: Path) -> None:
@@ -71,6 +74,77 @@ class StoreMetadataTests(unittest.TestCase):
             self.assertEqual(coarse.voxel_size_zyx, (2.0, 4.0, 4.0))
             self.assertIsNone(coarse.voxel_size)  # not cubic
             self.assertEqual(ZarrReader.open(store, level=1).voxel_size_zyx, (2.0, 4.0, 4.0))
+
+
+CATALOG = {"samples": {"S1": {"volumes": {"V1": {
+    "id": "V1", "scan_id": "SCAN1", "suffix": "V1-2.4um.zarr",
+    "properties": {"pixel_size_um": 2.4, "energy_keV": 70.0, "detector_distance_mm": 150.0},
+    "data": [{"type": "zarr", "origins": [{"path": "S1/volumes/v1.zarr", "access_roots": [
+        {"type": "https", "url": "https://bucket.example/", "usage": "public-read"}]}]}]}}}}}
+URL = "https://bucket.example/S1/volumes/v1.zarr"
+
+
+class CatalogMergeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(store_metadata._known.clear)
+        store_metadata._known.clear()
+        self.reads, self.catalogs = [], []
+        self.documents = {}
+
+        def read_node_file(location, name, access):
+            self.reads.append(name)
+            text = self.documents.get(name)
+            return None if text is None else text.encode()
+
+        def catalog_entry(location, offline):
+            self.catalogs.append(location)
+            return _catalog.parse(json.dumps(CATALOG)).volume_at(location), True
+
+        for name, value in (("read_node_file", read_node_file), ("_catalog_entry", catalog_entry)):
+            patcher = mock.patch.object(store_metadata, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.spec = {"cache_dirs": [self.tmp.name], "cache_writes": True, "offline": False}
+
+    def read(self):
+        return store_metadata.read_store_metadata(URL, Access("anonymous"), self.spec)
+
+    def test_both_sources_merge_and_the_store_wins(self):
+        self.documents["metadata.json"] = json.dumps({"tomo": {"acquisition": {
+            "energy": 78.0, "beamline": "bm18", "detector": {"samplePixelSize": 0.002399}}}})
+        metadata = self.read()
+        self.assertAlmostEqual(metadata.voxel_size_um, 2.399)  # the store's own
+        self.assertEqual(metadata.energy_kev, 78.0)
+        self.assertEqual(metadata.detector_distance_mm, 150.0)  # only the catalog has it
+        self.assertEqual(metadata.beamline, "bm18")
+        self.assertEqual((metadata.sample_id, metadata.volume_id, metadata.scan_id), ("S1", "V1", "SCAN1"))
+        self.assertEqual(sorted(metadata.documents), ["catalog", "metadata.json"])
+
+    def test_catalog_fills_a_store_that_says_nothing(self):
+        self.assertEqual(self.read().voxel_size_um, 2.4)
+
+    def test_sources_are_consulted_only_the_first_time(self):
+        first = self.read()
+        self.assertEqual(len(self.catalogs), 1)
+        reads = len(self.reads)
+        self.assertEqual(self.read(), first)  # this process
+        store_metadata._known.clear()
+        self.assertEqual(self.read(), first)  # a later process: the disk cache
+        self.assertEqual(len(self.catalogs), 1)
+        self.assertEqual(len(self.reads), reads)
+
+    def test_without_a_disk_cache_the_process_remembers(self):
+        self.spec = {"cache_dirs": [], "cache_writes": True, "offline": False}
+        self.read()
+        self.read()
+        self.assertEqual(len(self.catalogs), 1)
+
+    def test_an_unreachable_catalog_is_tried_again(self):
+        with mock.patch.object(store_metadata, "_catalog_entry", lambda location, offline: (None, False)):
+            self.assertIsNone(self.read().voxel_size_um)
+        self.assertEqual(self.read().voxel_size_um, 2.4)
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ _INHERITED: list[Any] = []
 
 
 from .transport import read_node_file, cache_url
-from .store_metadata import StoreMetadata, level_scale, read_group_attrs, read_store_metadata
+from .store_metadata import StoreMetadata, level_scale, read_store_metadata
 
 
 def _read_zarray(location: str, access: Access) -> ArrayMeta:
@@ -234,9 +234,9 @@ class ZarrReader:
         reader = cls(spec, cache)
         settings = reader._spec
         store = settings["group"] or reader.location
-        settings["store_metadata"] = read_store_metadata(store, reader.access, settings)
+        metadata = settings["store_metadata"] = read_store_metadata(store, reader.access, settings)
         if settings["group"]:
-            settings["level_scale"] = level_scale(read_group_attrs(store, reader.access, settings), settings["level_key"])
+            settings["level_scale"] = level_scale(metadata.documents.get(".zattrs", {}), settings["level_key"])
         return reader
 
     def __getstate__(self):

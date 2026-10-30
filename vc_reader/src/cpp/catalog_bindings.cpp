@@ -1,3 +1,4 @@
+#include <cmath>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -94,6 +95,21 @@ NB_MODULE(_catalog,m) {
         .def_prop_ro("properties",[](const OpenDataModel& v){return pyJson(v.properties);});metadata(model);
     auto catalog=nb::class_<OpenDataManifest>(m,"Catalog");
     catalog.def_ro("samples",&OpenDataManifest::samples).def_ro("models",&OpenDataManifest::models)
+        .def("volume_at",[](const OpenDataManifest& c,const std::string& url)->nb::object {
+            const auto view=c.volumeAt(resolveOpenDataUrl(url));
+            if(!view)return nb::none();
+            const auto* sample=c.findSample(view->sampleId);
+            const auto* volume=sample?sample->findVolume(view->volumeId):nullptr;
+            if(!volume)return nb::none();
+            nlohmann::json out{{"sample_id",view->sampleId},{"volume_id",view->volumeId},{"scan_id",volume->scanId},
+                {"name",volume->suffix},{"created_at",volume->createdAt},{"data_format",volume->dataFormat},
+                {"energy_kev",nullptr},{"detector_distance_mm",nullptr},{"voxel_size_um",nullptr},{"raw",volume->raw}};
+            if(volume->energyKeV)out["energy_kev"]=*volume->energyKeV;
+            if(volume->detectorDistanceMm)out["detector_distance_mm"]=*volume->detectorDistanceMm;
+            // A dataset derived on a coarser level has that level's voxels.
+            if(volume->pixelSizeUm)out["voxel_size_um"]=std::ldexp(*volume->pixelSizeUm,view->level);
+            return pyJson(out);
+        },nb::arg("url"),"What the catalog says about the volume a remote zarr shows; None if it does not list it.")
         .def("transform",[](const OpenDataManifest& c,const std::string& sample,const std::string& source,const std::string& target)->nb::object {
             const auto* s=c.findSample(sample);if(!s)return nb::none();
             RegistrationGraph graph;graph.addSample(*s);const auto resolution=graph.resolve(source,target);
@@ -111,6 +127,10 @@ NB_MODULE(_catalog,m) {
         if(!result.warning.empty())nb::module_::import_("warnings").attr("warn")(result.warning);
         return result.manifest;
     },nb::arg("source"),nb::arg("cache")="",nb::arg("refresh")=false,nb::arg("max_age")=3600.,nb::arg("timeout")=60.);
+    m.def("cached",[](const std::string& file)->nb::object {
+        auto manifest=cachedManifest(file);
+        return manifest?nb::cast(OpenDataManifest(*manifest)):nb::none();
+    },nb::arg("file"),"The manifest in a cache file, without touching the network; None if absent or invalid.");
     m.def("join_url",&joinOpenDataUrl);
     m.def("to_s3",&openDataS3Url);
     m.def("to_https",[](const std::string& url)->std::optional<std::string>{
