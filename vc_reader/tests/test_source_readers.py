@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch, PropertyMock
+from unittest.mock import patch
 
 import numpy as np
 try:
@@ -225,7 +225,7 @@ class SourceReaderTests(unittest.TestCase):
             self.assertEqual(reader.shape, (3, 5, 7))
             result = reader.read((0, 0, 0), (2, 5, 7))
             np.testing.assert_array_equal(result, np.stack([other, data]))
-            self.assertNotIn(2, reader._files)
+            self.assertFalse(reader._engine().loaded(2))
             with self.assertRaisesRegex(FileNotFoundError, 'user:stack'):
                 reader.read((2, 0, 0), (1, 1, 1))
         wrong, _ = self.png('wrong.png', np.zeros((3, 4), dtype=np.uint8))
@@ -256,15 +256,14 @@ class SourceReaderTests(unittest.TestCase):
         with source.open(decoded_cache_bytes=1) as reader:
             out = reader.read((0, 0), (1, 1))
             self.assertEqual(reader.decoded_cache.stats()['nbytes'], 0)
-            self.assertIsNone(out.base)
+            self.assertTrue(out.flags.writeable)
 
     def test_compressed_tiff_budget_and_mmap_small_crop(self):
         values = np.arange(10000, dtype=np.uint16).reshape(100, 100)
         compressed = self.tiff(values, axes='YX', compression='deflate')
         with compressed.open(max_decode_bytes=64) as reader:
-            with patch.object(tifffile.TiffPage, 'asarray', side_effect=AssertionError('decoded too early')):
-                with self.assertRaises(MemoryError):
-                    reader.read((0, 0), (1, 1))
+            with self.assertRaises(MemoryError):
+                reader.read((0, 0), (1, 1))
         with compressed.open() as reader:
             np.testing.assert_array_equal(reader.read((4, 7), (3, 5)), values[4:7, 7:12])
         mapped = self.tiff(values, axes='YX', filename='mapped.tif')
@@ -291,11 +290,17 @@ class SourceReaderTests(unittest.TestCase):
             output = reader.read((0, 0), (2, 3))
             self.assertEqual(output.dtype, np.dtype('float32'))
             np.testing.assert_array_equal(output.view(np.uint32), values.view(np.uint32))
-        source = self.tiff(np.zeros((5, 7), dtype=np.uint8), axes='YX',
-                           filename='compressed.tif', compression='deflate')
-        with source.open() as reader, patch.object(tifffile.TiffPage, 'decode', new_callable=PropertyMock,
-                                                   side_effect=ValueError('requires imagecodecs')):
-            with self.assertRaisesRegex(ValueError, 'TIFF codec.*imagecodecs'):
+        path = self.root / 'unknown-codec.tif'
+        tifffile.imwrite(path, np.zeros((5, 7), dtype=np.uint8), compression='deflate')
+        data = bytearray(path.read_bytes())
+        offset = int.from_bytes(data[4:8], 'little')
+        for entry in range(int.from_bytes(data[offset:offset+2], 'little')):
+            at = offset + 2 + 12 * entry
+            if int.from_bytes(data[at:at+2], 'little') == 259:
+                data[at+8:at+10] = (65000).to_bytes(2, 'little')
+        path.write_bytes(data)
+        with Source('codec', Storage(str(path), 'tiff')).open() as reader:
+            with self.assertRaisesRegex(ValueError, 'TIFF codec'):
                 reader.read((0, 0), (1, 1))
 
     def test_readers_use_one_thread_only_in_loader_workers(self):
@@ -333,7 +338,7 @@ class SourceReaderTests(unittest.TestCase):
         context = multiprocessing.get_context('fork')
         parent, child = context.Pipe()
         process = context.Process(target=worker_read, args=(reader, child))
-        with reader.decoded_cache._lock:
+        with reader.decoded_cache.working(0):
             process.start()
             child.close()
             try:

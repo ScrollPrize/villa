@@ -1,8 +1,7 @@
 # Scroll-centered discovery and paired reading
 
-The catalog and public views use the standard library. `load()` reads catalog
-metadata; navigating an already loaded catalog does not request arrays or
-import NumPy, compiled extensions, Pillow, or PyTorch.
+The catalog and its views are `vcr::catalog` in C++, bound here. `load()` reads catalog
+metadata; navigating an already loaded catalog does not request arrays.
 
 ## Collections and relationships
 

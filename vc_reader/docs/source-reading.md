@@ -7,10 +7,9 @@ TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
 
 Zarr sources use the existing C++ reader, authentication, memory cache,
 chunk planning, disk cache, and worker lifecycle. Remote image
-files use that same HTTP/S3 transport and directory budget. No installation
-occurs at runtime. Image decoders come from the optional `labels` extra
-(NumPy, Pillow, tifffile); local image reads do not load the compiled extension,
-PyTorch, or CUDA. Unsupported TIFF compression identifies the required codec.
+files use that same HTTP/S3 transport and directory budget. Decoding uses libtiff,
+libpng and libjpeg, in the native library; a TIFF compression this libtiff lacks is
+named in the error. The reader is `vcr::sources::SourceReader` for C++ callers.
 
 ```python
 from vc_reader import Encoding, Source, Storage

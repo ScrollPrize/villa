@@ -46,6 +46,12 @@ class SamplingEngine:
             return array_placement(self._open(volume.level(value.level).source).registration)
         raise ValueError('value frame needs an affine or a resolvable volume level')
 
+    def _encoded_options(self, location):
+        from .reader.zarr_reader import _make_settings, _open_options
+        settings, _ = _make_settings(location, **{k: v for k, v in self._options.items()
+                                                  if k in {'auth', 'cache_dir', 'cache_writes', 'cache_max_bytes', 'offline'}})
+        return _open_options(settings, None)
+
     def _initialize_runtime(self, backend, device, limits, reader_options):
         from .reader import DecodedCache, MemoryCache
         if backend not in ('cpu', 'cuda'):
@@ -272,9 +278,8 @@ class SamplingEngine:
             arrays = reader.read_many([(start[1:], size[1:]) if target['plane'] else (start, size) for start, size in shifted])
         affine_arrays = None
         if (self.backend == 'cpu' and not target['direct'] and not target['plane']
-                and target['dtype'].name == 'uint8' and reader._raw_axes == ('z', 'y', 'x')
-                and reader.source.encoding is None and reader._is_zarr
-                and reader.fill_value == reader._backend.fill_value):
+                and target['dtype'].name == 'uint8' and reader.spatial_axes == ('z', 'y', 'x')
+                and reader._is_direct):
             grids = [(size, tuple(reversed(target['mapping'].apply(tuple(reversed(start))))),
                       tuple(tuple(target['mapping'].linear[a][b] for b in (2, 1, 0)) for a in (2, 1, 0)))
                      for start, size in regions]

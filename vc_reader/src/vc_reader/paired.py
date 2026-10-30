@@ -174,9 +174,7 @@ class PairedReader(SamplingEngine):
         if not _same(selected_to_image, Affine.identity()) and source.storage.pyramid:
             # Header-declared levels are candidates, not an assumed shared level
             # count. Never request a nonexistent label/mask level.
-            backend = base._backend
-            datasets = backend.datasets if backend is not None else ()
-            levels = list(range(len(datasets)))
+            levels = list(range(base._engine().zarr_datasets))
             if preferred_level in levels:
                 levels.remove(preferred_level)
                 levels.insert(0, preferred_level)

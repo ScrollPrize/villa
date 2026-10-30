@@ -181,9 +181,9 @@ class StorageTests(FixtureCase):
         path = self.root/'palette.png'
         image = Image.fromarray(np.zeros((20, 31), 'u1')).convert('P')
         image.save(path)
-        with patch('PIL.PngImagePlugin.PngImageFile.load', side_effect=AssertionError('pixel decode')):
-            with Source('palette', Storage(str(path), 'png')).open() as reader:
-                self.assertIsNotNone(reader.palette)
+        with Source('palette', Storage(str(path), 'png')).open() as reader:
+            self.assertIsNotNone(reader.palette)
+            self.assertEqual(reader.stats()['image_payload_bytes'], 0)
         path = self.root/'large.tif'
         data = np.ones((2048, 3072), dtype=np.uint16)
         tifffile.imwrite(path, data, tile=(32, 32), compression='deflate')
@@ -761,7 +761,7 @@ class RemoteTests(RemoteFixtureCase):
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.root/'unused', cache_writes=False, cache_max_bytes=1)
         with source.open(cache_writes=False, cache_max_bytes=1024) as reader:
-            temporary = Path(reader._encoded._temp.name)
+            temporary = Path(reader._engine().temporary_directory)
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         self.assertFalse(temporary.exists())
         self.assertFalse((self.root/'unused').exists())

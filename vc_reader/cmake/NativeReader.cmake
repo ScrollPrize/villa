@@ -7,6 +7,9 @@ pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 find_package(SQLite3 3.24 REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(TIFF REQUIRED)
+find_package(PNG REQUIRED)
+find_package(JPEG REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
     find_package(vc_delta3d CONFIG QUIET)
 endif()
@@ -36,6 +39,10 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/computed.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/grid.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/caches.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/image_file.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/resolution.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/source_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/meta.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/access.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/layers.cpp"
@@ -56,7 +63,7 @@ target_include_directories(vc_reader_native PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD PkgConfig::LZ4
     SQLite::SQLite3 vc_delta3d::vc_delta3d ZLIB::ZLIB vc_reader::volcomp vc_reader::sftp Threads::Threads nlohmann_json::nlohmann_json
-    PRIVATE vc_reader::catalog)
+    PRIVATE vc_reader::catalog TIFF::TIFF PNG::PNG JPEG::JPEG)
 
 
 if(VC_READER_ENABLE_CUDA)

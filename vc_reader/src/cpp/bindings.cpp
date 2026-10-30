@@ -40,6 +40,7 @@ template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& 
 #ifdef VC_READER_CUDA
 #include "reader_cuda/bindings.hpp"
 #endif
+#include "sources/bindings.hpp"
 
 static nb::object py_json(const Json& value)
 {
@@ -138,6 +139,7 @@ NB_MODULE(_reader, m)
     vcr::sheet_normal::bind(m);
     vcr::geometry::bind(m);
     vcr::grid::python::bind(m);
+    vcr::sources::python::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.

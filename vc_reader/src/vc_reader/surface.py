@@ -75,7 +75,7 @@ class Geometry:
     def __init__(self, owner, surface):
         import json
         import numpy as np
-        from .reader.encoded_files import EncodedFiles
+        from . import _reader
         from .errors import CacheMissError
         if surface.xyz_to_volume is None or surface.component_order is None:
             raise ValueError(f'{surface.id}: unknown geometry coordinate frame/components')
@@ -87,13 +87,11 @@ class Geometry:
             root = surface.geometry.location
             if root is None:
                 raise ValueError('surface geometry location is unresolved')
-            files = EncodedFiles(**{k: v for k, v in owner._options.items()
-                                   if k in {'auth', 'cache_dir', 'cache_writes', 'cache_max_bytes', 'offline'}})
+            files = _reader.EncodedFiles(owner._encoded_options)
             try:
                 for candidate in (root,*surface.geometry.alternatives):
                     try:
-                        with files.open(candidate.rstrip('/')+'/meta.json') as (handle, _):
-                            meta = json.load(handle)
+                        meta = json.loads(files.read(candidate.rstrip('/')+'/meta.json'))
                         root=candidate
                         break
                     except (FileNotFoundError,CacheMissError):
@@ -293,8 +291,7 @@ def _layers(geom, normals, offsets):
 
 def _zarr_volume(target):
     r = target['reader']
-    if not (r._is_zarr and r._raw_axes == ('z', 'y', 'x') and r._lookup is None and target['field'] is None
-            and r.fill_value == r._backend.fill_value):
+    if not (r._is_direct and r.spatial_axes == ('z', 'y', 'x') and target['field'] is None):
         raise ValueError(f"{target['source'].id}: render_surface samples single-channel 3-D Zarr volumes")
     return r._backend.reader
 
