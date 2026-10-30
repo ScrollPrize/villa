@@ -219,6 +219,7 @@ class CrossFrameZarrDataset(Dataset):
                 patch_size=self.patch_size,
                 no_spatial=bool(getattr(mgr, "no_spatial_augmentation", False)),
                 no_scaling=bool(getattr(mgr, "no_scaling_augmentation", False)),
+                allowed_rotation_axes=getattr(mgr, "allowed_rotation_axes", None),
                 skeleton_targets=skeleton_targets or None,
                 skeleton_ignore_values=skeleton_ignore_values or None,
             )

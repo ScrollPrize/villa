@@ -54,6 +54,23 @@ from vesuvius.models.augmentation.transforms.local import (
 ENABLE_BLANK_RECTANGLE = False
 
 
+def _allowed_orientation_planes(patch_size, allowed_rotation_axes):
+    """3D Z/Y/X axis normals; None/all preserves the unrestricted pipeline."""
+    if len(patch_size) != 3 or allowed_rotation_axes is None:
+        return None
+    normals = set(allowed_rotation_axes)
+    if not normals.issubset({0, 1, 2}):
+        raise ValueError("allowed_rotation_axes must contain only Z/Y/X indices 0, 1, 2")
+    if normals == {0, 1, 2}:
+        return None
+    planes = []
+    for normal in sorted(normals):
+        plane = tuple(axis for axis in range(3) if axis != normal)
+        if patch_size[plane[0]] == patch_size[plane[1]]:
+            planes.append(set(plane))
+    return planes
+
+
 def create_training_transforms(
     patch_size: Tuple[int, ...],
     no_spatial: bool = False,
@@ -78,7 +95,10 @@ def create_training_transforms(
     only_spatial_and_intensity : bool
         If True, only use spatial and basic intensity transforms (skip noise, blur, etc.).
     allowed_rotation_axes : Optional[List[int]]
-        Restrict rotations to specific axes. None means all axes.
+        3D Z/Y/X axis normals: restrict quarter-turn/transpose planes to the
+        complementary equal-sized dimensions. None/all preserves the old
+        unrestricted pipeline; empty disables these orientation operations.
+        Existing 2D mirroring is unchanged.
     skeleton_targets : Optional[List[str]]
         List of target names that need skeleton/medial surface transform.
     skeleton_ignore_values : Optional[Dict[str, int]]
@@ -123,6 +143,18 @@ def create_training_transforms(
             transpose_allowed_axes.update([0, 2])
         if patch_h == patch_w:
             transpose_allowed_axes.update([1, 2])
+
+    # Restrict orientation planes, not the axes within a plane. Z means
+    # the Y/X plane so depth remains upright. Explicit all keeps old behavior.
+    orientation_planes = _allowed_orientation_planes(patch_size, allowed_rotation_axes)
+
+    def orientation_transform(transform_type, default_axes, **kwargs):
+        if orientation_planes is None:
+            return transform_type(allowed_axes=default_axes, **kwargs)
+        options = [transform_type(allowed_axes=plane, **kwargs) for plane in orientation_planes]
+        if not options:
+            return None
+        return options[0] if len(options) == 1 else OneOfTransform(options)
 
     # Local transform scale parameters (derived from patch size)
     min_patch_dim = min(patch_size)
@@ -170,14 +202,12 @@ def create_training_transforms(
 
         # Rot90 for 3D (only if there are valid rotation axes), Mirror for 2D
         if dimension == 3 and rot90_allowed_axes:
-            transforms.append(RandomTransform(
-                Rot90Transform(
-                    num_axis_combinations=1,
-                    num_rot_per_combination=(1, 2, 3),
-                    allowed_axes=rot90_allowed_axes,
-                ),
-                apply_probability=0.5
-            ))
+            rotation_transform = orientation_transform(
+                Rot90Transform, rot90_allowed_axes,
+                num_axis_combinations=1, num_rot_per_combination=(1, 2, 3),
+            )
+            if rotation_transform is not None:
+                transforms.append(RandomTransform(rotation_transform, apply_probability=0.5))
         elif dimension == 2:
             transforms.append(MirrorTransform(allowed_axes=mirror_axes))
 
@@ -381,10 +411,9 @@ def create_training_transforms(
         # 3D-specific transforms
         # Transpose only between axes with equal dimensions (need at least 2 axes)
         if not no_spatial and len(transpose_allowed_axes) >= 2:
-            transforms.append(RandomTransform(
-                TransposeAxesTransform(allowed_axes=transpose_allowed_axes),
-                apply_probability=0.2
-            ))
+            transpose_transform = orientation_transform(TransposeAxesTransform, transpose_allowed_axes)
+            if transpose_transform is not None:
+                transforms.append(RandomTransform(transpose_transform, apply_probability=0.2))
 
         if blank_rectangle is not None:
             transforms.append(blank_rectangle)
