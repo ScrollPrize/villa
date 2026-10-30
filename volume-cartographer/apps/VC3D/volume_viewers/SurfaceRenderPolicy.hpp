@@ -4,12 +4,16 @@
 
 namespace vc::render {
 
-// A workspace preference must not limit direct sampling when its surface
-// cache is disabled, unavailable, or cannot cover the frame's normal band.
+// Plane views share the chunk scheduler with flattened-surface tile fills.
+// Keep their coarse demand bounded in a tile-fill-preferring workspace even
+// though planes never have a SurfaceCache. Direct surface fallback still needs
+// coarse demand when its cache is disabled, unavailable, or out of band.
+// Line annotation viewers retain unrestricted fallback demand in either case.
 inline constexpr int surfaceQueuedFallbackLevels(
-    int requestedLevels, bool preferSurfaceTileFills, bool surfaceCacheUsable)
+    int requestedLevels, bool preferSurfaceTileFills, bool surfaceCacheUsable,
+    bool planeView = false, bool annotationView = false)
 {
-    return preferSurfaceTileFills && surfaceCacheUsable
+    return !annotationView && preferSurfaceTileFills && (planeView || surfaceCacheUsable)
         ? std::min(requestedLevels, 1)
         : requestedLevels;
 }

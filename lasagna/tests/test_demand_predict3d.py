@@ -618,6 +618,46 @@ def test_sharded_mmap_matches_unsharded_with_overlapping_adds(tmp_path, dtype, c
             array._mmap.close()
 
 
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+def test_chunk_major_circular_band_matches_flat_wrap_and_clear(tmp_path, dtype):
+    bands = [tiled._CircularZBand(name=f"band{b}", channel_count=2,
+        z_size=30, y_size=7, x_size=9, tmp_dir=str(tmp_path), prefix="test",
+        ring_depth=7, dtype=dtype, chunk_side=b) for b in (0, 4)]
+    caches = [tiled._BoundedMmapCache() for _ in bands]
+    rng = np.random.default_rng(123)
+    try:
+        for start in (0, 5, 10, 15, 20):
+            stop = start + 5
+            for _ in range(3):
+                values = rng.normal(size=(5, 6, 7)).astype(np.float32)
+                for band in bands:
+                    band.add(0, start, stop, 1, 7, 2, 9, values)
+                    band.ensure(start, stop)
+                for band, cache in zip(bands, caches):
+                    tiled._add_mmap_band_chunk(band.mmap_descriptor(), 1,
+                        start, stop, 1, 7, 2, 9, values, cache)
+            for ch in range(2):
+                np.testing.assert_array_equal(bands[0].read(ch, start, stop, 0, 7, 0, 9),
+                    bands[1].read(ch, start, stop, 0, 7, 0, 9))
+                results = [tiled._read_mmap_band_chunk(band.mmap_descriptor(), ch,
+                    start, stop, 0, 7, 0, 9, cache, clear=True)
+                    for band, cache in zip(bands, caches)]
+                np.testing.assert_array_equal(*results)
+                for band in bands:
+                    assert not band.read(ch, start, stop, 0, 7, 0, 9).any()
+            for band in bands:
+                band.discard_before(stop)
+        for band in bands:
+            band.add(0, 25, 30, 1, 7, 2, 9, values)
+            band.clear(25, 30, 0, 7, 0, 9)
+            assert not band.read(0, 25, 30, 0, 7, 0, 9).any()
+    finally:
+        for cache in caches:
+            cache.close()
+        for band in bands:
+            band.cleanup()
+
+
 def test_bounded_mmap_cache_evicts_and_remaps_shards(tmp_path):
     shape = (6, 2, 2)
     paths = tuple(str(tmp_path / f"part-{i}.mmap") for i in range(3))
@@ -633,6 +673,14 @@ def test_bounded_mmap_cache_evicts_and_remaps_shards(tmp_path):
         result = tiled._read_mmap_band_chunk(descriptor, 0, 0, 6, 0, 2, 0, 2, cache)
         assert len(cache) == 2
         np.testing.assert_array_equal(result, source)
+        cache.close()
+        # A cached read-only mapping must be upgraded for consume/clear.
+        tiled._read_mmap_band_chunk(descriptor, 0, 0, 6, 0, 2, 0, 2, cache)
+        consumed = tiled._read_mmap_band_chunk(descriptor, 0, 0, 6, 0, 2, 0, 2, cache, clear=True)
+        np.testing.assert_array_equal(consumed, source)
+        np.testing.assert_array_equal(
+            tiled._read_mmap_band_chunk(descriptor, 0, 0, 6, 0, 2, 0, 2, cache),
+            np.zeros(shape, dtype=np.float32))
     finally:
         cache.close()
 

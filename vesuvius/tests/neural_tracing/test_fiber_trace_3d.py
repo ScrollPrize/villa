@@ -840,6 +840,18 @@ def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyP
     assert _resolve_inference_device("cpu") == torch.device("cpu")
 
 
+def test_inference_auto_device_preserves_bf16_on_mps_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    for device in (None, "auto"):
+        devices = fiber_infer_module.resolve_inference_devices(device=device)
+        assert devices == (torch.device("cpu"),)
+        assert _resolve_inference_precision(
+            "bf16", checkpoint=None, devices=devices
+        ) == ("bf16", "cli")
+
+
 def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
     checkpoint = tmp_path / "snapshot.pt"
     torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
@@ -4495,7 +4507,8 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     import inspect
 
     parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
-    assert parameters["inference_scaledown_power"].default == 2
+    # None selects the model's native output stride.
+    assert parameters["inference_scaledown_power"].default is None
     assert parameters["ome_chunk"].default == 64
     assert parameters["ome_compressor"].default == "blosc-zstd"
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4

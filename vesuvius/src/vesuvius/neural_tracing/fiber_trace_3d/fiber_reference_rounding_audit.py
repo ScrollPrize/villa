@@ -45,7 +45,7 @@ def run(settings):
     gd=arrays(gc['tensor_cache']);gs=arrays(gt/'uv_whole/solution.npz')
     _,_,keep,gpick=uv.hard_assignment(gs['state'],len(gs['widths']),gc,best_nonbroken=True)
     if not keep.all():raise ValueError('Reference contains disabled fibers')
-    reference=read(settings['reference']);offsets={int(k):v for k,v in reference['fiber_offsets'].items()}
+    reference=read(settings['reference']);offsets=dict(reference['fiber_offsets'])
     rows=[];hashes={str(p):sha256_file(p) for p in [Path(settings['reference']),gt/'uv_whole/solution.npz',Path(__file__)]}
     out=Path(settings['output_root']);out.mkdir(parents=True,exist_ok=True)
     for spec in settings['solves']:
@@ -73,7 +73,7 @@ def run(settings):
         flowroot=Path(spec['flow_root'])
         with (flowroot/'gt_events.csv').open() as f:flow={int(e['event_id']):e for e in csv.DictReader(f)}
         def event_key(e):
-            return (int(e['gt_source']),int(e['test_source']),round(float(e['gt_arc']),4),round(float(e['test_arc']),4))
+            return (str(e['gt_source']),str(e['test_source']),round(float(e['gt_arc']),4),round(float(e['test_arc']),4))
         flow_geometry={event_key(e):e for e in flow.values()}
         if len(flow_geometry)!=len(flow):raise ValueError('Nonunique flow geometry key')
         indices=[i for i,e in enumerate(events) if e['gt_source'] in offsets and event_key(e) in flow_geometry]
@@ -82,7 +82,7 @@ def run(settings):
         records=[flow_geometry[event_key(e)] for e in ev]
         for e,f in zip(ev,records):
             for k in ('gt_source','test_source'):
-                if e[k]!=int(f[k]):raise ValueError('Flow event identity mismatch')
+                if e[k]!=f[k]:raise ValueError('Flow event identity mismatch')
             for k in ('gt_arc','test_arc','signed_distance'):
                 if abs(e[k]-float(f[k]))>1e-6:raise ValueError('Flow event geometry mismatch')
         connector=np.array([int(f['connector_crossings']) for f in records])

@@ -35,3 +35,5 @@ struct TiffSamples {
     std::vector<uint8_t> bytes;
 };
 TiffSamples readTiffSamples(const std::filesystem::path&, bool strictLayout = true);
+// The inverse of readTiffSamples: one LZW-compressed page holding the samples exactly.
+void writeTiffSamples(const std::filesystem::path&, const TiffSamples&);

@@ -40,20 +40,6 @@ def _device_points(points, device, dtype):
     return array.reshape(-1, 3), array.shape[:-1]
 
 
-class PointRequest:
-    """Immutable point coordinates/planning retained for repeated device reads."""
-    def __init__(self, reader, plan, shape, dtype):
-        self.reader, self._plan, self.shape, self.dtype = reader, plan, shape, dtype
-
-    def read(self, *, source="auto", valid=False):
-        self.reader._ready()
-        outputs = self.reader._engine.read_plan(self._plan, source, valid)
-        return self.reader._point_outputs(outputs, self.dtype, self.shape, valid)
-
-    def __getstate__(self):
-        raise TypeError("CUDA point requests cannot be pickled")
-
-
 class CudaReader:
     """Create with reader.cuda(). Outputs stay on device.
 
@@ -273,20 +259,3 @@ class CudaReader:
         flat, shape = _integer_points(_host_input(points))
         return self._point_outputs(self._engine.points(flat, [0, 0, 0], 3, 0, source, valid), np.uint8, shape, valid)
 
-    def prepare_points(self, points, *, integer=False, order=1, coordinate_origin=None):
-        """Plan/upload coordinates once; request.read() reuses them on device.
-
-        Source chunks still obey the cache budget and may be evicted between
-        reads. Caller mutations of points do not change the prepared request.
-        """
-        self._ready()
-        if order not in (0, 1): raise ValueError("order must be 0 or 1")
-        if integer:
-            if coordinate_origin is not None: raise ValueError("integer points use absolute coordinates")
-            local, shape = _integer_points(points)
-            base, kind, order, dtype = [0, 0, 0], 3, 0, np.uint8
-        else:
-            local, base, shape = points32(points, coordinate_origin)
-            kind, dtype = 2, np.float32 if order else np.uint8
-        plan = self._engine.prepare_points(local, base, kind, order)
-        return PointRequest(self, plan, shape, dtype)

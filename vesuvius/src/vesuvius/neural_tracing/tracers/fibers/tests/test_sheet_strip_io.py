@@ -8,6 +8,8 @@ import pytest
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip import evaluate, infer
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import StripIndex
 
+FIBER = '00000000-0000-4000-8000-00000000002a'
+
 
 def test_scorer_searches_past_empty_splits(tmp_path, monkeypatch):
     (tmp_path/'meta.json').write_text('{}')
@@ -47,7 +49,7 @@ def inference_setup(monkeypatch):
     fiber = SimpleNamespace(length=200.)
 
     class Fibers:
-        id_to_index = {42: 0}
+        id_to_index = {FIBER: 0}
 
         def __getitem__(self, index):
             return fiber
@@ -68,7 +70,8 @@ def inference_setup(monkeypatch):
 
     predictor = Predictor()
     monkeypatch.setattr(infer, 'StripPredictor', lambda *args, **kwargs: predictor)
-    monkeypatch.setattr(infer, 'AFVFibers', lambda *args, **kwargs: Fibers())
+    monkeypatch.setattr(infer, 'FiberStore', lambda *args, **kwargs: Fibers())
+    monkeypatch.setattr(infer, 'fiber_volume', lambda path: '1')
     # Exercise render_saved and its score handling without a CT volume or plotting.
     monkeypatch.setattr(infer, 'render_strip', lambda vol, rows, keep, *args: np.where(keep, 1., np.nan))
     renders = []
@@ -81,7 +84,7 @@ def test_empty_geometry_fails_before_writing(tmp_path, inference_setup):
     fiber.length = 100.
     out = tmp_path/'output'
     with pytest.raises(SystemExit, match='No strip nodes remain'):
-        infer.main(['--fiber', '42', '--afv', 'test.afv', '--index', 'none', '--out', str(out)])
+        infer.main(['--fiber', FIBER, '--fibers', 'test.vcobj', '--index', 'none', '--out', str(out)])
     assert not out.exists() and not renders
 
 
@@ -96,7 +99,7 @@ def test_inference_saves_with_partial_or_missing_scores(tmp_path, monkeypatch, i
 
     monkeypatch.setattr(infer, 'Scorer', lambda *args: Scorer())
     out = tmp_path/'output'
-    infer.main(['--fiber', '42', '--afv', 'test.afv', '--index', 'test-index', '--out', str(out)])
+    infer.main(['--fiber', FIBER, '--fibers', 'test.vcobj', '--index', 'test-index', '--out', str(out)])
     summary = json.loads((out/'summary.json').read_text())
     score = summary['patch_score']
     assert (out/'strip'/'x.tif').exists()

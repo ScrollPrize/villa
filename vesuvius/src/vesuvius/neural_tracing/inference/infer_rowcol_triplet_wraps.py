@@ -41,8 +41,10 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _generate_segment_cover_records,
     _serialize_bbox_record,
 )
-from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
+from vesuvius.neural_tracing.heatmap_single_point.tifxyz import get_area, save_tifxyz
 from vesuvius.tifxyz import read_tifxyz
+from vc_object_store import ObjectStore
+from vesuvius.tifxyz.store import create_surface, read_surface
 
 _TTA_TRANSFORM_ALIASES = {
     "mirror+rot90": "rotate3",
@@ -58,6 +60,10 @@ _COPY_ARG_ALIASES = {
 }
 _COPY_ARG_TO_CLI = {
     "tifxyz_path": "--tifxyz-path",
+    "store": "--store",
+    "surface_uuid": "--surface",
+    "geometry_revision": "--geometry-revision",
+    "volume_uuid": "--volume-uuid",
     "volume_path": "--volume-path",
     "checkpoint_path": "--checkpoint-path",
     "device": "--device",
@@ -739,7 +745,15 @@ def parse_args(argv=None):
     )
     cpu_count = int(os.cpu_count() or 1)
     max_band_workers = max(1, cpu_count // 2)
-    parser.add_argument("--tifxyz-path", type=str, required=True)
+    parser.add_argument("--tifxyz-path", type=str, default=None,
+                        help="Input tifxyz directory; outputs are tifxyz directories in --out-dir.")
+    parser.add_argument("--store", type=str, default=None,
+                        help="Object store (a local store or a hub's local replica): the input is --surface and "
+                             "the outputs are new surface objects bound to --volume-uuid.")
+    parser.add_argument("--surface", dest="surface_uuid", type=str, default=None)
+    parser.add_argument("--geometry-revision", type=str, default=None,
+                        help="Read this revision of --surface instead of its current geometry.")
+    parser.add_argument("--volume-uuid", type=str, default=None)
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -767,7 +781,15 @@ def parse_args(argv=None):
         help="Number of worker threads used to prepare per-bbox crop inputs.",
     )
 
-    parser.add_argument("--bbox-overlap", type=float, default=0.0)
+    parser.add_argument(
+        "--bbox-overlap",
+        type=float,
+        default=0.5,
+        help=(
+            "Overlap fraction for Copy inference crops (default: 0.5 to reduce "
+            "block-edge seams). Pass 0.0 to restore the previous faster behavior."
+        ),
+    )
     parser.add_argument("--bbox-prune", dest="bbox_prune", action="store_true")
     parser.add_argument("--no-bbox-prune", dest="bbox_prune", action="store_false")
     parser.set_defaults(bbox_prune=True)
@@ -876,8 +898,8 @@ def parse_args(argv=None):
             f"--bbox-band-workers must be <= {max_band_workers} "
             f"(half available CPUs; detected cpu_count={cpu_count})."
         )
-    if args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
-        parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
+    if not np.isfinite(args.bbox_overlap) or args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
+        parser.error("--bbox-overlap must be finite and satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
     if args.volume_cache_retry_seconds < 0.0:
@@ -901,6 +923,14 @@ def parse_args(argv=None):
         merge_temp_dir = Path(args.merge_temp_dir)
         if merge_temp_dir.exists() and not merge_temp_dir.is_dir():
             parser.error("--merge-temp-dir must be a directory when it already exists")
+    if (args.tifxyz_path is None) == (args.store is None):
+        parser.error("give exactly one of --tifxyz-path and --store.")
+    if args.store is not None and (args.surface_uuid is None or args.volume_uuid is None):
+        parser.error("--store needs --surface and --volume-uuid.")
+    if args.store is None and (args.surface_uuid or args.geometry_revision or args.volume_uuid):
+        parser.error("--surface, --geometry-revision and --volume-uuid need --store.")
+    if args.store is not None and args.out_dir is not None:
+        parser.error("--out-dir is for tifxyz outputs; stored outputs go to --store.")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be >= 1 when provided.")
     if args.iterations is not None and args.iter_direction is None:
@@ -985,7 +1015,10 @@ def _canonicalize_tta_settings(args):
 
 
 def _load_input_grid(tifxyz_path, retarget_factor=1):
-    surface = read_tifxyz(tifxyz_path)
+    return _surface_grid(read_tifxyz(tifxyz_path), retarget_factor)
+
+
+def _surface_grid(surface, retarget_factor=1):
     if float(retarget_factor) != 1.0:
         surface = surface.retarget(float(retarget_factor))
     surface.use_stored_resolution()
@@ -2077,17 +2110,7 @@ def _run_triplet_inference(
     }
 
 
-def _save_surface(
-    grid,
-    valid,
-    out_dir,
-    uuid,
-    step_size,
-    voxel_size_um,
-    source,
-    metadata,
-    apply_mesh_cleanup=True,
-):
+def _prepare_surface_for_save(grid, valid, step_size, metadata, apply_mesh_cleanup):
     save_grid = np.asarray(grid, dtype=np.float32).copy()
     save_valid = np.asarray(valid, dtype=bool)
     metadata_out = dict(metadata) if isinstance(metadata, dict) else {}
@@ -2101,6 +2124,81 @@ def _save_surface(
         metadata_out.update(cleanup_meta)
 
     save_grid[~save_valid] = -1.0
+    return save_grid, metadata_out
+
+
+class _TifxyzSurfaces:
+    """Input and outputs as tifxyz directories; outputs go to ``out_dir``."""
+
+    def __init__(self, out_dir):
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
+
+    def load(self, ref, retarget_factor):
+        return _load_input_grid(ref, retarget_factor=retarget_factor)
+
+    def name(self, ref):
+        return Path(ref).resolve().name
+
+    def is_input(self, ref, name):
+        return (Path(self.out_dir) / name).resolve() == Path(ref).resolve()
+
+    def save(self, grid, valid, name, step_size, voxel_size_um, source, metadata, apply_mesh_cleanup=True):
+        return _save_surface(grid, valid, self.out_dir, name, step_size, voxel_size_um, source=source,
+                             metadata=metadata, apply_mesh_cleanup=apply_mesh_cleanup)
+
+
+class _StoredSurfaces:
+    """Input and outputs as surface objects of a store: ``source`` (read at ``geometry_revision`` when given) is
+    the input, outputs are new surfaces bound to ``volume`` with ``source`` as their source."""
+
+    def __init__(self, store, volume, source, geometry_revision=None):
+        self.store = store
+        self.volume = volume
+        self.source = source
+        self.geometry_revision = geometry_revision
+
+    def load(self, ref, retarget_factor):
+        revision = self.geometry_revision if ref == self.source else None
+        return _surface_grid(read_surface(self.store, ref, volume=self.volume, geometry_revision=revision),
+                             retarget_factor)
+
+    def name(self, ref):
+        with ObjectStore.open(str(self.store), read_only=True, reader_pool_size=1) as store:
+            record = store.object(ref)
+        return (record or {}).get("name") or ref
+
+    def is_input(self, ref, name):
+        return False
+
+    def save(self, grid, valid, name, step_size, voxel_size_um, source, metadata, apply_mesh_cleanup=True):
+        save_grid, metadata_out = _prepare_surface_for_save(grid, valid, step_size, metadata, apply_mesh_cleanup)
+        area_vx2, area_cm2 = get_area(save_grid, step_size, voxel_size_um)
+        return create_surface(
+            self.store,
+            save_grid,
+            name=name,
+            scale=(1.0 / step_size, 1.0 / step_size),
+            volume=self.volume,
+            tool="vesuvius-displacement-copy",
+            parameters={"checkpoint": str(source)},
+            sources=[self.source],
+            meta={"area_vx2": area_vx2, "area_cm2": area_cm2, **metadata_out},
+        )
+
+
+def _save_surface(
+    grid,
+    valid,
+    out_dir,
+    uuid,
+    step_size,
+    voxel_size_um,
+    source,
+    metadata,
+    apply_mesh_cleanup=True,
+):
+    save_grid, metadata_out = _prepare_surface_for_save(grid, valid, step_size, metadata, apply_mesh_cleanup)
     save_tifxyz(
         save_grid,
         out_dir,
@@ -2486,8 +2584,8 @@ def _run_single_iteration(
     model_state,
     crop_size,
     volume_arr,
-    input_tifxyz_path,
-    out_dir,
+    input_ref,
+    surfaces,
     out_prefix,
     retarget_factor,
     tifxyz_step_size,
@@ -2504,11 +2602,10 @@ def _run_single_iteration(
     preloaded_input=None,
 ):
     if preloaded_input is None:
-        _, input_grid, input_valid = _load_input_grid(input_tifxyz_path, retarget_factor=retarget_factor)
+        _, input_grid, input_valid = surfaces.load(input_ref, retarget_factor)
     else:
         _, input_grid, input_valid = preloaded_input
-    input_path_resolved = Path(input_tifxyz_path).resolve()
-    input_uuid = input_path_resolved.name
+    input_uuid = surfaces.name(input_ref)
 
     world_points, uv_points = _extract_surface_points_for_iteration(
         input_grid=input_grid,
@@ -2620,12 +2717,10 @@ def _run_single_iteration(
     front_uuid = _append_iteration_suffix(f"{out_prefix}_front", iteration_index, iterative_mode)
 
     if args.save_original_copy:
-        original_target = Path(out_dir) / original_uuid
-        if original_target.resolve() != input_path_resolved:
-            outputs["original"] = _save_surface(
+        if not surfaces.is_input(input_ref, original_uuid):
+            outputs["original"] = surfaces.save(
                 input_grid_save,
                 input_valid,
-                out_dir,
                 original_uuid,
                 tifxyz_step_size,
                 tifxyz_voxel_size_um,
@@ -2634,7 +2729,7 @@ def _run_single_iteration(
                 apply_mesh_cleanup=False,
             )
         else:
-            outputs["original"] = str(input_path_resolved)
+            outputs["original"] = str(input_ref)
             _log(
                 args.verbose,
                 "original output path equals input tifxyz path; skipping rewrite and reusing input as unchanged original.",
@@ -2649,10 +2744,9 @@ def _run_single_iteration(
             save_front = False
 
     if save_back:
-        outputs["back"] = _save_surface(
+        outputs["back"] = surfaces.save(
             back_merged_save,
             back_merged_valid,
-            out_dir,
             back_uuid,
             tifxyz_step_size,
             tifxyz_voxel_size_um,
@@ -2660,10 +2754,9 @@ def _run_single_iteration(
             metadata={**run_meta, "surface_role": "back"},
         )
     if save_front:
-        outputs["front"] = _save_surface(
+        outputs["front"] = surfaces.save(
             front_merged_save,
             front_merged_valid,
-            out_dir,
             front_uuid,
             tifxyz_step_size,
             tifxyz_voxel_size_um,
@@ -2676,7 +2769,7 @@ def _run_single_iteration(
         chain_valid_cells = int(infer_out[f"n_{iter_direction}_cells"])
 
     return {
-        "input_tifxyz_path": str(input_path_resolved),
+        "input": str(input_ref),
         "outputs": outputs,
         "n_pred_back_cells": int(infer_out["n_back_cells"]),
         "n_pred_front_cells": int(infer_out["n_front_cells"]),
@@ -2687,9 +2780,15 @@ def _run_single_iteration(
 def run(args):
     args = _canonicalize_tta_settings(args)
     retarget_factor = float(2 ** int(args.volume_scale))
-    surface, input_grid, input_valid = _load_input_grid(args.tifxyz_path, retarget_factor=retarget_factor)
-    input_uuid = Path(args.tifxyz_path).resolve().name
-    out_prefix = args.output_prefix if args.output_prefix else input_uuid
+    if args.store is not None:
+        input_ref = str(args.surface_uuid)
+        surfaces = _StoredSurfaces(args.store, args.volume_uuid, input_ref, args.geometry_revision)
+    else:
+        out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
+        surfaces = _TifxyzSurfaces(out_dir)
+        input_ref = str(Path(args.tifxyz_path).resolve())
+    surface, input_grid, input_valid = surfaces.load(input_ref, retarget_factor)
+    out_prefix = args.output_prefix if args.output_prefix else surfaces.name(input_ref)
 
     model_state = load_model(args)
     model_config = model_state["model_config"]
@@ -2738,13 +2837,11 @@ def run(args):
         f"chunk_cache_gb={float(args.volume_chunk_cache_gb):.3g}",
     )
 
-    out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
-    os.makedirs(out_dir, exist_ok=True)
     save_scale_factor = int(2 ** int(args.volume_scale))
     iterative_mode = args.iterations is not None
     iterations_requested = int(args.iterations) if iterative_mode else 1
     iter_direction = str(args.iter_direction) if iterative_mode else None
-    current_tifxyz_path = str(Path(args.tifxyz_path).resolve())
+    current_input = input_ref
     outputs_by_iteration = {}
     iterations_completed = 0
     stop_reason = None
@@ -2752,15 +2849,15 @@ def run(args):
     for iteration_index in range(1, iterations_requested + 1):
         _log(
             args.verbose,
-            f"[iteration {iteration_index}/{iterations_requested}] input={current_tifxyz_path}",
+            f"[iteration {iteration_index}/{iterations_requested}] input={current_input}",
         )
         iter_result = _run_single_iteration(
             args=args,
             model_state=model_state,
             crop_size=crop_size,
             volume_arr=volume_arr,
-            input_tifxyz_path=current_tifxyz_path,
-            out_dir=out_dir,
+            input_ref=current_input,
+            surfaces=surfaces,
             out_prefix=out_prefix,
             retarget_factor=retarget_factor,
             tifxyz_step_size=tifxyz_step_size,
@@ -2777,7 +2874,7 @@ def run(args):
             preloaded_input=(surface, input_grid, input_valid) if iteration_index == 1 else None,
         )
         outputs_by_iteration[str(iteration_index)] = {
-            "input_tifxyz_path": iter_result["input_tifxyz_path"],
+            "input": iter_result["input"],
             "outputs": iter_result["outputs"],
             "n_pred_back_cells": int(iter_result["n_pred_back_cells"]),
             "n_pred_front_cells": int(iter_result["n_pred_front_cells"]),
@@ -2804,7 +2901,7 @@ def run(args):
                 raise RuntimeError(
                     f"Iteration {iteration_index} did not save chained direction output '{iter_direction}'."
                 )
-            current_tifxyz_path = str(next_input_path)
+            current_input = str(next_input_path)
 
     if not iterative_mode:
         return outputs_by_iteration["1"]["outputs"]

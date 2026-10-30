@@ -6,7 +6,7 @@ TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
 `stats()`, and `close()`. The source descriptor stays immutable.
 
 Zarr sources use the existing C++ reader, authentication, memory cache,
-chunk planning, disk cache, prefetch support, and worker lifecycle. Remote image
+chunk planning, disk cache, and worker lifecycle. Remote image
 files use that same HTTP/S3 transport and directory budget. No installation
 occurs at runtime. Image decoders come from the optional `labels` extra
 (NumPy, Pillow, tifffile); local image reads do not load the compiled extension,

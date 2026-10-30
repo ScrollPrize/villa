@@ -20,8 +20,8 @@ def test_aligned_geometry_uses_whole_fiber_sign_even_through_fold():
 def test_frozen_direction_provenance_and_masks(tmp_path):
     import json
     import pytest
-    ids=np.arange(4);labels=np.array([0,0,1,2])
-    signature={key:key for key in ('database','afv','features','stage1','hv_solution','umbilicus')}
+    ids=np.array([f'00000000-0000-4000-8000-00000000000{k}' for k in range(4)]);labels=np.array([0,0,1,2])
+    signature={key:key for key in ('database','fibers','features','stage1','hv_solution','umbilicus')}
     signature['h_direction_solution']='saved_h_hash'
     config={}
     hsign=np.array([1,0,0,0]);vsign=np.array([0,0,-1,0])
@@ -38,7 +38,7 @@ def test_frozen_direction_provenance_and_masks(tmp_path):
     config['h_convention']='cw'
     _,reverse=direction_inputs(config,signature,ids,labels)
     assert reverse[0]==-1 and reverse[2]==-1
-    with pytest.raises(ValueError,match='IDs'):direction_inputs(config,signature,ids+1,labels)
+    with pytest.raises(ValueError,match='IDs'):direction_inputs(config,signature,np.roll(ids,1),labels)
     with pytest.raises(ValueError,match='hash'):direction_inputs(config,dict(signature,h_direction_solution='wrong'),ids,labels)
 
 

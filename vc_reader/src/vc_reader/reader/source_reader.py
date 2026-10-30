@@ -100,7 +100,7 @@ class SourceReader:
                 raise ValueError('configure byte budgets on the supplied decoded_cache object')
         self.source = source
         allowed = {'auth', 'cache_dir', 'cache_writes', 'cache_max_bytes', 'offline', 'memory_cache',
-                   'compress_cache', 'allow_lossy_cache', 'threads', 'connections', 'read_mode', 'prefetcher'}
+                   'compress_cache', 'allow_lossy_cache', 'threads', 'connections', 'read_mode'}
         unknown = reader_options.keys() - allowed
         if unknown:
             raise TypeError(f'unknown reader options: {sorted(unknown)}')

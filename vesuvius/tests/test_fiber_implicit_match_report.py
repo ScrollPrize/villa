@@ -4,6 +4,10 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_implicit_match_report import candidates,select
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def test_cutoff_per_side_and_dedup():
     c=dict(same=torch.ones((1,2,2),dtype=torch.bool),ph=torch.tensor([[.6,.3]]),pv=torch.tensor([[.6,.3]]))
     for key in ('u','x','v'):c[key]=torch.arange(4.).reshape(1,2,2)
@@ -74,7 +78,7 @@ def test_saved_comparison_tracks_lost_events(tmp_path, filter_families, offsets,
     import json
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_implicit_match_report import run
-    d=dict(family=np.array([0,1,0,1]),source_id=np.arange(4),start=np.zeros(4),end=np.ones(4),
+    d=dict(family=np.array([0,1,0,1]),source_id=np.array([fid(k) for k in range(4)]),start=np.zeros(4),end=np.ones(4),
         i=np.array([0,2]),j=np.array([1,3]),ds_a=np.zeros(2),ds_b=np.zeros(2),
         sign=np.ones(2),distance=np.ones(2)*.5,parallel=np.zeros(2,dtype=bool))
     data=tmp_path/'tensors.npz';np.savez(data,**d)
@@ -120,7 +124,7 @@ def test_u_offsets_preserve_shared_event_geometry(tmp_path, monkeypatch, mapping
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_shared_curve as curve
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_implicit_match_report import run
-    d=dict(family=np.array([0,1]),source_id=np.arange(2),start=np.zeros(2),end=np.ones(2),
+    d=dict(family=np.array([0,1]),source_id=np.array([fid(0),fid(1)]),start=np.zeros(2),end=np.ones(2),
         i=np.array([0]),j=np.array([1]),ds_a=np.zeros(1),ds_b=np.zeros(1),parallel=np.array([False]))
     data=tmp_path/'tensors.npz';np.savez(data,**d)
     root=tmp_path/'solve';root.mkdir()

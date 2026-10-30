@@ -428,7 +428,7 @@ def deformation_geometry(d,saved,config):
     rates={}
     for sid in np.unique(d['source_id'][ids]):
         mask=source[l]==sid
-        rates[int(sid)]=(float(np.max(urate[mask],initial=0)),float(np.max(vrate[mask],initial=0)))
+        rates[str(sid)]=(float(np.max(urate[mask],initial=0)),float(np.max(vrate[mask],initial=0)))
     original_x=[];original_y=[];deformed_x=[];deformed_y=[]
     for n,idx in enumerate(ids):
         sid=d['source_id'][idx];lo,hi=d['start'][idx],d['end'][idx]
@@ -453,7 +453,7 @@ def render_deformation_comparison(config):
     before,after,rates=deformation_geometry(d,saved,cfg)
     bounds=[min(np.min(x) for x in before[1]+after[1]),max(np.max(x) for x in before[1]+after[1]),
         min(np.min(y) for y in before[2]+after[2]),max(np.max(y) for y in before[2]+after[2])]
-    ids=before[0];maximum=np.array([max(rates[int(d['source_id'][i])]) for i in ids])
+    ids=before[0];maximum=np.array([max(rates[str(d['source_id'][i])]) for i in ids])
     category=(maximum>.1).astype(int)+(maximum>.5).astype(int)
     base=[(90,125,160) if d['family'][i]==0 else (155,165,175) for i in ids]
     colors=[(220,35,45) if c==2 else (240,145,20) if c==1 else base[n] for n,c in enumerate(category)]
