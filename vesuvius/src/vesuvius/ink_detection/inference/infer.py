@@ -225,7 +225,12 @@ def select_layer_indices(
     output_depth: int,
     direction: str,
 ) -> np.ndarray:
-    """Select, clamp, center crop, and optionally reverse source layers."""
+    """Select, clamp, center crop, and optionally reverse source layers.
+
+    A requested window that is empty after clamping falls back to the full
+    source depth, which is logged as a warning so the run is not silently
+    equivalent to an unwindowed one.
+    """
 
     depth = int(depth)
     start = 0 if layer_start is None else int(layer_start)
@@ -237,6 +242,16 @@ def select_layer_indices(
     start = max(0, start)
     stop = min(depth, stop)
     if stop <= start:
+        if layer_start is not None or layer_end is not None:
+            LOGGER.warning(
+                "Requested source-Z window [%s, %s) is empty after clamping to "
+                "depth=%d; falling back to the full depth [0, %d). This run is "
+                "therefore identical to one with no window requested.",
+                layer_start,
+                layer_end,
+                depth,
+                depth,
+            )
         start, stop = 0, depth
     indices = center_crop_layer_indices(
         np.arange(start, stop, dtype=np.int64),
