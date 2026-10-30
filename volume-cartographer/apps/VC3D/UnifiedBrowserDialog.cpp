@@ -1,5 +1,6 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "vc_reader/sftp.hpp"
+#include "vc_reader/zarr.hpp"
 #include <QCheckBox>
 #include <QKeyEvent>
 
@@ -109,7 +110,7 @@ QString fileUriToPath(QString uri)
 
 // A browsable s3:// location: its bucket's URI ("s3://bucket/",
 // "s3+REGION://bucket/") and the listing of the key prefix below it, at the
-// endpoint the remote transport resolves (vc::resolveRemoteUrl).
+// endpoint the remote transport resolves (vcr::zarr::httpUrl).
 struct S3Location {
     QString bucketUri;
     vcr::s3::Prefix listing;  // key is empty at the bucket root, else ends with '/'
@@ -142,7 +143,7 @@ std::optional<S3Location> parseS3Url(const QString& input)
     const int bucketEnd = uri.indexOf('/', schemeEnd + 3);
     const QString bucketUri = bucketEnd >= 0 ? uri.left(bucketEnd) : uri;
     if (bucketUri.size() == schemeEnd + 3) return std::nullopt;
-    const auto listing = vcr::s3::splitPrefixUrl(vc::resolveRemoteUrl(uri.toStdString()).httpsUrl);
+    const auto listing = vcr::s3::splitPrefixUrl(vcr::zarr::httpUrl(uri.toStdString()));
     if (!listing) return std::nullopt;
     return S3Location{withTrailingSlash(bucketUri), *listing};
 }

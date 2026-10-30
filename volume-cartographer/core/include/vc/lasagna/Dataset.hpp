@@ -1,9 +1,12 @@
 #pragma once
 
-#include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -20,8 +23,9 @@ struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
     std::filesystem::path remoteCacheRoot;
     vc::HttpAuth remoteAuth;
-    vc::core::util::RemoteFileCachePolicy cachePolicy = vc::core::util::RemoteFileCachePolicy::CacheFirst;
-    vc::core::util::RemoteFileFetcher remoteFileFetcher;
+    bool refreshManifest = false;  // download a remote manifest even when it is cached
+    // Reads a remote manifest instead of a request, given its parent and file name.
+    std::function<std::optional<std::string>(const std::string&, const std::string&)> manifestReader;
     // False forces anonymous S3 access for both the manifest and its groups.
     bool discoverAwsCredentials = true;
 };
@@ -32,6 +36,8 @@ struct MaterializedLasagnaManifest {
     bool cacheHit = false;
 };
 
+// Downloads the manifest at a remote location to `path`, anonymously; atomic.
+void downloadLasagnaManifest(const std::string& location, const std::filesystem::path& path);
 [[nodiscard]] MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options);
 [[nodiscard]] std::string lasagnaGroupSourceLocation(
     const LasagnaChannelGroup& group);

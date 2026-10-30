@@ -6,7 +6,6 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc_reader/native/http.hpp"
-#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
@@ -244,11 +243,8 @@ CachedLasagna cacheLasagna(
 
     const auto manifestUrl = discoverManifestUrl(artifactUrl);
     const auto relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
-    vc::core::util::RemoteFileCacheOptions cacheOptions;
-    cacheOptions.cacheRoot = cacheRoot;
-    cacheOptions.destination = (finalDir / relativeName).lexically_relative(cacheRoot);
-    cacheOptions.discoverAwsCredentials = false;
-    const auto cached = vc::core::util::cacheRemoteFile(manifestUrl, cacheOptions);
+    const auto manifest = finalDir / relativeName;
+    vc::lasagna::downloadLasagnaManifest(manifestUrl, manifest);
     nlohmann::json marker{
         {"version", 1},
         {"anonymous", true},
@@ -267,9 +263,9 @@ CachedLasagna cacheLasagna(
         marker["base_shape_zyx"] = *volume.shapeZYX;
     writeMarker(markerPath, marker.dump(2));
     try {
-        auto dataset = vc::lasagna::LasagnaDataset::open(cached.path);
+        auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
         const auto kind = validatePrepared(volume, artifact, dataset);
-        return {cached.path, std::move(dataset), kind};
+        return {manifest, std::move(dataset), kind};
     } catch (...) {
         std::error_code ec;
         std::filesystem::remove(markerPath, ec);

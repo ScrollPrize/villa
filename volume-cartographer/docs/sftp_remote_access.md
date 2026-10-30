@@ -92,8 +92,8 @@ server requires clearing its old cache, as does changing data behind an HTTP URL
   POSIX-only. Uploads are deliberately outside this read-only feature.
 
 ```sh
-cmake --build volume-cartographer/build --target VC3D test_remote_url test_remote_file_cache test_unified_browser_dialog -j16
-ctest --test-dir volume-cartographer/build -R '^(test_(remote_url|remote_file_cache)|unified_browser_dialog)$' --output-on-failure
+cmake --build volume-cartographer/build --target VC3D test_remote_url test_unified_browser_dialog -j16
+ctest --test-dir volume-cartographer/build -R '^(test_remote_url|unified_browser_dialog)$' --output-on-failure
 cmake --build vc_reader/build-native-cuda --target test_native_sftp -j16
 ctest --test-dir vc_reader/build-native-cuda -R '^test_native_sftp$' --output-on-failure
 ```

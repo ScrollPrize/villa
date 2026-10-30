@@ -25,8 +25,6 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/util/RemoteFileCache.hpp"
-#include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "utils/hash.hpp"
 #include "vc_reader/zarr.hpp"
@@ -75,60 +73,22 @@ void applyResolvedVoxelSize(utils::Json& metadata,
         description);
 }
 
-// Reads metadata objects for a remote location. Definite answers for objects
-// under the public channels persist in the remote metadata cache, so a warm
-// open makes no network requests.
-vcr::zarr::MetadataReader cachedMetadataReader(const vcr::zarr::Access& access)
+// The first sidecar document a remote store has, with `scan` flattened into its root.
+std::optional<utils::Json> loadRemoteVolumeMetadata(const vcr::zarr::StoreMetadata& store, const std::string& location)
 {
-    return [read = vcr::zarr::metadataReader(access), access](
-               const std::string& location, const std::string& name) -> std::optional<std::string> {
-        const auto url = access.url(location + "/" + name);
-        if (!vc::core::util::RemoteMetadataCache::cacheable(url))
-            return read(location, name);
-        auto& cache = vc::core::util::remoteMetadataCache();
-        if (const auto answer = cache.lookup(url)) {
-            if (!*answer)
-                return std::nullopt;
-            return std::string(reinterpret_cast<const char*>((*answer)->data()), (*answer)->size());
-        }
-        auto text = read(location, name);
-        vc::core::util::RemoteMetadataCache::Answer record;
-        if (text) {
-            const auto* bytes = reinterpret_cast<const std::byte*>(text->data());
-            record.emplace(bytes, bytes + text->size());
-        }
-        cache.record(url, record);
-        return text;
-    };
-}
-
-std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& location,
-                                                    const vcr::zarr::MetadataReader& read)
-{
-    const auto load = [&](const std::string& name) -> std::optional<utils::Json> {
-        const auto body = read(location, name);
-        if (!body || body->empty())
-            return std::nullopt;
-        auto json = utils::Json::parse(*body);
-        const auto url = location + "/" + name;
-        if (!json.is_object()) {
-            throw std::runtime_error("remote volume metadata is not an object: " + url);
-        }
-        // Resolve from the document as published, before `scan` is flattened
-        // into the root.
-        const auto voxelSize = vcr::zarr::voxelSizeUm(vcr::zarr::Json::parse(*body));
-        if (json.contains("scan") && json["scan"].is_object()) {
+    for (const auto& name : {METADATA_FILE.string(), METADATA_FILE_ALT.string()}) {
+        const auto document = store.documents.find(name);
+        if (document == store.documents.end() || !document->is_object())
+            continue;
+        auto json = utils::Json::parse(document->dump());
+        if (json.contains("scan") && json["scan"].is_object())
             json.update(json["scan"]);
-        }
-        if (!json.contains("format")) {
+        if (!json.contains("format"))
             json["format"] = "zarr";
-        }
-        applyResolvedVoxelSize(json, voxelSize, url);
+        applyResolvedVoxelSize(json, store.voxelSizeUm, location + "/" + name);
         return json;
-    };
-    if (auto meta = load(METADATA_FILE.string()))
-        return meta;
-    return load(METADATA_FILE_ALT.string());
+    }
+    return std::nullopt;
 }
 
 std::string deriveRemoteVolumeId(const std::string& url)
@@ -185,17 +145,13 @@ bool paddedShapeOK(long long actual, long long expected, int padMultiple)
     return actual >= expected && actual - expected < maxPad;
 }
 
-// The signed form of a virtual-host S3 URL: https://BUCKET.s3[.REGION].amazonaws.com/KEY.
+// The signed form of an S3 URL.
 std::string signedS3Location(const std::string& url)
 {
-    const auto scheme = url.find("://");
-    const std::string rest = scheme == std::string::npos ? url : url.substr(scheme + 3);
-    const auto slash = rest.find('/');
-    const std::string host = rest.substr(0, slash);
-    const auto s3 = host.find(".s3.");
-    if (s3 == std::string::npos || host.find(".amazonaws.com") == std::string::npos)
+    auto location = vc::s3Location(url);
+    if (!location)
         throw std::runtime_error("signed requests need an S3 virtual-host URL: " + url);
-    return "s3://" + host.substr(0, s3) + (slash == std::string::npos ? std::string() : rest.substr(slash));
+    return std::move(*location);
 }
 
 std::array<int, 3> shape3(const vcr::Index& shape, const std::string& description)
@@ -446,8 +402,8 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
             location = signedS3Location(remoteUrl);
             options.access = vcr::zarr::s3Access(location, vc::readerAuth(requestAuth));
         }
-        options.metadata = cachedMetadataReader(options.access);
-        return std::pair{vcr::zarr::pyramidLevels(location, options), options.metadata};
+        options.cacheDirs = {vc::settings::remoteCachePath().string()};
+        return std::pair{vcr::zarr::pyramidLevels(location, options), options};
     };
     decltype(openLevels(auth)) opened;
     if (!spec.useAwsSigv4) {
@@ -459,15 +415,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         } catch (const std::exception&) {
             if (auth.empty() && discoverAwsCredentials) {
                 auth = vc::loadAwsCredentials();
-                if (auth.region.empty())
-                    auth.region = spec.awsRegion;
             }
             if (auth.empty())
                 throw;
             opened = openLevels(auth);
         }
     }
-    auto& [allLevels, readMetadata] = opened;
+    auto& [allLevels, openOptions] = opened;
     if (allLevels.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
     if (spec.baseScaleLevel > 0)
@@ -515,7 +469,8 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(vol->sourceLocation(), readMetadata)) {
+        const auto store = vcr::zarr::volumeMetadata(vol->sourceLocation(), openOptions);
+        if (auto remoteMeta = loadRemoteVolumeMetadata(store, vol->sourceLocation())) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
@@ -589,7 +544,6 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
         return options;
     if (!remoteAuth_.empty())
         options.access = vcr::zarr::s3Access(sourceLocation(), vc::readerAuth(remoteAuth_));
-    options.metadata = cachedMetadataReader(options.access);
     if (!remoteCacheRoot_.empty()) {
         options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;
         options.cacheMaxBytes = vc::settings::remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());

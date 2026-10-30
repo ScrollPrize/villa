@@ -33,7 +33,6 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/RemoteMetadataCache.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "BindCoordinatesPrompt.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -527,11 +526,13 @@ void MenuActionController::showOpenDataCatalog()
     dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
         if (!_window || !_window->_state) return tr("No viewer state.");
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        // Volume metadata is cached as immutable; a refresh is how a sample
+        // Volume metadata is kept as immutable; a refresh is how a sample
         // republished in place is picked up on its next open.
+        vcr::zarr::OpenOptions options;
+        options.cacheDirs = {vc::settings::remoteCachePath().string()};
         for (const auto& volume : sample.volumes)
             for (const auto& artifact : volume.artifacts)
-                vc::core::util::remoteMetadataCache().invalidate(artifact.url());
+                vcr::zarr::forgetKeptMetadata(artifact.url(), options);
         try {
             auto& state = *_window->_state;
             const auto project = state.sampleStore();

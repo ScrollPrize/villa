@@ -233,8 +233,6 @@ bool VolumeAttachmentController::resolveRemoteAuth(
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     *authOut = vc::loadAwsCredentials();
-    if (authOut->region.empty())
-        authOut->region = spec.awsRegion;
 
     if (authOut->access_key.empty() || authOut->secret_key.empty()) {
         const auto savedAccess =

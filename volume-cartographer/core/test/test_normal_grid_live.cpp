@@ -9,7 +9,7 @@
 
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc_reader/native/http.hpp"
-#include "vc/core/util/RemoteUrl.hpp"
+#include "vc_reader/zarr.hpp"
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -95,7 +95,7 @@ fs::path tmpDir(const std::string& tag)
 fs::path stagePHerc172Level5(const fs::path& dst)
 {
     const std::string base = std::string(kZarrRoot);
-    auto httpRoot = vc::resolveRemoteUrl(base).httpsUrl;
+    auto httpRoot = vcr::zarr::httpUrl(base);
 
     // 1. Pull root .zattrs (for OME multiscales).
     auto zattrs = fetch(httpRoot + "/.zattrs");

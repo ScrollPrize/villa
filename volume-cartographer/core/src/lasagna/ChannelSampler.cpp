@@ -9,10 +9,10 @@
 #include <type_traits>
 
 #include <opencv2/core.hpp>
-#if defined(__AVX2__) && defined(__FMA__)
-#include <immintrin.h>
 #include "vc_reader/array.hpp"
 #include "vc_reader/zarr.hpp"
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
 #endif
 
 namespace vc::lasagna {

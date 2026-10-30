@@ -1,5 +1,8 @@
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
+#include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
+#include "vc_reader/zarr.hpp"
 
 #include <charconv>
 #include <cstdlib>
@@ -74,77 +77,34 @@ int parseBaseScaleSelector(std::string_view fragment)
 
 } // namespace
 
-ResolvedUrl resolveRemoteUrl(const std::string& input)
+std::string normalizedRemoteUrl(const std::string& location)
 {
-    if (vcr::sftp::isSftpUrl(input))
-        return ResolvedUrl{vcr::sftp::parseUrl(input).str(), {}, false};
-    // Check for s3:// or s3+REGION:// prefix
-    if (input.rfind("s3://", 0) == 0) {
-        // s3://bucket/key — default region us-east-1
-        std::string rest = input.substr(5);  // after "s3://"
-        auto slash = rest.find('/');
-        std::string bucket = (slash != std::string::npos) ? rest.substr(0, slash) : rest;
-        std::string key = (slash != std::string::npos) ? rest.substr(slash + 1) : "";
+    return trimTrailingPathSlashes(vcr::sftp::isSftpUrl(location) ? vcr::sftp::parseUrl(location).str()
+                                                                  : vcr::zarr::httpUrl(location));
+}
 
-        std::string region = "us-east-1";
-        std::string httpsUrl = "https://" + bucket + ".s3." + region + ".amazonaws.com";
-        if (!key.empty()) {
-            httpsUrl += "/" + key;
-        }
+std::optional<std::string> s3Location(const std::string& url)
+{
+    if (url.starts_with("s3://"))
+        return url;
+    const auto https = vcr::zarr::httpUrl(url);
+    const auto prefix = vcr::s3::splitPrefixUrl(https);
+    if (!prefix || !https.starts_with("http"))
+        return std::nullopt;
+    const auto host = prefix->origin.substr(prefix->origin.find("://") + 3);
+    const auto s3 = host.find(".s3.");
+    if (s3 == std::string::npos || s3 == 0 || !host.ends_with(".amazonaws.com"))
+        return std::nullopt;
+    auto key = prefix->key;
+    while (!key.empty() && key.back() == '/')
+        key.pop_back();
+    return "s3://" + host.substr(0, s3) + (key.empty() ? std::string() : "/" + key);
+}
 
-        return ResolvedUrl{httpsUrl, region, true};
-    }
-
-    if (input.rfind("s3+", 0) == 0) {
-        // s3+REGION://bucket/key
-        auto schemeEnd = input.find("://");
-        if (schemeEnd == std::string::npos) {
-            // Malformed — treat as plain URL
-            return ResolvedUrl{input, {}, false};
-        }
-
-        std::string region = input.substr(3, schemeEnd - 3);  // between "s3+" and "://"
-        std::string rest = input.substr(schemeEnd + 3);
-
-        auto slash = rest.find('/');
-        std::string bucket = (slash != std::string::npos) ? rest.substr(0, slash) : rest;
-        std::string key = (slash != std::string::npos) ? rest.substr(slash + 1) : "";
-
-        std::string httpsUrl = "https://" + bucket + ".s3." + region + ".amazonaws.com";
-        if (!key.empty()) {
-            httpsUrl += "/" + key;
-        }
-
-        return ResolvedUrl{httpsUrl, region, true};
-    }
-
-    // Check if this is an S3 HTTPS URL by hostname pattern
-    // e.g. https://bucket.s3.region.amazonaws.com/key
-    //   or https://bucket.s3.amazonaws.com/key (us-east-1 default)
-    if (input.rfind("https://", 0) == 0 || input.rfind("http://", 0) == 0) {
-        auto schemeEnd = input.find("://");
-        std::string rest = input.substr(schemeEnd + 3);
-        auto slash = rest.find('/');
-        std::string host = (slash != std::string::npos) ? rest.substr(0, slash) : rest;
-
-        // Match *.s3.REGION.amazonaws.com or *.s3.amazonaws.com
-        auto s3Pos = host.find(".s3.");
-        if (s3Pos != std::string::npos && host.find(".amazonaws.com") != std::string::npos) {
-            // Extract region from between .s3. and .amazonaws.com
-            std::string afterS3 = host.substr(s3Pos + 4);  // after ".s3."
-            auto amzPos = afterS3.find(".amazonaws.com");
-            std::string region;
-            if (amzPos != std::string::npos && amzPos > 0) {
-                region = afterS3.substr(0, amzPos);
-            } else {
-                region = "us-east-1";
-            }
-            return ResolvedUrl{input, region, true};
-        }
-    }
-
-    // HTTP/HTTPS — pass through
-    return ResolvedUrl{input, {}, false};
+HttpAuth loadAwsCredentials()
+{
+    const auto keys = vcr::zarr::awsCredentials();
+    return keys ? HttpAuth{keys->user, keys->secret, keys->token, keys->region} : HttpAuth{};
 }
 
 RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
@@ -157,12 +117,7 @@ RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
         ? 0
         : parseBaseScaleSelector(std::string_view(input).substr(fragmentPos + 1));
 
-    auto resolved = resolveRemoteUrl(sourceInput);
-    // Preserve the legacy selector-free normalization exactly. Selector-aware
-    // URLs additionally trim a path slash which occurs before a query.
-    std::string sourceUrl = fragmentPos == std::string::npos
-        ? resolved.httpsUrl
-        : trimTrailingPathSlashes(std::move(resolved.httpsUrl));
+    std::string sourceUrl = normalizedRemoteUrl(sourceInput);
     while (!sourceUrl.empty() && sourceUrl.back() == '/') {
         sourceUrl.pop_back();
     }
@@ -175,8 +130,7 @@ RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
     if (baseScaleLevel > 0) {
         spec.portableLocator += "#vc-base-scale=" + std::to_string(baseScaleLevel);
     }
-    spec.awsRegion = std::move(resolved.awsRegion);
-    spec.useAwsSigv4 = resolved.useAwsSigv4;
+    spec.useAwsSigv4 = s3Location(spec.sourceUrl).has_value();
     return spec;
 }
 

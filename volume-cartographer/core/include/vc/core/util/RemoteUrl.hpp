@@ -1,21 +1,9 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 namespace vc {
-
-struct ResolvedUrl {
-    std::string httpsUrl;      // resolved transport URL (legacy field name; also SFTP)
-    std::string awsRegion;     // empty if not S3
-    bool useAwsSigv4 = false;  // true if s3:// and credentials detected
-};
-
-// Resolve s3://bucket/key -> https://... with optional SigV4 flag.
-// Supports s3://bucket/key (defaults to us-east-1) and
-// s3+REGION://bucket/key (explicit region).
-// Passes through http:// and https:// URLs unchanged.
-// Validates sftp:// URLs and canonicalizes ssh:// aliases to sftp://.
-ResolvedUrl resolveRemoteUrl(const std::string& input);
 
 inline constexpr int kMaxRemoteVolumeBaseScale = 5;
 
@@ -25,15 +13,20 @@ inline constexpr int kMaxRemoteVolumeBaseScale = 5;
 // * portableLocator includes the canonical client-side selector, when any,
 //   and is used when persisting or handing the view to another VC process.
 //
-// Selector-free inputs retain the pre-existing resolve-then-trim behavior.
 struct RemoteVolumeSpec {
     std::string sourceUrl;
     std::string portableLocator;
     int baseScaleLevel = 0;
     bool hasBaseScaleSelector = false;
-    std::string awsRegion;
     bool useAwsSigv4 = false;
 };
+
+// The URL requests for a location go to, with no slash ending its path; an existing
+// query is kept. ssh:// becomes sftp://.
+std::string normalizedRemoteUrl(const std::string& location);
+
+// The s3:// location (what vcr::zarr::s3Access signs) of an S3 URL; nullopt for any other.
+std::optional<std::string> s3Location(const std::string& url);
 
 // Parse #vc-base-scale=N before URL/S3 resolution. Unknown, duplicate, or
 // malformed selectors throw std::invalid_argument. N is restricted to 0..5;

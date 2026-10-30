@@ -33,8 +33,6 @@ add_library(vc_core
         src/Tiff.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
-        src/RemoteFileCache.cpp
-        src/RemoteMetadataCache.cpp
         src/RemoteCacheSettings.cpp
         src/Geometry.cpp
         src/PointCollections.cpp

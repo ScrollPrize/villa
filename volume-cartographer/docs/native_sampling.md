@@ -53,5 +53,5 @@ earlier gate are not reused.
 Malformed explicit configuration fails rather than silently falling back.
 Remote groups with explicit keys sign `s3://` requests; otherwise public
 buckets are read anonymously and other buckets with discovered AWS
-credentials when the dataset allows it. See
-[remote_file_cache.md](remote_file_cache.md) for manifest caching.
+credentials when the dataset allows it. A remote manifest is downloaded once under
+the cache root, at the path `vcr::zarr::decodedCachePath` gives it.

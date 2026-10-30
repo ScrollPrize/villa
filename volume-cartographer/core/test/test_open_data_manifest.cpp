@@ -474,9 +474,9 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     int fetches = 0;
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     openOptions.remoteCacheRoot = root;
-    openOptions.remoteFileFetcher = [&](const std::string&, const std::filesystem::path& temporary) {
+    openOptions.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
         ++fetches;
-        std::ofstream(temporary) << R"({"version":2,"groups":{
+        return R"({"version":2,"groups":{
             "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
         }})";
     };

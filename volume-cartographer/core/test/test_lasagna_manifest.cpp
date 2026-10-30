@@ -380,15 +380,8 @@ TEST_CASE("LasagnaDataset remote manifest requires explicit cache before fetch")
 TEST_CASE("LasagnaDataset rejects a malformed remote manifest source")
 {
     const auto dir = makeTmpDir("remote-fetch-diagnostics");
-    try {
-        (void)vc::lasagna::LasagnaDataset::openLocation(
-            "http://",
-            vc::lasagna::LasagnaDatasetOpenOptions{1.0, dir});
-        FAIL("expected invalid remote fetch to throw");
-    } catch (const std::exception& exc) {
-        const std::string what = exc.what();
-        CHECK(what.find("remote file cache source") != std::string::npos);
-    }
+    CHECK_THROWS(vc::lasagna::LasagnaDataset::openLocation(
+        "http://", vc::lasagna::LasagnaDatasetOpenOptions{1.0, dir}));
     fs::remove_all(dir);
 }
 
@@ -400,9 +393,9 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     options.remoteCacheRoot = dir;
     options.remoteAuth.access_key = "test-access";
     options.remoteAuth.secret_key = "test-secret";
-    options.remoteFileFetcher = [&](const std::string&, const fs::path& tmp) {
+    options.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
         ++fetches;
-        std::ofstream(tmp) << R"({
+        return R"({
           "version": 2,
           "groups": {
             "pred": {
@@ -429,10 +422,9 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     CHECK(first.manifest().groups.front().remoteCacheRoot ==
           fs::absolute(dir).lexically_normal());
     CHECK(first.manifest().manifestPath ==
-          dir / "remote_sources" / "s3+eu-west-2" / "bucket" /
-              "artifact" / "fiber.lasagna.json");
+          vcr::zarr::decodedCachePath(fs::absolute(dir).lexically_normal(), location));
     CHECK(second.manifest().manifestPath == first.manifest().manifestPath);
-    options.cachePolicy = vc::core::util::RemoteFileCachePolicy::Refresh;
+    options.refreshManifest = true;
     (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
     CHECK(fetches == 2);
     CHECK(fs::is_regular_file(first.manifest().manifestPath));
@@ -472,15 +464,15 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
     fs::remove_all(dir);
 }
 
-TEST_CASE("LasagnaDataset refreshes a corrupt size-valid cached manifest once")
+TEST_CASE("LasagnaDataset refreshes a corrupt cached manifest once")
 {
     const auto dir = makeTmpDir("remote-manifest-corrupt");
     int fetches = 0;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = dir;
-    options.remoteFileFetcher = [&](const std::string&, const fs::path& tmp) {
+    options.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
         ++fetches;
-        std::ofstream(tmp) << R"({"version":2,"groups":{}})";
+        return R"({"version":2,"groups":{}})";
     };
     const std::string location = "https://example.test/data/test.lasagna.json";
     const auto initial = vc::lasagna::LasagnaDataset::openLocation(location, options);

@@ -1,7 +1,6 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/PredictionPooling.hpp"
 
-#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <algorithm>
@@ -24,45 +23,56 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
 
 namespace vc::lasagna {
 namespace {
-
-[[nodiscard]] bool startsWithNoCase(std::string_view value, std::string_view prefix)
-{
-    if (value.size() < prefix.size())
-        return false;
-    for (size_t i = 0; i < prefix.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(value[i])) !=
-            std::tolower(static_cast<unsigned char>(prefix[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] bool isRemoteLocation(std::string_view value)
-{
-    return startsWithNoCase(value, "http://") ||
-           startsWithNoCase(value, "sftp://") ||
-           startsWithNoCase(value, "ssh://") ||
-           startsWithNoCase(value, "https://") ||
-           startsWithNoCase(value, "s3://") ||
-           (startsWithNoCase(value, "s3+") &&
-            value.find("://") != std::string_view::npos);
-}
 
 [[nodiscard]] bool isAbsoluteLocalPathString(const std::string& value)
 {
     return std::filesystem::path(value).is_absolute();
 }
 
-[[nodiscard]] vc::ResolvedUrl resolveRemoteEndpoint(const std::string& location)
+// A location's persistent, credential-free name: no query or fragment, no slash ending it.
+[[nodiscard]] std::string sourceName(std::string_view location)
 {
-    auto resolved = vc::resolveRemoteUrl(location);
-    resolved.httpsUrl = vc::core::util::normalizeRemoteFileLocation(location);
-    return resolved;
+    auto source = std::string(location.substr(0, location.find_first_of("?#")));
+    if (vcr::sftp::isSftpUrl(source))
+        source = vcr::sftp::parseUrl(source).str();
+    while (!source.empty() && source.back() == '/')
+        source.pop_back();
+    return source;
+}
+
+[[nodiscard]] std::string redacted(std::string_view location)
+{
+    const auto query = location.find('?');
+    return query == std::string_view::npos ? std::string(location) : std::string(location.substr(0, query)) + "?<redacted>";
+}
+
+// Keys sign s3:// requests; otherwise public buckets are read anonymously and others
+// with discovered AWS credentials when allowed.
+[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, const vc::HttpAuth& keys, bool discover)
+{
+    if (!keys.empty())
+        if (const auto s3 = vc::s3Location(location); s3 && !vcr::zarr::isPublicLocation(*s3))
+            return vcr::zarr::s3Access(*s3, vc::readerAuth(keys));
+    return vcr::zarr::resolveAccess(location, discover ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
+}
+
+void fetchManifest(const std::string& location, const std::filesystem::path& path,
+                   const std::function<std::optional<std::string>(const std::string&, const std::string&)>& read)
+{
+    const auto source = sourceName(location);
+    const auto slash = source.rfind('/');
+    if (slash == std::string::npos)
+        throw std::runtime_error("Remote Lasagna manifest has no object path: " + redacted(location));
+    const auto text = read(source.substr(0, slash), source.substr(slash + 1));
+    if (!text)
+        throw std::runtime_error("Remote Lasagna manifest does not exist: " + redacted(location));
+    std::filesystem::create_directories(path.parent_path());
+    vcr::zarr::atomicWrite(path, *text);
 }
 
 [[nodiscard]] std::string remoteParentUrl(const std::string& normalizedRemoteUrl)
@@ -139,9 +149,8 @@ void resolveGroupLocations(
         group.remoteCacheRoot.clear();
         group.discoverAwsCredentials = true;
 
-        if (isRemoteLocation(group.relativeZarrKey)) {
-            group.sourceLocation = vc::core::util::remoteFileCacheSource(
-                group.relativeZarrKey);
+        if (vcr::zarr::isRemote(group.relativeZarrKey)) {
+            group.sourceLocation = sourceName(group.relativeZarrKey);
             applyRemoteGroup(group, defaultRemoteCacheRoot,
                              remoteAuth, discoverAwsCredentials);
             continue;
@@ -188,9 +197,8 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
         throw std::runtime_error(
             "Lasagna remote marker does not identify the opened manifest");
     }
-    manifest.remoteBaseUrl = resolveRemoteEndpoint(url).httpsUrl;
-    manifest.remoteSourceBaseLocation =
-        vc::core::util::remoteFileCacheSource(url);
+    manifest.remoteBaseUrl = vc::normalizedRemoteUrl(url);
+    manifest.remoteSourceBaseLocation = sourceName(url);
     manifest.remoteCacheRoot = manifest.baseDirectory;
     manifest.discoverAwsCredentials =
         !marker.value("anonymous", false);
@@ -205,12 +213,17 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 
 bool isRemoteLasagnaLocation(std::string_view location)
 {
-    return isRemoteLocation(location);
+    return vcr::zarr::isRemote(std::string(location));
+}
+
+void downloadLasagnaManifest(const std::string& location, const std::filesystem::path& path)
+{
+    fetchManifest(location, path, vcr::zarr::metadataReader(vcr::zarr::resolveAccess(location, vcr::zarr::AuthMode::Anonymous)));
 }
 
 MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options)
 {
-    if (!isRemoteLocation(manifestLocation)) {
+    if (!vcr::zarr::isRemote(manifestLocation)) {
         return {
             std::filesystem::absolute(std::filesystem::path(manifestLocation)).lexically_normal(),
             manifestLocation,
@@ -218,28 +231,20 @@ MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manife
         };
     }
     if (options.remoteCacheRoot.empty()) {
-        throw std::runtime_error("Remote Lasagna manifest requires --remote-cache-dir: " + vc::core::util::redactedRemoteLocation(manifestLocation));
+        throw std::runtime_error("Remote Lasagna manifest requires --remote-cache-dir: " + redacted(manifestLocation));
     }
 
     const auto root = std::filesystem::absolute(options.remoteCacheRoot).lexically_normal();
-    const auto manifestPath = root / vc::core::util::remoteFileCachePath(
-        manifestLocation);
-
-    vc::core::util::RemoteFileCacheOptions cacheOptions;
-    cacheOptions.cacheRoot = root;
-    cacheOptions.destination = manifestPath.lexically_relative(root);
-    cacheOptions.policy = options.cachePolicy;
-    cacheOptions.auth = options.discoverAwsCredentials
-        ? options.remoteAuth
-        : vc::HttpAuth{};
-    cacheOptions.discoverAwsCredentials = options.discoverAwsCredentials;
-    cacheOptions.fetcher = options.remoteFileFetcher;
-    const auto cached = vc::core::util::cacheRemoteFile(manifestLocation, cacheOptions);
-    std::clog << "Lasagna manifest cache "
-              << (cached.cacheHit ? "hit: " : "download: ")
-              << vc::core::util::redactedRemoteLocation(cached.normalizedEndpoint)
-              << '\n';
-    return {cached.path, cached.normalizedEndpoint, cached.cacheHit};
+    const auto manifestPath = vcr::zarr::decodedCachePath(root, sourceName(manifestLocation));
+    const auto normalized = vc::normalizedRemoteUrl(manifestLocation);
+    const bool hit = !options.refreshManifest && std::filesystem::is_regular_file(manifestPath);
+    if (!hit) {
+        const auto keys = options.discoverAwsCredentials ? options.remoteAuth : vc::HttpAuth{};
+        fetchManifest(manifestLocation, manifestPath, options.manifestReader ? options.manifestReader
+            : vcr::zarr::metadataReader(lasagnaAccess(sourceName(manifestLocation), keys, options.discoverAwsCredentials)));
+    }
+    std::clog << "Lasagna manifest cache " << (hit ? "hit: " : "download: ") << redacted(normalized) << '\n';
+    return {manifestPath, normalized, hit};
 }
 
 namespace {
@@ -272,20 +277,18 @@ LasagnaDataset LasagnaDataset::openLocation(
     LasagnaDatasetOpenOptions options)
 {
     validateOpenOptions(options);
-    if (!isRemoteLocation(manifestLocation)) {
+    if (!vcr::zarr::isRemote(manifestLocation)) {
         return open(std::filesystem::path(manifestLocation), std::move(options));
     }
     auto materialized = materializeLasagnaManifest(manifestLocation, options);
     auto openMaterialized = [&](const MaterializedLasagnaManifest& source,
                                 const LasagnaDatasetOpenOptions& openOptions) {
         auto manifest = LasagnaDatasetManifest::parseFile(source.path);
-        manifest.manifestLocation =
-            vc::core::util::remoteFileCacheSource(manifestLocation);
+        manifest.manifestLocation = sourceName(manifestLocation);
         manifest.manifestIsRemote = true;
         manifest.workingToBaseScale = openOptions.workingToBaseScale;
         manifest.remoteBaseUrl = remoteParentUrl(source.normalizedLocation);
-        manifest.remoteSourceBaseLocation = remoteParentUrl(
-            vc::core::util::remoteFileCacheSource(manifestLocation));
+        manifest.remoteSourceBaseLocation = remoteParentUrl(sourceName(manifestLocation));
         manifest.remoteCacheRoot = source.path.parent_path();
         resolveGroupLocations(manifest, openOptions);
         return LasagnaDataset(std::move(manifest));
@@ -293,22 +296,14 @@ LasagnaDataset LasagnaDataset::openLocation(
     try {
         return openMaterialized(materialized, options);
     } catch (...) {
-        if (!materialized.cacheHit ||
-            options.cachePolicy == vc::core::util::RemoteFileCachePolicy::Refresh) {
+        if (!materialized.cacheHit)
             throw;
-        }
     }
 
-    // A size-valid cached object may still contain invalid JSON. Invalidate and
-    // refetch once; explicit sidecar-backed local manifests are never touched.
-    const auto root = std::filesystem::absolute(options.remoteCacheRoot)
-                          .lexically_normal();
-    vc::core::util::RemoteFileCacheOptions cacheOptions;
-    cacheOptions.cacheRoot = root;
-    cacheOptions.destination = materialized.path.lexically_relative(root);
-    vc::core::util::invalidateRemoteFileCacheEntry(cacheOptions);
+    // A cached object may still contain invalid JSON. Download it again, once;
+    // explicit sidecar-backed local manifests are never touched.
     auto refreshOptions = options;
-    refreshOptions.cachePolicy = vc::core::util::RemoteFileCachePolicy::Refresh;
+    refreshOptions.refreshManifest = true;
     materialized = materializeLasagnaManifest(manifestLocation, refreshOptions);
     return openMaterialized(materialized, refreshOptions);
 }
@@ -351,14 +346,7 @@ vcr::zarr::OpenedArray openLasagnaGroupArray(
     if (!group.isRemote())
         return vcr::zarr::openArray(lasagnaGroupSourceLocation(group), options);
     const auto& location = group.sourceLocation;
-    const auto& keys = group.remoteAuth;
-    // Explicit keys sign s3:// requests; otherwise public buckets are read
-    // anonymously and others with discovered AWS credentials when allowed.
-    options.access = keys.access_key.empty() || !location.starts_with("s3")
-        ? vcr::zarr::resolveAccess(location, group.discoverAwsCredentials
-              ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous)
-        : vcr::zarr::s3Access(location,
-              vcr::Auth{"s3", keys.access_key, keys.secret_key, keys.session_token, keys.region});
+    options.access = lasagnaAccess(location, group.remoteAuth, group.discoverAwsCredentials);
     options.cacheDirs = {group.remoteCacheRoot.string()};
     return vcr::zarr::openArray(location, options);
 }
