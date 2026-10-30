@@ -382,6 +382,58 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
         download_required_zarr_chunks.main(args)
 
 
+def test_downloader_plans_the_trainer_crop_at_volume_scale_one(tmp_path: Path) -> None:
+    datasets_root = tmp_path / "datasets"
+    segment = datasets_root / "dataset" / "segment"
+    segment.mkdir(parents=True)
+    # Level-0 tifxyz grid whose positions are offset from its row/column indices.
+    grid_y, grid_x = np.mgrid[0:16, 0:16].astype(np.float32)
+    surface = Tifxyz(
+        _x=grid_x + 8,
+        _y=grid_y + 4,
+        _z=np.full_like(grid_x, 12.0),
+        uuid="segment",
+        _mask=np.ones_like(grid_x, dtype=bool),
+    )
+    write_tifxyz(segment, surface, overwrite=True)
+    label_levels = {"0": np.zeros((3, 16, 16), dtype=np.uint8), "1": np.zeros((3, 8, 8), dtype=np.uint8)}
+    label_levels["0"][1, 8:10, 8:10] = 255
+    label_levels["1"][1, 4, 4] = 255
+    _write_group(segment / "segment_inklabels.zarr", label_levels, chunks=(1, 2, 2))
+    _write_group(segment / "segment_supervision_mask.zarr", label_levels, chunks=(1, 2, 2))
+
+    source_path = tmp_path / "source.zarr"
+    source = {
+        "0": (np.arange(16 * 32 * 32) % 250 + 1).astype(np.uint8).reshape(16, 32, 32),
+        "1": (np.arange(8 * 16 * 16) % 250 + 1).astype(np.uint8).reshape(8, 16, 16),
+    }
+    _write_group(source_path, source, chunks=(2, 2, 2))
+    volumes_json = tmp_path / "volumes.json"
+    volumes_json.write_text(
+        json.dumps({"dataset": {"volume_path": str(source_path), "volume_scale": 1}})
+    )
+    output_root = tmp_path / "output"
+
+    assert download_required_zarr_chunks.main(
+        [
+            "--datasets-root", str(datasets_root),
+            "--volumes-json", str(volumes_json),
+            "--output-root", str(output_root),
+            "--patch-size", "2",
+            "--overlap-fraction", "0.5",
+            "--download-workers", "1",
+        ]
+    ) == 0
+
+    # The only patch starts at level-1 flat (4, 4). The trainer samples tifxyz
+    # rows/columns 8 and 10 and halves their positions: z 6, y 6..7, x 8..9.
+    crop = (slice(6, 8), slice(6, 8), slice(8, 10))
+    output = zarr.open_group(output_root / "dataset.zarr", mode="r")
+    plan = output.attrs[download_required_zarr_chunks.DOWNLOAD_PLAN_ATTR]
+    assert plan["chunk_ids_by_scale"]["1"] == [[3, 3, 4]]
+    np.testing.assert_array_equal(output["1"][crop], source["1"][crop])
+
+
 @pytest.mark.parametrize(
     "dataset_name",
     [
