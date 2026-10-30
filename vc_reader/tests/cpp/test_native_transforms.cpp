@@ -29,6 +29,30 @@ int main()
         const auto defaults = default_targets();
         require(defaults.size() == 3 && defaults.at("image") == Target{} && defaults.at("mask").role == Role::Label && defaults.at("padding_mask").role == Role::Valid, "default targets");
         require(continuous(defaults.at("image")) && !continuous(defaults.at("mask")) && !continuous(defaults.at("padding_mask")), "continuous targets");
+
+        // Configuration checks belong to the pipeline, however a transform was built.
+        const std::map<std::string, Target> schema{{"image", image}};
+        const auto rejected = [&](const Op& op, const char* what) {
+            bool threw = false;
+            try { Pipeline({op}, schema); } catch (const std::invalid_argument&) { threw = true; }
+            require(threw, std::string("rejected: ") + what);
+        };
+        Normalize percentiles; percentiles.lower = 90; percentiles.upper = 10; rejected(percentiles, "percentile order");
+        Normalize fixed; fixed.scale = 0; rejected(fixed, "fixed scale");
+        BrightnessMultiply chance; chance.options.p_channel = 2; rejected(chance, "channel probability");
+        Gamma gamma; gamma.p_invert = -1; rejected(gamma, "gamma inversion probability");
+        OrientedBlur blur; blur.axis = {0, 0, 0}; rejected(blur, "zero axis");
+        DistanceTransform distance; distance.suffix = ""; rejected(distance, "empty suffix");
+        StructureTensor tensor; tensor.derivative = Derivative::Gaussian; tensor.sigma = 0; rejected(tensor, "gaussian sigma");
+        ForegroundCrop crop; rejected(crop, "crop shape");
+        ObjectDropout dropout; dropout.fill.image = std::numeric_limits<double>::infinity(); rejected(dropout, "fill value");
+        HistogramMatching matching; rejected(matching, "missing reference");
+        matching.reference = volume_detail::reference_volume(Array({1, 2, 2}, 'f', 4)); Pipeline({matching}, schema);
+        static_cast<float*>(matching.reference.values.data())[0] = std::numeric_limits<float>::quiet_NaN(); rejected(matching, "reference values");
+        auto one_of = std::make_shared<OneOf>(); one_of->transforms = {percentiles}; rejected(one_of, "inside OneOf");
+        // The defaults are the native ones, whichever language builds the transform.
+        require(std::holds_alternative<Uniform>(ChannelMisalignment{}.affine.degrees) && !ChannelMisalignment{}.affine.shared_scale, "channel misalignment default");
+        require(SurfacePerturb{}.p == .35, "surface perturbation default");
         std::cout << "Native transform pipeline and replay passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

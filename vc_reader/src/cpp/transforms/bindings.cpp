@@ -58,19 +58,19 @@ static std::vector<std::string> names(nb::handle value) {
     return nb::cast<std::vector<std::string>>(value);
 }
 static ChannelOptions options(Arguments& a) {
-    ChannelOptions o; o.p = a.kw("p", 1.); o.p_channel = a.kw("p_channel", 1.); o.shared = a.kw("shared", false);
+    ChannelOptions o; o.p = a.kw("p", o.p); o.p_channel = a.kw("p_channel", o.p_channel); o.shared = a.kw("shared", o.shared);
     o.channels = a.kw("channels", std::vector<std::size_t>{}); o.on = names(a.keyword("on", nb::none()));
-    probability(o.p); probability(o.p_channel); return o;
+    return o;
 }
 static LocalOptions local_options(Arguments& a) {
-    LocalOptions o; o.scale = parameter(a, "scale", o.scale); o.loc = scalar(a.keyword("loc", nb::cast(Uniform{-1, 2}))); return o;
+    LocalOptions o; o.scale = parameter(a, "scale", o.scale); o.loc = scalar(a.keyword("loc", std::visit([](const auto& v) { return nb::cast(v); }, o.loc))); return o;
 }
 template<class T, class F> void bind(nb::module_& m, const char* name, F initialize, const char* doc = nullptr) {
     nb::class_<T>(m, name, doc).def("__init__", [initialize](T* self, nb::args args, nb::kwargs kwargs) {
         Arguments a(args, kwargs); T value; initialize(value, a);
         if constexpr (requires { value.options; }) value.options = options(a);
-        else if constexpr (requires { value.p; }) { value.p = a.kw("p", 1.); probability(value.p); }
-        a.finish(); new (self) T(std::move(value));
+        else if constexpr (requires { value.p; }) value.p = a.kw("p", value.p);
+        a.finish(); validate_transform(value); new (self) T(std::move(value));
     });
 }
 static Morph morph(nb::handle object) {
@@ -157,8 +157,8 @@ NB_MODULE(_transforms, m) {
 
     bind<BrightnessMultiply>(m, "BrightnessMultiply", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); });
     bind<BrightnessAdd>(m, "BrightnessAdd", [](auto& t, auto& a) { t.shift = parameter(a, "shift", t.shift); });
-    bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", true); });
-    bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", 0.); t.p_retain_stats = a.get("p_retain_stats", 0.); probability(t.p_invert); probability(t.p_retain_stats); });
+    bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", t.preserve_range); });
+    bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", t.p_invert); t.p_retain_stats = a.get("p_retain_stats", t.p_retain_stats); });
     bind<Invert>(m, "Invert", [](auto&, auto&) {});
     bind<Normalize>(m, "Normalize", [](auto& t, auto& a) {
         const auto mode = a.get("mode", std::string("zscore"));
@@ -173,31 +173,26 @@ NB_MODULE(_transforms, m) {
             return a.kw(name, fallback);
         };
         using N = Normalization;
-        t.masked = option("masked", {N::MinMax, N::ZScore, N::Robust, N::Percentile}, false);
-        t.nonzero = option("nonzero", {N::ZScore}, true);
-        t.eps = option("eps", {N::ZScore}, 0.);
-        t.lower = option("lower", {N::Robust, N::Percentile}, 1.);
-        t.upper = option("upper", {N::Robust, N::Percentile}, 99.);
-        t.clip = option("clip", {N::Robust}, true);
-        t.median = option("median", {N::Percentile}, false);
-        t.center = option("center", {N::Fixed}, 0.);
-        t.scale = option("scale", {N::Fixed}, 1.);
+        t.masked = option("masked", {N::MinMax, N::ZScore, N::Robust, N::Percentile}, t.masked);
+        t.nonzero = option("nonzero", {N::ZScore}, t.nonzero);
+        t.eps = option("eps", {N::ZScore}, t.eps);
+        t.lower = option("lower", {N::Robust, N::Percentile}, t.lower);
+        t.upper = option("upper", {N::Robust, N::Percentile}, t.upper);
+        t.clip = option("clip", {N::Robust}, t.clip);
+        t.median = option("median", {N::Percentile}, t.median);
+        t.center = option("center", {N::Fixed}, t.center);
+        t.scale = option("scale", {N::Fixed}, t.scale);
         auto bounds = option("bounds", {N::Fixed}, nb::object(nb::none()));
         if (!bounds.is_none()) {
             auto values = nb::cast<std::vector<double>>(bounds); require(values.size() == 2, "bounds needs (low, high)");
             t.low = values[0]; t.high = values[1];
         }
-        require(std::isfinite(t.eps) && t.eps >= 0, "eps must be finite and nonnegative");
-        require(std::isfinite(t.lower) && std::isfinite(t.upper) && 0 <= t.lower && t.lower <= t.upper && t.upper <= 100,
-                "percentiles must satisfy 0 <= lower <= upper <= 100");
-        require(std::isfinite(t.center) && std::isfinite(t.scale) && t.scale != 0, "fixed normalization needs finite center and nonzero finite scale");
-        require(!std::isnan(t.low) && !std::isnan(t.high) && t.low <= t.high, "bounds must satisfy low <= high");
     });
-    bind<GaussianNoise>(m, "GaussianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
-    bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
-    bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", 1.); probability(t.p_retain_std); });
+    bind<GaussianNoise>(m, "GaussianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", t.shared_noise); });
+    bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", t.shared_noise); });
+    bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", t.p_retain_std); });
     bind<GaussianBlur>(m, "GaussianBlur", [](auto& t, auto& a) {
-        t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", true); t.truncate = a.get("truncate", 6.); t.full_width = a.get("full_width", true);
+        t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", t.shared_axes); t.truncate = a.get("truncate", t.truncate); t.full_width = a.get("full_width", t.full_width);
         auto boundary = a.get("boundary", std::string("mirror"));
         require(boundary == "mirror" || boundary == "reflect" || boundary == "nearest", "boundary must be mirror, reflect or nearest");
         t.boundary = boundary == "mirror" ? Boundary::Mirror : boundary == "nearest" ? Boundary::Nearest : Boundary::Reflect;
@@ -208,13 +203,12 @@ NB_MODULE(_transforms, m) {
         if (nb::isinstance<nb::str>(axis)) t.axis_from = nb::cast<std::string>(axis);
         else if (!axis.is_none()) {
             t.axis = nb::cast<std::vector<double>>(axis);
-            require((t.axis.size() == 2 || t.axis.size() == 3) && std::all_of(t.axis.begin(), t.axis.end(), [](double v) { return std::isfinite(v); }) &&
-                    std::any_of(t.axis.begin(), t.axis.end(), [](double v) { return v != 0; }), "axis must be a finite nonzero (y, x) or (z, y, x) vector");
+            require(!t.axis.empty(), "axis must be a finite nonzero (y, x) or (z, y, x) vector");
         }
     });
-    bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", false); });
-    bind<Sharpen>(m, "Sharpen", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.p_clamp = a.get("p_clamp", .5); probability(t.p_clamp); });
-    bind<BrightnessGradient>(m, "BrightnessGradient", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.mean_centered = a.get("mean_centered", true); t.clip = a.get("clip", false); });
+    bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", t.quantize); });
+    bind<Sharpen>(m, "Sharpen", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.p_clamp = a.get("p_clamp", t.p_clamp); });
+    bind<BrightnessGradient>(m, "BrightnessGradient", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.mean_centered = a.get("mean_centered", t.mean_centered); t.clip = a.get("clip", t.clip); });
     bind<LocalContrast>(m, "LocalContrast", [](auto& t, auto& a) { t.local = local_options(a); t.factor = parameter(a, "factor", t.factor); });
     bind<LocalGamma>(m, "LocalGamma", [](auto& t, auto& a) { t.local = local_options(a); t.gamma = parameter(a, "gamma", t.gamma); });
     bind<LocalSmoothing>(m, "LocalSmoothing", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.sigma = parameter(a, "sigma", t.sigma); });
@@ -222,37 +216,37 @@ NB_MODULE(_transforms, m) {
         auto size = a.take("size", nb::int_(16)); t.size.clear();
         if (nb::isinstance<nb::tuple>(size) || nb::isinstance<nb::list>(size)) { for (auto item : nb::borrow<nb::iterable>(size)) t.size.push_back(scalar(item)); } else t.size.push_back(scalar(size));
         auto value = a.take("value", nb::str("mean")); if (nb::isinstance<nb::str>(value)) t.statistic = nb::cast<std::string>(value); else { t.statistic.clear(); t.value = scalar(value); }
-        t.count = parameter(a, "count", t.count); t.square = a.get("square", false);
+        t.count = parameter(a, "count", t.count); t.square = a.get("square", t.square);
     });
     bind<SliceIllumination>(m, "SliceIllumination", [](auto& t, auto& a) {
         auto ax = a.get("axis", std::string("z")); require(ax.size() == 1, "axis must be one character"); t.axis = ax[0];
         t.defects = parameter(a, "defects", t.defects); t.width = parameter(a, "width", t.width); t.reduction = parameter(a, "reduction", t.reduction); t.base_p = parameter(a, "base_p", t.base_p); t.base_reduction = parameter(a, "base_reduction", t.base_reduction);
     });
     bind<Smear>(m, "Smear", [](auto& t, auto& a) { auto ax = a.get("axis", std::string("z")); require(ax.size() == 1, "axis must be one character"); t.axis = ax[0]; t.shift = a.get("shift", t.shift); t.alpha = a.get("alpha", t.alpha); t.previous = a.get("previous", t.previous); });
-    bind<Flip>(m, "Flip", [](auto& t, auto& a) { t.axes = a.get("axes", t.axes); t.p_axis = a.get("p_axis", t.p_axis); probability(t.p_axis); });
-    bind<Rotate90>(m, "Rotate90", [](auto& t, auto& a) { t.planes = a.get("planes", t.planes); auto turns = a.take("turns", nb::cast(t.turns)); t.turns = nb::isinstance<Choice>(turns) ? nb::cast<Choice>(turns) : Choice{nb::cast<std::vector<double>>(turns)}; t.resize = a.get("resize", false); });
+    bind<Flip>(m, "Flip", [](auto& t, auto& a) { t.axes = a.get("axes", t.axes); t.p_axis = a.get("p_axis", t.p_axis); });
+    bind<Rotate90>(m, "Rotate90", [](auto& t, auto& a) { t.planes = a.get("planes", t.planes); auto turns = a.take("turns", nb::cast(t.turns)); t.turns = nb::isinstance<Choice>(turns) ? nb::cast<Choice>(turns) : Choice{nb::cast<std::vector<double>>(turns)}; t.resize = a.get("resize", t.resize); });
     bind<Transpose>(m, "Transpose", [](auto& t, auto& a) { t.order = a.get("order", t.order); });
-    bind<CropPad>(m, "CropPad", [](auto& t, auto& a) { t.shape = a.get("shape", t.shape); t.random = a.get("random", false); });
-    bind<Affine>(m, "Affine", [](auto& t, auto& a) { t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale); t.translate = parameter(a, "translate", t.translate); t.shear = parameter(a, "shear", t.shear); t.rotation_axes = a.get("rotation_axes", t.rotation_axes); t.shared_scale = a.get("shared_scale", true); t.border = a.get("border", false); t.shape = a.get("shape", t.shape); });
-    bind<Elastic>(m, "Elastic", [](auto& t, auto& a) { t.sigma = parameter(a, "sigma", t.sigma); t.magnitude = parameter(a, "magnitude", t.magnitude); t.border = a.get("border", false); });
+    bind<CropPad>(m, "CropPad", [](auto& t, auto& a) { t.shape = a.get("shape", t.shape); t.random = a.get("random", t.random); });
+    bind<Affine>(m, "Affine", [](auto& t, auto& a) { t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale); t.translate = parameter(a, "translate", t.translate); t.shear = parameter(a, "shear", t.shear); t.rotation_axes = a.get("rotation_axes", t.rotation_axes); t.shared_scale = a.get("shared_scale", t.shared_scale); t.border = a.get("border", t.border); t.shape = a.get("shape", t.shape); });
+    bind<Elastic>(m, "Elastic", [](auto& t, auto& a) { t.sigma = parameter(a, "sigma", t.sigma); t.magnitude = parameter(a, "magnitude", t.magnitude); t.border = a.get("border", t.border); });
     bind<SheetCompression>(m, "SheetCompression", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.intensity_sigma = parameter(a, "intensity_sigma", t.intensity_sigma); t.smoothing = parameter(a, "smoothing", t.smoothing); t.axes = a.get("axes", t.axes); t.image = a.get("image", t.image); t.threshold = a.get("threshold", t.threshold); });
-    bind<LowResolution>(m, "LowResolution", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.shared_axes = a.get("shared_axes", true); });
-    bind<ThickSlice>(m, "ThickSlice", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.labels = a.get("labels", true); });
-    bind<Morphology>(m, "Morphology", [](auto& t, auto& a) { t.operation = morph(a.take("operation", nb::str("close"))); t.radius = parameter(a, "radius", t.radius); t.on = names(a.take("on", nb::none())); t.neutral_border = a.get("neutral_border", false); auto footprint = a.get("footprint", std::string("ball")); require(footprint == "ball" || footprint == "repeated_cross", "footprint must be ball or repeated_cross"); t.repeated_cross = footprint == "repeated_cross"; });
-    bind<RandomBinaryOperator>(m, "RandomBinaryOperator", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.radius = parameter(a, "radius", t.radius); auto ops = a.take("operations", nb::none()); if (!ops.is_none()) { t.operations.clear(); for (auto op : nb::borrow<nb::iterable>(ops)) t.operations.push_back(morph(op)); } t.p_channel = a.get("p_channel", 1.); });
-    bind<RemoveComponents>(m, "RemoveComponents", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.max_fraction = a.get("max_fraction", t.max_fraction); t.p_fill = a.get("p_fill", t.p_fill); t.p_channel = a.get("p_channel", t.p_channel); t.full_connectivity = a.get("full_connectivity", true); });
+    bind<LowResolution>(m, "LowResolution", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.shared_axes = a.get("shared_axes", t.shared_axes); });
+    bind<ThickSlice>(m, "ThickSlice", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.labels = a.get("labels", t.labels); });
+    bind<Morphology>(m, "Morphology", [](auto& t, auto& a) { t.operation = morph(a.take("operation", nb::str("close"))); t.radius = parameter(a, "radius", t.radius); t.on = names(a.take("on", nb::none())); t.neutral_border = a.get("neutral_border", t.neutral_border); auto footprint = a.get("footprint", std::string("ball")); require(footprint == "ball" || footprint == "repeated_cross", "footprint must be ball or repeated_cross"); t.repeated_cross = footprint == "repeated_cross"; });
+    bind<RandomBinaryOperator>(m, "RandomBinaryOperator", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.radius = parameter(a, "radius", t.radius); auto ops = a.take("operations", nb::none()); if (!ops.is_none()) { t.operations.clear(); for (auto op : nb::borrow<nb::iterable>(ops)) t.operations.push_back(morph(op)); } t.p_channel = a.get("p_channel", t.p_channel); });
+    bind<RemoveComponents>(m, "RemoveComponents", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.max_fraction = a.get("max_fraction", t.max_fraction); t.p_fill = a.get("p_fill", t.p_fill); t.p_channel = a.get("p_channel", t.p_channel); t.full_connectivity = a.get("full_connectivity", t.full_connectivity); });
     bind<ReplaceLabel>(m, "ReplaceLabel", [](auto& t, auto& a) { t.value = a.get("value", t.value); t.replacement = a.get("replacement", t.replacement); t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); });
     bind<Regions>(m, "Regions", [](auto& t, auto& a) { auto labels = a.take("labels", nb::tuple()); for (auto group : nb::borrow<nb::iterable>(labels)) { if (nb::isinstance<nb::list>(group) || nb::isinstance<nb::tuple>(group)) t.labels.push_back(nb::cast<std::vector<double>>(group)); else t.labels.push_back({nb::cast<double>(group)}); } t.on = a.get("on", t.on); t.output = a.get("output", t.output); t.channel = a.get("channel", t.channel); });
-    bind<OneHot>(m, "OneHot", [](auto& t, auto& a) { t.labels = a.get("labels", t.labels); t.on = a.get("on", t.on); t.output = a.get("output", t.output); t.append_to = a.get("append_to", t.append_to); t.channel = a.get("channel", t.channel); t.remove_source = a.get("remove_source", false); });
+    bind<OneHot>(m, "OneHot", [](auto& t, auto& a) { t.labels = a.get("labels", t.labels); t.on = a.get("on", t.on); t.output = a.get("output", t.output); t.append_to = a.get("append_to", t.append_to); t.channel = a.get("channel", t.channel); t.remove_source = a.get("remove_source", t.remove_source); });
     bind<MaskImage>(m, "MaskImage", [](auto& t, auto& a) { t.mask = a.get("mask", t.mask); t.on = a.get("on", t.on); t.mask_channel = a.get("mask_channel", t.mask_channel); t.channels = a.get("channels", t.channels); t.fill = a.get("fill", t.fill); });
     bind<DeepSupervision>(m, "DeepSupervision", [](auto& t, auto& a) { auto scales = a.take("scales", nb::tuple()); for (auto v : nb::borrow<nb::iterable>(scales)) { if (nb::isinstance<nb::tuple>(v) || nb::isinstance<nb::list>(v)) t.scales.push_back(nb::cast<std::vector<double>>(v)); else t.scales.push_back({nb::cast<double>(v)}); } t.on = a.get("on", t.on); t.output = a.get("output", t.output); });
     bind<ToPseudo2D>(m, "ToPseudo2D", [](auto&, auto&) {});
     bind<FromPseudo2D>(m, "FromPseudo2D", [](auto&, auto&) {});
-    bind<MedialSurface>(m, "MedialSurface", [](auto& t, auto& a) { t.on = names(a.take("on", nb::none())); t.suffix = a.get("suffix", t.suffix); t.tube = a.get("tube", true); t.open = a.get("open", false); t.close = a.get("close", true); t.ignore = a.get("ignore", t.ignore); });
+    bind<MedialSurface>(m, "MedialSurface", [](auto& t, auto& a) { t.on = names(a.take("on", nb::none())); t.suffix = a.get("suffix", t.suffix); t.tube = a.get("tube", t.tube); t.open = a.get("open", t.open); t.close = a.get("close", t.close); t.ignore = a.get("ignore", t.ignore); });
     bind<StripGeometry>(m, "StripGeometry", [](auto& t, auto& a) {
         t.shift_x = parameter(a, "shift_x", t.shift_x); t.shift_y = parameter(a, "shift_y", t.shift_y); t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale);
         t.shear_x = parameter(a, "shear_x", t.shear_x); t.shear_y = parameter(a, "shear_y", t.shear_y); t.smooth_offset = parameter(a, "smooth_offset", t.smooth_offset); t.stride = parameter(a, "stride", t.stride);
-        t.p_flip_x = a.get("p_flip_x", 0.); t.p_flip_y = a.get("p_flip_y", 0.); t.shape = a.get("shape", t.shape);
+        t.p_flip_x = a.get("p_flip_x", t.p_flip_x); t.p_flip_y = a.get("p_flip_y", t.p_flip_y); t.shape = a.get("shape", t.shape);
     });
     bind<SurfacePerturb>(m, "SurfacePerturb", [](auto& t, auto& a) {
         t.on = a.get("on", t.on); t.blobs = parameter(a, "blobs", t.blobs); t.sigma_fraction = parameter(a, "sigma_fraction", t.sigma_fraction); t.amplitude = parameter(a, "amplitude", t.amplitude);
@@ -265,7 +259,6 @@ NB_MODULE(_transforms, m) {
         t.mode = mode == "signed" ? DistanceMode::Signed : mode == "inside" ? DistanceMode::Inside : DistanceMode::Outside;
         t.suffix = a.get("suffix", t.suffix); auto normals = a.get("normals", nb::object(nb::none()));
         t.normals = normals.is_none() ? "" : nb::cast<std::string>(normals); t.components = a.get("components", t.components);
-        require(t.suffix != t.normals && !t.suffix.empty(), "distance and normal suffixes must be distinct and nonempty");
     });
     bind<StructureTensor>(m, "StructureTensor", [](auto& t, auto& a) {
         t.on = a.get("on", t.on); t.channel = a.get("channel", t.channel); t.output = a.get("output", t.output);
@@ -282,12 +275,6 @@ NB_MODULE(_transforms, m) {
         t.components = a.get("components", t.components); auto confidence = a.get("confidence", nb::object(nb::none()));
         t.confidence = confidence.is_none() ? "" : nb::cast<std::string>(confidence);
         auto at = a.get("at", nb::object(nb::none())); if (!at.is_none()) t.at = nb::cast<std::vector<double>>(at);
-        require(std::isfinite(t.sigma) && t.sigma >= 0 && t.sigma < 1000 && std::isfinite(t.rho) && t.rho >= 0 && t.rho < 1000, "sigma and rho must be in [0, 1000)");
-        require(t.derivative == Derivative::Pavel || t.sigma > 0, "gaussian derivatives need sigma > 0");
-        require(std::isfinite(t.truncate) && t.truncate > 0 && std::isfinite(t.scale), "truncate must be positive and scale finite");
-        require(t.at.empty() || (t.rho > 0 && t.field == StructureField::Components && t.confidence.empty()),
-                "point evaluation (at) returns the tensor and needs rho > 0");
-        require(std::all_of(t.at.begin(), t.at.end(), [](double v) { return std::isfinite(v); }), "at must be finite");
     });
     bind_volumetric(m);
     bind<OneOf>(m, "OneOf", [](auto& t, auto& a) { t.transforms = a.get("transforms", t.transforms); t.weights = a.get("weights", t.weights); });

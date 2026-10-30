@@ -31,6 +31,7 @@
 #include "cpu/stripe_masking.hpp"
 #include "cpu/foreground_dropout.hpp"
 #include "cpu/object_dropout.hpp"
+#include "validate.hpp"
 #include <bit>
 
 namespace vcr::transforms {
@@ -58,6 +59,12 @@ void validate_program(const std::vector<Op>&);
 namespace cuda { using vcr::cuda::available; }
 #endif
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
+inline void validate_transform(const Op& op) {
+    std::visit([](const auto& t) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) { probability(t->p); for (const auto& child : t->transforms) validate_transform(child); }
+        else validate_transform(t);
+    }, op);
+}
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };
 #ifdef VC_READER_CUDA
 namespace cuda {
@@ -153,7 +160,7 @@ public:
 #endif
         }
         require(!program_->targets.empty(), "target schema must not be empty");
-        for (const auto& op : program_->transforms) probability(chance(op));
+        for (const auto& op : program_->transforms) validate_transform(op);
     }
     const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
