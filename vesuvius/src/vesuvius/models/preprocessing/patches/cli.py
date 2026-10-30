@@ -77,8 +77,8 @@ def main() -> None:
     args = parser.parse_args()
     _configure_blosc_threads()
 
-    if args.input is not None and not args.input.exists():
-        parser.error(f"Input directory does not exist: {args.input}")
+    if args.input is not None and not args.input.is_dir():
+        parser.error(f"Input is not a directory: {args.input}")
 
     result = generate_patch_caches(
         config_path=args.config,
