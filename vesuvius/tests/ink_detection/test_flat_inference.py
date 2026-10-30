@@ -201,6 +201,41 @@ def test_flat_axes_layers_reverse_and_short_depth_padding(tmp_path):
     ).tolist() == [5, 4, 3, 2, 1, 0]
 
 
+def test_discarded_layer_window_warns_and_falls_back(caplog):
+    default = select_layer_indices(
+        31,
+        layer_start=None,
+        layer_end=None,
+        output_depth=17,
+        direction="forward",
+    )
+
+    for layer_start, layer_end in ((22, 5), (40, 50), (10, 10)):
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            indices = select_layer_indices(
+                31,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                output_depth=17,
+                direction="forward",
+            )
+        np.testing.assert_array_equal(indices, default)
+        assert "is empty after clamping" in caplog.text
+        assert "identical to one with no window requested" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        select_layer_indices(
+            31,
+            layer_start=None,
+            layer_end=None,
+            output_depth=17,
+            direction="forward",
+        )
+    assert caplog.text == ""
+
+
 def test_blocks_occupancy_blend_accumulation_and_truncating_tiles():
     occupancy = np.array([[False, True], [False, False]])
     blocks = iter_blocks((5, 7), 4, 3, occupancy, (3, 4))

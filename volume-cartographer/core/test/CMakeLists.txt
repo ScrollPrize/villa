@@ -595,6 +595,12 @@ set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
 
+vc_add_test(NAME test_normal_constraint_grid_change
+    SOURCES test_normal_constraint_grid_change.cpp
+            normal_constraint_grid_change_fixture.cpp
+    LIBS doctest::doctest vc_core Ceres::ceres)
+set_tests_properties(test_normal_constraint_grid_change PROPERTIES TIMEOUT 30)
+
 vc_add_test(NAME test_surface_patch_index)
 
 vc_add_test(NAME test_tiff_merge)
@@ -804,3 +810,6 @@ vc_add_test(NAME test_quadsurface_store)
 
 
 vc_add_test(NAME test_volume_pkg_more)
+
+vc_add_test(NAME test_seed_anchor LIBS doctest::doctest Ceres::ceres
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../include")

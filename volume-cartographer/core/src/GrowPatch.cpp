@@ -44,6 +44,7 @@
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
+#include "vc/tracer/SeedAnchor.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
 
@@ -533,6 +534,7 @@ private:
 struct TraceData {
     TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
+    vc::tracer::SeedAnchor seed_anchor;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
     cv::Mat_<uchar> allowed_growth_mask;
@@ -1955,6 +1957,7 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
     options.max_num_iterations = 10000;
     // options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;
+    trace_data.seed_anchor.apply(problem);
     ceres::Solve(options, &problem, &summary);
 
     // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
@@ -2026,8 +2029,10 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++)
             loss_status(oy,ox) = 0;
 
-    for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
+    // add_missing_losses() reads neighbours up to two cells away, so skip the outer two rows and
+    // columns of the grid (growth never places points there).
+    for(int oy=std::max(p[0]-radius,2);oy<=std::min(p[0]+radius,params.dpoints.rows-3);oy++)
+        for(int ox=std::max(p[1]-radius,2);ox<=std::min(p[1]+radius,params.dpoints.cols-3);ox++) {
             cv::Vec2i op = {oy, ox};
             if (cv::norm(p-op) <= radius) {
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
@@ -2090,6 +2095,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     ceres::Solver::Summary summary;
 
+    trace_data.seed_anchor.apply(problem);
     ceres::Solve(options, &problem, &summary);
 
     if (timing) {
@@ -2204,6 +2210,16 @@ struct thresholdedDistance
 
 QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
+    // Opt-in only. Existing jobs and unsupported editing/scaling modes retain
+    // their old behavior unless an anchor is explicitly requested.
+    const bool anchor_requested = params.contains("seed_anchor_xyz");
+    if (resume_surf && resume_surf->meta.contains("seed_anchor") && !anchor_requested)
+        throw std::runtime_error("anchored resume requires seed_anchor_xyz");
+    if (anchor_requested && (level != 0 || scale != 1.0f ||
+            params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
+            params.value("cell_reopt_mode", false) || params.value("rewind_gen", -1) != -1 ||
+            params.value("inpaint", false) || !corrections.getAllCollections().empty()))
+        throw std::runtime_error("seed anchor supports level-0 explicit seed/resume without inpaint or corrections only");
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
@@ -2267,6 +2283,25 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
     }
     TraceData trace_data(direction_fields);
+    if (anchor_requested) {
+        auto xyz = params["seed_anchor_xyz"].get_double_array();
+        if (xyz.size() != 3) throw std::runtime_error("seed_anchor_xyz needs three coordinates");
+        trace_data.seed_anchor.configure({xyz[0], xyz[1], xyz[2]});
+        if (!resume_surf) {
+            double seed[3] = {origin[0], origin[1], origin[2]};
+            if (!trace_data.seed_anchor.matches(seed))
+                throw std::runtime_error("explicit seed differs from seed_anchor_xyz");
+        } else {
+            if (!resume_surf->meta.contains("seed_anchor"))
+                throw std::runtime_error("resume has no seed anchor provenance");
+            const auto& saved = resume_surf->meta["seed_anchor"];
+            if (saved.value("version", 0) != 1 || saved.value("mode", std::string()) != "fixed-vertex")
+                throw std::runtime_error("unsupported seed anchor provenance");
+            auto old = saved["xyz"].get_double_array();
+            if (old.size() != 3 || !trace_data.seed_anchor.matches(old.data()))
+                throw std::runtime_error("resume seed anchor identity changed");
+        }
+    }
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
     loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
@@ -2408,6 +2443,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
 
     int w, h;
+    int resume_extra_cols = 0;
+    int resume_extra_rows = 0;
     if (resume_surf) {
         cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
         if (resume_generations.empty()) {
@@ -2434,6 +2471,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         const int grow_max_extra_rows = std::max(grow_extra_rows, params.value("grow_max_extra_rows", gen_diff));
         const int extra_cols = disable_grid_expansion ? grow_extra_cols : grow_max_extra_cols;
         const int extra_rows = disable_grid_expansion ? grow_extra_rows : grow_max_extra_rows;
+        resume_extra_cols = extra_cols;
+        resume_extra_rows = extra_rows;
         constexpr int grid_margin_each_side = 25;
         w = resume_generations.cols + 2 * extra_cols + 2 * grid_margin_each_side;
         h = resume_generations.rows + 2 * extra_rows + 2 * grid_margin_each_side;
@@ -2670,6 +2709,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
     cv::Rect used_area;
+    // Resume only: where outward growth from the imported grid may place points.
+    cv::Rect resume_growth_limit;
     int generation = 1;
 
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
@@ -2678,6 +2719,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     int resume_pad_x = 0;
 
     auto create_surface_from_state = [&, &f_timer = *timer]() {
+        trace_data.seed_anchor.verify();
         cv::Rect used_area_safe = used_area;
         used_area_safe.x -= 2;
         used_area_safe.y -= 2;
@@ -2749,6 +2791,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
+        if (anchor_requested) {
+            auto a = utils::Json::object();
+            a["version"] = 1; a["mode"] = "fixed-vertex";
+            auto xyz = utils::Json::array();
+            for (double v : trace_data.seed_anchor.xyz()) xyz.push_back(v);
+            a["xyz"] = xyz;
+            surf->meta["seed_anchor"] = a;
+        }
         {
             auto seed_arr = utils::Json::array();
             seed_arr.push_back(origin[0]); seed_arr.push_back(origin[1]); seed_arr.push_back(origin[2]);
@@ -2855,6 +2905,12 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         resume_pad_y = (h - resume_points.rows) / 2;
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        // Stay within the requested expansion (none with disable_grid_expansion, as in
+        // VC3D Fill) and two cells from the work grid edge, which add_losses requires.
+        resume_growth_limit = cv::Rect(resume_pad_x - resume_extra_cols, resume_pad_y - resume_extra_rows,
+                                       resume_points.cols + 2 * resume_extra_cols,
+                                       resume_points.rows + 2 * resume_extra_rows) &
+                              cv::Rect(2, 2, w - 4, h - 4);
 
         if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
             if (effective_allowed_growth_mask->rows != resume_points.rows || effective_allowed_growth_mask->cols != resume_points.cols) {
@@ -2924,6 +2980,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
+        if (anchor_requested) {
+            for (int r = 0; r < trace_params.dpoints.rows; ++r)
+                for (int c = 0; c < trace_params.dpoints.cols; ++c)
+                    if ((trace_params.state(r,c) & STATE_LOC_VALID) && generations(r,c) == 1 &&
+                            trace_data.seed_anchor.matches(&trace_params.dpoints(r,c)[0]))
+                        trace_data.seed_anchor.bind(&trace_params.dpoints(r,c)[0]);
+            trace_data.seed_anchor.verify();
+        }
         if (imported_zero_generation_points > 0) {
             std::cout << "Resume import preserved " << imported_zero_generation_points
                       << " valid points with zero generation metadata." << std::endl;
@@ -3170,6 +3234,15 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         fringe.push_back({y0+1,x0+1});
     }
 
+    if (anchor_requested && !resume_surf)
+        trace_data.seed_anchor.bind(&trace_params.dpoints(y0,x0)[0]);
+    auto log_seed_anchor = [&](const char* event) {
+        if (!anchor_requested) return;
+        trace_data.seed_anchor.verify();
+        std::cout << "seed_anchor event=" << event << " generation=" << generation
+                  << " displacement_vox=0 mode=fixed-vertex" << std::endl;
+    };
+    log_seed_anchor("before-initial-optimization");
     int succ_start = succ;
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
@@ -3398,6 +3471,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     }
 
     // Prepare a new set of Ceres options used later during local solves
+    log_seed_anchor("after-initial-optimization");
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
     options.minimizer_progress_to_stdout = false;
@@ -3407,6 +3481,13 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     auto neighs = parse_growth_directions(params);
 
     int local_opt_r = 3;
+
+    // add_losses() needs two cells of neighbours on every side of a point. A candidate closer
+    // than that to the work-grid edge used to throw "point too close to problem border!" inside
+    // the parallel candidate loop, which std::terminate()s the run before anything is saved.
+    // Growth now stops at this inner rectangle and the surface is saved as usual.
+    const cv::Rect growth_bounds(2, 2, w - 4, h - 4);
+    bool reported_grid_edge = false;
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
@@ -3431,7 +3512,17 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         };
 
         auto append_candidate = [&](const cv::Vec2i& p) {
-            if (!bounds.contains(cv::Point(p[1], p[0])) ||
+            if (!growth_bounds.contains(cv::Point(p[1], p[0]))) {
+                if (!reported_grid_edge && bounds.contains(cv::Point(p[1], p[0]))) {
+                    reported_grid_edge = true;
+                    std::cout << "growth reached the edge of the " << w << "x" << h
+                              << " work grid and stops there; the grid is sized from 'generations'"
+                              << " (and grow_extra_* / grow_max_extra_* when resuming)" << std::endl;
+                }
+                return;
+            }
+            // Enforce resume limits for both hole-filling and rectangular-frontier growth.
+            if ((resume_surf && !resume_growth_limit.contains(cv::Point(p[1], p[0]))) ||
                 (trace_params.state(p) & STATE_PROCESSING) != 0 ||
                 (trace_params.state(p) & STATE_LOC_VALID) != 0) {
                 return;
@@ -3457,10 +3548,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
 
         if (!used_area_fully_valid) {
-            // Irregular resumed patches should fill holes within the existing grid before
-            // growing the bounding rectangle. For right growth, this means every valid
-            // point with an invalid point immediately to its right contributes that
-            // invalid point as a candidate; the other directions follow the same rule.
+            // Offer interior candidates first, then outward neighbours on resume. Collect
+            // both in one traversal while preserving the interior-before-outward order.
+            std::vector<cv::Vec2i> outward_candidates;
             for (int j = used_area.y; j < used_area.br().y; ++j) {
                 for (int i = used_area.x; i < used_area.br().x; ++i) {
                     const cv::Vec2i p{j, i};
@@ -3472,9 +3562,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                         const cv::Vec2i candidate = p + n;
                         if (is_inside_used_area(candidate)) {
                             append_candidate(candidate);
+                        } else if (resume_surf) {
+                            outward_candidates.push_back(candidate);
                         }
                     }
                 }
+            }
+            for (const auto& candidate : outward_candidates) {
+                append_candidate(candidate);
             }
         } else {
             // For a rectangular patch, keep the existing fast frontier behavior.
@@ -3483,6 +3578,10 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     append_candidate(p + n);
                 }
             }
+        }
+
+        if (resume_surf && cands.empty()) {
+            break;
         }
 
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
@@ -3617,6 +3716,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
 
                     ceres::Solver::Summary summary;
+                    trace_data.seed_anchor.apply(problem);
                     ceres::Solve(options, &problem, &summary);
 
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true, false);
@@ -3693,6 +3793,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
+        log_seed_anchor("after-generation");
         cands.resize(0);
 
         // --- Speed Reporting ---

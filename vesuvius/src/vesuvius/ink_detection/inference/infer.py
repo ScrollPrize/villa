@@ -225,7 +225,12 @@ def select_layer_indices(
     output_depth: int,
     direction: str,
 ) -> np.ndarray:
-    """Select, clamp, center crop, and optionally reverse source layers."""
+    """Select, clamp, center crop, and optionally reverse source layers.
+
+    A requested window that is empty after clamping falls back to the full
+    source depth, which is logged as a warning so the run is not silently
+    equivalent to an unwindowed one.
+    """
 
     depth = int(depth)
     start = 0 if layer_start is None else int(layer_start)
@@ -237,6 +242,16 @@ def select_layer_indices(
     start = max(0, start)
     stop = min(depth, stop)
     if stop <= start:
+        if layer_start is not None or layer_end is not None:
+            LOGGER.warning(
+                "Requested source-Z window [%s, %s) is empty after clamping to "
+                "depth=%d; falling back to the full depth [0, %d). This run is "
+                "therefore identical to one with no window requested.",
+                layer_start,
+                layer_end,
+                depth,
+                depth,
+            )
         start, stop = 0, depth
     indices = center_crop_layer_indices(
         np.arange(start, stop, dtype=np.int64),
@@ -795,11 +810,27 @@ class ChunkAccumulator:
             weights = tile_weights[source]
             probability_buffer[destination] += tile[source] * weights
             weight_buffer[destination] += weights
-            seen = self.seen_counts.get(key, 0) + 1
-            if seen >= self.contribution_counts[key]:
+            self._finish_contribution(key)
+
+    def skip_tile(
+        self, *, y0: int, x0: int, valid_h: int, valid_w: int
+    ) -> None:
+        """Complete a raw-empty tile without allocating or adding weights."""
+
+        for key in iter_overlapping_chunks(
+            y0, x0, valid_h, valid_w, (self.chunk_h, self.chunk_w)
+        ):
+            self._finish_contribution(key)
+
+    def _finish_contribution(self, key: ChunkKey) -> None:
+        seen = self.seen_counts.get(key, 0) + 1
+        if seen >= self.contribution_counts[key]:
+            if key in self.buffers:
                 self._flush(key)
             else:
-                self.seen_counts[key] = seen
+                self.seen_counts.pop(key, None)
+        else:
+            self.seen_counts[key] = seen
 
     def _flush(self, key: ChunkKey) -> None:
         probability, weight = self.buffers.pop(key)
@@ -809,7 +840,7 @@ class ChunkAccumulator:
         self.weight_sum_store[y0:y1, x0:x1] = weight
 
     def flush_remaining(self) -> None:
-        """Flush chunks whose skipped raw-empty blocks prevented early completion."""
+        """Flush any remaining accumulation buffers."""
 
         for key in tuple(self.buffers):
             self._flush(key)
@@ -884,6 +915,11 @@ def run_block_inference(
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
+            for values in metadata[~keep].numpy():
+                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+                accumulator.skip_tile(
+                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+                )
             if not bool(keep.any()):
                 continue
             # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
