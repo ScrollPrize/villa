@@ -43,6 +43,11 @@ def read_remote_source(source, options):
         return reader.read((0, 0), (5, 7))
 
 
+def cached_files(cache):
+    """Remote image files cached under ``cache`` (at their URLs' bucket paths)."""
+    return [p for p in Path(cache).rglob('*') if p.is_file() and p.suffix in ('.png', '.tif')]
+
+
 def array(path, data, attrs=None, fill=0):
     path.mkdir(parents=True, exist_ok=True)
     (path / '.zarray').write_text(json.dumps(dict(zarr_format=2, shape=data.shape, chunks=data.shape,
@@ -534,7 +539,7 @@ class RemoteTests(RemoteFixtureCase):
                 release.set()
             np.testing.assert_array_equal(first.result(10), self.data)
             np.testing.assert_array_equal(second.result(10), self.data)
-        self.assertLessEqual(sum(p.stat().st_size for p in self.cache.rglob('*.blob')), len(payload))
+        self.assertLessEqual(sum(p.stat().st_size for p in cached_files(self.cache)), len(payload))
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
     def test_abandoned_download_releases_its_reservation(self):
@@ -617,7 +622,8 @@ class RemoteTests(RemoteFixtureCase):
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
             self.assertEqual(before, self.counts)
         with source.open(cache_dir=self.cache) as reader:
-            self.assertEqual(reader.stats()['remote_bytes'], 0)  # Conditional 304.
+            self.assertEqual(reader.stats()['remote_bytes'], 0)
+        self.assertEqual(before, self.counts)  # A cached copy is trusted, never revalidated.
         missing = replace(source, storage=Storage(self.url+'/missing.png', 'png'))
         with self.assertRaises(CacheMissError):
             missing.open(cache_dir=self.cache, offline=True)
@@ -652,7 +658,7 @@ class RemoteTests(RemoteFixtureCase):
         source = Source('image', Storage(self.url+'/image.png', 'png'))
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.cache, cache_max_bytes=size-1)
-        self.assertEqual(list(self.cache.rglob('*.blob')), [])
+        self.assertEqual(list(cached_files(self.cache)), [])
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
         def read(_):
             with source.open(cache_dir=self.cache, cache_max_bytes=2*size) as reader:
@@ -660,7 +666,7 @@ class RemoteTests(RemoteFixtureCase):
         with ThreadPoolExecutor(max_workers=4) as executor:
             for result in executor.map(read, range(8)):
                 np.testing.assert_array_equal(result, self.data)
-        self.assertEqual(len(list(self.cache.rglob('*.blob'))), 1)
+        self.assertEqual(len(list(cached_files(self.cache))), 1)
         self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2*size)
         first = source.open(cache_dir=self.cache, cache_max_bytes=size)
         Image.fromarray(self.data+1).save(self.root/'other.png')
@@ -670,7 +676,7 @@ class RemoteTests(RemoteFixtureCase):
         # A previously opened reader can re-materialize an evicted file.
         np.testing.assert_array_equal(first.read((0, 0), (5, 7)), self.data)
         first.close()
-        self.assertLessEqual(sum(p.stat().st_size for p in self.cache.rglob('*.blob')), size)
+        self.assertLessEqual(sum(p.stat().st_size for p in cached_files(self.cache)), size)
         restored = pickle.loads(pickle.dumps(source.open(cache_dir=self.cache)))
         np.testing.assert_array_equal(restored.read((0, 0), (5, 7)), self.data)
         restored.close()
@@ -686,6 +692,35 @@ class RemoteTests(RemoteFixtureCase):
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         self.assertEqual(before, self.counts)
 
+    def test_mirrored_files_are_used_in_place_and_not_owned(self):
+        from vc_reader import _reader
+        # A mirror laid out by bucket path (e.g. an Open Data sync) already holds the file.
+        payload = (self.root/'image.png').read_bytes()
+        url = self.url+'/mirrored/image.png'
+        mirrored = Path(decoded_cache_path(self.cache, url))
+        mirrored.parent.mkdir(parents=True)
+        mirrored.write_bytes(payload)
+        source = Source('mirrored', Storage(url, 'png'))
+        with source.open(cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+            self.assertEqual(reader.stats()['remote_bytes'], 0)
+        self.assertNotIn('/mirrored/image.png', self.counts)
+        # Downloads land at their own bucket paths and stay counted across owners;
+        # budget pressure evicts them, never the file found in place.
+        downloaded = Source('downloaded', Storage(self.url+'/image.png', 'png'))
+        with downloaded.open(cache_dir=self.cache, cache_max_bytes=len(payload)) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+        self.assertTrue(Path(decoded_cache_path(self.cache, self.url+'/image.png')).is_file())
+        _reader.DiskCache(str(self.cache), -1)  # a new owner reconciles the index
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select total from budget').fetchone()[0], len(payload))
+        Image.fromarray(self.data+1).save(self.root/'other.png')
+        other = Source('other', Storage(self.url+'/other.png', 'png'))
+        with other.open(cache_dir=self.cache, cache_max_bytes=len(payload)) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data+1)
+        self.assertFalse(Path(decoded_cache_path(self.cache, self.url+'/image.png')).exists())
+        self.assertEqual(mirrored.read_bytes(), payload)
+
     def test_remote_tiff_stack_lazy_reads_and_content_change(self):
         tifffile.imwrite(self.root/'image.tif', self.data)
         source = Source('tiff', Storage(self.url+'/image.tif', 'tiff'))
@@ -700,6 +735,9 @@ class RemoteTests(RemoteFixtureCase):
         png = Source('changed', Storage(self.url+'/image.png', 'png'))
         old = png.open(cache_dir=self.cache)
         Image.fromarray(self.data+1).save(self.root/'image.png')
+        with png.open(cache_dir=self.cache) as current:  # the cached copy is trusted
+            np.testing.assert_array_equal(current.read((0, 0), (5, 7)), self.data)
+        Path(decoded_cache_path(self.cache, self.url+'/image.png')).unlink()  # as eviction would
         with png.open(cache_dir=self.cache) as current:
             np.testing.assert_array_equal(current.read((0, 0), (5, 7)), self.data+1)
         with self.assertRaisesRegex(ValueError, 'source changed'):
@@ -715,7 +753,7 @@ class RemoteTests(RemoteFixtureCase):
                 with multiprocessing.get_context(method).Pool(2) as pool:
                     for result in pool.map(process_read, [reader]*4):
                         np.testing.assert_array_equal(result, self.data[:3, :4])
-        self.assertEqual(len(list(self.cache.rglob('*.blob'))), 1)
+        self.assertEqual(len(list(cached_files(self.cache))), 1)
         self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 1 << 30)
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.root/'unused', cache_writes=False, cache_max_bytes=1)

@@ -13,8 +13,11 @@ from .auth import is_remote, resolve_access
 class EncodedFiles:
     """Configuration plus process-local, lazily resolved file access.
 
-    File descriptors pin open inodes across cache eviction; no private copies
-    bypass the disk budget. Each location is revalidated once per owner/process.
+    A remote file is cached at its URL's decoded-cache path
+    (``<cache_dir>/<scheme>/<host or bucket>/<path>``), so mirrors laid out by
+    bucket path are found in place. Cached copies are trusted, like cached
+    chunks: they are never revalidated. File descriptors pin open inodes across
+    cache eviction; no private copies bypass the disk budget.
     """
 
     def __init__(self, *, cache_dir=None, cache_max_bytes=None, cache_writes=True,
@@ -26,7 +29,6 @@ class EncodedFiles:
         self.max_bytes, self.cache_writes, self.auth, self.offline = cache_max_bytes, cache_writes, auth, offline
         self._pid = os.getpid()
         self._temp = None
-        self._checked = set()
         self._access = {}
         self._identities = {}
         self.bytes_read = self.cache_hits = 0
@@ -39,13 +41,8 @@ class EncodedFiles:
             self._temp = None
             self._access = {}
             self._identities = {}
-            self._checked = set()
             self.bytes_read = self.cache_hits = 0
             self._pid = os.getpid()
-
-    @staticmethod
-    def _key(location):
-        return hashlib.sha256(location.encode()).hexdigest() + '.blob'
 
     @contextmanager
     def open(self, location):
@@ -56,27 +53,25 @@ class EncodedFiles:
                 yield handle, (str(Path(location).expanduser().absolute()), stat.st_dev, stat.st_ino,
                                stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
             return
-        from .disk_cache import disk_budget
+        from .disk_cache import decoded_cache_path, disk_budget
 
         if 'vc3d' in self.cache_dirs:
             raise ValueError('image files need explicit cache directories, not the vc3d chunk-cache alias')
-        name = self._key(location)
         roots = [Path(p).expanduser().resolve() for p in self.cache_dirs]
-        if self.offline or not self.cache_writes or location in self._checked:
-            checked_roots = roots + ([Path(self._temp.name)] if self._temp is not None else [])
-            for root in checked_roots:
-                try:
-                    handle = open(root / 'encoded' / name, 'rb')
-                except FileNotFoundError:
-                    continue
-                with handle:
-                    self.cache_hits += 1
-                    yield handle, self._identity(location, handle)
-                return
-            if self.offline:
-                raise CacheMissError(f'{location}: encoded file is not cached (offline)')
-        root = next((r for r in roots if (r / 'encoded' / name).exists()), roots[0] if roots else None)
-        if root is None or not self.cache_writes:
+        for root in roots + ([Path(self._temp.name)] if self._temp is not None else []):
+            try:
+                handle = open(decoded_cache_path(root, location), 'rb')
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            with handle:
+                self.cache_hits += 1
+                yield handle, self._identity(location, handle)
+            return
+        if self.offline:
+            raise CacheMissError(f'{location}: encoded file is not cached (offline)')
+        if roots and self.cache_writes:
+            root = roots[0]
+        else:
             if self._temp is None:
                 self._temp = tempfile.TemporaryDirectory(prefix='vc-reader-images-')
             root = Path(self._temp.name)
@@ -86,13 +81,11 @@ class EncodedFiles:
         if location not in self._access:
             self._access[location] = resolve_access(location, self.auth)
         access = self._access[location]
-        fd, etag, modified, received = budget.open_file(
-            str(root / 'encoded' / name), access.url(location), access.auth_tuple(), False,
-            location not in self._checked)
+        fd, received = budget.open_file(decoded_cache_path(root, location), access.url(location),
+                                        access.auth_tuple())
         self.bytes_read += received
         if fd < 0:
             raise FileNotFoundError(f'{location}: remote image does not exist')
-        self._checked.add(location)
         if not received:
             self.cache_hits += 1
         with os.fdopen(fd, 'rb') as handle:
@@ -121,7 +114,6 @@ class EncodedFiles:
         if self._temp is not None:
             self._temp.cleanup()
             self._temp = None
-        self._checked.clear()
 
     def __getstate__(self):
         return dict(cache_dir=self.cache_dirs, cache_max_bytes=self.max_bytes,

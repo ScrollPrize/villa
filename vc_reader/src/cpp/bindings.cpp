@@ -269,10 +269,10 @@ NB_MODULE(_reader, m)
         .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_bytes", &vcr::DiskCache::max_bytes, nb::call_guard<nb::gil_scoped_release>())
         .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& url,
-                              const AuthTuple& auth, bool offline, bool refresh) {
+                              const AuthTuple& auth) {
             nb::gil_scoped_release release;
-            return cache.open_file(path, url, to_auth(auth), offline, refresh);
-        }, "path"_a, "url"_a, "auth"_a, "offline"_a, "refresh"_a);
+            return cache.open_file(path, url, to_auth(auth));
+        }, "path"_a, "url"_a, "auth"_a);
 
     nb::class_<vcr::Array>(m, "Array")
         .def(
