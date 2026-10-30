@@ -10,6 +10,33 @@ import merge_concat_runs
 
 
 class ResampleMaskTests(unittest.TestCase):
+    def test_downsampling_masks_a_hole_skipped_by_nearest_neighbor(self):
+        pts = np.full((5, 20, 3), 5000.0, np.float32)
+        pts[2, 9] = -1.0
+
+        out, valid = merge_concat_runs.resample_to(pts, (5, 10))
+
+        expected_valid = np.ones((5, 10), dtype=bool)
+        expected_valid[1:4, 3:6] = False
+        np.testing.assert_array_equal(valid, expected_valid)
+        self.assertTrue(np.all(out[~valid] == -1.0))
+        self.assertTrue(np.all(out[valid] == 5000.0))
+
+    def test_zero_weight_nonfinite_input_does_not_leave_valid_nonfinite_output(self):
+        for value in (np.nan, np.inf, -np.inf):
+            with self.subTest(value=value):
+                pts = np.full((5, 7, 3), 5000.0, np.float32)
+                pts[0, 4] = value
+
+                out, valid = merge_concat_runs.resample_to(pts, (2, 3))
+
+                # The center column samples source column 3 exactly, but OpenCV
+                # can still evaluate the zero-weight contribution from column 4.
+                self.assertTrue(np.all(np.isfinite(out[valid])))
+                self.assertTrue(np.all(out[~valid] == -1.0))
+                self.assertTrue(valid[1, 0])
+                np.testing.assert_array_equal(out[1, 0], [5000.0] * 3)
+
     def test_downsampling_never_keeps_a_vertex_blended_with_a_missing_one(self):
         rng = np.random.default_rng(0)
         for _ in range(200):

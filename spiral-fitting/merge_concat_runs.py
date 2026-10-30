@@ -79,6 +79,7 @@ def resample_to(pts, target_hw):
     out = cv2.resize(pts, (tw, th), interpolation=cv2.INTER_LINEAR)
     inv_r = cv2.resize(invalid_mask(pts).astype(np.float32), (tw, th), interpolation=cv2.INTER_LINEAR)
     bad = cv2.dilate((inv_r > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1) > 0
+    bad |= ~np.isfinite(out).all(axis=-1)
     out[bad] = -1.0
     return out, ~bad
 
