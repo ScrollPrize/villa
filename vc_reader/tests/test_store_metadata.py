@@ -207,5 +207,15 @@ class CatalogMergeTests(unittest.TestCase):
         self.assertEqual(len(self.catalogs), 1)
 
 
+class CatalogScopeTests(unittest.TestCase):
+    def test_only_public_channels_load_the_catalog(self):
+        with mock.patch.object(store_metadata, "_catalog_manifest", side_effect=AssertionError("catalog loaded")):
+            for url in ("s3://private-bucket/x.zarr", "https://example.com/x.zarr"):
+                self.assertEqual(store_metadata._catalog_entry(url, False), (None, True))
+        with mock.patch.object(store_metadata, "_catalog_manifest", return_value=None) as manifest:
+            store_metadata._catalog_entry("s3://vesuvius-challenge-open-data/x.zarr", False)
+        manifest.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

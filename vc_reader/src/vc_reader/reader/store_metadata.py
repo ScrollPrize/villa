@@ -74,7 +74,8 @@ def _catalog_entry(location: str, offline: bool, refresh: bool = False) -> tuple
     outside the public channels are not in it, so the catalog is not loaded for them."""
     from .. import _catalog
 
-    if _catalog.to_s3(location) is None:
+    # to_s3 keeps any s3:// URL: resolve first, so only public channels count.
+    if _catalog.to_s3(_catalog.to_https(location)) is None:
         return None, True
     manifest = _fresh_catalog_manifest() if refresh else _catalog_manifest(offline)
     if manifest is None:
