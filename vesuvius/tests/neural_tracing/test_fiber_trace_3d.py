@@ -5841,9 +5841,7 @@ def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:
 
 def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_known() -> None:
     record = _whole_native_trace_record()
-    record.sampler = SimpleNamespace(
-        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
-    )
+    record.voxel_size_um = 2.0
     cache = SimpleNamespace(_blocks={})
     calls = 0
 
@@ -5886,9 +5884,7 @@ def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_
 
 def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(capsys) -> None:
     record = _whole_native_trace_record()
-    record.sampler = SimpleNamespace(
-        volume=SimpleNamespace(metadata={"voxelsize": 2000.0})
-    )
+    record.voxel_size_um = 2000.0
     cache = SimpleNamespace(_blocks={})
     calls = 0
 

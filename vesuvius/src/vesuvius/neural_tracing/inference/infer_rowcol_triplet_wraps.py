@@ -66,8 +66,6 @@ _COPY_ARG_TO_CLI = {
     "checkpoint_path": "--checkpoint-path",
     "device": "--device",
     "volume_scale": "--volume-scale",
-    "volume_cache_dir": "--volume-cache-dir",
-    "volume_cache_retry_seconds": "--volume-cache-retry-seconds",
     "volume_chunk_cache_gb": "--volume-chunk-cache-gb",
     "compile_mode": "--compile-mode",
     "crop_size": "--crop-size",
@@ -674,8 +672,6 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--volume-scale", type=int, default=0)
-    parser.add_argument("--volume-cache-dir", type=str, default="/tmp/vesuvius-volume-cache")
-    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
     parser.add_argument("--volume-chunk-cache-gb", type=float, default=_DEFAULT_VOLUME_CHUNK_CACHE_GB)
     parser.add_argument("--compile", dest="compile_model", action="store_true", default=True)
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
@@ -810,8 +806,6 @@ def parse_args(argv=None):
         parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
-    if args.volume_cache_retry_seconds < 0.0:
-        parser.error("--volume-cache-retry-seconds must be >= 0")
     if args.volume_chunk_cache_gb < 0.0:
         parser.error("--volume-chunk-cache-gb must be >= 0")
     if args.displacement_scale is not None and not is_auto_displacement_scale(args.displacement_scale):

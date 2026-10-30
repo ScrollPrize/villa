@@ -1106,6 +1106,7 @@ class FiberStrip2DLoader:
                 cache_dir=volume_cache_dirs(volume_path, self.config.volume_cache_dir),
                 memory_cache=self.config.volume_cache_memory_bytes,
                 threads=self.config.volume_io_threads,
+                offline=self.config.volume_cache_offline,
             )
             (
                 base_shape_zyx,

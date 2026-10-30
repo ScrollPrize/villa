@@ -5579,23 +5579,14 @@ def _control_point_reference_arc_voxels(record: Any) -> np.ndarray:
     return np.asarray(arcs, dtype=np.float64)
 
 
-def _vc3d_voxel_size_m(record: Any) -> float | None:
-    sampler = getattr(record, "sampler", None)
-    volume = getattr(sampler, "volume", None)
-    metadata = getattr(volume, "metadata", None)
-    if metadata is None:
+def _record_voxel_size_m(record: Any) -> float | None:
+    voxel_size_um = getattr(record, "voxel_size_um", None)
+    if voxel_size_um is None:
         return None
-    try:
-        voxelsize_um = metadata["voxelsize"]
-    except (KeyError, TypeError, AttributeError):
+    voxel_size_um = float(voxel_size_um)
+    if not math.isfinite(voxel_size_um) or voxel_size_um <= 0.0:
         return None
-    try:
-        voxelsize_um = float(voxelsize_um)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(voxelsize_um) or voxelsize_um <= 0.0:
-        return None
-    return voxelsize_um * 1.0e-6
+    return voxel_size_um * 1.0e-6
 
 
 def _reference_line_length_meters_between_cps(
@@ -5604,7 +5595,7 @@ def _reference_line_length_meters_between_cps(
     start_cp_index: int,
     end_cp_index: int,
 ) -> float | None:
-    voxel_size_m = _vc3d_voxel_size_m(record)
+    voxel_size_m = _record_voxel_size_m(record)
     if voxel_size_m is None:
         return None
     line_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)

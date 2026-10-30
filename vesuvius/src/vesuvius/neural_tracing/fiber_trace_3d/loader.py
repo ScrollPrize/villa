@@ -130,6 +130,7 @@ class _Record:
     fiber_identity: str
     dataset_config: dict[str, Any]
     label_breaks: tuple[int, ...] = ()
+    voxel_size_um: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2318,6 +2319,7 @@ class FiberTrace3DLoader:
                 cache_dir=volume_cache_dirs(volume_path, self.config.volume_cache_dir),
                 memory_cache=self.config.volume_cache_memory_bytes,
                 threads=self.config.volume_io_threads,
+                offline=self.config.volume_cache_offline,
             )
             base_shape_zyx = _validate_dataset_manifest(
                 dataset_config,
@@ -2376,6 +2378,7 @@ class FiberTrace3DLoader:
                             base_shape_zyx=base_shape_zyx,
                             fiber_identity=fiber_identity,
                             dataset_config=dict(dataset_config),
+                            voxel_size_um=reader.metadata.voxel_size_um,
                         )
                     )
             retained = len(records) - dataset_record_start
