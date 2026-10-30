@@ -9,14 +9,6 @@ import os
 import numpy as np
 
 
-def _loader_worker():
-    """True in a PyTorch DataLoader worker: its processes already read in parallel, so
-    each reader there uses one thread. Elsewhere readers keep their thread pools.
-    Readers reopen lazily after fork, so this runs in the worker itself."""
-    import sys
-    torch = sys.modules.get('torch')
-    return torch is not None and torch.utils.data.get_worker_info() is not None
-
 from ..errors import CacheMissError
 from ..sources import Source, Selection, VolumeRegistration
 from ..affine import Affine
@@ -114,8 +106,6 @@ class SourceReader:
         if unknown:
             raise TypeError(f'unknown reader options: {sorted(unknown)}')
         self._options = dict(reader_options)
-        if self._options.get('threads') is None and _loader_worker():
-            self._options['threads'] = 1
         self._backend = None
         self.companions = {}
         self._encoded = EncodedFiles(**{k: v for k, v in reader_options.items()

@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import subprocess
@@ -19,7 +20,7 @@ except ImportError as error:
     raise unittest.SkipTest('source reader tests require the optional labels extra') from error
 
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration
-from vc_reader.reader import DecodedCache
+from vc_reader.reader import DecodedCache, open_zarr
 
 
 def worker_read(reader, connection):
@@ -304,17 +305,26 @@ class SourceReaderTests(unittest.TestCase):
         path = self.root / 'volume.zarr'
         array(path, np.arange(64, dtype=np.uint8).reshape(4, 4, 4), {'_ARRAY_DIMENSIONS': ['z', 'y', 'x']})
         source = Source('volume', Storage(str(path), 'zarr'))
+
+        def threads(reader):
+            reader.read((0, 0, 0), (1, 1, 2))
+            return reader._backend.reader.threads
+
+        default = min(16, os.cpu_count() or 4)
         with source.open() as reader:
-            self.assertIsNone(reader._options.get('threads'))  # the Zarr reader's own pool size
+            self.assertEqual(threads(reader), default)  # the Zarr reader's own pool size
         with source.open(threads=4) as reader:
-            self.assertEqual(reader._options['threads'], 4)
+            self.assertEqual(threads(reader), 4)
+        self.assertEqual(open_zarr(path).threads, default)
         worker = SimpleNamespace(utils=SimpleNamespace(data=SimpleNamespace(get_worker_info=lambda: object())))
         with patch.dict(sys.modules, {'torch': worker}):
             with source.open() as reader:
-                self.assertEqual(reader._options['threads'], 1)
+                self.assertEqual(threads(reader), 1)
                 np.testing.assert_array_equal(reader.read((0, 0, 0), (1, 1, 2)), [[[0, 1]]])
             with source.open(threads=4) as reader:
-                self.assertEqual(reader._options['threads'], 4)
+                self.assertEqual(threads(reader), 4)
+            self.assertEqual(open_zarr(path).threads, 1)
+            self.assertEqual(open_zarr(path, threads=4).threads, 4)
 
     @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
     def test_fork_reopens_without_inherited_cache_lock(self):

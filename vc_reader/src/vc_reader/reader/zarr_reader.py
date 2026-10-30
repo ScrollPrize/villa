@@ -128,7 +128,8 @@ class ZarrReader:
             root = os.path.abspath(self.location)
             layers = [] if v3 is not None else [("array", root, codec, "", False)]
             identity = "file://" + root
-        threads = spec["threads"] or (32 if remote_url else min(16, os.cpu_count() or 4))
+        threads = spec["threads"] or (1 if _loader_worker() else 32 if remote_url else min(16, os.cpu_count() or 4))
+        self.threads: int = threads
         try:
             budget = (disk_budget(self.write_layer.budget_root, spec["cache_max_bytes"])
                       if self.write_layer is not None and self.write_layer.budget_root else None)
@@ -215,8 +216,9 @@ class ZarrReader:
         across processes via SQLite; offline/read-only opens never evict.
 
         ``memory_cache`` is a byte budget or a :class:`MemoryCache` shared
-        between readers. ``threads`` (default 16 local, 32 remote) read and
-        decode; at most ``connections`` HTTP requests are in flight.
+        between readers. ``threads`` (default 16 local, 32 remote; one in a
+        PyTorch DataLoader worker, whose processes already read in parallel)
+        read and decode; at most ``connections`` HTTP requests are in flight.
         ``read_mode`` is how uncompressed chunk files are read: ``"mmap"``
         (persistent memory maps, the default) or ``"slab"`` (``pread``).
 
@@ -720,6 +722,14 @@ class ZarrReader:
             if auth is not self._auth:
                 self._array.set_auth(auth)
                 self._auth = auth
+
+
+def _loader_worker() -> bool:
+    """True in a PyTorch DataLoader worker. A reader used in a forked worker rebuilds
+    its engine there, so the check runs in the worker itself."""
+    import sys
+    torch = sys.modules.get('torch')
+    return torch is not None and torch.utils.data.get_worker_info() is not None
 
 
 def _memory_cache(memory_cache: int | MemoryCache | None) -> MemoryCache | None:
