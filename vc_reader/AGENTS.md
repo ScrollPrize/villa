@@ -14,6 +14,7 @@ performance must be prioritized for anything implemented in this repository. the
 
 ### c++ first, python binds
 - there must be absolutely zero behavior in vc_reader that exists only in python. everything vc_reader can do is implemented in c++ and available to c++ callers, and python binds that code. new functionality goes into c++ first.
+- the only python that stays is what c++ has nothing equivalent to bind, as thin layers over c++: torch tensor and dataloader integration, numpy-style indexing and array conversion, pickling and rebuilding after a fork, and the cli entry point. real work they do underneath is in c++.
 
 ### cuda implementations
 - vc_reader has two backends -- cpu and cuda -- for most things within vc_reader that operate on volumes or images, wherever a cpu implementation exists there should be a cuda implementation as well  
