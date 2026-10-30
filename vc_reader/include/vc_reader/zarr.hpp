@@ -261,9 +261,14 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& location, const O
 LevelPlacement levelPlacement(const Json& groupAttributes, const std::string& path);
 
 struct StoreMetadata;
+// Drops the metadata kept with a remote volume's caches (see Group::open, volumeMetadata), so
+// its next open reads it as published.
+void forgetKeptMetadata(const std::string& location, const OpenOptions& options);
 
 class Group {
 public:
+    // A group in a public channel with caches keeps its state() there once its pyramid
+    // levels are known; a later open trusts it like a chunk and makes no request.
     static Group open(const std::string& location, OpenOptions options);
     // A group as state() saved it, without any request.
     static Group fromState(const Json& state, OpenOptions options);

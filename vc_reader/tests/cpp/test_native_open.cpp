@@ -293,6 +293,50 @@ void metadata(const fs::path& root)
 }
 }  // namespace
 
+// A public pyramid opened with caches is not asked for its metadata again.
+void keptPyramid(const fs::path& root)
+{
+    const std::string url = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercK/volumes/a.zarr";
+    const std::string zarray = R"({"zarr_format":2,"shape":[8,8,8],"chunks":[4,4,4],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null})";
+    int requests = 0;
+    OpenOptions options;
+    options.cacheDirs = {(root / "kept").string()};
+    options.metadata = [&](const std::string& location, const std::string& name) -> std::optional<std::string> {
+        ++requests;
+        if (location == url && name == ".zgroup")
+            return R"({"zarr_format":2})";
+        if (location == url && name == ".zattrs")
+            return "{}";
+        if ((location == url + "/0" || location == url + "/1") && name == ".zarray")
+            return zarray;
+        return std::nullopt;
+    };
+    require(pyramidLevels(url, options).size() == 2, "first read of the pyramid");
+    require(requests > 0, "first read asks");
+    const auto asked = requests;
+    require(pyramidLevels(url, options).size() == 2 && requests == asked, "the kept pyramid is not asked for");
+    require(openPyramidLevel(url, 1, options).meta.shape == vcr::Index{8, 8, 8} && requests == asked, "levels open from it");
+    forgetKeptMetadata(url, options);
+    require(pyramidLevels(url, options).size() == 2 && requests > asked, "forgotten");
+
+    // Outside the public channels nothing is trusted.
+    const std::string other = "https://example.com/a.zarr";
+    int direct = 0;
+    OpenOptions privateOptions = options;
+    privateOptions.metadata = [&](const std::string& location, const std::string& name) -> std::optional<std::string> {
+        ++direct;
+        if (location == other && name == ".zgroup")
+            return R"({"zarr_format":2})";
+        if (location == other + "/0" && name == ".zarray")
+            return zarray;
+        return std::nullopt;
+    };
+    (void)pyramidLevels(other, privateOptions);
+    const auto once = direct;
+    (void)pyramidLevels(other, privateOptions);
+    require(direct == 2 * once, "a store elsewhere is read each time");
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() / ("vcr-native-open-" +
@@ -319,6 +363,7 @@ int main()
             std::ofstream(dir / ".zarray") << "{}";
             require(isLocalZarrNode(dir) && isLocalZarrArray(dir), "a v2 array");
         }
+        keptPyramid(root);
         access(root);
         errors(root);
         groups(root);

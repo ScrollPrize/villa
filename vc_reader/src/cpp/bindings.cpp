@@ -383,6 +383,7 @@ NB_MODULE(_reader, m)
     }, "location"_a, "options"_a, "refresh"_a = false,
        "What is known about the volume at a location, as JSON (see vcr::zarr::volumeMetadata).");
     m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
+    m.def("forget_kept_metadata", &vcr::zarr::forgetKeptMetadata, "location"_a, "options"_a);
     m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
         vcr::zarr::StoreMetadata metadata;
         metadata.voxelSizeUm = voxel_size;

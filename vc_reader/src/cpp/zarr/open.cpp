@@ -50,6 +50,31 @@ std::vector<std::string> localNumberedChildren(const fs::path& root)
     return paths;
 }
 
+constexpr const char* kKeptGroup = ".vc_reader_group.json";
+
+// The cache folders of a remote volume, where its metadata is kept.
+std::vector<fs::path> keptFolders(const std::string& location, const OpenOptions& options)
+{
+    auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(location));
+    if (options.vc3dVolumeDir && fs::is_directory(*options.vc3dVolumeDir))
+        dirs.insert(dirs.begin(), *options.vc3dVolumeDir);
+    return dirs;
+}
+
+std::optional<Json> keptGroup(const std::string& location, const OpenOptions& options)
+{
+    if (options.offline || !isRemote(location) || !isPublicLocation(location))
+        return std::nullopt;
+    for (const auto& dir : keptFolders(location, options))
+        if (std::ifstream in(dir / kKeptGroup); in)
+            try {
+                return Json::parse(in);
+            } catch (const std::exception&) {
+                // A damaged copy: read the store again.
+            }
+    return std::nullopt;
+}
+
 MetadataReader reader(const OpenOptions& options)
 {
     return options.metadata ? options.metadata : metadataReader(options.access);
@@ -352,6 +377,8 @@ Group Group::open(const std::string& input, OpenOptions options)
 {
     const auto location = stripSlashes(input);
     const bool remote = isRemote(location);
+    if (const auto kept = keptGroup(location, options))
+        return fromState(*kept, std::move(options));
     if (options.offline && remote) {
         if (options.cacheDirs.empty() && !options.vc3dVolumeDir)
             throw std::invalid_argument("offline reads of a remote group need cache directories");
@@ -609,6 +636,8 @@ std::optional<Json> rootArrayMetadata(const std::string& location, const OpenOpt
     if (options.offline && isRemote(location))
         return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
                                   options.vc3dVolumeDir);
+    if (keptGroup(location, options))
+        return std::nullopt;
     const auto read = reader(options);
     auto root = readJsonNode(read, location, ".zarray");
     if (!root) {
@@ -654,6 +683,28 @@ bool isLocalZarrArray(const std::filesystem::path& directory)
     return node.is_object() && node.value("node_type", "") == "array";
 }
 
+// Keeps a pyramid's group state with its caches, every level looked up.
+static void keepPyramid(Group& group, const std::vector<std::pair<int, std::string>>& levels)
+{
+    const auto& options = group.options();
+    if (!options.cacheWrites || !isRemote(group.location()) || !isPublicLocation(group.location()) ||
+        options.offline || keptGroup(group.location(), options))
+        return;
+    const auto dirs = keptFolders(group.location(), options);
+    if (dirs.empty())
+        return;
+    for (const auto& [number, path] : levels)
+        (void)group.node(path);
+    const auto data = group.state().dump();
+    for (const auto& dir : dirs)
+        try {
+            atomicWrite(dir / kKeptGroup, data);
+            return;
+        } catch (const std::exception&) {
+            // Read-only: try the next.
+        }
+}
+
 OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOptions& options,
                              int probeLevels)
 {
@@ -667,7 +718,9 @@ OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOpti
         return openArray(location, options, std::move(hints));
     }
     auto group = Group::open(location, options);
-    for (const auto& [number, path] : numberedLevels(group, probeLevels))
+    const auto levels = numberedLevels(group, probeLevels);
+    keepPyramid(group, levels);
+    for (const auto& [number, path] : levels)
         if (number == level) return group.array(path);
     throw std::out_of_range("pyramid level " + std::to_string(level) + " is not present in " + location);
 }
@@ -681,14 +734,26 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
         return {{0, "", parseArrayMeta(*root)}};
     auto group = Group::open(location, options);
     std::vector<PyramidLevelInfo> out;
-    for (const auto& [number, path] : numberedLevels(group, probeLevels)) {
+    const auto levels = numberedLevels(group, probeLevels);
+    for (const auto& [number, path] : levels) {
         const auto node = group.node(path);
         if (!node || node->first != Group::NodeKind::Array)
             throw std::runtime_error("pyramid level " + path + " of " + location + " is not an array");
         out.push_back({number, path, parseArrayMeta(node->second)});
     }
+    keepPyramid(group, levels);
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.level < b.level; });
     return out;
+}
+
+void forgetKeptMetadata(const std::string& location, const OpenOptions& options)
+{
+    forgetVolumeMetadata();
+    for (const auto& dir : keptFolders(location, options)) {
+        std::error_code ec;
+        fs::remove(dir / kKeptGroup, ec);
+        fs::remove(dir / ".vc_reader_metadata.json", ec);
+    }
 }
 
 std::optional<Json> Group::consolidated()
