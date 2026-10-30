@@ -6,9 +6,36 @@
 namespace fs=std::filesystem;
 void check(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 void write(const fs::path& p,const std::string& bytes){fs::create_directories(p.parent_path());std::ofstream out(p);out<<bytes;}
+// No byte limit: nothing is walked until a limit or a total needs the index.
+void unbounded(const fs::path& root)
+{
+    const auto level=root/"volume/0";
+    write(level/".zarray","{}");
+    write(level/"0.0.0",std::string(32,'a'));
+    write(level/"0.0.1",std::string(32,'b'));
+    constexpr auto none=std::numeric_limits<std::int64_t>::max();
+    {
+        vcr::DiskCache cache(root.string(),none);
+        cache.adopt_chunks((root/"volume").string());
+        check(cache.total_bytes()==64,"a total walks the files when asked");
+    }
+    {
+        vcr::DiskCache cache(root.string(),none);
+        check(fs::exists(level/"0.0.0"),"unbounded opens evict nothing");
+        cache.set_max_bytes(32);
+        check(cache.total_bytes()==32,"a new limit walks the adopted files and applies");
+        check(!fs::exists(level/"0.0.0")||!fs::exists(level/"0.0.1"),"oldest chunk evicted");
+    }
+    vcr::DiskCache again(root.string(),-1);
+    check(again.max_bytes()==32&&again.total_bytes()==32,"a kept limit reconciles on open");
+}
+
 int main() try {
     const auto root=fs::temp_directory_path()/("vcr-adopt-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {fs::path p;~Cleanup(){fs::remove_all(p);}} cleanup{root};
+    const fs::path other=root.string()+"-unbounded";
+    struct CleanupOther {fs::path p;~CleanupOther(){fs::remove_all(p);}} cleanupOther{other};
+    unbounded(other);
     const auto level=root/"volume/0";
     write(level/".zarray","{}");write(level/".zattrs","{}");
     write(level/"0.0.0",std::string(32,'a'));

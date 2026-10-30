@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sqlite3.h>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <tuple>
 #include <sys/file.h>
@@ -51,45 +52,12 @@ public:
             exec("CREATE TABLE IF NOT EXISTS adopted_namespaces(path TEXT PRIMARY KEY);");
             exec("CREATE TABLE IF NOT EXISTS downloads(path TEXT PRIMARY KEY, size INTEGER NOT NULL);");
             transaction([&] {
-                // Reconcile after a crash or writes by an unbounded reader.
-                // Only numeric chunk files in the decoded-cache namespaces
-                // count, plus explicitly adopted VC3D arrays. Metadata and markers stay.
-                exec("DELETE FROM chunks; UPDATE budget SET total=0,clock=0 WHERE id=1;");
-                using Entry = std::tuple<std::filesystem::file_time_type, std::string, std::int64_t>;
-                std::vector<Entry> files;
-                for (const auto* scheme : {"http", "https", "s3"}) {
-                    const auto base = root_ / scheme;
-                    if (!std::filesystem::is_directory(base) || std::filesystem::is_symlink(base))
-                        continue;
-                    scan(base, files);
-                }
-                {
-                    Statement adopted(db_, "SELECT path FROM adopted_namespaces");
-                    while (adopted.step()) {
-                        const std::string path=reinterpret_cast<const char*>(sqlite3_column_text(adopted.get(),0));
-                        check_path(path);
-                        if (std::filesystem::is_directory(path) && !std::filesystem::is_symlink(path))
-                            scan(path,files);
-                    }
-                }
-                {
-                    Statement owned(db_, "SELECT path FROM files");
-                    while (owned.step()) {
-                        const std::filesystem::path path = reinterpret_cast<const char*>(sqlite3_column_text(owned.get(), 0));
-                        check_path(path.string());
-                        std::error_code ec;
-                        if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
-                            files.emplace_back(std::filesystem::last_write_time(path), path.string(),
-                                               std::filesystem::file_size(path));
-                    }
-                }
                 clean_downloads();
-                std::sort(files.begin(), files.end());
-                for (const auto& [time, file, size] : files)
-                    record(file, size);
-                exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
                 if (max_bytes >= 0) set_limit(max_bytes);
-                evict();
+                // Without a byte limit nothing reads the index: a walk of a large root on
+                // every open would only keep an unused total right.
+                if (number("SELECT max_bytes FROM budget WHERE id=1") != std::numeric_limits<std::int64_t>::max())
+                    reconcile();
             });
         } catch (...) {
             sqlite3_close(db_);
@@ -113,13 +81,14 @@ public:
             Statement known(db_, "SELECT 1 FROM adopted_namespaces WHERE path=?");
             known.text(1,canonical);
             if (known.step()) return;
+            Statement adopted(db_, "INSERT INTO adopted_namespaces(path) VALUES(?)");
+            adopted.text(1,canonical); adopted.step();
+            if (!reconciled_) return;  // no limit: the walk waits until one needs the index
             using Entry=std::tuple<std::filesystem::file_time_type,std::string,std::int64_t>;
             std::vector<Entry> files;
             scan(canonical,files);
             std::sort(files.begin(),files.end());
             for (const auto& [time,file,size] : files) record(file,size);
-            Statement adopted(db_, "INSERT INTO adopted_namespaces(path) VALUES(?)");
-            adopted.text(1,canonical); adopted.step();
             evict();
         });
     }
@@ -129,7 +98,11 @@ public:
         if (bytes < 0)
             throw std::invalid_argument("cache_max_bytes must be nonnegative");
         std::lock_guard lock(mutex_);
-        transaction([&] { set_limit(bytes); evict(); });
+        transaction([&] {
+            set_limit(bytes);
+            if (!reconciled_ && bytes != std::numeric_limits<std::int64_t>::max()) reconcile();
+            evict();
+        });
     }
 
     // Keep this much of the disk free: a write that would leave less is skipped
@@ -172,6 +145,7 @@ public:
     std::int64_t total_bytes()
     {
         std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
         return number("SELECT total FROM budget WHERE id=1");
     }
 
@@ -457,6 +431,48 @@ private:
             throw std::runtime_error("disk cache entry outside its root: " + path);
     }
 
+    // Rebuild the index from the files, after a crash or writes by an unbounded reader.
+    // Only numeric chunk files in the decoded-cache namespaces count, plus explicitly
+    // adopted VC3D arrays. Metadata and markers stay.
+    void reconcile()
+    {
+        exec("DELETE FROM chunks; UPDATE budget SET total=0,clock=0 WHERE id=1;");
+        using Entry = std::tuple<std::filesystem::file_time_type, std::string, std::int64_t>;
+        std::vector<Entry> files;
+        for (const auto* scheme : {"http", "https", "s3"}) {
+            const auto base = root_ / scheme;
+            if (!std::filesystem::is_directory(base) || std::filesystem::is_symlink(base))
+                continue;
+            scan(base, files);
+        }
+        {
+            Statement adopted(db_, "SELECT path FROM adopted_namespaces");
+            while (adopted.step()) {
+                const std::string path=reinterpret_cast<const char*>(sqlite3_column_text(adopted.get(),0));
+                check_path(path);
+                if (std::filesystem::is_directory(path) && !std::filesystem::is_symlink(path))
+                    scan(path,files);
+            }
+        }
+        {
+            Statement owned(db_, "SELECT path FROM files");
+            while (owned.step()) {
+                const std::filesystem::path path = reinterpret_cast<const char*>(sqlite3_column_text(owned.get(), 0));
+                check_path(path.string());
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
+                    files.emplace_back(std::filesystem::last_write_time(path), path.string(),
+                                       std::filesystem::file_size(path));
+            }
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& [time, file, size] : files)
+            record(file, size);
+        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
+        evict();
+        reconciled_ = true;
+    }
+
     template<class Entries> void scan(const std::filesystem::path& base, Entries& files)
     {
         namespace fs = std::filesystem;
@@ -487,6 +503,7 @@ private:
     std::filesystem::path root_;
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
+    bool reconciled_ = false;
     std::atomic<std::int64_t> min_free_bytes_{0};
     std::atomic<bool> low_space_{false}, low_space_warned_{false};
 };
