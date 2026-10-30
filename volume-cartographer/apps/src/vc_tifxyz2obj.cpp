@@ -8,7 +8,6 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
 #include "utils/Json.hpp"
 
 #include <filesystem>

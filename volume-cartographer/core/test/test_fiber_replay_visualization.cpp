@@ -1,7 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -99,7 +98,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {8,8,8};
     options.chunkShapeZYX = {4,4,4};
-    options.dtype = vc::render::ChunkDtype::UInt8;
+    options.dtype = "|u1";
     options.numLevels = 2;
     auto pyramid = vc::test::createZarrVolume(directory / "ct", options);
     REQUIRE(pyramid);
@@ -127,7 +126,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
         {0,0,0}, {0,1,1}, directory / "box"));
     CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {1,1,std::numeric_limits<double>::infinity()}, directory / "box"));
-    options.dtype = vc::render::ChunkDtype::UInt16;
+    options.dtype = "<u2";
     options.numLevels = 1;
     auto wider = vc::test::createZarrVolume(directory / "uint16", options);
     wider.reset();
@@ -416,7 +415,7 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
     vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {64, 64, 64};
     options.chunkShapeZYX = {16, 16, 16};
-    options.dtype = vc::render::ChunkDtype::UInt8;
+    options.dtype = "|u1";
     options.numLevels = 1;
     vc::test::createZarrVolume(directory / "ct", options).reset();
     const auto ct = openCtLevel(directory / "ct", "0");
@@ -475,12 +474,13 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {32, 32, 32};
     options.chunkShapeZYX = {16, 16, 16};
-    options.dtype = vc::render::ChunkDtype::UInt8;
+    options.dtype = "|u1";
     options.numLevels = 2;
     auto pyramid = vc::test::createZarrVolume(directory, options);
     REQUIRE(pyramid);
-    Array3D<uint8_t> values({32, 32, 32}, uint8_t(96));
-    vc::test::writeZYX(*pyramid, values, {0, 0, 0});
+    const std::vector<uint8_t> values(32 * 32 * 32, 96);
+    vcr::zarr::Writer::open(directory / "0").writeRegion({0, 0, 0}, {32, 32, 32}, values.data());
+    vcr::zarr::Writer::open(directory / "1").writeRegion({0, 0, 0}, {16, 16, 16}, values.data());
     pyramid.reset();
     const auto ct = openCtLevel(directory, "1");
 

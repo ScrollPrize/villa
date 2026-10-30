@@ -6,7 +6,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/types/Array3D.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -46,13 +46,12 @@ void writeSheets(const fs::path& dir, const std::vector<int>& centres)
     options.shapeZYX = {128, 128, 128};
     options.uuid = "test-volume";
     options.name = "test-volume";
-    auto volume = vc::test::createZarrVolume(dir / "volume.zarr", options);
-    Array3D<uint8_t> sheet({128, 128, 128}, 0);
+    vc::test::createZarrVolume(dir / "volume.zarr", options);
+    std::vector<uint8_t> sheet(128 * 128 * 128, 0);
     for (const int centre : centres)
         for (int z = centre - 4; z <= centre + 4; ++z)
-            for (size_t y = 0; y < 128; ++y)
-                for (size_t x = 0; x < 128; ++x) sheet(size_t(z), y, x) = uint8_t(255 - 20 * std::abs(z - centre));
-    vc::test::writeZYX(*volume, sheet, {0, 0, 0});
+            std::fill_n(sheet.begin() + size_t(z) * 128 * 128, 128 * 128, uint8_t(255 - 20 * std::abs(z - centre)));
+    vcr::zarr::Writer::open(dir / "volume.zarr" / "0").writeRegion({0, 0, 0}, {128, 128, 128}, sheet.data());
 }
 }
 

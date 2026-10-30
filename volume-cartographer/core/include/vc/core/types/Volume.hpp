@@ -13,8 +13,6 @@
 #include "utils/Json.hpp"
 #include <opencv2/core/mat.hpp>
 
-#include "vc/core/types/Sampling.hpp"
-#include "vc/core/types/Array3D.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
 
@@ -22,10 +20,8 @@ namespace vc::render {
 class IChunkedArray;
 struct OpenedChunkedZarr;
 }
-namespace utils { class ZarrArray; }
 namespace vcr::zarr { struct OpenOptions; }
 
-struct CompositeParams;
 
 class Volume
 {
@@ -111,13 +107,6 @@ public:
     [[nodiscard]] int firstPresentScaleLevel() const;
     [[nodiscard]] int finestPresentScaleLevelAtOrBelow(int level) const;
 
-    enum class MissingScaleLevelPolicy {
-        Error,
-        AllFill,
-        Empty,
-        VirtualDownsample,
-    };
-
     // --- Cache management ---
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
@@ -126,51 +115,6 @@ public:
     // Drop decoded/read cache state. Writes call this automatically.
     void invalidateCache();
 
-    // Blocking integer reads through the chunked local/remote cache.
-    // ZYX order matches zarr storage and numpy-style volume indexing:
-    //   offset = [z, y, x], shape = [z, y, x].
-    bool readZYX(Array3D<uint8_t>& out,
-                 const std::array<int, 3>& offsetZYX,
-                 int level = 0,
-                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
-    bool readZYX(Array3D<uint16_t>& out,
-                 const std::array<int, 3>& offsetZYX,
-                 int level = 0,
-                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
-    static void readZYX(Array3D<uint8_t>& out,
-                        const std::array<int, 3>& offsetZYX,
-                        vc::render::IChunkedArray& array,
-                        int level = 0);
-    static void readZYX(Array3D<uint16_t>& out,
-                        const std::array<int, 3>& offsetZYX,
-                        vc::render::IChunkedArray& array,
-                        int level = 0);
-
-    // UI/coordinate-order convenience:
-    //   offset = [x, y, z], shape = [x, y, z].
-    // Returned Array3D is still stored/indexed as [z, y, x].
-    bool readXYZ(Array3D<uint8_t>& out,
-                 const std::array<int, 3>& offsetXYZ,
-                 int level = 0,
-                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
-    bool readXYZ(Array3D<uint16_t>& out,
-                 const std::array<int, 3>& offsetXYZ,
-                 int level = 0,
-                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
-
-    // Local zarr chunk reads. Chunk coordinates are [z, y, x]. Data is raw,
-    // uncompressed chunk payload with exactly chunk_elems * dtype_size bytes.
-    [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(
-        int level,
-        const std::array<size_t, 3>& chunkZYX) const;
-    // Byte size of one decompressed chunk at the given level.
-    [[nodiscard]] size_t chunkByteSize(int level) const;
-    [[nodiscard]] std::vector<std::byte> readChunkOrFill(
-        int level,
-        const std::array<size_t, 3>& chunkZYX) const;
-    [[nodiscard]] bool chunkExists(
-        int level,
-        const std::array<size_t, 3>& chunkZYX) const;
 protected:
     std::filesystem::path path_;
     utils::Json metadata_;
@@ -191,13 +135,6 @@ protected:
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
 
-    // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
-    // and rebuilding the codec registry on every chunk read. ZarrArray is
-    // read-only after open and serialises its own shard I/O internally, so a
-    // shared instance is safe to use concurrently from OMP workers.
-    mutable std::vector<std::shared_ptr<utils::ZarrArray>> readArrayCache_;
-    mutable std::mutex readArrayCacheMutex_;
-    std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
     std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
         vc::render::ChunkCache::Options options) const;
     [[nodiscard]] std::string chunkCacheSourceIdentity() const;

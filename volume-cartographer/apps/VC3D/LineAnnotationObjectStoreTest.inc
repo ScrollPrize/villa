@@ -855,9 +855,7 @@ int runObjectStoreControllerTests()
                 require(overlays.size() == 1 && overlays.front().front() == toVec3f(line.front()),
                     "linked polyline is in the volume's voxels");
                 const cv::Vec3d point=fiber.controlPoints.front();
-                Array3D<uint8_t> crop({2,2,2});
-                require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");
-                std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, sampled XYZ " << point << "\n";
+                std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, fiber XYZ " << point << "\n";
             }
             const auto originalPin=fiber.storePin;
             fiber.tags.push_back("vc3d_smoke");

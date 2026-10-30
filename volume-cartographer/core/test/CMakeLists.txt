@@ -73,11 +73,6 @@ vc_add_test(NAME test_surface_area_units)
 
 vc_add_test(NAME test_voxel_size_metadata)
 
-
-vc_add_test(NAME test_chunked_plane_sampler_fallback)
-
-vc_add_test(NAME test_volume_chunk_errors)
-
 vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -323,15 +318,6 @@ vc_add_test(NAME test_quadsurface_save_roundtrip)
 
 vc_add_test(NAME test_post_process)
 
-# Pin the on-disk wire format: chunks must remain Blosc1-readable because
-# VcDataset writes Zarr v2 metadata advertising compressor_id = "blosc".
-# This catches any future migration to Blosc2 that would silently produce
-# chunks numcodecs / zarr-python cannot decode.
-#
-# Links vc_core directly so it can call vc::testing::bloscCompressForTest,
-# which exercises the *real* compress path used by VcDataset.
-vc_add_test(NAME test_blosc1_compat LIBS doctest::doctest vc_core Blosc::blosc)
-
 # Parser-only regression tests for vc_merge_tifxyz: compile its
 # gmResolveGrid + gmCheckConnected source and assert the failure messages
 # exactly without spawning the binary.
@@ -373,163 +359,6 @@ if(VC_BUILD_APPS)
     set_tests_properties(test_tool_store_modes PROPERTIES
         ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 endif()
-
-add_executable(bench_render_synthetic bench_render_synthetic.cpp)
-target_link_libraries(bench_render_synthetic PRIVATE vc_core)
-set(_render_benchmark_architecture "${CMAKE_SYSTEM_PROCESSOR}")
-if(NOT VC_MARCH_NATIVE AND
-   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT WIN32)
-    set(_render_benchmark_architecture "x86-64-v3")
-elseif(VC_MARCH_NATIVE)
-    set(_render_benchmark_architecture "native")
-endif()
-target_compile_definitions(bench_render_synthetic PRIVATE
-    VC_RENDER_BENCH_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-    VC_RENDER_BENCH_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-    VC_RENDER_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-    VC_RENDER_BENCH_ARCHITECTURE="${_render_benchmark_architecture}")
-vc_register_test_target(bench_render_synthetic)
-add_test(NAME test_render_synthetic_fixture
-    COMMAND bench_render_synthetic --verify-all)
-set_tests_properties(test_render_synthetic_fixture PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
-vc_register_ctest(test_render_synthetic_fixture bench_render_synthetic)
-add_test(NAME test_render_synthetic_fallback_1
-    COMMAND bench_render_synthetic
-        --fixture parallel --scenario fallback_1
-        --repetitions 1 --native-trials 1)
-set_tests_properties(test_render_synthetic_fallback_1 PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
-vc_register_ctest(test_render_synthetic_fallback_1 bench_render_synthetic)
-add_test(NAME test_render_sampler_worker_override_invalid
-    COMMAND bench_render_synthetic --fixture serial --scenario full_res)
-set_tests_properties(test_render_sampler_worker_override_invalid PROPERTIES
-    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=0"
-    WILL_FAIL TRUE)
-vc_register_ctest(
-    test_render_sampler_worker_override_invalid bench_render_synthetic)
-
-
-add_library(vc_thread_sync_replay STATIC
-    thread_sync_replay/Replay.cpp
-    thread_sync_replay/RenderValgrind.cpp)
-target_include_directories(vc_thread_sync_replay PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_thread_sync_replay PUBLIC
-    nlohmann_json::nlohmann_json)
-
-add_executable(bench_thread_sync_replay
-    thread_sync_replay/main.cpp
-    thread_sync_replay/RenderValgrindCli.cpp)
-target_link_libraries(bench_thread_sync_replay PRIVATE
-    vc_thread_sync_replay nlohmann_json::nlohmann_json)
-vc_register_test_target(bench_thread_sync_replay)
-
-vc_add_test(NAME test_thread_sync_replay_native
-    LIBS doctest::doctest vc_thread_sync_replay)
-
-if(VC_RUN_RENDER_BENCHMARKS)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        find_program(VC_VALGRIND_EXECUTABLE valgrind REQUIRED)
-    endif()
-
-    add_test(NAME test_render_valgrind_ci_driver
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_run_render_valgrind_ci.py")
-    vc_register_ctest(test_render_valgrind_ci_driver bench_render_synthetic)
-
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        set(_render_valgrind_ci_root
-            "${CMAKE_BINARY_DIR}/render-valgrind-ci")
-        set(_render_valgrind_ci_model
-            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_model.json")
-        set(_render_valgrind_ci_reference
-            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_reference.json")
-        set(_render_valgrind_ci_measure_outputs)
-        set(_render_valgrind_ci_gate_outputs)
-
-        foreach(_fixture serial parallel)
-            foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
-                set(_case_dir
-                    "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
-                set(_callgrind_dir "${_case_dir}/callgrind")
-                set(_callgrind_stamp
-                    "${_callgrind_dir}/collected.stamp")
-                set(_callgrind_prefix
-                    "${_callgrind_dir}/callgrind.out")
-                set(_callgrind_metadata
-                    "${_callgrind_dir}/metadata.json")
-                set(_callgrind_scheduler)
-                set(_callgrind_byproducts
-                    "${_callgrind_metadata}")
-                if(_fixture STREQUAL "parallel")
-                    set(_callgrind_scheduler
-                        "${_callgrind_dir}/scheduler.log")
-                    list(APPEND _callgrind_byproducts
-                        "${_callgrind_scheduler}")
-                endif()
-                set(_evaluation "${_case_dir}/evaluation.json")
-                add_custom_command(
-                    OUTPUT "${_evaluation}" "${_callgrind_stamp}"
-                    BYPRODUCTS ${_callgrind_byproducts}
-                    COMMAND ${Python3_EXECUTABLE}
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        collect-evaluate
-                        --valgrind "${VC_VALGRIND_EXECUTABLE}"
-                        --benchmark $<TARGET_FILE:bench_render_synthetic>
-                        --replay $<TARGET_FILE:bench_thread_sync_replay>
-                        --fixture ${_fixture}
-                        --scenario ${_scenario}
-                        --model "${_render_valgrind_ci_model}"
-                        --case-dir "${_case_dir}"
-                    DEPENDS
-                        bench_render_synthetic
-                        bench_thread_sync_replay
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        "${_render_valgrind_ci_model}"
-                    VERBATIM)
-                list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
-
-                set(_gate "${_case_dir}/checked.json")
-                set(_gate_command
-                    ${Python3_EXECUTABLE}
-                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                    collect-evaluate --reuse-capture
-                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
-                    --benchmark $<TARGET_FILE:bench_render_synthetic>
-                    --replay $<TARGET_FILE:bench_thread_sync_replay>
-                    --fixture ${_fixture}
-                    --scenario ${_scenario}
-                    --case-dir "${_case_dir}"
-                    --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}")
-                add_custom_command(
-                    OUTPUT "${_gate}"
-                    BYPRODUCTS "${_case_dir}/checked.failed.json"
-                    COMMAND ${_gate_command}
-                    DEPENDS
-                        "${_evaluation}"
-                        "${_callgrind_stamp}"
-                        bench_thread_sync_replay
-                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
-                        "${_render_valgrind_ci_model}"
-                        "${_render_valgrind_ci_reference}"
-                    VERBATIM)
-                list(APPEND _render_valgrind_ci_gate_outputs "${_gate}")
-            endforeach()
-        endforeach()
-
-        add_custom_target(render_valgrind_ci_measure
-            DEPENDS ${_render_valgrind_ci_measure_outputs})
-        add_custom_target(render_valgrind_ci
-            DEPENDS ${_render_valgrind_ci_gate_outputs})
-    endif()
-endif()
-
-
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
 # triggers a violation that the matching sanitizer must report; ctest
@@ -600,26 +429,11 @@ vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
 vc_add_test(NAME test_global_cache_root)
-vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
-if(VC_BUILD_PYTHON)
-    find_package(Python REQUIRED COMPONENTS Interpreter)
-    add_dependencies(test_sftp_fetch vc_volume)
-    add_test(NAME python_sftp_volume
-        COMMAND "${CMAKE_COMMAND}" -E env
-            "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
-            "PYTHONNOUSERSITE=1"
-            "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/python/tests/test_sftp_volume.py"
-            --ssh-fixture "$<TARGET_FILE:test_sftp_fetch>"
-            --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
-    set_tests_properties(python_sftp_volume PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 200)
-    vc_register_ctest(python_sftp_volume test_sftp_fetch)
-endif()
 
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.
 vc_add_test(NAME test_normal_grid_live)
 set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
-
 
 vc_add_test(NAME test_tiff_more)
 
@@ -659,7 +473,6 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
-
 if(TARGET vc_render_tifxyz)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     vc_register_test_target(vc_render_tifxyz)
@@ -669,18 +482,6 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
-    add_test(NAME test_render_fetch_failure
-        COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_fetch_failure.py"
-            $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
-    vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
-    add_test(NAME test_render_sampled_chunks
-        COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_sampled_chunks.py"
-            $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_sampled_chunks PROPERTIES TIMEOUT 120)
-    vc_register_ctest(test_render_sampled_chunks vc_render_tifxyz)
     add_test(NAME test_render_zarr_output
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_render_zarr_output.py"
@@ -697,9 +498,7 @@ vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
-
 vc_add_test(NAME test_quadsurface_more)
-
 
 vc_add_test(NAME test_thinning)
 
@@ -712,7 +511,6 @@ vc_add_test(NAME test_quadsurface_io)
 vc_add_test(NAME test_quadsurface_pointto)
 
 vc_add_test(NAME test_quadsurface_snapshot)
-
 
 vc_add_test(NAME test_quadsurface_save_paths)
 
@@ -738,10 +536,6 @@ vc_add_test(NAME test_quadsurface_components)
 
 vc_add_test(NAME test_volume_local)
 
-
-vc_add_test(NAME test_chunked_plane_sampler)
-
-
 vc_add_test(NAME test_volume_pkg)
 vc_add_test(NAME test_opened_volumes
     SOURCES test_opened_volumes.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp)
@@ -750,36 +544,8 @@ vc_add_test(NAME test_viewer_sampling
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerSampling.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-
-vc_add_test(NAME test_vcdataset)
-
 vc_add_test(NAME test_zarr)
 
-vc_add_test(NAME test_chunk_cache)
-
-vc_add_test(NAME test_volume_extras)
-
-
-vc_add_test(NAME test_vcdataset_compressors)
-
-vc_add_test(NAME test_vcdataset_volcomp)
-
-vc_add_test(NAME test_zarr_shard_index_location)
-
-vc_add_test(NAME test_volume_static_read)
-
-vc_add_test(NAME test_volume_pyramid)
-
-vc_add_test(NAME test_chunk_cache_persist)
-
-vc_add_test(NAME test_persistent_zarr_cache_budget)
-
-vc_add_test(NAME test_zarr_chunk_fetcher)
-
-vc_add_test(NAME test_chunked_plane_sampler_more)
-
-
-vc_add_test(NAME test_vcdataset_more)
 
 # Real PHerc 0172 segments committed under core/test/data/segments/.
 vc_add_test(NAME test_quadsurface_fixtures)
@@ -792,6 +558,5 @@ vc_add_test(NAME test_surface_patch_index_more)
 
 vc_add_test(NAME test_quadsurface_extras)
 vc_add_test(NAME test_quadsurface_store)
-
 
 vc_add_test(NAME test_volume_pkg_more)

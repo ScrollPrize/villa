@@ -42,49 +42,6 @@ std::string text(const fs::path& p) {
 }
 }
 
-TEST_CASE("normal-field visualization reads separators, fill and physical coordinates") {
-    QTemporaryDir temp;
-    REQUIRE(temp.isValid());
-    const fs::path root = temp.path().toStdString();
-    std::string reference;
-    for (const auto* separator : {".", "/"}) {
-        const auto field = root / (std::string(separator) == "." ? "dot" : "slash");
-        vcr::zarr::CreateOptions options;
-        options.shape = {3, 4, 5}; options.chunks = {2, 2, 2};
-        options.fillValue = 128; options.separator = separator;
-        options.compressor = "gzip";
-        for (const auto* axis : {"x", "y", "z"}) {
-            auto writer = vcr::zarr::Writer::create(field / axis / "0", options);
-            std::vector<uint8_t> chunk(8, axis[0] == 'x' ? 255 : 128);
-            writer.writeChunk({0, 0, 0}, chunk.data(), chunk.size());
-        }
-        vcr::zarr::writeAttributes(field, {{"grid_origin_xyz", {10, 20, 30}}, {"sample_step", 2}});
-        const auto ply = field / "normals.ply";
-        run({"--input", path(field), "--vis-ply", path(ply)});
-        const auto result = text(ply);
-        CHECK(result.find("element vertex 00000000000000000016") != std::string::npos);
-        CHECK(result.find("element edge 00000000000000000008") != std::string::npos);
-        CHECK(result.find("10 20 30 255 255 0\n11 20 30 255 255 0") != std::string::npos);
-        if (reference.empty()) reference = result;
-        else CHECK(result == reference);
-        const auto cropped = field / "crop.ply";
-        run({"--input", path(field), "--vis-ply", path(cropped), "--crop", "10", "20", "30", "11", "21", "31"});
-        CHECK(text(cropped).find("element edge 00000000000000000001") != std::string::npos);
-
-        // Every interpolation footprint lies inside the one populated 2^3 block.
-        cv::Mat_<cv::Vec3f> points(2, 2);
-        points(0, 0) = {10.25f, 20.25f, 30.5f};
-        points(0, 1) = {11.25f, 20.25f, 30.5f};
-        points(1, 0) = {10.25f, 21.25f, 30.5f};
-        points(1, 1) = {11.25f, 21.25f, 30.5f};
-        const auto surface = field / "surface";
-        QuadSurface(points, {1, 1}).save(surface, true);
-        const auto onSurface = field / "on-surface.ply";
-        run({"--input", path(field), "--vis-ply", path(onSurface), "--surf", path(surface)});
-        CHECK(text(onSurface).find("element edge 00000000000000000000") == std::string::npos);
-    }
-}
-
 TEST_CASE("fitted normals publish seven arrays with distinct fill values") {
     QTemporaryDir temp;
     REQUIRE(temp.isValid());

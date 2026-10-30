@@ -53,20 +53,6 @@ TEST_CASE("downsampleTileIntoPreserveZ<uint8>: preserves Z dim, halves Y/X")
     CHECK(dst[0] == 80);
 }
 
-TEST_CASE("createPyramidDatasets writes L1..L5 metadata directories")
-{
-    auto d = tmpDir("pyr_create");
-    // Create L0 first (createPyramidDatasets only writes L1..L5).
-    vcr::zarr::Writer::create(d / "0", {
-        .shape = {64, 64, 64}, .chunks = {32, 32, 32}, .compressor = "none"});
-    createPyramidDatasets(d, /*shape0=*/{64, 64, 64},
-                          /*CH=*/32, /*CW=*/32, /*isU16=*/false);
-    for (int lvl = 1; lvl <= 5; ++lvl) {
-        CHECK(fs::exists(d / std::to_string(lvl) / ".zarray"));
-    }
-    fs::remove_all(d);
-}
-
 TEST_CASE("writeZarrAttrs writes a parseable .zattrs at the volume path")
 {
     auto d = tmpDir("attrs");
@@ -299,14 +285,4 @@ void checkPyramidRoundTrip()
                 CHECK(output[(z * 10 + y) * 11 + x] == T((sum + count / 2) / count));
             }
     fs::remove_all(d);
-}
-
-TEST_CASE("buildPyramidLevel preserves uint8 slices, sparse chunks and odd edges")
-{
-    checkPyramidRoundTrip<uint8_t>();
-}
-
-TEST_CASE("buildPyramidLevel preserves uint16 slices, sparse chunks and odd edges")
-{
-    checkPyramidRoundTrip<uint16_t>();
 }

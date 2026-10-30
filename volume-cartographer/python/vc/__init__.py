@@ -1,15 +1,5 @@
-"""Python bindings for Volume Cartographer."""
+"""Python bindings for Volume Cartographer's fiber tooling: the fiber tracer
+(vc.fiber_trace), Fiber3D training kernels and the Lasagna normal sampler
+(vc.volume), fiber evaluation and the vcz1 codec.
 
-from .volume import (
-    Volume,
-    set_chunk_cache_budget,
-    set_chunk_cache_decode_threads,
-    set_chunk_cache_io_threads,
-)
-
-__all__ = [
-    "Volume",
-    "set_chunk_cache_budget",
-    "set_chunk_cache_decode_threads",
-    "set_chunk_cache_io_threads",
-]
+Volume reads and sampling are vc_reader's (vc_reader.reader.open_zarr)."""

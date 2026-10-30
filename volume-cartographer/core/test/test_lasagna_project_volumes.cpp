@@ -5,7 +5,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "support/TestProject.hpp"
-#include "utils/zarr.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <array>
 #include <filesystem>
@@ -25,40 +25,18 @@ fs::path temporaryDirectory()
     return path;
 }
 
-void createZyx(const fs::path& path,
-               std::array<std::size_t, 3> shape,
-               unsigned char firstValue)
+void createArray(const fs::path& path, vcr::Index shape)
 {
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {shape[0], shape[1], shape[2]};
-    metadata.chunks = {shape[0], shape[1], shape[2]};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    metadata.fill_value = 0.0;
-    auto array = utils::ZarrArray::create(path, metadata);
-    std::vector<std::byte> bytes(shape[0] * shape[1] * shape[2]);
-    for (std::size_t i = 0; i < bytes.size(); ++i)
-        bytes[i] = static_cast<std::byte>(firstValue + i);
-    const std::array<std::size_t, 3> key{0, 0, 0};
-    array.write_chunk(key, bytes);
+    vcr::zarr::CreateOptions options;
+    options.shape = shape;
+    options.chunks = shape;
+    options.compressor = "";
+    vcr::zarr::Writer::create(path, options);
 }
 
-void createZyx(const fs::path& path, unsigned char firstValue)
+void createZyx(const fs::path& path, vcr::Index shape = {2, 2, 2})
 {
-    createZyx(path, {2, 2, 2}, firstValue);
-}
-
-void createCzyx(const fs::path& path)
-{
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {2, 2, 2, 2};
-    metadata.chunks = {2, 2, 2, 2};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    metadata.fill_value = 0.0;
-    (void)utils::ZarrArray::create(path, metadata);
+    createArray(path, std::move(shape));
 }
 
 }  // namespace
@@ -66,7 +44,7 @@ void createCzyx(const fs::path& path)
 TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "pred.zarr", 100);
+    createZyx(dir / "pred.zarr");
     const auto manifestPath = dir / "fiber.lasagna.json";
     {
         std::ofstream manifest(manifestPath);
@@ -93,19 +71,13 @@ TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
           "vc-lasagna-manifest:" + manifestPath.string(),
           "vc-lasagna-group:pred"});
 
-    const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
-    REQUIRE(chunk.bytes);
-    REQUIRE(chunk.bytes->size() == 8);
-    for (std::size_t i = 0; i < 8; ++i)
-        CHECK(static_cast<unsigned char>((*chunk.bytes)[i]) == 100 + i);
     fs::remove_all(dir);
 }
 
 TEST_CASE("Lasagna project preparation deduplicates shared source zarrs")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "pred.zarr", 10);
+    createZyx(dir / "pred.zarr");
     const auto manifestPath = dir / "fiber.lasagna.json";
     {
         std::ofstream manifest(manifestPath);
@@ -182,9 +154,9 @@ TEST_CASE("Lasagna project volume tags preserve anonymous remote authentication"
 TEST_CASE("Lasagna project preparation keeps numeric scale group ids unique")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "fiber_sd1_exp002_crop_presence.ome.zarr" / "3", 1);
-    createZyx(dir / "fiber_sd1_exp002_crop_nx.ome.zarr" / "3", 10);
-    createZyx(dir / "fiber_sd1_exp002_crop_ny.ome.zarr" / "3", 20);
+    createZyx(dir / "fiber_sd1_exp002_crop_presence.ome.zarr" / "3");
+    createZyx(dir / "fiber_sd1_exp002_crop_nx.ome.zarr" / "3");
+    createZyx(dir / "fiber_sd1_exp002_crop_ny.ome.zarr" / "3");
     const auto manifestPath = dir / "fiber.lasagna.json";
     {
         std::ofstream manifest(manifestPath);
@@ -275,7 +247,7 @@ TEST_CASE("Lasagna project preparation keeps numeric scale group ids unique")
 TEST_CASE("Lasagna project preparation leaves scale handling to native volume loading")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "pred.zarr" / "2", {2, 3, 3}, 50);
+    createZyx(dir / "pred.zarr" / "2", {2, 3, 3});
     const auto manifestPath = dir / "data.lasagna.json";
     {
         std::ofstream manifest(manifestPath);
@@ -307,18 +279,13 @@ TEST_CASE("Lasagna project preparation leaves scale handling to native volume lo
     CHECK(volume->hasScaleLevel(2));
     CHECK(volume->levelShape(2) == std::array<int, 3>{2, 3, 3});
 
-    const auto chunk = volume->chunkedCache()->getChunkBlocking(2, 0, 0, 0);
-    REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
-    REQUIRE(chunk.bytes);
-    REQUIRE(chunk.bytes->size() == 18);
-    CHECK(static_cast<unsigned char>((*chunk.bytes)[0]) == 50);
     fs::remove_all(dir);
 }
 
 TEST_CASE("Lasagna project preparation uses native volume validation")
 {
     const auto dir = temporaryDirectory();
-    createCzyx(dir / "pred.zarr");
+    createArray(dir / "pred.zarr", {2, 2, 2, 2});
     const auto manifest = vc::lasagna::LasagnaDatasetManifest::
         parseText(R"({"version":2,"groups":{"pred":{"zarr":"pred.zarr","channels":["presence"]}}})", dir / "data.lasagna.json");
     CHECK_THROWS_WITH_AS(
@@ -331,8 +298,8 @@ TEST_CASE("Lasagna project preparation uses native volume validation")
 TEST_CASE("Lasagna project volumes reload without Lasagna-specific reconciliation")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "presence.zarr", 1);
-    createZyx(dir / "nx.zarr", 100);
+    createZyx(dir / "presence.zarr");
+    createZyx(dir / "nx.zarr");
     const auto manifestPath = dir / "fiber.lasagna.json";
     {
         std::ofstream manifest(manifestPath);

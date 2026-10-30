@@ -274,8 +274,9 @@ def test_real_ct_patch_end_to_end(request):
     if not path:
         pytest.skip("supply --vc-real-volume for real CT preparation validation")
     xyz_origin = tuple(float(v) for v in request.config.getoption("--vc-origin-xyz").split(","))
-    volume = native.Volume.open(path)
-    native.initialize_chunk_cache(256 * 1024**2, 1, 1, 1)
+    from vc_reader.reader import open_zarr
+    level = request.config.getoption("--vc-level")
+    volume = open_zarr(path, level=level)
     args = _geometry_args("3d", (32, 32, 32))
     args.update(cp_local_zyx=np.full(3, 15.5, np.float32),
                 cp_volume_zyx=np.array(xyz_origin[::-1], np.float32) + 15.5,
@@ -286,9 +287,8 @@ def test_real_ct_patch_end_to_end(request):
     np.testing.assert_array_equal(valid, expected_valid)
 
     def sample(grid, mask):
-        xyz = np.ascontiguousarray(grid[..., ::-1].reshape(32 * 32, 32, 3))
-        return volume.sample_coords(xyz, np.ascontiguousarray(mask.reshape(32 * 32, 32), bool),
-                                    sampler_threads=1, level=request.config.getoption("--vc-level"))[0].reshape(32, 32, 32)
+        values = volume.sample(grid.reshape(-1, 3) / 2**level, order=1).reshape(32, 32, 32)
+        return np.where(mask, np.round(values), 0).astype(np.uint8)
 
     sampled = sample(coords, valid)
     reference = sample(expected, expected_valid)

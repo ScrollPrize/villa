@@ -2,7 +2,7 @@
 #include "TargetContext.hpp"
 #include "utils/Json.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <boost/program_options.hpp>
@@ -1200,11 +1200,12 @@ int main(int argc, char *argv[])
     };
     params["tgt_dir"] = tgt_dir.string();
 
-    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
-
-    std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
-    add_internal_volume_shape(params, ds->shape());
+    const auto level0 = vcr::zarr::openArray((vol_path / "0").string(), {}).meta;
+    const std::vector<size_t> shape(level0.shape.begin(), level0.shape.end());
+    std::cout << "zarr dataset size for scale group 0 " << shape << std::endl;
+    std::cout << "chunk shape shape "
+              << std::vector<size_t>(level0.chunks.begin(), level0.chunks.end()) << std::endl;
+    add_internal_volume_shape(params, shape);
 
     // Resolved the same way Volume does, so a store that states its voxel size
     // only through an acquisition record is not read as 0.

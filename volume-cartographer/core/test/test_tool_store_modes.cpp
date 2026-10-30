@@ -4,7 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/types/Array3D.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -55,12 +55,12 @@ void writeRampVolume(const fs::path& path)
 {
     vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {128, 192, 192};
-    auto volume = vc::test::createZarrVolume(path, options);
-    Array3D<uint8_t> ramp({128, 192, 192}, 0);
+    vc::test::createZarrVolume(path, options);
+    std::vector<uint8_t> ramp(128 * 192 * 192);
     for (size_t z = 0; z < 128; ++z)
         for (size_t y = 0; y < 192; ++y)
-            for (size_t x = 0; x < 192; ++x) ramp(z, y, x) = uint8_t((x + 2 * y + 3 * z) % 251);
-    vc::test::writeZYX(*volume, ramp, {0, 0, 0});
+            for (size_t x = 0; x < 192; ++x) ramp[(z * 192 + y) * 192 + x] = uint8_t((x + 2 * y + 3 * z) % 251);
+    vcr::zarr::Writer::open(path / "0").writeRegion({0, 0, 0}, {128, 192, 192}, ramp.data());
 }
 
 // A store holding one curved surface, and the same surface as a tifxyz directory.

@@ -55,8 +55,6 @@ option(VC_ENABLE_TYSAN    "TypeSanitizer (clang-only, LLVM 18+)"         OFF)
 option(VC_ENABLE_NSAN     "NumericalStabilitySanitizer (clang-only, LLVM 19+)" OFF)
 option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
-option(VC_RUN_RENDER_BENCHMARKS
-       "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
 # practical Windows build — default it off there.
 if(WIN32)
