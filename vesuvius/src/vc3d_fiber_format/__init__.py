@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,27 @@ _POSITIVE_CONFIG_KEYS = {
     "max_step_factor", "endpoint_accept_threshold_base_voxels",
 }
 _NON_NEGATIVE_CONFIG_KEYS = _CONFIG_KEYS_V3 - _POSITIVE_CONFIG_KEYS
+
+# Canonical 8-4-4-4-12 hex UUID text; mirrors vc::util::isUuid in
+# volume-cartographer/core/include/vc/core/util/Uuid.hpp.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def is_canonical_uuid(value: Any) -> bool:
+    """True for a string in canonical 8-4-4-4-12 hex UUID form."""
+    return isinstance(value, str) and _UUID_RE.fullmatch(value) is not None
+
+
+def validate_fiber_uuid(obj: Any, *, label: str = "vc3d_fiber") -> None:
+    """Reject a present-but-invalid top-level fiber ``uuid``.
+
+    The field is optional (legacy fibers lack it), but when present it must
+    be canonical UUID text, as VC3D's parseVc3dFiberJson requires.
+    """
+    if isinstance(obj, dict) and "uuid" in obj and not is_canonical_uuid(obj["uuid"]):
+        raise ValueError(f"{label} has an invalid uuid")
 
 
 @dataclass(frozen=True)
@@ -99,6 +121,18 @@ def _points(raw: Any, *, label: str) -> tuple[tuple[float, float, float], ...]:
             _number(value, label=f"{label}[{index}]") for value in point
         ))
     return tuple(result)
+
+
+def serialize_segment_metadata(segment: FiberTraceSegmentMetadata) -> dict[str, Any]:
+    """Inverse of the canonical V3 parser; derived outcome is not serialized."""
+    result = asdict(segment)
+    result.pop("outcome")
+    tags = result.pop("tags", ())
+    if tags:
+        result["tags"] = list(tags)
+    result.update(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2)
+    parse_segment_metadata(result, version=4 if tags else 3)
+    return result
 
 
 def parse_segment_metadata(raw: Any, *, version: int = 3) -> FiberTraceSegmentMetadata:
@@ -239,8 +273,9 @@ def parse_vc3d_fiber_format(
         raise ValueError(f"only vc3d_fiber versions 1, 3 and 4 are supported, got {version!r}")
     if version >= 3 and "type" not in obj:
         raise ValueError("version-3/4 vc3d_fiber is missing type")
+    validate_fiber_uuid(obj, label=label)
 
-    if version >= 3 and "optimization_mode" not in obj:
+    if version == 3 and "optimization_mode" not in obj:
         raise ValueError("version-3/4 vc3d_fiber is missing optimization_mode")
     optimization_mode = obj.get("optimization_mode", "lasagna")
     if not isinstance(optimization_mode, str) or optimization_mode not in {
@@ -259,8 +294,20 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next", "tags"}:
-                raise ValueError("version-3/4 control points must contain only position, segment_to_next and tags")
+            # Editor hints are validated without changing reference geometry or span eligibility.
+            allowed = {"position", "segment_to_next", "tags", "direction", "display_normal", "display_normal_source"}
+            if not isinstance(control, dict) or not set(control) <= allowed:
+                raise ValueError("version-3/4 control point contains unknown fields")
+            for field in ("direction", "display_normal"):
+                if field in control:
+                    vector = _points([control[field]], label=f"control point {field}")[0]
+                    if not any(vector):
+                        raise ValueError(f"control point {field} must be nonzero")
+            if "display_normal_source" in control and (
+                "display_normal" not in control or control["display_normal_source"] not in
+                {"manual", "interpolated", "unknown"}
+            ):
+                raise ValueError("invalid control point display_normal_source")
             if "position" not in control:
                 raise ValueError("version-3/4 control point is missing position")
             # Optional per-control-point tags (VC3D writes e.g. "kollesis_termination",
@@ -277,9 +324,13 @@ def parse_vc3d_fiber_format(
                 parsed_segments.append(None)
             else:
                 if "segment_to_next" not in control:
-                    raise ValueError("a non-final control point is missing segment_to_next")
-                parsed_segments.append(
-                    parse_segment_metadata(control["segment_to_next"], version=version))
+                    if version == 3:
+                        raise ValueError("a non-final control point is missing segment_to_next")
+                    # Current typed geometry need not have tracing provenance.
+                    parsed_segments.append(None)
+                else:
+                    parsed_segments.append(
+                        parse_segment_metadata(control["segment_to_next"], version=version))
         control_points = _points(positions, label=f"{label} control_points")
         segments = tuple(parsed_segments)
 

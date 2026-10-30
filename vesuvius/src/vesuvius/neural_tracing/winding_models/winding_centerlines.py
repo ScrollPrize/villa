@@ -46,6 +46,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
@@ -1028,7 +1029,7 @@ class TifxyzSpool:
         _write_json_atomic(destination / 'meta.json', {
             'format': 'tifxyz',
             'type': 'seg',
-            'uuid': name,
+            'uuid': str(uuid.uuid4()),
             'scale': [1.0 / self.spacing, 1.0 / self.spacing],
             'bbox': [xyz.min(axis=0).astype(float).tolist(), xyz.max(axis=0).astype(float).tolist()],
             'source': f'Gaussian winding centerlines from {source}',

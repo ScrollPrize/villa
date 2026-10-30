@@ -36,15 +36,14 @@ import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Figure from "@site/src/components/Figure";
 import ChatCallout from "@site/src/components/ChatWidget/ChatCallout";
 
-*Last updated: July 10, 2026*
+*Last updated: October 14, 2026*
 
-In 2026, **PHerc. 1667** **was virtually unwrapped and read without physically opening the scroll** (see [References](#references-and-implementation-links)). 
-
-We are no longer asking whether a sealed Herculaneum scroll can be read. It can. The harder question is how to make the same process work automatically, reliably, and at scale for every scroll.
+In 2026, **PHerc. 1667 [was virtually unwrapped and read](/firstscroll) without physically opening the scroll**.
+We are no longer asking whether a sealed Herculaneum scroll can be read. It can. The next question is how to make the same process work automatically, reliably, and at scale for every scroll.
 
 ### 🙋 **How you can help**
 
-This post doubles as a technical map of the whole pipeline and an onboarding document for anyone who wants to work on it. There are six concrete ways to contribute introduced as we go — look for the 🙋 callouts in Sections [2](#2-unwrapping-turning-disconnected-voxels-into-a-surface)-[4](#4-data-scale-the-infrastructure-bottleneck)\! Write on [Discord](https://discord.com/invite/V4fJhvtaQn) for more information\!
+This post doubles as a technical map of the whole pipeline and an onboarding document for anyone who wants to work on it. There are six concrete ways to contribute introduced as we go — look for the 🙋 callouts throughout\! Many of them are backed by [open prizes](/prizes). Write on [Discord](https://discord.com/invite/V4fJhvtaQn) for more information\!
 
 ### 📊 **Where is the data**
 
@@ -55,26 +54,15 @@ This post doubles as a technical map of the whole pipeline and an onboarding doc
 
 ### 🧑‍💻 **Where is the code**
 
-Most of the code is publicly available in the GitHub [ScrollPrize](https://github.com/ScrollPrize) account, especially in the [villa](https://github.com/ScrollPrize/villa) monorepository.
+Most of the code is publicly available [on GitHub](https://github.com/ScrollPrize), especially in the [villa](https://github.com/ScrollPrize/villa) monorepository.
 
 ### 🎓 **Related tutorials**
 
 Hands-on guides for every stage of the pipeline described in this post:
 
-<details>
-<summary>Tutorials</summary>
-
-Up to date:
-
-- [Volume Cartographer 3D (VC3D)](tutorial_VC3D) — installing the software, loading scroll data, navigating volumes, and annotating fibers and windings (early draft)
+- [Volume Cartographer 3D (VC3D)](tutorial_VC3D) — installing the software, loading scroll data, navigating volumes, and annotating fibers and windings
 - [Spiral Fitting](tutorial_spiral) — fitting the global spiral prior to a scroll
 - [Ink Detection](tutorial5) — training and running ink-detection models
-
-Archived (describe earlier tooling and data layouts):
-
-- [Scanning](tutorial1) · [Representation](tutorial2) · [Segmentation](segmentation) · [Segmentation and Flattening](tutorial3)
-
-</details>
 
 ## The pipeline
 Reading a scroll is a chain of complex problems:
@@ -102,7 +90,7 @@ What it does not contain is information about mappings to different physical obj
 
 To reconstruct a scroll, the first step then is to find efficient and descriptive “representations” of this scan volume which capture the important properties — such as where individual papyrus sheets are — that allow us to unwrap it and read it.
 
-That is why the pipeline is difficult. We are reconstructing geometry and extracting text from a damaged carbonized object whose internal structure and connectivity is not given to us.
+That is why the pipeline is difficult. We are reconstructing geometry and extracting text from a tiny, complex, damaged object whose internal structure and connectivity is not given to us.
 
 ***
 ## 1\. Scanning: capturing the signal
@@ -118,7 +106,7 @@ There is, however, still a signal to be found. Ink may affect the scan in more s
   caption="A micro-CT cross-section of a carbonized Herculaneum scroll: hundreds of tightly wound, deformed papyrus windings packed into a few centimeters (scale bar: 5 cm)."
 />
 
-The subtle differences that distinguish ink from papyrus must be teased out of data like this.
+The subtle differences that distinguish ink from papyrus must be teased out of data like this. For more on the internal structure of a papyrus scroll, see [Anatomy of a Scroll](https://github.com/ScrollPrize/villa/blob/main/SCROLL_ANATOMY.md).
 
 ### The compressed-region problem
 For as long as we’ve been working on these scans, it’s been apparent that some regions of a scroll look worse than the resolution used to scan them would suggest. These crops come out blurred, foggy, "compressed" — papyrus layers that should be cleanly separable become hard to tell apart. When panning through layers, the sheets could almost be seen “behind” this fog. Recent scanning experiments conducted at very high resolutions (0.55 µm detector pixel size) have finally given us an answer to the question of why these areas exist. 
@@ -142,9 +130,9 @@ The explanation starts at the fiber level. Carbonized papyrus fibers contain sma
 <Figure
   variant="pair"
   srcs={["/img/ash2text/image5.jpg", "/img/ash2text/image6.jpg"]}
-  alts={["Compressed region of PHerc. Paris 4 scanned at DLS, 7.91 µm", "The same region rescanned at ESRF, 2.4 µm"]}
+  alts={["Compressed region of PHerc. Paris. 4 scanned at DLS, 7.91 µm", "The same region rescanned at ESRF, 2.4 µm"]}
   subCaptions={["DLS, 7.91 µm", "ESRF, 2.4 µm"]}
-  caption="The same compressed region of PHerc. Paris 4, imaged with two protocols. With a suboptimal protocol, layer boundaries blur into haze and adjacent sheets become hard to tell apart; with a more optimized protocol, individual windings become far easier to separate."
+  caption="The same compressed region of PHerc. Paris. 4, imaged with two protocols. With a suboptimal protocol, layer boundaries blur into haze and adjacent sheets become hard to tell apart; with a more optimized protocol, individual windings become far easier to separate."
 />
 
  The difficulty of unwrapping scrolls begins here. Blur the boundaries in the scan, and every downstream step gets harder: surface localization (finding the writing surface within the volume) turns noisier, mesh tracing turns less stable, and ink recovery may miss information it needs.
@@ -258,7 +246,7 @@ If you know geometry processing, optimization algorithms, or C++, this is one of
 
 </Admonition>
 ### Surface mesh representations
-The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer), uses a custom format called 'tifxyz,' an alternative to widely-used 3D formats such as .obj or .stl. Its key benefit is that it enforces grid topology on the surface mesh — meaning, again, a single flat sheet. The flat coordinate system on the surface is carried explicitly exploiting a 2D grid structure. Indeed, the surface mesh (QuadSurface in the C++ code; Tifxyz in Python, via vesuvius.tifxyz.Tifxyz/read\_tifxyz()) is represented by a 2D array of 3D vertex coordinates: the array's shape determines the mesh's grid structure, and the vertices define its actual shape in space. That grid of coordinates is saved as three separate TIFF images, one each for x, y, and z coordinates (as float32). The format can also mark a given cell as missing, either by setting each coordinate to \-1 or via an optional sidecar mask image. Converter scripts move between tifxyz and .obj in both directions ([vc\_tifxyz2obj](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_tifxyz2obj.cpp), [vc\_obj2tifxyz](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz.cpp)); going from .obj to tifxyz requires an accompanying .griduv sidecar file specifying the intended grid structure (a [legacy converter](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz_legacy.cpp) without this requirement also exists, but is not recommended for new work). The core representation itself lives in [QuadSurface.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/QuadSurface.cpp).
+The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer), uses a custom format called 'tifxyz' (see [Data Formats](/data)), an alternative to widely-used 3D formats such as .obj or .stl. Its key benefit is that it enforces grid topology on the surface mesh — meaning, again, a single flat sheet. The flat coordinate system on the surface is carried explicitly exploiting a 2D grid structure. Indeed, the surface mesh (QuadSurface in the C++ code; Tifxyz in Python, via vesuvius.tifxyz.Tifxyz/read\_tifxyz()) is represented by a 2D array of 3D vertex coordinates: the array's shape determines the mesh's grid structure, and the vertices define its actual shape in space. That grid of coordinates is saved as three separate TIFF images, one each for x, y, and z coordinates (as float32). The format can also mark a given cell as missing, either by setting each coordinate to \-1 or via an optional sidecar mask image. Converter scripts move between tifxyz and .obj in both directions ([vc\_tifxyz2obj](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_tifxyz2obj.cpp), [vc\_obj2tifxyz](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz.cpp)); going from .obj to tifxyz requires an accompanying .griduv sidecar file specifying the intended grid structure (a [legacy converter](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz_legacy.cpp) without this requirement also exists, but is not recommended for new work). The core representation itself lives in [QuadSurface.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/QuadSurface.cpp).
 
 ### Visualizing a mesh
 [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) makes it possible to visualize the CT scans, meshes, and annotations all in one tool. The CT data for the large scrolls, which can reach dozens of terabytes, is streamed remotely and synchronized from the S3 Open Data bucket, generously provided to the project by AWS. A hands-on [VC3D tutorial](tutorial_VC3D) walks through installing the software, loading scroll data, and annotating fibers and windings.
@@ -400,7 +388,7 @@ Each of these sources of information provides a hard (verified) or soft (unverif
   caption="The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates."
 />
 
-One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
+One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The method is described in [Henderson, WACV 2026](https://arxiv.org/abs/2512.04927) (see [References](#references-and-implementation-links)); the fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
 
 A global prior can organize and regularize geometry, allowing a single consistent result to be produced from disconnected annotations, bridging small gaps and interpolating windings. But where annotations are sparse or the volume is highly ambiguous, spiral fitting is still under-constrained, and won't necessarily follow the true sheet surfaces.
 
@@ -486,13 +474,13 @@ Sometimes a fragment-trained model reveals faint but coherent ink traces inside 
 
 A pseudo-label is a provisional label created from model output and human review rather than direct photographic ground truth. The loop is:
 
-4. Train on fragments.    
-5. Run the model on a sealed scroll.    
-6. Identify plausible ink traces.    
-7. Create conservative pseudo-labels.    
-8. Fine-tune the model.    
-9. Run inference again.    
-10. Repeat.
+1. Train on fragments.    
+2. Run the model on a sealed scroll.    
+3. Identify plausible ink traces.    
+4. Create conservative pseudo-labels.    
+5. Fine-tune the model.    
+6. Run inference again.    
+7. Repeat.
 
 <Figure
   variant="full"
@@ -513,7 +501,7 @@ This process helped recover readable text in PHerc. 1667\. **But it is not guara
 
 </Admonition>
 
-The current ink detection model, which works on 2.4 µm data, is [https://huggingface.co/scrollprize/ink\_canonical\_2um](https://huggingface.co/scrollprize/ink_canonical_2um), inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
+The current ink detection model, which works on 2.4 µm data, is [https://huggingface.co/scrollprize/ink\_canonical\_2um](https://huggingface.co/scrollprize/ink_canonical_2um), inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference). The [Ink Detection tutorial](tutorial5) covers training and running these models, and the [First Letters prizes](/prizes#first-letters-prizes) reward finding ink in new scrolls.
 
 We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µm data. But scanning at high resolution is impractical.
 
@@ -579,7 +567,7 @@ This is especially attractive for our data because the volumes are enormous and 
 
 Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the UNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
 
-Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
+Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris. 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
 
 We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step. It can be blended with cosine similarity between each voxel's DINO generated embedding and a reference fiber embedding.
 
@@ -595,7 +583,7 @@ We used this frozen checkpoint to guide a 2-class background/fiber segmentation 
 Top row: the raw CT image; the input mask; the teacher's pre-mask; the teacher's sigmoid output; the teacher binarized. Bottom row: the cosine-similarity map; the same map binarized by Otsu's method (labeled "Sim bin (Otsu=0.503)" in the original figure — 0.503 is simply this step's dynamically computed threshold, not a fixed setting); the soft union of the two signals; the binarized training target; and the student's own prediction.
 
 ### Direct 3D ink segmentation
-In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become visible enough to support direct volumetric segmentation (see [this paper](https://arxiv.org/abs/2606.29085)).
+In recent high-resolution scans of PHerc. Paris. 4, ink-bearing deposits become visible enough to support direct volumetric segmentation (see [this paper](https://arxiv.org/abs/2606.29085)).
 
 <Figure
   variant="medium"
@@ -603,23 +591,23 @@ In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become v
   enlarge
   maxHeight={640}
   src="/img/ash2text/image24.png"
-  alt="PHerc. Paris 4: ink segmented in 3D and overlaid on the flattened surface"
-  caption="a) XY slice of PHerc. Paris 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two."
+  alt="PHerc. Paris. 4: ink segmented in 3D and overlaid on the flattened surface"
+  caption="a) XY slice of PHerc. Paris. 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two."
 />
 
-Not every scroll will behave like PHerc. Paris 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
+Not every scroll will behave like PHerc. Paris. 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
 
-The checkpoint behind panel (d) in the previous image, [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided)  is trained specifically for PHerc. Paris 4 and is released on Hugging Face.
+The checkpoint behind panel (d) in the previous image, [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided)  is trained specifically for PHerc. Paris. 4 and is released on Hugging Face.
 
 Careful\! The 3D UNet segmentation model for ink segmentation was not only DINO guided, but it also used **self-distillation** from another 3D ink detection model (not discussed here) to clean up the DINO embedding during UNet training.
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
+If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris. 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
 
 </Admonition>
 ### Self-distillation without ground truth
-Not every fiber- and ink-modeling effort in this pipeline starts from labels at all. A trainer at [scripts/fiber\_5class/](https://github.com/ScrollPrize/villa/tree/main/scripts/fiber_5class), specifically its [label\_generator.py](https://github.com/ScrollPrize/villa/blob/main/scripts/fiber_5class/label_generator.py), trains a 3D U-Net for 4-class semantic segmentation — background, vertical fiber, horizontal/angular fiber, and ink — directly on raw CT, with no ground-truth labels of any kind (in PHerc. Paris 4).
+Not every fiber- and ink-modeling effort in this pipeline starts from labels at all. A trainer at [scripts/fiber\_5class/](https://github.com/ScrollPrize/villa/tree/main/scripts/fiber_5class), specifically its [label\_generator.py](https://github.com/ScrollPrize/villa/blob/main/scripts/fiber_5class/label_generator.py), trains a 3D U-Net for 4-class semantic segmentation — background, vertical fiber, horizontal/angular fiber, and ink — directly on raw CT, with no ground-truth labels of any kind (in PHerc. Paris. 4).
 
 Instead, two already-trained **teacher** networks generate the labels themselves. A teacher, here, is simply an ordinary, already-trained 3D U-Net — one estimating fiber probability, one estimating ink probability — kept completely **frozen** (its weights are never updated during this training run). Both teachers generate a fresh pseudo-label for every training crop, live, entirely on the GPU, and a **student** network is trained to reproduce it. Training a network this way — to reproduce another model's output rather than a hand-made label — is called **self-distillation**.
 
@@ -644,14 +632,14 @@ Top row: the raw CT crop, cutting across several parallel fiber bundles; the pse
 The result is released as [fiber\_ink\_4class\_selfdistill](https://huggingface.co/scrollprize/fiber_ink_4class_selfdistill), alongside the frozen fiber teacher that helped produce it, [fiber\_selftrain\_teacher\_epoch30](https://huggingface.co/scrollprize/fiber_selftrain_teacher_epoch30). 
 
 ### Six ways you can help, recapped
-Sections [2](#2-unwrapping-turning-disconnected-voxels-into-a-surface) and [3](#3-ink-recovery-reading-the-scrolls) above introduced mesh tracing, approximate labels, fiber connectivity, and 3D ink segmentation — and along the way, six 🙋 callouts pointed out where the community can make the most difference:
+The sections above introduced mesh tracing, approximate labels, fiber connectivity, the spiral fit, and 3D ink segmentation — and along the way, six 🙋 callouts pointed out where the community can make the most difference:
 
-* **Create datasets** with labels better localized on the papyrus’ recto **or train ML models** that can better preserve the sheets’ topology (See the 🙋 callout in ["Surface prediction"](#surface-prediction), Section 2.)  
-* **If you know classical geometry, optimization, or C++:** help with building tools that avoid mesh-tracing errors like holes, mergers, and sheet switches without a human checking and fixing every traced piece of surface by hand. (See the 🙋 callout in ["Meshes: adding connectivity"](#meshes-adding-connectivity), Section 2.)  
-* **If you have experience with 3D annotation, active learning, or data-quality work:** help improve surface supervision. The labels 3D models learn from are still approximate, and a smaller set of precise labels in the hardest regions may matter more than a larger set of easy ones. (See the 🙋 callout in ["Label quality: one of the main unwrapping bottlenecks"](#label-quality-one-of-the-main-unwrapping-bottlenecks), Section 2.)
-* **If you know classical computer vision or fiber/curve-following techniques:** help with conservative fiber tracing — following individual papyrus fibers reliably across long distances to give the pipeline connectivity clues it otherwise lacks. (See the 🙋 callout in ["Fibers as connectivity clues"](#fibers-as-connectivity-clues), Section 2.)  
-* Devise better **evaluation suites and loss functions to improve the global spiral fit**, or find efficient and automated ways to introduce exploitable prior information.  
-* **If you work in 3D deep learning** (segmentation, self-supervised learning, U-Nets): help with direct 3D ink segmentation, or with self-supervised representation learning that could sharpen nearly every stage of the pipeline at once. (See the 🙋 callout in ["Direct 3D ink segmentation"](#direct-3d-ink-segmentation), Section 3; self-supervised learning as a cross-cutting direction is discussed further)
+* **Create datasets** with labels better localized on the papyrus’ recto **or train ML models** that can better preserve the sheets’ topology (See the 🙋 callout in ["Surface prediction"](#surface-prediction).)  
+* **If you know classical geometry, optimization, or C++:** help with building tools that avoid mesh-tracing errors like holes, mergers, and sheet switches without a human checking and fixing every traced piece of surface by hand. (See the 🙋 callout in ["Meshes: adding connectivity"](#meshes-adding-connectivity).)  
+* **If you have experience with 3D annotation, active learning, or data-quality work:** help improve surface supervision. The labels 3D models learn from are still approximate, and a smaller set of precise labels in the hardest regions may matter more than a larger set of easy ones. (See the 🙋 callout in ["Label quality: one of the main unwrapping bottlenecks"](#label-quality-one-of-the-main-unwrapping-bottlenecks).)
+* **If you know classical computer vision or fiber/curve-following techniques:** help with conservative fiber tracing — following individual papyrus fibers reliably across long distances to give the pipeline connectivity clues it otherwise lacks. (See the 🙋 callout in ["Fibers as connectivity clues"](#fibers-as-connectivity-clues).)  
+* Devise better **evaluation suites and loss functions to improve the global spiral fit**, or find efficient and automated ways to introduce exploitable prior information. (See the 🙋 callout in ["Spiral fit: a global prior"](#spiral-fit-a-global-prior).)  
+* **If you work in 3D deep learning** (segmentation, self-supervised learning, U-Nets): help with direct 3D ink segmentation, or with self-supervised representation learning that could sharpen nearly every stage of the pipeline at once. (See the 🙋 callout in ["Direct 3D ink segmentation"](#direct-3d-ink-segmentation), and ["Self-supervised 3D representations"](#self-supervised-3d-representations) for self-supervised learning as a cross-cutting direction.)
 
 ***
 ## 5\. Bottlenecks
@@ -667,11 +655,11 @@ The pipeline works, but not without a person checking its output at almost every
 | Cross-scroll generalization | Ink models may work on one scroll but not another. | Fragment training plus scroll-specific pseudo-labeling. | Multi-scroll training, better labels, stronger diagnostics. |
 | Data scale | Scroll volumes are too large for ordinary local workflows. | OME-Zarr, chunked processing, cloud storage. | Reproducible streaming pipelines and cheaper compute/storage paths. |
 
-One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score (computed on pseudo-labels) on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
+One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source [karpathy/autoresearch](https://github.com/karpathy/autoresearch) project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score (computed on pseudo-labels) on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
 
 ***
 ## 6\. What’s next?
-We cant claim final victory. What's changed is that the bottlenecks are now much clearer.
+We can't claim final victory. What's changed is that the bottlenecks are now much clearer.
 
 We know that a sealed Herculaneum scroll can be virtually unwrapped and read. We know that high-resolution scanning can make previously elusive ink more visible. We know that direct volumetric ink segmentation is possible in favorable cases. We know that fragment-trained models can generalize far enough to bootstrap scroll-specific reading. We know that semi-automated geometry tools can drastically accelerate tracing, even though human correction remains necessary.
 
@@ -679,7 +667,7 @@ But the next goal is harder to name than any single breakthrough: making all of 
 
 Can we choose scan parameters that preserve useful signals across scrolls? Can we infer surfaces from voxels without months of correction? Can we reduce the dependence on approximate labels, and reliably tell "no ink" apart from "no ink recovered yet"? And can we make the whole workflow reproducible enough for collection-scale reading?
 
-With the help of the community, we are confident that we can drive these points home. The target of the Vesuvius Challenge for June 2027 is to demonstrate that these questions have a positive answer. And whomever will provide that answer will win prizes, obtain eternal glory and write history with us.
+With the help of the community, we are confident that we can drive these points home. The target of the Vesuvius Challenge for June 2027 — the [$1M Grand Prize](/prizes#2027-grand-prize) — is to demonstrate that these questions have a positive answer. And whoever provides that answer will win prizes, obtain eternal glory and write history with us.
 
 ***
 ## Appendix A: Methods we tried
@@ -714,6 +702,7 @@ High effective resolution matters here too: some ink information may live at ver
 
 * G. Angelotti, S. Parsons, F. Nicolardi, Y. Nader, S. Johnson, D. Josey, P. Henderson, H. Schilling, J. Rudolph, F. McDonald, E. R. Dal Prá, P. Tafforeau, A. Mirone, C. S. Parker, J. P. Posma, B. Kyles, C. Vergara, A. Lavorante, R. Villa, M. C. Robustelli, M. D'Angelo, G. Del Mastro, M. McOsker, K. Fleischer, C. Chapman, N. Friedman, and W. B. Seales, "Complete virtual unwrapping and reading of a rolled Herculaneum papyrus," arXiv:2606.29085, 2026. [https://arxiv.org/abs/2606.29085](https://arxiv.org/abs/2606.29085)
 * G. Angelotti, F. Nicolardi, P. Henderson, and W. B. Seales, "Ink Detection from Surface Topography of the Herculaneum Papyri," *Scientific Reports*, 2026. [https://www.nature.com/articles/s41598-026-58467-1](https://www.nature.com/articles/s41598-026-58467-1)
+* P. Henderson, "Virtually Unrolling the Herculaneum Papyri by Diffeomorphic Spiral Fitting," WACV 2026. [https://arxiv.org/abs/2512.04927](https://arxiv.org/abs/2512.04927)
 * S. Parsons, C. S. Parker, C. Chapman, M. Hayashida, and W. B. Seales, "EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT," arXiv:2304.02084, 2023. [https://arxiv.org/abs/2304.02084](https://arxiv.org/abs/2304.02084)
 
 ### Methods cited

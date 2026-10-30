@@ -15,11 +15,26 @@ this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
 ### Installation Instructions
-Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
+Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the release downloads described below (Linux, Windows, macOS) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
+
+The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [#1588](https://github.com/ScrollPrize/villa/issues/1588)); the `latest` release downloads are rebuilt from `main`.
+
+#### Linux
+
+A self-contained `VC3D-<version>-linux-x86_64.AppImage` (VC3D plus the `vc_*` command-line tools, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). Make it executable and pass the program to run as the first argument:
+
+```bash
+chmod +x VC3D-*-linux-x86_64.AppImage
+./VC3D-*-linux-x86_64.AppImage VC3D                      # the GUI
+./VC3D-*-linux-x86_64.AppImage list                      # the bundled tools
+./VC3D-*-linux-x86_64.AppImage vc_render_tifxyz --help   # one of the command-line tools
+```
+
+[scripts/appimage/README.md](scripts/appimage/README.md) lists what the host must provide and describes symlink dispatch and how the AppImage is built.
 
 To install VC3D and all command-line tools from source on a recent Debian-family
 Linux distribution using APT:
@@ -34,6 +49,37 @@ flatboi, and installs the runtime under `/usr/local` so commands such as
 distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
 meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
 corresponding defaults.
+
+#### Python source builds
+
+`uv sync` in this directory builds the Python bindings from C++ source. The
+monorepo's `vesuvius` environment also builds this local package when selecting
+the `models` or `all` extra (including `uv sync --all-extras`). Install the native
+build prerequisites first: `uv` manages Python packages, not system C++ libraries.
+The [Python CI workflow](../.github/workflows/test-vesuvius.yml) lists the native
+packages used for the Python-only build on Ubuntu.
+
+**Qt6 Core development files are required even with GUI targets disabled.** The
+shared SFTP implementation uses Qt Core for subprocess and URL handling. This
+does not require a display server, Qt Widgets, or Python Qt bindings. Installing
+`pyqt6` is not a substitute for the native development package.
+
+To add Qt to an otherwise prepared build environment:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install qt6-base-dev
+
+# macOS (Homebrew)
+brew install qt
+```
+
+These commands install Qt, not the complete native dependency set. The existing
+Linux dependency setup and macOS build helper already include Qt. If CMake cannot
+find `Qt6Config.cmake` after installation, add the Qt installation prefix to
+`CMAKE_PREFIX_PATH` before running `uv sync`. Keep the Qt Core runtime libraries
+installed when using the compiled bindings. See [SFTP access](docs/sftp_remote_access.md)
+for the OpenSSH runtime and authentication requirements.
 
 #### Windows
 
@@ -140,29 +186,14 @@ must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
 translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
-Coordinate-bearing artifacts created by VC3D retain the selected source view
-in their JSON metadata (`meta.json`, point collections, fibers, and atlas
-`metadata.json`). For example:
-
-```json
-{
-  "vc_open_data_coordinate_space": "PHerc1451/20260319101107@L2",
-  "vc_open_data_source_path": "s3://path/to/the/source/volume",
-  "vc_open_data_source_coordinate_level": 2,
-  "vc_open_data_source_coordinate_scale_factor": 4,
-  "vc_open_data_source_original_resolution": 2.4
-}
-```
-
-The source path identifies the native volume without the `#vc-base-scale`
-selector. The scale factor is `2^level`, and the original resolution is the
-native level-0 voxel size in micrometers.
-
-The selector is part of persistent volume identity but is never sent in HTTP
-requests. Tools that support remote volumes receive the complete portable
-locator. Local-only tools reject it instead of silently discarding the
-selector. Catalog surfaces, normal grids, and overlays are automatically paired
-only when their explicit coordinate-space tags match the selected view.
+The selector is the volume's working level, not part of its identity: a
+project keeps one entry per volume, VC3D changes the level with the L spinbox
+beside the volume selector, and the volume keeps its ID at every level. It is
+never sent in HTTP requests. Tools that support remote volumes receive the
+complete portable locator, and store-mode tools also receive `--voxel-scale
+2^-N` with `--volume-uuid`, so the surfaces they read and create are in level
+N's voxels of the volume. Local-only tools reject the selector instead of
+silently discarding it.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json
@@ -177,15 +208,18 @@ Your folder structure should resemble this:
     │   │   └── meta.json - REQUIRED!
     │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
     │       └── meta.json - REQUIRED!
-    ├── paths 
     └── config.json - REQUIRED!
 ```
 
+A VC3D project is an object store (`.vcobj`, `File -> New Project...`): it
+references the volumes above and holds the surfaces (segments), fibers and
+point collections.
+
 ### Working on remote volumes from the command line
 
-`vc_grow_seg_from_seed` accepts the remote locators described above and
-`vc_render_tifxyz` streams through `--remote-url`, so a segment can be grown
-and rendered on a public OME-Zarr volume without downloading it or building a
+`vc_grow_seg_from_seed` and `vc_render_tifxyz` both take the remote locators
+described above as `-v` and stream them, so a segment can be grown and
+rendered on a public OME-Zarr volume without downloading it or building a
 volpkg. The tools fetch only the chunks they touch, over anonymous HTTPS or
 S3. The GUI equivalent is `File -> Open Data Catalog…`, covered in the
 [VC3D tutorial](https://scrollprize.org/tutorial_VC3D).
@@ -240,9 +274,8 @@ To grow the segment further, pass `--resume out/auto_grown_<timestamp>` and
 raise `generations` in `params.json`: it is the total generation count the
 segment stops at, not a number of additional generations, so resuming with
 the unchanged `generations: 8` reports `Resuming from generation 7 with 196
-points`, adds nothing and writes the same 196 points again
-(`--resume-generations 8` on the command line changes nothing either; the
-tracer does not read that option). With `generations: 16` the same command
+points`, adds nothing and writes the same 196 points again. With
+`generations: 16` the same command
 continues from generation 8 to 15 (1.41 cm² to 7.02 cm² here) and writes the
 result to a new `auto_grown_<timestamp>/` under the target directory, reading
 the remote volume as before.
@@ -250,24 +283,27 @@ the remote volume as before.
 #### Rendering it
 
 ```bash
-vc_render_tifxyz -v render_cache --remote-url "$URL" -s out/auto_grown_* \
+vc_render_tifxyz -v "$URL" -s out/auto_grown_* \
   --scale 1 -g 0 --voxel-size 45.532 --voxel-unit micrometer --tif-output render/
 ```
 
 This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
-- `-v` is mandatory, but with `--remote-url` it is only consulted for a local
-  `meta.json`: a nonexistent or empty directory works and stays empty. Since
-  #1657 the renderer opens the remote volume the same way the tracer does, so
-  the chunks it fetches persist in the shared remote cache
+- `-v` takes the URL itself, and nothing is written under a local directory.
+  `--remote-url` is a deprecated alias for the same locator: alone it fills
+  `-v`, next to an equal `-v` it warns, next to a different one it is an
+  error. Since #1657 the renderer opens the remote volume the same way the
+  tracer does, so the chunks it fetches persist in the shared remote cache
   (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
   `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
   decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
-- Remote volumes are not probed for a voxel size. Without `--voxel-size` the
-  log says `Voxel size: 1.0 (no metadata found; override with --voxel-size)`
-  and the TIFF carries no resolution tag. `--voxel-unit` defaults to
-  `nanometer`, so pass both flags; `--voxel-size 45.532` alone yields a TIFF
+- The renderer reads the voxel size from the remote volume's metadata, as the
+  tracer does: without `--voxel-size` the log says
+  `Voxel size (from volume metadata): 45.532` and the TIFF carries the
+  matching resolution tag. Metadata values count as micrometers, while
+  `--voxel-unit` applies to `--voxel-size` and defaults to `nanometer`, so
+  pass both flags when overriding; `--voxel-size 45.532` alone yields a TIFF
   resolution 1000× too large.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
@@ -280,9 +316,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   segment's `meta.json` keeps the selector in `target_volume`.
 
 ### Opening a volume package and navigating the UI
-First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
+First, click `File -> Open Project...` and select the project (`.vcobj`) you wish to work with.
 
-On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the surface list, which lists the surfaces of the project (an Open Data sample's project includes its catalog surfaces) and selects the currently displayed segment. Selecting a surface in the list should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
 
 There are a number of widgets, each with their own purpose. From top to bottom, and left to right : 
 
@@ -292,13 +328,11 @@ _Main UI widget for interacting with the volume package and surface list_
 
 <img src="docs/imgs/volume-package-ui.png" style="height: 500px">
 
-- `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is {volpkg}/paths
 - `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
   - the most important one to remember here is `Current Segment Only`, which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
-- `Approved`, `Defective`, `Reviewed`, `Inspect`  : tags which can be applied to the surface meta.json, and filtered against
-- `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
+- `Tags` : filter by the tags of the surface's object store record (`Approved`, `Defective`, `Reviewed`, `Inspect`)
 
-**Location**
+**Viewer Controls**
 
 _Main UI widget for adjusting the ROI and display of the volume viewers_
 
@@ -306,69 +340,71 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 
 - `Focus` : Displays the current location of the focus point (in XYZ) -- also can be used to set the focus point by modifying the values in the text box
 - `Zoom` : Can be used in place of scroll wheel based zooming, mostly exists to alleviate touchy track pad zooming
-- `Overlay Volume` : Selects the volume to overlay onto the base volume 
-- `Overlay opacity` : Modifies the opacity of the overlay volume 
-- `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
-- `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
+- `Use axis-aligned slice planes` (`Ctrl+J`) : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead render them on fixed axis-aligned slices
+- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
+
+The opacity of the plane slice axis overlays is set by `Axis overlay opacity` in the settings dialog.
+
+**Overlay**
+
+_Overlays a second volume onto the base volume_
+
+- `Overlay volume` : Selects the volume to overlay onto the base volume
+- `Overlay opacity` : Modifies the opacity of the overlay volume
+- `Overlay window` : The overlay intensity range to draw; values outside it are transparent (raise its low end to remove background)
 - `Overlay colormap` : The colormap to use for the overlay volume
 - `Overlay interpolation` : Selects nearest-neighbor (default) or trilinear sampling independently of the base volume
-- `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
-- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
 
 _Keybinds:_
 > - `Right mouse + drag` : pans the current viewer
 > - `Scroll wheel` : zooms the current viewer
 > - `Ctrl + left mouse button` : centers the focus point on the cursor position
-> - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
+> - `Middle mouse + drag` : with axis-aligned slice planes on, rotates the slicing plane in the XZ or YZ volume viewers
 > - `Spacebar` : toggles the overlay on / off
-> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the "composite" dock tab, next to the location tab)
+> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the `Composite View` dock, under the `View` menu)
 
 **Segmentation**
 
-_Primary entry point for interacting with the segmentation, more info in the [segmentation docs](docs/segmentation.md)_
+_Primary entry point for interacting with the segmentation, more info in [extending and modifying segmentations](docs/extending_and_modifying_segmentations.md)_
  
 <img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
 
-- `Enable editing` : Must be checked to enable any of the actions in this widget. Creates a copy of the base surface upon which we perform any of the following actions
+- `Enable editing` (`Shift+T`) : Must be checked to enable any of the actions in this widget. Edits are applied to the surface and saved to the attached object store as new revisions
 - `Surface Growth` - grouping of settings mostly pertaining to the `Grow` action
   - `Steps` : The number of "generations" the growth action will undertake
-  - `Allowed Directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
+  - `Allowed directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
   - `Limit Z range` : Constrains the growth to a selected `Z` range
-  - `Volume` : the volume to pass to the `tracer()` call _should be a surface prediction volume!_ 
-- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._
-  - `Max Radius` : the maximum radius of the area to be affected by the action
-  - `Sigma` : the _strength_ of the push/pull on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
-  - `Push Pull Step` : The number of "offset steps" to take along the surface normal (in voxels) for each push/pull action (this parameter only affects the push/pull in the segmentation window that is applied with `F` and `G`)
+  - `Volume` : the volume to pass to the tracer _should be a surface prediction volume!_
+- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._ `Drag Brush` and `Push/Pull` each have their own:
+  - `Radius` : the radius of the area to be affected by the action
+  - `Sigma` : the _strength_ of the action on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
+  - `Step` (`Push/Pull` only) : The step size (in world units) to take along the surface normal for each push/pull action
 - `Direction Fields`
-  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/scroll.volpkg/fiber-directions.zarr/horizontal`) _these are optional_ 
-    - `Orientation` : the orientation/type of the direction field (from horizontal, vertical, or normal)
+  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/fiber-directions.zarr/horizontal`) _these are optional_
+    - `Orientation` : the orientation/type of the direction field (normal, horizontal, or vertical)
     - `Scale level` : the zarr resolution from which these were computed
     - `Weight` : the weight to apply to the field when optimizing.
 - `Corrections` : group which controls / manages the "correction points" for the current growth session
-  - `New correction set` : creates a new point collection containing a single "correction" 
-      
+  - `Active set` : chooses an existing correction set to apply
+  - `New correction set` : creates a new point collection containing a single "correction"
+
 _Keybinds:_
-> - `F` or `G` : push/pull the current surface in a positive or negative direction along the surface normal (only works in the surface
-> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up, down, right, all, respectively
-> - `T` : create a new correction set
+> - `A` or `D` (hold) : push/pull the current surface inward or outward along the surface normal (`Ctrl` for alpha mode)
+> - `1`, `2`, `3`, `4`, `5` : grow left, up, down, right, all, respectively (requires `Enable growth keybinds`)
+> - `T` : toggle correction annotation mode (click adds a correction point, right-click removes one)
 
 **Seeding** 
 
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 
-<img src="docs/imgs/seeding-ui.png" style="height: 500px">
-
-- `Switch to point mode` : toggles the seeding widget into draw mode (not recommended)
-- `Source Collection` : the source point collection to use as seed points (will autofill if you draw/analyze)
-- `Parallel processes` : the number of processes to run seeding with
+- `Draw paths` : while on, a left-drag in a viewer draws a path
+- `Source Collection` : the source point collection to use as seed points (`Analyze Paths` writes its peaks to `seeding_peaks`; select it here to seed from them)
+- `Parallel Processes` : the number of processes to run seeding with
 - `OMP Threads` : limits the amount of threads each process can use (recommend to set this to 1)
-- `Intensity threshold` : mostly unused, can leave default
-- `Peak detection window` : how closely each peak detected along a path/raycast can be
-- `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
-- `Show Preview Points` : unused, can be ignored
-- `Clear` (both) : clears current points, paths, or raycasts
+- `Intensity Threshold` : minimum intensity for a peak along a path
+- `Expansion Iterations` : how many iterations to run expansion mode on after initial seeding
+- `Clear Peaks` : clears the detected peaks
 - `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
-- `Run seeding` : creates segmentations from the current seed points
-- `Expand seeds` : expands the current seed points to the given number of iterations
-- `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
-- `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
+- `Run Seeding` : creates segmentations from the current seed points
+- `Expand Seeds` : expands the current seed points to the given number of iterations
+- `Clear All Paths` / `Reset Points` : clears the drawn paths and the detected peaks

@@ -68,7 +68,6 @@ fi
     libavahi-client-dev \
     libblosc-dev \
     libboost-program-options-dev \
-    libboost-system-dev \
     libcgal-dev \
     libceres-dev \
     libcurl4-openssl-dev \

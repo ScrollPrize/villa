@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -760,6 +762,11 @@ def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
     assert result["saved_tifxyz_path"] is not None
     z_tif = tifffile.imread(Path(result["saved_tifxyz_path"]) / "z.tif")
     assert tuple(z_tif.shape) == result["full_grid_local"].shape[:2]
+    # The prediction is a new surface: a fresh uuid4, not the source segment's id.
+    saved = Path(result["saved_tifxyz_path"])
+    assert saved.name == "synthetic_down"
+    saved_uuid = json.loads((saved / "meta.json").read_text())["uuid"]
+    assert uuid.UUID(saved_uuid).version == 4
 
 
 def test_axis_factorized_autoreg_mesh_inference_reconstructs_lattice() -> None:

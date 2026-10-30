@@ -20,6 +20,7 @@ multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
 from pathlib import Path
@@ -331,7 +332,7 @@ class Inferer():
                  patch_size: [list, tuple] = None,
                  save_softmax: bool = False,
                  normalization_scheme: str = 'instance_zscore',
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 device: str = None,
                  num_dataloader_workers: int = 4,
                  writer_workers: int = None,
                  verbose: bool = False,
@@ -350,6 +351,7 @@ class Inferer():
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
+                 chunk_cache_mb: int = 0,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -363,6 +365,8 @@ class Inferer():
         # self.tta_rotation_weights = tta_rotation_weights
         self.num_parts = num_parts
         self.part_id = part_id
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError(f"overlap must be in [0, 1), got {overlap}")
         self.overlap = overlap
         self.batch_size = batch_size
         self.patch_size = tuple(patch_size) if patch_size is not None else None  # Can be None, will derive from model
@@ -370,7 +374,8 @@ class Inferer():
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
         self.input_format = input_format
-        self.device = torch.device(device)
+        # cuda, then mps, then cpu unless a device is given.
+        self.device = torch.device(device) if device else get_accelerator()
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
@@ -387,6 +392,7 @@ class Inferer():
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
+        self.chunk_cache_mb = chunk_cache_mb
         self.model_patch_size = None
         self.num_classes = None
 
@@ -416,6 +422,8 @@ class Inferer():
              raise ValueError(f"Invalid tta_type '{self.tta_type}'. Must be 'mirroring' or 'rotation'.")
         if self.max_patches is not None and self.max_patches < 1:
             raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
+        if self.chunk_cache_mb < 0:
+            raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -790,8 +798,8 @@ class Inferer():
             )
 
     def _create_dataset_and_loader(self):
-        # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
-        # step_size of 0.5 means 50% overlap
+        # The dataset takes a stride as a fraction of the patch size, the complement of the
+        # overlap: overlap 0.25 is a stride of 0.75. A subclass may set step_size directly.
         
         # Use normalization from model checkpoint if available, otherwise use command line arg
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
@@ -822,7 +830,7 @@ class Inferer():
         self.dataset = VCDataset(
             input_path=self.input,
             patch_size=self.patch_size,
-            step_size=self.overlap,
+            step_size=(getattr(self, 'step_size', None) or 1.0 - self.overlap),
             num_parts=self.num_parts,
             part_id=self.part_id,
             normalization_scheme=normalization_scheme,
@@ -840,13 +848,16 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
-            # The float16 default suits the CUDA autocast path. CPU convolutions
-            # have no float16 kernels, so half patches meet float32 weights and
-            # raise "Input type (c10::Half) and bias type (float) should be the
-            # same". Ask for the dtype the CPU model can actually consume.
+            cache=self.chunk_cache_mb > 0,
+            cache_size_mb=self.chunk_cache_mb,
+            # The float16 default suits the CUDA autocast path. Autocast only
+            # runs on CUDA here, so on CPU and MPS half patches would meet
+            # float32 weights and raise "Input type (c10::Half) and bias type
+            # (float) should be the same". Ask for the dtype the model can
+            # actually consume.
             return_as_type=(
-                "np.float32" if self.device.type == "cpu"
-                else "np.float16"
+                "np.float16" if self.device.type == "cuda"
+                else "np.float32"
             ),
         )
 
@@ -893,7 +904,7 @@ class Inferer():
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
-            pin_memory=True if self.device != torch.device('cpu') else False,
+            pin_memory=self.device.type == 'cuda',
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
@@ -1266,7 +1277,8 @@ def build_parser():
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda, mps, cpu). Default: cuda, then mps, then cpu')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--writer_workers', type=int, default=None,
@@ -1306,6 +1318,11 @@ def build_parser():
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
                            'streaming run. Set to 1 to disable.')
+    parser.add_argument('--chunk_cache_mb', type=int, default=0,
+                      help='Keep up to this many MB of fetched input chunks in an in-memory LRU '
+                           'cache, so overlapping patches reuse chunks instead of downloading '
+                           'them again. Each DataLoader worker keeps its own cache. Requires '
+                           'zarr 3. Default 0 (off).')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1322,7 +1339,8 @@ def build_parser():
 def main():
     import sys
 
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
@@ -1389,11 +1407,19 @@ def main():
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
+        chunk_cache_mb=args.chunk_cache_mb,
     )
 
     try:
         print("\n--- Starting Inference ---")
-        logits_path, coords_path = inferer.infer()
+        result = inferer.infer()
+        if result is None:
+            # infer() already printed the exception and its traceback; do not
+            # bury it under "cannot unpack non-iterable NoneType object".
+            print("\n--- Inference Failed ---")
+            print("Inference raised the error shown above and wrote no output.")
+            return 1
+        logits_path, coords_path = result
 
         if logits_path and coords_path:
             # Check if paths exist, using fsspec for S3 paths

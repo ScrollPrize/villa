@@ -140,7 +140,6 @@ TEST_CASE("QuadSurface ctor from Mat retains scale and is loaded")
     CHECK(qs.isLoaded());
     CHECK(qs.scale()[0] == doctest::Approx(1.5f));
     CHECK(qs.scale()[1] == doctest::Approx(2.0f));
-    CHECK(qs.canUnload() == false); // no path
 }
 
 TEST_CASE("size() returns scaled grid size")
@@ -426,19 +425,6 @@ TEST_CASE("rotate runs without crashing on dense grid")
     CHECK(qs.rawPointsPtr() != nullptr);
 }
 
-TEST_CASE("overlappingIds get/set/add/remove")
-{
-    auto pts = makePlanarGrid(2, 2);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    CHECK(qs.overlappingIds().empty());
-    qs.setOverlappingIds({"a", "b"});
-    CHECK(qs.overlappingIds().size() == 2);
-    qs.addOverlappingId("c");
-    CHECK(qs.overlappingIds().count("c") == 1);
-    qs.removeOverlappingId("a");
-    CHECK(qs.overlappingIds().count("a") == 0);
-}
-
 TEST_CASE("dpi getter / setter")
 {
     auto pts = makePlanarGrid(2, 2);
@@ -472,9 +458,3 @@ TEST_CASE("invalidateCache / invalidateMask are no-throw")
     CHECK(true);
 }
 
-TEST_CASE("canUnload is false without a path")
-{
-    auto pts = makePlanarGrid(2, 2);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    CHECK_FALSE(qs.canUnload());
-}

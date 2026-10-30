@@ -69,23 +69,6 @@ static cv::Rect scaled_rect_trunc(const cv::Rect& rect, float scale)
     };
 }
 
-static cv::Rect valid_points_bounds(const cv::Mat_<cv::Vec3d>& points)
-{
-    cv::Rect bounds;
-    bool have_valid = false;
-    for (int y = 0; y < points.rows; ++y) {
-        for (int x = 0; x < points.cols; ++x) {
-            if (points(y, x)[0] == -1) {
-                continue;
-            }
-            const cv::Rect cell(x, y, 1, 1);
-            bounds = have_valid ? (bounds | cell) : cell;
-            have_valid = true;
-        }
-    }
-    return bounds;
-}
-
 static std::string surface_name(const QuadSurface* surf)
 {
     if (!surf)
@@ -369,32 +352,6 @@ static int remove_components_disconnected_from_seed(SurfTrackerData& data,
                   << " points disconnected from seed " << seed << std::endl;
     }
     return removed;
-}
-
-static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surface_patch_index,
-                                                       const cv::Vec3d& coord,
-                                                       QuadSurface* exclude = nullptr)
-{
-    std::set<QuadSurface*> candidates;
-    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
-        return candidates;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = {
-        static_cast<float>(coord[0]),
-        static_cast<float>(coord[1]),
-        static_cast<float>(coord[2])
-    };
-    query.tolerance = same_surface_th;
-
-    for (const auto& surface : surface_patch_index->locateSurfaces(query)) {
-        QuadSurface* raw = surface.get();
-        if (raw && raw != exclude) {
-            candidates.insert(raw);
-        }
-    }
-    return candidates;
 }
 
 static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePatchIndex* surface_patch_index,
@@ -1152,12 +1109,12 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid, true);
+            dbg_surf->saveAsNew(tgt_dir / uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -1366,12 +1323,12 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_loc = seed;
     data.seed_coord = points(seed);
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt_inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid, true);
+            dbg_surf->saveAsNew(tgt_dir / uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -1385,8 +1342,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                               const std::vector<QuadSurface *> &surfs_v,
                                               const nlohmann::json &params,
-                                              float voxelsize,
-                                              SurfacePatchIndex* external_surface_patch_index = nullptr)
+                                              float voxelsize)
 {
     bool flip_x = params.value("flip_x", 0);
     bool bidirectional = params.value("bidirectional", false);
@@ -1396,7 +1352,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
     std::cout << "bidirectional: " << bidirectional << std::endl;
-    std::filesystem::path tgt_dir = params["tgt_dir"].get<std::string>();
+    // Debug output (generation snapshots, inliers_sum.tif, debug_images) goes
+    // here; there is none without it.
+    const std::filesystem::path tgt_dir = params.value("tgt_dir", std::string{});
 
     std::unordered_map<std::string,QuadSurface *> surfs;
     float src_step = params.value("src_step", 20);
@@ -1493,9 +1451,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                   << " min_generations=" << sweep_prune_min_generations << std::endl;
     }
     std::cout << "  reopt_interval: " << reopt_interval << std::endl;
-    if (external_surface_patch_index) {
-        std::cout << "  external_surface_patch_index: true" << std::endl;
-    }
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1509,10 +1464,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::ofstream approved_log(log_filename);
 
     for(auto &sm : surfs_v) {
-        const nlohmann::json meta = json_from_utils(sm->meta);
-        if (meta.contains("tags") && meta.at("tags").contains("approved"))
+        const auto tagged = [&](const char* tag) { return std::find(sm->tags.begin(), sm->tags.end(), tag) != sm->tags.end(); };
+        if (tagged("approved"))
             approved_sm.insert(sm);
-        if (!meta.contains("tags") || !meta.at("tags").contains("defective")) {
+        if (!tagged("defective")) {
             surfs[surface_name(sm)] = sm;
         }
     }
@@ -1524,8 +1479,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "seed " << seed << " name " << surface_name(seed) << std::endl;
 
     SurfacePatchIndex surface_patch_index;
-    SurfacePatchIndex* surface_patch_index_ptr = external_surface_patch_index;
-    if (!surface_patch_index_ptr) {
+    {
         std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
         std::set<QuadSurface*> indexed_surfaces;
         patch_surfaces.reserve(surfs.size() + 1);
@@ -1547,11 +1501,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const double rebuild_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - rebuild_start).count();
         std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
-        surface_patch_index_ptr = &surface_patch_index;
         std::cout << "SurfacePatchIndex built for " << patch_surfaces.size()
                   << " surfaces patches=" << surface_patch_index.patchCount()
                   << std::endl;
     }
+    SurfacePatchIndex* surface_patch_index_ptr = &surface_patch_index;
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
     const bool resume_growth = looks_like_resume_surface(seed, params);
@@ -3102,7 +3056,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (!global_steps_per_window && reopt_interval == 0)
             update_mapping = false;
 
-        if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
+        if (!tgt_dir.empty() && (generation % 50 == 0 || update_mapping)) {
             {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
@@ -3116,16 +3070,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
                 const std::filesystem::path snapshot_path = tgt_dir / uuid;
-                dbg_surf->save(snapshot_path.string(), uuid, true);
+                dbg_surf->saveAsNew(snapshot_path, true);
 
                 std::error_code cleanup_ec;
-                if (legacy_current_path != snapshot_path) {
-                    std::filesystem::remove_all(legacy_current_path, cleanup_ec);
-                }
-                cleanup_ec.clear();
                 if (current_snapshot_path && *current_snapshot_path != snapshot_path) {
                     std::filesystem::remove_all(*current_snapshot_path, cleanup_ec);
                 }
@@ -3189,7 +3138,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 reseed_fringe_from_valid(active);
             }
 
-            if (debug_images) {
+            if (debug_images && !tgt_dir.empty()) {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
@@ -3203,7 +3152,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                dbg_surf->save(tgt_dir / uuid, uuid, true);
+                dbg_surf->saveAsNew(tgt_dir / uuid, true);
                 delete dbg_surf;
             }
         }
@@ -3486,7 +3435,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
 
-        cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
+        if (!tgt_dir.empty())
+            cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);
@@ -3573,15 +3523,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize)
 {
-    return grow_surf_from_surfs(seed, surfs_v, params, voxelsize, nullptr);
-}
-
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
-                                  const std::vector<QuadSurface*> &surfs_v,
-                                  const utils::Json &params,
-                                  float voxelsize,
-                                  SurfacePatchIndex* surface_patch_index)
-{
     if (!seed)
         return nullptr;
 
@@ -3602,5 +3543,5 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
     }
 
     nlohmann::json grow_params = json_from_utils(params);
-    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize, surface_patch_index);
+    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize);
 }

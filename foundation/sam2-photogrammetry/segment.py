@@ -156,38 +156,33 @@ def process_video_dir(video_dir: Path, mask_generator, predictor, recompute=Fals
             mask=masks[ann_obj_id]['segmentation'],
         )
 
-    # Run propagation throughout the "video"
-    video_segments = {}
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
-            obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, obj_id in enumerate(out_obj_ids)
-        }
-
     # Create output Masks folder (sibling to `video_dir`)
     mask_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save masks for each frame
-    for out_frame_idx, frame_file in tqdm(enumerate(frame_files), desc="saving masks", total=len(frame_files)):
-        frame = np.array(Image.open(frame_file))
-        height, width = frame.shape[:2]
+    def save_frame_mask(frame_file, obj_ids=(), mask_logits=None):
+        width, height = Image.open(frame_file).size
 
         # Create an empty mask with background set to 0
         mask = np.zeros((height, width), dtype=np.uint8)
-
-        # If we have segmentation data for this frame, set the segment IDs
-        if out_frame_idx in video_segments:
-            for obj_id, out_mask in video_segments[out_frame_idx].items():
-                mask[out_mask[0]] = obj_id
+        for i, obj_id in enumerate(obj_ids):
+            mask[(mask_logits[i] > 0.0).cpu().numpy()[0]] = obj_id
 
         # Save mask as <filename>_mask.png
-        base_filename = frame_file.stem
-        mask_filename = f"{base_filename}_mask.png"
-        mask_path = mask_output_dir / mask_filename
+        save_segmented_mask(mask, mask_output_dir / f"{frame_file.stem}_mask.png")
 
-        save_segmented_mask(mask, mask_path)
+    # Run propagation throughout the "video", writing each frame's mask as soon as it is
+    # produced; keeping full-resolution masks for every object and frame exhausts host RAM.
+    saved_frames = set()
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+        save_frame_mask(frame_files[out_frame_idx], out_obj_ids, out_mask_logits)
+        saved_frames.add(out_frame_idx)
 
-        predictor.reset_state(inference_state)
+    # Frames without segmentation data get an all-background mask
+    for out_frame_idx, frame_file in enumerate(frame_files):
+        if out_frame_idx not in saved_frames:
+            save_frame_mask(frame_file)
+
+    predictor.reset_state(inference_state)
 
 def main():
     # Parse command line arguments

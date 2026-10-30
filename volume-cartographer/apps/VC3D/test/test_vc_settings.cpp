@@ -14,6 +14,41 @@ class VCSettingsTest : public QObject
     Q_OBJECT
 
 private slots:
+    void breakExtrapolationDistanceIsClampedAndReadFromTheIniStore()
+    {
+        using namespace vc3d::settings::line_annotation;
+        QCOMPARE(clampBreakExtrapolationDistanceVx(0), BREAK_EXTRAPOLATION_DISTANCE_VX_MIN);
+        QCOMPARE(clampBreakExtrapolationDistanceVx(-5), BREAK_EXTRAPOLATION_DISTANCE_VX_MIN);
+        QCOMPARE(clampBreakExtrapolationDistanceVx(1000000000), BREAK_EXTRAPOLATION_DISTANCE_VX_MAX);
+        QCOMPARE(clampBreakExtrapolationDistanceVx(400), 400);
+
+        QTemporaryDir configDir;
+        QVERIFY(configDir.isValid());
+        qputenv("VC3D_CONFIG_DIR", configDir.path().toUtf8());
+        {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            QCOMPARE(breakExtrapolationDistanceVx(settings), BREAK_EXTRAPOLATION_DISTANCE_VX_DEFAULT);
+            settings.setValue(BREAK_EXTRAPOLATION_DISTANCE_VX, 650);
+            settings.sync();
+        }
+        {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            QCOMPARE(breakExtrapolationDistanceVx(settings), 650);
+            settings.setValue(BREAK_EXTRAPOLATION_DISTANCE_VX, 7);
+            settings.sync();
+        }
+        {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            QCOMPARE(breakExtrapolationDistanceVx(settings), BREAK_EXTRAPOLATION_DISTANCE_VX_MIN);
+            settings.setValue(BREAK_EXTRAPOLATION_DISTANCE_VX, QStringLiteral("not a number"));
+            settings.sync();
+        }
+        {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            QCOMPARE(breakExtrapolationDistanceVx(settings), BREAK_EXTRAPOLATION_DISTANCE_VX_DEFAULT);
+        }
+    }
+
     void storedRemoteCacheDirectoryIsGlobalAndRestartOnly()
     {
         QTemporaryDir configDir;

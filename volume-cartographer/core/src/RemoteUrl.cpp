@@ -1,4 +1,5 @@
 #include "vc/core/util/RemoteUrl.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #include <charconv>
 #include <cstdlib>
@@ -75,6 +76,8 @@ int parseBaseScaleSelector(std::string_view fragment)
 
 ResolvedUrl resolveRemoteUrl(const std::string& input)
 {
+    if (utils::is_sftp_url(input))
+        return ResolvedUrl{utils::canonical_sftp_url(input), {}, false};
     // Check for s3:// or s3+REGION:// prefix
     if (input.rfind("s3://", 0) == 0) {
         // s3://bucket/key — default region us-east-1

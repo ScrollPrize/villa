@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -235,7 +236,9 @@ def infer_autoreg_mesh(
             if isinstance(wrap_metadata, dict):
                 segment_uuid = str(wrap_metadata.get("segment_uuid", ""))
             surface_uuid = uuid or (segment_uuid or "autoreg_mesh_prediction")
-            surface = _build_tifxyz_from_grid(full_grid_world, uuid=surface_uuid)
+            # surface_uuid only names the output directory; the prediction is a
+            # new surface, so meta.json gets a fresh identity (not the source's).
+            surface = _build_tifxyz_from_grid(full_grid_world, uuid=str(uuid4()))
             tifxyz_path = write_tifxyz(Path(save_path) / surface_uuid, surface, overwrite=True)
 
         result = {

@@ -1,4 +1,5 @@
 #include "UnifiedBrowserDialog.hpp"
+#include <QRegularExpression>
 
 #include <QDir>
 #include <QCheckBox>
@@ -135,6 +136,8 @@ private slots:
     {
         QTest::addColumn<QString>("uri");
         QTest::newRow("s3") << QStringLiteral("s3://bucket/path/data.lasagna.json");
+        QTest::newRow("sftp") << QStringLiteral("sftp://user@alias:2222/path/data.lasagna.json");
+        QTest::newRow("ssh") << QStringLiteral("ssh://alias/path/data.lasagna.json");
         QTest::newRow("http") << QStringLiteral("http://example.com/path/data.lasagna.json");
         QTest::newRow("https") << QStringLiteral("https://example.com/path/data.lasagna.json?token=abc");
     }
@@ -198,6 +201,20 @@ private slots:
 
     void typedRemoteDirectoryAndDualMode()
     {
+        for (const auto& uri : {
+                 QStringLiteral("sftp://alias/data.zarr"),
+                 QStringLiteral("https://example.com/data.zarr?token=a%2Fb"),
+                 QStringLiteral("sftp://alias/data.zarr#vc-base-scale=2")}) {
+            UnifiedBrowserDialog dialog;
+            configureRemoteDialog(dialog, false, true);
+            typePath(dialog, uri);
+            clickOpen(dialog);
+            QCOMPARE(dialog.result(), int(QDialog::Accepted));
+            const auto suffix = uri.indexOf(QRegularExpression("[?#]"));
+            auto expected = uri;
+            expected.insert(suffix < 0 ? expected.size() : suffix, '/');
+            QCOMPARE(dialog.selectedUri(), expected);
+        }
         {
             UnifiedBrowserDialog dialog;
             configureRemoteDialog(dialog, false, true);

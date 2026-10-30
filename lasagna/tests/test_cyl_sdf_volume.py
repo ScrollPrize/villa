@@ -127,6 +127,35 @@ class CylSdfVolumeTests(unittest.TestCase):
 			cyl_sdf_volume.DEFAULT_CYL_OUTSIDE_DEEP_BLEND_CHUNKS,
 		)])
 
+	def test_builder_mps_volume_survives_freed_extension_output(self) -> None:
+		# The builder drops the extension's CPU output when it returns. A non_blocking
+		# copy to MPS can still be queued then and read whatever reuses that memory
+		# (torch 2.11 and 2.12, pytorch/pytorch#189690).
+		if not torch.backends.mps.is_available():
+			self.skipTest("MPS is not available")
+		shell = _cylinder_shell(h=3, w=5)
+		Z, Y, X = 64, 256, 256
+
+		def _pattern() -> torch.Tensor:
+			return (torch.arange(Z * Y * X, dtype=torch.int32) % 251).to(dtype=torch.uint8).reshape(1, Z, Y, X)
+
+		class _Ext:
+			def build_violation_depth_volume(self, verts, faces, origin, spacing, shape, depth_max, *_args):
+				return _pattern(), float(depth_max)
+
+		bbox = (0.0, 0.0, 0.0, float(X - 1), float(Y - 1), float(Z - 1))
+		with mock.patch.object(cyl_sdf_volume, "_get_ext_module", return_value=_Ext()):
+			field = cyl_sdf_volume.build_previous_shell_inside_depth_volume(shell, grid_step=1.0, bbox=bbox, device="mps")
+		# Reuse the freed CPU memory (255 never occurs in the pattern) before reading back.
+		fills = [torch.full((1, Z, Y, X), 255, dtype=torch.uint8) for _ in range(4)]
+		got = field.volume.cpu()
+		del fills
+
+		self.assertEqual(field.volume.device.type, "mps")
+		self.assertEqual(tuple(got.shape), (1, Z, Y, X))
+		mismatched = int((got != _pattern()).sum())
+		self.assertEqual(mismatched, 0, f"{mismatched} of {Z * Y * X} voxels differ from the extension output")
+
 
 @unittest.skipUnless(cyl_sdf_volume.libigl_headers_available(), "libigl/Eigen headers are required")
 class CylSdfVolumeExtensionTests(unittest.TestCase):
