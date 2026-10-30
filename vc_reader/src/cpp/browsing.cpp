@@ -103,7 +103,7 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
     Source source;
     source.id = identifier;
     source.storage = storageOf(artifact);
-    source.derived = owner.kind == "volume" && artifact.type != "ome-zarr";
+    source.derived = owner.kind == "volume" && artifact.type != artifact_type::omeZarr;
     const auto volumeRegistration = [&](const std::string& volume, const std::string& origin) {
         VolumeRegistration registration;
         registration.sampleId = sample.id;
@@ -113,10 +113,10 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
     };
     if (owner.kind == "volume") {
         source.registration = volumeRegistration(owner.id, "catalog");
-        if (artifact.type == "ome-zarr" || artifact.type == "surface-prediction-zarr" || artifact.type == "ink-detection-3d-zarr") {
+        if (artifact.type == artifact_type::omeZarr || artifact.type == artifact_type::surfacePredictionZarr || artifact.type == artifact_type::inkDetection3dZarr) {
             source.storage.format = "zarr";
             source.storage.pyramid = true;
-            source.role = artifact.type == "ome-zarr" ? "image" : "scalar";
+            source.role = artifact.type == artifact_type::omeZarr ? "image" : "scalar";
             source.axes = std::vector<std::string>{"z", "y", "x"};
             auto registration = volumeRegistration(owner.id, "catalog-fallback");
             if (const auto grid = artifact.gridLevel())
@@ -128,17 +128,17 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
                 registration.volumeSpacingUm = Vec3{spacing, spacing, spacing};
             }
             source.registration = std::move(registration);
-        } else if (artifact.type == "normal-grids") {
+        } else if (artifact.type == artifact_type::normalGrids) {
             source.role = "normal";  // Bundle layout and component frame stay unknown.
         }
     } else if (owner.kind == "segment" && artifact.targetVolumeId) {
         const auto& target = *artifact.targetVolumeId;
-        if (artifact.type == "ink-labels") {
+        if (artifact.type == artifact_type::inkLabels) {
             const OpenDataArtifact* mesh = nullptr;
             std::size_t meshes = 0, meshPosition = 0;
             for (std::size_t i = 0; i < owner.artifacts->size(); ++i) {
                 const auto& candidate = (*owner.artifacts)[i];
-                if (candidate.type == "tifxyz-transformed" && candidate.targetVolumeId == target) {
+                if (candidate.type == artifact_type::tifxyzTransformed && candidate.targetVolumeId == target) {
                     ++meshes;
                     mesh = &candidate;
                     meshPosition = i;
@@ -162,13 +162,13 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
                 companion.axes = source.axes;
                 source.companions.push_back({name, Shared<Source>(finished(std::move(companion))), true});
             }
-        } else if (artifact.type == "tifxyz-transformed") {
+        } else if (artifact.type == artifact_type::tifxyzTransformed) {
             source.storage.format = "tifxyz";
             SurfaceRegistration registration;
             registration.surface = surfaceDescriptor(sample, &artifact, identifier, target, identifier);
             registration.origin = "catalog";
             source.registration = std::move(registration);
-        } else if (artifact.type == "layers-zarr") {
+        } else if (artifact.type == artifact_type::layersZarr) {
             source.storage.format = "zarr";
             source.storage.pyramid = true;
             source.storage.selection.level = 0;
@@ -180,7 +180,7 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
             source.registration = volumeRegistration(target, "catalog");
         }
     }
-    if (artifact.type != "ink-labels") {
+    if (artifact.type != artifact_type::inkLabels) {
         for (const auto& declared : artifact.supersedes)
             source.supersedes.push_back(startsWithUserOrCatalog(declared) ? declared : "catalog:" + ownerKey + "/id/" + quote(declared));
     }
@@ -197,11 +197,11 @@ Source adapt(const OpenDataSample& sample, const Owner& owner, const OpenDataArt
 
 std::string assetKind(const Source& source, const std::string& ownerKind, const std::string& type)
 {
-    if (ownerKind == "volume" && type == "ome-zarr") return "volume";
-    if (type == "ink-labels") return "label";
-    if (type == "layers-zarr" || type == "layers-tif" || type == "alpha-render" || type == "alpha-render-downsampled") return "image";
-    if (type.starts_with("tifxyz") || type.starts_with("obj") || type == "umbilicus" || type == "fiberlets") return "geometry";
-    if ((source.derived && source.role) || type == "lasagna" || type == "ink-detection" || type == "ink-detection-downsampled" || type == "3d-ink-prediction")
+    if (ownerKind == "volume" && type == artifact_type::omeZarr) return "volume";
+    if (type == artifact_type::inkLabels) return "label";
+    if (type == artifact_type::layersZarr || type == artifact_type::layersTif || type == artifact_type::alphaRender || type == artifact_type::alphaRenderDownsampled) return "image";
+    if (type.starts_with("tifxyz") || type.starts_with("obj") || type == artifact_type::umbilicus || type == artifact_type::fiberlets) return "geometry";
+    if ((source.derived && source.role) || type == artifact_type::lasagna || type == artifact_type::inkDetection || type == artifact_type::inkDetectionDownsampled || type == artifact_type::ink3dPrediction)
         return "representation";
     return "artifact";
 }
@@ -253,7 +253,7 @@ Collection<Asset> surfaceVolumesAmong(const Collection<Asset>& images)
 {
     std::vector<Asset> out;
     for (const auto& asset : images.all())
-        if (asset.source().artifactKind == "layers-zarr" || asset.source().artifactKind == "layers-tif") out.push_back(asset);
+        if (asset.source().artifactKind == artifact_type::layersZarr || asset.source().artifactKind == artifact_type::layersTif) out.push_back(asset);
     return Collection<Asset>(std::move(out), images.includeSuperseded(), true);
 }
 } // namespace
@@ -433,7 +433,7 @@ void RelationshipIndex::finish()
         hidden_.insert(source.supersedes.begin(), source.supersedes.end());
         const auto& properties = propertiesOfProvenance(source);
         if (truthy(jsonObject(properties, "superseded_by"))) hidden_.insert(id);
-        if (source.artifactKind != "ink-labels" || !entry.segment) continue;
+        if (source.artifactKind != artifact_type::inkLabels || !entry.segment) continue;
         const auto* older = jsonObject(properties, "supersedes");
         if (!truthy(older)) continue;
         const auto candidates = bySegment_.find({entry.sample, *entry.segment});
@@ -931,7 +931,7 @@ Collection<Volume> volumesOf(const Collection<ScrollSource>& scrolls)
 }
 
 bool isZarrAsset(const Asset& asset) { return asset.source().storage.format == "zarr"; }
-bool isInkLabel(const Asset& asset) { return asset.source().artifactKind == "ink-labels"; }
+bool isInkLabel(const Asset& asset) { return asset.source().artifactKind == artifact_type::inkLabels; }
 
 // ---- Catalog ----
 struct Catalog::State {

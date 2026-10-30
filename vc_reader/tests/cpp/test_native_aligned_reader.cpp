@@ -123,6 +123,17 @@ void testReference(const fs::path& root, const std::string& backend)
 
     SampleReader reader(reference, targets, std::nullopt, optionsFor(backend));
     require(reader.shape() == Triple{20, 22, 24}, "reference shape");
+    {
+        SourceReader opened(reference, optionsFor("cpu").reader);
+        const auto grid = openedGrid(opened);
+        require(grid.shapeZYX == std::array<std::int64_t, 3>{20, 22, 24}, "opened grid");
+        const auto manifest = [](const std::string& volume) {
+            return vcr::catalog::Catalog(vcr::catalog::parseOpenDataManifest(R"({"samples":{"s":{"sample":{"id":"s"},"volumes":{")" + volume + R"(":{"id":")" + volume + R"(","data":[]}}}}})"));
+        };
+        const auto mine = manifest("v");
+        const vcr::catalog::VolumeLevel level(mine.scroll("s").volumes().at("v"), 0);
+        raises<std::invalid_argument>([&] { SampleReader r(level, {}, manifest("w"), optionsFor(backend)); }, "a level of another catalog");
+    }
     const auto result = reader.read({2, 4, 6}, {3, 4, 5});
     const auto image = values<std::uint8_t>(result["image"].data);
     require(result["image"].data.shape == Index{1, 3, 4, 5} && result["image"].data.dtype == "|u1", "image shape");

@@ -271,6 +271,15 @@ struct Target {
     bool normalize = false, external = true;
     bool operator==(const Target&) const = default;
 };
+// Whether a target holds continuous values (labels and validity masks do not).
+inline bool continuous(const Target& target) { return target.role != Role::Label && target.role != Role::Valid; }
+// The usual training sample: image, label mask, and validity of the image's padding.
+inline std::map<std::string, Target> default_targets() {
+    Target mask, valid;
+    mask.role = Role::Label;
+    valid.role = Role::Valid;
+    return {{"image", Target{}}, {"mask", mask}, {"padding_mask", valid}};
+}
 struct Field { Array array; Target target; std::string source; std::vector<Array> pyramid; };
 using Sample = std::map<std::string, Field>;
 inline bool sparse(Role r) { return r == Role::Points || r == Role::Vectors; }

@@ -63,12 +63,8 @@ inline void bind(nb::module_& m) {
         return reader_cuda::owned(std::move(out),n*4,nb::dtype<float>(),reader.device_id());
     },"reader"_a,"shape"_a,"points"_a);
 #endif
-    auto check=[](Centers c){
-        if(c.shape(1)!=4) throw nb::value_error("centers must be (B,4)");
-        for(std::size_t b=0;b<c.shape(0);++b) for(int j=0;j<3;++j)
-            if(!std::isfinite(c.data()[4*b+j]) || c.data()[4*b+j]<48 || c.data()[4*b+j]>=51)
-                throw nb::value_error("center must be in [48,51)");
-    };
+    m.attr("SHEET_NORMAL_RECIPE")=recipe;
+    auto check=[](Centers c){ if(c.shape(1)!=4) throw nb::value_error("centers must be (B,4)"); };
     const auto check_output=[](auto image,auto out,std::size_t n) {
         if (out.ndim()!=2 || out.shape(0)!=n || out.shape(1)!=4 || out.dtype()!=nb::dtype<float>() || out.device_id()!=image.device_id())
             throw nb::value_error("out must be contiguous (B,4) float32 on the input device");

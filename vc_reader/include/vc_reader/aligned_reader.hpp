@@ -40,6 +40,9 @@ struct SampleResult {
     [[nodiscard]] const TargetResult& operator[](const std::string& name) const;
 };
 
+// What an opened source's grid says: ResolutionCandidate::verifiedAgainst checks a candidate with it.
+[[nodiscard]] catalog::OpenedGrid openedGrid(SourceReader& reader);
+
 struct AlignedOptions {
     std::string backend = "cpu";  // or "cuda"
     std::int64_t device = 0;
@@ -89,7 +92,8 @@ class SampleReader : public AlignedEngine {
 public:
     // `reference`: a registered 3-D image. `catalog` relates volumes when sources do not.
     SampleReader(Source reference, std::vector<std::pair<std::string, Source>> targets, std::optional<catalog::Catalog> catalog, AlignedOptions options);
-    SampleReader(const catalog::VolumeLevel& reference, std::vector<std::pair<std::string, Source>> targets, AlignedOptions options);
+    // An explicit catalog must be the one the level belongs to.
+    SampleReader(const catalog::VolumeLevel& reference, std::vector<std::pair<std::string, Source>> targets, std::optional<catalog::Catalog> catalog, AlignedOptions options);
     ~SampleReader() override;
     [[nodiscard]] std::array<std::int64_t, 3> shape() const;
     [[nodiscard]] const VolumeTransform& referenceMap() const;

@@ -274,6 +274,7 @@ inline void bind(nb::module_& m)
         .def_prop_ro("is_zarr", &SourceReader::isZarr)
         .def_prop_ro("raw_axes", [](SourceReader& r) { return tupleOf(r.rawAxes()); })
         .def_prop_ro("is_direct", [](SourceReader& r) { return r.directArray() != nullptr; })
+        .def("opened_grid", [](SourceReader& r) { return openedGrid(r); })
         .def("zarr_array", &SourceReader::zarrArray)
         .def_prop_ro("zarr_datasets", &SourceReader::zarrDatasets)
         .def("stats", [](SourceReader& r) { return statsOf(r.stats()); })
@@ -316,7 +317,7 @@ inline void bind(nb::module_& m)
             if (nb::isinstance<catalog::VolumeLevel>(reference)) {
                 const auto level = nb::cast<catalog::VolumeLevel>(reference);
                 nb::gil_scoped_release release;
-                new (self) SampleReader(level, std::move(named), std::move(settings));
+                new (self) SampleReader(level, std::move(named), std::move(catalog), std::move(settings));
             } else if (nb::isinstance<Source>(reference)) {
                 auto source = nb::cast<Source>(reference);
                 nb::gil_scoped_release release;

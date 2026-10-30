@@ -82,6 +82,7 @@ void access(const fs::path& root)
     require(resolveAccess(bucket, AuthMode::Anonymous).kind == Access::Kind::Anonymous, "anonymous mode");
     require(raises<std::invalid_argument>([&] { resolveAccess("https://example.com/v", AuthMode::Aws); }), "aws needs s3://");
     require(raises<std::invalid_argument>([&] { s3Access("https://example.com/v", {}); }), "S3 keys need s3://");
+    require(s3Access(bucket, vcr::Auth{"s3", "key", "secret", "", ""}, {}, true).kind == Access::Kind::Anonymous, "offline S3 keys need no signing or region");
 
     auto copy = signedAccess;
     copy.auth.user = copy.auth.secret = "";

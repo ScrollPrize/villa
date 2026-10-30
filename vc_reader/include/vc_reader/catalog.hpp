@@ -15,6 +15,36 @@
 
 namespace vcr::catalog {
 
+// Artifact `type` strings documented by metadata.schema.json. New types appear over time;
+// unknown types are kept as plain artifacts.
+namespace artifact_type {
+inline constexpr const char* photo = "photo";
+inline constexpr const char* photoMask = "photo-mask";
+inline constexpr const char* omeZarr = "ome-zarr";
+inline constexpr const char* surfacePredictionZarr = "surface-prediction-zarr";
+inline constexpr const char* normalGrids = "normal-grids";
+inline constexpr const char* lasagna = "lasagna";
+inline constexpr const char* fiberlets = "fiberlets";
+inline constexpr const char* inkDetection3dZarr = "ink-detection-3d-zarr";
+inline constexpr const char* umbilicus = "umbilicus";
+inline constexpr const char* tifxyz = "tifxyz";
+inline constexpr const char* tifxyzFlattened = "tifxyz-flattened";
+inline constexpr const char* tifxyzNormalized = "tifxyz-normalized";
+inline constexpr const char* tifxyzTransformed = "tifxyz-transformed";
+inline constexpr const char* obj = "obj";
+inline constexpr const char* objLegacyUnits = "obj-legacy-units";
+inline constexpr const char* objFlattened = "obj-flattened";
+inline constexpr const char* objNormalized = "obj-normalized";
+inline constexpr const char* layersZarr = "layers-zarr";
+inline constexpr const char* layersTif = "layers-tif";
+inline constexpr const char* alphaRender = "alpha-render";
+inline constexpr const char* alphaRenderDownsampled = "alpha-render-downsampled";
+inline constexpr const char* inkDetection = "ink-detection";
+inline constexpr const char* inkDetectionDownsampled = "ink-detection-downsampled";
+inline constexpr const char* ink3dPrediction = "3d-ink-prediction";
+inline constexpr const char* inkLabels = "ink-labels";
+}
+
 inline constexpr std::string_view kDefaultManifestUrl =
     "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json";
 
@@ -119,6 +149,8 @@ struct OpenDataArtifact {
     // the location's own. The open-data bucket is preferred over other channels, then
     // metadata order. Empty optional when it has none; std::invalid_argument on another scheme.
     [[nodiscard]] std::optional<std::string> location(std::string_view scheme = "https") const;
+    // Distinct access classes of the artifact's roots, sorted.
+    [[nodiscard]] std::vector<std::string> usage() const;
 };
 
 std::vector<OpenDataArtifact> parseCatalogArtifacts(const nlohmann::json& entries);
@@ -241,6 +273,8 @@ struct OpenDataSegment {
     // The segment's identity across catalog revisions: long_id, else id.
     [[nodiscard]] std::string stableId() const;
     [[nodiscard]] const OpenDataVolumeCoverage* coverage(std::string_view volumeId) const noexcept;
+    // Artifacts of any of these types; with a target volume, only those keyed to it.
+    [[nodiscard]] std::vector<const OpenDataArtifact*> artifactsOf(const std::vector<std::string>& types, const std::optional<std::string>& targetVolume = std::nullopt) const;
 };
 
 // A tifxyz representation of a segment that can be opened as a surface.
@@ -401,6 +435,8 @@ struct OpenDataManifest {
 // The https:// location of an s3:// URL (public channels by their published
 // rewrite, other buckets by region: s3+REGION://); other URLs are unchanged.
 [[nodiscard]] std::string resolveOpenDataUrl(std::string url);
+// resolveOpenDataUrl for http(s) and s3 URLs; nullopt for anything else.
+[[nodiscard]] std::optional<std::string> openDataHttpsUrl(std::string url);
 // The s3:// form of a URL in a public channel (or already s3://), else nullopt.
 [[nodiscard]] std::optional<std::string> openDataS3Url(std::string url);
 [[nodiscard]] std::string joinOpenDataUrl(std::string root, std::string path);

@@ -247,10 +247,10 @@ NB_MODULE(_reader, m)
         return vcr::zarr::resolveAccess(location, mode == "aws" ? vcr::zarr::AuthMode::Aws : vcr::zarr::AuthMode::Auto, offline);
     }, "location"_a, "mode"_a, "offline"_a = false);
     m.def("s3_access", [](const std::string& location, const std::string& key, const std::string& secret,
-                          const std::string& token, const std::string& region, const std::string& endpoint) {
+                          const std::string& token, const std::string& region, const std::string& endpoint, bool offline) {
         nb::gil_scoped_release release;
-        return vcr::zarr::s3Access(location, vcr::Auth{"s3", key, secret, token, region}, endpoint);
-    }, "location"_a, "access_key_id"_a, "secret_access_key"_a, "session_token"_a, "region"_a, "endpoint"_a);
+        return vcr::zarr::s3Access(location, vcr::Auth{"s3", key, secret, token, region}, endpoint, offline);
+    }, "location"_a, "access_key_id"_a, "secret_access_key"_a, "session_token"_a, "region"_a, "endpoint"_a, "offline"_a = false);
     m.def("basic_access", &vcr::zarr::basicAccess, "user"_a, "password"_a);
 
     using vcr::zarr::ArrayMeta;

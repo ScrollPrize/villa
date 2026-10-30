@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 from . import _reader
 
-RECIPE = "ct-anisotropic-1-24-4-grid3-r48-v4"
+RECIPE = _reader.SHEET_NORMAL_RECIPE
 
 
 def sheet_normals(patches, offsets_xyz=None, *, valid=None, out=None):

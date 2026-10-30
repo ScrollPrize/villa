@@ -168,23 +168,14 @@ template <class T> void bindContext(nb::class_<T>& cls)
         .def_prop_ro("representations", &T::representations).def_prop_ro("geometry", &T::geometry);
 }
 
-// Readers are still Python: a descriptor opens through them.
+// A descriptor opens through the Python reader, which adds NumPy indexing and pickling.
 nb::object sourceReader(const Source& source, const nb::kwargs& options)
 {
     return nb::module_::import_("vc_reader.reader.source_reader").attr("SourceReader")(source, **options);
 }
 OpenedGrid openedGrid(nb::handle reader)
 {
-    nb::object resolved = reader.attr("resolved");
-    OpenedGrid grid;
-    grid.storageFromArray = nb::cast<std::optional<VolumeTransform>>(resolved.attr("storage_from_array"));
-    grid.storageUnits = nb::cast<std::optional<std::string>>(resolved.attr("storage_units"));
-    grid.registration = nb::cast<std::optional<SourceRegistration>>(resolved.attr("registration"));
-    grid.selection = nb::cast<Selection>(resolved.attr("selection"));
-    nb::object axes = reader.attr("axes"), shape = reader.attr("shape");
-    const char* names[] = {"z", "y", "x"};
-    for (int i = 0; i < 3; ++i) grid.shapeZYX[i] = nb::cast<std::int64_t>(shape[axes.attr("index")(names[i])]);
-    return grid;
+    return nb::cast<OpenedGrid>(reader.attr("_engine")().attr("opened_grid")());
 }
 
 template <class T>
@@ -324,12 +315,7 @@ NB_MODULE(_catalog, m) {
              "The preferred location: scheme 'https' (default; anonymous HTTP), 's3', or None to keep its own.")
         .def("urls", [](const OpenDataArtifact& a) { return tupleOf(a.urls()); }, "Every location as listed, in metadata order.")
         .def_prop_ro("path", [](const OpenDataArtifact& a) { return a.origins.empty() ? std::optional<std::string>{} : std::optional(a.origins[0].path); }, "Path of the first origin (relative to its access root).")
-        .def_prop_ro("usage", [](const OpenDataArtifact& a) {
-            std::set<std::string> usage;
-            for (const auto& o : a.origins)
-                for (const auto& r : o.accessRoots) usage.insert(r.usage);
-            return tupleOf(std::vector<std::string>(usage.begin(), usage.end()));
-        }, "Distinct access classes of the artifact's roots.")
+        .def_prop_ro("usage", [](const OpenDataArtifact& a) { return tupleOf(a.usage()); }, "Distinct access classes of the artifact's roots.")
         .def_prop_ro("parameters", [](const OpenDataArtifact& a) { return pyJson(a.parameters); })
         .def_prop_ro("properties", [](const OpenDataArtifact& a) { return pyJson(a.properties); })
         .def_prop_ro("creation_info", [](const OpenDataArtifact& a) { return a.creationInfo.empty() ? nb::none() : pyJson(a.creationInfo); })
@@ -384,13 +370,10 @@ NB_MODULE(_catalog, m) {
         .def_ro("width", &OpenDataSegment::width).def_ro("height", &OpenDataSegment::height)
         .def_prop_ro("artifacts", [](const OpenDataSegment& s) { return tupleOf(s.artifacts); })
         .def("artifacts_of", [](const OpenDataSegment& s, nb::args types, nb::kwargs kwargs) {
-            const auto target = kwargs.contains("target_volume") ? idOfAny(kwargs["target_volume"]) : std::nullopt;
+            std::vector<std::string> wanted;
+            for (nb::handle type : types) wanted.push_back(nb::cast<std::string>(type));
             nb::list out;
-            for (const auto& a : s.artifacts) {
-                if (target && a.targetVolumeId != target) continue;
-                for (nb::handle type : types)
-                    if (nb::cast<std::string>(type) == a.type) { out.append(nb::cast(a)); break; }
-            }
+            for (const auto* a : s.artifactsOf(wanted, kwargs.contains("target_volume") ? idOfAny(kwargs["target_volume"]) : std::nullopt)) out.append(nb::cast(*a));
             return out;
         })
         .def_prop_ro("original_volume_downscale", [](const OpenDataSegment& s) { return std::int64_t(s.originalVolumeDownscale); })
@@ -748,6 +731,7 @@ NB_MODULE(_catalog, m) {
         .def("__setstate__", [](VolumeLevel& self, const std::tuple<Volume, std::int64_t>& state) { new (&self) VolumeLevel(std::get<0>(state), std::get<1>(state)); })
         .def("open", [](const VolumeLevel& l, nb::kwargs options) { return sourceReader(l.source(), options); });
 
+    nb::class_<OpenedGrid>(m, "OpenedGrid");
     const auto verifiedBy = [](const ResolutionCandidate& c, nb::handle reader) { return c.verifiedAgainst(openedGrid(reader)); };
     candidate.def_ro("volume", &ResolutionCandidate::volume).def_ro("source", &ResolutionCandidate::source).def_ro("level", &ResolutionCandidate::level)
         .def_ro("estimated_resolution_um", &ResolutionCandidate::estimatedResolutionUm).def_ro("verified", &ResolutionCandidate::verified)
@@ -797,6 +781,33 @@ NB_MODULE(_catalog, m) {
                    ", source=" + (c.source().empty() ? std::string("None") : "'" + c.source() + "'") + ")";
         });
 
+    struct ArtifactTypes {};
+    nb::class_<ArtifactTypes>(m, "ArtifactType", "Artifact type strings documented by metadata.schema.json. New types appear over time; unknown types are kept as plain artifacts.")
+        .def_prop_ro_static("PHOTO", [](nb::handle) { return artifact_type::photo; })
+        .def_prop_ro_static("PHOTO_MASK", [](nb::handle) { return artifact_type::photoMask; })
+        .def_prop_ro_static("OME_ZARR", [](nb::handle) { return artifact_type::omeZarr; })
+        .def_prop_ro_static("SURFACE_PREDICTION_ZARR", [](nb::handle) { return artifact_type::surfacePredictionZarr; })
+        .def_prop_ro_static("NORMAL_GRIDS", [](nb::handle) { return artifact_type::normalGrids; })
+        .def_prop_ro_static("LASAGNA", [](nb::handle) { return artifact_type::lasagna; })
+        .def_prop_ro_static("FIBERLETS", [](nb::handle) { return artifact_type::fiberlets; })
+        .def_prop_ro_static("INK_DETECTION_3D_ZARR", [](nb::handle) { return artifact_type::inkDetection3dZarr; })
+        .def_prop_ro_static("UMBILICUS", [](nb::handle) { return artifact_type::umbilicus; })
+        .def_prop_ro_static("TIFXYZ", [](nb::handle) { return artifact_type::tifxyz; })
+        .def_prop_ro_static("TIFXYZ_FLATTENED", [](nb::handle) { return artifact_type::tifxyzFlattened; })
+        .def_prop_ro_static("TIFXYZ_NORMALIZED", [](nb::handle) { return artifact_type::tifxyzNormalized; })
+        .def_prop_ro_static("TIFXYZ_TRANSFORMED", [](nb::handle) { return artifact_type::tifxyzTransformed; })
+        .def_prop_ro_static("OBJ", [](nb::handle) { return artifact_type::obj; })
+        .def_prop_ro_static("OBJ_LEGACY_UNITS", [](nb::handle) { return artifact_type::objLegacyUnits; })
+        .def_prop_ro_static("OBJ_FLATTENED", [](nb::handle) { return artifact_type::objFlattened; })
+        .def_prop_ro_static("OBJ_NORMALIZED", [](nb::handle) { return artifact_type::objNormalized; })
+        .def_prop_ro_static("LAYERS_ZARR", [](nb::handle) { return artifact_type::layersZarr; })
+        .def_prop_ro_static("LAYERS_TIF", [](nb::handle) { return artifact_type::layersTif; })
+        .def_prop_ro_static("ALPHA_RENDER", [](nb::handle) { return artifact_type::alphaRender; })
+        .def_prop_ro_static("ALPHA_RENDER_DOWNSAMPLED", [](nb::handle) { return artifact_type::alphaRenderDownsampled; })
+        .def_prop_ro_static("INK_DETECTION", [](nb::handle) { return artifact_type::inkDetection; })
+        .def_prop_ro_static("INK_DETECTION_DOWNSAMPLED", [](nb::handle) { return artifact_type::inkDetectionDownsampled; })
+        .def_prop_ro_static("INK_3D_PREDICTION", [](nb::handle) { return artifact_type::ink3dPrediction; })
+        .def_prop_ro_static("INK_LABELS", [](nb::handle) { return artifact_type::inkLabels; });
     m.attr("DEFAULT_METADATA_URL") = std::string(kDefaultManifestUrl);
     m.attr("DEFAULT_RESOLUTION_REL_TOL") = kDefaultResolutionRelTol;
     m.attr("PYRAMID_LEVELS") = kPyramidLevels;
@@ -805,8 +816,5 @@ NB_MODULE(_catalog, m) {
     m.def("default_cache_dir", [] { return defaultCatalogCacheDir(); }, "Where manifests are cached (see vcr::catalog::defaultCatalogCacheDir).");
     m.def("join_url", &joinOpenDataUrl);
     m.def("to_s3", &openDataS3Url, "s3:// form of url, or None if it is not in a public channel.");
-    m.def("to_https", [](const std::string& url) -> std::optional<std::string> {
-        if (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("s3://") || url.starts_with("s3+")) return resolveOpenDataUrl(url);
-        return std::nullopt;
-    }, "Public HTTPS location resolved by the shared native catalog.");
+    m.def("to_https", &openDataHttpsUrl, "Public HTTPS location resolved by the shared native catalog.");
 }

@@ -889,10 +889,12 @@ SampleReader::SampleReader(Source reference, std::vector<std::pair<std::string, 
         throw;
     }
 }
-SampleReader::SampleReader(const catalog::VolumeLevel& reference, std::vector<std::pair<std::string, Source>> targets, AlignedOptions options) : AlignedEngine(std::move(options))
+SampleReader::SampleReader(const catalog::VolumeLevel& reference, std::vector<std::pair<std::string, Source>> targets, std::optional<catalog::Catalog> catalog, AlignedOptions options) : AlignedEngine(std::move(options))
 {
     const auto& index = reference.volume.index();
     impl_->catalog = catalog::Catalog(index->published() ? index->published() : index);
+    if (catalog && catalog->manifest().raw != impl_->catalog->manifest().raw)
+        throw std::invalid_argument("VolumeLevel and explicit catalog must belong to the same catalog");
     try {
         prepareSampleReader(*impl_, reference.source(), targets);
     } catch (...) {
@@ -901,6 +903,25 @@ SampleReader::SampleReader(const catalog::VolumeLevel& reference, std::vector<st
     }
 }
 SampleReader::~SampleReader() = default;
+
+catalog::OpenedGrid openedGrid(SourceReader& reader)
+{
+    const auto& resolved = reader.resolved();
+    catalog::OpenedGrid grid;
+    grid.storageFromArray = resolved.storageFromArray;
+    grid.storageUnits = resolved.storageUnits;
+    grid.registration = resolved.registration;
+    grid.selection = resolved.selection;
+    const auto& axes = reader.axes();
+    const auto& shape = reader.shape();
+    const char* names[] = {"z", "y", "x"};
+    for (int i = 0; i < 3; ++i) {
+        const auto axis = std::find(axes.begin(), axes.end(), names[i]);
+        if (axis == axes.end()) throw std::invalid_argument(std::string("source has no ") + names[i] + " axis");
+        grid.shapeZYX[i] = shape[std::size_t(axis - axes.begin())];
+    }
+    return grid;
+}
 std::array<std::int64_t, 3> SampleReader::shape() const { return impl_->find("image")->shape; }
 const VolumeTransform& SampleReader::referenceMap() const { return impl_->referenceMap; }
 bool SampleReader::hasTarget(const std::string& name) const { return impl_->find(name) != nullptr; }

@@ -504,6 +504,27 @@ std::vector<std::string> OpenDataArtifact::urls() const
     return out;
 }
 
+std::vector<std::string> OpenDataArtifact::usage() const
+{
+    std::vector<std::string> out;
+    for (const auto& origin : origins)
+        for (const auto& root : origin.accessRoots)
+            out.push_back(root.usage);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::vector<const OpenDataArtifact*> OpenDataSegment::artifactsOf(const std::vector<std::string>& types, const std::optional<std::string>& targetVolume) const
+{
+    std::vector<const OpenDataArtifact*> out;
+    for (const auto& artifact : artifacts) {
+        if (targetVolume && artifact.targetVolumeId != targetVolume) continue;
+        if (std::find(types.begin(), types.end(), artifact.type) != types.end()) out.push_back(&artifact);
+    }
+    return out;
+}
+
 std::optional<std::string> OpenDataArtifact::location(std::string_view scheme) const
 {
     if (scheme != "https" && scheme != "s3" && !scheme.empty())
@@ -552,7 +573,7 @@ bool OpenDataSegment::hasLayersZarr() const
 {
     return std::any_of(artifacts.begin(), artifacts.end(), [](const OpenDataArtifact& artifact) {
         const auto type = lowerCopy(artifact.type);
-        return type == "layers_zarr" || type == "layers-zarr" ||
+        return type == "layers_zarr" || type == artifact_type::layersZarr ||
                type == "layers zarr" || (type.find("layers") != std::string::npos &&
                                           type.find("zarr") != std::string::npos);
     });
@@ -596,7 +617,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
 
     std::map<std::string, const OpenDataArtifact*> publishedByTarget;
     for (const auto& artifact : segment.artifacts) {
-        if (lowerCopy(artifact.type) != "tifxyz-transformed" || artifact.url().empty() ||
+        if (lowerCopy(artifact.type) != artifact_type::tifxyzTransformed || artifact.url().empty() ||
             !artifact.targetVolumeId || !findVolume(*artifact.targetVolumeId))
             continue;
         publishedByTarget.emplace(*artifact.targetVolumeId, &artifact);
@@ -614,7 +635,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
                            1.0e-9 * std::max(1.0, segment.originalVolumeDownscale)) { level = l; break; }
                    return level.has_value();
                }()) {
-        for (const auto* type : {"tifxyz-flattened", "tifxyz", "tifxyz-normalized"}) {
+        for (const auto* type : {artifact_type::tifxyzFlattened, artifact_type::tifxyz, artifact_type::tifxyzNormalized}) {
             const auto it = std::find_if(segment.artifacts.begin(), segment.artifacts.end(), [&](const auto& artifact) {
                 return lowerCopy(artifact.type) == type && !artifact.url().empty();
             });
@@ -645,7 +666,7 @@ std::optional<OpenDataRepresentationKind> classifyDerivedRepresentation(
     if (type.find("normal-grid") != std::string::npos) {
         return OpenDataRepresentationKind::NormalGrids;
     }
-    if (type == "lasagna") {
+    if (type == artifact_type::lasagna) {
         return OpenDataRepresentationKind::Lasagna;
     }
     const bool prediction =
@@ -718,8 +739,8 @@ std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view ur
 
 std::optional<int> OpenDataArtifact::gridLevel() const
 {
-    if (type == "ome-zarr" || type == "ink-detection-3d-zarr") return 0;
-    if (type == "surface-prediction-zarr") return sourceCoordinateLevel;
+    if (type == artifact_type::omeZarr || type == artifact_type::inkDetection3dZarr) return 0;
+    if (type == artifact_type::surfacePredictionZarr) return sourceCoordinateLevel;
     return std::nullopt;
 }
 
@@ -845,6 +866,13 @@ constexpr std::pair<std::string_view, std::string_view> kPublicChannels[] = {
     {"s3://vesuvius-challenge-open-data/", "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"},
     {"s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"},
 };
+
+std::optional<std::string> openDataHttpsUrl(std::string url)
+{
+    if (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("s3://") || url.starts_with("s3+"))
+        return resolveOpenDataUrl(std::move(url));
+    return std::nullopt;
+}
 
 std::string resolveOpenDataUrl(std::string url)
 {

@@ -6,7 +6,7 @@ from . import _reader
 from ._sampling_engine import SamplingEngine
 from .browsing import VolumeLevel
 from .reader._indexing import parse_index
-from .sources import Source, SurfaceRegistration, Surface
+from .sources import SurfaceRegistration, Surface
 
 
 def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reader_options):
@@ -62,10 +62,6 @@ class SampleReader(SamplingEngine):
             raise ValueError('surface_output_bytes must be positive')
         self._configuration = (reference, dict(targets or {}), backend, catalog, limits, device,
                                self._surface_output_bytes, dict(reader_options))
-        if isinstance(reference, VolumeLevel) and catalog is not None and catalog.raw != reference.volume.scroll.catalog.raw:
-            raise ValueError('VolumeLevel and explicit catalog must belong to the same catalog')
-        if not isinstance(reference, (Source, VolumeLevel)):
-            raise ValueError('reference must be a VolumeLevel or registered volumetric image Source')
         self.reference = reference.source if isinstance(reference, VolumeLevel) else reference
         self._reference, self._targets_declared, self._catalog, self._limits = reference, dict(targets or {}), catalog, limits
         self._setup(backend, device, limits, reader_options)

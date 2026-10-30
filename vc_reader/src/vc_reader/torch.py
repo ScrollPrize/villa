@@ -155,7 +155,7 @@ def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
                     raise ValueError(f"{key}: expected CPU or CUDA input")
                 value = value.to(device, non_blocking=True)
                 _record(value, stream)
-                continuous = pipeline.targets[key]._constructor.__name__ not in ("Label", "ValidMask")
+                continuous = pipeline._engine.continuous(key)
                 if continuous and value.dtype == torch.uint8:
                     value = value.to(torch.float32)
                 if continuous and value.dtype not in (torch.float32, torch.float64):

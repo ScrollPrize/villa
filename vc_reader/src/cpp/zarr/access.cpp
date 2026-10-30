@@ -240,10 +240,12 @@ Access signedAccess(const std::string& location, Auth keys, std::string endpoint
 }
 }  // namespace
 
-Access s3Access(const std::string& location, Auth keys, std::string endpoint)
+Access s3Access(const std::string& location, Auth keys, std::string endpoint, bool offline)
 {
     if (!location.starts_with("s3://"))
         throw std::invalid_argument("S3 credentials need an s3:// URL, not '" + location + "'");
+    if (offline)
+        return Access{};
     return signedAccess(location, std::move(keys), std::move(endpoint), {});
 }
 

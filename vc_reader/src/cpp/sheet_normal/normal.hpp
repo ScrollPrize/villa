@@ -21,6 +21,7 @@ namespace vcr::sheet_normal {
 device::Storage cuda(const void* image, bool floating, const float* centers,
                      std::size_t batch, int device, device::Storage output = {});
 #endif
+inline constexpr const char* recipe="ct-anisotropic-1-24-4-grid3-r48-v4";
 constexpr int width=109, sites=33, count=sites*sites*sites;
 constexpr int zcount=sites*width*width, ycount=sites*sites*width;
 // Where the patch of one XYZ query sits: its ZYX start, and the query's XYZ offset from the
@@ -44,6 +45,12 @@ inline void center(const float* offset,bool valid,float* out) {
         out[axis]=std::min(offset[axis]+48.f,std::nextafter(51.f,48.f));
     }
     out[3]=valid;
+}
+// Centers (B,4) are patch-local XYZ in [48,51) plus validity.
+inline void check_centers(const float* centers,std::size_t batch) {
+    for(std::size_t b=0;b<batch;++b) for(int j=0;j<3;++j)
+        if(!std::isfinite(centers[4*b+j]) || centers[4*b+j]<48 || centers[4*b+j]>=51)
+            throw std::invalid_argument("center must be in [48,51)");
 }
 struct Kernels {
     float taps[4][13]{}; // smooth/derivative sigma 2, then sigma 1, zero padded
@@ -90,6 +97,7 @@ VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
     sums[3]+=weight*gy*gy; sums[4]+=weight*gy*gz; sums[5]+=weight*gz*gz; sums[6]+=weight;
 }
 template<class T> inline void cpu(const T* image,const float* centers,float* output,std::size_t batch) {
+    check_centers(centers,batch);
     Kernels k;
     auto z=std::make_unique_for_overwrite<float[]>(4*zcount);
     auto y=std::make_unique_for_overwrite<float[]>(6*ycount);

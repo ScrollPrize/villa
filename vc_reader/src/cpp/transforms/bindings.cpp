@@ -144,6 +144,7 @@ NB_MODULE(_transforms, m) {
     nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);
     nb::class_<Named>(m, "Param").def(nb::init<std::string>(), "name"_a);
     nb::class_<Target>(m, "Target");
+    m.def("default_targets", &default_targets);
     m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"));
     m.def("Label", [](double fill) { Target t; t.role = Role::Label; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ScalarField", [](double fill) { Target t; t.role = Role::Scalar; t.fill = fill; return t; }, "fill"_a = 0.);
@@ -295,13 +296,15 @@ NB_MODULE(_transforms, m) {
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
     m.def("cuda_available", &vcr::cuda::available);
 #ifdef VC_READER_CUDA
-    nb::class_<DeviceOutputs>(m, "DeviceOutputs")
-        .def("export", &DeviceOutputs::mark_exported)
-        .def("check", &DeviceOutputs::check, nb::call_guard<nb::gil_scoped_release>());
+    nb::class_<BoundOutputs>(m, "DeviceOutputs")
+        .def("export", &BoundOutputs::mark_exported)
+        .def("check", &BoundOutputs::check, nb::call_guard<nb::gil_scoped_release>());
 #endif
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
         .def_prop_ro("backend", &Pipeline::backend)
+        .def_prop_ro("targets", &Pipeline::targets)
+        .def("continuous", [](const Pipeline& p, const std::string& target) { return continuous(p.targets().at(target)); }, "target"_a)
 #ifdef VC_READER_CUDA
         .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool inplace,
                               const NamedValues& params) {

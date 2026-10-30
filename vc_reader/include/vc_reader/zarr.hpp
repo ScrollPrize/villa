@@ -65,7 +65,8 @@ enum class AuthMode {
 };
 Access resolveAccess(const std::string& location, AuthMode mode = AuthMode::Auto, bool offline = false);
 // Fixed S3 keys (auth.kind "s3"). An empty region asks the bucket, then AWS_REGION.
-Access s3Access(const std::string& location, Auth keys, std::string endpoint = {});
+// Offline needs neither signing nor a bucket region: anonymous.
+Access s3Access(const std::string& location, Auth keys, std::string endpoint = {}, bool offline = false);
 Access basicAccess(std::string user, std::string password);
 // Reads the keys of an Access resolved from the environment again, keeping its region.
 // HttpDenied when the environment no longer has any.

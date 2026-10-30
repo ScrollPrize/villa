@@ -66,6 +66,7 @@ __global__ void solve(const double* partial,double* normals,float* output,int n)
 }
 device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int id,device::Storage out) {
     if(batch>128) throw std::invalid_argument("sheet normal CUDA batch must be <=128; process larger requests in groups");
+    check_centers(centers,batch);
     if (!out) out=device::allocate(batch*4*sizeof(float),id);
     if(!batch) return out;
     const int n=int(batch); auto stream=device::stream(); Kernels k;

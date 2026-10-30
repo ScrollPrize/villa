@@ -4,7 +4,7 @@ from copy import deepcopy
 import numpy as np
 
 from .. import _transforms
-from ._config import _unwrap, Image, Label, ValidMask
+from ._config import _unwrap
 
 
 def _as_array(value, inplace=False):
@@ -64,13 +64,13 @@ class Pipeline:
         self.compact = bool(compact)
         self._requested_backend = backend
         self.transforms = tuple(deepcopy(tuple(transforms)))
-        self.targets = deepcopy(targets) if targets is not None else {
-            "image": Image(), "mask": Label(), "padding_mask": ValidMask(),
-        }
-        self._engine = _transforms.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
+        self._declared_targets = deepcopy(targets)
+        declared = _transforms.default_targets() if targets is None else _unwrap(self._declared_targets)
+        self._engine = _transforms.Pipeline(_unwrap(self.transforms), declared, self.compact, backend)
+        self.targets = self._engine.targets
 
     def __getstate__(self):
-        return self.transforms, self.targets, self.compact, self._requested_backend
+        return self.transforms, self._declared_targets, self.compact, self._requested_backend
 
     def __setstate__(self, state):
         self.__init__(state[0], targets=state[1], compact=state[2], backend=state[3])

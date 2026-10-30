@@ -73,10 +73,8 @@ def resolve_access(location: str, auth: Any = "auto", *, offline: bool = False):
             raise ValueError("HTTP basic auth needs an http(s):// URL, not s3://")
         return native.basic_access(str(auth[0]), str(auth[1]))
     if isinstance(auth, S3Credentials):
-        if offline and s3:  # cached reads need neither signing credentials nor a bucket region
-            return native.anonymous_access()
         return native.s3_access(location, auth.access_key_id, auth.secret_access_key, auth.session_token or "",
-                                auth.region or "", auth.endpoint_url or "")
+                                auth.region or "", auth.endpoint_url or "", offline)
     if auth in ("auto", "aws"):
         return native.resolve_access(location, auth, offline)
     raise TypeError("auth must be 'auto', 'aws', None, an S3Credentials or a (username, password) tuple")

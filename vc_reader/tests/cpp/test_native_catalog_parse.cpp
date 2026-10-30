@@ -302,6 +302,22 @@ int main()
                     model.task == "ink-detection" && model.architecture == "timesformer",
                 "model");
 
+        // Artifact queries.
+        const auto artifactsParsed = parseCatalogArtifacts(nlohmann::json::array({
+            {{"type", artifact_type::inkLabels}, {"parameters", {{"target_volume", "v"}}},
+             {"origins", {{{"path", "a"}, {"access_roots", {{{"type", "s3"}, {"url", "s3://b/"}, {"usage", "public"}},
+                                                             {{"type", "s3"}, {"url", "s3://c/"}, {"usage", "archive"}},
+                                                             {{"type", "s3"}, {"url", "s3://d/"}, {"usage", "public"}}}}}}}},
+            {{"type", artifact_type::layersZarr}, {"parameters", {{"target_volume", "w"}}}, {"origins", nlohmann::json::array()}}}));
+        require(artifactsParsed.front().usage() == std::vector<std::string>{"archive", "public"}, "distinct sorted usage");
+        OpenDataSegment withArtifacts;
+        withArtifacts.artifacts = artifactsParsed;
+        require(withArtifacts.artifactsOf({artifact_type::inkLabels, artifact_type::layersZarr}).size() == 2, "artifacts of types");
+        require(withArtifacts.artifactsOf({artifact_type::layersZarr}, "v").empty(), "another target volume");
+        require(withArtifacts.artifactsOf({artifact_type::layersZarr}, "w").size() == 1, "its target volume");
+        require(openDataHttpsUrl("/a/local/path") == std::nullopt, "no public form of a local path");
+        require(openDataHttpsUrl("https://example.com/a") == std::optional<std::string>("https://example.com/a"), "https stays");
+
         // Only published keys are read.
         const auto aliases = parseOpenDataManifest(R"({"metadata": {"samples": {"s": {}}}})");
         require(aliases.samples.empty(), "no metadata wrapper");
