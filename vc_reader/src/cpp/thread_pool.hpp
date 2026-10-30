@@ -1,4 +1,5 @@
-// Fixed-size worker pool with a blocking parallel_for.
+// Fixed-size worker pool with a blocking parallel_for. A pool of zero workers runs
+// every item on the calling thread.
 #pragma once
 
 #include <atomic>
@@ -18,7 +19,6 @@ class ThreadPool {
 public:
     explicit ThreadPool(std::size_t threads)
     {
-        threads = threads ? threads : 1;
         workers_.reserve(threads);
         for (std::size_t i = 0; i < threads; ++i)
             workers_.emplace_back([this] { loop(); });

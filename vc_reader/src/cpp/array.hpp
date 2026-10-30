@@ -188,6 +188,10 @@ struct ArraySpec {
     std::shared_ptr<DiskCache> disk_cache;
     HttpOptions http;
     ChunkCompute compute;            // the chunk source of a computed array (no remote or store)
+    // Every read runs on its calling thread alone (threads must be 0) and fetches or
+    // computes a missing chunk itself, never waiting for another read of the same
+    // chunk: for sources bound to the reader's thread.
+    bool caller_thread_only = false;
 };
 
 struct Stats {
@@ -227,6 +231,8 @@ public:
                 stats_.remote_fetches, stats_.remote_bytes);
         if (spec_.compute && (!spec_.remote_url.empty() || !spec_.source_root.empty()))
             throw std::invalid_argument("a computed array has no remote or stored source");
+        if (spec_.caller_thread_only && spec_.threads != 0)
+            throw std::invalid_argument("a caller-thread-only array has no workers");
         if (spec_.write_layer >= 0 && codecs_.at(spec_.write_layer) == Codec::Delta3d && nd != 3)
             throw std::invalid_argument("Delta3D caches hold 3-D chunks only");
         if (spec_.write_layer >= 0)
@@ -531,10 +537,7 @@ public:
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
         if (!http_ && !source_ && !spec_.compute)
             return nullptr;
-        ChunkPtr chunk = fetch(idx, k);
-        if (cache_)
-            cache_->put(ck, chunk);
-        return chunk;
+        return fetch(idx, k, ck);
     }
 
     // Copy a full decoded chunk, including stored padding at the array edge, or
@@ -1560,15 +1563,20 @@ private:
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        ChunkPtr chunk = fetch(w.idx, k);
-        if (cache_)
-            cache_->put(ck, chunk);
-        apply(chunk, w, out_strides, op, output);
+        apply(fetch(w.idx, k, ck), w, out_strides, op, output);
     }
 
-    // Fetches (or computes) a chunk once, however many reads want it at the same time.
-    ChunkPtr fetch(const Index& idx, const std::string& k)
+    // Fetches (or computes) a chunk once, however many reads want it at the same time,
+    // and puts it in the memory cache (key `ck`) before it stops being in flight, so a
+    // read that missed the memory cache meanwhile finds it there instead of fetching again.
+    ChunkPtr fetch(const Index& idx, const std::string& k, const std::string& ck)
     {
+        if (spec_.caller_thread_only) {
+            ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
+            if (cache_)
+                cache_->put(ck, chunk);
+            return chunk;
+        }
         std::shared_future<ChunkPtr> future;
         std::promise<ChunkPtr> promise;
         bool owner = false;
@@ -1578,6 +1586,12 @@ private:
             if (it != inflight_.end()) {
                 future = it->second;
             } else {
+                if (cache_) {
+                    if (auto [found, chunk] = cache_->get(ck); found) {
+                        ++stats_.memory_hits;
+                        return chunk;
+                    }
+                }
                 future = promise.get_future().share();
                 inflight_.emplace(k, future);
                 owner = true;
@@ -1587,6 +1601,8 @@ private:
             return future.get();
         try {
             ChunkPtr chunk = spec_.compute ? compute_now(idx, k) : fetch_now(k);
+            if (cache_)
+                cache_->put(ck, chunk);
             promise.set_value(chunk);
             std::lock_guard lock(inflight_mutex_);
             inflight_.erase(k);

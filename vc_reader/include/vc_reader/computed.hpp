@@ -34,10 +34,17 @@ struct Options {
     bool compressCache = false;
     std::shared_ptr<MemoryCache> memoryCache;  // decoded chunks in memory; none when unset
     std::size_t threads = 0;  // region-read and sampling workers; 0: min(16, cores)
+    // Read and compute on the reading thread alone, with no workers, and compute a
+    // missing chunk in every read that wants it rather than waiting for another
+    // read's computation: for compute callbacks bound to the reader's thread (e.g.
+    // waits that a cooperative scheduler on that thread must see and may suspend).
+    // Ignores `threads`.
+    bool callerThreadOnly = false;
 };
 
-// A computed array. Each chunk is computed by one caller at a time, then kept in
-// the memory cache and on disk when those are set.
+// A computed array. Each chunk is computed by one caller at a time (every caller
+// that wants it, with callerThreadOnly), then kept in the memory cache and on disk
+// when those are set.
 std::unique_ptr<Array> open(const Options& options, ChunkCompute compute);
 
 // The directory holding the persisted chunks of `options` (requires cacheDir).

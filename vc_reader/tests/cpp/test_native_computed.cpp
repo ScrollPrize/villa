@@ -1,7 +1,9 @@
 // Computed arrays: a derived field (a max filter with a border) computed per chunk
 // from region reads of a stored array; a memory cache serves repeated reads; chunks
 // persist on disk and are reused by a later open of the same identity; mismatched
-// persisted arrays are refused; fill chunks; point sampling of the computed array.
+// persisted arrays are refused; fill chunks; point sampling of the computed array;
+// concurrent readers of an uncached chunk compute it once; caller-thread-only arrays
+// compute every chunk on the reading thread.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
 
@@ -12,6 +14,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <future>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -175,6 +179,83 @@ void computedArrays(const Fixture& f)
     b->read_many({{0, 0, 0}}, {{Z, Y, X}}, {again.data()});
     require(again == all, "compressed persisted chunks reused");
 }
+// Readers racing for one chunk that is not cached yet: one computes it, the others
+// wait for it or find it in the memory cache, never computing it again.
+void concurrentReadersComputeOnce()
+{
+    for (int round = 0; round < 200; ++round) {
+        computed::Options o;
+        o.shape = {C, C, C};
+        o.chunks = {C, C, C};
+        o.identity = "round " + std::to_string(round);
+        o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+        std::atomic<int> computed{0};
+        auto array = computed::open(o, [&](const Index&, std::uint8_t* out) {
+            ++computed;
+            std::memset(out, 7, std::size_t(C) * C * C);
+            return true;
+        });
+        std::atomic<bool> go{false};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 8; ++t)
+            readers.emplace_back([&] {
+                while (!go) {}
+                const std::int64_t at[] = {1, 2, 3};
+                std::uint8_t value = 0;
+                array->read_points(at, 1, &value);
+                require(value == 7, "a raced read sees the computed chunk");
+            });
+        go = true;
+        for (auto& reader : readers)
+            reader.join();
+        require(computed == 1, "a chunk raced by concurrent readers is computed once");
+    }
+}
+void callerThreadOnly()
+{
+    computed::Options o;
+    o.shape = {4 * C, C, C};
+    o.chunks = {C, C, C};
+    o.identity = "caller thread";
+    o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    o.callerThreadOnly = true;
+    const auto reader = std::this_thread::get_id();
+    std::atomic<int> elsewhere{0}, computed{0};
+    auto array = computed::open(o, [&](const Index& c, std::uint8_t* out) {
+        elsewhere += std::this_thread::get_id() != reader;
+        ++computed;
+        std::memset(out, int(c[0]) + 1, std::size_t(C) * C * C);
+        return true;
+    });
+    std::vector<std::uint8_t> all(std::size_t(4) * C * C * C);
+    array->read_many({{0, 0, 0}}, {{4 * C, C, C}}, {all.data()});
+    require(computed == 4 && elsewhere == 0, "caller-thread-only chunks are computed on the reading thread");
+    require(all.front() == 1 && all.back() == 4, "caller-thread-only values");
+
+    // A read never waits for another read's computation of the same chunk: the first
+    // computation finishes only after a second read of that chunk has returned.
+    o.identity = "caller thread, overlapping reads";
+    std::promise<void> secondDone;
+    auto second = secondDone.get_future().share();
+    std::atomic<int> calls{0};
+    auto overlapping = computed::open(o, [&](const Index&, std::uint8_t* out) {
+        if (++calls == 1 && second.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+            throw std::runtime_error("the second read waited for the first computation");
+        std::memset(out, 3, std::size_t(C) * C * C);
+        return true;
+    });
+    const std::int64_t at[] = {0, 0, 0};
+    auto first = std::async(std::launch::async, [&] {
+        std::uint8_t v = 0;
+        overlapping->read_points(at, 1, &v);
+        return v;
+    });
+    while (calls == 0) std::this_thread::yield();
+    std::uint8_t v = 0;
+    overlapping->read_points(at, 1, &v);
+    secondDone.set_value();
+    require(v == 3 && first.get() == 3 && calls == 2, "overlapping caller-thread-only reads compute independently");
+}
 }  // namespace
 
 int main()
@@ -182,6 +263,8 @@ int main()
     try {
         Fixture f;
         computedArrays(f);
+        concurrentReadersComputeOnce();
+        callerThreadOnly();
         std::cout << "computed arrays passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

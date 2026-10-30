@@ -59,9 +59,11 @@ std::unique_ptr<Array> open(const Options& options, ChunkCompute compute)
     spec.itemsize = meta.itemsize();
     spec.fill = meta.fill;
     spec.identity = "computed:" + options.identity;
-    spec.threads = options.threads ? options.threads
-                                   : std::min<std::size_t>(16, std::max(4u, std::thread::hardware_concurrency()));
+    spec.threads = options.callerThreadOnly ? 0
+                 : options.threads           ? options.threads
+                                             : std::min<std::size_t>(16, std::max(4u, std::thread::hardware_concurrency()));
     spec.compute = std::move(compute);
+    spec.caller_thread_only = options.callerThreadOnly;
     if (options.cacheDir) {
         const fs::path dir = cachePath(options);
         const Json stored = options.compressCache ? meta.delta3dZarray() : meta.decodedZarray();
