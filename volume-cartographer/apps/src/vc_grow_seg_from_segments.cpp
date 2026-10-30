@@ -3,6 +3,7 @@
 #include "utils/Json.hpp"
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_metadata.hpp>
 
 #include <algorithm>
 #include <boost/program_options.hpp>

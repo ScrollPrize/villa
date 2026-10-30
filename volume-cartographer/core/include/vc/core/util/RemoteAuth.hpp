@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include <vc_reader/zarr.hpp>
+#include <vc_reader/native/reader_types.hpp>
 
 namespace vc {
 
@@ -17,11 +17,7 @@ struct HttpAuth {
 };
 
 // From the environment and the shared AWS files; empty when there are none.
-inline HttpAuth loadAwsCredentials()
-{
-    const auto keys = vcr::zarr::awsCredentials();
-    return keys ? HttpAuth{keys->user, keys->secret, keys->token, keys->region} : HttpAuth{};
-}
+HttpAuth loadAwsCredentials();
 
 inline vcr::Auth readerAuth(const HttpAuth& auth)
 {

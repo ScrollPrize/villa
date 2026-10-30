@@ -5,6 +5,8 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 
 #include <QProcess>
 #include <QProcessEnvironment>

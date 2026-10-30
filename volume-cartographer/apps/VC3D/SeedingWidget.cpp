@@ -38,6 +38,7 @@
 #include <functional>
 #include <limits>
 #include <unordered_set>
+#include "vc_reader/array.hpp"
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;

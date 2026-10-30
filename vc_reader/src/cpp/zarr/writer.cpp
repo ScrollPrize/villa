@@ -1,5 +1,7 @@
 // Writing local Zarr arrays: metadata, encoded chunk files and regions.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_write.hpp"
+#include "vc_reader/array.hpp"
 #include "vc_reader/native/codecs.hpp"
 #include "format.hpp"
 #include "files.hpp"

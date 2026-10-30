@@ -13,6 +13,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include <cstdlib>
 #include <iostream>
 

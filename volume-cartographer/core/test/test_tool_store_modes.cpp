@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"

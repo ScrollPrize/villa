@@ -1,6 +1,8 @@
 // Box geometry, copies, file reads (pread slabs, cached mmaps) and atomic writes.
 #pragma once
 
+#include "reader_types.hpp"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -23,8 +25,6 @@
 #include <vector>
 
 namespace vcr {
-
-using Index = std::vector<std::int64_t>;
 
 // Byte strides of a C-order array.
 inline Index c_strides(const Index& shape, std::size_t itemsize)

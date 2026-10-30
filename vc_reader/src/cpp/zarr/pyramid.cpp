@@ -1,5 +1,7 @@
 // Writing multiscale pyramids: coarser levels as block means of the level below.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_write.hpp"
+#include "vc_reader/array.hpp"
 #include "vc_reader/native/rounding.hpp"
 #include "vc_reader/native/thread_pool.hpp"
 

@@ -69,6 +69,7 @@ option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
     ON)
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+option(VC_USE_LTO "Link-time optimization in optimized builds; OFF for fast relinks while developing" ON)
 option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
@@ -392,7 +393,7 @@ if(NOT MSVC)
 endif()
 # LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
 # auto-import/export-all, and link times on the CI runners balloon.
-if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+if(VC_USE_LTO AND NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     # Host LTO on NVCC-generated objects can leave fatbinData unresolved.
     # Keep C/C++ and link-time LTO, but exclude CUDA compilation.
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${_lto}>")

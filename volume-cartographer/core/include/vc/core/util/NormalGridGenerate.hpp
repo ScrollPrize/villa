@@ -15,6 +15,7 @@
 #include <omp.h>
 #include <opencv2/core/mat.hpp>
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 
 namespace vc::core::util {
 

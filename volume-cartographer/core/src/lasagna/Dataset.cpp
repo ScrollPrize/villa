@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include "vc_reader/zarr.hpp"
 
 namespace vc::lasagna {
 namespace {

@@ -5,6 +5,7 @@
 // measurement derived from it silently becomes 0 too.
 
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
 
 #include <cmath>
 #include <functional>

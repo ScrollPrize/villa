@@ -1,4 +1,7 @@
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc_reader/native/http.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/sftp.hpp"
 
 
 #include <algorithm>
@@ -362,3 +365,11 @@ void invalidateRemoteFileCacheEntry(const RemoteFileCacheOptions& options)
 }
 
 }  // namespace vc::core::util
+
+namespace vc {
+HttpAuth loadAwsCredentials()
+{
+    const auto keys = vcr::zarr::awsCredentials();
+    return keys ? HttpAuth{keys->user, keys->secret, keys->token, keys->region} : HttpAuth{};
+}
+} // namespace vc

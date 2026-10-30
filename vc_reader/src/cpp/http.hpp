@@ -3,6 +3,7 @@
 // read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
 
+#include "reader_types.hpp"
 #include "sigv4.hpp"
 #include "vc_reader/sftp.hpp"
 
@@ -26,20 +27,6 @@
 #include <vector>
 
 namespace vcr {
-
-// How requests authenticate.
-struct Auth {
-    std::string kind;  // "" (anonymous), "basic" or "s3"
-    std::string user;  // basic: user name; s3: access key id
-    std::string secret;  // basic: password; s3: secret access key
-    std::string token;   // s3: session token (may be empty)
-    std::string region;  // s3: the bucket's region
-};
-
-// 401/403: the request was not allowed (missing, wrong or expired credentials).
-struct HttpDenied : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
 
 struct HttpOptions {
     int connections = 16;          // concurrent requests (and kept-alive connections)

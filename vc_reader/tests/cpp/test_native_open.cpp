@@ -2,6 +2,9 @@
 // attributes, group listing and saved state, and volume metadata kept once.
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr_metadata.hpp"
+#include "vc_reader/zarr_write.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>

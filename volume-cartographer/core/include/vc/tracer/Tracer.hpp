@@ -3,8 +3,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "utils/Json.hpp"
-#include "vc_reader/array.hpp"
 
+namespace vcr { class Array; }
 class SurfacePatchIndex;
 
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize = 1.0);

@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include <fstream>
 #include <random>
 #include <cstdlib>

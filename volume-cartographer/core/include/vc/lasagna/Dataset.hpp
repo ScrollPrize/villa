@@ -3,11 +3,12 @@
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <vc_reader/zarr.hpp>
-
 #include <filesystem>
 #include <string>
 #include <string_view>
+
+namespace vcr { class MemoryCache; }
+namespace vcr::zarr { struct OpenedArray; }
 
 namespace vc::lasagna {
 

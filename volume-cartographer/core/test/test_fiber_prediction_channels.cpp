@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 
 #include <array>
 #include <atomic>

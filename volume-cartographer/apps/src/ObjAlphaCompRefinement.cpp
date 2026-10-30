@@ -3,6 +3,7 @@
 
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>

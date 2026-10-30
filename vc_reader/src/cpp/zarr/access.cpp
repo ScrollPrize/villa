@@ -4,6 +4,7 @@
 #include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/native/http.hpp"
 
 #include <curl/curl.h>
 

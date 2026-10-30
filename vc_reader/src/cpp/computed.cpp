@@ -2,6 +2,7 @@
 // decoded disk-cache layout under a directory named by the computation's identity.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 
 #include <cstdio>
 #include <fstream>

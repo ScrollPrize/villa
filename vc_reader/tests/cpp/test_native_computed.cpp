@@ -6,6 +6,8 @@
 // compute every chunk on the reading thread.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr_write.hpp"
 
 #include <atomic>
 #include <chrono>

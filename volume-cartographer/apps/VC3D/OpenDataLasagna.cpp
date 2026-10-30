@@ -25,6 +25,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include "vc_reader/zarr.hpp"
 
 namespace vc3d::opendata {
 namespace {

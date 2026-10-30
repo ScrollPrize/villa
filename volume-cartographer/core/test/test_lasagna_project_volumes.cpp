@@ -6,6 +6,7 @@
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "support/TestProject.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 
 #include <array>
 #include <filesystem>

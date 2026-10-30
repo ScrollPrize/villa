@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include "vc_reader/array.hpp"
 
 namespace {
 

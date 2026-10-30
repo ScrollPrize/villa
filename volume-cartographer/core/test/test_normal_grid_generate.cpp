@@ -5,6 +5,7 @@
 #include <fstream>
 #include <random>
 #include <opencv2/core.hpp>
+#include "vc_reader/zarr_write.hpp"
 
 TEST_CASE("Native normal-grid assembly covers sparse edges and parallel read errors")
 {

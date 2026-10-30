@@ -10,6 +10,7 @@
 #include "utils/Json.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"

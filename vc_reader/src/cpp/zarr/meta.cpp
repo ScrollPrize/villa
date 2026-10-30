@@ -1,6 +1,7 @@
 // Zarr array metadata normalized for source chunks and decoded disk caches.
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 
 #include <bit>
 #include <cmath>

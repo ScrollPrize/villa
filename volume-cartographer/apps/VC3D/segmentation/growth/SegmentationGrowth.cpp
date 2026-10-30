@@ -21,6 +21,7 @@
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)

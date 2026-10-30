@@ -13,6 +13,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 
 #include <opencv2/core.hpp>
 

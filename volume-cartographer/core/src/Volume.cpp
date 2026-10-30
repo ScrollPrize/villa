@@ -30,6 +30,7 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "utils/hash.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";

@@ -1,6 +1,8 @@
 // The native opener: metadata parsing, local arrays and OME-Zarr groups, and
 // remote (sftp://) arrays with decoded and VC3D disk caches, online and offline.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr_write.hpp"
 #include "sftp_fixture.hpp"
 
 #include <algorithm>

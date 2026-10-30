@@ -8,6 +8,9 @@
 #include "vc/core/types/Volume.hpp"
 #include <vc_reader/composite.hpp>
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/zarr_metadata.hpp>
+#include <vc_reader/array.hpp>
 #include "utils/Json.hpp"
 #include <vc_reader/affine.hpp>
 

@@ -29,6 +29,7 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include "vc_reader/zarr.hpp"
 #endif
 
 namespace vc::fiber_tracer {

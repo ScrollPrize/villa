@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 #include "vc/lasagna/PredictionPooling.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 #include <fstream>
 #include <future>
 #include <random>

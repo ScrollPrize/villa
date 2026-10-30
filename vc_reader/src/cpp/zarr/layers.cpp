@@ -16,6 +16,7 @@
 // take that lock exclusively.
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 #include "files.hpp"
 
 #include <cmath>

@@ -7,6 +7,7 @@
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_write.hpp"
 #include "../src/fiber_tracer/FiberAnchorObjectives.hpp"
 #include "../src/fiber_tracer/FiberAnchorFinalEvaluation.hpp"
 

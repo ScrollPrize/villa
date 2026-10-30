@@ -7,6 +7,7 @@
 #include "utils/Json.hpp"
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 
 #include <algorithm>
 #include <array>

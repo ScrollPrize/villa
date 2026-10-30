@@ -10,6 +10,8 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr.hpp"
 
 namespace vc::lasagna {
 namespace {

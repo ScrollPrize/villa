@@ -3,6 +3,7 @@
 #include "cuda_available.hpp"
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
 #include "output_pool.hpp"
 
 #include <nanobind/nanobind.h>

@@ -2,6 +2,7 @@
 // about it once the Open Data catalog is merged in.
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
 
 #include <algorithm>
 #include <cctype>

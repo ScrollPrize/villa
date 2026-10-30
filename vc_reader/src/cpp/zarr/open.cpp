@@ -1,5 +1,7 @@
 // Zarr v2/v3 arrays and groups opened for reading, with their disk-cache layers.
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/zarr_metadata.hpp"
+#include "vc_reader/array.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -281,6 +283,11 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     out.array = std::make_unique<Array>(std::move(spec), options.memoryCache);
     return out;
 }
+
+OpenedArray::OpenedArray() = default;
+OpenedArray::~OpenedArray() = default;
+OpenedArray::OpenedArray(OpenedArray&&) noexcept = default;
+OpenedArray& OpenedArray::operator=(OpenedArray&&) noexcept = default;
 
 void OpenedArray::close()
 {

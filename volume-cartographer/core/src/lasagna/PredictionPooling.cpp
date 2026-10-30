@@ -15,6 +15,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include "vc_reader/zarr.hpp"
 
 #ifdef VC_POOLING_LAPACK
 extern "C" void dsyevd_(const char*,const char*,const int*,double*,const int*,double*,double*,const int*,int*,const int*,int*,size_t,size_t);

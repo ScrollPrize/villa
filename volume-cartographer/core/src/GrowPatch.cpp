@@ -42,6 +42,7 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
+#include "vc_reader/array.hpp"
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2

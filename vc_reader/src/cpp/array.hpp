@@ -200,11 +200,6 @@ LocalOrigin localOrigin(const T* origin, const std::optional<Index>& coordinateO
     return out;
 }
 
-// A chunk an offline read needs is in none of the disk layers.
-struct CacheMiss : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 // Linear chunk index -> dense id, for grouping point reads by chunk (open addressing).
 class ChunkIds {
 public:

@@ -4,6 +4,7 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/array.hpp>
 
 #include <atomic>
 #include <exception>

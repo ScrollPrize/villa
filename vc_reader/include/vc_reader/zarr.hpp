@@ -2,15 +2,12 @@
 // Opening Zarr v2/v3 arrays and groups, local or remote (http(s)://, s3://,
 // sftp://), with the disk caches other tools already wrote: vc_reader/vesuvius
 // decoded caches and VC3D mirror and Delta3D caches. The same implementation
-// backs the Python reader.
+// backs the Python reader. Reading an opened array needs vc_reader/array.hpp, writing
+// vc_reader/zarr_write.hpp and a volume's metadata vc_reader/zarr_metadata.hpp.
 
-#include "vc_reader/native/array.hpp"
-#include "vc_reader/native/disk_cache.hpp"
-#include "vc_reader/native/element_type.hpp"
-#include "vc_reader/native/http.hpp"
 #include "vc_reader/native/memory_cache.hpp"
-
-#include <nlohmann/json.hpp>
+#include "vc_reader/native/reader_types.hpp"
+#include "vc_reader/zarr_array_meta.hpp"
 
 #include <array>
 #include <cstdint>
@@ -25,8 +22,13 @@
 #include <utility>
 #include <vector>
 
+namespace vcr {
+class Array;
+class DiskCache;
+struct LayerSpec;
+}  // namespace vcr
+
 namespace vcr::zarr {
-using Json = nlohmann::json;
 
 // There is no Zarr array or group at a location.
 struct NotFound : std::runtime_error {
@@ -37,40 +39,6 @@ struct NotFound : std::runtime_error {
 bool isRemote(const std::string& location);
 // The https:// URL of an s3:// location (public buckets only), otherwise unchanged.
 std::string httpUrl(const std::string& location);
-
-// ---- metadata ------------------------------------------------------------------------
-
-struct ArrayMeta {
-    Index shape, chunks;
-    std::string dtype;               // numpy typestr, e.g. "|u1", "<u2", "<f4"
-    ElementType type;                // how stored elements read as numbers
-    std::vector<std::uint8_t> fill;  // one element, in stored byte order
-    std::string separator = ".";
-    Json compressor;                 // v2 compressor object, or null
-    Json filters;                    // v2 filters, or null
-    std::string order = "C";
-    struct V3 {
-        std::string prefix;          // chunk key prefix ("c/" or "c.")
-        Index shards;                // chunks per shard along each axis; empty when unsharded
-        bool indexEnd = true, indexCrc = false;
-        Json metadata;               // the zarr.json as stored
-    };
-    std::optional<V3> v3;
-    Json raw;                        // the metadata as a v2 .zarray
-
-    std::size_t itemsize() const { return type.itemsize; }
-    // The reader's codec id ("" uncompressed); throws when the chunks cannot be decoded.
-    std::string codec() const;
-    std::size_t chunkBytes() const;
-    // .zarray of the same array stored uncompressed (the decoded-cache layout).
-    Json decodedZarray() const;
-    // .zarray of the decoded chunks stored with lossless Delta3D (as VC3D writes them).
-    Json delta3dZarray() const;
-};
-
-// Parses a .zarray or v3 zarr.json. Throws for unsupported layouts and dtypes;
-// whether the chunks can be decoded is checked by codec().
-ArrayMeta parseArrayMeta(const Json& metadata);
 
 // ---- access --------------------------------------------------------------------------
 
@@ -245,6 +213,11 @@ struct OpenedArray {
     std::vector<std::string> busy;  // VC3D caches skipped: another process is replacing them
     bool attributesRead = false;    // `attributes` holds what the array's .zattrs say
 
+    OpenedArray();
+    ~OpenedArray();
+    OpenedArray(OpenedArray&&) noexcept;
+    OpenedArray& operator=(OpenedArray&&) noexcept;
+
     // Finishes queued cache writes and releases VC3D's leases. Reads must have ended.
     void close();
 };
@@ -333,149 +306,5 @@ private:
     std::shared_ptr<const StoreMetadata> metadata_;
     std::shared_ptr<std::recursive_mutex> mutex_ = std::make_shared<std::recursive_mutex>();  // lookups may come from any thread
 };
-
-// ---- writing --------------------------------------------------------------------------
-
-struct CreateOptions {
-    Index shape, chunks;
-    std::string dtype = "|u1";       // numpy typestr: |u1, <u2, <f4, ...
-    std::string compressor = "blosc";  // "" or "none", blosc, zstd, zlib, gzip, lz4, vc-delta3d, volcomp
-    // blosc clevel, zstd/zlib/gzip level, lz4 acceleration; volcomp's quantiser step q
-    // (0 lossless). Values <= 0 choose the codec default (blosc 3, zstd 3, volcomp q 8).
-    int level = -1;
-    std::string separator = ".";
-    Json fillValue = 0;
-    int version = 2;               // Zarr format 2 or 3
-    Index shardShape;               // v3 outer shape in elements; empty: unsharded
-    bool shardIndexEnd = true, shardIndexCrc = true;
-};
-
-// A local Zarr v2/v3 array opened for writing. Chunk files are replaced atomically,
-// so readers never see a partial chunk. Thread-safe for distinct chunks in one
-// process, including chunks sharing a shard. Separate processes must coordinate
-// updates to the same shard. Partial writes to the same chunk require coordination.
-class Writer {
-public:
-    // Writes array metadata and a matching parent group marker when absent.
-    // Refuses to replace a node of a different Zarr format.
-    static Writer create(const std::filesystem::path& path, const CreateOptions& options);
-    // An existing local array.
-    static Writer open(const std::filesystem::path& path);
-    Writer(Writer&&) noexcept;
-    Writer& operator=(Writer&&) noexcept;
-    ~Writer();
-
-    const ArrayMeta& meta() const;
-    const std::filesystem::path& path() const;
-    // Reads the stored array (no memory cache: always what is on disk).
-    Array& reader();
-
-    // Change the fill used for absent chunks, preserving stored chunks and all
-    // other metadata. Invalidates references returned by reader(); separately
-    // opened arrays must be reopened. Call only with no concurrent writer users.
-    void setFillValue(const Json& value);
-
-    // The containing file (a shard for sharded arrays). chunkExists tests the
-    // individual chunk's index entry, not merely the presence of this file.
-    std::filesystem::path chunkPath(const Index& chunk) const;
-    bool chunkExists(const Index& chunk) const;
-    // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.
-    void writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size);
-    // Skips a chunk that is entirely the fill value, removing any stored one.
-    // Returns whether the chunk was written.
-    bool writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size);
-    bool removeChunk(const Index& chunk);
-    // Writes a C-order region; chunks it covers partially are read, patched and
-    // rewritten. The region must lie inside the array.
-    void writeRegion(const Index& start, const Index& shape, const std::uint8_t* data);
-
-private:
-    struct Impl;
-    explicit Writer(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
-};
-
-// Attributes of a local v2/v3 group or array (an empty object when absent).
-Json readAttributes(const std::filesystem::path& node);
-void writeAttributes(const std::filesystem::path& node, const Json& attributes);
-
-// ---- store metadata -------------------------------------------------------------------
-
-// Micrometers per voxel of level 0, from a store's sidecar document (meta.json or
-// metadata.json, as published). By exact path, since these documents also record
-// unrelated scales. In order: a top-level voxelsize (or voxel_size_um, voxelSizeUm,
-// pixel_size_um, pixelSizeUm, resolution_um); scan.voxelsize; the acquisition record
-// [scan.]tomo.acquisition.detector.samplePixelSize (millimeters); and for a derived
-// store that record under source.metadata scaled by 2^source.resolution, which is then
-// required. Only positive finite numbers count.
-std::optional<double> voxelSizeUm(const Json& document);
-
-// What a store's sidecar documents say about its volume, each field from the first
-// document stating it (meta.json before metadata.json).
-struct StoreMetadata {
-    std::optional<double> voxelSizeUm;         // level 0, see voxelSizeUm()
-    std::optional<double> energyKeV;           // acquisition.energy
-    std::optional<double> detectorDistanceMm;  // acquisition.sampleDetectorDistance
-    std::string beamline, scanName, acquisitionDate;  // beamline, scanRadix or scan_name, date
-    // zarr_export: the source values the stored range spans, and the Z range kept.
-    std::optional<std::array<double, 2>> valueWindow;
-    std::optional<std::array<std::int64_t, 2>> zCrop;
-    std::string sampleId, volumeId, scanId, name, createdAt, dataFormat;  // from the Open Data catalog
-    Json documents = Json::object();  // file name (.zattrs too) or "catalog" -> the document as published
-};
-// The metadata of the store at `location` (or a numbered level of one). A missing,
-// unreadable or malformed document does not end the search; this never throws. The
-// default reader reads local stores and anonymous remote ones.
-StoreMetadata storeMetadata(const std::string& location, const MetadataReader& read = {});
-inline std::optional<double> storeVoxelSizeUm(const std::string& location, const MetadataReader& read = {})
-{
-    return storeMetadata(location, read).voxelSizeUm;
-}
-// Everything known about the volume at `location`: its sidecar documents and, for a store
-// in a public channel, the Open Data catalog, one value per field with the store's
-// documents winning. A remote store's result is gathered only the first time: it is kept
-// with the volume in the disk caches (and for this process), and a kept copy is trusted
-// like a chunk. A local store's documents are read at each call. `refresh` reads both
-// sources as published now and replaces what was kept; if a source cannot be read, nothing
-// kept changes and the kept metadata is returned when there is one.
-StoreMetadata volumeMetadata(const std::string& location, const OpenOptions& options, bool refresh = false);
-// Drops what this process remembers (not what is kept on disk).
-void forgetVolumeMetadata();
-Json storeMetadataJson(const StoreMetadata& metadata);
-StoreMetadata storeMetadataFromJson(const Json& json);
-
-// ---- writing pyramids -----------------------------------------------------------------
-
-// Numbered levels <root>/0, /1, ...: each level is the block mean of the level below,
-// reduced by `factors` (ZYX) per level.
-struct PyramidOptions {
-    int levels = 5;  // levels above level 0
-    std::array<int, 3> factors{2, 2, 2};
-    std::size_t threads = 0;  // output-chunk workers; 0: all cores
-};
-// Creates the arrays of levels 1..levels (metadata only) to go with a level 0 created
-// from `level0`: the same dtype, codec and chunks, chunks capped to each level's shape.
-void createPyramidLevels(const std::filesystem::path& root, const CreateOptions& level0, const PyramidOptions& options);
-// Output chunks [begin, end), clamped to the level's chunk grid.
-struct ChunkRange {
-    Index begin, end;
-};
-// Writes `level` from level - 1 on disk (uint8, uint16, float32). Chunks that come out
-// entirely fill are not stored. Separate processes may write disjoint ranges. Integer
-// means round to nearest, ties to even. `progress(done, total)` may run on any worker.
-void writePyramidLevel(const std::filesystem::path& root, int level, const PyramidOptions& options,
-                       const std::optional<ChunkRange>& range = std::nullopt,
-                       const std::function<void(std::size_t, std::size_t)>& progress = {});
-
-struct MultiscalesOptions {
-    std::string name = "image";
-    int levels = 5;  // levels above level 0
-    std::array<int, 3> factors{2, 2, 2};
-    std::array<double, 3> scale{1, 1, 1};  // level 0's voxel size per axis (ZYX); level factors without a unit
-    std::string unit;                      // axis unit of a physical scale; empty declares none
-};
-// One OME-NGFF 0.4 "multiscales" entry for such a pyramid, with each level's scale and
-// the translation that centres its voxels on the blocks they reduce.
-Json omeMultiscales(const MultiscalesOptions& options);
 
 }  // namespace vcr::zarr

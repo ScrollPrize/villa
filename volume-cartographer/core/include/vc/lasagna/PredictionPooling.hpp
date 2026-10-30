@@ -1,8 +1,9 @@
 #pragma once
-#include <vc_reader/zarr.hpp>
-
 #include <filesystem>
 #include <memory>
+
+namespace vcr { class MemoryCache; }
+namespace vcr::zarr { struct OpenedArray; }
 
 namespace vc::lasagna {
 // The pooled view of a local fiber prediction store: a directory holding the

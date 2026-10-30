@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include "vc_reader/zarr.hpp"
 
 namespace fs = std::filesystem;
 

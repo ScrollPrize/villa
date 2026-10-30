@@ -19,6 +19,8 @@
 #include <boost/program_options.hpp>
 #include "utils/Json.hpp"
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/array.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 

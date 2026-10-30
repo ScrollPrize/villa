@@ -7,6 +7,7 @@
 #include "vc/lasagna/LineOptimizer.hpp"
 
 #include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 
 #include <array>
 #include <cstddef>
