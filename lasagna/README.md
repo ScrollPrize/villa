@@ -48,6 +48,10 @@ modules; direct and managed inference do not require `PYTHONPATH`.
 
 ### Inference manager
 
+For Qualzz AFV V2 models and plain V/H probability Zarr output, see
+[Qualzz AFV inference](docs/qualzz_afv_inference.md). This uses the same tiled
+engine and GPU manager without writing Lasagna-schema metadata.
+
 `las_manager` provides configuration, discovery, prefetch, and durable tmux
 execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
 in `cache_dir`, `output_dir`, `venv`, and one or more `snapshot_dirs`, then:
@@ -82,13 +86,46 @@ printed run directory's `run.log`. Passing `--no-prefetch` writes only the
 source descriptor and lets the inference backend download missing chunks on
 demand for its crop; this download belongs to the inference lifecycle.
 
+### Cooperative full-volume GPUs
+
+`las_manager` inference jobs automatically use the local cooperative GPU manager
+(`incremental_release` capability required). Prefetch does not reserve GPUs.
+The GPU phase uses one tile per forward pass and varies the **number of GPUs**,
+not batch size or tile geometry. `--devices` limits the eligible devices; it is
+not itself a reservation. CUDA ordinals are resolved to UUIDs before requesting
+resources. An older manager fails capability negotiation; it is never bypassed
+or restarted behind existing clients' backs.
+
+CPU readers, caches, bounded queues, accumulators and output state persist when
+the allocation changes. Removed GPU workers finish submitted tiles, return their
+results and exit before release is acknowledged. Retained workers stay loaded;
+only newly granted GPUs load a model. Full pause unloads all GPU workers; work
+continues automatically after a new grant. Pyramid generation runs after GPU
+workers have exited and release has been reported. A manager restart still
+requires a GPU-only drain; the CPU pipeline remains intact. Communication errors
+are logged and stop new tile admission, drain GPU workers and retry every five
+seconds. No full-volume rescan is needed for these transitions.
+
+Until a one-tile peak is measured, the conservative default requests a full
+selected GPU's memory (the largest selected capacity on heterogeneous hosts).
+To share GPUs, pass a **measured budget including CUDA overhead and reserve**
+through `LASAGNA_GPU_MEMORY_GIB`, for example `46` only if that budget has been
+verified for the chosen model/tile size. `LASAGNA_GPU_PRIORITY` defaults to `0`;
+`VILLA_GPU_MANAGER_SOCKET` optionally selects a socket. These variables are
+inherited by the inference runner. The worker limits Torch's allocator to the
+grant minus 1 GiB reserved for non-allocator CUDA use; this is not a memory
+calibration and an undersized user budget may still fail with OOM. Normalization
+calibration must be performed separately, not inside cooperative inference.
+Direct API/CLI callers can opt into the same behavior with `LASAGNA_COOPERATIVE=1`;
+the manager launcher always sets it for volume inference, not Fiberlet jobs.
+
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:
 
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
   --input /path/to/volume.ome.zarr/1 \
-  --output /path/to/artifacts/fiber.lasagna.json \
+  --output /path/to/artifacts/fiber.zarr \
   --checkpoint /path/to/snapshots/best.pt
 ```
 
@@ -105,8 +142,19 @@ las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices 
 ```
 
 The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
-and managed Lasagna inference write portable provenance and remain compatible
-with the existing Atlas `lasagna` artifact type.
+and managed Lasagna inference write portable provenance.
+
+New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
+one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
+Existing sidecar outputs remain resumable. Fiber additionally defaults to
+blanking auxiliary channels at zero presence and rounding/clamping width to
+uint8 base-volume voxels; `--no-blank-invalid` and `--no-width-uint8-base`
+disable those changes independently.
+
+Atlas/catalogue publication and manager Fiberlet discovery still require
+legacy output until their v3 integration is available. For those workflows,
+append `-- --output-format legacy` to the manager command. Direct inference
+uses `--output-format legacy --output /path/to/fiber.lasagna.json`.
 
 Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
 same as `las_manager snapshot ls`. Install path-aware Bash completion once with
@@ -126,7 +174,8 @@ Atlas/local normal overrides and compatibility rules.
 This installation currently expects the `villa` monorepo layout: Lasagna
 packages the sibling `vesuvius/src` implementation, installs its declared
 model dependencies, and installs the sibling Volume Cartographer Python
-distribution with its `vc_fiberlets` command. Copying only the `lasagna/`
+distribution with its `vc_fiberlets` command and the sibling `vc_object_store`
+Python package, through which surfaces are exchanged. Copying only the `lasagna/`
 directory is therefore not yet a supported standalone installation. On Linux,
 the bootstrap selects an available GCC 13 or newer for that C++23 build unless
 `CC` or `CXX` is already set.

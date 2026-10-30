@@ -54,14 +54,6 @@ inline std::optional<PclRole> pclRoleFromName(const QString& name)
     return std::nullopt;
 }
 
-// Conventional dataset file the service commits this role into.
-inline QString pclRoleFileName(PclRole role)
-{
-    return role == PclRole::Relative
-        ? QStringLiteral("relative_windings.json")
-        : QStringLiteral("same_windings.json");
-}
-
 // /session/status key carrying the role's display artifact reference.
 inline QString pclRoleStatusKey(PclRole role)
 {

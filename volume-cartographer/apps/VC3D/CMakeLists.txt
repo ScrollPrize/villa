@@ -16,26 +16,24 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     FiberCollectionController.cpp
+    SurfaceCatalog.cpp
+    SurfaceCatalog.hpp
     FiberCollectionController.hpp
+    FiberDisplayOptions.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
-    RenderBenchRecorder.cpp
-    RenderBenchRecorder.hpp
-    RenderBenchReplay.cpp
-    RenderBenchReplay.hpp
     FileWatcherService.cpp
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
-    LineAnnotationFiberClassification.hpp
     LineAnnotationFiberDeletion.hpp
-    LineAnnotationFiberSaveJob.cpp
-    LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
+    ProjectWorkspace.cpp
+    ProjectWorkspace.hpp
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
@@ -45,13 +43,12 @@ set(srcs
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
+    FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp
-    FiberSliceGeometry.cpp
-    FiberSliceGeometry.hpp
-    AnnotationFrame.hpp
-    UmbilicusOrientationFreshness.hpp
+    FiberLineGeometry.cpp
+    FiberLineGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
@@ -75,17 +72,8 @@ set(srcs
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
     OpenDataNormalGrids.hpp
-    OpenDataSegmentCache.cpp
-    OpenDataSegmentCache.hpp
-    OpenDataSegmentCacheIO.cpp
-    OpenDataSegmentCacheIO.hpp
-    SurfaceAffineTransformController.cpp
-    SurfaceAffineTransformController.hpp
-    SurfaceAreaCalculator.cpp
-    SurfaceAreaCalculator.hpp
-    AtlasControlPointsDock.cpp
-    AtlasControlPointsDock.hpp
-    AtlasControlPointsTypes.hpp
+    VolumeRegistrations.cpp
+    VolumeRegistrations.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp
@@ -93,8 +81,6 @@ set(srcs
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.hpp
     volume_viewers/CVolumeViewerView.cpp
-    VolumeViewerCmaps.cpp
-    VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
     WindowRangeWidget.hpp
     WrapAnnotationWidget.cpp
@@ -117,6 +103,7 @@ set(srcs
     elements/ViewerStatsBar.hpp
     elements/DownloadQueueStats.cpp
     elements/DownloadQueueStats.hpp
+    elements/GrowOnlyLabel.hpp
     elements/DownloadQueueDebugOverlay.cpp
     elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
@@ -124,8 +111,6 @@ set(srcs
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
-    SurfaceDisplayName.hpp
-    SurfaceTimestamp.hpp
     SeedingBatchTracker.cpp
     SeedingBatchTracker.hpp
     SeedingWidget.cpp
@@ -143,8 +128,6 @@ set(srcs
     segmentation/panels/SegmentationCorrectionsPanel.hpp
     segmentation/panels/SegmentationCustomParamsPanel.cpp
     segmentation/panels/SegmentationCustomParamsPanel.hpp
-    segmentation/panels/SegmentationApprovalMaskPanel.cpp
-    segmentation/panels/SegmentationApprovalMaskPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
@@ -156,25 +139,22 @@ set(srcs
     segmentation/growth/SegmentationGrower.hpp
     segmentation/tools/SegmentationEditManager.cpp
     segmentation/tools/SegmentationEditManager.hpp
-    segmentation/tools/ApprovalMaskBrushTool.cpp
-    segmentation/tools/ApprovalMaskBrushTool.hpp
     segmentation/tools/SurfaceMaskBrushTool.cpp
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
-    segmentation/tools/SegmentationLineTool.cpp
-    segmentation/tools/SegmentationLineTool.hpp
     segmentation/tools/SegmentationPushPullTool.cpp
     segmentation/tools/SegmentationPushPullTool.hpp
     segmentation/tools/SegmentationTool.hpp
-    segmentation/tools/SegmentationBrushTool.cpp
-    segmentation/tools/SegmentationBrushTool.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
     overlays/SegmentationOverlayController.cpp
+    overlays/StoreSurfaceOverlayController.cpp
+    overlays/StoreSurfaceOverlayController.hpp
+    SurfaceIntersectionStyle.hpp
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
     overlays/PointsOverlayController.hpp
@@ -191,14 +171,6 @@ set(srcs
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
     overlays/SurfaceRotationTransform.hpp
-    overlays/AtlasOverlayController.cpp
-    overlays/AtlasOverlayController.hpp
-    overlays/AtlasControlPointsOverlayController.cpp
-    overlays/AtlasControlPointsOverlayController.hpp
-    overlays/FiberSliceOverlayController.cpp
-    overlays/FiberSliceOverlayController.hpp
-    overlays/FiberOverlayController.cpp
-    overlays/FiberOverlayController.hpp
     overlays/OverlayBatchItem.cpp
     overlays/OverlayBatchItem.hpp
     overlays/ScreenSpacePointIndex.hpp
@@ -214,11 +186,17 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    SshPrompts.cpp
+    SshPrompts.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
+    segmentation/SurfaceStoreEdit.cpp
+    segmentation/SurfaceCorrections.cpp
+    segmentation/SurfaceCorrections.hpp
+    segmentation/SurfaceStoreEdit.hpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp
     segmentation/growth/SegmentationCorrections.hpp
@@ -276,16 +254,20 @@ set(srcs
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
-    viewer_controls/panels/ViewerTransformsPanel.cpp
-    viewer_controls/panels/ViewerTransformsPanel.hpp
+    viewer_controls/panels/VolumeRegistrationsPanel.cpp
+    viewer_controls/panels/VolumeRegistrationsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp
     viewer_controls/panels/ViewerViewExtrasPanel.hpp
-    SegmentRenderThread.cpp
-    SegmentRenderThread.hpp
     elements/ProgressUtil.cpp
     elements/ProgressUtil.hpp
     CommandLineToolRunner.cpp
     CommandLineToolRunner.hpp
+    ToolExecutable.cpp
+    ToolExecutable.hpp
+    ToolProcess.cpp
+    ToolProcess.hpp
+    PointCollectionSync.cpp
+    PointCollectionSync.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp
@@ -293,14 +275,10 @@ set(srcs
     CPointCollectionWidget.cpp
     CFiberWidget.cpp
     CFiberWidget.hpp
-    FiberAnnotationController.cpp
-    FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
-    volume_viewers/IntersectionLayerItem.cpp
-    volume_viewers/IntersectionLayerItem.hpp
     volume_viewers/CameraGizmoWidget.cpp
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp
@@ -309,7 +287,6 @@ set(srcs
     agent_bridge/AgentBridgeServer.hpp
     agent_bridge/AgentBridgeMethod.cpp
     agent_bridge/AgentBridgeMethod.hpp
-    agent_bridge/AgentBridgeMethods_atlas.cpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
     agent_bridge/AgentBridgeMethods_editing.cpp
     agent_bridge/AgentBridgeMethods_fiber.cpp
@@ -329,7 +306,6 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
-    agent_bridge/AgentBridgeHandlers_atlas.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
     agent_bridge/AgentBridgeHandlers_seeding.cpp
     agent_bridge/AgentBridgeHandlers_lasagna.cpp
@@ -358,8 +334,6 @@ target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
-        ${CMAKE_SOURCE_DIR}/libs/edt
-        ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
 )
 
@@ -386,12 +360,11 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
-    vc_fiber_collection
-    vc_atlas
+    vc_object_store::vc_object_geometry
+    vc_fiber_view
     vc_lasagna
     vc_fiber_tracer
     vc_tracer
-    vc_flattening
     Ceres::ceres
     Qt6::Core
     Qt6::Concurrent
@@ -481,4 +454,10 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
         FILES_MATCHING
             PATTERN "*.py"
             PATTERN "__pycache__" EXCLUDE)
+endif()
+
+if(VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    # The in-binary store tests build their fixture volumes with core/test/support.
+    target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
 endif()

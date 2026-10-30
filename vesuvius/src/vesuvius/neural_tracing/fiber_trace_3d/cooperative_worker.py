@@ -1,11 +1,12 @@
-"""Cancellable worker views over the persistent CPU sample owner.
+"""Fiber adapter for the reusable process-cohort lifecycle.
 
-Extracted transport only: no model, manager registration or cohort launcher.
-Closing a worker view never closes the shared loading pool.
+Imported in an authorized GPU worker, not in the resource-manager server.
+Uses the ordinary trainer's unit iterator; no second implementation of losses,
+optimization, tests or snapshots lives here.
 """
 
-import os
 from dataclasses import dataclass
+import os
 import queue
 import threading
 
@@ -30,11 +31,11 @@ class QueueBatchSource:
             raise RuntimeError("managed evaluation requires the shared sample broker")
         return _QueueTestBatches(self, step, global_batch_indices, batch_size, start_sample_index, sample_count)
 
-    def _test_boundary(self, kind, step):
+    def _test_boundary(self, kind, step, details=()):
         connection = self.test_connection
         if connection is None:
             raise RuntimeError("managed tests require shared sample phase coordination")
-        connection.send((kind, step, ()))
+        connection.send((kind, step, details))
         while not connection.poll(0.1):
             if self.stopped.is_set():
                 raise RuntimeError("sample source closed during test phase transition")
@@ -48,6 +49,9 @@ class QueueBatchSource:
 
     def end_test(self, step):
         self._test_boundary("end-test", step)
+
+    def select_test_source(self, step, source):
+        self._test_boundary("select-test", step, (source,))
 
     def __iter__(self):
         return self
@@ -142,6 +146,7 @@ class FiberWorkerFactory:
     calibrated_torch_versions: tuple = ()
     calibrated_cuda_versions: tuple = ()
     test_connections: tuple = ()
+    trace_connections: tuple = ()
     measure_startup_memory: bool = False
     dataset_metadata: object = None
 
@@ -181,7 +186,8 @@ class FiberTrainingWorker:
         from .train import training_units
         from .cooperative_resources import EffectiveBatchSampleIndex
         index_map = EffectiveBatchSampleIndex(factory.effective_batch_size, factory.microbatch_sizes,
-                                              rank, factory.start_step)
+                                              rank, factory.start_step,
+                                              2 if raw.get("embedding", {}).get("paired_patches", False) else 1)
         self.source = QueueBatchSource(factory.queues[rank], factory.received[rank], factory.owner_pid, index_map,
                                        factory.test_connections[rank] if factory.test_connections else None)
         self.units = training_units(
@@ -192,6 +198,8 @@ class FiberTrainingWorker:
             distributed_init_method=factory.rendezvous,
             training_overrides=factory.training_overrides,
             yield_initialized=True,
+            enable_reviewed_trace=not factory.measure_startup_memory,
+            on_model_ready=lambda model: setattr(self, "model", model),
             on_failure=lambda detail: self._error_reporter(detail) if hasattr(self, "_error_reporter") else None,
         )
         self.boundary = next(self.units)
@@ -227,6 +235,17 @@ class FiberTrainingWorker:
                 faulthandler.cancel_dump_traceback_later()
 
     def _run_unit(self):
+        connection = self.factory.trace_connections[self.rank] if self.factory.trace_connections else None
+        if connection is not None and connection.poll():
+            from .resident_trace import serve_resident
+            kind = connection.recv()
+            if kind != "trace":
+                raise RuntimeError(f"invalid resident trace command: {kind}")
+            arguments = connection.recv()
+            serve_resident(connection, self.model, self.rank, arguments)
+            self._check_memory()
+            return {"step": self.boundary.step, "done": False,
+                    "phase": "reviewed_trace_complete", "samples_seen": self.boundary.samples_seen}
         if not self.boundary.done:
             try:
                 self.boundary = next(self.units)
@@ -242,6 +261,8 @@ class FiberTrainingWorker:
                 raise
         self._check_memory()
         row = {"step": self.boundary.step, "done": self.boundary.done, "phase": self.boundary.phase}
+        if self.boundary.samples_seen is not None:
+            row["samples_seen"] = self.boundary.samples_seen
         if self.factory.measure_startup_memory:
             import torch
             torch.cuda.synchronize(0)

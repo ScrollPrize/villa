@@ -152,7 +152,11 @@ def _downsample_chunk_worker(args: Tuple) -> str:
             input_chunk = np.pad(input_chunk, ((0, pad_z), (0, pad_y), (0, pad_x)), mode='edge')
             sz, sy, sx = input_chunk.shape
 
-        downsampled = input_chunk.reshape(sz // 2, 2, sy // 2, 2, sx // 2, 2).mean(axis=(1, 3, 5)).astype(input_chunk.dtype)
+        mean = input_chunk.reshape(sz // 2, 2, sy // 2, 2, sx // 2, 2).mean(axis=(1, 3, 5))
+        if np.issubdtype(input_chunk.dtype, np.integer):
+            # Round, don't truncate: a plain cast drops ~0.44 levels per pyramid level.
+            np.rint(mean, out=mean)
+        downsampled = mean.astype(input_chunk.dtype)
 
     # Ensure correct output size (handle edge cases)
     if downsampled.shape != (out_z, out_y, out_x):

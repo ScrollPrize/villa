@@ -33,10 +33,6 @@ QCheckBox* DropdownChecklistButton::addOption(const QString& text,
     action->setDefaultWidget(checkBox);
     dropdownMenu->addAction(action);
 
-    connect(checkBox, &QCheckBox::toggled, this, [this, checkBox](bool state) {
-        emit optionToggled(checkBox, state);
-    });
-
     _options.append(checkBox);
     return checkBox;
 }
@@ -54,15 +50,4 @@ void DropdownChecklistButton::clearOptions()
         dropdownMenu->clear();
     }
     _options.clear();
-}
-
-int DropdownChecklistButton::checkedCount() const
-{
-    int count = 0;
-    for (auto* option : _options) {
-        if (option && option->isChecked()) {
-            ++count;
-        }
-    }
-    return count;
 }

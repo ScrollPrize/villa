@@ -1,4 +1,5 @@
 #include "imports/SourceRelationships.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/Dependencies.hpp"
 #include "imports/SourceIdentityIndex.hpp"
@@ -10,12 +11,13 @@ namespace {
 using Json = nlohmann::json;
 struct Points {
     std::vector<double> xyz;
+    std::vector<int64_t> ids;
     Anchor anchor(int64_t index) const {
         const auto offset = index;
         if (offset < 0 || static_cast<size_t>(offset) >= xyz.size() / 3)
             throw std::runtime_error("source branch control point index out of range");
         Anchor result;
-        result.points.push_back({"control_points", {index}});
+        result.points.push_back({"control_point_ids", {ids.at(index)}});
         result.position = {xyz[3*offset], xyz[3*offset+1], xyz[3*offset+2]};
         return result;
     }
@@ -36,7 +38,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
             throw std::runtime_error("source relationship endpoint needs stored fiber geometry: " + id);
         GeometrySnapshot snapshot; snapshot.revision = *revision;
         snapshot.arrays["control_points"] = db.readGeometryArray(txn, revision->uuid, "control_points");
-        Points p; p.xyz = snapshot.values<double>("control_points");
+        snapshot.arrays["control_point_ids"] = db.readGeometryArray(txn, revision->uuid, "control_point_ids");
+        Points p; p.xyz = snapshot.values<double>("control_points"); p.ids = snapshot.values<int64_t>("control_point_ids");
         return points.emplace(id, std::move(p)).first->second;
     };
     int64_t inserted = 0;
@@ -52,40 +55,36 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                     Json::parse(current.meta).value("adjacent", false) != Json::parse(edge.meta).value("adjacent", false))
                     throw std::runtime_error("conflicting ordinary/adjacent fiber branch declarations: " +
                                              edge.aUuid + " <-> " + edge.bUuid);
+                if (edge.kind == "fiber_branch" &&
+                    ((!edge.uuid.empty() && edge.uuid != current.uuid) || edge.approvalState != current.approvalState ||
+                     Json::parse(current.meta).value("auto", false) != Json::parse(edge.meta).value("auto", false) ||
+                     (forward ? current.aAnchor.direction != edge.aAnchor.direction || current.bAnchor.direction != edge.bAnchor.direction
+                              : current.bAnchor.direction != edge.aAnchor.direction || current.aAnchor.direction != edge.bAnchor.direction)))
+                    throw std::runtime_error("conflicting reciprocal fiber branch declarations");
                 return; // Consistent reciprocal declarations represent one edge.
             }
         }
-        db.addEdge(txn, edge); ++inserted;
+        const auto uuid = db.addEdge(txn, edge);
+        if (edge.approvalState != "pending") db.setApproval(txn, uuid, edge.approvalState);
+        ++inserted;
     };
-    // Resolve source filenames only during ingestion; stored edges always use UUIDs.
-    std::map<std::string, std::set<std::string>> fiberNames;
-    if (std::any_of(sources.begin(),sources.end(),[](const auto& s) { return s.object.kind=="fiber"; }))
-    for (const auto& object : db.objectsByKind(txn, "fiber")) {
-        fiberNames[std::filesystem::path(object.storageRef).filename().string()].insert(object.uuid);
-        fiberNames[object.name + ".json"].insert(object.uuid);
-    }
-    for (const auto& entry : sources)
-        if (entry.object.kind == "fiber")
-            fiberNames[std::filesystem::path(entry.object.storageRef).filename().string()].insert(entry.object.uuid);
     for (const auto& entry : sources) {
         if (entry.object.kind != "fiber") continue;
         for (const auto* key : {"branches", "adjacent_branches"}) {
             for (const auto& branch : entry.source.value(key, Json::array())) {
-                auto target = branch.value("target_uuid", std::string());
-                if (target.empty()) {
-                    const auto file = std::filesystem::path(branch.at("branch_file").get<std::string>()).filename().string();
-                    const auto found = fiberNames.find(file);
-                    if (found == fiberNames.end() || found->second.size() != 1)
-                        throw std::runtime_error("missing or ambiguous branch target: " + file + "; ingest connected fibers together or supply target_uuid");
-                    target = *found->second.begin();
-                }
+                const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
                 EdgeRecord edge; edge.kind = "fiber_branch";
+                if (branch.contains("edge_uuid")) edge.uuid = util::canonicalUuid(branch.at("edge_uuid").get<std::string>());
+                edge.approvalState = branch.value("pending", false) ? "pending" : "approved";
                 edge.aUuid = entry.object.uuid; edge.bUuid = target;
                 edge.aAnchor = load(edge.aUuid).anchor(branch.at("control_point_index").get<int64_t>());
                 edge.bAnchor = load(edge.bUuid).anchor(branch.at("branch_control_point_index").get<int64_t>());
                 for (auto [anchor, field] : {std::pair{&edge.aAnchor, "control_point_direction"}, {&edge.bAnchor, "branch_control_point_direction"}})
                     if (branch.contains(field)) anchor->direction = branch.at(field).get<std::array<double, 3>>();
-                edge.meta = Json{{"source_import", "object-source"}, {"adjacent", std::string(key) == "adjacent_branches"}}.dump();
+                const bool adjacent = std::string(key) == "adjacent_branches";
+                auto meta = Json{{"source_import", "object-source"}, {"adjacent", adjacent}};
+                if (edge.approvalState == "pending" && !adjacent && branch.value("auto", false)) meta["auto"] = true;
+                edge.meta = meta.dump();
                 add(std::move(edge));
             }
         }

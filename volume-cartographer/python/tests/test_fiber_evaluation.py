@@ -13,10 +13,90 @@ from vc import fiber_evaluation as evaluation
 pytestmark = pytest.mark.skipif(not ft.case_queue_supported(), reason="native case queue unavailable")
 
 
+def test_separate_direct_gate_config_roundtrip(inputs):
+    cfg = ft.TraceConfig.from_dict(dict(width_relative_tolerance=.3,
+        width_hard_relative_tolerance=.05, replay_presence_modulated=True,
+        replay_presence_ignore_width=True, replay_presence_cutoff=.75))
+    assert cfg.width_hard_relative_tolerance == .05
+    assert cfg.replay_presence_ignore_width
+    assert ft.TraceConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
+    field, normals = handles(inputs)
+    cache = ft.ChunkCache(field, normals, cfg, chunk_config(), str(inputs / "unsupported"), "gate-test")
+    with pytest.raises(ValueError, match="direct CPU"):
+        cache.get([0,0,0])
+
+
+def test_sampling_window_config_roundtrip():
+    assert 'sampling_window_voxels' not in ft.TraceConfig().to_dict()
+    cfg=ft.TraceConfig.from_dict({'sampling_window_voxels':64,'parallel_threads':1})
+    assert cfg.sampling_window_voxels==64
+    assert ft.TraceConfig.from_dict(cfg.to_dict()).to_dict()==cfg.to_dict()
+
+
 def fixture_cache(inputs):
     field, normals = handles(inputs)
     cache = ft.ChunkCache(field, normals, trace_config(), chunk_config(), str(inputs / "cache"), "tube")
     return field, normals, cache
+
+
+def test_training_profile_preserves_output_and_resets(inputs):
+    field,normals=handles(inputs)
+    trace=trace_config()
+    trace.width_relative_tolerance=.3
+    case=ft.EvaluationCase(np.array([[16.,16.,16.],[220.,16.,16.]]))
+    replay=ft.ChunkReplayConfig()
+    def run(profile=None):
+        return evaluation.replay_dict(ft.training_replay(field,normals,normals,
+            trace,case,replay,profile=profile))
+    expected=run()
+    profile=ft.TraceProfile()
+    assert profile.to_dict()['oneWayCalls']==0
+    assert run(profile)==expected
+    first=profile.to_dict()
+    assert first['oneWayCalls']>0 and first['candidateTasks']>0
+    assert first['widthSamplePoints']>0 and first['widthSampleSeconds']>=0
+    assert run(profile)==expected
+    assert profile.to_dict()['candidateTasks']==first['candidateTasks']
+
+
+def test_training_profile_rejects_concurrent_read_and_reuse(inputs):
+    field,normals=handles(inputs)
+    trace=trace_config()
+    case=ft.EvaluationCase(np.array([[16.,16.,16.],[220.,16.,16.]]))
+    profile=ft.TraceProfile()
+    received=threading.Event()
+    with Coordinator(lambda *args: received.set()) as server:
+        client=bridge(server)
+        field.set_live_bridge(client,'profile-test')
+        with ThreadPoolExecutor(1) as pool:
+            future=pool.submit(ft.training_replay,field,normals,normals,trace,
+                case,ft.ChunkReplayConfig(),True,profile)
+            try:
+                assert received.wait(5)
+                with pytest.raises(RuntimeError,match='already in use'):
+                    profile.to_dict()
+                with pytest.raises(RuntimeError,match='already in use'):
+                    ft.training_replay(field,normals,normals,trace,case,
+                        ft.ChunkReplayConfig(),profile=profile)
+            finally:
+                client.cancel('end profile guard test')
+            with pytest.raises(RuntimeError):
+                future.result(timeout=5)
+    # Exception must clear the guard before Python regains the completed call.
+    assert isinstance(profile.to_dict(),dict)
+
+
+def test_delayed_reverse_config_roundtrip_and_chunk_rejection(inputs):
+    cfg = ft.TraceConfig.from_dict(dict(replay_reverse_interval_base=512.,
+        replay_reverse_to_start=True,replay_reverse_delay_steps=4,
+        replay_reverse_convergence_min_base=1536.,
+        replay_reverse_convergence_distance_base=4.,
+        replay_reverse_convergence_angle_degrees=5.,replay_reverse_convergence_steps=4))
+    assert ft.TraceConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
+    field,normals=handles(inputs)
+    cache=ft.ChunkCache(field,normals,cfg,chunk_config(),str(inputs/'delay'),'delay-test')
+    with pytest.raises(ValueError,match='direct CPU replay'):
+        cache.get([0,0,0])
 
 
 def test_batch_matches_serial_and_is_single_use(inputs):
@@ -85,6 +165,23 @@ def config(inputs):
                 replay=dict(error_threshold_base=2), workers=2, contexts_per_worker=2,
                 cases=[dict(id="forward", points_base_xyz=[[16, 16, 16], [220, 16, 16]]),
                        dict(id="backward", points_base_xyz=[[220, 16, 16], [16, 16, 16]])])
+
+
+def test_predicted_normals_with_separate_evaluation_normals(inputs, monkeypatch):
+    cfg = config(inputs)
+    expected = evaluation.evaluate(cfg, base_directory=inputs)
+    del cfg["normal_manifest"]
+    cfg["evaluation_normal_manifest"] = "norm.json"
+    calls = []
+    def predicted(field, *, cache_bytes):
+        calls.append((field.trace_to_base_scale, cache_bytes))
+        return ft.open_normal_sampler(str(inputs / "norm.json"),
+                                      field.trace_to_base_scale, cache_bytes=cache_bytes)
+    monkeypatch.setattr(ft, "open_fiber_normal_sampler", predicted)
+    actual = evaluation.evaluate(cfg, base_directory=inputs)
+    assert len(calls) == 1
+    assert actual["cases"] == expected["cases"]
+    assert actual["config"]["evaluation_normal_manifest"] == "norm.json"
 
 
 def test_callable_and_cli(inputs):
@@ -179,10 +276,30 @@ def test_beam_cancel_waiting_for_publication(inputs):
         client.cancel("close")
 
 
+def _reference_span_metadata(mode):
+    config = dict(step_voxels=1, cone_angle_degrees=30, cone_angle_step_degrees=5,
+        cone_grid_size=3, beam_width=1, beam_prune_distance_voxels=1, beam_lookahead_steps=0,
+        smoothness_weight=0, smoothness_normal_weight=0, smoothness_tangent_weight=0,
+        smoothness_free_angle_degrees=0, cumulative_smoothness_steps=0,
+        cumulative_smoothness_tangent_weight=0, initial_free_angle_degrees=0,
+        max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20)
+    result = dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
+        interp_goal=mode, interp_mode=mode, metric=None, msg="", normal_manifest="", fiber_manifest="",
+        trace_to_base_scale=1, meeting_error_base_voxels=None, meeting_error_ratio=None,
+        meeting_source="", failure_code="", failure_detail="", lasagna_failure_code="",
+        lasagna_failure_detail="", config=config)
+    if mode == "trace":
+        result.update(metric=0, meeting_error_base_voxels=0, meeting_error_ratio=0,
+                      meeting_source="test", normal_manifest="test-normal", fiber_manifest="test-fiber")
+    return result
+
+
 def test_reference_selection_preserves_spans_and_direction(inputs):
-    annotation = dict(type="vc3d_fiber", version=1, optimization_mode="native_fiber_trace3d",
+    annotation = dict(type="vc3d_fiber", version=4, uuid="10000000-0000-4000-8000-000000000001",
+                      optimization_mode="native_fiber_trace3d",
                       line_points=[[0, 16, 16], [16, 16, 16], [100, 16, 16], [220, 16, 16], [240, 16, 16]],
-                      control_points=[[16, 16, 16], [220, 16, 16]])
+                      control_points=[dict(position=[16, 16, 16], segment_to_next=_reference_span_metadata("trace")),
+                                      dict(position=[220, 16, 16])])
     cases, plan = evaluation.reference_cases(annotation, "a")
     assert len(cases) == 2
     assert plan["eligible_length_base_voxels"] == 204
@@ -198,31 +315,23 @@ def test_reference_selection_preserves_spans_and_direction(inputs):
     assert [r["id"] for r in result["cases"]] == ["a/run0/reverse"]
     assert result["reference_selection"][0]["sha256"]
     annotation["optimization_mode"] = "lasagna"
+    # In v4 eligibility is defined per span, not by the root optimizer label.
+    assert len(evaluation.reference_cases(annotation, "a")[0]) == 1
+    annotation["control_points"][0]["segment_to_next"] = _reference_span_metadata("lasagna")
     assert evaluation.reference_cases(annotation, "a")[0] == []
-    annotation["control_points"][0][0] += .01
+    annotation["control_points"][0]["position"][0] += .01
     with pytest.raises(RuntimeError, match="exact line point"):
         evaluation.reference_cases(annotation, "a")
 
 
 def test_reference_selection_splits_at_lasagna_spans():
     # Valid annotation metadata, not a second implementation of selection.
-    config = dict(step_voxels=1, cone_angle_degrees=30, cone_angle_step_degrees=5,
-        cone_grid_size=3, beam_width=1, beam_prune_distance_voxels=1, beam_lookahead_steps=0,
-        smoothness_weight=0, smoothness_normal_weight=0, smoothness_tangent_weight=0,
-        smoothness_free_angle_degrees=0, cumulative_smoothness_steps=0,
-        cumulative_smoothness_tangent_weight=0, initial_free_angle_degrees=0,
-        max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20)
-    def metadata(mode):
-        return dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
-            interp_goal=mode, interp_mode=mode, metric=None, msg="", normal_manifest="", fiber_manifest="",
-            trace_to_base_scale=1, meeting_error_base_voxels=None, meeting_error_ratio=None,
-            meeting_source="", failure_code="", failure_detail="", lasagna_failure_code="",
-            lasagna_failure_detail="", config=config)
     points = [[i * 10, 0, 0] for i in range(6)]
-    controls = [dict(position=p, segment_to_next=metadata(mode))
+    controls = [dict(position=p, segment_to_next=_reference_span_metadata(mode))
                 for p, mode in zip(points[1:4], ["cspline", "lasagna", "cspline"])]
     controls.append(dict(position=points[4]))
-    annotation = dict(type="vc3d_fiber", version=3, optimization_mode="native_fiber_trace3d",
+    annotation = dict(type="vc3d_fiber", version=4, uuid="10000000-0000-4000-8000-000000000002",
+                      optimization_mode="native_fiber_trace3d",
                       line_points=points, control_points=controls)
     cases, plan = evaluation.reference_cases(annotation, "mixed")
     assert len(cases) == 4

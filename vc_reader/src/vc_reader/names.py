@@ -7,7 +7,6 @@ People write them as ``PHerc. Paris 4``, ``pherc paris 4``, ``paris4``,
 
 from __future__ import annotations
 
-import difflib
 import re
 from typing import Iterable
 
@@ -48,16 +47,3 @@ class SampleNameIndex:
             hits = self._keys.get(_PREFIX + key)
         return set(hits or ())
 
-    def search(self, query: str) -> set[str]:
-        """Sample ids with a name containing ``query`` (after normalisation)."""
-        key = name_key(query)
-        return {sid for k, ids in self._keys.items() if key in k for sid in ids}
-
-    def suggest(self, query: str, n: int = 5) -> list[str]:
-        close = difflib.get_close_matches(name_key(query), list(self._keys), n=n, cutoff=0.6)
-        seen: list[str] = []
-        for k in close:
-            for sid in sorted(self._keys[k]):
-                if sid not in seen:
-                    seen.append(sid)
-        return seen

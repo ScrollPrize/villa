@@ -287,3 +287,20 @@ waiters are suspended, retry and CLI output. The documented cached Paris4
 fixture variables in `fiber_chunk_tracing.md` also run the native batch and
 callable orchestrator on a real 256-base-voxel reference span, comparing full
 results with serial replay. No GPU inference or throughput claim is involved.
+
+## Training benchmark compatibility
+
+The annotated Fiber3D trainer also uses the existing native `replay-set`,
+`replay-references` and `render-replay` entrypoints. These preserve its historical
+reference selection, predicted local-peak restart seeds, presence checks on
+committed points, independent reverse-check radii/settings, and canonical
+artifact/summary formats. They are not aliases for the smaller JSON API above:
+the public direct-beam API still restarts on reference points and filters
+candidate presence as documented.
+
+Native integration is in `FiberTraceEvaluationCli.cpp`; the training-compatible
+`replayFiberTrainingCase` and public `replayFiberBeamCase` use a shared replay
+implementation. Matching, failure/filter accounting, live dependencies and
+bounded case scheduling remain shared. Build `vc_fiber_trace_metric` and
+`vc_cache_root` to use the training entrypoints.
+

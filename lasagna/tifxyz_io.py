@@ -57,28 +57,41 @@ def surface_step_stats(xyz: torch.Tensor, valid: torch.Tensor) -> tuple[float, f
 		return _mean_or_nan(h_vals), _mean_or_nan(w_vals), _mean_or_nan(diag_vals), combined
 
 
-def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu"
+def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
+				store: str | Path | None = None, volume: str | None = None, target_scale: float = 1.0,
 				) -> tuple[torch.Tensor, torch.Tensor, dict]:
-	"""Load a tifxyz directory into a mesh tensor.
+	"""Load a tifxyz directory, or a stored surface (``vcobj:`` reference into ``store``, in voxels of
+	``volume`` at ``target_scale``), into a mesh tensor.
 
 	Returns (xyz, valid, meta) where:
 	  xyz: (H, W, 3) float32 tensor — invalid vertices zeroed out
 	  valid: (H, W) bool tensor — True for valid vertices
-	  meta: dict from meta.json (or empty if missing)
+	  meta: dict from meta.json (or empty if missing); for a stored surface its record meta with
+	    uuid, name and the grid scale
 	"""
-	p = Path(path)
-	if not p.is_dir():
-		raise ValueError(f"tifxyz path is not a directory: {p}")
-	x = tifffile.imread(str(p / "x.tif")).astype(np.float32)
-	y = tifffile.imread(str(p / "y.tif")).astype(np.float32)
-	z = tifffile.imread(str(p / "z.tif")).astype(np.float32)
-	if x.shape != y.shape or x.shape != z.shape:
-		raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
-	xyz = np.stack([x, y, z], axis=-1)  # (H, W, 3)
-	meta_path = p / "meta.json"
-	meta: dict = {}
-	if meta_path.exists():
-		meta = json.loads(meta_path.read_text(encoding="utf-8"))
+	from stored_surfaces import parse_surface_ref, read_surface
+	if parse_surface_ref(path) is not None:
+		if store is None:
+			raise ValueError(f"stored surface {path} needs a store")
+		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
+		xyz = stored.xyz
+		meta = stored.meta
+		label = stored.meta["name"]
+	else:
+		p = Path(path)
+		if not p.is_dir():
+			raise ValueError(f"tifxyz path is not a directory: {p}")
+		x = tifffile.imread(str(p / "x.tif")).astype(np.float32)
+		y = tifffile.imread(str(p / "y.tif")).astype(np.float32)
+		z = tifffile.imread(str(p / "z.tif")).astype(np.float32)
+		if x.shape != y.shape or x.shape != z.shape:
+			raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
+		xyz = np.stack([x, y, z], axis=-1)  # (H, W, 3)
+		meta_path = p / "meta.json"
+		meta: dict = {}
+		if meta_path.exists():
+			meta = json.loads(meta_path.read_text(encoding="utf-8"))
+		label = p.name
 
 	xyz_t = torch.from_numpy(xyz)
 	# VC3D uses (-1, -1, -1) as invalid sentinel
@@ -89,7 +102,7 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu"
 	n_valid = int(valid.sum())
 	n_total = valid.numel()
 	step_h, step_w, step_diag, step_avg = surface_step_stats(xyz_t, valid)
-	print(f"[tifxyz_io] loaded {p.name}: {x.shape[0]}x{x.shape[1]}, "
+	print(f"[tifxyz_io] loaded {label}: {xyz.shape[0]}x{xyz.shape[1]}, "
 		  f"{n_valid}/{n_total} valid ({100*n_valid/max(1,n_total):.1f}%) "
 		  f"step_h={step_h:.3f} step_w={step_w:.3f} step_diag={step_diag:.3f} "
 		  f"step_avg={step_avg:.3f}", flush=True)

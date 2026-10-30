@@ -31,7 +31,6 @@
 #include "cpu/foreground_dropout.hpp"
 #include "cpu/object_dropout.hpp"
 #include <bit>
-#include <chrono>
 
 namespace vcr::transforms {
 struct OneOf;
@@ -51,7 +50,6 @@ void execute(const Op&, Sample&, const Parameters&, void*);
 std::shared_ptr<void> begin(const Sample&);
 void finish(Sample&, void*);
 void finish_device(void*);
-void synchronize();
 Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
 void validate_program(const std::vector<Op>&);
 }
@@ -76,7 +74,7 @@ struct Plan {
     std::map<std::string, InputSpec> inputs;
     std::vector<Step> steps;
 };
-struct RunResult { Sample sample; Plan plan; std::map<std::string, double> timings; };
+struct RunResult { Sample sample; Plan plan; };
 inline std::map<std::string, InputSpec> input_specs(const Sample& s) {
     std::map<std::string, InputSpec> result;
     for (const auto& [name, f] : s) result[name] = {f.array.shape, f.array.kind, f.array.bytes};
@@ -133,7 +131,7 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
     }, op);
     if (record) {
         parameters.device_field.reset();
-        for (auto& c : parameters.channels) { c.device_field.reset(); c.device_indices.reset(); }
+        for (auto& c : parameters.channels) c.device_field.reset();
         record->push_back({std::move(path), std::move(parameters)});
     }
 }
@@ -159,33 +157,23 @@ public:
     const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
     const auto& program() const { return program_; }
-    RunResult run(Sample s, std::uint64_t seed, bool record, bool profile, std::shared_ptr<void> context = {}) const {
+    RunResult run(Sample s, std::uint64_t seed, bool record, std::shared_ptr<void> context = {}) const {
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");
         validate(s, !resident); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
         CompactState compact(compact_);
-        const auto upload_start = std::chrono::steady_clock::now();
 #ifdef VC_READER_CUDA
         if (executor_ && !resident) context = cuda::begin(s);
 #endif
-        const double upload_time = std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
             for (const auto& [name, f] : s) require(f.pyramid.empty(), "DeepSupervision must be the last transform");
-            auto start = std::chrono::steady_clock::now(); Random r{split_seed(seed, std::to_string(i))};
+            Random r{split_seed(seed, std::to_string(i))};
             prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact, executor_, context.get());
-#ifdef VC_READER_CUDA
-            if (executor_ && profile) cuda::synchronize();
-#endif
-            if (profile) result.timings[std::to_string(i)] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
-                + (executor_ && i == 0 ? upload_time : 0);
         }
-        auto start = std::chrono::steady_clock::now();
 #ifdef VC_READER_CUDA
         if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
         compact.flush(s);
-        if (profile && !program_->transforms.empty()) result.timings[std::to_string(program_->transforms.size() - 1)] +=
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         result.sample = std::move(s); return result;
     }
     RunResult replay(Sample s, const Plan& plan, std::shared_ptr<void> context = {}) const {

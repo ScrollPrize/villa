@@ -1,12 +1,13 @@
-// Local zarr volume creation + chunk I/O. Exercises Volume / VcDataset /
-// Zarr.cpp paths that the live S3 test never hits (writes, downsample,
-// fill-value, removeChunk, readChunkOrFill).
+// Local zarr volume reads and the chunk cache. Exercises Volume / VcDataset /
+// Zarr.cpp paths that the live S3 test never hits (fill values,
+// readChunkOrFill, cache retention and reconfiguration).
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include <algorithm>
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/util/LoadJson.hpp"
 
@@ -34,11 +35,11 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-Volume::ZarrCreateOptions makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
+vc::test::ZarrVolumeSpec makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
                                    std::array<size_t, 3> chunks = {32, 32, 32},
                                    size_t numLevels = 2)
 {
-    Volume::ZarrCreateOptions opts;
+    vc::test::ZarrVolumeSpec opts;
     opts.shapeZYX = shape;
     opts.chunkShapeZYX = chunks;
     opts.numLevels = numLevels;
@@ -46,10 +47,6 @@ Volume::ZarrCreateOptions makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
     opts.voxelSize = 1.0;
     opts.uuid = "test-vol-uuid";
     opts.name = "test-vol";
-    opts.overwriteExisting = true;
-    // The build-bot blosc support is optional; force uncompressed so the
-    // test runs regardless of whether libblosc was linked.
-    opts.compressor = "none";
     return opts;
 }
 
@@ -62,35 +59,12 @@ void writeTextFile(const fs::path& path, const std::string& text)
 
 } // namespace
 
-TEST_CASE("Volume::New(path, opts): creates a fresh local zarr pyramid")
-{
-    auto d = tmpDir("create");
-    auto opts = makeOpts();
-    auto v = Volume::New(d, opts);
-    REQUIRE(v);
-    CHECK_FALSE(v->isRemote());
-    CHECK(v->id() == "test-vol-uuid");
-    CHECK(v->numScales() == 2);
-
-    auto s0 = v->levelShape(0);
-    CHECK(s0[0] == 64);
-    CHECK(s0[1] == 64);
-    CHECK(s0[2] == 64);
-
-    auto s1 = v->levelShape(1);
-    CHECK(s1[0] == 32);
-    CHECK(s1[1] == 32);
-    CHECK(s1[2] == 32);
-
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume: reopen existing local zarr without options")
 {
     auto d = tmpDir("reopen");
     auto opts = makeOpts();
     {
-        auto v = Volume::New(d, opts);
+        auto v = vc::test::createZarrVolume(d, opts);
         REQUIRE(v);
     }
     // Second open without options finds the existing pyramid on disk.
@@ -101,22 +75,10 @@ TEST_CASE("Volume: reopen existing local zarr without options")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::checkDir: true for created volume, false for arbitrary")
-{
-    auto d = tmpDir("checkdir");
-    {
-        auto v = Volume::New(d, makeOpts());
-        REQUIRE(v);
-    }
-    CHECK(Volume::checkDir(d));
-    CHECK_FALSE(Volume::checkDir("/__nonexistent__/x"));
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume: chunkByteSize and chunkExists on a fresh volume")
 {
     auto d = tmpDir("chunkexist");
-    auto v = Volume::New(d, makeOpts());
+    auto v = vc::test::createZarrVolume(d, makeOpts());
     REQUIRE(v);
     // No chunks written yet — none should exist.
     CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
@@ -128,7 +90,7 @@ TEST_CASE("Volume: chunkByteSize and chunkExists on a fresh volume")
 TEST_CASE("Volume: writeZYX then readZYX round-trips a small buffer")
 {
     auto d = tmpDir("writeread");
-    auto v = Volume::New(d, makeOpts());
+    auto v = vc::test::createZarrVolume(d, makeOpts());
     REQUIRE(v);
 
     // Write a small region of known values.
@@ -139,7 +101,7 @@ TEST_CASE("Volume: writeZYX then readZYX round-trips a small buffer")
             for (size_t x = 0; x < 16; ++x)
                 in(z, y, x) = static_cast<uint8_t>((z * 31 + y * 13 + x) & 0xFF);
 
-    v->writeZYX(in, {0, 0, 0}, /*level=*/0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, /*level=*/0);
 
     Array3D<uint8_t> out({16, 16, 16});
     bool ok = v->readZYX(out, {0, 0, 0}, 0);
@@ -154,7 +116,7 @@ TEST_CASE("Volume: writeZYX then readZYX round-trips a small buffer")
 TEST_CASE("Volume: readChunkOrFill returns fill when chunk is absent")
 {
     auto d = tmpDir("orfill");
-    auto v = Volume::New(d, makeOpts());
+    auto v = vc::test::createZarrVolume(d, makeOpts());
     REQUIRE(v);
     auto bytes = v->readChunkOrFill(0, {0, 0, 0});
     CHECK(bytes.size() == v->chunkByteSize(0));
@@ -166,12 +128,12 @@ TEST_CASE("Volume: readChunkOrFill returns fill when chunk is absent")
 TEST_CASE("Volume: chunkExists turns true after writeChunk")
 {
     auto d = tmpDir("wc");
-    auto v = Volume::New(d, makeOpts());
+    auto v = vc::test::createZarrVolume(d, makeOpts());
     REQUIRE(v);
     std::vector<std::byte> chunk(v->chunkByteSize(0));
     // Fill with something non-zero so we don't get write_empty_chunks=false elided.
     std::memset(chunk.data(), 0xAB, chunk.size());
-    v->writeChunk(0, {0, 0, 0}, chunk);
+    vc::test::writeChunk(*v, 0, {0, 0, 0}, chunk);
     CHECK(v->chunkExists(0, {0, 0, 0}));
     auto opt = v->readChunk(0, {0, 0, 0});
     REQUIRE(opt.has_value());
@@ -183,10 +145,10 @@ TEST_CASE("Volume: chunkExists turns true after writeChunk")
 TEST_CASE("Volume: regular cache retains decoded chunks")
 {
     auto d = tmpDir("cache-client");
-    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    auto v = vc::test::createZarrVolume(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
     REQUIRE(v);
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
-    v->writeChunk(0, {0, 0, 0}, chunk);
+    vc::test::writeChunk(*v, 0, {0, 0, 0}, chunk);
 
     auto service = vc::render::processChunkCacheService();
     service->configureDecodedByteCapacity(1);
@@ -209,12 +171,12 @@ TEST_CASE("Volume: regular cache retains decoded chunks")
 TEST_CASE("Volume: process service keeps decoded chunks across handles")
 {
     auto d = tmpDir("cache-service-client");
-    auto firstVolume = Volume::New(
+    auto firstVolume = vc::test::createZarrVolume(
         d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
     REQUIRE(firstVolume);
     std::vector<std::byte> chunk(
         firstVolume->chunkByteSize(0), std::byte{0x3c});
-    firstVolume->writeChunk(0, {0, 0, 0}, chunk);
+    vc::test::writeChunk(*firstVolume, 0, {0, 0, 0}, chunk);
 
     auto service = vc::render::processChunkCacheService();
     service->configureDecodedByteCapacity(1);
@@ -241,10 +203,10 @@ TEST_CASE("Volume: process service keeps decoded chunks across handles")
 TEST_CASE("Volume: service concurrency reconfigures without eviction")
 {
     auto d = tmpDir("cache-service-threads");
-    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    auto v = vc::test::createZarrVolume(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
     REQUIRE(v);
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x4d});
-    v->writeChunk(0, {0, 0, 0}, chunk);
+    vc::test::writeChunk(*v, 0, {0, 0, 0}, chunk);
 
     auto service = vc::render::processChunkCacheService();
     service->configureFetchConcurrency(2, false);
@@ -270,10 +232,10 @@ TEST_CASE("Volume: service concurrency reconfigures without eviction")
 TEST_CASE("Volume: cache budget reconfigures without replacing source state")
 {
     auto d = tmpDir("cache-service-budget");
-    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    auto v = vc::test::createZarrVolume(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
     REQUIRE(v);
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
-    v->writeChunk(0, {0, 0, 0}, chunk);
+    vc::test::writeChunk(*v, 0, {0, 0, 0}, chunk);
 
     auto service = vc::render::processChunkCacheService();
     service->configureDecodedByteCapacity(1);
@@ -304,73 +266,13 @@ TEST_CASE("Volume: cache budget reconfigures without replacing source state")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: writes invalidate service state without a live handle")
-{
-    auto d = tmpDir("cache-service-write");
-    auto reader = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
-    REQUIRE(reader);
-    std::vector<std::byte> chunk(reader->chunkByteSize(0), std::byte{0x21});
-    reader->writeChunk(0, {0, 0, 0}, chunk);
-    auto writer = Volume::New(d);
-    REQUIRE(writer);
-
-    auto service = vc::render::processChunkCacheService();
-    service->configureDecodedByteCapacity(1);
-    service->configureDecodedByteCapacity(64 * 1024);
-    auto first = reader->sharedChunkCache();
-    auto initial = first->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(initial.status == vc::render::ChunkStatus::Data);
-    CHECK(std::to_integer<int>((*initial.bytes)[0]) == 0x21);
-    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
-
-    std::fill(chunk.begin(), chunk.end(), std::byte{0x43});
-    // The writer shares the source identity but has never acquired a handle.
-    writer->writeChunk(0, {0, 0, 0}, chunk);
-    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
-
-    auto refreshed = reader->sharedChunkCache()->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(refreshed.status == vc::render::ChunkStatus::Data);
-    CHECK(std::to_integer<int>((*refreshed.bytes)[0]) == 0x43);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: removeChunk drops the chunk file")
-{
-    auto d = tmpDir("rm");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    std::vector<std::byte> chunk(v->chunkByteSize(0));
-    std::memset(chunk.data(), 0x55, chunk.size());
-    v->writeChunk(0, {0, 0, 0}, chunk);
-    CHECK(v->chunkExists(0, {0, 0, 0}));
-    CHECK(v->removeChunk(0, {0, 0, 0}));
-    CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
-    // Second remove is a no-op (chunk already gone).
-    CHECK_FALSE(v->removeChunk(0, {0, 0, 0}));
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: empty-chunk write with writeEmptyChunks=false is elided")
-{
-    auto d = tmpDir("empty");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    std::vector<std::byte> zero(v->chunkByteSize(0));
-    // all zero == fill value
-    Volume::ChunkWriteOptions o;
-    o.writeEmptyChunks = false;
-    v->writeChunk(0, {0, 0, 0}, zero, o);
-    CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume: writeXYZ and readXYZ obey UI-order offsets")
 {
     auto d = tmpDir("xyz");
-    auto v = Volume::New(d, makeOpts());
+    auto v = vc::test::createZarrVolume(d, makeOpts());
     REQUIRE(v);
     Array3D<uint8_t> in({4, 4, 4}, /*fill=*/77);
-    v->writeXYZ(in, /*offsetXYZ=*/{0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, /*offsetXYZ=*/{0, 0, 0}, 0);
     Array3D<uint8_t> out({4, 4, 4});
     bool ok = v->readXYZ(out, {0, 0, 0}, 0);
     CHECK(ok);
@@ -381,7 +283,7 @@ TEST_CASE("Volume: writeXYZ and readXYZ obey UI-order offsets")
 TEST_CASE("Volume: shape() / sliceWidth() / sliceHeight() / numSlices() agree")
 {
     auto d = tmpDir("shape");
-    auto v = Volume::New(d, makeOpts({100, 50, 200}, {25, 25, 25}, 1));
+    auto v = vc::test::createZarrVolume(d, makeOpts({100, 50, 200}, {25, 25, 25}, 1));
     REQUIRE(v);
     auto sh = v->shape();
     CHECK(sh[0] == v->numSlices());
@@ -397,7 +299,7 @@ TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
     // accessor throw from deep inside whatever asked for a physical area.
     auto d = tmpDir("unusable_voxelsize");
     auto opts = makeOpts({32, 32, 32}, {16, 16, 16}, 1);
-    Volume::New(d, opts);
+    vc::test::createZarrVolume(d, opts);
     const auto meta = vc::json::load_json_file(d / "meta.json");
     const auto metaWithVoxelSize = [&](const std::string& voxelsizeJson) {
         std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get_string() +

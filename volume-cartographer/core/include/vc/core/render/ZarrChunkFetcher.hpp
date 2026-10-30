@@ -112,4 +112,18 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options = {});
 
+// Packed CZYX arrays share one physical decoded chunk; scalar views only add
+// an offset into that payload. Legacy 3D arrays keep the existing fast path.
+std::shared_ptr<IChunkedArray> acquireProcessZarrChannel(
+    std::string sourceIdentity, std::shared_ptr<utils::ZarrArray> array,
+    std::size_t channel, ChunkCache::Options options = {});
+
+// Rebind native scalar/packed channel views to another decoded-cache partition,
+// preserving normal cache reads and each view's offset/shape/dtype.
+std::shared_ptr<IChunkedArray> rebindChunkCache(
+    const std::shared_ptr<IChunkedArray>& channel,
+    const std::shared_ptr<ChunkCacheService>& partition);
+std::shared_ptr<ChunkCacheService> threadLocalDecodedPartition(
+    const std::shared_ptr<ChunkCacheService>& parent,std::size_t bytes);
+
 } // namespace vc::render

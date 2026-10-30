@@ -1,4 +1,8 @@
 # Python venvs, IDE files, build artifacts
+/local/
+/task.md
+/experiments/
+/global-fiber-sgd
 **/.venv*/
 **/.idea/*
 **/__pycache__/
@@ -51,10 +55,6 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/coverage/
 /coverage/
 
-# Dead-code analysis outputs
-/volume-cartographer/dead-code/
-/dead-code/
-
 # ccache (mounted into builder docker)
 /volume-cartographer/.ccache/
 /.ccache/
@@ -87,3 +87,4 @@ dinovol/cufile.log
 *.csv
 /vc_object_store/build-core
 /vc_object_store/docs/benchmarks
+/volume-cartographer/planning
