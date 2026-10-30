@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import numpy as np
@@ -8,6 +9,51 @@ import torch.nn.functional as F
 import flow_grad_smoothing
 import flow_triton
 from geom_utils import grid_sample_border
+
+
+_SEP_W = {}
+
+
+def _graph_rk4_enabled():
+    # FIT_SPIRAL_GRAPH_RK4=1: replay the eager RK4 slab integration as CUDA/HIP
+    # graphs (see graph_rk4).
+    return os.environ.get('FIT_SPIRAL_GRAPH_RK4', '0') == '1'
+
+
+def _linear_interp_matrix(n_in, n_out, device, dtype):
+    key = (n_in, n_out, device, dtype)
+    w = _SEP_W.get(key)
+    if w is None:
+        scale = n_in / n_out
+        src = ((torch.arange(n_out, dtype=torch.float64) + 0.5) * scale - 0.5).clamp(min=0)
+        i0 = src.floor().long().clamp(max=n_in - 1)
+        i1 = (i0 + 1).clamp(max=n_in - 1)
+        l1 = src - i0.double()
+        w = torch.zeros(n_out, n_in, dtype=torch.float64)
+        rows = torch.arange(n_out)
+        w.index_put_((rows, i0), 1 - l1, accumulate=True)
+        w.index_put_((rows, i1), l1, accumulate=True)
+        w = _SEP_W[key] = w.to(device=device, dtype=dtype)
+    return w
+
+
+def _sep_trilinear(x, size):
+    D, H, W = x.shape[-3:]
+    wz = _linear_interp_matrix(D, size[0], x.device, x.dtype)
+    wy = _linear_interp_matrix(H, size[1], x.device, x.dtype)
+    wx = _linear_interp_matrix(W, size[2], x.device, x.dtype)
+    x = torch.einsum('...dhw,zd->...zhw', x, wz)
+    x = torch.einsum('...zhw,yh->...zyw', x, wy)
+    return torch.einsum('...zyw,xw->...zyx', x, wx)
+
+
+def _upsample_lr(lr_flow, size):
+    # FIT_SPIRAL_SEP_UPSAMPLE=1: trilinear upsampling (align_corners=False) as
+    # three 1-D interpolation matmuls. Same math as F.interpolate; its backward
+    # is three small GEMMs, much faster than upsample_trilinear3d_backward on ROCm.
+    if os.environ.get('FIT_SPIRAL_SEP_UPSAMPLE', '0') == '1':
+        return _sep_trilinear(lr_flow, size)
+    return F.interpolate(lr_flow, size=size, mode='trilinear')
 
 
 def sample_field(normalised_zyx, field_for_grid_sample):
@@ -402,7 +448,7 @@ class CartesianFlowField(nn.Module):
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         hr_shape = tuple(hr_flow.shape[2:])
         # HR flow is already at the target resolution, so only LR interpolates.
-        lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')
+        lr_upsampled = _upsample_lr(lr_flow, hr_shape)
         training_field = torch.is_grad_enabled() and (lr_flow.requires_grad or hr_flow.requires_grad)
         if not training_field:
             return lr_upsampled, hr_flow.detach(), None
@@ -414,6 +460,16 @@ class CartesianFlowField(nn.Module):
         # full-resolution accumulator becomes the HR parameter gradient.
         low_field = lr_upsampled.detach()
         high_field = hr_flow.detach()
+        if _graph_rk4_enabled() and low_field.is_cuda:
+            # Graph replays bake in field pointers: keep the upsampled LR field
+            # in one persistent buffer, and drop graphs that point at an old one.
+            buf = getattr(self, '_graph_low_buf', None)
+            if buf is None or buf.shape != low_field.shape:
+                import graph_rk4
+                graph_rk4.clear()
+                buf = self._graph_low_buf = torch.empty_like(low_field)
+            buf.copy_(low_field)
+            low_field = buf
         if self._field_grad_acc is None or self._field_grad_acc.shape != high_field.shape:
             self._field_grad_acc = torch.zeros_like(high_field)
         else:
@@ -501,6 +557,12 @@ class CartesianFlowField(nn.Module):
                     y = _rk4_sampler_loop(
                         y, lambda p: sample_field(p, low) + sample_field(p, high),
                         h, n_steps)
+                elif _graph_rk4_enabled() and y.is_cuda:
+                    import graph_rk4
+                    y = graph_rk4.RK4GraphIntegrate.apply(
+                        y, low, high,
+                        None if acc is None else acc[slab], h, n_steps,
+                    )
                 else:
                     y = _RK4SparseFlowIntegrate.apply(
                         y, low, high, 1.0,
