@@ -246,11 +246,14 @@ struct LineSurfaceParams : CoordinateParams {
     double ctToBaseScale = 1.0;
     int ctLevel = 0;
     // Sheet-normal source, at most one of: the detector's ctVolume argument
-    // (structure-tensor normals from uint8 CT), or both of these paired uint8
-    // lasagna nx/ny volumes (see LasagnaSheetNormalSampler). ctLevel and
-    // ctToBaseScale address whichever volume is selected. With neither, no
-    // normal strip is built and anchors test the centerline points themselves.
+    // (structure-tensor normals from uint8 CT), both of these paired uint8
+    // lasagna nx/ny volumes (see LasagnaSheetNormalSampler), or the same
+    // normals' resident-pool pack (PooledLasagnaSheetNormalSampler; ctLevel
+    // does not apply). ctLevel and ctToBaseScale address whichever volume is
+    // selected. With none, no normal strip is built and anchors test the
+    // centerline points themselves.
     std::filesystem::path normalXVolume, normalYVolume;
+    std::filesystem::path normalPool;
     // Discovery: dense line point -> surface distance.
     double proximity = 1.5;
     std::size_t minContacts = 2;

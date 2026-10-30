@@ -173,6 +173,7 @@ bool setLineSurfaceParameter(vc::object_links::LineSurfaceParams& p, const std::
     else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
     else if (key == "normal_x_volume") p.normalXVolume = nb::cast<std::string>(val);
     else if (key == "normal_y_volume") p.normalYVolume = nb::cast<std::string>(val);
+    else if (key == "normal_pool") p.normalPool = nb::cast<std::string>(val);
     else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
     else if (key == "proximity") p.proximity = nb::cast<double>(val);
     else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);

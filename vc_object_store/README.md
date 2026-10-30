@@ -122,6 +122,12 @@ the sheet normal. The normal source is one of:
   spiral fitter does: `(v - 128) / 127`, `nz = sqrt(1 - nx² - ny²)`, with
   `nx = ny = 0` meaning no data. Nearest-voxel lookup; `ct_to_base_scale` is the
   store's downsampling (the spiral's `lasagna_scale`).
+- Packed lasagna normals (`normal_pool`): the same normals from a resident-pool
+  pack (spiral-fitting's `pack_resident_pools.py`: `meta.json`, `table.npy`,
+  `channel_0.u8`/`channel_1.u8`), sampled and decoded identically, bricks read
+  on demand; a brick the pack dropped reads as no data. `ct_level` does not
+  apply. The fiber strip cache keys it by the pack's recorded dataset identity
+  and CT mask rather than its path.
 - Neither: no strip is built. Anchors compare the centerline points themselves
   with each surface, by distance only (same sheet within `same_sheet`, adjacent
   within `adjacent_low..adjacent_high`), under the same strip gate ratio/margin.

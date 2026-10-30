@@ -54,4 +54,27 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// The same lasagna normals read from a resident-pool pack instead
+// (spiral-fitting's pack_resident_pools.py: meta.json, table.npy and the
+// channel_0.u8 / channel_1.u8 brick pools of nx and ny), sampled and decoded
+// exactly as LasagnaSheetNormalSampler does; an absent brick (one the pack
+// dropped as empty or CT-masked) reads as no data. Bricks are read on demand.
+class PooledLasagnaSheetNormalSampler {
+public:
+    static constexpr const char* method = LasagnaSheetNormalSampler::method;
+    explicit PooledLasagnaSheetNormalSampler(const std::filesystem::path& pack,
+                                             double workingToNormalScale = 1.0);
+    ~PooledLasagnaSheetNormalSampler();
+    PooledLasagnaSheetNormalSampler(const PooledLasagnaSheetNormalSampler&) = delete;
+    PooledLasagnaSheetNormalSampler& operator=(const PooledLasagnaSheetNormalSampler&) = delete;
+
+    CtSheetNormal sampleNormal(const cv::Vec3d& workingXYZ,
+                               const std::atomic_bool* cancel = nullptr) const;
+    // The pack's meta.json text (its dataset identity, CT mask and shape).
+    const std::string& metadata() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 } // namespace vc

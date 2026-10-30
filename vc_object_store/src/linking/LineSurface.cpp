@@ -35,30 +35,34 @@ class SheetNormalSource {
 public:
     SheetNormalSource(const std::filesystem::path& ctVolume, const LineSurfaceParams& params)
         : ctVolume_(ctVolume), normalX_(params.normalXVolume), normalY_(params.normalYVolume),
-          level_(params.ctLevel) {
+          pool_(params.normalPool), level_(params.ctLevel) {
         if (params.normalXVolume.empty() != params.normalYVolume.empty())
             throw std::invalid_argument("graph links: lasagna normals need both normal_x and normal_y volumes");
-        if (!ctVolume.empty() && !params.normalXVolume.empty())
-            throw std::invalid_argument("graph links: choose CT or lasagna normals, not both");
+        if (int(!ctVolume.empty()) + int(!params.normalXVolume.empty()) + int(!params.normalPool.empty()) > 1)
+            throw std::invalid_argument("graph links: choose CT, lasagna or packed lasagna normals, not several");
         const double scale = params.workingToBaseScale / params.ctToBaseScale;
         if (!ctVolume.empty())
             ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel, scale);
         else if (!params.normalXVolume.empty())
             lasagna_ = std::make_unique<vc::LasagnaSheetNormalSampler>(
                 params.normalXVolume, params.normalYVolume, params.ctLevel, scale);
+        else if (!params.normalPool.empty())
+            pooled_ = std::make_unique<vc::PooledLasagnaSheetNormalSampler>(params.normalPool, scale);
     }
     ~SheetNormalSource() {
         if (profile_) printProfile("total");
     }
-    bool available() const { return ct_ || lasagna_; }
+    bool available() const { return ct_ || lasagna_ || pooled_; }
     const char* method() const {
         if (ct_) return vc::CtSheetNormalSampler::method;
         if (lasagna_) return vc::LasagnaSheetNormalSampler::method;
+        if (pooled_) return vc::PooledLasagnaSheetNormalSampler::method;
         return "centerline";
     }
     nlohmann::json location() const {
         if (ct_) return ctVolume_.string();
         if (lasagna_) return {{"normal_x", normalX_.string()}, {"normal_y", normalY_.string()}};
+        if (pooled_) return {{"normal_pool", pool_.string()}};
         return nullptr;
     }
     // Strip-cache identity for the selected volume(s); none without normals.
@@ -68,7 +72,9 @@ public:
         if (!available()) throw std::logic_error("graph links: no sheet-normal source");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
-        result = ct_ ? ct_->sampleNormal(point, cancel) : lasagna_->sampleNormal(point, cancel);
+        result = ct_ ? ct_->sampleNormal(point, cancel)
+               : lasagna_ ? lasagna_->sampleNormal(point, cancel)
+                          : pooled_->sampleNormal(point, cancel);
         if (profile_) {
             seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             ++queries_;
@@ -82,10 +88,11 @@ private:
         std::fprintf(stderr, "FIBER_SURFACE_PROFILE %s queries %zu normal_seconds %.9f invalid %zu\n",
                      phase, queries_, seconds_, invalid_);
     }
-    std::filesystem::path ctVolume_, normalX_, normalY_;
+    std::filesystem::path ctVolume_, normalX_, normalY_, pool_;
     int level_ = 0;
     std::unique_ptr<vc::CtSheetNormalSampler> ct_;
     std::unique_ptr<vc::LasagnaSheetNormalSampler> lasagna_;
+    std::unique_ptr<vc::PooledLasagnaSheetNormalSampler> pooled_;
     bool profile_ = std::getenv("VC_FIBER_SURFACE_PROFILE") != nullptr;
     mutable size_t queries_ = 0, invalid_ = 0;
     mutable double seconds_ = 0;
@@ -351,6 +358,18 @@ std::optional<nlohmann::json> SheetNormalSource::identity() const
     if (ct_) return volumeIdentity(ctVolume_, level_);
     if (lasagna_) return nlohmann::json{{"normal_x", volumeIdentity(normalX_, level_)},
                                         {"normal_y", volumeIdentity(normalY_, level_)}};
+    if (pooled_) {
+        // The pack's dataset and how it was packed, wherever it is; a pack
+        // that records no dataset is its location.
+        const auto meta = nlohmann::json::parse(pooled_->metadata());
+        nlohmann::json identity{{"array_shape", meta.at("array_shape")},
+                                {"ct_mask", meta.value("ct_mask", nlohmann::json())}};
+        if (const auto dataset = meta.find("lasagna_identity"); dataset != meta.end() && !dataset->is_null())
+            identity["lasagna_identity"] = *dataset;
+        else
+            identity["location"] = volumeIdentity(pool_, 0).at("location");
+        return nlohmann::json{{"normal_pool", identity}};
+    }
     return std::nullopt;
 }
 
