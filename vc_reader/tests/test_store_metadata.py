@@ -1,17 +1,15 @@
 """A reader exposes what its store's sidecar documents say, read once at open."""
 import json
-import os
 import pickle
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 
-from vc_reader import _catalog
-from vc_reader.reader import ZarrReader, open_group, store_metadata
-from vc_reader.reader.auth import Access
+from test_source_storage import RemoteFixtureCase
+from vc_reader import _reader
+from vc_reader.reader import ZarrReader, open_group
 
 
 def write_array(path: Path) -> None:
@@ -77,144 +75,35 @@ class StoreMetadataTests(unittest.TestCase):
             self.assertEqual(ZarrReader.open(store, level=1).voxel_size_zyx, (2.0, 4.0, 4.0))
 
 
-CATALOG = {"samples": {"S1": {"volumes": {"V1": {
-    "id": "V1", "scan_id": "SCAN1", "suffix": "V1-2.4um.zarr",
-    "properties": {"pixel_size_um": 2.4, "energy_keV": 70.0, "detector_distance_mm": 150.0},
-    "data": [{"type": "zarr", "origins": [{"path": "S1/volumes/v1.zarr", "access_roots": [
-        {"type": "https", "url": "https://bucket.example/", "usage": "public-read"}]}]}]}}}}}
-URL = "https://bucket.example/S1/volumes/v1.zarr"
+class RemoteMetadataTests(RemoteFixtureCase):
+    """The merge, what is kept and when are covered by test_native_open; this is what Python exposes of it."""
 
-
-class CatalogMergeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(store_metadata._known.clear)
-        store_metadata._known.clear()
-        self.reads, self.catalogs = [], []
-        self.documents = {}
-        self.catalog = CATALOG
+        super().setUp()
+        _reader.forget_volume_metadata()
+        self.addCleanup(_reader.forget_volume_metadata)
+        self.store = self.root / "store.zarr"
+        write_array(self.store / "0")
+        (self.store / ".zgroup").write_text('{"zarr_format": 2}')
+        (self.store / "meta.json").write_text(json.dumps({"voxelsize": 2.0}))
+        self.location = f"{self.url}/store.zarr"
 
-        def read_node_file(location, name, access):
-            self.reads.append(name)
-            text = self.documents.get(name)
-            return None if text is None else text.encode()
-
-        def catalog_entry(location, offline, refresh=False):
-            self.catalogs.append(location)
-            return _catalog.parse(json.dumps(self.catalog)).volume_at(location), True
-
-        for name, value in (("read_node_file", read_node_file), ("_catalog_entry", catalog_entry)):
-            patcher = mock.patch.object(store_metadata, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.spec = {"cache_dirs": [self.tmp.name], "cache_writes": True, "offline": False}
-
-    def read(self, **options):
-        return store_metadata.read_store_metadata(URL, Access("anonymous"), self.spec, **options)
-
-    def test_both_sources_merge_and_the_store_wins(self):
-        self.documents["metadata.json"] = json.dumps({"tomo": {"acquisition": {
-            "energy": 78.0, "beamline": "bm18", "detector": {"samplePixelSize": 0.002399}}}})
-        metadata = self.read()
-        self.assertAlmostEqual(metadata.voxel_size_um, 2.399)  # the store's own
-        self.assertEqual(metadata.energy_kev, 78.0)
-        self.assertEqual(metadata.detector_distance_mm, 150.0)  # only the catalog has it
-        self.assertEqual(metadata.beamline, "bm18")
-        self.assertEqual((metadata.sample_id, metadata.volume_id, metadata.scan_id), ("S1", "V1", "SCAN1"))
-        self.assertEqual(sorted(metadata.documents), ["catalog", "metadata.json"])
-
-    def test_catalog_fills_a_store_that_says_nothing(self):
-        self.assertEqual(self.read().voxel_size_um, 2.4)
-
-    def test_sources_are_consulted_only_the_first_time(self):
-        first = self.read()
-        self.assertEqual(len(self.catalogs), 1)
-        reads = len(self.reads)
-        self.assertEqual(self.read(), first)  # this process
-        store_metadata._known.clear()
-        self.assertEqual(self.read(), first)  # a later process: the disk cache
-        self.assertEqual(len(self.catalogs), 1)
-        self.assertEqual(len(self.reads), reads)
-
-    def test_without_a_disk_cache_the_process_remembers(self):
-        self.spec = {"cache_dirs": [], "cache_writes": True, "offline": False}
-        self.read()
-        self.read()
-        self.assertEqual(len(self.catalogs), 1)
-
-    def test_an_unreachable_catalog_is_tried_again(self):
-        with mock.patch.object(store_metadata, "_catalog_entry", lambda location, offline, refresh=False: (None, False)):
-            self.assertIsNone(self.read().voxel_size_um)
-        self.assertEqual(self.read().voxel_size_um, 2.4)
-
-    def test_a_failed_read_is_not_kept(self):
-        real = store_metadata.read_node_file
-
-        def down(location, name, access):
-            raise OSError("connection reset")
-
-        with mock.patch.object(store_metadata, "read_node_file", down):
-            self.read()
-        store_metadata._known.clear()
-        self.documents["metadata.json"] = json.dumps({"voxelsize": 2.399})
-        self.assertIs(store_metadata.read_node_file, real)
-        self.assertEqual(self.read().voxel_size_um, 2.399)
-
-    def test_refresh_replaces_what_was_kept(self):
-        self.documents["metadata.json"] = json.dumps({"voxelsize": 2.399})
-        self.assertEqual(self.read().voxel_size_um, 2.399)
-        self.documents["metadata.json"] = json.dumps({"voxelsize": 2.5})
-        self.assertEqual(self.read().voxel_size_um, 2.399)  # kept
-        self.assertEqual(self.read(refresh=True).voxel_size_um, 2.5)
-        self.assertEqual(len(self.catalogs), 2)
-        self.assertEqual(self.read().voxel_size_um, 2.5)
-        store_metadata._known.clear()
-        self.assertEqual(self.read().voxel_size_um, 2.5)  # replaced on disk too
-
-    def test_a_failed_refresh_keeps_what_was_kept(self):
-        self.documents["metadata.json"] = json.dumps({"voxelsize": 2.399})
-        self.read()
-
-        def down(location, name, access):
-            raise OSError("connection reset")
-
-        with mock.patch.object(store_metadata, "read_node_file", down):
-            self.assertEqual(self.read(refresh=True).voxel_size_um, 2.399)
-        store_metadata._known.clear()
-        self.assertEqual(self.read().voxel_size_um, 2.399)
-
-    def test_refresh_needs_the_network(self):
-        self.spec = {**self.spec, "offline": True}
+    def test_kept_with_the_volume_until_refresh(self):
+        self.assertEqual(open_group(self.location, cache_dir=self.cache).voxel_size, 2.0)
+        (self.store / "meta.json").write_text(json.dumps({"voxelsize": 3.0}))
+        self.assertEqual(ZarrReader.open(self.location, level=0, cache_dir=self.cache).voxel_size, 2.0)
+        _reader.forget_volume_metadata()  # a later process
+        self.assertEqual(ZarrReader.open(self.location, level=0, cache_dir=self.cache).voxel_size, 2.0)
+        self.assertEqual(ZarrReader.open(self.location, level=0, cache_dir=self.cache, refresh=True).voxel_size, 3.0)
+        self.assertEqual(open_group(self.location, cache_dir=self.cache).voxel_size, 3.0)
         with self.assertRaises(ValueError):
-            self.read(refresh=True)
+            open_group(self.location, cache_dir=self.cache, offline=True, refresh=True)
 
-    def test_vc3d_cache_keeps_it_with_the_volume(self):
-        with tempfile.TemporaryDirectory() as config, tempfile.TemporaryDirectory() as root:
-            Path(config, "VC3D.ini").write_text(f"[viewer]\nremote_cache_dir={root}\n")
-            with mock.patch.dict(os.environ, {"VC3D_CONFIG_DIR": config}):
-                self.spec = {"cache_dirs": ["vc3d"], "cache_writes": True, "offline": False}
-                first = self.read()
-                self.assertEqual(len(list(Path(root).rglob(".vc_reader_metadata.json"))), 1)
-                store_metadata._known.clear()
-                self.assertEqual(self.read(), first)
-                self.assertEqual(len(self.catalogs), 1)
-
-    def test_a_read_only_cache_directory_still_answers(self):
-        self.spec = {**self.spec, "cache_dirs": ["/proc/not-writable"]}
-        self.assertEqual(self.read().voxel_size_um, 2.4)
-        self.read()
-        self.assertEqual(len(self.catalogs), 1)
-
-
-class CatalogScopeTests(unittest.TestCase):
-    def test_only_public_channels_load_the_catalog(self):
-        with mock.patch.object(store_metadata, "_catalog_manifest", side_effect=AssertionError("catalog loaded")):
-            for url in ("s3://private-bucket/x.zarr", "https://example.com/x.zarr"):
-                self.assertEqual(store_metadata._catalog_entry(url, False), (None, True))
-        with mock.patch.object(store_metadata, "_catalog_manifest", return_value=None) as manifest:
-            store_metadata._catalog_entry("s3://vesuvius-challenge-open-data/x.zarr", False)
-        manifest.assert_called_once()
+    def test_offline_reads_what_was_kept(self):
+        open_group(self.location, cache_dir=self.cache).array("0").flush()
+        _reader.forget_volume_metadata()
+        (self.store / "meta.json").unlink()
+        self.assertEqual(open_group(self.location, cache_dir=self.cache, offline=True).voxel_size, 2.0)
 
 
 if __name__ == "__main__":

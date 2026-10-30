@@ -1,12 +1,14 @@
 // How remote arrays are requested: their request URLs and credentials, and
 // reading one metadata object of a node.
 #include "vc_reader/catalog.hpp"
+#include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
 
 #include <curl/curl.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <fstream>
 #include <map>
@@ -94,12 +96,6 @@ std::string lookup(const Ini& ini, const std::string& section, const std::string
     return k == s->second.end() ? std::string() : k->second;
 }
 
-// An s3:// location in a public channel has a published https form.
-bool publicChannel(const std::string& location)
-{
-    return catalog::openDataS3Url(catalog::resolveOpenDataUrl(location)).has_value();
-}
-
 std::size_t headerRegion(char* data, std::size_t size, std::size_t count, void* user)
 {
     const std::string line(data, size * count);
@@ -113,7 +109,21 @@ std::size_t headerRegion(char* data, std::size_t size, std::size_t count, void* 
     }
     return size * count;
 }
+
+std::string bucketRoot(const Access& access, const std::string& bucket)
+{
+    if (!access.endpoint.empty())
+        return access.endpoint + "/" + bucket + "/";
+    if (bucket.find('.') != std::string::npos)  // virtual-host names with dots fail TLS verification
+        return "https://s3." + access.auth.region + ".amazonaws.com/" + bucket + "/";
+    return "https://" + bucket + ".s3." + access.auth.region + ".amazonaws.com/";
+}
 }  // namespace
+
+bool isPublicLocation(const std::string& location)
+{
+    return catalog::openDataS3Url(catalog::resolveOpenDataUrl(location)).has_value();
+}
 
 bool isRemote(const std::string& location)
 {
@@ -133,14 +143,7 @@ std::string Access::url(const std::string& location) const
     if (kind != Kind::S3 || !location.starts_with("s3://"))
         return httpUrl(location);
     const auto [bucket, key] = splitS3(location);
-    std::string root;
-    if (!endpoint.empty())
-        root = endpoint + "/" + bucket + "/";
-    else if (bucket.find('.') != std::string::npos)  // virtual-host names with dots fail TLS verification
-        root = "https://s3." + auth.region + ".amazonaws.com/" + bucket + "/";
-    else
-        root = "https://" + bucket + ".s3." + auth.region + ".amazonaws.com/";
-    return root + percentEncode(key);
+    return bucketRoot(*this, bucket) + percentEncode(key);
 }
 
 std::string Access::cacheUrl(const std::string& location) const
@@ -238,6 +241,8 @@ Access signedAccess(const std::string& location, Auth keys, std::string endpoint
 
 Access s3Access(const std::string& location, Auth keys, std::string endpoint)
 {
+    if (!location.starts_with("s3://"))
+        throw std::invalid_argument("S3 credentials need an s3:// URL, not '" + location + "'");
     return signedAccess(location, std::move(keys), std::move(endpoint), {});
 }
 
@@ -249,6 +254,79 @@ Access basicAccess(std::string user, std::string password)
     return access;
 }
 
+void reloadEnvironmentKeys(Access& access)
+{
+    if (!access.fromEnvironment)
+        return;
+    const auto keys = awsCredentials();
+    if (!keys)
+        throw HttpDenied("no AWS credentials found (environment, AWS_PROFILE or ~/.aws)");
+    access.auth.user = keys->user;
+    access.auth.secret = keys->secret;
+    access.auth.token = keys->token;
+}
+
+std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& path)
+{
+    std::ifstream in(path);
+    if (!in)
+        throw std::filesystem::filesystem_error("cannot read credentials", path, std::error_code(errno, std::generic_category()));
+    const auto data = nlohmann::json::parse(in);
+    if (!data.is_object())
+        throw std::invalid_argument(path.string() + ": expected a JSON object");
+    const auto& root = data.contains("auth") && data.at("auth").is_object() ? data.at("auth") : data;
+    const auto field = [&](const char* name) {
+        const auto it = root.find(name);
+        return it == root.end() || it->is_null() ? std::optional<std::string>{}
+                                                 : std::optional<std::string>(it->is_string() ? it->get<std::string>() : it->dump());
+    };
+    auto user = field("username");
+    if (!user)
+        user = field("user");
+    const auto password = field("password");
+    if (!user || user->empty() || !password)
+        throw std::invalid_argument(path.string() + ": needs 'username' (or 'user') and 'password'");
+    return {*user, *password};
+}
+
+std::vector<std::string> listChildren(const Access& access, const std::string& location)
+{
+    const auto s3 = location.starts_with("s3://") ? std::optional<std::string>(location) : catalog::openDataS3Url(location);
+    if (!s3)
+        throw std::invalid_argument("cannot list " + location + ": plain HTTP has no listing and the group has no "
+                                    "consolidated .zmetadata; open its children by name");
+    const auto [bucket, key] = splitS3(*s3);
+    auto origin = access.kind == Access::Kind::S3 ? bucketRoot(access, bucket) : "https://" + bucket + ".s3.amazonaws.com/";
+    origin.pop_back();
+    auto prefixKey = key;
+    while (!prefixKey.empty() && prefixKey.back() == '/')
+        prefixKey.pop_back();
+    if (!prefixKey.empty())
+        prefixKey += '/';
+    const s3::Prefix prefix{origin, prefixKey};
+    HttpOptions options;
+    options.connections = 1;
+    options.auth = access.auth;
+    HttpClient http(options);
+    std::vector<std::string> names;
+    std::string token;
+    do {
+        std::vector<std::uint8_t> body;
+        if (!http.get(s3::listUrl(prefix, "/", token), body))
+            throw NotFound("cannot list " + *s3 + ": bucket not found");
+        const auto page = s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
+        for (const auto& child : page.commonPrefixes) {
+            auto name = child.substr(prefixKey.size());
+            while (!name.empty() && name.back() == '/')
+                name.pop_back();
+            if (!name.empty())
+                names.push_back(std::move(name));
+        }
+        token = page.nextContinuationToken;
+    } while (!token.empty());
+    return names;
+}
+
 Access resolveAccess(const std::string& location, AuthMode mode, bool offline)
 {
     const bool s3 = location.starts_with("s3://");
@@ -257,7 +335,7 @@ Access resolveAccess(const std::string& location, AuthMode mode, bool offline)
     // Cached reads need neither signing credentials nor a bucket region.
     if (offline && s3)
         return {};
-    if (mode == AuthMode::Auto && (!s3 || publicChannel(location)))
+    if (mode == AuthMode::Auto && (!s3 || isPublicLocation(location)))
         return {};
     if (!s3)
         throw std::invalid_argument("AWS credentials need an s3:// URL, not '" + location + "'");
@@ -265,12 +343,14 @@ Access resolveAccess(const std::string& location, AuthMode mode, bool offline)
     if (!keys) {
         if (mode == AuthMode::Auto)  // no credentials: anonymous, as for a public bucket
             return {};
-        throw std::runtime_error("no AWS credentials found (environment, AWS_PROFILE or ~/.aws)");
+        throw HttpDenied("no AWS credentials found (environment, AWS_PROFILE or ~/.aws)");
     }
     // The bucket's own region, then AWS_REGION, then the profile's.
     const auto profileRegion = std::move(keys->region);
     keys->region.clear();
-    return signedAccess(location, std::move(*keys), {}, profileRegion);
+    auto access = signedAccess(location, std::move(*keys), {}, profileRegion);
+    access.fromEnvironment = true;
+    return access;
 }
 
 MetadataReader metadataReader(const Access& access, int connections)
@@ -281,9 +361,14 @@ MetadataReader metadataReader(const Access& access, int connections)
     auto http = std::make_shared<HttpClient>(options);
     return [access, http](const std::string& location, const std::string& name) -> std::optional<std::string> {
         if (!isRemote(location)) {
-            std::ifstream in(std::filesystem::path(location) / name, std::ios::binary);
-            if (!in)
+            const auto path = std::filesystem::path(location) / name;
+            std::error_code ec;
+            const auto status = std::filesystem::status(path, ec);
+            if (status.type() == std::filesystem::file_type::not_found)
                 return std::nullopt;
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                throw std::filesystem::filesystem_error("cannot read", path, std::error_code(errno, std::generic_category()));
             std::ostringstream text;
             text << in.rdbuf();
             return text.str();

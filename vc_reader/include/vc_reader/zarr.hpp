@@ -18,12 +18,20 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vcr::zarr {
 using Json = nlohmann::json;
+
+// There is no Zarr array or group at a location.
+struct NotFound : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // http(s)://, s3://, s3+REGION:// and sftp:// / ssh:// locations.
 bool isRemote(const std::string& location);
@@ -72,6 +80,9 @@ struct Access {
     Kind kind = Kind::Anonymous;
     Auth auth;             // the credentials handed to the HTTP client
     std::string endpoint;  // S3-compatible server (path-style URLs); empty for AWS
+    // The keys came from the environment: a copy in another process reads them again
+    // (see reloadEnvironmentKeys) rather than carrying them.
+    bool fromEnvironment = false;
 
     // The URL to GET for a remote location.
     std::string url(const std::string& location) const;
@@ -88,13 +99,25 @@ Access resolveAccess(const std::string& location, AuthMode mode = AuthMode::Auto
 // Fixed S3 keys (auth.kind "s3"). An empty region asks the bucket, then AWS_REGION.
 Access s3Access(const std::string& location, Auth keys, std::string endpoint = {});
 Access basicAccess(std::string user, std::string password);
+// Reads the keys of an Access resolved from the environment again, keeping its region.
+// HttpDenied when the environment no longer has any.
+void reloadEnvironmentKeys(Access& access);
+// (user, password) from a JSON file {"username": ..., "password": ...}: the fields may
+// sit under an "auth" object, and "user" is accepted for "username".
+std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& path);
+// Whether a location is in a public channel of the Open Data bucket.
+bool isPublicLocation(const std::string& location);
+// The immediate children of an s3:// location or one in a public channel (ListObjectsV2).
+// Throws std::invalid_argument for anything else: plain HTTP has no listing.
+std::vector<std::string> listChildren(const Access& access, const std::string& location);
 // AWS keys from AWS_ACCESS_KEY_ID/..., then the AWS_PROFILE (or default) profile of
 // the shared credentials and config files. kind is "s3"; region is the profile's.
 std::optional<Auth> awsCredentials(const std::string& profile = {});
 // A bucket's region from S3's x-amz-bucket-region header (cached); nullopt if unknown.
 std::optional<std::string> bucketRegion(const std::string& bucket);
 
-// Reads one metadata object (e.g. ".zarray") of a node. nullopt only when it does not exist.
+// Reads one metadata object (e.g. ".zarray") of a node. nullopt only when it does not
+// exist; any other failure throws (std::filesystem::filesystem_error for a local one).
 using MetadataReader = std::function<std::optional<std::string>(const std::string& location, const std::string& name)>;
 MetadataReader metadataReader(const Access& access, int connections = 4);
 
@@ -217,11 +240,22 @@ struct OpenedArray {
     int writer = -1;
     LevelPlacement placement;  // set by Group::array and openPyramidLevel
     std::unique_ptr<Array> array;
+    std::string store;         // the group holding this level, else the array's own location
+    std::string levelKey;      // the array's path in `store`; empty for a root array
+    std::vector<std::string> busy;  // VC3D caches skipped: another process is replacing them
+    bool attributesRead = false;    // `attributes` holds what the array's .zattrs say
+
+    // Finishes queued cache writes and releases VC3D's leases. Reads must have ended.
+    void close();
 };
+// The array's attributes, read on first use (and then kept with a writable cache for
+// opening offline). CacheMiss offline when no cache holds them.
+const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options);
 
 struct ArrayHints {
     std::optional<std::string> group, levelKey;  // inferred from a digits-only last path part when absent
     std::optional<Json> metadata;                // already-read .zarray/zarr.json
+    std::optional<Json> attributes;              // already-read array attributes
 };
 OpenedArray openArray(const std::string& location, const OpenOptions& options, ArrayHints hints = {});
 
@@ -243,9 +277,22 @@ struct PyramidLevelInfo {
 std::vector<PyramidLevelInfo> pyramidLevels(const std::string& location, const OpenOptions& options,
                                             int probeLevels = 32);
 
+// Where the level at `path` sits (see LevelPlacement), from the attributes of the group
+// holding it; the identity for paths that are not pyramid levels. Throws
+// std::invalid_argument for OME metadata that cannot place it.
+LevelPlacement levelPlacement(const Json& groupAttributes, const std::string& path);
+
+struct StoreMetadata;
+
 class Group {
 public:
     static Group open(const std::string& location, OpenOptions options);
+    // A group as state() saved it, without any request.
+    static Group fromState(const Json& state, OpenOptions options);
+    // What fromState needs: the attributes and every lookup made so far. `inherited`:
+    // called in a forked process, where another thread of the parent may have held the
+    // lock when it forked (no other thread can be using the group here).
+    Json state(bool inherited = false) const;
 
     const std::string& location() const { return location_; }
     const Json& attributes() const { return attributes_; }
@@ -258,9 +305,14 @@ public:
     // groups without an index stop at the first absent level unless probeLevels
     // is positive, in which case all levels [0, probeLevels) are checked.
     std::vector<std::string> levels(int probeLevels = 0);
-    // The placement of the level at a path (see LevelPlacement); the identity for
-    // paths that are not pyramid levels.
+    // The placement of the level at a path (see levelPlacement).
     LevelPlacement placement(const std::string& path) const;
+    // Names of the arrays and groups directly in this group, sorted: from the directory,
+    // consolidated metadata or the caches when offline, else by listing the S3 prefix.
+    // Throws std::invalid_argument for plain HTTP, which has no listing.
+    std::vector<std::string> keys();
+    // The volume's metadata (see volumeMetadata), memoized with the group.
+    const StoreMetadata& metadata(bool refresh = false);
 
     enum class NodeKind { Array, Group };
     // The child at a path, its metadata when it is an array; nullopt when absent.
@@ -278,6 +330,8 @@ private:
     int version_ = 2;
     std::map<std::string, std::optional<std::pair<NodeKind, Json>>> nodes_;
     std::optional<std::optional<Json>> consolidated_;
+    std::shared_ptr<const StoreMetadata> metadata_;
+    std::shared_ptr<std::recursive_mutex> mutex_ = std::make_shared<std::recursive_mutex>();  // lookups may come from any thread
 };
 
 // ---- writing --------------------------------------------------------------------------
@@ -366,7 +420,8 @@ struct StoreMetadata {
     // zarr_export: the source values the stored range spans, and the Z range kept.
     std::optional<std::array<double, 2>> valueWindow;
     std::optional<std::array<std::int64_t, 2>> zCrop;
-    Json documents = Json::object();  // file name -> the document as published
+    std::string sampleId, volumeId, scanId, name, createdAt, dataFormat;  // from the Open Data catalog
+    Json documents = Json::object();  // file name (.zattrs too) or "catalog" -> the document as published
 };
 // The metadata of the store at `location` (or a numbered level of one). A missing,
 // unreadable or malformed document does not end the search; this never throws. The
@@ -376,6 +431,18 @@ inline std::optional<double> storeVoxelSizeUm(const std::string& location, const
 {
     return storeMetadata(location, read).voxelSizeUm;
 }
+// Everything known about the volume at `location`: its sidecar documents and, for a store
+// in a public channel, the Open Data catalog, one value per field with the store's
+// documents winning. A remote store's result is gathered only the first time: it is kept
+// with the volume in the disk caches (and for this process), and a kept copy is trusted
+// like a chunk. A local store's documents are read at each call. `refresh` reads both
+// sources as published now and replaces what was kept; if a source cannot be read, nothing
+// kept changes and the kept metadata is returned when there is one.
+StoreMetadata volumeMetadata(const std::string& location, const OpenOptions& options, bool refresh = false);
+// Drops what this process remembers (not what is kept on disk).
+void forgetVolumeMetadata();
+Json storeMetadataJson(const StoreMetadata& metadata);
+StoreMetadata storeMetadataFromJson(const Json& json);
 
 // ---- writing pyramids -----------------------------------------------------------------
 

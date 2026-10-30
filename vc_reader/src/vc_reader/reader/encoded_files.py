@@ -81,8 +81,7 @@ class EncodedFiles:
         if location not in self._access:
             self._access[location] = resolve_access(location, self.auth)
         access = self._access[location]
-        fd, received = budget.open_file(decoded_cache_path(root, location), access.url(location),
-                                        access.auth_tuple())
+        fd, received = budget.open_file(decoded_cache_path(root, location), location, access)
         self.bytes_read += received
         if fd < 0:
             raise FileNotFoundError(f'{location}: remote image does not exist')

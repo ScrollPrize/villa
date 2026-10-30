@@ -53,7 +53,7 @@ MetadataReader reader(const OpenOptions& options)
     return options.metadata ? options.metadata : metadataReader(options.access);
 }
 
-Json arrayAttributes(const ArrayMeta& meta)
+Json v3Attributes(const ArrayMeta& meta)
 {
     if (!meta.v3)
         return Json::object();
@@ -77,9 +77,11 @@ struct AxisMap {
     bool scaled = false, translated = false;
 };
 
-// The three spatial axes, as indices into the OME axes (or the last three of `rank`
-// when axes are not declared).
-std::array<std::size_t, 3> spatialAxes(const Json& multiscale, std::size_t rank)
+// Where ZYX of a placement come from in the OME axes, nullopt for a leading axis the
+// array does not have (a 2-D image): (the spatial axes, or the last three of `rank` when
+// axes are not declared.)
+using SpatialAxes = std::array<std::optional<std::size_t>, 3>;
+SpatialAxes spatialAxes(const Json& multiscale, std::size_t rank)
 {
     std::vector<std::size_t> axes;
     const auto list = multiscale.value("axes", Json::array());
@@ -90,15 +92,17 @@ std::array<std::size_t, 3> spatialAxes(const Json& multiscale, std::size_t rank)
         if (type == "space" || (type.empty() && (name == "z" || name == "y" || name == "x")))
             axes.push_back(i);
     }
-    if (list.empty() && rank >= 3)
-        for (std::size_t i = rank - 3; i < rank; ++i)
+    if (list.empty())
+        for (std::size_t i = rank > 3 ? rank - 3 : 0; i < rank; ++i)
             axes.push_back(i);
-    if (axes.size() != 3)
-        throw std::invalid_argument("OME multiscales need exactly three spatial axes to place pyramid levels");
-    return {axes[0], axes[1], axes[2]};
+    if (axes.empty() || axes.size() > 3)
+        throw std::invalid_argument("OME multiscales need one to three spatial axes to place pyramid levels");
+    SpatialAxes out;
+    std::copy(axes.begin(), axes.end(), out.begin() + std::ptrdiff_t(3 - axes.size()));
+    return out;
 }
 
-AxisMap datasetMap(const Json& dataset, const std::array<std::size_t, 3>& axes)
+AxisMap datasetMap(const Json& dataset, const SpatialAxes& axes)
 {
     AxisMap m;
     for (const auto& t : dataset.value("coordinateTransformations", Json::array())) {
@@ -109,9 +113,11 @@ AxisMap datasetMap(const Json& dataset, const std::array<std::size_t, 3>& axes)
             throw std::invalid_argument("unsupported OME dataset transformation '" + type + "'");
         const auto& v = t.at(type);
         for (int k = 0; k < 3; ++k) {
-            if (!v.is_array() || axes[k] >= v.size() || !v[axes[k]].is_number())
+            if (!axes[k])
+                continue;
+            if (!v.is_array() || *axes[k] >= v.size() || !v[*axes[k]].is_number())
                 throw std::invalid_argument("OME " + type + " does not cover the spatial axes");
-            const double x = v[axes[k]].get<double>();
+            const double x = v[*axes[k]].get<double>();
             if (!std::isfinite(x) || (type == "scale" && !(x > 0)))
                 throw std::invalid_argument("OME " + type + " values must be finite (and scales positive)");
             if (type == "scale") {
@@ -193,11 +199,18 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         if (!meta) {
             meta = readJsonNode(read, location, "zarr.json");
             if (!meta || meta->value("node_type", "") != "array")
-                throw std::runtime_error("no Zarr array at " + location + " (.zarray/zarr.json not found)");
+                throw NotFound("no Zarr array at " + location + " (.zarray/zarr.json not found)");
         }
         out.meta = parseArrayMeta(*meta);
     }
-    out.attributes = arrayAttributes(out.meta);
+    out.store = group.value_or(location);
+    out.levelKey = levelKey.value_or("");
+    out.attributes = v3Attributes(out.meta);
+    out.attributesRead = out.meta.v3.has_value();
+    if (hints.attributes) {
+        out.attributes = std::move(*hints.attributes);
+        out.attributesRead = true;
+    }
     // Offline, chunks only come from the caches: the source compressor never decodes anything.
     const std::string codec = offline ? std::string() : out.meta.codec();
 
@@ -226,6 +239,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
             auto layers = openLayers(options.cacheDirs, keyUrl, out.meta, layerOptions);
             out.layers = std::move(layers.layers);
             out.writer = layers.writer;
+            out.busy = std::move(layers.busy);
         }
         if (offline && out.layers.empty())
             throw CacheMiss("no disk cache of " + location + " (offline)");
@@ -266,6 +280,55 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     }
     out.array = std::make_unique<Array>(std::move(spec), options.memoryCache);
     return out;
+}
+
+void OpenedArray::close()
+{
+    if (array)
+        array->flush();
+    for (auto& layer : layers)
+        layer.lease.reset();
+}
+
+namespace {
+constexpr const char* kSourceAttributes = ".vc_reader_source_attrs.json";
+
+void keepAttributes(const OpenedArray& array)
+{
+    if (array.writer < 0)
+        return;
+    try {
+        // The .zattrs of a decoded cache belongs to the cache, not the source.
+        atomicWrite(fs::path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes, array.attributes.dump());
+    } catch (const std::exception&) {
+        // A read-only cache: the attributes are still known to this reader.
+    }
+}
+}  // namespace
+
+const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options)
+{
+    if (array.attributesRead)
+        return array.attributes;
+    if (options.offline && isRemote(array.location)) {
+        auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(array.location));
+        if (options.vc3dVolumeDir && !array.levelKey.empty())
+            dirs.insert(dirs.begin(), *options.vc3dVolumeDir / array.levelKey);
+        for (const auto& dir : dirs) {
+            std::ifstream in(dir / kSourceAttributes);
+            if (in) {
+                array.attributes = Json::parse(in);
+                array.attributesRead = true;
+                return array.attributes;
+            }
+        }
+        throw CacheMiss("array attributes for " + array.location + " are not cached (offline)");
+    }
+    const auto text = reader(options)(array.location, ".zattrs");
+    array.attributes = text ? Json::parse(*text) : Json::object();
+    array.attributesRead = true;
+    keepAttributes(array);
+    return array.attributes;
 }
 
 // ---- groups ---------------------------------------------------------------------------
@@ -321,7 +384,7 @@ Group Group::open(const std::string& input, OpenOptions options)
             throw std::invalid_argument(location + " is an array, not a group");
         // Zarr v2 permits implicit parent groups in local hierarchies.
         if (remote || localNumberedChildren(location).empty())
-            throw std::runtime_error("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
+            throw NotFound("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
     }
     Json attrs = zattrs ? Json::parse(*zattrs) : Json::object();
     if (remote && options.cacheWrites) {
@@ -360,18 +423,106 @@ Group Group::open(const std::string& input, OpenOptions options)
     return Group(location, std::move(options), std::move(attrs), version);
 }
 
+Group Group::fromState(const Json& state, OpenOptions options)
+{
+    Group group(state.at("location").get<std::string>(), std::move(options), state.at("attributes"), state.at("version").get<int>());
+    for (const auto& [key, node] : state.at("nodes").items()) {
+        auto& entry = group.nodes_[key];
+        if (!node.is_null())
+            entry = {node.at(0).get<std::string>() == "array" ? NodeKind::Array : NodeKind::Group, node.at(1)};
+    }
+    if (const auto it = state.find("consolidated"); it != state.end())
+        group.consolidated_ = it->is_null() ? std::optional<Json>{} : std::optional<Json>(*it);
+    return group;
+}
+
+Json Group::state(bool inherited) const
+{
+    std::unique_lock lock(*mutex_, std::defer_lock);
+    if (!inherited)
+        lock.lock();
+    Json nodes = Json::object();
+    for (const auto& [key, node] : nodes_)
+        nodes[key] = node ? Json::array({node->first == NodeKind::Array ? "array" : "group", node->second}) : Json();
+    Json out{{"location", location_}, {"attributes", attributes_}, {"version", version_}, {"nodes", std::move(nodes)}};
+    if (consolidated_)
+        out["consolidated"] = consolidated_->value_or(Json());
+    return out;
+}
+
+namespace {
+Json multiscalesOf(const Json& attributes)
+{
+    Json ms = attributes.value("multiscales", Json());
+    if (ms.is_null() && attributes.contains("ome"))
+        ms = attributes.at("ome").value("multiscales", Json());
+    return ms.is_array() ? ms : Json::array();
+}
+
+bool isNodeDir(const fs::path& path)
+{
+    std::error_code ec;
+    for (const auto* name : {".zarray", ".zgroup", ".zattrs", "zarr.json"})
+        if (fs::is_regular_file(path / name, ec))
+            return true;
+    return false;
+}
+}  // namespace
+
 Json Group::multiscales() const
 {
-    Json ms = attributes_.value("multiscales", Json());
-    if (ms.is_null() && attributes_.contains("ome"))
-        ms = attributes_.at("ome").value("multiscales", Json());
-    return ms.is_array() ? ms : Json::array();
+    return multiscalesOf(attributes_);
+}
+
+const StoreMetadata& Group::metadata(bool refresh)
+{
+    std::lock_guard lock(*mutex_);
+    if (!metadata_ || refresh)
+        metadata_ = std::make_shared<const StoreMetadata>(volumeMetadata(location_, options_, refresh));
+    return *metadata_;
+}
+
+std::vector<std::string> Group::keys()
+{
+    std::lock_guard lock(*mutex_);
+    std::set<std::string> names;
+    const auto meta = consolidated();
+    const auto scan = [&](const fs::path& directory, bool skipHidden) {
+        for (const auto& entry : fs::directory_iterator(directory)) {
+            const auto name = entry.path().filename().string();
+            if (entry.is_directory() && !(skipHidden && name.starts_with(".")) && isNodeDir(entry.path()))
+                names.insert(name);
+        }
+    };
+    if (meta && meta->is_object()) {
+        for (const auto& [key, value] : meta->items()) {
+            const auto slash = key.find('/');
+            if (slash == std::string::npos || key.find('/', slash + 1) != std::string::npos)
+                continue;
+            const auto leaf = key.substr(slash + 1);
+            if (leaf == ".zarray" || leaf == ".zgroup" || leaf == ".zattrs")
+                names.insert(key.substr(0, slash));
+        }
+    } else if (!isRemote(location_)) {
+        scan(location_, false);
+    } else if (options_.offline) {
+        for (const auto& d : cachedNodeDirs(options_.cacheDirs, options_.access.cacheUrl(location_)))
+            scan(d, true);
+        if (options_.vc3dVolumeDir && fs::is_directory(*options_.vc3dVolumeDir))
+            scan(*options_.vc3dVolumeDir, true);
+    } else {
+        for (const auto& name : listChildren(options_.access, location_))
+            if (node(name))
+                names.insert(name);
+    }
+    return {names.begin(), names.end()};
 }
 
 std::vector<std::string> Group::levels(int probeLevels)
 {
     if (probeLevels < 0)
         throw std::invalid_argument("probeLevels must be nonnegative");
+    std::lock_guard lock(*mutex_);
     std::vector<std::string> out;
     const auto ms = multiscales();
     if (!ms.empty()) {
@@ -418,7 +569,12 @@ std::vector<std::string> Group::levels(int probeLevels)
 
 LevelPlacement Group::placement(const std::string& path) const
 {
-    const auto ms = multiscales();
+    return levelPlacement(attributes_, path);
+}
+
+LevelPlacement levelPlacement(const Json& attributes, const std::string& path)
+{
+    const auto ms = multiscalesOf(attributes);
     if (ms.empty())
         return digits(path) ? blockReduced(levelNumber(path)) : LevelPlacement{};
     const auto datasets = ms.at(0).value("datasets", Json::array());
@@ -520,6 +676,7 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
 
 std::optional<Json> Group::consolidated()
 {
+    std::lock_guard lock(*mutex_);
     if (!consolidated_) {
         std::optional<Json> metadata;
         if (!(options_.offline && isRemote(location_)) && version_ == 2)
@@ -546,6 +703,7 @@ std::optional<std::pair<Group::NodeKind, Json>> Group::node(const std::string& i
             throw std::invalid_argument("invalid child path '" + input + "'");
         b = e + 1;
     }
+    std::lock_guard lock(*mutex_);
     if (const auto it = nodes_.find(key); it != nodes_.end())
         return it->second;
     const auto location = location_ + "/" + key;
@@ -598,8 +756,11 @@ OpenedArray Group::array(const std::string& key)
     hints.metadata = n->second;
     auto out = openArray(location_ + "/" + key, options_, std::move(hints));
     out.placement = placement(key);
-    if (const auto meta = consolidated(); meta && meta->contains(key + "/.zattrs"))
-        out.attributes = meta->at(key + "/.zattrs");
+    if (const auto meta = consolidated()) {
+        out.attributes = meta->value(key + "/.zattrs", Json::object());
+        out.attributesRead = true;
+        keepAttributes(out);
+    }
     return out;
 }
 

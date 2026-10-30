@@ -1,18 +1,13 @@
-"""Zarr array metadata normalized for source chunks and decoded disk caches."""
+"""Zarr array metadata: NumPy's view of what the native reader parsed."""
 
 from __future__ import annotations
 
-import json
-import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import numpy as np
 
-#: Compressors the C++ reader decodes, by numcodecs id (None: uncompressed).
-SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "zstd": "zstd", "zlib": "zlib", "gzip": "gzip", "lz4": "lz4",
-                         "lzw": "lzw", "imagecodecs_lzw": "lzw", "vc-delta3d": "vc-delta3d",
-                         "volcomp": "volcomp"}
+from .. import _reader
 
 
 @dataclass(frozen=True)
@@ -26,33 +21,17 @@ class ArrayMeta:
     compressor: Mapping[str, Any] | None = None
     filters: tuple[Mapping[str, Any], ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    _native: Any = field(default=None, compare=False, repr=False)
+
+    @classmethod
+    def from_native(cls, native) -> ArrayMeta:
+        dtype = np.dtype(native.dtype)
+        return cls(tuple(native.shape), tuple(native.chunks), dtype, np.frombuffer(native.fill, dtype=dtype)[0].item(),
+                   native.order, native.separator, native.compressor, tuple(native.filters or ()), native.raw, native)
 
     @classmethod
     def from_zarray(cls, d: Mapping[str, Any]) -> ArrayMeta:
-        if d.get('zarr_format') == 3:
-            from .zarr_v3 import normalize
-            d = normalize(d)
-        if d.get("zarr_format") != 2:
-            raise ValueError(f"only Zarr v2/v3 arrays are supported, got zarr_format={d.get('zarr_format')!r}")
-        dtype = np.dtype(d["dtype"])
-        if dtype.hasobject:
-            raise ValueError(f"object dtype {dtype} is not supported")
-        fill = d.get("fill_value")
-        return cls(
-            shape=tuple(int(n) for n in d["shape"]),
-            chunks=tuple(int(n) for n in d["chunks"]),
-            dtype=dtype,
-            fill_value=0 if fill is None else np.asarray(fill, dtype=dtype).item(),
-            order=d.get("order") or "C",
-            separator=d.get("dimension_separator") or ".",
-            compressor=d.get("compressor"),
-            filters=tuple(d.get("filters") or ()),
-            raw=d,
-        )
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> ArrayMeta:
-        return cls.from_zarray(json.loads(data))
+        return cls.from_native(_reader.parse_array_meta(dict(d)))
 
     @property
     def ndim(self) -> int:
@@ -60,23 +39,13 @@ class ArrayMeta:
 
     @property
     def chunk_nbytes(self) -> int:
-        return math.prod(self.chunks) * self.dtype.itemsize
+        return self._native.chunk_nbytes
 
     @property
     def codec_id(self) -> str:
-        """The C++ reader's id for this array's compressor; ValueError if it cannot read the chunks."""
-        cid = self.compressor.get("id") if self.compressor else None
-        if cid not in SUPPORTED_COMPRESSORS:
-            raise ValueError(f"vc_reader cannot read arrays compressed with {cid!r} "
-                             f"(supported: uncompressed, {', '.join(c for c in SUPPORTED_COMPRESSORS if c)})")
-        if self.filters:
-            raise ValueError("vc_reader cannot read arrays with numcodecs filters")
-        if self.order != "C":
-            raise ValueError("vc_reader cannot read arrays stored in Fortran order")
-        return SUPPORTED_COMPRESSORS[cid]
+        """The native reader's id for this array's compressor; ValueError if it cannot read the chunks."""
+        return self._native.codec()
 
     def decoded_zarray(self) -> dict[str, Any]:
         """``.zarray`` of the same array stored uncompressed (the decoded-cache layout)."""
-        result = dict(self.raw, compressor=None, filters=None, order="C")
-        result.pop('_vc_reader_v3', None)
-        return result
+        return self._native.decoded_zarray()

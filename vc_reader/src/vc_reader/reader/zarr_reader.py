@@ -4,8 +4,8 @@ All reading happens in the compiled extension (``vc_reader._reader``, C++): loca
 chunk files through persistent memory maps (or ``pread``), HTTP fetches with
 libcurl, raw / blosc / vc-delta3d decoding, disk-cache reads and appends in
 each cache's own format, an in-memory LRU, and assembly into the outputs, on
-C++ threads without the GIL. Python finds the caches, checks them against
-the remote ``.zarray`` and holds VC3D's lease.
+C++ threads without the GIL. Opening is native too (``vcr::zarr::openArray``):
+this module adds NumPy indexing and conversion, and handling of fork and pickle.
 
 Values are exactly the stored values; missing chunks and out-of-bounds regions
 read as ``fill_value``.
@@ -29,41 +29,33 @@ reopened the same way.
 
 from __future__ import annotations
 
-import json
 import operator
 import os
+import warnings
 import weakref
-from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
 
 from .. import _reader
-from ..errors import CacheMissError
-from .auth import Access, http_url, is_remote, resolve_access
-from .disk_cache import CacheLayer, cached_source_zarray, open_layers, cached_node_dirs, atomic_write, disk_budget
+from .auth import http_url, is_remote, resolve_access
 from .memory_cache import MemoryCache
 from ._indexing import parse_index, expand_index
+from .store_metadata import StoreMetadata
 from .zarr_meta import ArrayMeta
-
-READ_MODES = ("mmap", "slab")
 
 # C++ engines inherited through fork, kept alive and never touched: their
 # threads do not exist in the child, and their locks may have been held by them.
 _INHERITED: list[Any] = []
 
 
-from .transport import read_node_file, cache_url
-from .store_metadata import StoreMetadata, level_scale, read_store_metadata
-
-
-def _read_zarray(location: str, access: Access) -> ArrayMeta:
-    data = read_node_file(location, ".zarray", access)
-    if data is None:
-        data = read_node_file(location, 'zarr.json', access)
-        if data is None or json.loads(data).get('node_type') != 'array':
-            raise FileNotFoundError(f"no Zarr array at {location} (.zarray/zarr.json not found)")
-    return ArrayMeta.from_bytes(data)
+def _open_options(settings: dict[str, Any], cache: MemoryCache | None):
+    """The native options for these settings, in this process."""
+    return _reader.OpenOptions(
+        settings["access"], settings["cache_dirs"] or [], settings["cache_writes"], settings["cache_max_bytes"],
+        settings["compress_cache"], settings["allow_lossy_cache"], cache._engine if cache is not None else None,
+        settings["threads"] or (1 if _loader_worker() else 0), settings["connections"], settings["read_mode"],
+        settings["offline"])
 
 
 class ZarrReader:
@@ -75,82 +67,30 @@ class ZarrReader:
     reader rebuilds its C++ engine there (see the module docstring).
     """
 
-    def __init__(self, spec: dict[str, Any], cache: MemoryCache | None):
+    def __init__(self, settings: dict[str, Any], cache: MemoryCache | None, opened=None):
         self.memory_cache = cache
         self._pid = os.getpid()
-        self.location: str = spec["location"]
-        remote = is_remote(self.location)
-        self.access: Access = spec["access"]
-        self.offline: bool = bool(spec["offline"]) and remote
-        key_url = cache_url(self.location, self.access) if remote else self.location
-        group_url = cache_url(spec["group"], self.access) if remote and spec["group"] else None
-        if spec["meta"]:
-            self.meta = ArrayMeta.from_zarray(spec["meta"])
-        elif self.offline:
-            cached = cached_source_zarray(spec["cache_dirs"], key_url, group_url=group_url,
-                                          level_key=spec["level_key"])
-            if cached is None:
-                raise CacheMissError(f"{self.location} is not in the disk caches {spec['cache_dirs']} (offline)")
-            self.meta = ArrayMeta.from_zarray(cached)
-        else:
-            self.meta = _read_zarray(self.location, self.access)
-        self._spec = dict(spec, meta=dict(self.meta.raw))
-        self._attrs = spec.get("attrs")
-        v3 = self.meta.raw.get('_vc_reader_v3')
-        if v3 is not None and self._attrs is None:
-            self._attrs = dict(v3['metadata'].get('attributes', {}))
-            names = v3['metadata'].get('dimension_names')
-            if names is not None:
-                self._attrs['_ARRAY_DIMENSIONS'] = names
-        # Raises for arrays the C++ reader cannot decode; offline, chunks only come from the caches.
-        codec = "" if self.offline else self.meta.codec_id
-        self.cache_layers: list[CacheLayer] = []
-        self.write_layer: CacheLayer | None = None
-        layers: list[tuple] = []
-        write_index, remote_url = -1, ""
-        self._auth = auth_tuple = self.access.auth_tuple() if remote and not self.offline else ("", "", "", "", "")
-        if remote:
-            remote_url = self.access.url(self.location)
-            if spec["cache_dirs"]:
-                self.cache_layers, self.write_layer = open_layers(
-                    spec["cache_dirs"], key_url, self.meta, group_url=group_url, level_key=spec["level_key"],
-                    writable=spec["cache_writes"] and not self.offline,
-                    allow_lossy=spec["allow_lossy_cache"],
-                    compress=spec["compress_cache"], cache_max_bytes=spec["cache_max_bytes"])
-                layers = [layer.reader_spec() for layer in self.cache_layers]
-                if self.write_layer is not None:
-                    write_index = self.cache_layers.index(self.write_layer)
-            if self.offline and not self.cache_layers:
-                raise CacheMissError(f"no disk cache of {self.location} under {spec['cache_dirs']} (offline)")
-            # A shared decoded cache must not let quantized reads satisfy an
-            # exact reader, even when both open the same source URL.
-            identity = json.dumps((key_url, bool(spec["allow_lossy_cache"])))
-        else:
-            root = os.path.abspath(self.location)
-            layers = [] if v3 is not None else [("array", root, codec, "", False)]
-            identity = "file://" + root
-        threads = spec["threads"] or (1 if _loader_worker() else 32 if remote_url else min(16, os.cpu_count() or 4))
-        self.threads: int = threads
-        try:
-            budget = (disk_budget(self.write_layer.budget_root, spec["cache_max_bytes"])
-                      if self.write_layer is not None and self.write_layer.budget_root else None)
-            self._array = _reader.Array(
-                list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
-                np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
-                layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url or v3 else "",
-                auth=auth_tuple, offline=self.offline,
-                read_mode=spec["read_mode"], threads=threads,
-                connections=spec["connections"], cache=cache._engine if cache is not None else None,
-                disk_cache=budget,
-                source_root=(remote_url if remote else root) if v3 else '',
-                source_prefix=v3['prefix'] if v3 else '', shard_chunks=v3['shard_chunks'] if v3 else [],
-                shard_index_end=v3['index_end'] if v3 else True, shard_index_crc=v3['index_crc'] if v3 else False)
-        except BaseException:
-            for layer in self.cache_layers:
-                layer.close()
-            raise
+        self.location: str = settings["location"]
+        self.access = settings["access"]
+        self.offline: bool = bool(settings["offline"]) and is_remote(self.location)
+        self._options = _open_options(settings, cache)
+        if opened is None:
+            opened = _reader.open_array(self.location, self._options, settings["group"], settings["level_key"],
+                                        settings["meta"], settings["attrs"])
+        self._opened = opened
+        self._array = opened.array
+        self.threads: int = self._array.threads
+        self.meta = ArrayMeta.from_native(opened.meta)
+        self._settings = dict(settings, meta=self.meta.raw)
+        self._attrs = opened.known_attributes
+        self._metadata: StoreMetadata | None = settings["store_metadata"]
+        self.cache_layers = opened.layers
+        self.write_layer = self.cache_layers[opened.writer] if opened.writer >= 0 else None
+        for busy in opened.busy:
+            warnings.warn(f"VC3D cache {busy} is being replaced by another process (its lease is held "
+                          "exclusively); not using it", stacklevel=3)
         # Queued cache writes finish even if the reader is dropped without close().
-        self._finalizer = weakref.finalize(self, _shutdown, self._array, self.cache_layers, self._pid)
+        self._finalizer = weakref.finalize(self, _shutdown, opened, self._pid)
 
     # -- construction -----------------------------------------------------------
 
@@ -231,33 +171,30 @@ class ZarrReader:
         The reader works on background threads. In a process forked after this
         call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
         """
-        spec, cache = _make_spec(location, level=level, cache_dir=cache_dir, cache_writes=cache_writes,
-                                 cache_max_bytes=cache_max_bytes,
-                                 compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
-                                 memory_cache=memory_cache, threads=threads, connections=connections,
-                                 read_mode=read_mode, auth=auth, offline=offline)
-        reader = cls(spec, cache)
-        settings = reader._spec
-        store = settings["group"] or reader.location
-        metadata = settings["store_metadata"] = read_store_metadata(store, reader.access, settings, refresh=refresh)
-        if settings["group"]:
-            settings["level_scale"] = level_scale(metadata.documents.get(".zattrs", {}), settings["level_key"])
+        settings, cache = _make_settings(location, level=level, cache_dir=cache_dir, cache_writes=cache_writes,
+                                         cache_max_bytes=cache_max_bytes,
+                                         compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
+                                         memory_cache=memory_cache, threads=threads, connections=connections,
+                                         read_mode=read_mode, auth=auth, offline=offline)
+        reader = cls(settings, cache)
+        reader._metadata = StoreMetadata.from_json(
+            _reader.volume_metadata_json(reader._opened.store, reader._options, refresh))
         return reader
 
     def __getstate__(self):
-        return {"spec": dict(self._spec, attrs=self._attrs), "memory_cache": self.memory_cache}
+        return {"settings": dict(self._settings, attrs=self._attrs, store_metadata=self._metadata),
+                "memory_cache": self.memory_cache}
 
     def __setstate__(self, state):
-        self.__init__(state["spec"], state["memory_cache"])
+        self.__init__(state["settings"], state["memory_cache"])
 
     @property
     def metadata(self) -> StoreMetadata:
-        """What the store's ``meta.json`` / ``metadata.json`` say, read when it was opened."""
-        metadata = self._spec.get("store_metadata")
-        if metadata is None:
-            metadata = self._spec["store_metadata"] = read_store_metadata(
-                self._spec.get("group") or self.location, self.access, self._spec)
-        return metadata
+        """What is known about the volume: its store's ``meta.json`` / ``metadata.json``
+        and the Open Data catalog, read when it was opened."""
+        if self._metadata is None:
+            self._metadata = StoreMetadata.from_json(_reader.volume_metadata_json(self._opened.store, self._options))
+        return self._metadata
 
     @property
     def voxel_size_zyx(self) -> tuple[float, float, float] | None:
@@ -265,7 +202,12 @@ class ZarrReader:
         base = self.metadata.voxel_size_um
         if base is None:
             return None
-        scale = self._spec.get("level_scale") or (1.0, 1.0, 1.0)
+        scale = self._settings["level_scale"]
+        if scale is None:
+            key = self._opened.level_key
+            scale = (_reader.level_placement_scale(self.metadata.documents.get(".zattrs", {}), key)
+                     if key else (1.0, 1.0, 1.0))
+            self._settings["level_scale"] = tuple(scale)
         return tuple(base * s for s in scale)
 
     @property
@@ -283,12 +225,12 @@ class ZarrReader:
         if self._pid == os.getpid() or self._array is None:
             return
         self._abandon_inherited()
-        self.__init__(dict(self._spec, attrs=self._attrs), self.memory_cache)
+        self.__init__(dict(self._settings, attrs=self._attrs, store_metadata=self._metadata), self.memory_cache)
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine
-        _INHERITED.append((self._array, self.cache_layers))
-        self._array, self.cache_layers, self.write_layer = None, [], None
+        _INHERITED.append(self._opened)
+        self._opened, self._array, self.cache_layers, self.write_layer = None, None, [], None
 
     def flush(self) -> None:
         """Wait until every chunk fetched so far is written to the disk cache."""
@@ -323,28 +265,8 @@ class ZarrReader:
         """
         if self._attrs is None:
             self._ready()
-            if self.offline:
-                for root in cached_node_dirs(self._spec["cache_dirs"], cache_url(self.location, self.access)):
-                    # Decoded-cache .zattrs belongs to the cache, not the source.
-                    path = root / ".vc_reader_source_attrs.json"
-                    if path.is_file():
-                        self._attrs = json.loads(path.read_bytes())
-                        break
-                else:
-                    raise CacheMissError(f"array attributes for {self.location} are not cached (offline)")
-            else:
-                data = read_node_file(self.location, ".zattrs", self.access)
-                self._attrs = json.loads(data) if data is not None else {}
-                self._cache_attrs()
+            self._attrs = self._opened.attributes(self._options)
         return self._attrs
-
-    def _cache_attrs(self) -> None:
-        if self._attrs is not None and self.write_layer is not None:
-            try:
-                atomic_write(Path(self.write_layer.root) / ".vc_reader_source_attrs.json",
-                             json.dumps(self._attrs).encode())
-            except OSError:
-                pass  # Attribute access still works with a read-only cache.
 
     @property
     def compressor(self):
@@ -750,15 +672,10 @@ class ZarrReader:
         return result
 
     def _ready(self) -> None:
-        """Rebuild after a fork, check the reader is open, and pass on refreshed credentials."""
+        """Rebuild after a fork and check the reader is open."""
         self._check_process()
         if self._array is None:
             raise ValueError("reader is closed")
-        if self.access.source is not None and not self.offline:
-            auth = self.access.auth_tuple()
-            if auth is not self._auth:
-                self._array.set_auth(auth)
-                self._auth = auth
 
 
 def _loader_worker() -> bool:
@@ -779,7 +696,7 @@ def _memory_cache(memory_cache: int | MemoryCache | None) -> MemoryCache | None:
     raise TypeError("memory_cache must be a byte count or a vc_reader.reader.MemoryCache")
 
 
-def _make_spec(
+def _make_settings(
     location: str | os.PathLike[str],
     *,
     level: int | str | None = None,
@@ -795,47 +712,27 @@ def _make_spec(
     read_mode: str = "mmap",
     auth: Any = "auto",
     offline: bool = False,
-    meta: dict | None = None,
 ) -> tuple[dict[str, Any], MemoryCache | None]:
-    """The settings a :class:`ZarrReader` is built (and rebuilt in other processes) from, and its memory cache.
-
-    ``group`` names the array's parent group explicitly (instead of inferring
-    an OME-Zarr level from a digits-only last path part); ``meta`` is its
-    already-read ``.zarray``.
-    """
-    if read_mode not in READ_MODES:
-        raise ValueError(f"read_mode must be one of {READ_MODES}")
+    """What a :class:`ZarrReader` is built (and rebuilt in other processes) from, and its memory cache."""
     loc = os.fspath(location).rstrip("/")
+    level_key = None
     if level is not None:
         group, level_key = loc, str(level)
         loc = f"{loc}/{level}"
-    elif group is not None:
-        group = group.rstrip("/")
-        level_key = loc[len(group) + 1:]
-    else:
-        # An OME-Zarr level is a digits-only path under its group.
-        head, _, tail = loc.rpartition("/")
-        group, level_key = (head, tail) if tail.isdigit() and head else (None, None)
     if cache_dir is None:
         dirs = None
     elif isinstance(cache_dir, (str, os.PathLike)):
         dirs = [os.fspath(cache_dir)]
     else:
         dirs = [os.fspath(d) for d in cache_dir]
-    if offline and is_remote(loc) and not dirs:
-        raise ValueError("offline reads of a remote array need cache_dir")
     if cache_max_bytes is not None:
         cache_max_bytes = operator.index(cache_max_bytes)
-        if cache_max_bytes < 0:
-            raise ValueError("cache_max_bytes must be nonnegative or None")
-        if is_remote(loc) and not dirs:
-            raise ValueError("cache_max_bytes requires cache_dir")
-    access = auth if isinstance(auth, Access) else resolve_access(loc, auth, offline=offline)
-    spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
-                cache_max_bytes=cache_max_bytes,
-                compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads,
-                connections=connections, read_mode=read_mode, meta=meta, access=access, offline=offline)
-    return spec, _memory_cache(memory_cache)
+    settings = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
+                    cache_max_bytes=cache_max_bytes, compress_cache=compress_cache,
+                    allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
+                    read_mode=read_mode, meta=None, attrs=None, access=resolve_access(loc, auth, offline=offline),
+                    offline=offline, store_metadata=None, level_scale=None)
+    return settings, _memory_cache(memory_cache)
 
 
 def _check_float_source(dtype: np.dtype) -> None:
@@ -876,12 +773,10 @@ def output_pool_stats() -> dict[str, int]:
     return dict(_reader.output_pool_stats())
 
 
-def _shutdown(array, layers: list[CacheLayer], pid: int) -> None:
+def _shutdown(opened, pid: int) -> None:
     if os.getpid() != pid:  # a forked child exiting: the engine belongs to the parent
         return
-    array.flush()
-    for layer in layers:
-        layer.close()
+    opened.close()
 
 
 def _index_points(keys: tuple, shape: tuple[int, ...]) -> np.ndarray:

@@ -1,4 +1,6 @@
-// What a volume store says about itself in its sidecar documents.
+// What a volume store says about itself in its sidecar documents, and what is known
+// about it once the Open Data catalog is merged in.
+#include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
 
 #include <algorithm>
@@ -6,7 +8,11 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <initializer_list>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -190,6 +196,212 @@ StoreMetadata storeMetadata(const std::string& input, const MetadataReader& read
             break;
     }
     return out;
+}
+
+Json storeMetadataJson(const StoreMetadata& m)
+{
+    const auto optional = [](const auto& value) { return value ? Json(*value) : Json(); };
+    return Json{{"voxel_size_um", optional(m.voxelSizeUm)},
+                {"energy_kev", optional(m.energyKeV)},
+                {"detector_distance_mm", optional(m.detectorDistanceMm)},
+                {"beamline", m.beamline},
+                {"scan_name", m.scanName},
+                {"acquisition_date", m.acquisitionDate},
+                {"value_window", optional(m.valueWindow)},
+                {"z_crop", optional(m.zCrop)},
+                {"sample_id", m.sampleId},
+                {"volume_id", m.volumeId},
+                {"scan_id", m.scanId},
+                {"name", m.name},
+                {"created_at", m.createdAt},
+                {"data_format", m.dataFormat},
+                {"documents", m.documents}};
+}
+
+StoreMetadata storeMetadataFromJson(const Json& json)
+{
+    StoreMetadata m;
+    const auto number = [&](const char* key, std::optional<double>& field) {
+        if (const auto it = json.find(key); it != json.end() && !it->is_null())
+            field = it->get<double>();
+    };
+    number("voxel_size_um", m.voxelSizeUm);
+    number("energy_kev", m.energyKeV);
+    number("detector_distance_mm", m.detectorDistanceMm);
+    m.beamline = json.value("beamline", "");
+    m.scanName = json.value("scan_name", "");
+    m.acquisitionDate = json.value("acquisition_date", "");
+    if (const auto it = json.find("value_window"); it != json.end() && !it->is_null())
+        m.valueWindow = it->get<std::array<double, 2>>();
+    if (const auto it = json.find("z_crop"); it != json.end() && !it->is_null())
+        m.zCrop = it->get<std::array<std::int64_t, 2>>();
+    m.sampleId = json.value("sample_id", "");
+    m.volumeId = json.value("volume_id", "");
+    m.scanId = json.value("scan_id", "");
+    m.name = json.value("name", "");
+    m.createdAt = json.value("created_at", "");
+    m.dataFormat = json.value("data_format", "");
+    m.documents = json.value("documents", Json::object());
+    return m;
+}
+
+namespace {
+constexpr const char* kKeptMetadata = ".vc_reader_metadata.json";
+
+std::mutex knownMutex;
+std::map<std::string, StoreMetadata> known;  // what this process already knows, by store
+
+std::optional<std::string> readFile(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    std::ostringstream text;
+    text << in.rdbuf();
+    return text.str();
+}
+
+// The catalog (from its cache file alone when offline); nullptr when it is unavailable.
+std::shared_ptr<const catalog::OpenDataManifest> catalogManifest(bool offline, bool refresh)
+{
+    static std::mutex mutex;
+    static std::shared_ptr<const catalog::OpenDataManifest> loaded;
+    const std::string source(catalog::kDefaultManifestUrl);
+    const auto file = catalog::catalogCacheFile(source);
+    try {
+        if (offline)
+            return catalog::cachedManifest(file);
+        std::lock_guard lock(mutex);
+        if (!loaded || refresh) {
+            loaded.reset();
+            loaded = std::make_shared<const catalog::OpenDataManifest>(
+                catalog::loadCatalog(source, {file, refresh, 3600, 15}).manifest);
+        }
+        return loaded;
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+}  // namespace
+
+void forgetVolumeMetadata()
+{
+    std::lock_guard lock(knownMutex);
+    known.clear();
+}
+
+StoreMetadata volumeMetadata(const std::string& input, const OpenOptions& options, bool refresh)
+{
+    auto location = input;
+    while (location.size() > 1 && location.back() == '/')
+        location.pop_back();
+    const bool remote = isRemote(location);
+    const bool offline = options.offline && remote;
+    if (refresh && offline)
+        throw std::invalid_argument("refresh needs the network; it cannot be combined with offline");
+    const auto& access = options.access;
+    const auto key = remote ? access.cacheUrl(location) : location;
+    // The cache folders of a node of this store.
+    const auto folders = [&](const std::string& node) {
+        auto dirs = cachedNodeDirs(options.cacheDirs, remote ? access.cacheUrl(node) : node);
+        if (options.vc3dVolumeDir && node == location)
+            dirs.insert(dirs.begin(), *options.vc3dVolumeDir);
+        return dirs;
+    };
+    const auto kept = [&]() -> std::optional<StoreMetadata> {
+        {
+            std::lock_guard lock(knownMutex);
+            if (const auto it = known.find(key); it != known.end())
+                return it->second;
+        }
+        for (const auto& directory : folders(location))
+            if (const auto text = readFile(directory / kKeptMetadata)) {
+                try {
+                    auto metadata = storeMetadataFromJson(Json::parse(*text));
+                    std::lock_guard lock(knownMutex);
+                    known[key] = metadata;
+                    return metadata;
+                } catch (const std::exception&) {
+                    // A damaged copy: read the sources again.
+                }
+            }
+        return std::nullopt;
+    };
+    if (remote && !refresh)
+        if (auto metadata = kept())
+            return *metadata;
+
+    bool failed = false;
+    const auto source = options.metadata ? options.metadata : metadataReader(access);
+    const MetadataReader read = [&](const std::string& node, const std::string& name) -> std::optional<std::string> {
+        if (remote && !refresh)
+            for (const auto& directory : folders(node))
+                if (auto text = readFile(directory / name))
+                    return text;
+        if (offline)
+            return std::nullopt;
+        try {
+            return source(node, name);
+        } catch (...) {
+            failed = true;  // not the same as a store without this document
+            throw;
+        }
+    };
+    auto metadata = storeMetadata(location, read);
+    try {
+        if (const auto attributes = read(location, ".zattrs"))
+            metadata.documents[".zattrs"] = Json::parse(*attributes);
+        else if (const auto node = read(location, "zarr.json"))  // v3 keeps them in the node's own document
+            metadata.documents[".zattrs"] = Json::parse(*node).value("attributes", Json::object());
+    } catch (const std::exception&) {
+        // Malformed says nothing; a failed read is noted above.
+    }
+    // Stores outside the public channels are not in the catalog, so it is not loaded for them.
+    bool answered = true;
+    if (remote && isPublicLocation(location)) {
+        const auto manifest = catalogManifest(offline, refresh);
+        answered = manifest != nullptr;
+        if (const auto entry = manifest ? manifest->volumeMetadataAt(location) : std::nullopt) {
+            if (!metadata.voxelSizeUm)
+                metadata.voxelSizeUm = entry->voxelSizeUm;
+            if (!metadata.energyKeV)
+                metadata.energyKeV = entry->energyKeV;
+            if (!metadata.detectorDistanceMm)
+                metadata.detectorDistanceMm = entry->detectorDistanceMm;
+            metadata.sampleId = entry->sampleId;
+            metadata.volumeId = entry->volumeId;
+            metadata.scanId = entry->scanId;
+            metadata.name = entry->name;
+            metadata.createdAt = entry->createdAt;
+            metadata.dataFormat = entry->dataFormat;
+            metadata.documents["catalog"] = entry->raw;
+        }
+    }
+    // Keep it only once both sources have answered, so a later open can fill what is missing.
+    if (remote && answered && !failed && !offline) {
+        {
+            std::lock_guard lock(knownMutex);
+            known[key] = metadata;
+        }
+        if (options.cacheWrites) {
+            auto candidates = folders(location);
+            for (const auto& root : cacheRoots(options.cacheDirs))
+                candidates.push_back(decodedCachePath(root, key));
+            const auto data = storeMetadataJson(metadata).dump();
+            for (const auto& candidate : candidates) {
+                try {
+                    atomicWrite(candidate / kKeptMetadata, data);
+                    break;
+                } catch (const std::exception&) {
+                    // Read-only: try the next; this process still remembers it.
+                }
+            }
+        }
+    } else if (refresh) {
+        if (auto previous = kept())
+            return *previous;
+    }
+    return metadata;
 }
 
 }  // namespace vcr::zarr

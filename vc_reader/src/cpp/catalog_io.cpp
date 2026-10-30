@@ -2,6 +2,7 @@
 #include "vc_reader/catalog.hpp"
 #include "http.hpp"
 #include <zlib.h>
+#include <cstdlib>
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,16 @@
 #include <sstream>
 #include <thread>
 namespace vcr::catalog {
+std::filesystem::path defaultCatalogCacheDir() {
+    const auto env=[](const char* name){const char* v=std::getenv(name);return std::string(v?v:"");};
+    if(const auto dir=env("VC_READER_CACHE_DIR");!dir.empty())return dir;
+    if(const auto xdg=env("XDG_CACHE_HOME");!xdg.empty())return std::filesystem::path(xdg)/"vc_reader";
+    return std::filesystem::path(env("HOME"))/".cache"/"vc_reader";
+}
+std::filesystem::path catalogCacheFile(const std::string& source,const std::filesystem::path& cacheDir) {
+    Sha256 hash;hash.update(source.data(),source.size());
+    return (cacheDir.empty()?defaultCatalogCacheDir():cacheDir)/("metadata-"+to_hex(hash.finish()).substr(0,16)+".json");
+}
 namespace {
 constexpr size_t maxBytes=512*1024*1024;
 std::string decode(std::string body) {

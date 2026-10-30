@@ -397,8 +397,8 @@ class RemoteFixtureCase(FixtureCase):
 class RemoteTests(RemoteFixtureCase):
     def test_auto_signs_private_buckets_and_keeps_public_channels_anonymous(self):
         from vc_reader.reader.auth import resolve_access
-        keys = dict(AWS_ACCESS_KEY_ID='example', AWS_SECRET_ACCESS_KEY='test-secret', AWS_REGION='us-east-1')
-        with patch.dict('os.environ', keys), patch('vc_reader.reader.auth.bucket_region', return_value='us-east-1'):
+        keys = dict(AWS_ACCESS_KEY_ID='example', AWS_SECRET_ACCESS_KEY='test-secret', AWS_ENDPOINT_URL=self.url)
+        with patch.dict('os.environ', keys):
             self.assertEqual(resolve_access('s3://my-private-bucket/volume.zarr').kind, 's3')
             for public in ('s3://vesuvius-challenge-open-data/volume.zarr', 's3://vesuvius-challenge/volume.zarr',
                            'https://example.com/volume.zarr'):
@@ -406,8 +406,6 @@ class RemoteTests(RemoteFixtureCase):
 
     def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
         from vc_reader.reader import ZarrGroup
-        from vc_reader.reader.auth import Access
-        from vc_reader.reader.transport import cache_url
         group = self.root/'offline-group'
         group.mkdir()
         (group/'.zgroup').write_text('{"zarr_format": 2}')
@@ -419,17 +417,14 @@ class RemoteTests(RemoteFixtureCase):
         with ZarrGroup.open(url, cache_dir=self.cache, auth=keys) as reader:
             np.testing.assert_array_equal(reader.level(0)[:], values)
         before = dict(self.counts)
-        with patch('vc_reader.reader.auth.bucket_region', side_effect=AssertionError('region discovery')), \
-             patch('vc_reader.reader.auth._AwsSource', side_effect=AssertionError('credential discovery')), \
-             patch('vc_reader._reader.http_get', side_effect=AssertionError('metadata fetch')):
-            for auth in ('auto', 'aws', None, S3Credentials('example', 'test-secret')):
-                with self.subTest(auth=type(auth).__name__):
-                    with ZarrReader.open(url+'/0', cache_dir=self.cache, offline=True, auth=auth) as reader:
-                        np.testing.assert_array_equal(reader[:], values)
-                    with ZarrGroup.open(url, cache_dir=self.cache, offline=True, auth=auth) as reader:
-                        np.testing.assert_array_equal(reader.level(0)[:], values)
+        # No credentials and no way to learn a bucket's region: offline needs neither.
+        for auth in ('auto', 'aws', None, S3Credentials('example', 'test-secret')):
+            with self.subTest(auth=type(auth).__name__):
+                with ZarrReader.open(url+'/0', cache_dir=self.cache, offline=True, auth=auth) as reader:
+                    np.testing.assert_array_equal(reader[:], values)
+                with ZarrGroup.open(url, cache_dir=self.cache, offline=True, auth=auth) as reader:
+                    np.testing.assert_array_equal(reader.level(0)[:], values)
         self.assertEqual(before, self.counts)
-        self.assertEqual(cache_url(url, Access('anonymous')), cache_url(url, Access('s3')))
 
     def test_shared_memory_cache_separates_lossy_and_exact_reads(self):
         data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)

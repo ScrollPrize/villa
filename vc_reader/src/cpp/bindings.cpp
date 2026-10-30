@@ -22,9 +22,7 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 using Bytes = nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
-using LayerTuple = std::tuple<std::string, std::string, std::string, std::string, bool>;
-// (kind, user or access key id, password or secret key, session token, region); see vcr::Auth.
-using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
+using Json = vcr::zarr::Json;
 using HostPoints = nb::ndarray<nb::ro, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
 template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& points,
@@ -41,10 +39,20 @@ template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& 
 #include "reader_cuda/bindings.hpp"
 #endif
 
-static vcr::Auth to_auth(const AuthTuple& t)
+static nb::object py_json(const Json& value)
 {
-    auto& [kind, user, secret, token, region] = t;
-    return vcr::Auth{kind, user, secret, token, region};
+    return nb::module_::import_("json").attr("loads")(value.dump());
+}
+
+static Json to_json(const nb::object& value)
+{
+    return Json::parse(nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(value)));
+}
+
+static std::string access_kind(const vcr::zarr::Access& access)
+{
+    using Kind = vcr::zarr::Access::Kind;
+    return access.kind == Kind::S3 ? "s3" : access.kind == Kind::Basic ? "basic" : "anonymous";
 }
 
 static vcr::ElementType sample_type(const std::string& name, std::size_t itemsize, bool swap)
@@ -87,7 +95,6 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 
 NB_MODULE(_reader, m)
 {
-    m.def("normalize_zarr_metadata", &vcr::normalizeZarrMetadata);
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
     m.def("_point_origin", [](HostPoints points) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
@@ -127,6 +134,11 @@ NB_MODULE(_reader, m)
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const vcr::HttpDenied& e) {
             PyErr_SetString(PyExc_PermissionError, e.what());
+        } catch (const vcr::zarr::NotFound& e) {
+            PyErr_SetString(PyExc_FileNotFoundError, e.what());
+        } catch (const std::filesystem::filesystem_error& e) {
+            errno = e.code().value();
+            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
         }
     });
 
@@ -153,28 +165,6 @@ NB_MODULE(_reader, m)
         return d;
     });
 
-    m.def(
-        "http_get",
-        [](const std::string& url, const AuthTuple& auth, long stall_timeout_s, int retries) -> nb::object {
-            std::vector<std::uint8_t> body;
-            bool found;
-            {
-                nb::gil_scoped_release release;
-                vcr::HttpOptions options;
-                options.connections = 1;
-                options.stall_timeout_s = stall_timeout_s;
-                options.retries = retries;
-                options.auth = to_auth(auth);
-                vcr::HttpClient client(options);
-                found = client.get(url, body);
-            }
-            if (!found)
-                return nb::none();
-            return nb::bytes(reinterpret_cast<const char*>(body.data()), body.size());
-        },
-        "url"_a, "auth"_a = AuthTuple{}, "stall_timeout_s"_a = 10, "retries"_a = 5,
-        "GET a small object (e.g. .zarray); None if it does not exist (404). PermissionError on 401/403.");
-
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
         .def_prop_ro("max_bytes", &vcr::MemoryCache::max_bytes)
@@ -184,47 +174,11 @@ NB_MODULE(_reader, m)
         .def("__len__", &vcr::MemoryCache::size)
         .def("clear", &vcr::MemoryCache::clear);
 
-    // Disk-cache layers of remote arrays (vc_reader/zarr.hpp); the Python reader's
-    // vc_reader.reader.disk_cache is a thin layer over these.
-    nb::class_<vcr::zarr::Layers>(m, "CacheLayers")
-        .def("__len__", [](const vcr::zarr::Layers& l) { return l.layers.size(); })
-        .def_prop_ro("writer", [](const vcr::zarr::Layers& l) { return l.writer; })
-        .def_prop_ro("busy", [](const vcr::zarr::Layers& l) { return l.busy; })
-        .def("layer", [](const vcr::zarr::Layers& l, std::size_t i) {
-            const auto& c = l.layers.at(i);
-            return std::make_tuple(c.kind, c.root, c.stored.raw.dump(), c.emptyRoot, c.allowLossy, c.budgetRoot);
-        }, "index"_a)
-        .def("release", [](vcr::zarr::Layers& l, std::size_t i) { l.layers.at(i).lease.reset(); }, "index"_a);
-    m.def("open_layers",
-          [](const std::vector<std::string>& cache_dirs, const std::string& url, const std::string& source,
-             std::optional<std::string> group_url, std::optional<std::string> level_key, bool writable,
-             bool allow_lossy, bool compress, std::optional<std::int64_t> max_bytes) {
-              vcr::zarr::LayerOptions options;
-              options.groupUrl = std::move(group_url);
-              options.levelKey = std::move(level_key);
-              options.writable = writable;
-              options.allowLossy = allow_lossy;
-              options.compress = compress;
-              options.maxBytes = max_bytes;
-              const auto meta = vcr::zarr::parseArrayMeta(vcr::zarr::Json::parse(source));
-              nb::gil_scoped_release release;
-              return vcr::zarr::openLayers(cache_dirs, url, meta, options);
-          },
-          "cache_dirs"_a, "url"_a, "source"_a, "group_url"_a.none(), "level_key"_a.none(), "writable"_a,
-          "allow_lossy"_a, "compress"_a, "max_bytes"_a.none());
-    m.def("cached_source_zarray",
-          [](const std::vector<std::string>& cache_dirs, const std::string& url, std::optional<std::string> group_url,
-             std::optional<std::string> level_key) -> std::optional<std::string> {
-              const auto found = vcr::zarr::cachedSourceZarray(cache_dirs, url, group_url, level_key);
-              return found ? std::optional<std::string>(found->dump()) : std::nullopt;
-          },
-          "cache_dirs"_a, "url"_a, "group_url"_a.none(), "level_key"_a.none());
-    m.def("cached_node_dirs", [](const std::vector<std::string>& cache_dirs, const std::string& url) {
-        std::vector<std::string> out;
-        for (const auto& d : vcr::zarr::cachedNodeDirs(cache_dirs, url))
-            out.push_back(d.string());
-        return out;
-    }, "cache_dirs"_a, "url"_a);
+    // Finding remote arrays and their disk caches (vc_reader/zarr.hpp).
+    m.def("is_remote", &vcr::zarr::isRemote, "location"_a);
+    m.def("http_url", &vcr::zarr::httpUrl, "location"_a);
+    m.def("is_public_location", &vcr::zarr::isPublicLocation, "location"_a);
+    m.def("load_basic_auth", [](const std::string& path) { return vcr::zarr::loadBasicAuth(path); }, "path"_a);
     m.def("cache_roots", [](const std::vector<std::string>& cache_dirs) {
         std::vector<std::string> out;
         for (const auto& d : vcr::zarr::cacheRoots(cache_dirs))
@@ -235,94 +189,200 @@ NB_MODULE(_reader, m)
         return vcr::zarr::decodedCachePath(cache_dir, url).string();
     }, "cache_dir"_a, "url"_a);
     m.def("vc3d_volume_id", &vcr::zarr::vc3dVolumeId, "url"_a);
-    m.def("store_metadata_json",
-          [](const std::string& location, std::function<std::optional<std::string>(const std::string&, const std::string&)> read) {
-              const auto m = vcr::zarr::storeMetadata(location, read);
-              const auto optional = [](const auto& value) { return value ? vcr::zarr::Json(*value) : vcr::zarr::Json(); };
-              return vcr::zarr::Json{{"voxel_size_um", optional(m.voxelSizeUm)},
-                                     {"energy_kev", optional(m.energyKeV)},
-                                     {"detector_distance_mm", optional(m.detectorDistanceMm)},
-                                     {"beamline", m.beamline},
-                                     {"scan_name", m.scanName},
-                                     {"acquisition_date", m.acquisitionDate},
-                                     {"value_window", optional(m.valueWindow)},
-                                     {"z_crop", optional(m.zCrop)},
-                                     {"documents", m.documents}}.dump();
-          },
-          "location"_a, "read"_a,
-          "What the store's sidecar documents say, as JSON; read(location, name) returns a document's "
-          "text or None.");
     m.def("vc3d_cache_root", []() -> std::optional<std::string> {
         const auto root = vcr::zarr::vc3dCacheRoot();
         return root ? std::optional<std::string>(root->string()) : std::nullopt;
     });
     m.def("disk_budget", &vcr::zarr::diskBudget, "root"_a, "max_bytes"_a.none(),
           nb::call_guard<nb::gil_scoped_release>());
-    m.def("atomic_write", [](const std::string& path, nb::bytes data) {
-        vcr::zarr::atomicWrite(path, std::string(data.c_str(), data.size()));
-    }, "path"_a, "data"_a);
+
+    using vcr::zarr::Access;
+    nb::class_<Access>(m, "Access", "How requests under one root are made. Picklable; keys from the environment are read again in the new process.")
+        .def_prop_ro("kind", &access_kind)
+        .def_prop_ro("region", [](const Access& a) { return a.auth.region; })
+        .def_prop_ro("endpoint", [](const Access& a) { return a.endpoint; })
+        .def("url", &Access::url, "location"_a)
+        .def("cache_url", &Access::cacheUrl, "location"_a)
+        .def("__repr__", [](const Access& a) {
+            if (a.kind != Access::Kind::S3)
+                return "Access(" + access_kind(a) + ")";
+            return std::string("Access(s3, ") + (a.fromEnvironment ? "AWS environment" : "fixed keys") + ", region='" + a.auth.region + "')";
+        })
+        .def("__getstate__", [](const Access& a) {
+            const bool keep = !a.fromEnvironment;
+            return nb::make_tuple(access_kind(a), keep ? a.auth.user : "", keep ? a.auth.secret : "", keep ? a.auth.token : "",
+                                  a.auth.region, a.auth.kind, a.endpoint, a.fromEnvironment);
+        })
+        .def("__setstate__", [](Access& a, const std::tuple<std::string, std::string, std::string, std::string, std::string,
+                                                            std::string, std::string, bool>& state) {
+            const auto& [kind, user, secret, token, region, authKind, endpoint, environment] = state;
+            new (&a) Access();
+            a.kind = kind == "s3" ? Access::Kind::S3 : kind == "basic" ? Access::Kind::Basic : Access::Kind::Anonymous;
+            a.auth = vcr::Auth{authKind, user, secret, token, region};
+            a.endpoint = endpoint;
+            a.fromEnvironment = environment;
+            vcr::zarr::reloadEnvironmentKeys(a);
+        });
+    m.def("anonymous_access", [] { return Access{}; });
+    m.def("resolve_access", [](const std::string& location, const std::string& mode, bool offline) {
+        if (mode != "auto" && mode != "aws")
+            throw nb::value_error("auth mode must be 'auto' or 'aws'");
+        nb::gil_scoped_release release;
+        return vcr::zarr::resolveAccess(location, mode == "aws" ? vcr::zarr::AuthMode::Aws : vcr::zarr::AuthMode::Auto, offline);
+    }, "location"_a, "mode"_a, "offline"_a = false);
+    m.def("s3_access", [](const std::string& location, const std::string& key, const std::string& secret,
+                          const std::string& token, const std::string& region, const std::string& endpoint) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::s3Access(location, vcr::Auth{"s3", key, secret, token, region}, endpoint);
+    }, "location"_a, "access_key_id"_a, "secret_access_key"_a, "session_token"_a, "region"_a, "endpoint"_a);
+    m.def("basic_access", &vcr::zarr::basicAccess, "user"_a, "password"_a);
+
+    using vcr::zarr::ArrayMeta;
+    nb::class_<ArrayMeta>(m, "ArrayMeta", "Zarr array metadata as parsed by vcr::zarr::parseArrayMeta.")
+        .def_prop_ro("shape", [](const ArrayMeta& a) { return a.shape; })
+        .def_prop_ro("chunks", [](const ArrayMeta& a) { return a.chunks; })
+        .def_prop_ro("dtype", [](const ArrayMeta& a) { return a.dtype; })
+        .def_prop_ro("fill", [](const ArrayMeta& a) { return nb::bytes(reinterpret_cast<const char*>(a.fill.data()), a.fill.size()); })
+        .def_prop_ro("order", [](const ArrayMeta& a) { return a.order; })
+        .def_prop_ro("separator", [](const ArrayMeta& a) { return a.separator; })
+        .def_prop_ro("compressor", [](const ArrayMeta& a) { return py_json(a.compressor); })
+        .def_prop_ro("filters", [](const ArrayMeta& a) { return py_json(a.filters); })
+        .def_prop_ro("raw", [](const ArrayMeta& a) { return py_json(a.raw); })
+        .def_prop_ro("chunk_nbytes", &ArrayMeta::chunkBytes)
+        .def("codec", &ArrayMeta::codec)
+        .def("decoded_zarray", [](const ArrayMeta& a) { return py_json(a.decodedZarray()); });
+    m.def("parse_array_meta", [](const nb::object& metadata) { return vcr::zarr::parseArrayMeta(to_json(metadata)); }, "metadata"_a);
+
+    using vcr::zarr::CacheLayer;
+    nb::class_<CacheLayer>(m, "CacheLayer", "One cache directory holding chunks of one array, in one format.")
+        .def_ro("kind", &CacheLayer::kind)
+        .def_ro("root", &CacheLayer::root)
+        .def_ro("stored", &CacheLayer::stored)
+        .def_ro("empty_root", &CacheLayer::emptyRoot)
+        .def_ro("allow_lossy", &CacheLayer::allowLossy)
+        .def_ro("budget_root", &CacheLayer::budgetRoot)
+        .def("__repr__", [](const CacheLayer& l) { return "CacheLayer('" + l.kind + "', '" + l.root + "')"; });
+
+    using vcr::zarr::OpenOptions;
+    nb::class_<OpenOptions>(m, "OpenOptions")
+        .def("__init__", [](OpenOptions* self, Access access, std::vector<std::string> cache_dirs, bool cache_writes,
+                            std::optional<std::int64_t> cache_max_bytes, bool compress_cache, bool allow_lossy_cache,
+                            std::shared_ptr<vcr::MemoryCache> memory_cache, std::size_t threads, int connections,
+                            std::string read_mode, bool offline) {
+            new (self) OpenOptions();
+            self->access = std::move(access);
+            self->cacheDirs = std::move(cache_dirs);
+            self->cacheWrites = cache_writes;
+            self->cacheMaxBytes = cache_max_bytes;
+            self->compressCache = compress_cache;
+            self->allowLossyCache = allow_lossy_cache;
+            self->memoryCache = std::move(memory_cache);
+            self->threads = threads;
+            self->connections = connections;
+            self->readMode = std::move(read_mode);
+            self->offline = offline;
+        }, "access"_a, "cache_dirs"_a, "cache_writes"_a, "cache_max_bytes"_a.none(), "compress_cache"_a, "allow_lossy_cache"_a,
+           "memory_cache"_a.none(), "threads"_a, "connections"_a, "read_mode"_a, "offline"_a);
+
+    using vcr::zarr::OpenedArray;
+    nb::class_<OpenedArray>(m, "OpenedArray")
+        .def_ro("location", &OpenedArray::location)
+        .def_ro("meta", &OpenedArray::meta)
+        .def_ro("store", &OpenedArray::store)
+        .def_ro("level_key", &OpenedArray::levelKey)
+        .def_ro("writer", &OpenedArray::writer)
+        .def_ro("busy", &OpenedArray::busy)
+        .def_prop_ro("array", [](OpenedArray& o) -> vcr::Array& { return *o.array; }, nb::rv_policy::reference_internal)
+        .def_prop_ro("layers", [](const OpenedArray& o) {
+            auto layers = o.layers;  // a view: the leases stay with the opened array
+            for (auto& layer : layers)
+                layer.lease.reset();
+            return layers;
+        })
+        .def_prop_ro("placement_scale", [](const OpenedArray& o) { return o.placement.scale; })
+        .def("attributes", [](OpenedArray& o, const OpenOptions& options) {
+            {
+                nb::gil_scoped_release release;
+                vcr::zarr::arrayAttributes(o, options);
+            }
+            return py_json(o.attributes);
+        }, "options"_a)
+        .def_prop_ro("known_attributes", [](const OpenedArray& o) -> nb::object {
+            return o.attributesRead ? py_json(o.attributes) : nb::none();
+        })
+        .def("close", &OpenedArray::close, nb::call_guard<nb::gil_scoped_release>());
+    m.def("open_array", [](const std::string& location, const OpenOptions& options, std::optional<std::string> group,
+                           std::optional<std::string> level_key, nb::object metadata, nb::object attributes) {
+        vcr::zarr::ArrayHints hints;
+        hints.group = std::move(group);
+        hints.levelKey = std::move(level_key);
+        if (!metadata.is_none())
+            hints.metadata = to_json(metadata);
+        if (!attributes.is_none())
+            hints.attributes = to_json(attributes);
+        nb::gil_scoped_release release;
+        return vcr::zarr::openArray(location, options, std::move(hints));
+    }, "location"_a, "options"_a, "group"_a.none() = nb::none(), "level_key"_a.none() = nb::none(),
+       "metadata"_a.none() = nb::none(), "attributes"_a.none() = nb::none());
+
+    using vcr::zarr::Group;
+    nb::class_<Group>(m, "Group")
+        .def_static("open", [](const std::string& location, const OpenOptions& options) {
+            nb::gil_scoped_release release;
+            return Group::open(location, options);
+        }, "location"_a, "options"_a)
+        .def_static("from_state", [](const std::string& state, const OpenOptions& options) {
+            return Group::fromState(Json::parse(state), options);
+        }, "state"_a, "options"_a)
+        .def("state", [](const Group& g, bool inherited) { return g.state(inherited).dump(); }, "inherited"_a = false)
+        .def_prop_ro("location", [](const Group& g) { return g.location(); })
+        .def_prop_ro("version", &Group::version)
+        .def_prop_ro("attributes", [](const Group& g) { return py_json(g.attributes()); })
+        .def_prop_ro("multiscales", [](const Group& g) { return py_json(g.multiscales()); })
+        .def("levels", &Group::levels, "probe_levels"_a = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("keys", &Group::keys, nb::call_guard<nb::gil_scoped_release>())
+        .def("node", [](Group& g, const std::string& key) -> nb::object {
+            std::optional<std::pair<Group::NodeKind, Json>> node;
+            {
+                nb::gil_scoped_release release;
+                node = g.node(key);
+            }
+            if (!node)
+                return nb::none();
+            return nb::cast(std::string(node->first == Group::NodeKind::Array ? "array" : "group"));
+        }, "key"_a, "'array' or 'group' for a child path; None when there is none.")
+        .def("array", &Group::array, "key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("group", &Group::group, "key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("metadata_json", [](Group& g, bool refresh) {
+            std::string text;
+            {
+                nb::gil_scoped_release release;
+                text = vcr::zarr::storeMetadataJson(g.metadata(refresh)).dump();
+            }
+            return text;
+        }, "refresh"_a = false);
+    m.def("volume_metadata_json", [](const std::string& location, const OpenOptions& options, bool refresh) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::storeMetadataJson(vcr::zarr::volumeMetadata(location, options, refresh)).dump();
+    }, "location"_a, "options"_a, "refresh"_a = false,
+       "What is known about the volume at a location, as JSON (see vcr::zarr::volumeMetadata).");
+    m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
+    m.def("level_placement_scale", [](const nb::object& group_attributes, const std::string& path) {
+        return vcr::zarr::levelPlacement(to_json(group_attributes), path).scale;
+    }, "group_attributes"_a, "path"_a);
 
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,
              nb::call_guard<nb::gil_scoped_release>())
         .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_bytes", &vcr::DiskCache::max_bytes, nb::call_guard<nb::gil_scoped_release>())
-        .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& url,
-                              const AuthTuple& auth) {
+        .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& location,
+                              const vcr::zarr::Access& access) {
             nb::gil_scoped_release release;
-            return cache.open_file(path, url, to_auth(auth));
-        }, "path"_a, "url"_a, "auth"_a);
+            return cache.open_file(path, access.url(location), access.auth);
+        }, "path"_a, "location"_a, "access"_a);
 
     nb::class_<vcr::Array>(m, "Array")
-        .def(
-            "__init__",
-            [](vcr::Array* self, vcr::Index shape, vcr::Index chunks, std::size_t itemsize, nb::bytes fill,
-               std::string separator, std::string identity, std::vector<LayerTuple> layers, int write_layer,
-               std::string remote_url, std::string remote_codec, AuthTuple auth, bool offline,
-               std::string read_mode, bool hint, std::size_t threads, int connections, long stall_timeout_s, int retries,
-               std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
-               std::size_t max_pending_write_bytes, std::shared_ptr<vcr::DiskCache> disk_cache,
-               std::string source_root, std::string source_prefix, vcr::Index shard_chunks,
-               bool shard_index_end, bool shard_index_crc) {
-                vcr::ArraySpec spec;
-                spec.shape = std::move(shape);
-                spec.chunks = std::move(chunks);
-                spec.itemsize = itemsize;
-                spec.fill.assign(static_cast<const std::uint8_t*>(fill.data()),
-                                 static_cast<const std::uint8_t*>(fill.data()) + fill.size());
-                spec.separator = std::move(separator);
-                spec.identity = std::move(identity);
-                for (auto& [kind, root, codec, empty_root, allow_lossy] : layers)
-                    spec.layers.push_back({kind, root, codec, empty_root, allow_lossy});
-                spec.write_layer = write_layer;
-                spec.remote_url = std::move(remote_url);
-                spec.remote_codec = std::move(remote_codec);
-                spec.source_root = std::move(source_root);
-                spec.source_prefix = std::move(source_prefix);
-                spec.shard_chunks = std::move(shard_chunks);
-                spec.shard_index_end = shard_index_end;
-                spec.shard_index_crc = shard_index_crc;
-                spec.offline = offline;
-                spec.http.auth = to_auth(auth);
-                spec.read_mode = std::move(read_mode);
-                spec.hint = hint;
-                spec.threads = threads;
-                spec.writer_threads = writer_threads;
-                spec.max_pending_write_bytes = max_pending_write_bytes;
-                spec.disk_cache = std::move(disk_cache);
-                spec.http.connections = connections;
-                spec.http.stall_timeout_s = stall_timeout_s;
-                spec.http.retries = retries;
-                new (self) vcr::Array(std::move(spec), std::move(cache));
-            },
-            "shape"_a, "chunks"_a, "itemsize"_a, "fill"_a, "separator"_a, "identity"_a, "layers"_a,
-            "write_layer"_a = -1, "remote_url"_a = "", "remote_codec"_a = "", "auth"_a = AuthTuple{},
-            "offline"_a = false, "read_mode"_a = "slab",
-            "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
-            "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
-            "max_pending_write_bytes"_a = std::size_t{1} << 30, "disk_cache"_a.none() = nb::none(),
-            "source_root"_a = "", "source_prefix"_a = "", "shard_chunks"_a = vcr::Index{},
-            "shard_index_end"_a = true, "shard_index_crc"_a = false)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
@@ -482,8 +542,7 @@ NB_MODULE(_reader, m)
             nb::gil_scoped_release release;
             a.sample_u8_float32(grid,counts[0],order,out.data());
         })
-        .def("set_auth", [](vcr::Array& a, const AuthTuple& auth) { a.set_auth(to_auth(auth)); }, "auth"_a,
-             "Credentials for later fetches.")
+        .def_prop_ro("threads", &vcr::Array::threads)
         .def("flush", &vcr::Array::flush, nb::call_guard<nb::gil_scoped_release>(),
              "Wait for every queued disk-cache write.")
         .def("stats", [](vcr::Array& a) {

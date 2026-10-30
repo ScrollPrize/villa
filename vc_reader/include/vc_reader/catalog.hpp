@@ -398,6 +398,12 @@ struct OpenDataManifest {
     const OpenDataSample& sample) noexcept;
 
 
+// Where manifests are cached: $VC_READER_CACHE_DIR, else $XDG_CACHE_HOME/vc_reader,
+// else ~/.cache/vc_reader.
+[[nodiscard]] std::filesystem::path defaultCatalogCacheDir();
+// The cache file of one manifest source in `cacheDir` (empty: the default directory).
+[[nodiscard]] std::filesystem::path catalogCacheFile(const std::string& source, const std::filesystem::path& cacheDir = {});
+
 struct CatalogLoadOptions {
     std::filesystem::path cacheFile;
     bool refresh = false;

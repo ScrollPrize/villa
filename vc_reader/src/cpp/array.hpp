@@ -265,6 +265,8 @@ public:
     }
 
     // Waits for every queued disk-cache write.
+    std::size_t threads() const { return spec_.threads; }
+
     void flush()
     {
         if (writes_)

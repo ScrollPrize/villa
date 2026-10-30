@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ._fetch import DEFAULT_METADATA_URL, default_cache_dir
+from .catalog import DEFAULT_METADATA_URL, default_cache_dir
 from .affine import Affine
 from .artifacts import AccessRoot, Artifact, ArtifactType, Origin, to_https, to_s3
 from .catalog import DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS, Catalog, License, Model, Scan, VolumeCoverage

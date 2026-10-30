@@ -123,6 +123,9 @@ NB_MODULE(_catalog,m) {
         auto manifest=cachedManifest(file);
         return manifest?nb::cast(OpenDataManifest(*manifest)):nb::none();
     },nb::arg("file"),"The manifest in a cache file, without touching the network; None if absent or invalid.");
+    m.def("cache_file",[](const std::string& source,const std::string& cache_dir){return catalogCacheFile(source,cache_dir).string();},nb::arg("source"),nb::arg("cache_dir")="");
+    m.def("default_cache_dir",[]{return defaultCatalogCacheDir().string();});
+    m.attr("DEFAULT_METADATA_URL")=std::string(kDefaultManifestUrl);
     m.def("join_url",&joinOpenDataUrl);
     m.def("to_s3",&openDataS3Url);
     m.def("to_https",[](const std::string& url)->std::optional<std::string>{

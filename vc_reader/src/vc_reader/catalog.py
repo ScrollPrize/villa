@@ -9,12 +9,17 @@ import json
 from . import _catalog
 from dataclasses import dataclass
 from typing import Any, Mapping
-from . import _fetch
 from .affine import Affine
 from .artifacts import Artifact, parse_artifacts
 from .names import COMMUNITY_ALIASES, SampleNameIndex
+DEFAULT_METADATA_URL = _catalog.DEFAULT_METADATA_URL
 DEFAULT_RESOLUTION_REL_TOL = 0.005
 PYRAMID_LEVELS = 6
+
+def default_cache_dir():
+    """Where manifests are cached (see ``vcr::catalog::defaultCatalogCacheDir``)."""
+    from pathlib import Path
+    return Path(_catalog.default_cache_dir())
 
 @dataclass(frozen=True)
 class VolumeCoverage:
@@ -178,15 +183,13 @@ class Catalog:
         return f'Catalog(samples={len(self._samples)}, models={len(self.models)}, source={self.source!r})'
 
     @staticmethod
-    def cache_file(source: str | os.PathLike[str]=_fetch.DEFAULT_METADATA_URL, cache_dir: str | os.PathLike[str] | None=None):
+    def cache_file(source: str | os.PathLike[str]=DEFAULT_METADATA_URL, cache_dir: str | os.PathLike[str] | None=None):
         """Where :meth:`load` caches a manifest."""
-        import hashlib
         from pathlib import Path
-        src = os.fspath(source)
-        return (_fetch.default_cache_dir() if cache_dir is None else Path(cache_dir)) / ('metadata-' + hashlib.sha256(src.encode()).hexdigest()[:16] + '.json')
+        return Path(_catalog.cache_file(os.fspath(source), '' if cache_dir is None else os.fspath(cache_dir)))
 
     @classmethod
-    def load(cls, source: str | os.PathLike[str]=_fetch.DEFAULT_METADATA_URL, *, cache_dir: str | os.PathLike[str] | None=None, use_cache: bool=True, max_age: float=3600.0, refresh: bool=False, timeout: float=60.0) -> Catalog:
+    def load(cls, source: str | os.PathLike[str]=DEFAULT_METADATA_URL, *, cache_dir: str | os.PathLike[str] | None=None, use_cache: bool=True, max_age: float=3600.0, refresh: bool=False, timeout: float=60.0) -> Catalog:
         """Load from an http(s) URL (cached on disk) or a local file (plain or gzipped JSON)."""
         src = os.fspath(source)
         cache = os.fspath(cls.cache_file(src, cache_dir)) if use_cache else ''
