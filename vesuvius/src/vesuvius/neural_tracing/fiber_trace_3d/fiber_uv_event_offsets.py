@@ -52,12 +52,12 @@ def prepare(d,config):
             query='SELECT id,fiber_a,fiber_b,arc_a,arc_b FROM constraints WHERE id IN ('+','.join('?' for _ in batch)+')'
             records.update({int(r[0]):r[1:] for r in db.execute(query,batch)})
     if len(records)!=len(ids):raise ValueError('Missing/duplicate constraint endpoint IDs')
-    rows=np.asarray([records[int(i)] for i in ids])
+    ends=np.asarray([records[int(i)][:2] for i in ids],dtype=str).reshape(-1,2)
     owners=np.r_[d['i'],d['j']]
     source=d['source_id'][owners]
-    if not np.array_equal(rows[:,:2].T.reshape(-1),source):
+    if not np.array_equal(ends.T.reshape(-1),source):
         raise ValueError('Endpoint source order does not match cached constraints')
-    arcs=rows[:,2:].T.reshape(-1)
+    arcs=np.asarray([records[int(i)][2:] for i in ids],dtype=float).reshape(-1,2).T.reshape(-1)
     if np.any(arcs<d['start'][owners]-1e-5) or np.any(arcs>d['end'][owners]+1e-5):
         raise ValueError('Endpoint arc outside owning piece')
     event_nodes=len(owners)

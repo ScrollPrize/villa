@@ -1,8 +1,8 @@
-"""Original AFV curve interpolation and frozen native normal sampling."""
+"""Original fiber curve interpolation and frozen native normal sampling."""
 import json
 from pathlib import Path
 import numpy as np
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
 
 
 def unit(v):
@@ -13,15 +13,15 @@ def unit(v):
 
 class CurveBank:
     """Vectorized exact polyline interpolation and shared native normal samples."""
-    def __init__(self,afv,source_ids,normal_root,normal_solution):
-        self.ids=np.unique(source_ids)
-        curves=read_afv_polylines(afv,self.ids)
-        if not np.array_equal([row['id'] for row,_ in curves],self.ids):raise ValueError('AFV source identity mismatch')
+    def __init__(self,fibers,source_ids,normal_root,normal_solution):
+        self.ids=np.unique(np.asarray(source_ids,dtype=str))
+        curves=read_polylines(fibers,self.ids)
+        if not np.array_equal([row['id'] for row,_ in curves],self.ids):raise ValueError('Fiber source identity mismatch')
         lengths=[];arcs=[];points=[]
         for row,xyz in curves:
             arc=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(xyz,axis=0),axis=1))]
             keep=np.r_[True,np.diff(arc)>0]
-            if keep.sum()<2:raise ValueError('Degenerate AFV curve')
+            if keep.sum()<2:raise ValueError('Degenerate fiber curve')
             arcs.append(arc[keep]);points.append(xyz[keep]);lengths.append(arc[-1])
         self.lengths=np.asarray(lengths)
         self.base=np.r_[0.,np.cumsum(self.lengths[:-1]+1.)]
@@ -31,10 +31,12 @@ class CurveBank:
         self.last=self.first+np.asarray([len(a) for a in arcs])-1
         doc=json.loads((Path(normal_root)/'index.json').read_text())
         if doc['format']!='fiber-normal-curves' or doc['columns']!=['arc','nx','ny','nz','valid']:raise ValueError('Normal curve format')
-        index=np.asarray(doc['index'],np.int64)
-        at=np.searchsorted(index[:,0],self.ids)
-        if not np.array_equal(index[at,0],self.ids):raise ValueError('Missing normal fibers')
-        self.normal_first=index[at,1];self.normal_count=index[at,2]
+        # Rows are [fiber UUID, first sample, sample count] in UUID order.
+        index_ids=np.asarray([r[0] for r in doc['index']],dtype=str)
+        index=np.asarray([r[1:] for r in doc['index']],np.int64).reshape(-1,2)
+        at=np.minimum(np.searchsorted(index_ids,self.ids),max(len(index_ids)-1,0))
+        if not len(index_ids) or not np.array_equal(index_ids[at],self.ids):raise ValueError('Missing normal fibers')
+        self.normal_first=index[at,0];self.normal_count=index[at,1]
         if (self.normal_count<2).any():raise ValueError('Degenerate normal curve')
         self.normals=np.memmap(Path(normal_root)/'normals.bin',dtype='<f8',mode='r',shape=(doc['statistics']['samples'],5))
         self.spacing=doc['statistics']['sample_spacing_base']

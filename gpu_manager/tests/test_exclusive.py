@@ -1,5 +1,6 @@
 """Synthetic GPU promises and real CPU-only gated subprocesses; no CUDA."""
 import os
+import json
 from pathlib import Path
 import sys
 import threading
@@ -87,6 +88,66 @@ def test_fixed_nonexclusive_command_shares_inventory(tmp_path):
     assert not task["request"]["exclusive"] and not task["pausable"] and not task["adaptable"]
     assert task["request"]["max_vram_bytes_per_gpu"] == 30
     assert e.tasks[donor["task"]["task_id"]]["phase"] == "applied"
+
+
+def test_partial_admission_exports_actual_resources_and_joins_before_release(tmp_path):
+    e = engine()
+    def donor_identity(op, body):
+        if op == "register":
+            body["root"] = dict(pid=1, start_us=1, boot_us=1)
+    donor = memory_client(e, donor_identity)("unused")
+    donor.connect()
+    donor.register("occupied", dict(max_cpu_cores=4, max_gpus=1,
+        min_vram_bytes_per_gpu=100, max_vram_bytes_per_gpu=100,
+        allowed_gpu_uuids=["GPU-b"], priority=0, exclusive=False),
+        pausable=False, adaptable=False)
+    donor.report("applied", donor.poll()["granted"])
+    released=[]
+    def hook(op, body):
+        if op == "report" and body["phase"] == "released":
+            task=e.tasks[body["task_id"]]
+            assert all(process_state(p, os.getuid()) == "dead" for p in task["processes"][1:])
+            released.append(True)
+    marker=tmp_path / "actual.json"
+    command=[sys.executable,"-c",
+        "import os,json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(visible=os.environ['CUDA_VISIBLE_DEVICES'],grant=json.loads(os.environ['VILLA_GPU_MANAGER_GRANT']))))",
+        str(marker)]
+    assert run_exclusive(command,socket="unused",gpu_uuids=["GPU-b","GPU-a"],
+        client_factory=memory_client(e,hook),exclusive=False,cpu_cores=8,
+        vram_bytes_per_gpu=40,accept_partial=True,poll_interval=.01) == 0
+    result=json.loads(marker.read_text())
+    assert result == {"visible":"GPU-a","grant":{"cpu_cores":4,"gpus":{"GPU-a":40}}}
+    task=max(e.tasks.values(),key=lambda t:t["order"])
+    assert task["terminal"] and task["granted"] == empty() and released
+    assert not task["adaptable"] and not task["pausable"]
+    assert donor.poll()["phase"] == "applied"
+
+
+@pytest.mark.parametrize("kind", ["empty", "foreign", "memory", "cpu_zero", "cpu_excess"])
+def test_invalid_partial_grants_do_not_launch(tmp_path,kind):
+    e=engine();base=memory_client(e)
+    class InvalidGrant(base):
+        def register(self,*args,**kwargs):
+            task=super().register(*args,**kwargs)
+            if kind=="empty":task["granted"]["gpus"]={}
+            elif kind=="foreign":task["granted"]["gpus"]={"GPU-foreign":40}
+            elif kind=="memory":task["granted"]["gpus"]["GPU-a"]=39
+            elif kind=="cpu_zero":task["granted"]["cpu_cores"]=0
+            elif kind=="cpu_excess":task["granted"]["cpu_cores"]=9
+            return task
+    marker=tmp_path/"forbidden"
+    with pytest.raises(RuntimeError,match="invalid partial grant"):
+        run_exclusive(marker_command(marker),socket="unused",gpu_uuids=["GPU-a","GPU-b"],
+            exclusive=False,cpu_cores=8,vram_bytes_per_gpu=40,accept_partial=True,
+            client_factory=InvalidGrant,poll_interval=.01)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("partial,exact", [(True,True),(1,False)])
+def test_partial_admission_arguments(tmp_path,partial,exact):
+    with pytest.raises(ValueError,match="accept_partial"):
+        run_exclusive(marker_command(tmp_path/"forbidden"),socket="unused",gpu_uuids=["GPU-a"],
+            client_factory=memory_client(engine()),accept_partial=partial,wait_for_exact=exact)
 
 
 def test_nonexclusive_requires_explicit_budgets(tmp_path):

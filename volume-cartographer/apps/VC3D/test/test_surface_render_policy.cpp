@@ -7,6 +7,33 @@ class SurfaceRenderPolicyTest : public QObject
     Q_OBJECT
 
 private slots:
+    void annotationDemandIsUnrestricted()
+    {
+        using vc::render::surfaceQueuedFallbackLevels;
+        for (int levels = 0; levels <= 5; ++levels) {
+            for (bool preferTileFills : {false, true}) {
+                for (bool cacheUsable : {false, true}) {
+                    QCOMPARE(surfaceQueuedFallbackLevels(
+                                 levels, preferTileFills, cacheUsable, true, true),
+                             levels);
+                }
+            }
+        }
+    }
+
+    void neighboringPlaneDemand()
+    {
+        using vc::render::surfaceQueuedFallbackLevels;
+        for (int levels = 0; levels <= 5; ++levels) {
+            // Planes have no SurfaceCache, but their interactive requests share
+            // the scheduler with background flattened-surface tile fills.
+            QCOMPARE(surfaceQueuedFallbackLevels(levels, true, false, true),
+                     std::min(levels, 1));
+            QCOMPARE(surfaceQueuedFallbackLevels(levels, false, false, true),
+                     levels);
+        }
+    }
+
     void fallbackDemand()
     {
         using vc::render::surfaceQueuedFallbackLevels;

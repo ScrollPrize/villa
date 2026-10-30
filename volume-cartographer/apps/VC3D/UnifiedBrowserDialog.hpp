@@ -53,7 +53,6 @@ private:
     bool ensureRemoteAuth(const QString& probeUrl);
     static Mode detectModeFromUri(const QString& uri);
     QString currentUri() const;
-    QString itemUri(const QListWidgetItem* item) const;
     bool isAcceptableUri(const QString& uri, bool isFile) const;
     void handleTypedPath(const QString& typed, bool acceptDirectories);
 

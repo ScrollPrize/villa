@@ -9,11 +9,7 @@ from .constraint_extraction import resolve_native_binary
 
 
 def resolve_command(case, config):
-    name=case['binary'];args=list(case.get('args',[]))
-    # The AFV exporter was extracted from the historical tracing executable.
-    if name=='vc_fiber_trace_chunk' and args[:1]==['afv-constraints']:
-        name='vc_fiber_constraints';args=args[1:]
-    return [resolve_native_binary(name, config),*map(str,args)]
+    return [resolve_native_binary(case['binary'], config),*map(str,case.get('args',[]))]
 
 
 def run(config):

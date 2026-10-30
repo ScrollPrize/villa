@@ -1,10 +1,9 @@
 #include "LineAnnotationStructuralEdits.hpp"
 
 #include <algorithm>
-#include <cstring>
-#include <filesystem>
 
 #include <nlohmann/json.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 namespace vc3d::line_annotation {
 
@@ -37,7 +36,6 @@ void applyIdentity(StoredFiber& fiber, const NewFiberIdentity& identity)
     fiber.startedAt = identity.startedAt;
     fiber.sequence = identity.sequence;
     fiber.fileName = identity.fileName;
-    fiber.sourceRoot = identity.sourceRoot;
     fiber.generation = 1;
 }
 
@@ -82,16 +80,16 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // endpoints; anything else connecting these fibers blocks the merge, and
     // an adjacent-winding link between the endpoints cannot become one fiber.
     const auto isPairLink = [&](const FiberBranchRef& branch, uint64_t otherId,
-                                const std::string& otherFile, int localIdx, int otherIdx) {
-        return branchReferencesFiber(branch, otherId, otherFile) &&
+                                int localIdx, int otherIdx) {
+        return branchReferencesFiber(branch, otherId) &&
                branch.controlPointIndex == localIdx &&
                branch.branchControlPointIndex == otherIdx;
     };
     for (const auto& branch : clicked.branches) {
-        if (!branchReferencesFiber(branch, far.id, far.fileName)) {
+        if (!branchReferencesFiber(branch, far.id)) {
             continue;
         }
-        if (!isPairLink(branch, far.id, far.fileName, clickedIndex, candidateIndex)) {
+        if (!isPairLink(branch, far.id, clickedIndex, candidateIndex)) {
             fail(error, "These fibers are linked elsewhere; unlink first.");
             return std::nullopt;
         }
@@ -102,10 +100,10 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         }
     }
     for (const auto& branch : far.branches) {
-        if (!branchReferencesFiber(branch, clicked.id, clicked.fileName)) {
+        if (!branchReferencesFiber(branch, clicked.id)) {
             continue;
         }
-        if (!isPairLink(branch, clicked.id, clicked.fileName, candidateIndex, clickedIndex)) {
+        if (!isPairLink(branch, clicked.id, candidateIndex, clickedIndex)) {
             fail(error, "These fibers are linked elsewhere; unlink first.");
             return std::nullopt;
         }
@@ -115,8 +113,21 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
             return std::nullopt;
         }
     }
-    if (clicked.coordinateBaseShapeZYX != far.coordinateBaseShapeZYX) {
-        fail(error, "Cannot merge: the fibers are stored in different coordinate domains.");
+    try {
+        using namespace vc::objects;
+        const auto a = geometryCoordinates(clicked.coordinateIdentity.value("coordinates", nlohmann::json::object()));
+        const auto b = geometryCoordinates(far.coordinateIdentity.value("coordinates", nlohmann::json::object()));
+        // Advisory bindings (volume labels, dimensions) do not define a frame.
+        if (a != b) throw std::invalid_argument("different coordinate frames");
+        // Both must be in the same voxels too: the merged fiber's positions are
+        // mapped back to the stored frame through the clicked fiber's frame.
+        const bool sameView = clicked.frame.has_value() == far.frame.has_value() &&
+            (!clicked.frame || (clicked.frame->volume == far.frame->volume &&
+                                clicked.frame->storedToVolume == far.frame->storedToVolume));
+        if (!sameView) throw std::invalid_argument("different coordinate frames");
+        (void)mergeGeometryCoordinates(a, b); // Also check exact mixed integer/float scales.
+    } catch (const std::exception&) {
+        fail(error, "Cannot merge fibers from different coordinate frames");
         return std::nullopt;
     }
 
@@ -183,14 +194,15 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // The join span has no real geometry until the merged line is re-fit.
     addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
     merged.hvClassification =
-        classifyFiberHv(storedControlPointPositions(merged.controlPoints));
-    merged.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
+        vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(merged.controlPoints));
+    merged.coordinateIdentity = clicked.coordinateIdentity;
+    merged.frame = clicked.frame;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
     // left as stored; the batch canonicalization recomputes them from the
     // merged line (the incident: a copied direction on a reversed line).
     for (const auto& branch : clicked.branches) {
-        if (branchReferencesFiber(branch, far.id, far.fileName) || branch.controlPointIndex < 0) {
+        if (branchReferencesFiber(branch, far.id) || branch.controlPointIndex < 0) {
             continue;
         }
         FiberBranchRef moved = branch;
@@ -198,7 +210,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         merged.branches.push_back(std::move(moved));
     }
     for (const auto& branch : far.branches) {
-        if (branchReferencesFiber(branch, clicked.id, clicked.fileName) ||
+        if (branchReferencesFiber(branch, clicked.id) ||
             branch.controlPointIndex < 0) {
             continue;
         }
@@ -237,7 +249,8 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
-        half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
+        half.coordinateIdentity = parent.coordinateIdentity;
+        half.frame = parent.frame;
     };
     StoredFiber& prefix = result.prefix;
     StoredFiber& suffix = result.suffix;
@@ -271,8 +284,8 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         moved.controlPointIndex = remapped->second;
         (remapped->first ? suffix : prefix).branches.push_back(std::move(moved));
     }
-    prefix.hvClassification = classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
-    suffix.hvClassification = classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
+    prefix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
+    suffix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
 
     if (linkHalves) {
         // "Split and link, same winding": record the boundary connection as
@@ -320,7 +333,7 @@ std::optional<std::size_t> redirectBranchRefs(std::vector<FiberBranchRef>& refs,
     for (std::size_t i = 0; i < refs.size(); ++i) {
         const FiberBranchRef& ref = refs[i];
         for (const auto& source : sources) {
-            if (!branchReferencesFiber(ref, source.id, source.fileName)) {
+            if (!branchReferencesFiber(ref, source.id)) {
                 continue;
             }
             if (!source.stored || !source.map) {
@@ -358,55 +371,6 @@ std::optional<std::size_t> redirectBranchRefs(std::vector<FiberBranchRef>& refs,
         ref.branchControlPointIndex = target.controlPointIndex;
     }
     return resolved.size();
-}
-
-std::vector<std::string> referencedFiberFileNames(const nlohmann::json& root)
-{
-    std::vector<std::string> names;
-    if (!root.is_object()) {
-        return names;
-    }
-    for (const char* kind : {"branches", "adjacent_branches"}) {
-        const auto it = root.find(kind);
-        if (it == root.end() || !it->is_array()) {
-            continue;
-        }
-        for (const auto& entry : *it) {
-            if (!entry.is_object()) {
-                continue;
-            }
-            const auto file = entry.find("branch_file");
-            if (file == entry.end() || !file->is_string()) {
-                continue;
-            }
-            const std::string name =
-                std::filesystem::path(file->get<std::string>()).filename().string();
-            if (!name.empty()) {
-                names.push_back(name);
-            }
-        }
-    }
-    return names;
-}
-
-std::string fiberGeometryKey(const std::vector<StoredControlPoint>& controls,
-                             const std::vector<cv::Vec3d>& linePoints)
-{
-    if (controls.empty() && linePoints.empty()) return {};
-    std::string key;
-    key.reserve(sizeof(uint64_t) + (controls.size() + linePoints.size()) * 3 * sizeof(uint64_t));
-    auto appendPoint = [&key](const cv::Vec3d& point) {
-        for (int axis = 0; axis < 3; ++axis) {
-            uint64_t bits = 0;
-            std::memcpy(&bits, &point[axis], sizeof(bits));
-            key.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
-        }
-    };
-    const uint64_t controlCount = controls.size();
-    key.append(reinterpret_cast<const char*>(&controlCount), sizeof(controlCount));
-    for (const auto& control : controls) appendPoint(control);
-    for (const auto& point : linePoints) appendPoint(point);
-    return key;
 }
 
 }  // namespace vc3d::line_annotation

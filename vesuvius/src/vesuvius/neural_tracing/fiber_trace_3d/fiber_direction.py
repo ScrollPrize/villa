@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from .fiber_normal_sign import sign_alignment_terms, launch_tensor_solve
 
 
@@ -69,13 +70,13 @@ def inherit_h_labels(ids,labels,inherited):
 def prepare(config):
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
     from vesuvius.neural_tracing.tracers.shared.geometry import arclength,tangents_at
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
     start=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
     family,label,_=family_settings(config)
-    signature={k:sha256_file(config[k]) for k in ('database','afv','features','stage1','hv_solution','umbilicus')}
+    signature={k:(fibers_digest if k=='fibers' else sha256_file)(config[k]) for k in ('database','fibers','features','stage1','hv_solution','umbilicus')}
     signature.update(version=1,tangent_half=config.get('tangent_half',16.),prior_spacing=config.get('prior_spacing',16.),
                      axis_half=config.get('axis_half',8.),convention='axis_increasing_z_cross_outward_radius_ccw')
     if family=='V':signature.update(family='V',convention='local_umbilicus_axis_increasing_z_up')
@@ -86,7 +87,7 @@ def prepare(config):
         raise ValueError('Sampling spans must be positive and finite')
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
     feature=json.loads(Path(config['features']).read_text());verify_feature_source(config['database'],feature)
-    if feature['afv_sha256']!=signature['afv'] or feature['umbilicus_sha256']!=signature['umbilicus']:
+    if feature['fibers_digest']!=signature['fibers'] or feature['umbilicus_sha256']!=signature['umbilicus']:
         raise ValueError('Source/feature identity mismatch')
     previous=json.loads((Path(config['hv_solution']).parent/'summary.json').read_text())
     if previous['input']['signature']['database']!=signature['database'] or previous['input']['signature']['stage1']!=signature['stage1']:
@@ -94,32 +95,33 @@ def prepare(config):
     with np.load(config['hv_solution']) as h:ids=h['ids'].copy();labels=h['labels'].copy()
     with np.load(config['stage1']) as s:
         if not np.array_equal(ids,s['ids']) or np.any(s['broken']&(labels!=2)):raise ValueError('Stage1 exclusions changed')
-    if not np.all(np.diff(ids)>0) or not np.isin(labels,[0,1,2]).all():raise ValueError('Invalid source labels')
+    if not np.all(ids[1:]>ids[:-1]) or not np.isin(labels,[0,1,2]).all():raise ValueError('Invalid source labels')
     inherited={}
     if config.get('inherited_h_solution'):
         hpath=Path(config['inherited_h_solution'])
         hmeta=json.loads((hpath.parent/'summary.json').read_text())['input']['signature']
-        for k in ('database','afv','features','stage1','hv_solution','umbilicus'):
+        for k in ('database','fibers','features','stage1','hv_solution','umbilicus'):
             if hmeta[k]!=signature[k]:raise ValueError('Inherited H provenance mismatch: '+k)
         with np.load(hpath) as h:
             labels=inherit_h_labels(ids,labels,h)
             inherited={f'inherited_h_direction_sign_{g}':h[f'direction_sign_{g}'].copy() for g in ('ccw','cw')}
     active=np.flatnonzero(labels==label)
     if not len(active):raise ValueError('No retained family fibers')
-    with _ro(config['afv']) as db:meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    axis=load_umbilicus_frame(config['umbilicus'],meta['root'])
+    axis=load_umbilicus_frame(config['umbilicus'],fiber_volume(config['fibers']))
     with _ro(config['database']) as db:
-        rows=np.asarray(db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b FROM constraints WHERE parallel_score>perpendicular_score ORDER BY id').fetchall(),dtype=float).reshape(-1,5)
-    idx=np.searchsorted(ids,rows[:,1:3].astype(np.int64))
-    if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],rows[:,1:3]):raise ValueError('Unknown event fiber')
+        records=db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b FROM constraints WHERE parallel_score>perpendicular_score ORDER BY id').fetchall()
+    rows=np.asarray([(r[0],r[3],r[4]) for r in records],dtype=float).reshape(-1,3)
+    ends=np.asarray([r[1:3] for r in records],dtype=str).reshape(-1,2)
+    idx=np.searchsorted(ids,ends)
+    if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],ends):raise ValueError('Unknown event fiber')
     mask=(labels[idx]==label).all(1);original_parallel=len(rows);rows=rows[mask];idx=idx[mask]
     remap=np.full(len(ids),-1,np.int64);remap[active]=np.arange(len(active));ends=remap[idx]
-    count=len(rows);end_ids=ends.T.reshape(-1);arcs=rows[:,3:5].T.reshape(-1)
+    count=len(rows);end_ids=ends.T.reshape(-1);arcs=rows[:,1:3].T.reshape(-1)
     order=np.argsort(end_ids,kind='stable');sorted_ids=end_ids[order]
     starts=np.searchsorted(sorted_ids,np.arange(len(active)));stops=np.searchsorted(sorted_ids,np.arange(len(active)),side='right')
     tangents=np.empty((2*count,3),np.float32);prior=np.zeros(len(active),np.float32)
     support=np.zeros(len(active),np.float32);lengths=np.zeros(len(active))
-    geometry=read_afv_polylines(config['afv'],ids[active])
+    geometry=read_polylines(config['fibers'],ids[active])
     print(f'{family}-direction prepare: {len(active):,} fibers; {count:,} parallel events',flush=True)
     for n,(row,xyz) in enumerate(geometry):
         if row['id']!=ids[active[n]]:raise ValueError('Geometry order mismatch')
@@ -289,7 +291,7 @@ def solve(config):
     convention='CCW viewed from positive-Z axis end towards negative' if family=='H' else 'UP along local positive-Z umbilicus axis'
     np.savez(root/'solution.npz',ids=d['ids'],active=d['active'],family=np.asarray(family),
              direction_sign_positive=full,direction_sign_negative=-full,component=d['component'],
-             convention=np.asarray(convention+'; sign multiplies stored AFV tangent'),**aliases,**extra)
+             convention=np.asarray(convention+'; sign multiplies stored fiber tangent'),**aliases,**extra)
     final=history[-1];final['changed_vs_umbilicus_percent']=float(100*(sign!=np.where(d['prior']>=0,1,-1)).mean())
     # Independent CPU/gauge audit of the saved data.
     with np.load(root/'solution.npz') as saved:
@@ -333,8 +335,8 @@ def report(config):
     if family_settings(cfg)[0]!='H':raise ValueError('Legacy sign-only report is H-only; use fiber_direction_review for V')
     with np.load(cfg['tensor_cache']) as archive:d={k:archive[k] for k in archive.files}
     with np.load(root/'solution.npz') as archive:s={k:archive[k] for k in archive.files}
-    for key in ('database','afv','features','stage1','hv_solution','umbilicus'):
-        if sha256_file(cfg[key])!=summary['input']['signature'][key]:raise ValueError('Changed source: '+key)
+    for key in ('database','fibers','features','stage1','hv_solution','umbilicus'):
+        if (fibers_digest if key=='fibers' else sha256_file)(cfg[key])!=summary['input']['signature'][key]:raise ValueError('Changed source: '+key)
     if not np.array_equal(s['ids'],d['ids']) or not np.array_equal(s['active'],d['active']):raise ValueError('Saved source identity mismatch')
     if not np.all(np.isfinite(s['sign_logit_ccw'])):raise ValueError('Nonfinite solution')
     if not np.array_equal(s['direction_sign_cw'],-s['direction_sign_ccw']):raise ValueError('Bad CW gauge')

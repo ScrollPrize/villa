@@ -1,8 +1,6 @@
 #include "utils/http_fetch.hpp"
 #include "utils/sftp_fetch.hpp"
 
-#if UTILS_HAS_CURL
-
 #include <curl/curl.h>
 
 #include <array>
@@ -590,5 +588,3 @@ HttpResponse HttpClient::put_file(std::string_view url,
 }
 
 } // namespace utils
-
-#endif // UTILS_HAS_CURL

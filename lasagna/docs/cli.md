@@ -68,3 +68,20 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `flatten` optimizes a 2D flattening over one external tifxyz source. The default [`configs/flatten.json`](../configs/flatten.json) keeps the existing inverse-map Adam path. [`configs/flatten_forward.json`](../configs/flatten_forward.json) sets `flatten_solver: "forward"` to optimize source-vertex UVs with the same pyramid/Adam stages, then invert that UV map at export. Use exactly one `external_surfaces` entry supplied by VC3D or the calling config.
 
 For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.
+
+### Stored surfaces (VC3D)
+
+VC3D works on surfaces in a VC object store, never on tifxyz directories. Start the service with `--store PATH`
+(a hub replica or local store; `/health` reports its `store_uuid`); VC3D starts its internal service on its own
+store file with `--shared-store`, leaving hub sync to VC3D's session. A VC3D request names that store
+(`store_uuid`) and the volume it works in (`volume_uuid`); its surface references are
+`{"type": "surface", "uuid": ..., "revision": optional geometry revision}` in `external_surfaces`, the atlas
+`base.ref`, and `model` (the model checkpoint a fit left in that surface's artifact directory, `<hub>.artifacts/<uuid>/model.pt`).
+The service syncs the store before a job, the fit reads the surfaces directly (`fit.py --store --volume-uuid`,
+references `vcobj:<uuid>[@<revision>]`), and the export creates new surfaces in the store
+(`fit2tifxyz.py --store PATH --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
+channels, `model.pt`/`model_params.json`/mask debug files go to the surface's artifact directory, and the
+correction-point and atlas-control results are point collections attached to the surface (record meta `role`
+`lasagna_corr_points_results` / `lasagna_atlas_control_points_results`, an `attachment` relationship that is
+never a graph link). Provenance lists the stored surfaces the job read. The job reports the new surfaces'
+UUIDs as `output_surfaces`. Command-line fits keep reading and writing tifxyz directories.

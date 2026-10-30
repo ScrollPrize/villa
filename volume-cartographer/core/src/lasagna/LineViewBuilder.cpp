@@ -379,18 +379,6 @@ cv::Vec3d requiredDisplayAnchorUp(const std::vector<SegmentNormalSample>& sample
     return up;
 }
 
-double unwrapNear(double angle, double reference)
-{
-    constexpr double twoPi = 2.0 * 3.14159265358979323846;
-    while (angle - reference > 3.14159265358979323846) {
-        angle -= twoPi;
-    }
-    while (angle - reference < -3.14159265358979323846) {
-        angle += twoPi;
-    }
-    return angle;
-}
-
 double unwrapAxisNear(double angle, double reference)
 {
     constexpr double pi = 3.14159265358979323846;
@@ -429,31 +417,6 @@ std::vector<double> smoothRollAngles(const std::vector<double>& targets)
     return angles;
 }
 
-std::vector<cv::Vec3d> alignedTargetNormals(const std::vector<cv::Vec3d>& normals,
-                                            const std::vector<cv::Vec3d>& tangents,
-                                            const std::vector<cv::Vec3d>& baseNormals)
-{
-    std::vector<cv::Vec3d> targets(normals.size(), {0.0, 0.0, 0.0});
-    cv::Vec3d previous{0.0, 0.0, 0.0};
-    for (size_t row = 0; row < normals.size(); ++row) {
-        cv::Vec3d target = projectToTangentPlane(normalizedOrZero(normals[row]), tangents[row]);
-        if (!validDirection(target)) {
-            targets[row] = previous;
-            continue;
-        }
-
-        const cv::Vec3d reference = validDirection(previous) && row > 0
-            ? transportNormal(previous, tangents[row - 1], tangents[row])
-            : baseNormals[row];
-        if (validDirection(reference) && target.dot(reference) < 0.0) {
-            target *= -1.0;
-        }
-        targets[row] = target;
-        previous = target;
-    }
-    return targets;
-}
-
 struct LineFrame {
     cv::Vec3d side;
     cv::Vec3d meshNormal;
@@ -471,29 +434,6 @@ cv::Vec3d fallbackMeshNormalForTangent(const cv::Vec3d& tangent)
         return normal;
     }
     return {0.0, 1.0, 0.0};
-}
-
-cv::Vec3d clampedFrameNormal(const cv::Vec3d& reference,
-                             const cv::Vec3d& target,
-                             const cv::Vec3d& tangent)
-{
-    if (!validDirection(reference)) {
-        return target;
-    }
-    if (!validDirection(target)) {
-        return reference;
-    }
-
-    const cv::Vec3d binormal = normalizedOrZero(tangent.cross(reference));
-    if (!validDirection(binormal)) {
-        return target;
-    }
-
-    const double angle = std::atan2(target.dot(binormal), target.dot(reference));
-    const double clampedAngle = clamped(angle, -kMaxFrameRollDelta, kMaxFrameRollDelta);
-    cv::Vec3d normal = rotateAroundAxis(reference, tangent, clampedAngle);
-    normal = projectToTangentPlane(normal, tangent);
-    return validDirection(normal) ? normal : target;
 }
 
 LineFrame frameFromMeshNormal(cv::Vec3d meshNormal, const cv::Vec3d& tangent)
@@ -646,27 +586,6 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
                   static_cast<float>(1.0 / crossSpacing)});
     surface->setStrictQuadRenderValidity(true);
     return surface;
-}
-
-std::vector<LineFrame> framesAtControlPoints(const std::vector<SegmentNormalSample>& controlSamples,
-                                             const std::vector<SegmentNormalSample>& frameSamples,
-                                             const std::vector<LineFrame>& frameSamplesFrames)
-{
-    std::vector<LineFrame> frames;
-    frames.reserve(controlSamples.size());
-    for (const auto& controlSample : controlSamples) {
-        size_t bestIndex = 0;
-        double bestDistance = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < frameSamples.size(); ++i) {
-            const double distance = norm(frameSamples[i].position - controlSample.position);
-            if (distance < bestDistance) {
-                bestIndex = i;
-                bestDistance = distance;
-            }
-        }
-        frames.push_back(frameSamplesFrames[bestIndex]);
-    }
-    return frames;
 }
 
 // Only entries where both the hint and the direction are usable contribute, so
