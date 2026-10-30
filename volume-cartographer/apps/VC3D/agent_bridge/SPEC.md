@@ -459,7 +459,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
+| `vc3d_manual_add_add_constraint` | `segmentation.manual_add.add_constraint` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
+| `vc3d_manual_add_extend` | `segmentation.manual_add.extend` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |

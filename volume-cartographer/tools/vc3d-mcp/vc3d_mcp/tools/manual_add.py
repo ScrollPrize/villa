@@ -57,6 +57,57 @@ async def vc3d_manual_add_undo_constraint() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def vc3d_manual_add_extend(
+    side: Literal["up", "down", "left", "right"],
+    cells: int = 16,
+    first: int | None = None,
+    last: int | None = None,
+    applyPending: bool = False,
+) -> dict[str, Any]:
+    """Continue the active segment past one edge by `cells` vertices.
+
+    Each row (side "left"/"right") or column ("up"/"down") ending at that
+    edge is continued along its own direction at the edge; first/last limit
+    it to those rows or columns. With the panel's "Extensions follow the
+    sheet" setting on (the default), each line is then re-walked along the
+    CT sheet in the background; "followingSheet" is true until that finishes
+    (vc3d_get_state reports it as manualAddFollowingSheet), so wait for it
+    before adding constraints or applying. Enters manual-add mode if needed and grows
+    the grid when there is no room. Refine the preview with
+    vc3d_manual_add_add_constraint or vc3d_shift_click on a plane viewer, then
+    vc3d_manual_add_finish to apply (apply=false removes the strip and any
+    grid growth). With applyPending=true and an extension of the same side
+    pending, that one is applied and saved first and the next starts from the
+    new edge, keeping its first/last; "queued" is true while it waits for the
+    save. Returns {"active": bool, "side": str, "queued": bool,
+    "followingSheet": bool}.
+    """
+    params: dict[str, Any] = {"side": side, "cells": cells}
+    if first is not None:
+        params["first"] = first
+    if last is not None:
+        params["last"] = last
+    if applyPending:
+        params["applyPending"] = True
+    return await _call("segmentation.manual_add.extend", params)
+
+
+@mcp.tool()
+async def vc3d_manual_add_add_constraint(
+    world: list[float], radius: float = 0.0
+) -> dict[str, Any]:
+    """Pin the pending manual-add geometry to a world point [x, y, z], like a
+    Shift+click on the sheet in a plane viewer. The pending vertex nearest to
+    the point within `radius` (the panel's constraint radius when 0) moves
+    there and the rest of the pending geometry follows. Returns
+    {"placed": true}. Requires manual-add mode with pending geometry."""
+    return await _call(
+        "segmentation.manual_add.add_constraint",
+        {"world": world, "radius": radius},
+    )
+
+
+@mcp.tool()
 async def vc3d_corrections_set_point_mode(active: bool) -> dict[str, Any]:
     """Enable/disable correction-point authoring mode (the G-key mode) without a
     keypress. Requires editing enabled, an active edit session, and no growth

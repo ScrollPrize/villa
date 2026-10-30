@@ -56,6 +56,7 @@ public:
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
+    [[nodiscard]] int manualAddExtendCells() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;
@@ -196,6 +197,7 @@ signals:
     void manualAddRecomputeRequested();
     void manualAddApplyExitRequested();
     void manualAddCancelRequested();
+    void manualAddExtendRequested(int side, int cells);
 
 private:
     void buildUi();
