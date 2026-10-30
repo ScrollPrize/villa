@@ -3,7 +3,7 @@
 #include "OpenDataManifest.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
@@ -43,7 +43,10 @@ std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
         }
         vcr::s3::ListPage page;
         try {
-            page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken)));
+            vcr::HttpClient http{vcr::HttpOptions{}};
+            std::vector<std::uint8_t> body;
+            http.get(vcr::s3::listUrl(prefix, {}, continuationToken), body);
+            page = vcr::s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
         } catch (const std::exception& e) {
             if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
             return {};
@@ -393,13 +396,12 @@ std::filesystem::path downloadOpenDataNormalGrids(
                 }
                 if (linkEc || !std::filesystem::is_regular_file(target, linkEc)) {
                     const auto url = vcr::s3::objectUrl(remote->origin, remote->key + object.relativePath);
-                    const auto bytes = vc::httpGetBytes(url);
-                    // httpGetBytes returns an empty body for 4xx misses; only
-                    // accept it when the listing says the object really is empty.
-                    if (bytes.empty() && object.size > 0) {
-                        throw std::runtime_error("empty response for " + url);
-                    }
-                    writeFile(target, bytes);
+                    vcr::HttpClient http{vcr::HttpOptions{}};
+                    std::vector<std::uint8_t> received;
+                    if (!http.get(url, received))
+                        throw std::runtime_error("object is missing: " + url);
+                    const auto* bytes = reinterpret_cast<const std::byte*>(received.data());
+                    writeFile(target, std::vector<std::byte>(bytes, bytes + received.size()));
                 }
                 completed.fetch_add(1, std::memory_order_relaxed);
                 completedBytes.fetch_add(object.size, std::memory_order_relaxed);

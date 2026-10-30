@@ -8,7 +8,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/NormalGridGenerate.hpp"
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include "utils/Json.hpp"
@@ -50,11 +50,20 @@ bool requireNetwork()
     return env && env[0] && env[0] != '0';
 }
 
+// The object's body; empty when it is missing.
+std::string getText(const std::string& url)
+{
+    vcr::HttpClient http{vcr::HttpOptions{}};
+    std::vector<std::uint8_t> body;
+    if (!http.get(url, body)) return {};
+    return std::string(body.begin(), body.end());
+}
+
 // Returns nullopt on network failure (after soft-skipping via MESSAGE).
 std::optional<std::string> fetch(const std::string& url)
 {
     try {
-        auto body = vc::httpGetString(url);
+        auto body = getText(url);
         if (body.empty()) return std::nullopt;
         return body;
     } catch (const std::exception& e) {
@@ -131,7 +140,7 @@ fs::path stagePHerc172Level5(const fs::path& dst)
                     std::to_string(iz) + "/" + std::to_string(iy) + "/" +
                     std::to_string(ix);
                 try {
-                    auto body = vc::httpGetString(chunkUrl);
+                    auto body = getText(chunkUrl);
                     if (body.empty()) { ++missing; continue; }
                     writeBytes(dst / "0" / std::to_string(iz) /
                                std::to_string(iy) /

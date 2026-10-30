@@ -427,7 +427,6 @@ vc_add_test(NAME test_surface_patch_index)
 
 vc_add_test(NAME test_tiff_merge)
 
-vc_add_test(NAME test_http_fetch_errors)
 vc_add_test(NAME test_global_cache_root)
 
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises

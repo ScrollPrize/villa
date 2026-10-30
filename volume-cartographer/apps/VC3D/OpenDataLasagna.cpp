@@ -5,7 +5,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -134,7 +134,10 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
     const auto prefix = vcr::s3::splitPrefixUrl(artifactUrl);
     if (!prefix || prefix->key.empty())
         throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " + artifactUrl);
-    const auto page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(*prefix, "/", {}, 100)));
+    vcr::HttpClient http{vcr::HttpOptions{}};
+    std::vector<std::uint8_t> body;
+    http.get(vcr::s3::listUrl(*prefix, "/", {}, 100), body);
+    const auto page = vcr::s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
     std::vector<std::string> keys;
     for (const auto& object : page.objects) {
         if (object.key.rfind(prefix->key, 0) != 0) continue;

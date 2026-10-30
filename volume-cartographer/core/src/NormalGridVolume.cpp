@@ -2,7 +2,7 @@
 #include "vc/core/util/HashFunctions.hpp"
 
 #include "utils/Json.hpp"
-#include <utils/http_fetch.hpp>
+#include "vc_reader/native/http.hpp"
 
  #include <filesystem>
  #include <fstream>
@@ -198,7 +198,7 @@
          // are not re-fetched across runs.
          bool remote = false;
          std::string remote_url;
-         utils::HttpClient http_client;
+         mutable vcr::HttpClient http_client{vcr::HttpOptions{}};
          static constexpr int prefetch_radius = 4;
          static constexpr int prefetch_worker_count = 4;
          static constexpr size_t prefetch_queue_limit = 256;
@@ -333,16 +333,17 @@
                 return false;
             }
 
-            utils::HttpResponse resp;
+            std::vector<std::uint8_t> body;
+            bool found = false;
             try {
-                resp = http_client.get(remote_url + "/" + rel);
+                found = http_client.get(remote_url + "/" + rel, body);
             } catch (const std::exception& e) {
                 std::cerr << "normal-grid fetch failed for " << rel << ": " << e.what()
                           << std::endl;
                 return false;
             }
 
-            if (resp.ok()) {
+            if (found) {
                 fs::create_directories(local.parent_path(), ec);
                 // Unique temp + rename so concurrent readers (and concurrent
                 // processes streaming into the same cache) never see partial files.
@@ -355,9 +356,9 @@
                     if (!out) {
                         return false;
                     }
-                    if (!resp.body.empty()) {
-                        out.write(reinterpret_cast<const char*>(resp.body.data()),
-                                  static_cast<std::streamsize>(resp.body.size()));
+                    if (!body.empty()) {
+                        out.write(reinterpret_cast<const char*>(body.data()),
+                                  static_cast<std::streamsize>(body.size()));
                     }
                     out.close();
                     if (!out) {
@@ -373,14 +374,8 @@
                 return true;
             }
 
-            if (resp.not_found()) {
-                fs::create_directories(local.parent_path(), ec);
-                std::ofstream(missing_marker.string()).flush();
-                return false;
-            }
-
-            std::cerr << "normal-grid fetch for " << rel << " returned HTTP "
-                      << resp.status_code << std::endl;
+            fs::create_directories(local.parent_path(), ec);
+            std::ofstream(missing_marker.string()).flush();
             return false;
         }
 

@@ -6,7 +6,7 @@
 #include "VCSettings.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1164,7 +1164,11 @@ void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample
         result.sampleId = sampleId;
         result.url = url;
         try {
-            result.image = imageFromBytes(vc::httpGetBytes(url.toStdString()));
+            vcr::HttpClient http{vcr::HttpOptions{}};
+            std::vector<std::uint8_t> received;
+            http.get(url.toStdString(), received);
+            const auto* bytes = reinterpret_cast<const std::byte*>(received.data());
+            result.image = imageFromBytes(std::vector<std::byte>(bytes, bytes + received.size()));
             if (result.image.isNull()) {
                 result.error = QStringLiteral("Could not decode photo.");
             }

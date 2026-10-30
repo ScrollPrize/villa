@@ -13,7 +13,6 @@
 
 #include "utils/thread_pool.hpp"
 
-#include <zstd.h>
 
 #include <algorithm>
 #include <atomic>

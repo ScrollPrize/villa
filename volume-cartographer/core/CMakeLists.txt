@@ -38,8 +38,6 @@ add_library(vc_core
         src/RemoteFileCache.cpp
         src/RemoteMetadataCache.cpp
         src/RemoteCacheSettings.cpp
-        src/HttpFetch.cpp
-        src/S3AuthFallback.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp
@@ -61,7 +59,6 @@ target_link_libraries(vc_core
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
         TIFF::TIFF
-        CURL::libcurl
 )
 
 target_link_libraries(vc_core PUBLIC
@@ -207,7 +204,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
-target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)
 
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)

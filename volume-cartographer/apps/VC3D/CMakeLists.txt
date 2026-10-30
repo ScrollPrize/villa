@@ -371,7 +371,6 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    Blosc::blosc
 )
 
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to

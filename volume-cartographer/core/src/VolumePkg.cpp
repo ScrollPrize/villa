@@ -21,7 +21,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "utils/sftp_fetch.hpp"
+#include "vc_reader/sftp.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
 namespace fs = std::filesystem;
@@ -46,7 +46,7 @@ bool isFiberLasagnaEntry(const Entry& entry)
 
 bool isLocationRemote(const std::string& location)
 {
-    if (utils::is_sftp_url(location)) return true;
+    if (vcr::sftp::isSftpUrl(location)) return true;
     if (location.rfind("s3://", 0) == 0) return true;
     if (location.rfind("s3+", 0) == 0) return true;
     if (location.rfind("http://", 0) == 0) return true;

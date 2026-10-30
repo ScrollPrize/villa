@@ -1,8 +1,5 @@
 #include "vc/core/util/RemoteFileCache.hpp"
-#include "vc/core/util/S3AuthFallback.hpp"
 
-#include "utils/http_fetch.hpp"
-#include "utils/sftp_fetch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -124,166 +121,52 @@ RemoteFileCacheResult makeResult(const std::filesystem::path& payload, const std
     return {payload, normalized, cacheHit};
 }
 
-struct RemoteClientDetails {
-    utils::HttpClient::Config config;
-    bool isS3 = false;
-    bool credentialsLoaded = false;
-    std::string region;
-};
-
-RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint,
-                                            const vc::HttpAuth& explicitAuth,
-                                            bool discoverAwsCredentials)
-{
-    RemoteClientDetails details;
-    details.config.transfer_timeout = std::chrono::seconds{60};
-    details.config.connect_timeout = std::chrono::seconds{10};
-    details.config.max_retries = 2;
-    details.config.aws_auth = explicitAuth;
-    details.isS3 = endpoint.useAwsSigv4;
-    if (details.isS3 && details.config.aws_auth.empty() &&
-        discoverAwsCredentials)
-        details.config.aws_auth = vc::loadAwsCredentials();
-    if (details.isS3 && details.config.aws_auth.region.empty())
-        details.config.aws_auth.region = endpoint.awsRegion;
-    details.credentialsLoaded = !details.config.aws_auth.empty();
-    details.region = details.config.aws_auth.region;
-    return details;
-}
-
-std::string compactBodyExcerpt(std::string_view body)
-{
-    constexpr std::size_t kMaxExcerptBytes = 1024;
-    const auto take = std::min(body.size(), kMaxExcerptBytes);
-    std::string out;
-    out.reserve(take);
-    bool previousWhitespace = false;
-    for (std::size_t index = 0; index < take; ++index) {
-        const auto ch = static_cast<unsigned char>(body[index]);
-        if (std::isspace(ch)) {
-            if (!previousWhitespace && !out.empty())
-                out.push_back(' ');
-            previousWhitespace = true;
-            continue;
-        }
-        previousWhitespace = false;
-        out.push_back(std::isprint(ch) ? static_cast<char>(ch) : '.');
-    }
-    while (!out.empty() && out.back() == ' ')
-        out.pop_back();
-    if (body.size() > kMaxExcerptBytes)
-        out += "...";
-    return out;
-}
-
-std::string escapedDiagnosticString(std::string_view value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (const char ch : value) {
-        if (ch == '\\' || ch == '"')
-            out.push_back('\\');
-        out.push_back(ch);
-    }
-    return out;
-}
-
-std::string xmlTagValue(std::string_view body, std::string_view tag)
-{
-    const std::string open = "<" + std::string(tag) + ">";
-    const std::string close = "</" + std::string(tag) + ">";
-    const auto start = body.find(open);
-    if (start == std::string_view::npos)
-        return {};
-    const auto valueStart = start + open.size();
-    const auto end = body.find(close, valueStart);
-    return end == std::string_view::npos ? std::string{} : compactBodyExcerpt(body.substr(valueStart, end - valueStart));
-}
-
-std::string fetchFailureMessage(const std::string& sourceLocation, const vc::ResolvedUrl& endpoint, const RemoteClientDetails& details, const utils::HttpResponse& response)
-{
-    std::string message = "failed to fetch remote file source=" + redactedRemoteLocation(sourceLocation) +
-                          " request_url=" + redactedRemoteLocation(endpoint.httpsUrl);
-    message += response.status_code > 0 ? " HTTP " + std::to_string(response.status_code) : " no_http_response";
-    if (!response.error_message.empty())
-        message += " transport_error=\"" + escapedDiagnosticString(response.error_message) + "\"";
-    if (!response.content_type.empty())
-        message += " content_type=\"" + escapedDiagnosticString(response.content_type) + "\"";
-    if (response.content_length > 0)
-        message += " content_length=" + std::to_string(response.content_length);
-    message += " received_bytes=" + std::to_string(response.body.size());
-    if (details.isS3) {
-        message += " s3_region=" + (details.region.empty() ? std::string{"<unset>"} : details.region);
-        message += " aws_sigv4_credentials=" + std::string(details.credentialsLoaded ? "loaded" : "missing");
-    }
-    const auto body = std::string(response.body_string());
-    if (!body.empty()) {
-        for (const auto tag : {std::string_view{"Code"}, std::string_view{"Message"}, std::string_view{"Region"}}) {
-            const auto value = xmlTagValue(body, tag);
-            if (!value.empty())
-                message += " s3_" + std::string(tag) + "=\"" + escapedDiagnosticString(value) + "\"";
-        }
-        message += " response_body=\"" + escapedDiagnosticString(compactBodyExcerpt(body)) + "\"";
-    }
-    if (details.isS3) {
-        message += " hint=\"Verify bucket/key, region, AWS login, and s3:GetObject permissions.\"";
-    }
-    return message;
-}
-
 void defaultFetch(const std::string& sourceLocation,
                   const std::filesystem::path& temporaryPath,
                   const vc::HttpAuth& explicitAuth,
                   bool discoverAwsCredentials)
 {
     const auto endpoint = vc::resolveRemoteUrl(sourceLocation);
-    auto anonymousDetails = makeRemoteClientDetails(
-        endpoint, vc::HttpAuth{}, false);
-    utils::HttpClient anonymousClient(std::move(anonymousDetails.config));
-    vc::DeferredAwsAuth deferredAuth(
-        explicitAuth,
-        endpoint.useAwsSigv4 && discoverAwsCredentials,
-        endpoint.awsRegion);
-    std::optional<RemoteClientDetails> authenticatedDetails;
-    std::unique_ptr<utils::HttpClient> authenticatedClient;
-    vc::S3AuthFallback fallback(
-        endpoint.useAwsSigv4, deferredAuth.available());
-    auto result = fallback.request([&](bool anonymous) {
-        if (anonymous)
-            return anonymousClient.get(endpoint.httpsUrl);
-        if (!authenticatedClient) {
-            authenticatedDetails = makeRemoteClientDetails(
-                endpoint, deferredAuth.resolve(), false);
-            authenticatedClient = std::make_unique<utils::HttpClient>(
-                std::move(authenticatedDetails->config));
+    std::vector<std::uint8_t> body;
+    const auto fetch = [&](const vc::HttpAuth& auth) {
+        vcr::HttpOptions options;
+        options.auth = vc::readerAuth(auth);
+        vcr::HttpClient client(options);
+        return client.get(endpoint.httpsUrl, body);
+    };
+    const auto failure = [&](const std::string& reason) {
+        return std::runtime_error(
+            "failed to fetch remote file source=" + redactedRemoteLocation(sourceLocation) +
+            " request_url=" + redactedRemoteLocation(endpoint.httpsUrl) + ": " + reason);
+    };
+    bool found = false;
+    try {
+        // Recognized S3 sources are tried anonymously first; credentials are
+        // only consulted when that is denied.
+        try {
+            found = fetch(endpoint.useAwsSigv4 ? vc::HttpAuth{} : explicitAuth);
+        } catch (const vcr::HttpDenied&) {
+            if (!endpoint.useAwsSigv4)
+                throw;
+            auto auth = explicitAuth;
+            if (auth.empty() && discoverAwsCredentials)
+                auth = vc::loadAwsCredentials();
+            if (auth.empty())
+                throw;
+            if (auth.region.empty())
+                auth.region = endpoint.awsRegion;
+            found = fetch(auth);
         }
-        return authenticatedClient->get(endpoint.httpsUrl);
-    });
-    if (!result.response.ok()) {
-        const auto& failureDetails = result.usedAnonymous || !authenticatedDetails
-            ? anonymousDetails
-            : *authenticatedDetails;
-        std::string message = fetchFailureMessage(
-            sourceLocation, endpoint, failureDetails, result.response);
-        if (result.anonymousFailure) {
-            message += " anonymous_attempt_http=" +
-                std::to_string(result.anonymousFailure->status_code);
-            const auto code = xmlTagValue(
-                result.anonymousFailure->body_string(), "Code");
-            if (!code.empty()) {
-                message += " anonymous_s3_Code=\"" +
-                    escapedDiagnosticString(code) + "\"";
-            }
-            message += " authenticated_fallback=failed";
-        }
-        throw std::runtime_error(std::move(message));
+    } catch (const std::exception& error) {
+        throw failure(error.what());
     }
+    if (!found)
+        throw failure("HTTP 404");
     std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!output)
         throw std::runtime_error("cannot create remote cache temporary file");
-    if (!result.response.body.empty()) {
-        output.write(reinterpret_cast<const char*>(result.response.body.data()), static_cast<std::streamsize>(result.response.body.size()));
-    }
+    if (!body.empty())
+        output.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
     output.close();
     if (!output)
         throw std::runtime_error("cannot write remote cache temporary file");
@@ -314,7 +197,7 @@ std::string remoteFileCacheSource(std::string_view sourceLocation)
 {
     const auto suffix = sourceLocation.find_first_of("?#");
     auto source = std::string(sourceLocation.substr(0, suffix));
-    if (utils::is_sftp_url(source)) source = utils::canonical_sftp_url(source);
+    if (vcr::sftp::isSftpUrl(source)) source = vcr::sftp::parseUrl(source).str();
     while (!source.empty() && source.back() == '/')
         source.pop_back();
     if (source.empty())
@@ -349,8 +232,8 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
     const auto authority = std::string_view(source).substr(
         authorityStart,
         pathStart == std::string::npos ? std::string::npos : pathStart - authorityStart);
-    const auto cacheAuthority = utils::is_sftp_url(source)
-        ? utils::sftp_cache_authority(source) : std::string(authority);
+    const auto cacheAuthority = vcr::sftp::isSftpUrl(source)
+        ? vcr::sftp::cacheAuthority(source) : std::string(authority);
     if (!validComponent(cacheAuthority))
         throw std::invalid_argument("remote file cache source has an invalid authority");
 

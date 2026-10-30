@@ -1,9 +1,9 @@
 #include "UnifiedBrowserDialog.hpp"
-#include "utils/sftp_fetch.hpp"
+#include "vc_reader/sftp.hpp"
 #include <QCheckBox>
 #include <QKeyEvent>
 
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -185,8 +185,12 @@ RemoteListResult listS3Prefix(const QString& urlPrefix,
 
     vcr::s3::ListPage page;
     try {
-        page = vcr::s3::parseListPage(vc::httpGetString(
-            vcr::s3::listUrl(loc->listing, "/", continuationToken.toStdString()), auth));
+        vcr::HttpOptions options;
+        options.auth = vc::readerAuth(auth);
+        vcr::HttpClient http(options);
+        std::vector<std::uint8_t> body;
+        http.get(vcr::s3::listUrl(loc->listing, "/", continuationToken.toStdString()), body);
+        page = vcr::s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
     } catch (const std::exception& e) {
         result.error = QObject::tr("Could not list bucket: %1").arg(QString::fromUtf8(e.what()));
         return result;
@@ -455,7 +459,7 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
 
 bool UnifiedBrowserDialog::ensureRemoteAuth(const QString& probeUrl)
 {
-    if (utils::is_sftp_url(probeUrl.toStdString())) return true;
+    if (vcr::sftp::isSftpUrl(probeUrl.toStdString())) return true;
     if (_authResolved && probeUrl == _authProbeUrl) return true;
     if (!_authResolver) {
         // No resolver — proceed with empty auth (works for fully public buckets).
@@ -486,7 +490,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
     _status->setText(tr("Loading..."));
 
     const bool hasScheme =
-        utils::is_sftp_url(_currentRemoteUrl.toStdString()) ||
+        vcr::sftp::isSftpUrl(_currentRemoteUrl.toStdString()) ||
         _currentRemoteUrl.startsWith(QLatin1String("s3://"), Qt::CaseInsensitive)
         || _currentRemoteUrl.startsWith(QLatin1String("s3+"), Qt::CaseInsensitive)
         || _currentRemoteUrl.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
@@ -496,7 +500,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
         return;
     }
 
-    if (!parseS3Url(_currentRemoteUrl) && !utils::is_sftp_url(_currentRemoteUrl.toStdString())) {
+    if (!parseS3Url(_currentRemoteUrl) && !vcr::sftp::isSftpUrl(_currentRemoteUrl.toStdString())) {
         _status->setText(tr("Browsing is available for s3:// buckets and sftp:// hosts. Paste a full URL and click Open to attach it directly."));
         return;
     }
@@ -546,9 +550,10 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
             : tr("%1 items; more available").arg(shown));
     });
     watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth]() {
-        if (utils::is_sftp_url(url.toStdString())) {
+        if (vcr::sftp::isSftpUrl(url.toStdString())) {
             RemoteListResult result;
-            for (const auto& entry : utils::list_sftp_directory(url.toStdString()))
+            static vcr::sftp::Fetcher fetcher;
+            for (const auto& entry : fetcher.list(url.toStdString()))
                 result.entries.push_back({QString::fromStdString(entry.name),
                     QString::fromStdString(entry.url), entry.directory});
             return result;

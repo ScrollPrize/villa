@@ -445,9 +445,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         std::string location = remoteUrl;
         if (!requestAuth.empty()) {
             location = signedS3Location(remoteUrl);
-            options.access = vcr::zarr::s3Access(location,
-                vcr::Auth{"s3", requestAuth.access_key, requestAuth.secret_key,
-                          requestAuth.session_token, requestAuth.region});
+            options.access = vcr::zarr::s3Access(location, vc::readerAuth(requestAuth));
         }
         options.metadata = cachedMetadataReader(options.access);
         return std::pair{vcr::zarr::pyramidLevels(location, options), options.metadata};
@@ -461,12 +459,9 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
             auth = {};
         } catch (const std::exception&) {
             if (auth.empty() && discoverAwsCredentials) {
-                if (const auto keys = vcr::zarr::awsCredentials()) {
-                    auth.access_key = keys->user;
-                    auth.secret_key = keys->secret;
-                    auth.session_token = keys->token;
-                    auth.region = keys->region.empty() ? spec.awsRegion : keys->region;
-                }
+                auth = vc::loadAwsCredentials();
+                if (auth.region.empty())
+                    auth.region = spec.awsRegion;
             }
             if (auth.empty())
                 throw;
@@ -598,9 +593,7 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
     if (!isRemote_)
         return options;
     if (!remoteAuth_.empty())
-        options.access = vcr::zarr::s3Access(sourceLocation(),
-            vcr::Auth{"s3", remoteAuth_.access_key, remoteAuth_.secret_key,
-                      remoteAuth_.session_token, remoteAuth_.region});
+        options.access = vcr::zarr::s3Access(sourceLocation(), vc::readerAuth(remoteAuth_));
     options.metadata = cachedMetadataReader(options.access);
     if (!remoteCacheRoot_.empty()) {
         options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;

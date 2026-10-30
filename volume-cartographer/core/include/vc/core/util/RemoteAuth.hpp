@@ -1,80 +1,31 @@
 #pragma once
 
-#include <exception>
-#include <functional>
-#include <mutex>
-#include <optional>
 #include <string>
-#include <utility>
 
-#include <utils/http_fetch.hpp>
+#include <vc_reader/zarr.hpp>
 
 namespace vc {
 
 // AWS credentials used by remote HTTP/S3-backed volume and scroll workflows.
-using HttpAuth = utils::AwsAuth;
+struct HttpAuth {
+    std::string access_key;
+    std::string secret_key;
+    std::string session_token;  // optional (STS temporary credentials)
+    std::string region;         // e.g. "us-east-1"
 
-inline HttpAuth loadAwsCredentials(const std::string& profile = "default")
+    [[nodiscard]] bool empty() const noexcept { return access_key.empty() && secret_key.empty(); }
+};
+
+// From the environment and the shared AWS files; empty when there are none.
+inline HttpAuth loadAwsCredentials()
 {
-    return utils::AwsAuth::load(profile);
+    const auto keys = vcr::zarr::awsCredentials();
+    return keys ? HttpAuth{keys->user, keys->secret, keys->token, keys->region} : HttpAuth{};
 }
 
-// Keep credential-process execution off the public-S3 fast path.  Constructing
-// this object never consults ambient AWS configuration; resolve() does so at
-// most once, and callers invoke it only after an anonymous request is denied.
-class DeferredAwsAuth final
+inline vcr::Auth readerAuth(const HttpAuth& auth)
 {
-public:
-    using Loader = std::function<HttpAuth()>;
-
-    DeferredAwsAuth(HttpAuth explicitAuth,
-                    bool discoverAwsCredentials,
-                    std::string region,
-                    Loader loader = {})
-        : explicitAuth_(std::move(explicitAuth))
-        , discoverAwsCredentials_(discoverAwsCredentials)
-        , region_(std::move(region))
-        , loader_(std::move(loader))
-    {
-    }
-
-    [[nodiscard]] bool available() const noexcept
-    {
-        return !explicitAuth_.empty() || discoverAwsCredentials_;
-    }
-
-    [[nodiscard]] HttpAuth resolve() const
-    {
-        std::lock_guard lock(mutex_);
-        if (failure_)
-            std::rethrow_exception(failure_);
-        if (!resolved_) {
-            try {
-                auto auth = explicitAuth_;
-                if (auth.empty() && discoverAwsCredentials_) {
-                    auth = loader_ ? loader_() : loadAwsCredentials();
-                }
-                if (!auth.empty() && auth.region.empty())
-                    auth.region = region_;
-                if (auth.access_key.empty() || auth.secret_key.empty())
-                    auth = {};
-                resolved_ = std::move(auth);
-            } catch (...) {
-                failure_ = std::current_exception();
-                throw;
-            }
-        }
-        return *resolved_;
-    }
-
-private:
-    HttpAuth explicitAuth_;
-    bool discoverAwsCredentials_ = true;
-    std::string region_;
-    Loader loader_;
-    mutable std::mutex mutex_;
-    mutable std::optional<HttpAuth> resolved_;
-    mutable std::exception_ptr failure_;
-};
+    return auth.empty() ? vcr::Auth{} : vcr::Auth{"s3", auth.access_key, auth.secret_key, auth.session_token, auth.region};
+}
 
 } // namespace vc
