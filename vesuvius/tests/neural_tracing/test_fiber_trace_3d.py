@@ -17,17 +17,12 @@ import torch
 from torch.utils.data import DataLoader
 import zarr
 
-from tests.zarr_utils import create_v2_array
+from tests.zarr_utils import create_v2_array, zarr_volume
+from vc_reader.reader import ZarrReader
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vc3d_fiber_format import legacy_lasagna_segments
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
-from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
-    CoordinateSampleResult,
-    NumpyZarrCoordinateSampler,
-    Vc3dCoordinateSampler,
-)
 from vesuvius.neural_tracing.fiber_trace_3d import loader as loader3d_module
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
@@ -1026,59 +1021,6 @@ def _centered_fiber() -> Vc3dFiber:
     )
 
 
-class _FakeChunkedVolume:
-    def __init__(
-        self,
-        *,
-        shape: tuple[int, int, int] = (256, 256, 256),
-        chunks: tuple[int, int, int] = (16, 16, 16),
-    ) -> None:
-        self.shape = tuple(int(v) for v in shape)
-        self.chunks = tuple(int(v) for v in chunks)
-
-
-class _CapturingDependencySampler:
-    def __init__(self, *, chunks: tuple[int, int, int] = (16, 16, 16)) -> None:
-        self.chunks = np.asarray(chunks, dtype=np.int64)
-        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
-        self.store = object()
-
-    def chunk_requests_for_coords(
-        self,
-        coords_zyx_base: np.ndarray,
-        valid_mask: np.ndarray,
-    ) -> list[ZarrChunkRequest]:
-        del coords_zyx_base, valid_mask
-        raise AssertionError("3D prefetch must use bbox dependency requests")
-
-    def chunk_requests_for_bbox(
-        self,
-        start_zyx: np.ndarray,
-        end_zyx: np.ndarray,
-    ) -> list[ZarrChunkRequest]:
-        start = np.asarray(start_zyx, dtype=np.int64)
-        end = np.asarray(end_zyx, dtype=np.int64)
-        self.calls.append((start.copy(), end.copy()))
-        if not bool(np.all(end > start)):
-            return []
-        chunk_start = np.floor_divide(start, self.chunks)
-        chunk_end = np.floor_divide(end - 1, self.chunks) + 1
-        axes = [
-            np.arange(int(chunk_start[axis]), int(chunk_end[axis]), dtype=np.int64)
-            for axis in range(3)
-        ]
-        zz, yy, xx = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
-        unique = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], axis=1)
-        return [
-            ZarrChunkRequest(
-                store=self.store,
-                store_identity="fake-dependency-store",
-                key=f"0/{int(chunk[0])}/{int(chunk[1])}/{int(chunk[2])}",
-            )
-            for chunk in unique
-        ]
-
-
 def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
     config = config_from_mapping(
         {
@@ -1093,16 +1035,15 @@ def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
             **raw,
         }
     )
-    volume = _FakeChunkedVolume()
-    sampler = _CapturingDependencySampler(chunks=volume.chunks)
+    reader = ZarrReader.open(zarr_volume(np.zeros((256, 256, 256), dtype=np.uint8)))
     record = loader3d_module._Record(
         fiber=_centered_fiber(),
-        volume=volume,
-        sampler=sampler,
+        volume=reader,
+        reader=reader,
         volume_path="fake",
         volume_scale=0,
         volume_spacing_base=1.0,
-        base_shape_zyx=volume.shape,
+        base_shape_zyx=reader.shape,
         fiber_identity="fake-centered-fiber",
         dataset_config={},
     )
@@ -1115,6 +1056,27 @@ def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
     loader._arc_sampler = None
     loader._mixed_sampler = None
     return loader
+
+
+def _prefetch_regions(
+    monkeypatch: pytest.MonkeyPatch,
+    loader: FiberTrace3DLoader,
+    start_sample_index: int,
+    **kwargs,
+) -> tuple[dict, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]:
+    """Prefetch one sample and return its summary and the regions it read."""
+    reader = loader.records[0].reader
+    regions: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+    original = reader.read_region
+
+    def read_region(start, size, *args, **read_kwargs):
+        regions.append((tuple(int(v) for v in start), tuple(int(v) for v in size)))
+        return original(start, size, *args, **read_kwargs)
+
+    monkeypatch.setattr(reader, "read_region", read_region)
+    summary = loader.prefetch(start_sample_index, 1, workers=1, **kwargs)
+    monkeypatch.undo()
+    return summary, regions
 
 
 def _long_segment_fiber(*, source_format: str | None = None) -> Vc3dFiber:
@@ -1161,9 +1123,8 @@ def _loader(*, augment_enabled: bool = False) -> FiberTrace3DLoader:
             "round_source_to_chunk_boundaries": False,
             "_array_records": [
                 {
-                    "volume": volume,
+                    "volume_path": zarr_volume(volume),
                     "fiber": _straight_fiber(),
-                    "volume_path": "synthetic",
                 }
             ],
         }
@@ -1209,7 +1170,6 @@ def _native_trace_record(
     volume: np.ndarray,
     *,
     spacing_base: float = 1.0,
-    sampler: object | None = None,
     base_shape_zyx: tuple[int, int, int] | None = None,
 ) -> SimpleNamespace:
     volume_arr = np.asarray(volume, dtype=np.float32)
@@ -1218,17 +1178,18 @@ def _native_trace_record(
         base_shape_zyx = tuple(
             int(round(float(size) * spacing)) for size in volume_arr.shape
         )
-    if sampler is None:
-        sampler = NumpyZarrCoordinateSampler(
-            volume_arr,
-            level_spacing_base=spacing,
-        )
     return SimpleNamespace(
         volume=volume_arr,
-        sampler=sampler,
+        reader=ZarrReader.open(zarr_volume(volume_arr)),
         volume_spacing_base=spacing,
         base_shape_zyx=tuple(int(v) for v in base_shape_zyx),
     )
+
+
+def _z_ramp(shape: tuple[int, int, int]) -> np.ndarray:
+    return np.broadcast_to(
+        np.arange(shape[0], dtype=np.float32)[:, None, None], shape
+    ).copy()
 
 
 def _long_segment_loader(
@@ -1254,9 +1215,8 @@ def _long_segment_loader(
         "round_source_to_chunk_boundaries": False,
         "_array_records": [
             {
-                "volume": volume,
+                "volume_path": zarr_volume(volume),
                 "fiber": _long_segment_fiber(source_format=source_format),
-                "volume_path": "synthetic",
             }
         ],
     }
@@ -1291,9 +1251,8 @@ def _loader_with_mapping(raw: dict) -> FiberTrace3DLoader:
         "round_source_to_chunk_boundaries": False,
         "_array_records": [
             {
-                "volume": volume,
+                "volume_path": zarr_volume(volume),
                 "fiber": _straight_fiber(),
-                "volume_path": "synthetic",
             }
         ],
     }
@@ -1394,9 +1353,8 @@ def test_3d_config_defaults_volume_cache_to_512_mib() -> None:
             "seed": 3,
             "_array_records": [
                 {
-                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "volume_path": zarr_volume(np.zeros((16, 16, 16), dtype=np.float32)),
                     "fiber": _straight_fiber(),
-                    "volume_path": "synthetic",
                 }
             ],
         }
@@ -1415,9 +1373,8 @@ def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
             "volume_cache_memory_mib": 128,
             "_array_records": [
                 {
-                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "volume_path": zarr_volume(np.zeros((16, 16, 16), dtype=np.float32)),
                     "fiber": _straight_fiber(),
-                    "volume_path": "synthetic",
                 }
             ],
         }
@@ -1427,27 +1384,22 @@ def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
     assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
 
 
-def test_3d_config_preserves_volume_io_decode_and_sample_threads() -> None:
+def test_3d_config_preserves_volume_io_threads() -> None:
     config = config_from_mapping(
         {
             "batch_size": 1,
             "patch_shape_zyx": [16, 16, 16],
             "volume_io_threads": 2,
-            "volume_decode_threads": 3,
-            "volume_sample_threads": 1,
             "_array_records": [
                 {
-                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "volume_path": zarr_volume(np.zeros((16, 16, 16), dtype=np.float32)),
                     "fiber": _straight_fiber(),
-                    "volume_path": "synthetic",
                 }
             ],
         }
     )
 
     assert config.volume_io_threads == 2
-    assert config.volume_decode_threads == 3
-    assert config.volume_sample_threads == 1
 
 
 def test_3d_dataset_manifest_is_optional_at_scale_zero() -> None:
@@ -1509,28 +1461,17 @@ def test_3d_prefetch_dependency_uses_augmentation_envelope_not_sampled_params(
 
     monkeypatch.setattr(loader, "_sample_augment_params", fail_sampled_augmentation)
 
-    valid_a, requests_a = loader._chunk_requests_and_valid_voxels_for_sample_index(
-        0,
-        sample_index_limit=1,
-    )
-    valid_b, requests_b = loader._chunk_requests_and_valid_voxels_for_sample_index(
-        99,
-        sample_index_limit=1,
-    )
+    summary_a, regions_a = _prefetch_regions(monkeypatch, loader, 0, sample_index_limit=1)
+    monkeypatch.setattr(loader, "_sample_augment_params", fail_sampled_augmentation)
+    summary_b, regions_b = _prefetch_regions(monkeypatch, loader, 99, sample_index_limit=1)
 
-    assert valid_a == valid_b
-    assert valid_a > 0
-    assert sorted(request.key for request in requests_a) == sorted(
-        request.key for request in requests_b
-    )
-    sampler = loader.records[0].sampler
-    assert isinstance(sampler, _CapturingDependencySampler)
-    assert len(sampler.calls) == 2
-    assert sampler.calls[0][0].shape == (3,)
-    assert sampler.calls[0][1].shape == (3,)
+    assert summary_a["errors"] == summary_b["errors"] == 0
+    assert summary_a["valid_voxels"] == summary_b["valid_voxels"] > 0
+    assert len(regions_a) == 1
+    assert regions_a == regions_b
 
 
-def test_3d_prefetch_envelope_extrema_expand_dependency_region() -> None:
+def test_3d_prefetch_envelope_extrema_expand_dependency_region(monkeypatch) -> None:
     base_loader = _prefetch_dependency_test_loader(
         {
             "augment_enabled": False,
@@ -1553,19 +1494,11 @@ def test_3d_prefetch_envelope_extrema_expand_dependency_region() -> None:
         }
     )
 
-    base_valid, base_requests = base_loader._chunk_requests_and_valid_voxels_for_sample_index(
-        0,
-        sample_index_limit=1,
-    )
-    augmented_valid, augmented_requests = (
-        augmented_loader._chunk_requests_and_valid_voxels_for_sample_index(
-            0,
-            sample_index_limit=1,
-        )
-    )
+    base, (base_region,) = _prefetch_regions(monkeypatch, base_loader, 0, sample_index_limit=1)
+    augmented, (augmented_region,) = _prefetch_regions(monkeypatch, augmented_loader, 0, sample_index_limit=1)
 
-    assert augmented_valid > base_valid
-    assert len(augmented_requests) > len(base_requests)
+    assert augmented["valid_voxels"] > base["valid_voxels"]
+    assert np.prod(augmented_region[1]) > np.prod(base_region[1])
 
 
 def _load_materialized_batch(
@@ -2550,7 +2483,6 @@ def test_native_geometry_preserves_sampled_patch() -> None:
         "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
         "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
         "augment_smooth_displacement_probability": 1.0,
-        "volume_sample_threads": 1,
     }
     eager = _loader_with_mapping({**common, "geometry_backend": "eager"})
     native = _loader_with_mapping({**common, "geometry_backend": "native"})
@@ -2999,8 +2931,31 @@ def test_nonzero_unsupported_3d_shear_and_ringing_raise(tmp_path) -> None:
 def test_local_prefetch_has_no_remote_chunks() -> None:
     loader = _loader(augment_enabled=False)
     summary = loader.prefetch(0, 2)
-    assert summary["chunks"] == 0
+    assert summary["samples"] == 2
+    assert summary["valid_voxels"] > 0
+    assert summary["max_exclusive_sample_index"] == 2
+    assert summary["remote_fetches"] == 0
+    assert summary["remote_bytes"] == 0
     assert summary["errors"] == 0
+
+
+def test_3d_prefetch_counts_skipped_samples_as_finished(monkeypatch) -> None:
+    loader = _loader(augment_enabled=False)
+    original = loader.descriptor_for_sample_index
+
+    def descriptor_for_sample_index(sample_index, **kwargs):
+        if int(sample_index) == 0:
+            raise ValueError("no eligible control point")
+        return original(sample_index, **kwargs)
+
+    monkeypatch.setattr(loader, "descriptor_for_sample_index", descriptor_for_sample_index)
+
+    summary = loader.prefetch(0, 2)
+
+    assert summary["samples"] == 2
+    assert summary["skipped_samples"] == 1
+    assert "no eligible control point" in summary["first_sample_skip"]
+    assert summary["max_exclusive_sample_index"] == 2
 
 
 def test_3d_training_sample_index_limit_validation() -> None:
@@ -3525,320 +3480,6 @@ def test_train_sample_3d_contact_sheet_stacks_multiple_samples() -> None:
 
     assert multi.shape[0] == single.shape[0]
     assert multi.shape[1] > single.shape[1]
-
-
-def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
-    loader.config = SimpleNamespace(
-        prefetch_workers=1,
-        prefetch_sampler_workers=2,
-        volume_cache_retry_seconds=0.0,
-    )
-
-    store = object()
-
-    def request(key: str) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="fake-store",
-            key=key,
-            cache_path=tmp_path / f"{key}.bin",
-            empty_path=tmp_path / f"{key}.empty",
-            remote_url=f"https://example.invalid/{key}",
-            remote_chunk_key=key,
-            cache_payload_format="source_bytes",
-        )
-
-    samples = {
-        0: [request("a")],
-        1: [request("b")],
-        2: [request("b"), request("c")],
-    }
-
-    def fake_requests(
-        sample_index: int,
-        *,
-        sample_mode: str = "random",
-        sample_index_limit: int | None = None,
-    ) -> tuple[int, list[ZarrChunkRequest]]:
-        del sample_mode, sample_index_limit
-        if int(sample_index) == 0:
-            time.sleep(0.05)
-        return 8, list(samples[int(sample_index)])
-
-    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
-    download_order: list[str] = []
-
-    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
-        del retry_seconds
-        download_order.append(request.key)
-        return {"status": "downloaded", "bytes": 4}
-
-    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
-    summary = loader.prefetch(0, 3)
-
-    assert download_order == ["a", "b", "c"]
-    assert summary["samples"] == 3
-    assert summary["chunks"] == 3
-    assert summary["downloaded"] == 3
-    assert summary["download_done"] == 3
-    assert summary["max_exclusive_sample_index"] == 3
-    assert summary["valid_voxels"] == 24
-
-
-def test_3d_prefetch_classifies_cache_hit_empty_and_skip(tmp_path, monkeypatch) -> None:
-    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
-    loader.config = SimpleNamespace(
-        prefetch_workers=2,
-        prefetch_sampler_workers=2,
-        volume_cache_retry_seconds=0.0,
-    )
-
-    store = object()
-    hit_path = tmp_path / "hit.bin"
-    hit_path.write_bytes(b"cached")
-    empty_path = tmp_path / "missing.empty"
-    empty_path.write_bytes(b"")
-
-    def request(key: str, *, cache_path: object | None, empty_path_value: object | None) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="fake-store",
-            key=key,
-            cache_path=None if cache_path is None else Path(cache_path),
-            empty_path=None if empty_path_value is None else Path(empty_path_value),
-            remote_url=f"https://example.invalid/{key}",
-            remote_chunk_key=key,
-            cache_payload_format="source_bytes",
-        )
-
-    def fake_requests(
-        sample_index: int,
-        *,
-        sample_mode: str = "random",
-        sample_index_limit: int | None = None,
-    ) -> tuple[int, list[ZarrChunkRequest]]:
-        del sample_mode, sample_index_limit
-        if int(sample_index) == 1:
-            raise ValueError("invalid synthetic sample")
-        if int(sample_index) == 0:
-            return 7, [
-                request("hit", cache_path=hit_path, empty_path_value=tmp_path / "hit.empty"),
-                request("missing", cache_path=tmp_path / "missing.bin", empty_path_value=empty_path),
-            ]
-        return 5, [
-            request("download", cache_path=tmp_path / "download.bin", empty_path_value=tmp_path / "download.empty")
-        ]
-
-    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
-    downloaded_keys: list[str] = []
-
-    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
-        del retry_seconds
-        downloaded_keys.append(request.key)
-        return {"status": "downloaded", "bytes": 3}
-
-    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
-    summary = loader.prefetch(0, 3)
-
-    assert downloaded_keys == ["download"]
-    assert summary["samples"] == 3
-    assert summary["skipped_samples"] == 1
-    assert summary["chunks"] == 3
-    assert summary["cache_hits"] == 1
-    assert summary["known_missing"] == 1
-    assert summary["downloaded"] == 1
-    assert summary["errors"] == 0
-    assert summary["max_exclusive_sample_index"] == 3
-    assert "invalid synthetic sample" in summary["first_sample_skip"]
-
-
-def test_vc3d_dependency_prefetch_flattens_3d_coords_like_training_sampling() -> None:
-    class _FakeVolume:
-        remote_url = "s3://example/volume.zarr"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, ...]] = []
-
-        def collect_coords_dependencies(
-            self,
-            coords_xyz: np.ndarray,
-            valid_mask: np.ndarray,
-            level: int,
-            sampling: str,
-            workers: int,
-        ) -> list[dict[str, object]]:
-            if coords_xyz.ndim != 3 or coords_xyz.shape[-1] != 3:
-                raise ValueError("coords_xyz must have shape [H, W, 3]")
-            if valid_mask.shape != coords_xyz.shape[:2]:
-                raise ValueError("valid_mask must have shape [H, W]")
-            call_index = len(self.calls)
-            self.calls.append(tuple(int(v) for v in coords_xyz.shape))
-            assert level == 2
-            assert sampling == "trilinear"
-            assert workers == 32
-            return [
-                {
-                    "key": f"2/0/0/{call_index}",
-                    "cache_path": f"/tmp/cache/{call_index}.bin",
-                    "empty_path": f"/tmp/cache/{call_index}.empty",
-                    "remote_url": "https://example.invalid/volume.zarr",
-                    "remote_chunk_key": f"2/0/0/{call_index}",
-                    "cache_payload_format": "direct",
-                    "persistent_extension": ".bin",
-                },
-                {
-                    "key": "2/shared",
-                    "cache_path": "/tmp/cache/shared.bin",
-                    "empty_path": "/tmp/cache/shared.empty",
-                    "remote_url": "https://example.invalid/volume.zarr",
-                    "remote_chunk_key": "2/shared",
-                    "cache_payload_format": "direct",
-                    "persistent_extension": ".bin",
-                },
-            ]
-
-    fake = _FakeVolume()
-    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
-    sampler.volume = fake
-    sampler.level = 2
-    sampler.sampling = "trilinear"
-    sampler.blocking = True
-
-    coords = np.zeros((3, 4, 5, 3), dtype=np.float32)
-    valid = np.ones((3, 4, 5), dtype=bool)
-    valid[1, :, :] = False
-    requests = sampler.chunk_requests_for_coords(coords, valid)
-
-    assert fake.calls == [(12, 5, 3)]
-    assert [request.key for request in requests] == ["2/0/0/0", "2/shared"]
-    assert requests[0].cache_path is not None
-
-
-def test_vc3d_dependency_prefetch_uses_bbox_metadata() -> None:
-    class _FakeVolume:
-        remote_url = "s3://example/volume.zarr"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int]] = []
-
-        def collect_bbox_dependencies(
-            self,
-            offset: tuple[int, int, int],
-            shape: tuple[int, int, int],
-            level: int,
-        ) -> list[dict[str, object]]:
-            self.calls.append((tuple(offset), tuple(shape), int(level)))
-            return [
-                {
-                    "key": "2/3/4/5",
-                    "cache_path": "/tmp/cache/2/3/4/5.bin",
-                    "empty_path": "/tmp/cache/2/3/4/5.empty",
-                    "remote_url": "https://example.invalid/volume.zarr/2/3/4/5",
-                    "remote_chunk_key": "2/3/4/5",
-                    "cache_payload_format": "source_bytes",
-                    "persistent_extension": ".bin",
-                }
-            ]
-
-    fake = _FakeVolume()
-    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
-    sampler.volume = fake
-    sampler.level = 2
-    sampler.sampling = "trilinear"
-    sampler.blocking = True
-
-    requests = sampler.chunk_requests_for_bbox(
-        np.asarray([1.2, 2.0, 3.1], dtype=np.float32),
-        np.asarray([5.0, 7.9, 9.0], dtype=np.float32),
-    )
-
-    assert fake.calls == [((1, 2, 3), (4, 6, 6), 2)]
-    assert [request.key for request in requests] == ["2/3/4/5"]
-    assert requests[0].cache_path == Path("/tmp/cache/2/3/4/5.bin")
-    assert requests[0].cache_payload_format == "source_bytes"
-
-
-def test_vc3d_bbox_dependency_reports_missing_binding() -> None:
-    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
-    sampler.volume = SimpleNamespace(remote_url="s3://example/volume.zarr")
-    sampler.level = 2
-    sampler.sampling = "trilinear"
-    sampler.blocking = True
-
-    with pytest.raises(RuntimeError, match="collect_bbox_dependencies"):
-        sampler.chunk_requests_for_bbox(
-            np.asarray([0, 0, 0], dtype=np.int64),
-            np.asarray([1, 1, 1], dtype=np.int64),
-        )
-
-
-def test_vc3d_coordinate_sampler_forwards_worker_limit_and_stats() -> None:
-    class _FakeVolume:
-        def __init__(self) -> None:
-            self.calls: list[tuple[object, ...]] = []
-
-        def sample_coords(self, *args: object):
-            self.calls.append(args)
-            coords = np.asarray(args[0])
-            shape = coords.shape[:2]
-            return (
-                np.zeros((*shape, 1), dtype=np.uint8),
-                np.ones((*shape, 1), dtype=np.uint8),
-                {
-                    "requested_level_only": True,
-                    "fallback_levels": 0,
-                    "sample_workers": 1,
-                    "sample_seconds": 0.25,
-                    "decoded_chunks": 2,
-                },
-            )
-
-    fake = _FakeVolume()
-    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
-    sampler.volume = fake
-    sampler.level = 2
-    sampler.sampling = "trilinear"
-    sampler.blocking = True
-    sampler.sample_threads = 1
-    sampler.chunk_locality_fast_path = True
-    sampler.collect_locality_stats = True
-
-    coords = np.zeros((4, 5, 3), dtype=np.float32)
-    valid = np.ones((4, 5), dtype=bool)
-    result = sampler.sample_coords(coords, valid)
-
-    assert fake.calls[0][6] == 1
-    assert fake.calls[0][7] is True
-    assert fake.calls[0][8] is True
-    assert result.stats["sample_workers"] == 1
-    assert result.stats["sample_seconds"] == 0.25
-    assert result.stats["decoded_chunks"] == 2
-    assert result.stats["requested_level_only"] is True
-
-
-def test_numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds() -> None:
-    array = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
-    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=2.0)
-
-    result = sampler.sample_block_zyx(
-        np.asarray([-1, 2, 3], dtype=np.int64),
-        (3, 2, 4),
-    )
-
-    assert result.image.shape == (3, 2, 4)
-    assert result.valid_mask.shape == (3, 2, 4)
-    assert not bool(result.valid_mask[0].any())
-    assert bool(result.valid_mask[1:, :, :3].all())
-    assert not bool(result.valid_mask[1:, :, 3].any())
-    assert np.allclose(result.image[1, 0, 0], array[0, 2, 3])
-    assert np.allclose(result.image[2, 1, 2], array[1, 3, 5])
-    assert result.image[2, 1, 3] == 0.0
-    assert not bool(result.valid_mask[2, 1, 3])
-    assert result.stats["requested_level_only"] is True
 
 
 def test_3d_model_and_losses_smoke() -> None:
@@ -6841,49 +6482,10 @@ def test_native_3d_trace2cp_field_cache_evicts_lru_blocks() -> None:
     assert cache.evicted_inferred_blocks == 2
 
 
-def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
+def test_native_3d_trace2cp_field_cache_reads_level_blocks(monkeypatch) -> None:
     class UnsliceableVolume:
         def __getitem__(self, _key):
             raise AssertionError("native trace field cache must not slice volume directly")
-
-    class RecordingSampler:
-        blocking = True
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[np.ndarray, tuple[int, int, int]]] = []
-
-        def sample_coord_batch(
-            self,
-            coords_zyx_base: np.ndarray,
-            valid_mask: np.ndarray,
-        ) -> CoordinateSampleResult:
-            del coords_zyx_base, valid_mask
-            raise AssertionError("native trace field cache must use sample_block_zyx")
-
-        def sample_block_zyx(
-            self,
-            start_zyx: np.ndarray,
-            shape_zyx: tuple[int, int, int],
-        ) -> CoordinateSampleResult:
-            start = np.asarray(start_zyx, dtype=np.int64)
-            shape = tuple(int(v) for v in shape_zyx)
-            self.calls.append((start.copy(), shape))
-            zz = (
-                np.arange(shape[0], dtype=np.float32)[:, None, None]
-                + np.float32(start[0])
-            )
-            image = np.broadcast_to(zz, shape).astype(np.float32, copy=True)
-            valid = np.ones(shape, dtype=bool)
-            return CoordinateSampleResult(
-                image=image,
-                valid_mask=valid,
-                stats={
-                    "sample_block_zyx": 1,
-                    "requested_level_only": True,
-                    "fallback_levels": 0,
-                    "error_chunks": 0,
-                },
-            )
 
     class RecordingModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -6895,14 +6497,17 @@ def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
             b, _c, d, h, w = volume.shape
             return torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
 
-    sampler = RecordingSampler()
     model = RecordingModel()
-    record = SimpleNamespace(
-        volume=UnsliceableVolume(),
-        sampler=sampler,
-        volume_spacing_base=4.0,
-        base_shape_zyx=(128, 128, 128),
-    )
+    record = _native_trace_record(_z_ramp((32, 32, 32)), spacing_base=4.0)
+    record.volume = UnsliceableVolume()
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    original = record.reader.read_region
+
+    def read_region(start, size, *args, **kwargs):
+        calls.append((tuple(int(v) for v in start), tuple(int(v) for v in size)))
+        return original(start, size, *args, **kwargs)
+
+    monkeypatch.setattr(record.reader, "read_region", read_region)
     cache = NativeTraceFieldCache(
         record=record,
         prediction_adapter=_NativeTraceTestPredictionAdapter(),
@@ -6920,40 +6525,38 @@ def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
     assert np.allclose(block.sample_origin_zyx, [2, 3, 4])
     assert block.output_czyx.device.type == "cpu"
     assert block.valid_mask_zyx.device.type == "cpu"
-    assert len(sampler.calls) == 1
-    start, shape = sampler.calls[0]
-    assert np.allclose(start, [1, 2, 3])
-    assert shape == (4, 4, 4)
+    assert calls == [((1, 2, 3), (4, 4, 4))]
     assert model.input_volume is not None
     assert float(model.input_volume[0, 0, 0, 0, 0]) == 1.0
+
+
+def test_native_3d_trace2cp_block_read_masks_out_of_bounds() -> None:
+    volume = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+    cache = NativeTraceFieldCache(
+        record=_native_trace_record(volume),
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=torch.nn.Identity(),
+        patch_shape_zyx=(3, 2, 4),
+        core_margin_voxels=0,
+        device=torch.device("cpu"),
+    )
+
+    image, valid = cache._sample_block_volume(np.asarray([-1, 2, 3], dtype=np.int64))
+
+    assert image.shape == (3, 2, 4)
+    assert valid.shape == (3, 2, 4)
+    assert not bool(valid[0].any())
+    assert bool(valid[1:, :, :3].all())
+    assert not bool(valid[1:, :, 3].any())
+    assert float(image[1, 0, 0]) == volume[0, 2, 3]
+    assert float(image[2, 1, 2]) == volume[1, 3, 5]
+    assert float(image[2, 1, 3]) == 0.0
 
 
 def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
     encoded = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
     )[0]
-
-    class ZRampSampler:
-        blocking = True
-
-        def sample_block_zyx(
-            self,
-            start_zyx: np.ndarray,
-            shape_zyx: tuple[int, int, int],
-        ) -> CoordinateSampleResult:
-            start = np.asarray(start_zyx, dtype=np.int64)
-            shape = tuple(int(v) for v in shape_zyx)
-            zz = np.arange(shape[0], dtype=np.float32)[:, None, None] + np.float32(start[0])
-            return CoordinateSampleResult(
-                image=np.broadcast_to(zz, shape).astype(np.float32, copy=True),
-                valid_mask=np.ones(shape, dtype=bool),
-                stats={
-                    "sample_block_zyx": 1,
-                    "requested_level_only": True,
-                    "fallback_levels": 0,
-                    "error_chunks": 0,
-                },
-            )
 
     class PresenceRampModel(torch.nn.Module):
         def forward(self, volume: torch.Tensor) -> torch.Tensor:
@@ -6963,10 +6566,7 @@ def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
             out[:, 6:7] = volume / 10.0
             return out
 
-    record = _native_trace_record(
-        np.zeros((16, 16, 16), dtype=np.float32),
-        sampler=ZRampSampler(),
-    )
+    record = _native_trace_record(_z_ramp((16, 16, 16)))
     cache = NativeTraceFieldCache(
         record=record,
         prediction_adapter=_NativeTraceTestPredictionAdapter(),
@@ -7044,26 +6644,6 @@ def test_native_3d_trace2cp_rejects_total_stride_below_native_stride() -> None:
 
 
 def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() -> None:
-    class OnesSampler:
-        blocking = True
-
-        def sample_block_zyx(
-            self,
-            start_zyx: np.ndarray,
-            shape_zyx: tuple[int, int, int],
-        ) -> CoordinateSampleResult:
-            del start_zyx
-            return CoordinateSampleResult(
-                image=np.ones(shape_zyx, dtype=np.float32),
-                valid_mask=np.ones(shape_zyx, dtype=bool),
-                stats={
-                    "sample_block_zyx": 1,
-                    "requested_level_only": True,
-                    "fallback_levels": 0,
-                    "error_chunks": 0,
-                },
-            )
-
     class ScaledImpulseModel(torch.nn.Module):
         def forward(self, volume: torch.Tensor) -> torch.Tensor:
             b, _c, d, h, w = volume.shape
@@ -7071,10 +6651,7 @@ def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() ->
             out[:, 6, 4:6, 4:6, 4:6] = 8.0
             return out
 
-    record = _native_trace_record(
-        np.zeros((16, 16, 16), dtype=np.float32),
-        sampler=OnesSampler(),
-    )
+    record = _native_trace_record(np.ones((16, 16, 16), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
         prediction_adapter=_NativeTraceTestPredictionAdapter(),
@@ -8385,37 +7962,6 @@ def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() ->
     assert np.max(np.linalg.norm(lookahead_beam.trace_zyx[:, :2], axis=1)) > 0.1
 
 
-def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:
-    class NonBlockingSampler:
-        blocking = False
-
-        def sample_coord_batch(
-            self,
-            coords_zyx_base: np.ndarray,
-            valid_mask: np.ndarray,
-        ) -> CoordinateSampleResult:
-            del coords_zyx_base, valid_mask
-            raise AssertionError("non-blocking sampler should be rejected before sampling")
-
-    record = SimpleNamespace(
-        volume=object(),
-        sampler=NonBlockingSampler(),
-        volume_spacing_base=1.0,
-        base_shape_zyx=(32, 32, 32),
-    )
-    cache = NativeTraceFieldCache(
-        record=record,
-        prediction_adapter=_NativeTraceTestPredictionAdapter(),
-        model=torch.nn.Identity(),
-        patch_shape_zyx=(4, 4, 4),
-        core_margin_voxels=1,
-        device=torch.device("cpu"),
-    )
-
-    with pytest.raises(ValueError, match="blocking coordinate sampling"):
-        cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
-
-
 def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
     encoded = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
@@ -8561,41 +8107,3 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
     assert len(result.reverse.steps) == 2
 
 
-def test_vc3d_coordinate_sampler_direct_block_read_uses_binding() -> None:
-    class _FakeVolume:
-        def __init__(self) -> None:
-            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int, bool]] = []
-
-        def sample_zyx_block(
-            self,
-            offset: tuple[int, int, int],
-            shape: tuple[int, int, int],
-            level: int,
-            blocking: bool,
-        ):
-            self.calls.append((tuple(offset), tuple(shape), int(level), bool(blocking)))
-            image = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
-            valid = np.ones(shape, dtype=np.uint8)
-            stats = {
-                "requested_level_only": True,
-                "fallback_levels": 0,
-                "error_chunks": 0,
-                "missing_chunks": 0,
-                "requested_chunks": 1,
-            }
-            return image, valid, stats
-
-    fake = _FakeVolume()
-    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
-    sampler.volume = fake
-    sampler.level = 2
-    sampler.sampling = "trilinear"
-    sampler.blocking = True
-
-    result = sampler.sample_block_zyx(np.asarray([1, 2, 3], dtype=np.int64), (4, 5, 6))
-
-    assert fake.calls == [((1, 2, 3), (4, 5, 6), 2, True)]
-    assert result.image.shape == (4, 5, 6)
-    assert result.valid_mask.shape == (4, 5, 6)
-    assert result.valid_mask.all()
-    assert result.stats["sample_block_zyx"] == 1

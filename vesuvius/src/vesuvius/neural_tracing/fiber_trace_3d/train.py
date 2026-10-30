@@ -2281,7 +2281,6 @@ def _make_trace2cp_geometry_loader(raw_config: dict[str, Any], cfg: _Trace2Cp3DC
             strip_z_offset_step=float(cfg.strip_z_offset_step),
             seed=int(raw_config.get("seed", 1)),
             prefetch_workers=int(raw_config.get("prefetch_workers", 16)),
-            prefetch_sampler_workers=2,
             loader_workers=1,
             volume_cache_dir=(
                 None
@@ -3471,7 +3470,7 @@ def training_units(
         if any(type(size) is not int or size < 1 for size in physical_microbatch_sizes):
             raise ValueError("physical microbatch sizes must be positive integers")
         loader_config = replace(loader_config, batch_size=physical_microbatch_sizes[distributed.rank],
-                                volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
+                                volume_io_threads=1)
     if cuda_batch_depth > 0 and device.type != "cuda":
         raise ValueError("CUDA batch preparation requires a CUDA training device")
     writer = None
@@ -3495,7 +3494,7 @@ def training_units(
             config_dir=Path(config_path).resolve().parent,
         )
         if physical_microbatch_sizes is not None:
-            test_config = replace(test_config, volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
+            test_config = replace(test_config, volume_io_threads=1)
         test_loader = dataset_view("test", test_config)
     historical_loader = None
     historical_raw = historical_test_config(raw_config)

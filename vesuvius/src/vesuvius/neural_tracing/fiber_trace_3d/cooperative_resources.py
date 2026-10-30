@@ -22,19 +22,6 @@ def configure_cuda_memory_budget(allowance, reserve, device=0):
     return properties
 
 
-def initialize_worker_volume_cache(raw):
-    """Initialize actual native worker counts before the first cache operation."""
-    if "datasets" in raw and not raw["datasets"]:
-        return
-    from vc import volume
-    initialize = getattr(volume, "initialize_chunk_cache", None)
-    if initialize is None:
-        raise RuntimeError("cooperative loading needs rebuilt vc.volume with initialize_chunk_cache")
-    from .loader import _parse_volume_cache_memory_mib
-    mib = _parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib"))
-    initialize(int(mib * 1024**2), 1, 1, 1)
-
-
 def partition_offsets(effective_batch_size, weights):
     if type(effective_batch_size) is not int or effective_batch_size < 1 or not weights:
         raise ValueError("partition requires a positive effective batch and weights")

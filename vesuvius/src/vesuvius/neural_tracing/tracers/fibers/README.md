@@ -51,7 +51,7 @@ bash scripts/stop.sh NAME                                      # the trainer and
   and SHA-256 are recorded with the model).
 - `training` holds the optimizer and schedule, losses, label tolerance, operating policy (`n_commit`,
   `trace_confidence`, `gate`), sampling, task shares (`task_shares`: a full `{task: share}` dict; absent tasks get 0),
-  DAgger collection and diagnostics; `runtime` the machine settings (device, workers, threads, CT prefetch).
+  DAgger collection and diagnostics; `runtime` the machine settings (device, workers, threads, CT cache).
 - Omitted fields take the model type's defaults (`run_config.DEFAULTS` and the configuration classes); unknown keys
   are errors, except removed settings (`run_config.RETIRED`), which are dropped when they hold a value that matches
   the current code and refused otherwise; relative paths resolve against the configuration file's folder.
@@ -106,8 +106,9 @@ model into the Hugging Face cache on first use. A repo holds the follower as `ck
 On a machine other than the one that trained it (`tracing/runtime.py`):
 - **Frame model**: for a checkpoint file, put the frame checkpoint next to it, under its recorded file name or as
   `frame_model.pt` / `heading_model.pt`, or pass `--frame-checkpoint`. It must match the sha256 the follower recorded.
-- **CT**: a remote store (`s3://`) is read through a local chunk cache: `--cache-dir`, else the recorded folder if it
-  exists, else `~/.cache/vesuvius/volume_cache` (`$XDG_CACHE_HOME`). `--ct`, `--ct-level`, `--ct-grid-scale` and
+- **CT**: CT is read with vc_reader; a remote store (`s3://`) keeps a local chunk cache: `--cache-dir`, else VC3D's
+  cache when VC3D launched the process, else the recorded folder if it exists, else `~/.cache/vesuvius/volume_cache`
+  (`$XDG_CACHE_HOME`). `--ct`, `--ct-level`, `--ct-grid-scale` and
   `--grid-scale` point a checkpoint at another copy or level of its CT.
 - Crops are sampled on the GPU (`--crops gpu`, the default on CUDA; `--crops cpu` for the CPU sampler).
 
@@ -139,8 +140,8 @@ for any other CT, pass a fiber store of the same scan as `--fibers-template` (`v
 fiber's UUID is derived from the run's `fiber_namespace` (run.json) and its id in the run, so re-exports keep them;
 `meta['fiber_follow']` holds its seed, stop reasons and links (the UUIDs of the fibers its ends touch). Status lines
 (progress, decisions/s, ETA) print every minute. One process uses one GPU; the Paris4 run held about 23 GB with
-`--gpu-chunks 1024 --forward-chunk 64` and 27 GB with `--gpu-chunks 3072` (each chunk slot is 2 MiB; more slots
-load fewer CT chunks).
+`--gpu-chunks 1024 --forward-chunk 64` and 27 GB with `--gpu-chunks 3072` (the CUDA reader's device cache, in 2 MiB CT
+chunks; a larger cache loads fewer chunks).
 
 VC3D's Line Annotation can trace its Fiber model lines with this model (hamburger menu, "Fiber follow model" → "Use
 for the Fiber model"; off by default) through `tracing/service.py`, which VC3D starts with the Python environment it
@@ -283,8 +284,6 @@ process needs about 1.3–1.5 GB of GPU memory, so 18 shards fill a 32 GB card. 
 per crop axis rather than per point, and `normalize_ct` makes fewer passes (both bitwise unchanged): 220 -> 310
 decisions/s. Running the shards as clients of an NVIDIA MPS daemon (`nvidia-cuda-mps-control -d`, with the shards'
 `CUDA_MPS_PIPE_DIRECTORY` set to its pipe directory) lowers GPU use from 92% to 76% at the same rate.
-`--crop-threads 2` (a batch's crops sampled on two threads, same values) gave 326 decisions/s, but shards then
-segfaulted inside CPython (3 of 18 within 50 minutes); keep the default 1.
 
 A decision every 8 trace voxels (`--step 8`) gave the same stitched strips as every 4 on held-out fibers (median node
 distance to the patch sheet within 0.012 voxels); every 16 was 0.01–0.03 worse. Decisions whose seed lies outside the
@@ -343,7 +342,7 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
 | `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors, the CT structure tensor (`ct_structure.py`), training-run pieces (`training.py`: run dirs, log, LR schedule, EMA) and compile options |
 | `tracers/shared/annotations` | Fiber annotations: fiber stores (VC object store), VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
-| `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling (CPU kernel for data workers, GPU sampler for in-step crops), remote prefetch |
+| `tracers/shared/crop_sampling` | CT crops: the volume spec, intensity normalization, oriented crops read with vc_reader (CPU, or its CUDA reader), GPU sampling of in-step crops from device blocks |
 | `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, fiber-store sources and neighbors |
 | `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
 | `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |

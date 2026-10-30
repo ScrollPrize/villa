@@ -87,10 +87,8 @@ and code names therefore means masked output, not halted motion.
 
 - **Training patches:** `data.patches_dir`. These are verified tifxyz patches with level-0 `x, y, z`; `-1` marks
   invalid nodes.
-- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr v2 pyramid read through tracers/shared/crop_sampling's
-  `ChunkedArray`; the models read level 0. Levels can be decoded in place with
-  `python -m vesuvius.neural_tracing.tracers.shared.crop_sampling.decode_store --workers 8 --verify 256 .../s1_ds2.zarr/0`.
-  Uncompressed chunks are memory-mapped and shared through the page cache.
+- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr pyramid read with vc_reader
+  (`vc_reader.reader.open_zarr`); the models read level 0.
 - **Episodes:** an episode resamples one patch window onto a canonical `(u, v)` grid at `data.gt_resolution`. `u`
   is the advance direction and `v` runs along the front, both in voxels. There are eight orientations: advance along
   rows or columns, either sign, front either sign. Fiber episodes use a window rotated to the fiber instead.

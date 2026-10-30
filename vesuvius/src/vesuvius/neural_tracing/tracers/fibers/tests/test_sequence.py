@@ -96,8 +96,7 @@ def test_tracing_builds_whole_trace_history_one_step_per_commit(tmp_path):
             self.sequence = sequence
 
     model = small_model().eval()
-    vol = ct_volume(tmp_path)
-    tracer = Recorder(model, vol, model.cfg.fine, model.cfg.n_history,
+    tracer = Recorder(model, *ct_volume(tmp_path), model.cfg.fine, model.cfg.n_history,
                       TraceParams(n_commit=1, max_len=3., confidence=0.), device='cpu')
     tracer.read = []
     try:

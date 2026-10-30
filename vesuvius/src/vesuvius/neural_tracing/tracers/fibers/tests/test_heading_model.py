@@ -12,10 +12,12 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize
 
 
 def volume(root):
-    """Tiny CT-only volume (80^3 native CT, trace grid at half resolution) with per-crop z-score records."""
+    """Reader and spec of a tiny CT-only volume (80^3 native CT, trace grid at half resolution) with per-crop
+    z-score records."""
+    from vc_reader.reader import open_zarr
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
         ZSCORE_EPSILON, ZSCORE_METHOD, volume_key)
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     path = root/'ct/0'
     path.mkdir(parents=True)
     (path/'.zarray').write_text(json.dumps(dict(shape=[80, 80, 80], chunks=[80, 80, 80], dtype='|u1', fill_value=0,
@@ -24,7 +26,7 @@ def volume(root):
     (path/'0.0.0').write_bytes(((x+2*y+z) % 256).astype(np.uint8).tobytes())
     spec = CTVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
     spec.ct_normalization = dict(method=ZSCORE_METHOD, volume=volume_key(spec), epsilon=ZSCORE_EPSILON)
-    return CTVolume(spec, cache_bytes=1 << 20)
+    return open_zarr(spec.ct_zarr, level=spec.ct_level, memory_cache=1 << 20), spec
 
 
 def line_fiber(length=200.):
@@ -68,15 +70,15 @@ def test_joint_loader_training_validation_checkpoint_and_resume(tmp_path):
         HeadingSampling, Source, mixed_heading_states, build_states, fiber_weights)
     from vesuvius.neural_tracing.tracers.fibers.heading_model.train import DEFAULTS, train
     from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import NORMAL_TARGET_POLICY
-    vol = volume(tmp_path)
+    ct, spec = volume(tmp_path)
     cfg, sampling = HeadingConfig(width=2, predict_normals=True), HeadingSampling()
     fiber = line_fiber()
-    source = Source('fixture', 'paris4', 1., vol.spec, [fiber], [fiber])
-    mixed, _ = mixed_heading_states([source], cfg, sampling, batch=2)
+    source = Source('fixture', 'paris4', 1., spec, [fiber], [fiber])
+    mixed = mixed_heading_states([source], cfg, sampling, batch=2)
     loader = torch.utils.data.DataLoader(mixed, batch_size=None, num_workers=0)
     batch = next(iter(loader))
     assert batch['normal_target'].shape == (2, 3) and torch.isfinite(batch['patch']).all()
-    held_out = {'fixture': build_states([fiber], fiber_weights([fiber], cfg.forward+8), vol, 4,
+    held_out = {'fixture': build_states([fiber], fiber_weights([fiber], cfg.forward+8), ct, spec, 4,
                                        np.random.default_rng(42), cfg, sampling)}
     run = tmp_path/'run'; run.mkdir()
     model = HeadingNet(cfg)

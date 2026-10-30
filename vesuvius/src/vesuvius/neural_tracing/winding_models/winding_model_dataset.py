@@ -31,8 +31,6 @@ _WINDING_NAME = re.compile(r"(?:^|-)w(?P<index>\d+)(?:_|$)")
 
 _SEGMENT_CACHE_VERSION = 2
 
-_MALFORMED_CHUNK_ERROR = "decoded chunk byte size does not match full chunk shape"
-
 # Surface rasterization constants, all in slab sample units. Quads are
 # subdivided to at most _RASTER_STEP between samples, each sample is assigned
 # to a supervised column when it falls within _COLUMN_WINDOW of the column
@@ -379,7 +377,6 @@ class WindingModelDataset(torch.utils.data.Dataset):
             ray_length=self.ray_length,
             spacing=self.spacing,
             sampling=str(cfg.get("sampling", "trilinear")),
-            tile_size=int(cfg.get("tile_size", 32)),
             cache_bytes=int(cfg.get("volume_cache_bytes", 0)),
             io_threads=int(cfg.get("volume_io_threads", 0)),
             segment_to_volume_xyz=[
@@ -828,9 +825,8 @@ class WindingModelDataset(torch.utils.data.Dataset):
 
         Anchored at the primary ray's midpoint, cast within the multiview
         cone with a randomized position along the new ray. Needs no
-        targets: the loss is label-free. Samples that draw no pair (or
-        whose extraction hits a truncated chunk) return zero-filled fields
-        with ``has_pair`` False so batch keys stay collate-uniform.
+        targets: the loss is label-free. Samples that draw no pair return
+        zero-filled fields with ``has_pair`` False so batch keys stay collate-uniform.
         """
         size = self.transverse_size
         empty = {
@@ -851,14 +847,9 @@ class WindingModelDataset(torch.utils.data.Dataset):
         anchor = origin + 0.5 * self.ray_extent * frame.direction
         direction = self._pair_direction(frame.direction)
         offset = self.ray_extent * (0.35 + 0.3 * float(torch.rand(())))
-        try:
-            image, valid, pair_frame = self.slab_extractor.extract(
-                volume_idx, direction, anchor - offset * direction
-            )
-        except RuntimeError as exc:
-            if _MALFORMED_CHUNK_ERROR not in str(exc):
-                raise
-            return empty
+        image, valid, pair_frame = self.slab_extractor.extract(
+            volume_idx, direction, anchor - offset * direction
+        )
         return {
             "pair_image": torch.from_numpy(np.ascontiguousarray(image)),
             "pair_valid": torch.from_numpy(np.ascontiguousarray(valid)).bool(),
@@ -1537,44 +1528,36 @@ class WindingModelDataset(torch.utils.data.Dataset):
                     for bracket_segment in bracket
                 ]
 
-            try:
-                hits = self._filter_crossings(
-                    volume_idx, hits, require_anchored=not crossings_only
-                )
-                if len(hits) < (1 if crossings_only else 2):
-                    continue
-                origin, hits = self._randomly_position_crossings(
-                    origin, direction, hits
-                )
-                slab_image, slab_valid, frame = self.slab_extractor.extract(
-                    volume_idx, direction, origin
-                )
-                if crossings_only:
-                    slab_min, slab_max = self._slab_bounds(frame)
-                    raster_specs = [
-                        (neighbor, None, 0.0)
-                        for ref in self._patches_in_bounds(
-                            volume, slab_min, slab_max
-                        )
-                        for neighbor in (self._load_patch(volume, ref),)
-                        if neighbor is not None
-                    ]
-                    if not raster_specs:
-                        continue
-                targets = self._slab_targets(
-                    frame,
-                    raster_specs,
-                    slab_image,
-                    slab_valid,
-                    crossings_only=crossings_only,
-                )
-            except RuntimeError as exc:
-                # A few locally stored Zarr chunks may be truncated. Discard
-                # only samples that touch those chunks; unrelated runtime
-                # failures must still terminate training.
-                if _MALFORMED_CHUNK_ERROR not in str(exc):
-                    raise
+            hits = self._filter_crossings(
+                volume_idx, hits, require_anchored=not crossings_only
+            )
+            if len(hits) < (1 if crossings_only else 2):
                 continue
+            origin, hits = self._randomly_position_crossings(
+                origin, direction, hits
+            )
+            slab_image, slab_valid, frame = self.slab_extractor.extract(
+                volume_idx, direction, origin
+            )
+            if crossings_only:
+                slab_min, slab_max = self._slab_bounds(frame)
+                raster_specs = [
+                    (neighbor, None, 0.0)
+                    for ref in self._patches_in_bounds(
+                        volume, slab_min, slab_max
+                    )
+                    for neighbor in (self._load_patch(volume, ref),)
+                    if neighbor is not None
+                ]
+                if not raster_specs:
+                    continue
+            targets = self._slab_targets(
+                frame,
+                raster_specs,
+                slab_image,
+                slab_valid,
+                crossings_only=crossings_only,
+            )
             if targets is None:
                 continue
             sample = {

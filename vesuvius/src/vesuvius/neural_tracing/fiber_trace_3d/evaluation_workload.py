@@ -60,8 +60,9 @@ def prepare(workload, *, pilot_only=False):
     from lasagna.manager.catalog import CatalogCache, index_volumes, index_lasagna_predictions
     from lasagna.manager.config import load_config
     from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
-    from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
-    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import input_root_attributes, validate_input_lattice
+    from vc_reader.reader import open_group
+    from vesuvius.neural_tracing.fiber_trace_2d.sampling import volume_cache_dirs
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import validate_input_lattice
 
     CHECKPOINT, SPLIT, ROOT, BINARY = (Path(workload[k]) for k in ("checkpoint", "split_root", "output_root", "native_binary"))
     CHECKPOINT_SHA = workload["checkpoint_sha256"]
@@ -99,12 +100,13 @@ def prepare(workload, *, pilot_only=False):
         resolve_key = (sample, scan, input_level, 'baked' if baked_reference else json.dumps(binding["normal"], sort_keys=True))
         if resolve_key not in resolved:
             normal = None if baked_reference else resolve_normal_binding(manager, binding, predictions)
-            sampler = Vc3dCoordinateSampler(volume.s3_url.rstrip("/"), level=input_level,
-                                           cache_root=cache_root, sample_threads=1)
-            validate_input_lattice(input_root_attributes(sampler.volume), input_level)
-            shape = tuple(int(v) for v in sampler.volume.shape_at(0))
+            ct_url = volume.s3_url.rstrip("/")
+            # cache_root is VC3D's cache root, which "vc3d" names.
+            ct = open_group(ct_url, cache_dir=volume_cache_dirs(ct_url, None))
+            validate_input_lattice(ct.attrs, input_level)
+            shape = tuple(int(v) for v in ct.level(0).shape)
             factor = 1 << input_level
-            shape1 = tuple(int(v) for v in sampler.volume.shape_at(input_level))
+            shape1 = tuple(int(v) for v in ct.level(input_level).shape)
             if shape1 != tuple((v + factor - 1) // factor for v in shape):
                 raise ValueError("CT selected-level extent mismatch")
             if normal is not None and any(abs(a-b) > 1 for a,b in zip(shape, normal["base_shape_zyx"])):

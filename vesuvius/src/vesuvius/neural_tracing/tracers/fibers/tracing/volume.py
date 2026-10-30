@@ -64,6 +64,7 @@ import torch
 import zarr
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, ct_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
@@ -75,7 +76,7 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, Tr
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume_store import export_store
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
@@ -99,10 +100,10 @@ def runs(mask):
     return list(zip(np.flatnonzero(m == 1), np.flatnonzero(m == -1)))
 
 
-def outside_scan(vol, xyz):
+def outside_scan(ct, spec, xyz):
     """Grid xyz points where the CT is 0 (beyond the scanned/masked region, or beyond the array)."""
     xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
-    return vol.sample_image_nearest(xyz[:, ::-1]) == 0 if len(xyz) else np.zeros(0, bool)
+    return ct.sample(xyz[:, ::-1]*spec.input_scale, order=0) == 0 if len(xyz) else np.zeros(0, bool)
 
 
 def outside_ct_cut(outside, gap):
@@ -422,10 +423,10 @@ def build_tracer(args):
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
     configure_volume(args, spec, model.cfg, path)
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
-    vol = CTVolume(spec, cache_bytes=8 << 30)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=8 << 30)
     params = TraceParams.from_policy(policy, max_len=args.max_len, precision=args.precision,
                                      forward_chunk=args.forward_chunk, seed=args.sampling_seed)
-    tracer = FiberTracer(model, vol, crop, n_hist, params, device=args.device)
+    tracer = FiberTracer(model, ct, spec, crop, n_hist, params, device=args.device)
     if getattr(args, 'cuda_graph', False):
         if args.forward_chunk <= 0 or getattr(model.cfg, 'model_type', '') != 'regression':
             raise ValueError('CUDA graph inference requires regression and a positive forward chunk')
@@ -440,25 +441,26 @@ def build_tracer(args):
                                                initializer=_worker_init, initargs=(spec.to_dict(),))
         tracer.observations.geometry_pool = tracer.axis_pool
     if args.crops == 'gpu':
-        use_gpu_crops(tracer, vol, args.device, args.gpu_chunks)
-    return tracer, vol, spec, policy
+        use_gpu_crops(tracer, args.device, args.gpu_chunks)
+    return tracer, ct, spec, policy
 
 
-_WORKER_VOL = None
+_WORKER_CT = _WORKER_SPEC = None
 
 
 def _worker_init(spec):
     """Worker process: its own CT reader (the volume's spec, normalization included)."""
-    global _WORKER_VOL
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
-    _WORKER_VOL = CTVolume(CTVolumeSpec.from_dict(spec), cache_bytes=1 << 30)
+    global _WORKER_CT, _WORKER_SPEC
+    _WORKER_SPEC = CTVolumeSpec.from_dict(spec)
+    _WORKER_CT = open_zarr(_WORKER_SPEC.ct_zarr, level=_WORKER_SPEC.ct_level, cache_dir=_WORKER_SPEC.cache_dir,
+                           memory_cache=1 << 30)
 
 
 def _seed_heading(task):
     """CT seed heading of one dot, signed along its presence direction; None when unusable."""
     xyz, family, direction = task
     try:
-        h = ct_seed_heading(_WORKER_VOL, xyz, family)
+        h = ct_seed_heading(_WORKER_CT, _WORKER_SPEC, xyz, family)
     except SeedHeadingError:
         return None
     if abs(h @ direction) < np.cos(np.radians(35)):
@@ -466,7 +468,7 @@ def _seed_heading(task):
     return h if h @ direction > 0 else -h
 
 
-def seed_headings(vol, dots, pool):
+def seed_headings(dots, pool):
     """CT seed headings (signed along the presence direction) in the worker processes; rows without a usable one
     are dropped. (numpy/scipy work in tracer threads crashed CPython 3.14, so it runs in processes.)"""
     tasks = list(zip(dots['xyz'], dots['family'], dots['direction']))
@@ -522,8 +524,8 @@ class TilePrefetch:
 class Streamer:
     """Feeds tile dots to one streaming tracer call, stops traces each step, writes each dot when both directions end."""
 
-    def __init__(self, tracer, vol, owned, lo, hi, args, out, spec, provenance, next_id, tiles):
-        self.tracer, self.vol, self.owned, self.lo, self.hi, self.args = tracer, vol, owned, lo, hi, args
+    def __init__(self, tracer, ct, owned, lo, hi, args, out, spec, provenance, next_id, tiles):
+        self.tracer, self.ct, self.owned, self.lo, self.hi, self.args = tracer, ct, owned, lo, hi, args
         self.out, self.spec, self.provenance, self.next_id = out, spec, provenance, next_id
         self.tiles = tiles  # list of dict(name, lo, hi, weight), in order; dots read when reached
         self.cursor = 0  # next tile to read
@@ -631,7 +633,7 @@ class Streamer:
                      direction=np.array([t['dots']['direction'][k] for t, k in chosen]),
                      family=np.array([t['dots']['family'][k] for t, k in chosen]),
                      plane=np.array([t['dots']['plane'][k] for t, k in chosen]))
-        batch, keep = seed_headings(self.vol, batch, self.tracer.axis_pool)
+        batch, keep = seed_headings(batch, self.tracer.axis_pool)
         tile_by_index = [t for (t, _), ok in zip(chosen, keep) if ok]
         for (t, _), ok in zip(chosen, keep):
             t['stats']['traced' if ok else 'no_heading'] += 1
@@ -666,7 +668,7 @@ class Streamer:
         dirs = frames[:, :, 2]
         stops = {}
         outside = np.any(pos < self.lo-BOX_MARGIN, 1) | np.any(pos > self.hi+BOX_MARGIN, 1)
-        unscanned = outside_scan(self.vol, pos)
+        unscanned = outside_scan(self.ct, self.spec, pos)
         pair = np.array([self.rows[i][0] for i in idx])
         near = (self.owned.owner(pos, dirs, args.dedupe) >= 0) | self.live.hits(pos, dirs, pair, self.step)
         prev = np.array([self.prev[i] for i in idx])
@@ -716,7 +718,7 @@ class Streamer:
         poly = np.concatenate([bw[::-1], fw[1:]])  # backward reversed, then forward
         info['tile']['stats']['traced_vox'] += int(arclength(poly)[-1]) if len(poly) > 1 else 0
         inside = np.all((poly >= self.lo) & (poly <= self.hi), 1) & \
-            ~outside_ct_cut(outside_scan(self.vol, poly), args.outside_gap)
+            ~outside_ct_cut(outside_scan(self.ct, self.spec, poly), args.outside_gap)
         new = []
         for a, b in runs(inside):
             part = poly[a:b]
@@ -842,9 +844,10 @@ def main(argv=None):
     ap.add_argument('--gate', choices=('full', 'prefix'))
     ap.add_argument('--precision', choices=('bf16', 'fp32'), default='bf16')
     ap.add_argument('--crops', choices=('gpu', 'cpu'), default='gpu',
-                    help='GPU: follower and frame-model crops from a GPU chunk cache (shared/crop_sampling/gpu.py) and '
-                         'the frame model on the GPU; CPU: the CPU sampler and CPU frame model')
-    ap.add_argument('--gpu-chunks', type=int, default=2048, help='GPU chunk cache slots (2 MiB each for 128^3 uint8)')
+                    help="GPU: follower and frame-model crops sampled by vc_reader's CUDA reader and the frame model on "
+                         'the GPU; CPU: the CPU sampler and CPU frame model')
+    ap.add_argument('--gpu-chunks', type=int, default=2048,
+                    help='CT chunks in the CUDA reader\'s device cache (2 MiB each for 128^3 uint8)')
     ap.add_argument('--forward-chunk', type=int, default=128)
     ap.add_argument('--cuda-graph', action='store_true', help='Replay full regression forward chunks with a CUDA graph')
     ap.add_argument('--axis-workers', type=int, default=8,
@@ -870,15 +873,16 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     out = Path(args.out)
     (out/'tiles').mkdir(parents=True, exist_ok=True)
-    tracer, vol, spec, policy = build_tracer(args)
+    tracer, ct, spec, policy = build_tracer(args)
+    shape = tuple(int(n) for n in np.ceil(np.asarray(ct.shape)/spec.input_scale))  # the trace grid, zyx
     presence = zarr.open(args.presence, mode='r')
-    if tuple(presence.shape) != tuple(vol.shape):
-        raise SystemExit(f'presence shape {presence.shape} is not the trace grid {vol.shape} (zyx)')
+    if tuple(presence.shape) != shape:
+        raise SystemExit(f'presence shape {presence.shape} is not the trace grid {shape} (zyx)')
     if args.box:
         b = np.array([float(v) for v in args.box.split(',')])
         lo, hi = b[:3], b[3:]
     else:
-        lo, hi = np.zeros(3), np.array(vol.shape[::-1], float)
+        lo, hi = np.zeros(3), np.array(shape[::-1], float)
         if args.ct_z:
             z0, z1 = (float(v)*spec.ct_grid_scale/spec.grid_scale for v in args.ct_z.split(','))
             lo[2], hi[2] = z0, z1
@@ -914,7 +918,7 @@ def main(argv=None):
              for z in np.arange(lo[2], hi[2], args.tile) for y in np.arange(lo[1], hi[1], args.tile)
              for x in np.arange(lo[0], hi[0], args.tile)]
     t_w = time.time()
-    weights = tile_weights(args.presence, args.threshold, tiles, vol.shape)
+    weights = tile_weights(args.presence, args.threshold, tiles, shape)
     for t, w in zip(tiles, weights if weights is not None else [1]*len(tiles)):
         t['weight'] = w
     total_w = sum(t['weight'] for t in tiles)
@@ -944,7 +948,7 @@ def main(argv=None):
     try:
         for z in sorted({float(t['lo'][2]) for t in todo}):  # one streaming tracer call per z row of tiles
             band = [t for t in todo if float(t['lo'][2]) == z]
-            st = Streamer(tracer, vol, owned, lo, hi, args, out, spec, provenance, next_id, band)
+            st = Streamer(tracer, ct, owned, lo, hi, args, out, spec, provenance, next_id, band)
             st.presence = presence
             st.prefetch = prefetch
 
@@ -982,7 +986,6 @@ def main(argv=None):
                           f'feed {st.timing["feed"]/max(time.time()-t_band, 1e-9):.0%} checks '
                           f'{st.timing["checks"]/max(time.time()-t_band, 1e-9):.0%} write '
                           f'{st.timing["write"]/max(time.time()-t_band, 1e-9):.0%} of time | '
-                          f'GPU chunk loads {getattr(getattr(tracer, "chunk_cache", None), "loads", 0)/max(el, 1e-9):.0f}/s | '
                           f'elapsed {el/3600:.2f} h, ETA {eta/3600:.1f} h', flush=True)
                     stages = dict(getattr(tracer, 'stage_seconds', {}))
                     delta = {k: v-reported_stage.get(k, 0.) for k, v in stages.items()}

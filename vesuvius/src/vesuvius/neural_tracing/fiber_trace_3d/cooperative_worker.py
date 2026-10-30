@@ -178,9 +178,6 @@ class FiberTrainingWorker:
                 raise ValueError("PyTorch version differs from the measured memory calibration")
             if factory.calibrated_cuda_versions and torch.version.cuda not in factory.calibrated_cuda_versions:
                 raise ValueError("CUDA version differs from the measured memory calibration")
-            from .cooperative_resources import initialize_worker_volume_cache
-            if raw.get("datasets"):
-                initialize_worker_volume_cache(raw)
             if factory.measure_startup_memory:
                 torch.cuda.reset_peak_memory_stats(0)
         from .train import training_units

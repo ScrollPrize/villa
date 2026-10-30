@@ -3,25 +3,22 @@ import json
 
 import numpy as np
 import pytest
+import zarr
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_snapping import SnapConfig, resample, snap_polylines
 
 
-class ArrayVolume:
-    """A zyx numpy volume with the ChunkedArray read interface."""
-    def __init__(self, values):
-        self.values, self.shape, self.dtype = values, values.shape, values.dtype
-
-    def read(self, start, size):
-        return self.values[tuple(slice(a, a+n) for a, n in zip(start, size))]
-
-
-def tube_volume(centre, shape=(48, 48, 96), sigma=.8):
-    """uint8 presence: a Gaussian tube (sigma voxels) around ``centre`` (xyz samples)."""
+def tube_volume(path, centre, shape=(48, 48, 96), sigma=.8):
+    """uint8 presence: a Gaussian tube (sigma voxels) around ``centre`` (xyz samples), written as a local Zarr v2
+    array at ``path`` and opened with vc_reader."""
     from scipy.spatial import cKDTree
     z, y, x = np.indices(shape)
     distance = cKDTree(resample(centre, .1)).query(np.c_[x.ravel(), y.ravel(), z.ravel()])[0].reshape(shape)
-    return (255*np.exp(-.5*(distance/sigma)**2)).astype(np.uint8)
+    array = zarr.create_array(str(path), shape=shape, chunks=(16, 16, 32), dtype='u1', fill_value=0, zarr_format=2,
+                              compressors=None)
+    array[:] = (255*np.exp(-.5*(distance/sigma)**2)).astype(np.uint8)
+    return open_zarr(path)
 
 
 def wavy(offset=(0., 0., 0.)):
@@ -29,9 +26,9 @@ def wavy(offset=(0., 0., 0.)):
     return np.c_[x, 24+3*np.sin(x/9.), 24+2*np.cos(x/13.)]+np.asarray(offset)
 
 
-def test_snapping_moves_an_offset_label_onto_the_presence_centre():
+def test_snapping_moves_an_offset_label_onto_the_presence_centre(tmp_path):
     centre = wavy()
-    presence = ArrayVolume(tube_volume(centre))
+    presence = tube_volume(tmp_path/'presence', centre)
     label = wavy((0., 1.4, -.9))  # off the fiber by ~1.7 voxels
     snapped = snap_polylines([label], presence, SnapConfig(tile=32, threads=2), device='cpu')[0]
     from scipy.spatial import cKDTree
@@ -55,7 +52,7 @@ def test_store_snapping_keeps_uuids_names_families_and_meta_and_reads_back(tmp_p
     write_fibers(tmp_path/'in.vcobj', [(dict(id=B, name='b', family='V', meta={'origin': 'test'}), centre*scale),
                                        (dict(id=A, name='a', family='H', meta={'origin': 'test'}),
                                         wavy((0., 1.4, -.9))*scale)], volume='1')
-    presence = ArrayVolume(tube_volume(centre))
+    presence = tube_volume(tmp_path/'presence', centre)
     result = snap_fibers.snap_store(tmp_path/'in.vcobj', tmp_path/'out.vcobj', presence, scale, 0.,
                                     SnapConfig(tile=32, threads=2), 'cpu', 1., 0, dict(method='test'))
     assert result['fibers'] == 2
@@ -81,7 +78,7 @@ def test_json_snapping_rewrites_the_line_and_keeps_controls_on_it(tmp_path):
                     control_points=[dict(position=line[i].tolist()) for i in (0, 40, len(line)-1)])
     (tmp_path/'in').mkdir()
     (tmp_path/'in'/'f.json').write_text(json.dumps(document))
-    presence = ArrayVolume(tube_volume(centre))
+    presence = tube_volume(tmp_path/'presence', centre)
     snap_fibers.snap_json([tmp_path/'in'/'f.json'], tmp_path/'out', presence, scale, 0., SnapConfig(tile=32, threads=2),
                           'cpu', 1., dict(method='test'))
     out = json.loads((tmp_path/'out'/'f.json').read_text())

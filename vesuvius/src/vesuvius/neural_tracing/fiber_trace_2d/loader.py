@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import glob
-import heapq
 import hashlib
 import json
 import math
 import os
 import threading
 import time
-import urllib.error
-import urllib.request
-import uuid
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -21,7 +17,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -72,8 +68,13 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     strip_augment_transform,
     value_only_params,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, make_coordinate_sampler
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
+    format_seconds,
+    level_points,
+    prefetch_samples,
+    volume_cache_dirs,
+)
+from vc_reader.reader import ZarrReader
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
@@ -90,7 +91,6 @@ class FiberStrip2DConfig:
     strip_z_offset_step: float = 1.0
     seed: int = 1
     prefetch_workers: int = 16
-    prefetch_sampler_workers: int = 2
     loader_workers: int = max(1, os.cpu_count() or 1)
     volume_cache_dir: str | None = None
     volume_cache_memory_mib: float | None = None
@@ -175,7 +175,7 @@ class _Record:
     volume_scale: int
     volume_spacing_base: float
     fiber_identity: str
-    sampler: CoordinateSampler | None
+    reader: ZarrReader | None
     grad_mag: Any
     grad_mag_spacing_base: float
     nx: Any | None
@@ -306,27 +306,6 @@ class _PreparedTopStripSample:
     valid_mask: np.ndarray
     line_xy: np.ndarray
     control_point_xy: np.ndarray
-
-
-@dataclass
-class _PrefetchCounters:
-    samples_done: int = 0
-    samples_skipped: int = 0
-    patches_done: int = 0
-    unique_chunks_seen: int = 0
-    queued_for_download: int = 0
-    download_done: int = 0
-    cache_hits: int = 0
-    known_missing: int = 0
-    downloaded: int = 0
-    newly_missing: int = 0
-    download_errors: int = 0
-    bytes_downloaded: int = 0
-    valid_pixels: int = 0
-    first_error: str = ""
-    first_sample_skip: str = ""
-    queued_download_futures: int = 0
-    max_exclusive_sample_index: int = 0
 
 
 def _is_remote_path(path: str | Path) -> bool:
@@ -519,10 +498,6 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         strip_z_offset_step=float(raw.get("strip_z_offset_step", 1.0)),
         seed=int(raw.get("seed", 1)),
         prefetch_workers=_parse_positive_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
-        prefetch_sampler_workers=_parse_positive_worker_count(
-            raw.get("prefetch_sampler_workers", 2),
-            key="prefetch_sampler_workers",
-        ),
         loader_workers=_parse_positive_worker_count(
             raw.get("loader_workers", 0),
             key="loader_workers",
@@ -996,137 +971,6 @@ def _sync_if_needed(device: torch.device | None) -> None:
         torch.cuda.synchronize(device)
 
 
-def _existing_data_path(request: ZarrChunkRequest) -> Path | None:
-    store_paths = getattr(request.store, "data_paths_for_key", None)
-    if callable(store_paths):
-        paths = tuple(Path(path) for path in store_paths(request.key))
-    elif request.cache_path is not None:
-        cache_path = Path(request.cache_path)
-        paths = (cache_path,) if cache_path.suffix else tuple(cache_path.parent.glob(f"{cache_path.name}.*"))
-    else:
-        paths = ()
-    for path in paths:
-        if path.name.endswith(".empty") or path.name.endswith(".tmp"):
-            continue
-        if path.is_file():
-            return path
-    return None
-
-
-def _empty_marker_path(request: ZarrChunkRequest) -> Path | None:
-    if request.empty_path is not None:
-        return Path(request.empty_path)
-    store_empty = getattr(request.store, "empty_path_for_key", None)
-    if callable(store_empty):
-        value = store_empty(request.key)
-        return None if value is None else Path(value)
-    return None
-
-
-def _write_empty_marker(request: ZarrChunkRequest) -> None:
-    path = _empty_marker_path(request)
-    if path is None:
-        raise RuntimeError(f"missing .empty marker path for chunk {request.store_identity}:{request.key}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb"):
-        pass
-
-
-class _PrefetchDefinitiveMissing(Exception):
-    pass
-
-
-class _PrefetchPermanentError(Exception):
-    pass
-
-
-def _fetch_prefetch_payload(request: ZarrChunkRequest) -> bytes:
-    if request.cache_payload_format != "source_bytes":
-        raise _PrefetchPermanentError(
-            "unsupported prefetch cache payload format "
-            f"{request.cache_payload_format!r} for chunk {request.store_identity}:{request.key}; "
-            "only uncompressed direct-source zarr chunks are supported for Python prefetch"
-        )
-    if request.downloader is not None:
-        payload = request.downloader(request)
-        if payload is None:
-            raise _PrefetchDefinitiveMissing()
-        return bytes(payload)
-    if not request.remote_url:
-        raise _PrefetchPermanentError(f"missing remote URL for chunk {request.store_identity}:{request.key}")
-    try:
-        with urllib.request.urlopen(request.remote_url, timeout=60.0) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code in {404, 410}:
-            raise _PrefetchDefinitiveMissing() from exc
-        raise
-
-
-def _write_prefetch_payload_atomic(request: ZarrChunkRequest, payload: bytes) -> int:
-    if request.cache_path is None:
-        raise _PrefetchPermanentError(f"missing cache path for chunk {request.store_identity}:{request.key}")
-    path = Path(request.cache_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (
-        f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-    )
-    try:
-        with tmp.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return len(payload)
-
-
-def _download_prefetch_request(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, Any]:
-    if _existing_data_path(request) is not None:
-        return {"status": "cache_hit", "bytes": 0}
-    empty_path = _empty_marker_path(request)
-    if empty_path is not None and empty_path.is_file():
-        return {"status": "known_missing", "bytes": 0}
-
-    deadline = time.monotonic() + max(0.0, float(retry_seconds))
-    delay = 0.25
-    last_error = ""
-    while True:
-        try:
-            payload = _fetch_prefetch_payload(request)
-            byte_count = _write_prefetch_payload_atomic(request, payload)
-            if _existing_data_path(request) is None:
-                raise RuntimeError(f"downloaded chunk did not produce cache file for {request.key}")
-            return {"status": "downloaded", "bytes": int(byte_count)}
-        except _PrefetchDefinitiveMissing:
-            _write_empty_marker(request)
-            return {"status": "new_missing", "bytes": 0}
-        except _PrefetchPermanentError as exc:
-            return {"status": "error", "bytes": 0, "error": str(exc)}
-        except Exception as exc:  # pragma: no cover - exact network exceptions are backend-specific.
-            last_error = str(exc)
-            if time.monotonic() >= deadline:
-                return {"status": "error", "bytes": 0, "error": last_error}
-            time.sleep(delay)
-            delay = min(delay * 1.5, 5.0)
-
-
-def _format_seconds(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    if seconds < 60.0:
-        return f"{seconds:.1f}s"
-    minutes, sec = divmod(seconds, 60.0)
-    if minutes < 60.0:
-        return f"{int(minutes)}m{int(sec):02d}s"
-    hours, minutes = divmod(minutes, 60.0)
-    return f"{int(hours)}h{int(minutes):02d}m"
-
-
 def _sync_value_augmentation_params(
     geometric_params: FiberStripAugmentParams,
     value_params: FiberStripAugmentParams,
@@ -1142,15 +986,11 @@ def _sync_value_augmentation_params(
     )
 
 
-SamplerFactory = Callable[..., CoordinateSampler]
-
-
 class FiberStrip2DLoader:
     def __init__(
         self,
         config: FiberStrip2DConfig,
         *,
-        sampler_factory: SamplerFactory | None = None,
         records: tuple[_Record, ...] | list[_Record] | None = None,
         geometry_store: _FiberLineGeometryStore | None = None,
         sample_identity_keys: tuple[str, ...] | None = None,
@@ -1163,7 +1003,6 @@ class FiberStrip2DLoader:
             config.strip_z_offset_count, config.strip_z_offset_step
         )
         self.config = config
-        self._sampler_factory = make_coordinate_sampler if sampler_factory is None else sampler_factory
         if records is None:
             self.records = self._load_records()
         else:
@@ -1227,41 +1066,12 @@ class FiberStrip2DLoader:
         clone_config = replace(self.config, suppress_record_warnings=True)
         return FiberStrip2DLoader(
             clone_config,
-            sampler_factory=self._sampler_factory,
-            records=self._clone_records_with_local_samplers(clone_config),
+            records=self.records,
             geometry_store=self._geometry_store,
             sample_identity_keys=self._sample_identity_keys,
             random_pass_cache=self._random_pass_cache,
             random_pass_cache_lock=self._random_pass_cache_lock,
         )
-
-    def _make_sampler_for_record(self, record: _Record, config: FiberStrip2DConfig) -> CoordinateSampler:
-        return self._sampler_factory(
-            volume_path=record.volume_path,
-            array=record.volume,
-            level=record.volume_scale,
-            level_spacing_base=record.volume_spacing_base,
-            cache_root=config.volume_cache_dir,
-            cache_budget_bytes=config.volume_cache_memory_bytes,
-            io_threads=config.volume_io_threads,
-        )
-
-    def _clone_records_with_local_samplers(self, config: FiberStrip2DConfig) -> list[_Record]:
-        samplers: dict[tuple[str, int, float, int], CoordinateSampler] = {}
-        records: list[_Record] = []
-        for record in self.records:
-            key = (
-                record.volume_path,
-                int(record.volume_scale),
-                float(record.volume_spacing_base),
-                id(record.volume),
-            )
-            sampler = samplers.get(key)
-            if sampler is None:
-                sampler = self._make_sampler_for_record(record, config)
-                samplers[key] = sampler
-            records.append(replace(record, sampler=sampler))
-        return records
 
     def _get_loader_executor(self, worker_count: int) -> ThreadPoolExecutor:
         worker_count = max(1, int(worker_count))
@@ -1290,14 +1100,12 @@ class FiberStrip2DLoader:
             )
             volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
             volume_spacing_base = float(1 << volume_scale)
-            sampler = self._sampler_factory(
-                volume_path=volume_path,
-                array=volume,
+            reader = ZarrReader.open(
+                volume_path,
                 level=volume_scale,
-                level_spacing_base=volume_spacing_base,
-                cache_root=self.config.volume_cache_dir,
-                cache_budget_bytes=self.config.volume_cache_memory_bytes,
-                io_threads=self.config.volume_io_threads,
+                cache_dir=volume_cache_dirs(volume_path, self.config.volume_cache_dir),
+                memory_cache=self.config.volume_cache_memory_bytes,
+                threads=self.config.volume_io_threads,
             )
             (
                 base_shape_zyx,
@@ -1365,7 +1173,7 @@ class FiberStrip2DLoader:
                             volume_scale=volume_scale,
                             volume_spacing_base=volume_spacing_base,
                             fiber_identity=fiber_identity,
-                            sampler=sampler,
+                            reader=reader,
                             grad_mag=grad_mag,
                             grad_mag_spacing_base=grad_mag_spacing_base,
                             nx=nx,
@@ -1907,7 +1715,7 @@ class FiberStrip2DLoader:
             print(
                 "\r"
                 f"fiber_trace_2d geometry[{bar}] {done}/{total_records} "
-                f"eta={_format_seconds(eta)} "
+                f"eta={format_seconds(eta)} "
                 f"valid_cps={store.valid_control_points} "
                 f"skipped_cps={store.skipped_control_points} "
                 f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB",
@@ -1984,7 +1792,7 @@ class FiberStrip2DLoader:
                 f"records={total_records} valid_cps={store.valid_control_points} "
                 f"skipped_cps={store.skipped_control_points} "
                 f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB "
-                f"elapsed={_format_seconds(elapsed)}",
+                f"elapsed={format_seconds(elapsed)}",
                 flush=True,
             )
         return store
@@ -3285,13 +3093,12 @@ class FiberStrip2DLoader:
         sampled_valid: np.ndarray | None = None
         if load_image:
             with _ProfileBlock(profile, "volume_sample"):
-                result = source.record.sampler.sample_coords(coords_zyx, valid_mask)
-                image = result.image
-                sampled_valid = result.valid_mask
-                if profile is not None:
-                    for key, value in result.stats.items():
-                        if isinstance(value, (int, float)):
-                            profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+                reader = source.record.reader
+                points, sampled_valid = level_points(
+                    coords_zyx, valid_mask, source.record.volume_scale, reader.shape
+                )
+                image = np.zeros(sampled_valid.shape, dtype=np.float32)
+                image[sampled_valid] = reader.sample(points[sampled_valid], order=1)
             if params is not None and apply_image_augmentation:
                 with _ProfileBlock(profile, "value_augmentation", device):
                     image_t, valid_t = apply_value_augmentation(
@@ -3640,13 +3447,10 @@ class FiberStrip2DLoader:
             images_by_item: list[np.ndarray | None] = [None] * control_point_count
             valids_by_item: list[np.ndarray | None] = [None] * control_point_count
             groups: dict[int, list[int]] = {}
-            samplers: dict[int, CoordinateSampler] = {}
             for item_index, (prepared, _) in enumerate(prepared_items):
-                sampler = prepared.source.record.sampler
-                key = id(sampler)
-                groups.setdefault(key, []).append(item_index)
-                samplers[key] = sampler
-            for key, item_indices in groups.items():
+                groups.setdefault(id(prepared.source.record.reader), []).append(item_index)
+            for item_indices in groups.values():
+                record = prepared_items[item_indices[0]][0].source.record
                 coords = np.stack(
                     [
                         np.asarray(prepared_items[item_index][0].coords_zyx, dtype=np.float32)
@@ -3662,25 +3466,9 @@ class FiberStrip2DLoader:
                     axis=0,
                 )
                 with _ProfileBlock(profile, "volume_sample"):
-                    result = samplers[key].sample_coord_batch(coords, valid)
-                images = np.asarray(result.image, dtype=np.float32)
-                valids = np.asarray(result.valid_mask, dtype=bool)
-                if images.shape != valid.shape:
-                    raise ValueError(
-                        "top batched coordinate sampler returned incompatible image shape: "
-                        f"shape={images.shape} expected={valid.shape}"
-                    )
-                if valids.shape != valid.shape:
-                    raise ValueError(
-                        "top batched coordinate sampler returned incompatible valid-mask shape: "
-                        f"shape={valids.shape} expected={valid.shape}"
-                    )
-                if profile is not None:
-                    for stat_key, value in result.stats.items():
-                        if isinstance(value, (int, float)):
-                            profile[f"volume_stat_{stat_key}"] = (
-                                profile.get(f"volume_stat_{stat_key}", 0.0) + float(value)
-                            )
+                    points, valids = level_points(coords, valid, record.volume_scale, record.reader.shape)
+                    images = np.zeros(valids.shape, dtype=np.float32)
+                    images[valids] = record.reader.sample(points[valids], order=1)
                 for local_offset, item_index in enumerate(item_indices):
                     images_by_item[item_index] = images[local_offset]
                     valids_by_item[item_index] = valids[local_offset]
@@ -3847,13 +3635,12 @@ class FiberStrip2DLoader:
                 profile=profile,
             )
         with _ProfileBlock(profile, "volume_sample"):
-            result = prepared.source.record.sampler.sample_coord_batch(prepared.coords_zyx, prepared.valid_mask)
-            images_np = np.asarray(result.image, dtype=np.float32)
-            valids_np = np.asarray(result.valid_mask, dtype=bool)
-            if profile is not None:
-                for key, value in result.stats.items():
-                    if isinstance(value, (int, float)):
-                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+            record = prepared.source.record
+            points, valids_np = level_points(
+                prepared.coords_zyx, prepared.valid_mask, record.volume_scale, record.reader.shape
+            )
+            images_np = np.zeros(valids_np.shape, dtype=np.float32)
+            images_np[valids_np] = record.reader.sample(points[valids_np], order=1)
         return self._finish_prepared_sample(
             prepared,
             images_np,
@@ -3888,14 +3675,11 @@ class FiberStrip2DLoader:
         images_by_item: list[np.ndarray | None] = [None] * len(prepared_items)
         valids_by_item: list[np.ndarray | None] = [None] * len(prepared_items)
         groups: dict[int, list[int]] = {}
-        samplers: dict[int, CoordinateSampler] = {}
         for item_index, (prepared, _) in enumerate(prepared_items):
-            sampler = prepared.source.record.sampler
-            key = id(sampler)
-            groups.setdefault(key, []).append(item_index)
-            samplers[key] = sampler
+            groups.setdefault(id(prepared.source.record.reader), []).append(item_index)
 
-        for key, item_indices in groups.items():
+        for item_indices in groups.values():
+            record = prepared_items[item_indices[0]][0].source.record
             coords = np.concatenate(
                 [
                     np.asarray(prepared_items[item_index][0].coords_zyx, dtype=np.float32)
@@ -3911,25 +3695,9 @@ class FiberStrip2DLoader:
                 axis=0,
             )
             with _ProfileBlock(profile, "volume_sample"):
-                result = samplers[key].sample_coord_batch(coords, valid)
-            images = np.asarray(result.image, dtype=np.float32)
-            valids = np.asarray(result.valid_mask, dtype=bool)
-            if images.shape != valid.shape:
-                raise ValueError(
-                    "batched coordinate sampler returned incompatible image shape: "
-                    f"shape={images.shape} expected={valid.shape}"
-                )
-            if valids.shape != valid.shape:
-                raise ValueError(
-                    "batched coordinate sampler returned incompatible valid-mask shape: "
-                    f"shape={valids.shape} expected={valid.shape}"
-                )
-            if profile is not None:
-                for stat_key, value in result.stats.items():
-                    if isinstance(value, (int, float)):
-                        profile[f"volume_stat_{stat_key}"] = (
-                            profile.get(f"volume_stat_{stat_key}", 0.0) + float(value)
-                        )
+                points, valids = level_points(coords, valid, record.volume_scale, record.reader.shape)
+                images = np.zeros(valids.shape, dtype=np.float32)
+                images[valids] = record.reader.sample(points[valids], order=1)
             offset = 0
             for item_index in item_indices:
                 prepared = prepared_items[item_index][0]
@@ -3937,8 +3705,6 @@ class FiberStrip2DLoader:
                 images_by_item[item_index] = images[offset : offset + patch_count]
                 valids_by_item[item_index] = valids[offset : offset + patch_count]
                 offset += patch_count
-            if offset != int(images.shape[0]):
-                raise RuntimeError("internal batched coordinate sampler dispatch mismatch")
 
         finished: list[
             tuple[
@@ -4195,9 +3961,9 @@ class FiberStrip2DLoader:
         )
         coords_zyx = _as_numpy_float32(coords_t)
         coord_valid = _as_numpy_bool(valid_t)
-        result = record.sampler.sample_coords(coords_zyx, coord_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        points, valid_mask = level_points(coords_zyx, coord_valid, record.volume_scale, record.reader.shape)
+        image = np.zeros(valid_mask.shape, dtype=np.float32)
+        image[valid_mask] = record.reader.sample(points[valid_mask], order=1)
         source_line = torch.as_tensor(sample.line_xy, dtype=torch.float32, device=resolved_device)
         source_cp = torch.as_tensor(sample.control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
         mapped = transform.source_to_output_points(torch.cat([source_line, source_cp], dim=0))
@@ -4704,7 +4470,6 @@ class FiberStrip2DLoader:
             source,
             coords_zyx,
             grid_valid,
-            context="top-strip",
         )
 
     def trace2cp_segment_coords_xyz(
@@ -4754,35 +4519,11 @@ class FiberStrip2DLoader:
         source: _Trace2CpSegmentSource,
         coords_zyx: np.ndarray,
         grid_valid: np.ndarray,
-        *,
-        context: str,
     ) -> tuple[np.ndarray, np.ndarray]:
-        sampler = source.record.sampler
-        if hasattr(sampler, "blocking") and not bool(getattr(sampler, "blocking")):
-            raise ValueError(
-                f"Trace2CP {context} rendering requires blocking coordinate sampling"
-            )
-        result = sampler.sample_coords(coords_zyx, grid_valid)
-        stats = dict(result.stats)
-        error_chunks = int(stats.get("error_chunks", 0) or 0)
-        if error_chunks > 0:
-            raise ValueError(
-                f"Trace2CP {context} rendering encountered {error_chunks} chunk errors; "
-                "refusing to render incomplete requested-level data "
-                f"stats={stats}"
-            )
-        if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
-            raise ValueError(
-                f"Trace2CP {context} rendering did not use requested-level-only sampling; "
-                f"stats={stats}"
-            )
-        fallback_levels = int(stats.get("fallback_levels", 0) or 0)
-        if fallback_levels != 0:
-            raise ValueError(
-                f"Trace2CP {context} rendering used scale fallback; stats={stats}"
-            )
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        record = source.record
+        points, valid_mask = level_points(coords_zyx, grid_valid, record.volume_scale, record.reader.shape)
+        image = np.zeros(valid_mask.shape, dtype=np.float32)
+        image[valid_mask] = record.reader.sample(points[valid_mask], order=1)
         return image, valid_mask
 
     def sample_trace2cp_traced_top_strip_source(
@@ -4802,7 +4543,6 @@ class FiberStrip2DLoader:
             source,
             coords_zyx,
             grid_valid,
-            context="traced top-strip",
         )
 
     def trace2cp_traced_top_strip_coords_xyz(
@@ -4910,7 +4650,6 @@ class FiberStrip2DLoader:
             source,
             coords_zyx,
             grid_valid,
-            context="side-strip",
         )
         sample = FiberStripSegmentSample(
             record_index=int(source.record_index),
@@ -4950,7 +4689,6 @@ class FiberStrip2DLoader:
             source,
             coords_zyx,
             grid_valid,
-            context="side-z strip",
         )
         sample = FiberStripSegmentSample(
             record_index=int(source.record_index),
@@ -5029,9 +4767,9 @@ class FiberStrip2DLoader:
         )
         coords_zyx = _as_numpy_float32(coords_t)
         coord_valid = _as_numpy_bool(valid_t)
-        result = record.sampler.sample_coords(coords_zyx, coord_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        points, valid_mask = level_points(coords_zyx, coord_valid, record.volume_scale, record.reader.shape)
+        image = np.zeros(valid_mask.shape, dtype=np.float32)
+        image[valid_mask] = record.reader.sample(points[valid_mask], order=1)
         source_line = torch.as_tensor(sample.line_xy, dtype=torch.float32, device=resolved_device)
         start = torch.as_tensor(sample.start_control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
         target = torch.as_tensor(sample.target_control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
@@ -5414,53 +5152,6 @@ class FiberStrip2DLoader:
             include_coords=include_coords,
         )
 
-    def chunk_requests_for_sample_index(
-        self,
-        sample_index: int,
-        *,
-        sample_mode: str = "random",
-        sample_index_limit: int | None = None,
-        include_top_view: bool = False,
-    ) -> list[ZarrChunkRequest]:
-        device = resolve_torch_device(self.config.augment.device)
-        bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
-        source = self.build_strip_source(bounded_sample_index, device=device, sample_mode=sample_mode)
-        requests: list[ZarrChunkRequest] = []
-        for offset_index, _ in enumerate(self.strip_z_offsets):
-            coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
-            requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
-        if include_top_view:
-            top_source = self.build_top_strip_source(
-                bounded_sample_index,
-                device=device,
-                sample_mode=sample_mode,
-                use_augmentation_envelope=True,
-            )
-            coords_zyx = _as_numpy_float32(top_source.grid.coords_zyx)
-            valid_mask = _as_numpy_bool(top_source.grid.valid_mask)
-            requests.extend(top_source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
-        return requests
-
-    def chunk_requests_for_samples(
-        self,
-        start_sample_index: int,
-        sample_count: int,
-        *,
-        sample_mode: str = "random",
-        sample_index_limit: int | None = None,
-        include_top_view: bool = False,
-    ) -> list[ZarrChunkRequest]:
-        unique: dict[tuple[str, str], ZarrChunkRequest] = {}
-        for sample_index in range(int(start_sample_index), int(start_sample_index) + int(sample_count)):
-            for request in self.chunk_requests_for_sample_index(
-                sample_index,
-                sample_mode=sample_mode,
-                sample_index_limit=sample_index_limit,
-                include_top_view=include_top_view,
-            ):
-                unique[(request.store_identity, request.key)] = request
-        return list(unique.values())
-
     def prefetch(
         self,
         start_sample_index: int,
@@ -5471,94 +5162,9 @@ class FiberStrip2DLoader:
         sample_index_limit: int | None = None,
         include_top_view: bool = False,
     ) -> dict[str, Any]:
-        total_samples = int(sample_count)
-        total_patches = total_samples * len(self.strip_z_offsets)
-        worker_count = max(1, int(self.config.prefetch_workers if workers is None else workers))
-        producer_count = min(max(1, int(self.config.prefetch_sampler_workers)), max(1, total_samples))
-        retry_seconds = self.config.volume_cache_retry_seconds
-        if retry_seconds <= 0.0:
-            retry_seconds = 600.0
-        counters = _PrefetchCounters()
-        start_sample = int(start_sample_index)
-        seen: set[tuple[str, str]] = set()
-        completed_chunks: set[tuple[str, str]] = set()
-        chunk_waiters: dict[tuple[str, str], set[int]] = {}
-        sample_pending: dict[int, set[tuple[str, str]]] = {}
-        sample_requests_closed: set[int] = set()
-        complete_raw_samples: set[int] = set()
-        next_safe_raw_sample = start_sample
-        start = time.perf_counter()
-        print(
-            "prefetch: "
-            f"samples={total_samples} patches={total_patches} "
-            f"workers={worker_count} sampler_workers={producer_count} "
-            f"sample_mode={sample_mode} sample_index_limit={int(sample_index_limit or 0)} "
-            f"include_top_view={bool(include_top_view)} "
-            "mode=dependency_chunks",
-            flush=True,
-        )
+        """Read each sample's augmentation envelope (and top view if requested) so vc_reader disk-caches its chunks."""
 
-        def print_progress(*, final: bool = False) -> None:
-            elapsed = max(time.perf_counter() - start, 1.0e-9)
-            sample_rate = counters.samples_done / elapsed
-            remaining_samples = total_samples - counters.samples_done
-            sample_eta = remaining_samples / sample_rate if remaining_samples > 0 and sample_rate > 0.0 else 0.0
-            download_rate = counters.download_done / elapsed
-            if counters.samples_done > 0 and counters.samples_done < total_samples:
-                observed_chunks_per_sample = counters.unique_chunks_seen / max(counters.samples_done, 1)
-                observed_download_ratio = counters.queued_for_download / max(counters.unique_chunks_seen, 1)
-                estimated_total_downloads = counters.queued_for_download + int(
-                    math.ceil(remaining_samples * observed_chunks_per_sample * observed_download_ratio)
-                )
-            else:
-                estimated_total_downloads = counters.queued_for_download
-            remaining_downloads = estimated_total_downloads - counters.download_done
-            download_eta = (
-                remaining_downloads / download_rate
-                if remaining_downloads > 0 and download_rate > 0.0
-                else 0.0
-            )
-            mib = counters.bytes_downloaded / (1024.0 * 1024.0)
-            mib_s = mib / elapsed
-            bar_width = 24
-            sample_filled = int(math.floor(bar_width * counters.samples_done / max(total_samples, 1)))
-            sample_bar = "#" * sample_filled + "-" * (bar_width - sample_filled)
-            if counters.queued_for_download > 0:
-                download_filled = int(
-                    math.floor(bar_width * counters.download_done / max(counters.queued_for_download, 1))
-                )
-            else:
-                download_filled = 0
-            download_bar = "#" * download_filled + "-" * (bar_width - download_filled)
-            sample_prefix = ""
-            if counters.samples_done < total_samples:
-                sample_prefix = (
-                    f"prefetch samples[{sample_bar}] {counters.samples_done}/{total_samples} "
-                    f"eta={_format_seconds(sample_eta)} "
-                )
-            else:
-                sample_prefix = "prefetch "
-            line = (
-                sample_prefix
-                + f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
-                f"eta={_format_seconds(download_eta)} "
-                f"idx={counters.max_exclusive_sample_index} "
-                f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
-                f"queued={counters.queued_download_futures} transfers={worker_count} "
-                f"samplers={producer_count} "
-                f"skipped={counters.samples_skipped} "
-                f"missing={counters.known_missing + counters.newly_missing} "
-                f"downloaded={counters.downloaded} errors={counters.download_errors} "
-                f"{mib:.1f} MiB {mib_s:.1f} MiB/s"
-            )
-            if counters.first_error:
-                error = counters.first_error
-                if len(error) > 160:
-                    error = error[:157] + "..."
-                line += f" first_error={error!r}"
-            print(line, end="\n" if final else "\r", flush=True)
-
-        def build_requests(sample_index: int) -> tuple[int, int, list[ZarrChunkRequest]]:
+        def read_sample(sample_index: int) -> dict[str, int]:
             bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
             source = self.build_strip_source(
                 bounded_sample_index,
@@ -5566,12 +5172,11 @@ class FiberStrip2DLoader:
                 sample_mode=sample_mode,
                 use_augmentation_envelope=True,
             )
-            requests: list[ZarrChunkRequest] = []
-            valid_pixels = 0
-            for offset_index, _ in enumerate(self.strip_z_offsets):
-                coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
-                valid_pixels += int(np.count_nonzero(valid_mask))
-                requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
+            grids = [
+                self._prefetch_envelope_coords_from_source(source, offset_index)
+                for offset_index in range(len(self.strip_z_offsets))
+            ]
+            sources = [(source.record, coords_zyx, valid_mask) for coords_zyx, valid_mask in grids]
             if include_top_view:
                 top_source = self.build_top_strip_source(
                     bounded_sample_index,
@@ -5579,251 +5184,37 @@ class FiberStrip2DLoader:
                     sample_mode=sample_mode,
                     use_augmentation_envelope=True,
                 )
-                top_coords_zyx = _as_numpy_float32(top_source.grid.coords_zyx)
-                top_valid_mask = _as_numpy_bool(top_source.grid.valid_mask)
-                valid_pixels += int(np.count_nonzero(top_valid_mask))
-                requests.extend(top_source.record.sampler.chunk_requests_for_coords(top_coords_zyx, top_valid_mask))
-            return bounded_sample_index, valid_pixels, requests
-
-        def classify_or_submit(
-            request: ZarrChunkRequest,
-            raw_sample_index: int,
-            download_queue: list[tuple[int, int, tuple[str, str]]],
-            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]],
-        ) -> None:
-            nonlocal download_sequence
-            identity = (request.store_identity, request.key)
-            if identity in completed_chunks:
-                return
-            sample_pending.setdefault(raw_sample_index, set()).add(identity)
-            chunk_waiters.setdefault(identity, set()).add(raw_sample_index)
-            if identity in seen:
-                queued = queued_downloads.get(identity)
-                if queued is not None and int(raw_sample_index) < queued[0]:
-                    download_sequence += 1
-                    queued_downloads[identity] = (int(raw_sample_index), download_sequence, queued[2])
-                    heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
-                return
-            seen.add(identity)
-            counters.unique_chunks_seen += 1
-            if _existing_data_path(request) is not None:
-                counters.cache_hits += 1
-                mark_chunk_complete(identity)
-                return
-            empty_path = _empty_marker_path(request)
-            if empty_path is not None and empty_path.is_file():
-                counters.known_missing += 1
-                mark_chunk_complete(identity)
-                return
-            counters.queued_for_download += 1
-            download_sequence += 1
-            queued_downloads[identity] = (int(raw_sample_index), download_sequence, request)
-            heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
-
-        def advance_safe_prefix() -> None:
-            nonlocal next_safe_raw_sample
-            while next_safe_raw_sample < end_sample and next_safe_raw_sample in complete_raw_samples:
-                # This is the exclusive deterministic training-stream prefix.
-                # The raw stream position is intentionally reported before the
-                # seeded random CP permutation maps it to a flat fiber/CP id.
-                counters.max_exclusive_sample_index = max(
-                    counters.max_exclusive_sample_index,
-                    int(next_safe_raw_sample) + 1,
-                )
-                next_safe_raw_sample += 1
-
-        def mark_sample_complete(raw_sample_index: int) -> None:
-            if raw_sample_index not in sample_requests_closed:
-                return
-            if sample_pending.get(raw_sample_index):
-                return
-            complete_raw_samples.add(raw_sample_index)
-            advance_safe_prefix()
-
-        def close_sample_requests(raw_sample_index: int) -> None:
-            sample_requests_closed.add(raw_sample_index)
-            mark_sample_complete(raw_sample_index)
-
-        def mark_chunk_complete(identity: tuple[str, str]) -> None:
-            if identity in completed_chunks:
-                return
-            completed_chunks.add(identity)
-            for raw_sample_index in chunk_waiters.pop(identity, set()):
-                pending = sample_pending.get(raw_sample_index)
-                if pending is None:
-                    continue
-                pending.discard(identity)
-                mark_sample_complete(raw_sample_index)
-
-        def consume_download_result(request: ZarrChunkRequest, result: dict[str, Any]) -> None:
-            counters.download_done += 1
-            status = str(result.get("status", "error"))
-            if status == "cache_hit":
-                counters.cache_hits += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "known_missing":
-                counters.known_missing += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "new_missing":
-                counters.newly_missing += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "downloaded":
-                counters.downloaded += 1
-                counters.bytes_downloaded += int(result.get("bytes", 0))
-                mark_chunk_complete((request.store_identity, request.key))
-            else:
-                counters.download_errors += 1
-                if not counters.first_error:
-                    counters.first_error = str(result.get("error", "prefetch download failed"))
-
-        next_sample = start_sample
-        end_sample = next_sample + total_samples
-        last_progress = 0.0
-        download_sequence = 0
-        previous_torch_threads = int(torch.get_num_threads())
-        torch_threads_changed = False
-        if previous_torch_threads != 1:
-            torch.set_num_threads(1)
-            torch_threads_changed = True
-        producer_executor = ThreadPoolExecutor(max_workers=producer_count)
-        download_executor = ThreadPoolExecutor(max_workers=worker_count)
-        normal_shutdown = False
-        try:
-            producer_futures: dict[Future[tuple[int, int, list[ZarrChunkRequest]]], int] = {}
-            download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]] = {}
-            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]] = {}
-            download_queue: list[tuple[int, int, tuple[str, str]]] = []
-            producer_results: dict[int, tuple[str, Any]] = {}
-            next_producer_result = start_sample
-
-            def update_download_queue_counters() -> None:
-                counters.queued_download_futures = len(download_futures) + len(queued_downloads)
-
-            def submit_downloads() -> None:
-                while len(download_futures) < worker_count:
-                    request: ZarrChunkRequest | None = None
-                    while download_queue:
-                        priority, sequence, identity = heapq.heappop(download_queue)
-                        queued = queued_downloads.get(identity)
-                        if queued is None:
-                            continue
-                        queued_priority, queued_sequence, queued_request = queued
-                        if priority != queued_priority or sequence != queued_sequence:
-                            continue
-                        queued_downloads.pop(identity, None)
-                        request = queued_request
-                        break
-                    if request is None:
-                        return
-                    future = download_executor.submit(
-                        _download_prefetch_request,
-                        request,
-                        retry_seconds=retry_seconds,
+                sources.append(
+                    (
+                        top_source.record,
+                        _as_numpy_float32(top_source.grid.coords_zyx),
+                        _as_numpy_bool(top_source.grid.valid_mask),
                     )
-                    download_futures[future] = (request, time.perf_counter())
+                )
+            valid_pixels = 0
+            points_by_reader: dict[int, tuple[ZarrReader, list[np.ndarray]]] = {}
+            for record, coords_zyx, valid_mask in sources:
+                points, valid = level_points(coords_zyx, valid_mask, record.volume_scale, record.reader.shape)
+                points_by_reader.setdefault(id(record.reader), (record.reader, []))[1].append(points[valid])
+                valid_pixels += int(np.count_nonzero(valid_mask))
+            for reader, points in points_by_reader.values():
+                reader.sample(np.concatenate(points), order=1)
+            return {"patches": len(self.strip_z_offsets), "valid_pixels": valid_pixels}
 
-            def submit_producers() -> None:
-                nonlocal next_sample
-                while next_sample < end_sample and len(producer_futures) < producer_count:
-                    future = producer_executor.submit(build_requests, next_sample)
-                    producer_futures[future] = next_sample
-                    next_sample += 1
-
-            def consume_ready_producer_results() -> None:
-                nonlocal next_producer_result
-                while next_producer_result in producer_results:
-                    status, payload = producer_results.pop(next_producer_result)
-                    sample_index_for_error = next_producer_result
-                    next_producer_result += 1
-                    if status == "error":
-                        exc = payload
-                        counters.samples_done += 1
-                        counters.samples_skipped += 1
-                        if not counters.first_sample_skip:
-                            counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
-                        sample_pending.setdefault(sample_index_for_error, set())
-                        close_sample_requests(sample_index_for_error)
-                        submit_producers()
-                        continue
-
-                    _bounded_sample_index, sample_valid_pixels, requests = payload
-                    counters.samples_done += 1
-                    sample_pending.setdefault(sample_index_for_error, set())
-                    counters.patches_done += len(self.strip_z_offsets)
-                    counters.valid_pixels += int(sample_valid_pixels)
-                    for request in requests:
-                        classify_or_submit(request, sample_index_for_error, download_queue, queued_downloads)
-                    close_sample_requests(sample_index_for_error)
-                    submit_downloads()
-                    submit_producers()
-
-            submit_producers()
-            submit_downloads()
-            update_download_queue_counters()
-            print_progress()
-            while producer_futures or download_futures or queued_downloads:
-                consume_ready_producer_results()
-                submit_downloads()
-                active = set(producer_futures) | set(download_futures)
-                if not active:
-                    break
-                done, _ = wait(active, timeout=0.25, return_when=FIRST_COMPLETED)
-                for future in done:
-                    if future in producer_futures:
-                        sample_index_for_error = producer_futures.pop(future)
-                        try:
-                            producer_results[sample_index_for_error] = ("ok", future.result())
-                        except ValueError as exc:
-                            producer_results[sample_index_for_error] = ("error", exc)
-                        consume_ready_producer_results()
-                    else:
-                        request, _submitted_at = download_futures.pop(future)
-                        consume_download_result(request, future.result())
-                        submit_downloads()
-                now = time.perf_counter()
-                if now - last_progress >= 0.5:
-                    update_download_queue_counters()
-                    print_progress()
-                    last_progress = now
-            update_download_queue_counters()
-            print_progress(final=True)
-            normal_shutdown = True
-        except BaseException:
-            for future in producer_futures:
-                future.cancel()
-            for future in download_futures:
-                future.cancel()
-            producer_executor.shutdown(wait=False, cancel_futures=True)
-            download_executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            if normal_shutdown:
-                producer_executor.shutdown(wait=True)
-                download_executor.shutdown(wait=True)
-            if torch_threads_changed:
-                torch.set_num_threads(previous_torch_threads)
-
-        return {
-            "generated": counters.unique_chunks_seen,
-            "cache_hits": counters.cache_hits,
-            "missing": counters.known_missing + counters.newly_missing,
-            "known_missing": counters.known_missing,
-            "newly_missing": counters.newly_missing,
-            "downloaded": counters.downloaded,
-            "queued_for_download": counters.queued_for_download,
-            "download_done": counters.download_done,
-            "bytes": counters.bytes_downloaded,
-            "errors": counters.download_errors,
-            "workers": worker_count,
-            "producer_workers": producer_count,
-            "patches": counters.patches_done,
-            "samples": counters.samples_done,
-            "skipped_samples": counters.samples_skipped,
-            "valid_pixels": counters.valid_pixels,
-            "first_error": counters.first_error,
-            "first_sample_skip": counters.first_sample_skip,
-            "max_exclusive_sample_index": counters.max_exclusive_sample_index,
-        }
+        print(
+            f"prefetch: patches={int(sample_count) * len(self.strip_z_offsets)} sample_mode={sample_mode} "
+            f"sample_index_limit={int(sample_index_limit or 0)} include_top_view={bool(include_top_view)}",
+            flush=True,
+        )
+        return prefetch_samples(
+            read_sample,
+            start_sample_index,
+            sample_count,
+            workers=self.config.prefetch_workers if workers is None else workers,
+            readers=[record.reader for record in self.records],
+            count_keys=("patches", "valid_pixels"),
+            label="prefetch",
+        )
 
 
 def _build_fiber_line_geometry_process(
@@ -5851,7 +5242,7 @@ def _build_fiber_line_geometry_process(
         volume_scale=int(job.volume_scale),
         volume_spacing_base=float(job.volume_spacing_base),
         fiber_identity=job.fiber_identity,
-        sampler=None,
+        reader=None,
         grad_mag=grad_mag,
         grad_mag_spacing_base=float(grad_mag_spacing_base),
         nx=nx,

@@ -691,23 +691,22 @@ def test_written_tifxyz_mmap_layout(tmp_path):
     assert not tifffile.TiffFile(tmp_path/'mmap'/'mask.tif').pages[0].is_tiled
 
 
-def test_fiber_seed_directions_follow_the_tensor_normal():
+def test_fiber_seed_directions_follow_the_tensor_normal(tmp_path):
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
+    import zarr
+    from vc_reader.reader import open_zarr
     mod = _script('trace_from_fibers')
     n = np.array([1., 0., .5])/np.linalg.norm([1., 0., .5])  # sheet normal (xyz), tilted from horizontal x
     z, y, x = np.meshgrid(*(np.arange(160.),)*3, indexing='ij')
-    vol = (255*np.exp(-.5*((x*n[0]+y*n[1]+z*n[2]-100.)/1.5)**2)).astype(np.uint8)
-
-    class Volume:
-        shape = vol.shape
-
-        def read(self, start, size):
-            return vol[tuple(slice(a, a+b) for a, b in zip(start, size))]
+    array = zarr.create_array(str(tmp_path/'ct'), shape=x.shape, chunks=(64, 64, 64), dtype='u1', fill_value=0,
+                              zarr_format=2, compressors=None)
+    array[:] = (255*np.exp(-.5*((x*n[0]+y*n[1]+z*n[2]-100.)/1.5)**2)).astype(np.uint8)
+    volume = open_zarr(tmp_path/'ct')
     pts = np.stack([np.full(5, 80.), 60.+10*np.arange(5), np.full(5, (100.-80.*n[0])/n[2])], 1)  # on it, along y
-    normal = mod.sheet_normal(Volume(), pts[2])
+    normal = mod.sheet_normal(volume, pts[2])
     assert normal is not None and abs(normal@n) > .99
-    d = mod.advance_directions(pts, 1., Volume())
+    d = mod.advance_directions(pts, 1., volume)
     assert d is not None and np.all(d[:, 2] > 0) and np.allclose(d@n, 0, atol=.05) and np.allclose(d[:, 1], 0, atol=.05)
 
 

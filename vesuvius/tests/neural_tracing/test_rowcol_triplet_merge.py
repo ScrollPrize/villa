@@ -154,3 +154,44 @@ def test_prefetch_batch_items_propagates_errors(monkeypatch):
     assert next(gen) == [0]
     with pytest.raises(RuntimeError, match="chunk read failed"):
         next(gen)
+
+
+def _write_level_group(root, shapes):
+    import zarr
+
+    group = zarr.open_group(str(root), mode="w", zarr_format=2)
+    rng = np.random.default_rng(0)
+    data = {}
+    for level, shape in enumerate(shapes):
+        values = rng.integers(1, 255, size=shape, dtype=np.uint8)
+        group.create_array(str(level), shape=shape, chunks=(4, 4, 4), dtype="u1", fill_value=0)[:] = values
+        data[level] = values
+    return data
+
+
+def test_open_volume_level_falls_back_to_nearest_level(tmp_path):
+    import vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps as M
+
+    _write_level_group(tmp_path / "v.zarr", [(16, 16, 16), (8, 8, 8)])
+    reader, level = M._open_volume_level(tmp_path / "v.zarr", volume_scale=1, chunk_cache_gb=0.01)
+    assert (level, reader.shape) == (1, (8, 8, 8))
+    reader, level = M._open_volume_level(tmp_path / "v.zarr", volume_scale=3, chunk_cache_gb=0.01)
+    assert (level, reader.shape) == (1, (8, 8, 8))
+
+
+def test_prepare_bbox_item_reads_crop_with_zero_fill_outside_volume(tmp_path):
+    import vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps as M
+    from vesuvius.image_proc.intensity.normalization import normalize_zscore
+
+    data = _write_level_group(tmp_path / "v.zarr", [(10, 12, 14)])[0]
+    reader, _ = M._open_volume_level(tmp_path / "v.zarr", volume_scale=0, chunk_cache_gb=0.01)
+    crop_size = (6, 6, 6)
+    record = {"bbox_id": 3, "bbox": (-2, 4, 8, 14, 5, 11)}
+    world = np.asarray([[0.5, 9.0, 7.0]], dtype=np.float32)
+    uv = np.asarray([[0, 0]], dtype=np.int64)
+    item = M._prepare_bbox_item(record, crop_size, world, uv, reader)
+
+    expected = np.zeros(crop_size, dtype=np.uint8)
+    expected[2:, :4, :] = data[0:4, 8:12, 5:11]
+    assert item["volume"].dtype == np.float32
+    np.testing.assert_array_equal(item["volume"], normalize_zscore(expected).astype(np.float32))

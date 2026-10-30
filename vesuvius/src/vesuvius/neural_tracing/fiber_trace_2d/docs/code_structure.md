@@ -382,9 +382,8 @@ Ownership changed as follows:
   block whose trusted core contains that point.
 - Inference block inputs use the same sampler-backed loading convention as 3D
   training: regular selected-level block grids are multiplied by the dataset
-  `volume_spacing_base`, validated against the base-volume shape, and sampled
-  with the configured blocking `CoordinateSampler`. The native tool does not
-  directly slice zarr/raw blocks for real configured volumes.
+  `volume_spacing_base`, validated against the base-volume shape, and read
+  with the record's vc_reader `ZarrReader.read_region`.
 - Model input normalization is the configured 3D `image_normalization` value.
   With the current fast 3D config this is `zscore`: mean/std over valid voxels
   before model inference. Exported native Trace2CP volume panels show that same
@@ -546,11 +545,10 @@ Ownership changed as follows:
   one decimal. Reference lengths and `physical_unit=m` are omitted from human
   progress output. Live progress uses carriage-return updates on one terminal
   line and prints a newline only at completion. Physical per-meter output is
-  optional and comes only from the VC3D sampler's
-  `record.sampler.volume.metadata["voxelsize"]` value, interpreted as
-  micrometers and converted to meters. If VC3D does not expose a finite
-  positive `voxelsize`, stdout/progress omit physical units and JSON stores
-  null for the per-meter fields. The fiber code does not parse Zarr/OME JSON,
+  optional and came only from the VC3D volume's `metadata["voxelsize"]`.
+  Records now hold a vc_reader `ZarrReader`, which exposes no voxel size, so
+  stdout/progress omit physical units and JSON stores null for the per-meter
+  fields. The fiber code does not parse Zarr/OME JSON,
   dataset config, record metadata, alternate keys, or filenames for physical
   units. The JSON summary includes per-segment status, errors, step counts,
   restart points, the last successful reference arc distance, reference
@@ -794,8 +792,8 @@ Ownership changed as follows:
   `test/loss_total` remains the sole metric used for fiber3d snapshot selection.
 - Native 3D Trace2CP uses a field-provider boundary. The current provider is
   `NativeTraceFieldCache`, a sparse live checkpoint-backed block cache. It
-  samples regular requested-level volume blocks through
-  `CoordinateSampler.sample_block_zyx(...)`, batches missing blocks for model
+  reads regular requested-level volume blocks with the record reader's
+  `read_region(...)`, batches missing blocks for model
   forwarding where memory permits, calls `FiberTrace3DPredictAdapter` for
   per-tile normalization, recurrent/conditioned inference, mixed precision, and
   raw option splitting, stores decoded trusted-core model outputs on the
@@ -1053,19 +1051,11 @@ Ownership changed as follows:
     --remote-cache-dir /data/vc3d_remote_cache
   ```
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
-  and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
-  materializing representative coordinates or reconstructing chunk paths in
-  Python.
-- 3D prefetch follows the 2D streaming prefetch architecture: bounded
-  dependency producer workers controlled by `prefetch_sampler_workers`,
-  bounded transfer workers controlled by `prefetch_workers`, immediate
-  cache-hit / `.empty` / download classification, earliest-sample download
-  priority, deterministic safe-prefix `idx`, and live progress while
-  dependencies are still being generated. The 3D-only simplification is that
-  each sample contributes one CP-centered 3D augmentation-envelope volume
-  derived from configured augmentation extrema rather than one sampled
-  augmentation draw; no strip-z loop, coordinate-envelope tensor, or top-view
-  branch exists in 3D.
+  (derived from configured augmentation extrema rather than one sampled
+  augmentation draw) and reads it with the record reader's `read_region`,
+  discarding the values; vc_reader fetches and disk-caches exactly the chunks
+  the bbox touches. Samples run on `prefetch_workers` threads with the shared
+  `sampling.prefetch_samples` driver (see Prefetch below).
 - 3D prefetch follows the 2D step-count sentinels: omitted `--prefetch-steps`
   uses `training.max_steps`; positive values override config; explicit
   `--prefetch-steps 0` means every selected training CP once; negative values
@@ -1144,44 +1134,21 @@ The important behavior is:
 - The dense grid also exposes the per-pixel strip offset axis so nearby
   strip-z patches can be derived from one CP-local source grid.
 
-`loader_support.py`
-
-- Contains small Zarr-array helpers used by the fallback/manual sampling path.
-- Computes chunk requests for explicit trilinear coordinate samples.
-- Provides `sample_array_trilinear` for fake/local-array tests.
-- Uses the shared `vesuvius.neural_tracing.zarr_support` compatibility boundary
-  for store-relative chunk keys. That boundary uses Zarr 2's array/store APIs
-  or Zarr 3's metadata encoder and synchronous store API while preserving the
-  same v2 slash-separated cache keys and raw bytes.
-
 `sampling.py`
 
-- Defines the `CoordinateSampler` interface used by the loader.
-- `CoordinateSampler.sample_coord_batch` loads a stack of coordinate patches
-  and returns `[patches,H,W]` image and valid-mask arrays. The default
-  implementation flattens `[patches,H,W,3]` into one larger coordinate image,
-  calls ordinary `sample_coords` once, and reshapes back.
-- `CoordinateSampler.sample_block_zyx` loads a regular axis-aligned
-  selected-level `[D,H,W]` block and returns the same image/valid/stats
-  contract. Native 3D Trace2CP uses this for inference blocks so it does not
-  build dense coordinate grids for ordinary cubes.
-- `Vc3dCoordinateSampler` is the production sampler:
-  - opens local paths with `vc.volume.Volume.open`;
-  - converts `s3://bucket/key` to the matching public HTTPS URL;
-  - opens remote paths with `Volume.open_url`;
-  - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
-    are fetched/decoded and pinned before sampling starts;
-  - calls `Volume.sample_zyx_block(..., blocking=True)` for regular
-    axis-aligned block reads used by native 3D Trace2CP;
-  - rejects blocking results that do not report strict requested-level sampling
-    (`requested_level_only=true`, `fallback_levels=0`);
-  - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
-    discovery, without sampling image values;
-  - exposes VC3D persistent-cache data and `.empty` marker paths for Python
-    prefetch classification.
-- `NumpyZarrCoordinateSampler` remains useful for tests and local fake arrays.
-- `make_coordinate_sampler` currently returns the VC3D sampler for normal
-  runtime.
+- Records hold a vc_reader `ZarrReader` of the base volume's selected level
+  (`ZarrReader.open(volume_path, level=..., cache_dir=volume_cache_dirs(...),
+  memory_cache=volume_cache_memory_bytes, threads=volume_io_threads)`), and
+  the loader calls `reader.sample(points, order=1)` directly.
+- `level_points` maps level-0 ZYX coordinates to level positions
+  (`base / 2**level`, no half-voxel offset, the convention of these scale-only
+  pyramids) and returns the valid mask: given mask, finite, and inside
+  `[0, shape)` of the level. Only valid points are sampled; the rest of the
+  image is zero.
+- `volume_cache_dirs` gives the reader's `cache_dir`: for remote volumes VC3D's
+  cache root (`"vc3d"`) then `volume_cache_dir`; local volumes are read in
+  place.
+- `prefetch_samples` is the prefetch driver shared by the 2D and 3D loaders.
 
 `augmentation.py`
 
@@ -1231,9 +1198,8 @@ The important behavior is:
 - Training `build_sample` batches compatible strip-z offset coordinate
   augmentation by stacking `backward_map_xy` tensors and running dense
   coordinate/valid-mask sampling over the stack. It then sends the whole
-  strip-z stack through `CoordinateSampler.sample_coord_batch`, so normal VC3D
-  loading is one flattened coordinate-sampling call per CP sample instead of
-  one call per strip-z offset.
+  strip-z stack through one `reader.sample` call per CP sample instead of one
+  call per strip-z offset.
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur. Training
   `build_sample` applies value augmentation to the loaded image stack, while
@@ -1294,8 +1260,8 @@ The important behavior is:
   the CP sample's deterministic geometric/value augmentation parameters. Its
   source geometry uses the same compact geometry store as side-view source
   construction. Runtime preparation mirrors the side-view path: batched
-  augmentation maps, batched coordinate resampling, and grouped
-  `CoordinateSampler.sample_coord_batch` calls. The transformed line and CP
+  augmentation maps, batched coordinate resampling, and one `reader.sample`
+  call per reader. The transformed line and CP
   pixel coordinates are reused from the center side-strip sample because those
   pixel-frame coordinates are identical for the same augmentation.
 - Does not use a persistent dense strip-coordinate cache. The old
@@ -1830,13 +1796,9 @@ Top-level keys used by `load_config`:
 - `strip_z_offset_count`: number of parallel strip-z offsets per sample.
 - `strip_z_offset_step`: offset step in selected-scale voxels.
 - `seed`: deterministic control-point sample seed.
-- `prefetch_workers`: transfer-worker count for prefetch; values above 16 are
-  allowed and are not clamped by the loader.
-- `prefetch_sampler_workers`: dependency/sampler producer-worker count for
-  prefetch. This limits CPU-side CP-local source generation separately from
-  download concurrency. During prefetch, PyTorch CPU intra-op threads are
-  temporarily forced to `1` and restored afterwards, so producer workers do not
-  each expand over the full machine.
+- `prefetch_workers`: sample-worker thread count for prefetch. During
+  prefetch, PyTorch CPU intra-op threads are temporarily forced to `1` and
+  restored afterwards, so workers do not each expand over the full machine.
 - `loader_workers`: worker count for startup compact-geometry record
   construction and CP-sample construction in `load_batch`. The default is the
   logical CPU count. Set `loader_workers: 0` to explicitly use all logical CPU
@@ -2294,63 +2256,35 @@ TensorBoard event file.
 
 ## Prefetch
 
-`chunk_requests_for_sample_index` is a compatibility/test helper that derives
-dependency requests from the same conservative source-envelope coordinates used
-by prefetch.
-
 `prefetch(start_sample_index, sample_count)`:
 
-- builds the shared CP-local source once per deterministic sample index;
-- derives each configured strip-z offset from that source;
-- temporarily caps PyTorch CPU intra-op fanout during dependency generation so
-  `prefetch_sampler_workers` is the effective generation concurrency limit;
-- sends the source-envelope coordinates to `chunk_requests_for_coords`, which
-  maps them to dependency-only base-volume chunk metadata;
-- deduplicates globally by `(store_identity, key)`;
-- may run dependency producers in parallel, but consumes their completed
-  results in raw deterministic sample-index order before classifying chunks;
-- treats existing VC3D persistent-cache data files as hits;
-- treats existing `<cache>/level_<level>/<iz>/<iy>/<ix>.empty` files as
-  known-missing hits;
-- fetches only still-missing direct-source chunks with bounded Python workers,
-  writes data through unique temp files followed by atomic rename, and writes
-  zero-byte `.empty` markers for definitive missing chunks;
-- keeps not-yet-submitted downloads in a priority queue keyed by the earliest
-  raw deterministic sample index that needs each chunk. This prevents later
-  dependency producers from flooding the download executor ahead of chunks that
-  would advance the reported `idx` prefix. Already-active transfers are allowed
-  to finish instead of being cancelled for reprioritization;
-- prints sample/dependency progress only while dependency generation is still
-  running, then switches to download-only progress. The live line includes
-  unique chunks, cache hits, known-missing chunks, downloaded chunks, queued
-  download futures, configured transfer workers, configured sampler/dependency
-  producer workers, skipped samples, errors, and MiB/s. The download
-  denominator counts chunks that were not cache hits or pre-existing `.empty`
-  markers. While sample dependency generation is
-  incomplete, download ETA extrapolates from observed chunks per sample and
-  observed cache-hit/known-missing/download-needed ratios;
-- reports invalid deterministic sample skips separately from download errors
-  and includes the first skip reason.
-
-For VC3D-backed remote volumes, dependency discovery returns the authoritative
-remote chunk URL/key, final persistent-cache data path, `.empty` marker path,
-persistent extension, and cache payload format. Python prefetch does not
-reconstruct those paths. The current Python writer supports only uncompressed
-direct-source chunks where the remote payload is exactly the `.bin` payload VC3D
-expects; compressed, filtered, sharded, or byte-swapped payloads fail clearly
-until explicit codec support is added.
+- builds the shared CP-local source once per deterministic sample index, with
+  the augmentation envelope;
+- derives each configured strip-z offset's envelope coordinates (and the top
+  view if requested) and samples their valid points through the record reader,
+  blocking, discarding the values. vc_reader fetches and disk-caches exactly
+  the chunks those points touch, and the readers' queued cache writes are
+  flushed at the end;
+- runs samples on `prefetch_workers` threads (`sampling.prefetch_samples`);
+- reports `max_exclusive_sample_index`, the end of the contiguous run of
+  finished samples from the start index. A sample skipped with `ValueError`
+  counts as finished; any other exception counts as an error and stops the
+  prefix there;
+- returns `samples`, `skipped_samples`, `patches`, `valid_pixels`, `errors`,
+  `first_error`, `first_sample_skip`, `workers`,
+  `max_exclusive_sample_index`, and `remote_fetches`/`remote_bytes` summed
+  from the readers' `stats()` changes (3D reports `valid_voxels` instead of
+  `patches`/`valid_pixels`).
 
 Prefetch covers the configured augmentation envelope, not a single random
 augmentation draw. It may fetch a conservative superset for one patch, but later
 training draws within the configured extrema should be covered by the same
 cached base-volume chunks. For 3D, this is implemented as a CP-centered
-selected-level bbox: the prefetcher passes the bbox to VC3D
-`collect_bbox_dependencies`, and VC3D returns the same authoritative metadata
-used by coordinate-surface dependency discovery.
+selected-level bbox read with `read_region`.
 
 Prefetch is only for addressed base-volume image chunks. Lasagna channels are
 local manifest channels in the current Staticsheep config and are not part of
-the VC3D base-volume prefetch path.
+the base-volume prefetch path.
 
 ## Augmentation Contact Sheet
 
@@ -2468,12 +2402,11 @@ They cover:
 
 - config parsing and offset generation;
 - deterministic sample selection;
-- fake/local-array coordinate sampling;
+- coordinate sampling through vc_reader on a small local Zarr;
 - side-strip coordinate generation;
 - torch vectorized strip-grid equivalence to the NumPy path;
 - vectorized line-coordinate augmentation behavior;
-- dependency-only prefetch, cache-hit / `.empty` marker handling, and
-  augmentation-envelope dependency coverage;
+- prefetch through the readers (summary, sample prefix, skipped samples);
 - runner export behavior where practical.
 
 Run them with:

@@ -3,11 +3,11 @@ with their images, and each fiber-store source's monitor rollouts."""
 from pathlib import Path
 
 import torch
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.plots import plot_batch, plot_refinement, plot_rollouts, plot_run_curves
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import evaluate, rollout_summary
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.policy import DIAGNOSTIC_THRESHOLDS
 from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
 
@@ -49,7 +49,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                                coverage_max_len=tracer.p.max_len,
                                on_trace=lambda seed, path, reason: traces.append((path, reason)))
             paths, reasons = zip(*traces)
-            plot_rollouts(tracer.vol, fibers, seeds, paths, reasons,
+            plot_rollouts(tracer.ct, tracer.spec, fibers, seeds, paths, reasons,
                           images/f'rollout_{step:06d}_c{threshold}.png', tracer.p.max_len, rows=rows)
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             **({'dataset':dataset_name} if dataset_name else {}),
@@ -65,7 +65,9 @@ def monitor_store_sources(model, sources, datasets, cfg, policy, step, log, *, m
     for source, source_dataset in zip(sources, datasets):
         if source['kind'] != 'fibers':
             continue
-        source_tracer = FiberTracer(model,CTVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
+        spec = source_dataset.vol_spec
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30)
+        source_tracer = FiberTracer(model,ct,spec,cfg.fine,cfg.n_history,
             TraceParams.from_policy(policy,max_len=max_len),device=device)
         try:
             rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,

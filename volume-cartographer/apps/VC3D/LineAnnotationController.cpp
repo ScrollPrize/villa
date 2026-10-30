@@ -10160,11 +10160,6 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless,
                            dialog, &LineAnnotationDialog::appendFiberTraceDetail);
     }
     const auto disconnectProgress = qScopeGuard([&]() { disconnect(progress); });
-    const auto volume = _state ? _state->currentVolume() : nullptr;
-    const QString volumeSource = volume && volume->isRemote()
-        ? QString::fromStdString(volume->remoteUrl()) : QString();
-    const QString volumeLocator = volume && volume->isRemote()
-        ? QString::fromStdString(volume->remoteLocator()) : QString();
     // The service start processes events: the dialog is only reached again
     // through a QPointer.
     const QPointer<LineAnnotationDialog> dialogGuard(dialog);
@@ -10172,7 +10167,7 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless,
     const bool running = FiberFollowService::instance().ensureRunning(
         settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
         settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
-        &error, volumeSource, volumeLocator);
+        &error);
     // The service start processes events while the model boots: an
     // operation that must not continue past a package switch or a teardown
     // says so here, before the dialog or the error path is touched.

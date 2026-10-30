@@ -241,24 +241,24 @@ def test_seed_heading_is_reused_per_seed(monkeypatch):
     from vesuvius.neural_tracing.tracers.fibers.sheet_strip import infer
     calls = []
 
-    def heading(vol, pos, family, direction):
+    def heading(ct, spec, pos, family, direction):
         calls.append(family)
         return np.array([0., 0., 1.]) if np.dot([0., 0., 1.], direction) >= 0 else np.array([0., 0., -1.])
 
     monkeypatch.setattr(infer, 'oriented_seed_heading', heading)
     monkeypatch.setattr(targets, 'oriented_seed_heading', heading)
     item = lambda: dict(seed_heading_family='H', seed_pos=np.zeros(3), seed_tangent=np.array([.1, 0., .9]))
-    expected = targets.resolve_trace_seed(item(), None)
+    expected = targets.resolve_trace_seed(item(), None, None)
     cache, items = {}, [item() for _ in range(3)]
     for it in items:
-        infer.reuse_seed_heading(it, None, cache)
+        infer.reuse_seed_heading(it, None, None, cache)
     assert calls == ['H', 'H']  # once for resolve_trace_seed, once for the three reused items
     for it in items:
         assert it.keys() == expected.keys() and it['fiber_family'] == 'H'
         assert np.array_equal(it['seed_tangent'], expected['seed_tangent'])
-        assert targets.resolve_trace_seed(it, None) is it and len(calls) == 2  # nothing left to resolve
+        assert targets.resolve_trace_seed(it, None, None) is it and len(calls) == 2  # nothing left to resolve
     pending = dict(item(), _pending_seed_heading=('fiber', 0., False, None))
-    infer.reuse_seed_heading(pending, None, cache)
+    infer.reuse_seed_heading(pending, None, None, cache)
     assert pending['seed_heading_family'] == 'H'  # a seed decision's crop heading stays with resolve_trace_seed
 
 

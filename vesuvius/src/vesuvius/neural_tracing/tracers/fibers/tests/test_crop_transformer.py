@@ -148,7 +148,7 @@ def test_tracing_runs_the_regression_model(tmp_path):
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
     import numpy as np
     model = small().eval()
-    tracer = FiberTracer(model, ct_volume(tmp_path), model.cfg.fine, model.cfg.n_history,
+    tracer = FiberTracer(model, *ct_volume(tmp_path), model.cfg.fine, model.cfg.n_history,
                          TraceParams(n_commit=2, max_len=4., confidence=0.), device='cpu')
     try:
         paths, reasons = tracer.trace(np.array([[24., 24., 24.]]), np.array([[.3, .4, .8660254]]))

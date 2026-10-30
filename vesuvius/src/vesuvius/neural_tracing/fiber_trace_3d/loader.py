@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import glob
 import copy
-import heapq
 import hashlib
 import itertools
 import json
 import math
 import os
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace, field
 from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
                         InvalidNormalSampleError)
@@ -37,17 +35,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
     Vc3dFiber,
     load_fiber_file,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.loader import (
-    _download_prefetch_request,
-    _empty_marker_path,
-    _existing_data_path,
-)
-from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
-    CoordinateSampler,
-    NumpyZarrCoordinateSampler,
-    make_coordinate_sampler,
+    level_points,
+    prefetch_samples,
+    volume_cache_dirs,
 )
+from vc_reader.reader import ZarrReader
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     control_point_line_index,
 )
@@ -110,14 +103,9 @@ class FiberTrace3DConfig:
     geometry_backend: str = "auto"
     value_augmentation_backend: str = "auto"
     prefetch_workers: int = 16
-    prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
     volume_cache_memory_mib: float | None = DEFAULT_VOLUME_CACHE_MEMORY_MIB
     volume_io_threads: int | None = None
-    volume_decode_threads: int | None = None
-    volume_sample_threads: int | None = None
-    volume_chunk_locality_fast_path: bool = True
-    volume_collect_locality_stats: bool = False
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
     config_dir: Path | None = None
@@ -134,7 +122,7 @@ class FiberTrace3DConfig:
 class _Record:
     fiber: Vc3dFiber
     volume: Any
-    sampler: CoordinateSampler
+    reader: ZarrReader
     volume_path: str
     volume_scale: int
     volume_spacing_base: float
@@ -189,26 +177,6 @@ class _GeometryMaps3D:
     params: _Augment3DParams
     backward_source_base_zyx: np.ndarray | None = None
     valid_base: np.ndarray | None = None
-
-
-@dataclass
-class _PrefetchCounters3D:
-    samples_done: int = 0
-    samples_skipped: int = 0
-    unique_chunks_seen: int = 0
-    queued_for_download: int = 0
-    download_done: int = 0
-    cache_hits: int = 0
-    known_missing: int = 0
-    downloaded: int = 0
-    newly_missing: int = 0
-    download_errors: int = 0
-    bytes_downloaded: int = 0
-    valid_voxels: int = 0
-    first_error: str = ""
-    first_sample_skip: str = ""
-    queued_download_futures: int = 0
-    max_exclusive_sample_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -945,30 +913,10 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
             raw.get("value_augmentation_backend", "auto")
         ).lower(),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
-        prefetch_sampler_workers=_parse_worker_count(
-            raw.get("prefetch_sampler_workers", 2),
-            key="prefetch_sampler_workers",
-        ),
         volume_cache_dir=None if raw.get("volume_cache_dir") is None else str(raw.get("volume_cache_dir")),
         volume_cache_memory_mib=cache_memory_mib,
         volume_io_threads=(
             None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
-        ),
-        volume_decode_threads=(
-            None
-            if raw.get("volume_decode_threads") is None
-            else int(raw.get("volume_decode_threads"))
-        ),
-        volume_sample_threads=(
-            None
-            if raw.get("volume_sample_threads") is None
-            else int(raw.get("volume_sample_threads"))
-        ),
-        volume_chunk_locality_fast_path=bool(
-            raw.get("volume_chunk_locality_fast_path", True)
-        ),
-        volume_collect_locality_stats=bool(
-            raw.get("volume_collect_locality_stats", False)
         ),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
@@ -981,10 +929,6 @@ def _common_zarr_config(config: FiberTrace3DConfig) -> dict[str, Any]:
         "volume_cache_dir": config.volume_cache_dir,
         "volume_cache_memory_mib": config.volume_cache_memory_mib,
         "volume_io_threads": config.volume_io_threads,
-        "volume_decode_threads": config.volume_decode_threads,
-        "volume_sample_threads": config.volume_sample_threads,
-        "volume_chunk_locality_fast_path": config.volume_chunk_locality_fast_path,
-        "volume_collect_locality_stats": config.volume_collect_locality_stats,
         "volume_cache_offline": config.volume_cache_offline,
         "volume_cache_retry_seconds": config.volume_cache_retry_seconds,
         "_config_dir": str(config.config_dir) if config.config_dir is not None else None,
@@ -2118,17 +2062,6 @@ def augment_fiber_trace_3d_raw_sample(
     return replace(sample, volume=volume, profile_timings_ms=timings)
 
 
-def _format_seconds(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    if seconds < 60.0:
-        return f"{seconds:.1f}s"
-    minutes, sec = divmod(int(seconds + 0.5), 60)
-    if minutes < 60:
-        return f"{minutes}m{sec:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m"
-
-
 def _bounded_data_sample_index(sample_index: int, sample_index_limit: int | None) -> int:
     limit = 0 if sample_index_limit is None else int(sample_index_limit)
     if limit <= 0:
@@ -2151,9 +2084,7 @@ class FiberTrace3DDatasetMetadata:
         # Physical microbatch and sampler thread limits are allocation-local;
         # every sampling/target setting must remain the CPU owner's setting.
         adapted = replace(self.config, batch_size=config.batch_size,
-            volume_io_threads=config.volume_io_threads,
-            volume_decode_threads=config.volume_decode_threads,
-            volume_sample_threads=config.volume_sample_threads)
+            volume_io_threads=config.volume_io_threads)
         if adapted != config:
             raise ValueError("persistent dataset metadata differs from worker configuration")
         return replace(self, config=copy.deepcopy(adapted))
@@ -2346,8 +2277,8 @@ class FiberTrace3DLoader:
         if raw_array_records is not None:
             for index, raw in enumerate(raw_array_records):
                 record = dict(raw)
-                volume = np.asarray(record["volume"])
-                if volume.ndim != 3:
+                reader = ZarrReader.open(record["volume_path"])
+                if reader.ndim != 3:
                     raise ValueError("_array_records volume must be 3D")
                 fiber = record["fiber"]
                 if not isinstance(fiber, Vc3dFiber):
@@ -2358,13 +2289,13 @@ class FiberTrace3DLoader:
                 records.append(
                     _Record(
                         fiber=fiber,
-                        volume=volume,
-                        sampler=NumpyZarrCoordinateSampler(volume, level_spacing_base=1.0),
-                        volume_path=str(record.get("volume_path", f"array:{index}")),
+                        volume=reader,
+                        reader=reader,
+                        volume_path=str(record["volume_path"]),
                         volume_scale=0,
                         volume_spacing_base=1.0,
-                        base_shape_zyx=tuple(int(v) for v in volume.shape),
-                        fiber_identity=_stable_digest("array", index, id(volume)),
+                        base_shape_zyx=tuple(int(v) for v in reader.shape),
+                        fiber_identity=_stable_digest("array", index, str(record["volume_path"])),
                         dataset_config={**(self.config.datasets[0] if len(self.config.datasets) == 1 else {}), **record},
                     )
                 )
@@ -2381,18 +2312,12 @@ class FiberTrace3DLoader:
             volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
             volume_spacing_base = float(1 << volume_scale)
             volume = _open_dataset_volume(dataset_config, self.config)
-            sampler = make_coordinate_sampler(
-                volume_path=volume_path,
-                array=volume,
+            reader = ZarrReader.open(
+                volume_path,
                 level=volume_scale,
-                level_spacing_base=volume_spacing_base,
-                cache_root=self.config.volume_cache_dir,
-                cache_budget_bytes=self.config.volume_cache_memory_bytes,
-                io_threads=self.config.volume_io_threads,
-                decode_threads=self.config.volume_decode_threads,
-                sample_threads=self.config.volume_sample_threads,
-                chunk_locality_fast_path=self.config.volume_chunk_locality_fast_path,
-                collect_locality_stats=self.config.volume_collect_locality_stats,
+                cache_dir=volume_cache_dirs(volume_path, self.config.volume_cache_dir),
+                memory_cache=self.config.volume_cache_memory_bytes,
+                threads=self.config.volume_io_threads,
             )
             base_shape_zyx = _validate_dataset_manifest(
                 dataset_config,
@@ -2444,7 +2369,7 @@ class FiberTrace3DLoader:
                         _Record(
                             fiber=fiber,
                             volume=volume,
-                            sampler=sampler,
+                            reader=reader,
                             volume_path=volume_path,
                             volume_scale=volume_scale,
                             volume_spacing_base=volume_spacing_base,
@@ -3100,19 +3025,17 @@ class FiberTrace3DLoader:
         if profile_timings_ms is not None:
             profile_timings_ms["coord_valid_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        result = record.sampler.sample_coord_batch(coords_base, np.ascontiguousarray(valid))
+        points, valid = level_points(coords_base, valid, record.volume_scale, record.reader.shape)
+        # Uncovered voxels stay zero. The trilinear value is rounded to the CT's
+        # uint8 so the patch stays compact through shared storage and H2D;
+        # complete CUDA augmentation performs the only float32 conversion.
+        sampled_np = np.zeros(valid.shape, dtype=np.uint8)
+        sampled_np[valid] = np.rint(record.reader.sample(points[valid], order=1))
         if profile_timings_ms is not None:
             profile_timings_ms["volume_sample_ms"] = (time.perf_counter() - start) * 1000.0
             profile_timings_ms["coordinate_points"] = float(coords_base.size // 3)
             profile_timings_ms["valid_coordinate_points"] = float(np.count_nonzero(valid))
-            for key, value in result.stats.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    profile_timings_ms[f"vc_{key}"] = float(value)
         start = time.perf_counter()
-        # The native sampler initializes uncovered output to zero. Keep its
-        # compact uint8 result through shared storage and H2D; complete CUDA
-        # augmentation performs the only float32 conversion.
-        sampled_np = np.asarray(result.image, dtype=np.uint8)
         sampled = torch.as_tensor(sampled_np, dtype=torch.uint8, device=device)
         if profile_timings_ms is not None:
             profile_timings_ms["volume_tensor_ms"] = (time.perf_counter() - start) * 1000.0
@@ -3903,42 +3826,6 @@ class FiberTrace3DLoader:
             wall_start_ns=wall_start_ns,
         )
 
-    def _chunk_requests_and_valid_voxels_for_sample_index(
-        self,
-        sample_index: int,
-        *,
-        sample_index_limit: int | None = None,
-        sample_mode: str = "random",
-    ) -> tuple[int, list[ZarrChunkRequest]]:
-        stream_index = int(sample_index)
-        data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
-        record, _record_index, cp_index = self.descriptor_for_sample_index(
-            data_index,
-            sample_mode=sample_mode,
-        )
-        valid_voxels, start_selected, end_selected = self._prefetch_envelope_bbox_selected(
-            record,
-            cp_index,
-        )
-        return int(valid_voxels), record.sampler.chunk_requests_for_bbox(
-            start_selected,
-            end_selected,
-        )
-
-    def chunk_requests_for_sample_index(
-        self,
-        sample_index: int,
-        *,
-        sample_index_limit: int | None = None,
-        sample_mode: str = "random",
-    ) -> list[ZarrChunkRequest]:
-        _valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
-            sample_index,
-            sample_index_limit=sample_index_limit,
-            sample_mode=sample_mode,
-        )
-        return requests
-
     def prefetch(
         self,
         start_sample_index: int,
@@ -3948,346 +3835,33 @@ class FiberTrace3DLoader:
         sample_index_limit: int | None = None,
         sample_mode: str = "random",
     ) -> dict[str, Any]:
-        total_samples = int(sample_count)
-        if total_samples < 0:
-            raise ValueError("sample_count must be >= 0")
-        worker_count = max(1, int(self.config.prefetch_workers if workers is None else workers))
-        producer_count = min(
-            max(1, int(self.config.prefetch_sampler_workers)),
-            max(1, total_samples),
-        )
-        retry_seconds = float(self.config.volume_cache_retry_seconds)
-        if retry_seconds <= 0.0:
-            retry_seconds = 600.0
-        counters = _PrefetchCounters3D()
-        start_sample = int(start_sample_index)
-        end_sample = start_sample + total_samples
-        seen: set[tuple[str, str]] = set()
-        completed_chunks: set[tuple[str, str]] = set()
-        chunk_waiters: dict[tuple[str, str], set[int]] = {}
-        sample_pending: dict[int, set[tuple[str, str]]] = {}
-        sample_requests_closed: set[int] = set()
-        complete_raw_samples: set[int] = set()
-        next_safe_raw_sample = start_sample
-        start = time.perf_counter()
-        print(
-            "fiber_trace_3d prefetch: "
-            f"samples={total_samples} workers={worker_count} "
-            f"sampler_workers={producer_count} sample_mode={sample_mode} "
-            f"sample_index_limit={0 if sample_index_limit is None else int(sample_index_limit)} "
-            "mode=augmentation_envelope_bbox",
-            flush=True,
-        )
+        """Read each sample's augmentation-envelope bounding box so vc_reader disk-caches its chunks."""
 
-        def print_progress(*, final: bool = False) -> None:
-            elapsed = max(time.perf_counter() - start, 1.0e-9)
-            sample_rate = counters.samples_done / elapsed
-            remaining_samples = total_samples - counters.samples_done
-            sample_eta = (
-                remaining_samples / sample_rate
-                if remaining_samples > 0 and sample_rate > 0.0
-                else 0.0
-            )
-            download_rate = counters.download_done / elapsed
-            if counters.samples_done > 0 and counters.samples_done < total_samples:
-                observed_chunks_per_sample = counters.unique_chunks_seen / max(counters.samples_done, 1)
-                observed_download_ratio = counters.queued_for_download / max(counters.unique_chunks_seen, 1)
-                estimated_total_downloads = counters.queued_for_download + int(
-                    math.ceil(remaining_samples * observed_chunks_per_sample * observed_download_ratio)
-                )
-            else:
-                estimated_total_downloads = counters.queued_for_download
-            remaining_downloads = estimated_total_downloads - counters.download_done
-            download_eta = (
-                remaining_downloads / download_rate
-                if remaining_downloads > 0 and download_rate > 0.0
-                else 0.0
-            )
-            mib = counters.bytes_downloaded / (1024.0 * 1024.0)
-            mib_s = mib / elapsed
-            bar_width = 24
-            sample_filled = int(math.floor(bar_width * counters.samples_done / max(total_samples, 1)))
-            sample_bar = "#" * sample_filled + "-" * (bar_width - sample_filled)
-            if counters.queued_for_download > 0:
-                download_filled = int(
-                    math.floor(bar_width * counters.download_done / max(counters.queued_for_download, 1))
-                )
-            else:
-                download_filled = 0
-            download_bar = "#" * download_filled + "-" * (bar_width - download_filled)
-            if counters.samples_done < total_samples:
-                sample_prefix = (
-                    f"fiber_trace_3d prefetch samples[{sample_bar}] "
-                    f"{counters.samples_done}/{total_samples} "
-                    f"eta={_format_seconds(sample_eta)} "
-                )
-            else:
-                sample_prefix = "fiber_trace_3d prefetch "
-            line = (
-                sample_prefix
-                + f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
-                f"eta={_format_seconds(download_eta)} "
-                f"idx={counters.max_exclusive_sample_index} "
-                f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
-                f"queued={counters.queued_download_futures} transfers={worker_count} "
-                f"samplers={producer_count} "
-                f"valid_voxels={counters.valid_voxels} "
-                f"skipped={counters.samples_skipped} "
-                f"missing={counters.known_missing + counters.newly_missing} "
-                f"downloaded={counters.downloaded} errors={counters.download_errors} "
-                f"{mib:.1f} MiB {mib_s:.1f} MiB/s"
-            )
-            if counters.first_error:
-                error = counters.first_error
-                if len(error) > 160:
-                    error = error[:157] + "..."
-                line += f" first_error={error!r}"
-            print(line, end="\n" if final else "\r", flush=True)
-
-        def build_requests(sample_index: int) -> tuple[int, int, list[ZarrChunkRequest]]:
-            valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
-                sample_index,
-                sample_index_limit=sample_index_limit,
+        def read_sample(sample_index: int) -> dict[str, int]:
+            data_index = _bounded_data_sample_index(int(sample_index), sample_index_limit)
+            record, _record_index, cp_index = self.descriptor_for_sample_index(
+                data_index,
                 sample_mode=sample_mode,
             )
-            return int(sample_index), int(valid_voxels), requests
+            valid_voxels, start, end = self._prefetch_envelope_bbox_selected(record, cp_index)
+            if valid_voxels > 0:
+                record.reader.read_region(start, end - start)
+            return {"valid_voxels": valid_voxels}
 
-        def advance_safe_prefix() -> None:
-            nonlocal next_safe_raw_sample
-            while next_safe_raw_sample < end_sample and next_safe_raw_sample in complete_raw_samples:
-                counters.max_exclusive_sample_index = max(
-                    counters.max_exclusive_sample_index,
-                    int(next_safe_raw_sample) + 1,
-                )
-                next_safe_raw_sample += 1
-
-        def mark_sample_complete(raw_sample_index: int) -> None:
-            if raw_sample_index not in sample_requests_closed:
-                return
-            if sample_pending.get(raw_sample_index):
-                return
-            complete_raw_samples.add(raw_sample_index)
-            advance_safe_prefix()
-
-        def close_sample_requests(raw_sample_index: int) -> None:
-            sample_requests_closed.add(raw_sample_index)
-            mark_sample_complete(raw_sample_index)
-
-        def mark_chunk_complete(identity: tuple[str, str]) -> None:
-            if identity in completed_chunks:
-                return
-            completed_chunks.add(identity)
-            for raw_sample_index in chunk_waiters.pop(identity, set()):
-                pending = sample_pending.get(raw_sample_index)
-                if pending is None:
-                    continue
-                pending.discard(identity)
-                mark_sample_complete(raw_sample_index)
-
-        def classify_or_submit(
-            request: ZarrChunkRequest,
-            raw_sample_index: int,
-            download_queue: list[tuple[int, int, tuple[str, str]]],
-            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]],
-        ) -> None:
-            nonlocal download_sequence
-            identity = (request.store_identity, request.key)
-            if identity in completed_chunks:
-                return
-            sample_pending.setdefault(raw_sample_index, set()).add(identity)
-            chunk_waiters.setdefault(identity, set()).add(raw_sample_index)
-            if identity in seen:
-                queued = queued_downloads.get(identity)
-                if queued is not None and int(raw_sample_index) < queued[0]:
-                    download_sequence += 1
-                    queued_downloads[identity] = (int(raw_sample_index), download_sequence, queued[2])
-                    heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
-                return
-            seen.add(identity)
-            counters.unique_chunks_seen += 1
-            if _existing_data_path(request) is not None:
-                counters.cache_hits += 1
-                mark_chunk_complete(identity)
-                return
-            empty_path = _empty_marker_path(request)
-            if empty_path is not None and empty_path.is_file():
-                counters.known_missing += 1
-                mark_chunk_complete(identity)
-                return
-            counters.queued_for_download += 1
-            download_sequence += 1
-            queued_downloads[identity] = (int(raw_sample_index), download_sequence, request)
-            heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
-
-        def consume_download_result(request: ZarrChunkRequest, result: dict[str, Any]) -> None:
-            counters.download_done += 1
-            status = str(result.get("status", "error"))
-            if status == "cache_hit":
-                counters.cache_hits += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "known_missing":
-                counters.known_missing += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "new_missing":
-                counters.newly_missing += 1
-                mark_chunk_complete((request.store_identity, request.key))
-            elif status == "downloaded":
-                counters.downloaded += 1
-                counters.bytes_downloaded += int(result.get("bytes", 0))
-                mark_chunk_complete((request.store_identity, request.key))
-            else:
-                counters.download_errors += 1
-                if not counters.first_error:
-                    counters.first_error = str(result.get("error", "prefetch download failed"))
-
-        next_sample = start_sample
-        last_progress = 0.0
-        download_sequence = 0
-        previous_torch_threads = int(torch.get_num_threads())
-        torch_threads_changed = False
-        if previous_torch_threads != 1:
-            torch.set_num_threads(1)
-            torch_threads_changed = True
-        producer_executor = ThreadPoolExecutor(max_workers=producer_count)
-        download_executor = ThreadPoolExecutor(max_workers=worker_count)
-        normal_shutdown = False
-        try:
-            producer_futures: dict[Future[tuple[int, int, list[ZarrChunkRequest]]], int] = {}
-            download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]] = {}
-            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]] = {}
-            download_queue: list[tuple[int, int, tuple[str, str]]] = []
-            producer_results: dict[int, tuple[str, Any]] = {}
-            next_producer_result = start_sample
-
-            def update_download_queue_counters() -> None:
-                counters.queued_download_futures = len(download_futures) + len(queued_downloads)
-
-            def submit_downloads() -> None:
-                while len(download_futures) < worker_count:
-                    request: ZarrChunkRequest | None = None
-                    while download_queue:
-                        priority, sequence, identity = heapq.heappop(download_queue)
-                        queued = queued_downloads.get(identity)
-                        if queued is None:
-                            continue
-                        queued_priority, queued_sequence, queued_request = queued
-                        if priority != queued_priority or sequence != queued_sequence:
-                            continue
-                        queued_downloads.pop(identity, None)
-                        request = queued_request
-                        break
-                    if request is None:
-                        return
-                    future = download_executor.submit(
-                        _download_prefetch_request,
-                        request,
-                        retry_seconds=retry_seconds,
-                    )
-                    download_futures[future] = (request, time.perf_counter())
-
-            def submit_producers() -> None:
-                nonlocal next_sample
-                while next_sample < end_sample and len(producer_futures) < producer_count:
-                    future = producer_executor.submit(build_requests, next_sample)
-                    producer_futures[future] = next_sample
-                    next_sample += 1
-
-            def consume_ready_producer_results() -> None:
-                nonlocal next_producer_result
-                while next_producer_result in producer_results:
-                    status, payload = producer_results.pop(next_producer_result)
-                    sample_index_for_error = next_producer_result
-                    next_producer_result += 1
-                    if status == "error":
-                        exc = payload
-                        counters.samples_done += 1
-                        counters.samples_skipped += 1
-                        if not counters.first_sample_skip:
-                            counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
-                        sample_pending.setdefault(sample_index_for_error, set())
-                        close_sample_requests(sample_index_for_error)
-                        submit_producers()
-                        continue
-
-                    _raw_sample_index, sample_valid_voxels, requests = payload
-                    counters.samples_done += 1
-                    sample_pending.setdefault(sample_index_for_error, set())
-                    counters.valid_voxels += int(sample_valid_voxels)
-                    for request in requests:
-                        classify_or_submit(request, sample_index_for_error, download_queue, queued_downloads)
-                    close_sample_requests(sample_index_for_error)
-                    submit_downloads()
-                    submit_producers()
-
-            submit_producers()
-            submit_downloads()
-            update_download_queue_counters()
-            print_progress()
-            while producer_futures or download_futures or queued_downloads:
-                consume_ready_producer_results()
-                submit_downloads()
-                active = set(producer_futures) | set(download_futures)
-                if not active:
-                    break
-                done, _ = wait(active, timeout=0.25, return_when=FIRST_COMPLETED)
-                for future in done:
-                    if future in producer_futures:
-                        sample_index_for_error = producer_futures.pop(future)
-                        try:
-                            producer_results[sample_index_for_error] = ("ok", future.result())
-                        except ValueError as exc:
-                            producer_results[sample_index_for_error] = ("error", exc)
-                        consume_ready_producer_results()
-                    else:
-                        request, _submitted_at = download_futures.pop(future)
-                        consume_download_result(request, future.result())
-                        submit_downloads()
-                now = time.perf_counter()
-                if now - last_progress >= 0.5:
-                    update_download_queue_counters()
-                    print_progress()
-                    last_progress = now
-            update_download_queue_counters()
-            print_progress(final=True)
-            normal_shutdown = True
-        except BaseException:
-            for future in producer_futures:
-                future.cancel()
-            for future in download_futures:
-                future.cancel()
-            producer_executor.shutdown(wait=False, cancel_futures=True)
-            download_executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            if normal_shutdown:
-                producer_executor.shutdown(wait=True)
-                download_executor.shutdown(wait=True)
-            if torch_threads_changed:
-                torch.set_num_threads(previous_torch_threads)
-
-        elapsed = time.perf_counter() - start
-        return {
-            "samples": counters.samples_done,
-            "skipped_samples": counters.samples_skipped,
-            "chunks": counters.unique_chunks_seen,
-            "cache_hits": counters.cache_hits,
-            "queued_for_download": counters.queued_for_download,
-            "download_done": counters.download_done,
-            "downloaded": counters.downloaded,
-            "missing": counters.known_missing + counters.newly_missing,
-            "known_missing": counters.known_missing,
-            "new_missing": counters.newly_missing,
-            "errors": counters.download_errors,
-            "elapsed_s": elapsed,
-            "mib": counters.bytes_downloaded / (1024.0 * 1024.0),
-            "bytes": counters.bytes_downloaded,
-            "workers": worker_count,
-            "producer_workers": producer_count,
-            "valid_voxels": counters.valid_voxels,
-            "first_error": counters.first_error,
-            "first_sample_skip": counters.first_sample_skip,
-            "max_exclusive_sample_index": counters.max_exclusive_sample_index,
-        }
+        print(
+            f"fiber_trace_3d prefetch: sample_mode={sample_mode} "
+            f"sample_index_limit={0 if sample_index_limit is None else int(sample_index_limit)}",
+            flush=True,
+        )
+        return prefetch_samples(
+            read_sample,
+            start_sample_index,
+            sample_count,
+            workers=self.config.prefetch_workers if workers is None else workers,
+            readers=[record.reader for record in self.records],
+            count_keys=("valid_voxels",),
+            label="fiber_trace_3d prefetch",
+        )
 
 
 def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) -> FiberTrace3DConfig:
@@ -4372,30 +3946,10 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
             raw.get("value_augmentation_backend", "auto")
         ).lower(),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
-        prefetch_sampler_workers=_parse_worker_count(
-            raw.get("prefetch_sampler_workers", 2),
-            key="prefetch_sampler_workers",
-        ),
         volume_cache_dir=None if raw.get("volume_cache_dir") is None else str(raw.get("volume_cache_dir")),
         volume_cache_memory_mib=_parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib")),
         volume_io_threads=(
             None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
-        ),
-        volume_decode_threads=(
-            None
-            if raw.get("volume_decode_threads") is None
-            else int(raw.get("volume_decode_threads"))
-        ),
-        volume_sample_threads=(
-            None
-            if raw.get("volume_sample_threads") is None
-            else int(raw.get("volume_sample_threads"))
-        ),
-        volume_chunk_locality_fast_path=bool(
-            raw.get("volume_chunk_locality_fast_path", True)
-        ),
-        volume_collect_locality_stats=bool(
-            raw.get("volume_collect_locality_stats", False)
         ),
         config_dir=config_dir,
     )

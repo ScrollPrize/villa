@@ -1295,7 +1295,6 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
             ray_length=ray_length,
             spacing=spacing,
             sampling=str(model_cfg.get("sampling", "trilinear")),
-            tile_size=int(model_cfg.get("tile_size", 64)),
             cache_bytes=int(
                 args.volume_cache_bytes
                 if args.volume_cache_bytes is not None
@@ -1311,10 +1310,6 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
 
     midpoint_t = (ray_length - 1) / 2.0
 
-    # A few locally stored chunks of these volumes are truncated; the
-    # training dataloader skips samples that touch them and so do we.
-    malformed_chunk = "decoded chunk byte size does not match full chunk shape"
-
     def extract(index):
         if phase_reader is not None:
             cached = phase_reader.read(int(shard["global_index"][index]))
@@ -1324,12 +1319,7 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
             return index, phase, valid, frame
         origin = seeds[index].astype(np.float64) \
             - midpoint_t * spacing * directions[index].astype(np.float64)
-        try:
-            return index, *extractor.extract(0, directions[index], origin)
-        except RuntimeError as exc:
-            if malformed_chunk not in str(exc):
-                raise
-            return index, None, None, None
+        return index, *extractor.extract(0, directions[index], origin)
 
     phase_only = bool(getattr(args, "native_phase_only", False))
     phase_writer = (
@@ -1484,7 +1474,7 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         while extract_window:
             item = extract_window.popleft().result()
             refill()
-            if item[1] is None:  # slab touched a truncated volume chunk
+            if item[1] is None:  # slab not available in the phase cache
                 skipped += 1
                 decoded_slabs += 1
                 # Extraction is consumed in index order, so any earlier
@@ -1510,8 +1500,8 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         if spill is not None:
             spill.flush()
         if skipped:
-            print(f"[gpu{gpu}] skipped {skipped} slabs on truncated volume "
-                  "chunks", flush=True)
+            print(f"[gpu{gpu}] skipped {skipped} slabs not available in the "
+                  "phase cache", flush=True)
 
     compute_elapsed = time.time() - started
     if decoded_writer is not None:

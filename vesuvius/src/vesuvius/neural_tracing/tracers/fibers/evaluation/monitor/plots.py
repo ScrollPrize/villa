@@ -133,7 +133,7 @@ def _gt_frames(points):
     return np.stack(frames)
 
 
-def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=15, *, rows=None):
+def plot_rollouts(ct, spec, fibers, seeds, paths, reasons, path, max_len=400., half=15, *, rows=None):
     """Render existing traces without tracing again.
 
     Supplied score rows are used unchanged. Without rows, retain the flow
@@ -163,7 +163,7 @@ def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=1
         off = np.einsum("ni,nij->nj", p - g[j], fr[j])
         for c, name in ((0, "u"), (1, "v")):
             q = g[:, None, :] + lat[None, :, None] * fr[:, None, :, c]
-            img = vol.sample_image_nearest(q[..., ::-1]).astype(np.float32) / 255.0
+            img = ct.sample(q[..., ::-1]*spec.input_scale, order=0).astype(np.float32) / 255.0
             a = ax[k // per_row, 2 * (k % per_row) + c]
             a.imshow(img, origin="lower", aspect="auto", cmap="gray", vmin=0, vmax=1,
                      extent=(-half - 0.5, half + 0.5, -0.5, len(g) - 0.5))

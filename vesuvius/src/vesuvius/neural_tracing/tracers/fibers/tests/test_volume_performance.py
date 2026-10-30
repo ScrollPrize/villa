@@ -12,7 +12,7 @@ def test_heading_queued_chunks_exact():
     torch.manual_seed(84)
     rng = np.random.default_rng(85)
     cfg = HeadingConfig(width=1, predict_normals=True, predict_frames=True)
-    def crops(items, vol, crop, pool):
+    def crops(items, ct, spec, crop):
         patch = torch.arange(32**3, dtype=torch.float32).reshape(1,32,32,32)/32768.
         return torch.stack([patch+float(item['pos'][0])/100 for item in items])
     predictor = HeadingPredictor(HeadingNet(cfg), device='cpu', crops=crops)
@@ -24,18 +24,26 @@ def test_heading_queued_chunks_exact():
     expected = []
     for start in range(0,130,64):
         s = slice(start,start+64)
-        expected.extend(predictor.predict_frames(None, positions[s], priors[s], paths[s], families[s], previous[s]))
-    actual = predictor.predict_frames_batched(None, positions, priors, paths, families, previous)
+        expected.extend(predictor.predict_frames(None, None, positions[s], priors[s], paths[s], families[s], previous[s]))
+    actual = predictor.predict_frames_batched(None, None, positions, priors, paths, families, previous)
     np.testing.assert_array_equal(actual, expected)
-    assert predictor.predict_frames_batched(None, [], [], [], []) == []
+    assert predictor.predict_frames_batched(None, None, [], [], [], []) == []
 
-def test_parallel_advancement_whole_trace_exact(monkeypatch):
+def test_parallel_advancement_whole_trace_exact(monkeypatch, tmp_path):
     import torch
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
+    import zarr
+    from vc_reader.reader import open_zarr
     from vesuvius.neural_tracing.tracers.fibers.tracing import trace
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-    monkeypatch.setattr(trace, 'ct_frame', lambda vol, pos, *a, **k:
+    # An empty 100^3 CT: only its shape (the trace bounds) is read; frames come from the patched ct_frame.
+    zarr.create_array(str(tmp_path/'ct'/'0'), shape=(100, 100, 100), chunks=(50, 50, 50), dtype='u1', fill_value=0,
+                      zarr_format=2, compressors=None)
+    spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0, ct_grid_scale=8., grid_scale=8.)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level)
+    monkeypatch.setattr(trace, 'ct_frame', lambda ct, spec, pos, *a, **k:
                         np.diag([1., -1., -1.]) if pos[0] == 13 and pos[2] >= 24 else np.eye(3))
     class Policy(torch.nn.Module):
         cfg = SimpleNamespace(n_future=4, max_recovery_distance=6.)
@@ -54,7 +62,7 @@ def test_parallel_advancement_whole_trace_exact(monkeypatch):
     headings = np.tile([0., 0., 1.], (24, 1))
     results = []
     for parallel, callback in ((False, False), (True, False), (True, True)):
-        tracer = Tracer(Policy(), SimpleNamespace(shape=(100,100,100)),
+        tracer = Tracer(Policy(), ct, spec,
                         CropSpec(depth=12, width=9, behind=2), 8,
                         trace.TraceParams(n_commit=4, max_len=10., gate='prefix', loop_skip=2), device='cpu')
         pool = ProcessPoolExecutor(2, mp_context=multiprocessing.get_context('spawn')) if parallel else None
@@ -99,48 +107,10 @@ def test_seed_dispatch_preserves_order_and_filter(monkeypatch):
         def map(self, fn, tasks, *, chunksize):
             assert chunksize == 1
             return map(fn, tasks)
-    output, keep = volume.seed_headings(None, dots, Pool())
+    output, keep = volume.seed_headings(dots, Pool())
     np.testing.assert_array_equal(keep, [True, True, False, True, True])
     np.testing.assert_array_equal(output['xyz'], dots['xyz'][keep])
     np.testing.assert_array_equal(output['heading'], dots['xyz'][keep])
-
-
-def reference_crops(self, items, vol, crop, pool=None):
-    """Pre-batching crop path, kept only as an exactness/benchmark reference."""
-    import torch
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import _gather_trilinear, zscore_crops
-    scale = float(getattr(vol, 'input_scale', 1.))
-    local = self._local(crop)
-    out = torch.empty((len(items), 1)+tuple(local.shape[:3]), dtype=torch.float32, device=self.device)
-    bounds = torch.tensor(self.ct.shape, device=self.device, dtype=torch.int32)
-    for r0 in range(0, len(items), self.rows):
-        part = items[r0:r0+self.rows]
-        self._ensure(self._keys(part, crop, scale), pool)
-        pos = np.stack([np.asarray(i['pos'], np.float64) for i in part])*scale
-        anchor = np.floor(pos)
-        frame = np.stack([np.asarray(i['frame'], np.float64) for i in part])*scale
-        rel = torch.from_numpy((pos-anchor).astype(np.float32)).to(self.device)
-        frame = torch.from_numpy(frame.astype(np.float32)).to(self.device)
-        anchor = torch.from_numpy(anchor[:, ::-1].astype(np.int32).copy()).to(self.device)
-        out[r0:r0+len(part), 0] = _gather_trilinear(self.pool, self.table, anchor, rel, frame, local, bounds, self.shifts)
-    return zscore_crops(out)
-
-
-def test_crop_metadata_batching_exact(monkeypatch):
-    import torch
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling import gpu
-    from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-    rng = np.random.default_rng(32)
-    chunks = {(z,y,x): rng.integers(0,256,(8,8,8),dtype=np.uint8)
-              for z in range(4) for y in range(4) for x in range(4)}
-    vol = SimpleNamespace(input_scale=1., ct=SimpleNamespace(chunks=(8,8,8), shape=(32,32,32), chunk=chunks.get))
-    cache = gpu.GPUChunkCache(vol, device='cpu', slots=64, rows=3)
-    monkeypatch.setattr(gpu, '_gather_trilinear', lambda pool,table,anchor,rel,frame,local,bounds,shifts:
-        gpu._gather_kernel(*shifts)(pool,table,anchor,rel,frame,local,bounds))
-    crop = CropSpec(depth=8, width=8, behind=2, spacing=1.)
-    items = [dict(pos=p, frame=np.eye(3)) for p in rng.uniform(8,20,(11,3))]
-    expected = reference_crops(cache, items, vol, crop)
-    torch.testing.assert_close(cache.crops(items, vol, crop), expected, rtol=0, atol=0)
 
 
 def reference_tensor(cube, center_zyx, *, sample_spacing=1., derivative_sigma=1., integration_sigma=4.):
@@ -260,52 +230,3 @@ def test_restore_reads_each_npz_member_once(tmp_path, monkeypatch):
     assert reads == {'points': 1, 'offsets': 1, 'id': 1}
     assert [fid for _, fid in owner.rows] == [2, 5, 9]
     np.testing.assert_array_equal(np.concatenate([p for p, _ in owner.rows]), points)
-
-
-def test_occupied_lru_matches_original_evictions():
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import GPUChunkCache
-    def chunk(key):
-        return np.full((1, 1, 1), 0 if key[0] % 3 else 1, dtype=np.uint8)
-    ct = SimpleNamespace(chunks=(1, 1, 1), shape=(256, 1, 1), chunk=chunk)
-    cache = GPUChunkCache(SimpleNamespace(ct=ct), device='cpu', slots=3)
-    resident, free = {}, [3, 2, 1]
-    rng = np.random.default_rng(17)
-    groups = [[(i, 0, 0)] for i in range(100)]
-    groups += [[(int(i), 0, 0) for i in rng.choice(100, 3, replace=False)] for _ in range(200)]
-    for group in groups:
-        keys = sorted(set(group))
-        for key in keys:
-            if key in resident:
-                resident[key] = resident.pop(key)
-        for key in [k for k in keys if k not in resident]:
-            if not chunk(key).any():
-                resident[key] = 0
-                continue
-            if not free:
-                victim = next(k for k in resident if k not in keys and resident[k])
-                free.append(resident.pop(victim))
-            resident[key] = free.pop()
-        cache._ensure(set(group))
-        assert list(cache.resident.items()) == list(resident.items())
-        assert list(cache.occupied) == [k for k, v in resident.items() if v]
-        for key, slot in resident.items():
-            assert int(cache.table[key]) == slot
-            if slot:
-                assert int(cache.pool[slot]) == 1
-
-
-def test_grow_cache_preserves_slots_and_values():
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import GPUChunkCache
-    ct = SimpleNamespace(chunks=(1, 1, 1), shape=(32, 1, 1),
-                         chunk=lambda k: np.full((1, 1, 1), k[0]+1, dtype=np.uint8))
-    cache = GPUChunkCache(SimpleNamespace(ct=ct), device='cpu', slots=3)
-    cache._ensure({(1, 0, 0), (2, 0, 0)})
-    before = dict(cache.resident)
-    cache.grow_slots(8)
-    cache._ensure({(k, 0, 0) for k in range(8)})
-    assert all(cache.resident[k] == v for k, v in before.items())
-    assert int(cache.pool[0]) == 0
-    for k, slot in cache.resident.items():
-        assert int(cache.pool[slot]) == k[0]+1
-    cache.grow_slots(4)
-    assert cache.pool.numel() == 9

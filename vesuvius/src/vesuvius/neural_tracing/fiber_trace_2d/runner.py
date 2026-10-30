@@ -33,6 +33,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     embedding_output,
     presence_output,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import level_points
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
 
@@ -3015,9 +3016,10 @@ def _sample_trace2cp_local_top_patch(
     ).astype(np.float32)
     valid = np.isfinite(coords_xyz).all(axis=2)
     coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
-    result = segment_source.record.sampler.sample_coords(coords_zyx, valid)
-    image = np.asarray(result.image, dtype=np.float32)
-    valid_mask = np.asarray(result.valid_mask, dtype=bool)
+    record = segment_source.record
+    points, valid_mask = level_points(coords_zyx, valid, record.volume_scale, record.reader.shape)
+    image = np.zeros(valid_mask.shape, dtype=np.float32)
+    image[valid_mask] = record.reader.sample(points[valid_mask], order=1)
     return image, valid_mask
 
 
@@ -12505,8 +12507,8 @@ def main() -> None:
         summary = loader.prefetch(args.sample_index, sample_count)
         print(
             "prefetch summary: "
-            f"generated={summary['generated']} missing={summary['missing']} "
-            f"downloaded={summary['downloaded']} bytes={summary['bytes']} "
+            f"samples={summary['samples']} skipped={summary['skipped_samples']} "
+            f"remote_fetches={summary['remote_fetches']} remote_bytes={summary['remote_bytes']} "
             f"errors={summary['errors']} workers={summary['workers']}"
         )
         return

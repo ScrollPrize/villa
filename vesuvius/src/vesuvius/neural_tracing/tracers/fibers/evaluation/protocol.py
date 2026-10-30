@@ -27,13 +27,13 @@ from pathlib import Path
 import time
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 SPLITS = ('monitor', 'calibration', 'final')
 THRESHOLDS = (.5, .6, .7, .8, .85, .9, .95)
@@ -61,7 +61,7 @@ def run_policy(checkpoint, sources, splits, policy, *, device, max_len, batch, f
     tolerance = float(ck.get('tolerance', 1.5))
     rows = []
     for source in sources:
-        tracer = FiberTracer(model, source['volume'], crop, n_history,
+        tracer = FiberTracer(model, source['ct'], source['spec'], crop, n_history,
                              TraceParams.from_policy(policy, max_len=max_len, forward_chunk=forward_chunk), device=device)
         try:
             for split in splits:
@@ -261,8 +261,9 @@ def dataset_sources(args, config=None):
         # Every annotation source on the same CT and trace grid (neighbour fibers for tube_scoring switch labels).
         same_volume = [s for s in document['sources'] if str(s['ct']).rstrip('/') == str(source['ct']).rstrip('/')
                        and float(s.get('grid_scale', 8.)) == float(source.get('grid_scale', 8.))]
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=3 << 30)
         sources.append(dict(name=source['name'], fibers=validation, manifest=manifest, detector=detector,
-                            volume=CTVolume(spec), config=source, volume_configs=same_volume))
+                            ct=ct, spec=spec, config=source, volume_configs=same_volume))
     return sources
 
 

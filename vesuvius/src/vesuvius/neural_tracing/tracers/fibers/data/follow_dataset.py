@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import os
-from collections import deque
 import json
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.geometry import crop_local_grid
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.episodes import (
     episode_decisions, episode_tensors, mark_episode_identity)
@@ -19,7 +17,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORI
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import FALLBACKS, SOURCE, TASK, TASKS, TaskBudget, stable_key
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import RECOVERABLE, FOLLOWING
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, frame_prefetch_bounds
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 
 
@@ -49,9 +47,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
         self.live_continuation = None  # Optional trainer-to-worker prediction feedback.
-        self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.episodes = None  # EpisodeSpec: plans of whole episodes (model 'sequence'); chunk then counts episodes
-        self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         # Shared by every loader worker: current update and per-event replay draw counts.
         self.step = mp.Value('q', 0)
         self.event_draws = mp.Array('i', EVENT_TABLE_SIZE)
@@ -362,25 +358,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item.update(task_requested=task, task_delivered=TASK[delivered], task_fallback=FALLBACKS.index(fallback))
         return item
 
-    def prefetch_bounds(self, items, vol):
-        if hasattr(self.batch_builder, 'prefetch_bounds'):
-            return [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
-        return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
-
-    def prefetch_items(self, items, vol, *, required=False):
-        if self.remote_prefetch is None or not items:
-            return
-        # Whole lookahead windows are retained by the remote process instead of
-        # sending disposable per-item hints into a potentially full queue.
-        if not required and self.remote_prefetch_lookahead:
-            return
-        bounds = self.prefetch_bounds(items,vol)
-        if required:
-            self.remote_prefetch.ensure(vol.ct,bounds)
-        else:
-            self.remote_prefetch.submit(vol.ct,bounds)
-
-    def resolve_seeds(self, items, vol, rng, windows):
+    def resolve_seeds(self, items, ct, rng, windows):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
         rejected = 0
         if self.episodes is not None:
@@ -393,12 +371,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 for _ in range(MAX_CT_FRAME_REJECTIONS):
                     try:
                         for item in group:
-                            resolve_trace_seed(item, vol)
+                            resolve_trace_seed(item, ct, self.vol_spec)
                         break
                     except SeedHeadingError:
                         rejected += 1
                         group = self.episode_items(rng, windows, index)
-                        self.prefetch_items(group, vol, required=True)
                 else:
                     raise SeedHeadingError('No CT-oriented replacement episode after repeated rejections')
                 resolved.extend(group)
@@ -407,12 +384,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
         for index, item in enumerate(items):
             for _ in range(MAX_CT_FRAME_REJECTIONS):
                 try:
-                    resolve_trace_seed(item, vol)
+                    resolve_trace_seed(item, ct, self.vol_spec)
                     break
                 except SeedHeadingError:
                     rejected += 1
                     replacement = self.task_item(item['task_requested'], rng, windows)
-                    self.prefetch_items([replacement], vol, required=True)
                     item = items[index] = replacement
             else:
                 raise SeedHeadingError('No CT-oriented replacement seed after repeated rejections')
@@ -420,49 +396,25 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         torch.set_num_threads(1)
-        if self.remote_prefetch is not None:
-            self.remote_prefetch.ensure_metadata(self.vol_spec)
-            vol = CTVolume(self.vol_spec,cache_bytes=self.cache_bytes,cache_only=True)
-        else:
-            vol = CTVolume(self.vol_spec,cache_bytes=self.cache_bytes)
-        grid = torch.from_numpy(crop_local_grid(self.cfg.crop)).float()
-        lookahead = self.remote_prefetch_lookahead if self.remote_prefetch is not None else 0
-        if lookahead < 0:
-            raise ValueError('Remote prefetch lookahead must be nonnegative')
+        spec = self.vol_spec
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=self.cache_bytes)
         windows = []
-        plans, pending = self._iter_plans(vol, windows), deque()
-        first = True
+        plans = self._iter_plans(windows)
         worker = torch.utils.data.get_worker_info()
         live_rng = np.random.default_rng(np.random.SeedSequence([self.seed, 8123, 0 if worker is None else worker.id]))
         rejected = seed_rejections = 0
         while True:
-            # Deliver the first batch promptly. Fill the deeper plan queue when
-            # the loader asks for its next batch, overlapping the first update.
-            while len(pending) < (1 if first else lookahead+1):
-                plan = next(plans)
-                bounds = self.prefetch_bounds(plan,vol) if lookahead else None
-                pending.append((plan,bounds))
-            first = False
-            if lookahead:
-                self.remote_prefetch.lookahead(vol.ct,
-                    [bounds for _,bounds in pending],scope=id(self))
-            items, bounds = pending.popleft()
+            items = next(plans)
             live_outcomes = None
             if self.live_continuation is not None:
-                items = [self.live_continuation.resolve(item, self, vol, live_rng)
+                items = [self.live_continuation.resolve(item, self, ct, live_rng)
                          if item.get('live_requested') else item for item in items]
                 live_outcomes = self.live_continuation.take_outcomes()
-                # Resolved positions differ from the geometry lookahead plan.
-                bounds = self.prefetch_bounds(items, vol) if lookahead else None
-            if lookahead:
-                self.remote_prefetch.ensure(vol.ct,bounds)
-            else:
-                self.prefetch_items(items,vol,required=True)
-            seed_rejections += self.resolve_seeds(items, vol, live_rng, windows)
+            seed_rejections += self.resolve_seeds(items, ct, live_rng, windows)
             try:
                 if self.batch_builder is None:
                     raise ValueError('Training requires the common observation builder')
-                batch = self.batch_builder(items, vol)
+                batch = self.batch_builder(items, ct, spec)
             except SeedHeadingError as exc:
                 # Invalid crop or slab orientation context rejects the whole plan.
                 # Weak CT orientation falls back in ct_frame; I/O errors propagate.
@@ -494,7 +446,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             rejected = seed_rejections = 0
             yield batch
 
-    def _iter_plans(self, vol, windows):
+    def _iter_plans(self, windows):
         """Ordered geometry/augmentation plans, without CT or dense image tensors."""
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
@@ -506,16 +458,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
             items = []
             if self.episodes is not None:
                 for index in range(self.chunk):
-                    episode = self.episode_plan(rng, windows, index)
-                    self.prefetch_items(episode, vol)
-                    items.extend(episode)
+                    items.extend(self.episode_plan(rng, windows, index))
                 yield items
                 continue
             for task in rng.choice(len(TASKS), size=self.chunk, p=self.budget.shares):
-                item = self.task_item(int(task), rng, windows)
-                self.prefetch_items([item], vol)
-                items.append(item)
-            if (self.remote_prefetch is not None and self.remote_prefetch_lookahead
-                    and hasattr(self.batch_builder,'prepare_sampling_feedback')):
-                self.batch_builder.prepare_sampling_feedback(items)
+                items.append(self.task_item(int(task), rng, windows))
             yield items

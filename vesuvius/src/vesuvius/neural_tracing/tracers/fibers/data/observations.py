@@ -12,17 +12,17 @@ from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_cr
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.tracers.shared.reference import observed_seed
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, supervise
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICIES
-from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, crop_frame_bounds, prediction_window
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import reframe_item, FRAME_POLICIES
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, prediction_window
 from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig
 from vesuvius.neural_tracing.tracers.models.path_geometry import path_geometry_inputs
 from vesuvius.neural_tracing.tracers.fibers.data.samples import make_sample
 
 
-def image_crop(items, vol, crop, pool=None):
+def image_crop(items, ct, spec, crop):
     """CT-only crops, normalized identically for training and tracing."""
     tensor = empty_image_batch((len(items), 1, crop.depth, crop.width, crop.width))
-    scalar_crops(items, vol, crop, pool, out=tensor.numpy())
+    scalar_crops(items, ct, spec, crop, out=tensor.numpy())
     return tensor
 
 
@@ -33,25 +33,17 @@ class ObservationBuilder:
         # Crop backend: CPU crops (image_crop) unless a tracer installs another one with the same values.
         self.crop_images = image_crop
 
-    def prefetch_bounds(self,item,vol):
-        """CT footprints covering unresolved roll and normal-estimation context."""
-        if '_pending_seed_heading' in item:
-            # A trace start takes its CT seed heading only once the image is built.
-            yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
-        predictor = frame_predictor(self.cfg)
-        yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor)
-
-    def finalize_frames(self,items,vol):
+    def finalize_frames(self,items,ct,spec):
         for item in items:
-            resolve_trace_seed(item,vol)
-        orient_items(items,vol,frame_predictor(self.cfg),window=prediction_window(self.cfg))
+            resolve_trace_seed(item,ct,spec)
+        orient_items(items,ct,spec,frame_predictor(self.cfg),window=prediction_window(self.cfg))
 
-    def images(self,items,vol,pool=None):
-        self.finalize_frames(items,vol)
+    def images(self,items,ct,spec):
+        self.finalize_frames(items,ct,spec)
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        x = dict(fine=self.crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
+        x = dict(fine=self.crop_images(items,ct,spec,self.cfg.fine),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
         x.update(path_geometry_inputs(items, pool=getattr(self, 'geometry_pool', None)))
@@ -63,8 +55,8 @@ class ObservationBuilder:
             x['ct_frame_'+key] = torch.tensor([q.get(key, default) for q in quality], dtype=dtype)
         return x
 
-    def observations(self, items, vol):
-        batch = dict(x=self.images(items,vol),
+    def observations(self, items, ct, spec):
+        batch = dict(x=self.images(items,ct,spec),
                     hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]),dtype=torch.float32),
                     hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]),dtype=torch.float32))
         # Small, CPU-side geometry for truthful crop diagnostics. It is never
@@ -86,8 +78,8 @@ class ObservationBuilder:
                      crop_pos=torch.as_tensor(np.stack([i['pos'] for i in items]), dtype=torch.float64))
         return batch
 
-    def __call__(self,items,vol):
-        return dict(self.observations(items, vol), **collate_targets(items))
+    def __call__(self,items,ct,spec):
+        return dict(self.observations(items, ct, spec), **collate_targets(items))
 
 
 @dataclass(frozen=True)
@@ -283,8 +275,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             supervise(item)
         return item
 
-    def finalize_frames(self,items,vol):
-        super().finalize_frames(items,vol)
+    def finalize_frames(self,items,ct,spec):
+        super().finalize_frames(items,ct,spec)
         for item in items:
             if self.augment:
                 self.apply_roll(item, any_heading_planned=frame_predictor(self.cfg) is not None)
@@ -377,12 +369,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         item.setdefault('location_source',0)
         return item
 
-    def prepare_sampling_feedback(self, items):
-        """Advance geometry-only sampling feedback before planning another batch."""
-        self.bank_targets(items,np.zeros(len(items),bool))
-        for item in items:
-            item['_sampling_feedback_prepared'] = True
-
     def bank_targets(self, items, decision_mask=None):
         """Foreign-path masks and coverage feedback; no contrastive point queries.
 
@@ -399,8 +385,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['location_source'][j] = item.get('location_source', 0)
             if bank is None or 'identity_curve' not in item:
                 continue
-            feedback = (self.fibers is not None and item.get('source') == SOURCE['fresh']
-                        and not item.get('_sampling_feedback_prepared',False))
+            feedback = self.fibers is not None and item.get('source') == SOURCE['fresh']
             if not selected[j] and not feedback:
                 continue
             found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine, rasterize=bool(selected[j]))
@@ -416,9 +401,9 @@ class IdentityObservationBuilder(ObservationBuilder):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
-    def __call__(self,items,vol):
+    def __call__(self,items,ct,spec):
         """Images and targets for every observation; per-item augmentation RNG is unchanged."""
-        batch = self.observations(items, vol)
+        batch = self.observations(items, ct, spec)
         if items:
             batch.update(collate_targets(items))
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):

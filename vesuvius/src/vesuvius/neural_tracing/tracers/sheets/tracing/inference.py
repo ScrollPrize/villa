@@ -29,10 +29,10 @@ import numpy as np
 from scipy import ndimage
 import tifffile
 import torch
+from vc_reader.reader import ZarrReader, open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.geometry import resample_polyline
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
@@ -73,12 +73,12 @@ def seed_from_json(path):
     return points, np.broadcast_to(np.asarray(document['direction'], np.float64), points.shape)
 
 
-def read_block(volume: ChunkedArray, pos: np.ndarray, pad: float, level: int):
+def read_block(volume: ZarrReader, pos: np.ndarray, pad: float, level: int):
     scale = 1 << level
     lo, hi = pos.min(0)-pad, pos.max(0)+pad
     origin = np.floor((lo[::-1]+.5)/scale-.5).astype(np.int64)
     size = np.ceil((hi-lo)[::-1]/scale).astype(np.int64)+2
-    return volume.read(origin, size), origin
+    return volume.read_region(origin, size), origin
 
 
 def _reach_row(kept: np.ndarray, above: np.ndarray) -> np.ndarray:
@@ -127,7 +127,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     pos = torch.tensor(seed, dtype=torch.float32, device=device)[None]
     prev = torch.tensor(seed-d.step*unit, dtype=torch.float32, device=device)[None]
     front = Front(pos, prev, torch.ones(1, count, device=device))
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 30)
+    volume = open_zarr(d.volume, level=d.volume_level, memory_cache=1 << 30)
     pad = view_radius(cfg.model)+d.step+4
     columns = lambda pos, conf, dense=None: tuple(x[0].cpu().numpy() for x in tracer.output_columns(pos, conf, dense))
     p, c = columns(front.pos, front.conf)

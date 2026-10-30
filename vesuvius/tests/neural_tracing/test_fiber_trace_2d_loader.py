@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import itertools
 import json
 import math
 import threading
@@ -52,7 +53,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
     FiberStripSegmentSample,
-    ZarrChunkRequest,
     load_config,
     strip_z_offsets_from_count_step,
 )
@@ -63,7 +63,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     embedding_output,
     presence_output,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampleResult
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _benchmark_stage_totals,
     _draw_predicted_cp_direction,
@@ -180,7 +179,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _write_scalar_surface_obj,
     _write_trace2cp_side_top_z_top_slice_debug,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid,
     build_side_strip_patch_grid_from_line_window,
@@ -304,17 +302,6 @@ def _write_config(tmp_path: Path, *, batch_size: int = 2) -> Path:
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     return path
-
-
-def _test_sampler_factory(**kwargs):
-    return NumpyZarrCoordinateSampler(
-        kwargs["array"],
-        level_spacing_base=kwargs["level_spacing_base"],
-    )
-
-
-def _make_loader(config) -> FiberStrip2DLoader:
-    return FiberStrip2DLoader(config, sampler_factory=_test_sampler_factory)
 
 
 def test_augment_vis_timing_table_reports_warm_path_average(capsys: pytest.CaptureFixture[str]) -> None:
@@ -2395,7 +2382,7 @@ def test_trace2cp_segment_window_maps_start_and_target_cp(tmp_path: Path) -> Non
 
 
 def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
 
     with pytest.raises(ValueError, match="must differ"):
         loader.build_trace2cp_segment_patch(
@@ -2411,7 +2398,7 @@ def test_trace2cp_segment_patch_uses_eight_times_configured_height(tmp_path: Pat
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["patch_shape_hw"] = [5, 7]
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     sample, image, valid = loader.build_trace2cp_segment_patch(
         0,
@@ -2426,7 +2413,7 @@ def test_trace2cp_segment_patch_uses_eight_times_configured_height(tmp_path: Pat
 
 
 def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
 
     center, _, _ = loader.build_trace2cp_segment_patch(
         0,
@@ -2449,7 +2436,7 @@ def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_pat
 
 
 def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2472,7 +2459,7 @@ def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None
 
 
 def test_trace2cp_segment_side_z_offsets_use_out_of_plane_axis(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2506,63 +2493,8 @@ def test_trace2cp_segment_side_z_offsets_use_out_of_plane_axis(tmp_path: Path) -
     assert np.max(np.abs(row_side_dot)) < 1.0e-4
 
 
-def test_trace2cp_render_sampling_rejects_chunk_errors() -> None:
-    class ErrorSampler:
-        blocking = True
-
-        def sample_coords(
-            self,
-            coords_zyx_base: np.ndarray,
-            valid_mask: np.ndarray,
-        ) -> CoordinateSampleResult:
-            return CoordinateSampleResult(
-                image=np.zeros(valid_mask.shape, dtype=np.float32),
-                valid_mask=np.asarray(valid_mask, dtype=bool),
-                stats={"error_chunks": 1},
-            )
-
-    source = SimpleNamespace(record=SimpleNamespace(sampler=ErrorSampler()))
-    coords = np.zeros((3, 4, 3), dtype=np.float32)
-    valid = np.ones((3, 4), dtype=bool)
-
-    with pytest.raises(ValueError, match="incomplete requested-level data"):
-        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
-            object(),
-            source,
-            coords,
-            valid,
-            context="test",
-        )
-
-
-def test_trace2cp_render_sampling_rejects_nonblocking_sampler() -> None:
-    class NonBlockingSampler:
-        blocking = False
-
-        def sample_coords(
-            self,
-            coords_zyx_base: np.ndarray,
-            valid_mask: np.ndarray,
-        ) -> CoordinateSampleResult:
-            del coords_zyx_base, valid_mask
-            raise AssertionError("non-blocking sampler should be rejected before sampling")
-
-    source = SimpleNamespace(record=SimpleNamespace(sampler=NonBlockingSampler()))
-    coords = np.zeros((3, 4, 3), dtype=np.float32)
-    valid = np.ones((3, 4), dtype=bool)
-
-    with pytest.raises(ValueError, match="blocking coordinate sampling"):
-        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
-            object(),
-            source,
-            coords,
-            valid,
-            context="test",
-        )
-
-
 def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2602,7 +2534,7 @@ def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path
 def test_trace2cp_volume_trace_segment_source_ignores_original_source_grid(
     tmp_path: Path,
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2634,7 +2566,7 @@ def test_trace2cp_volume_trace_segment_source_ignores_original_source_grid(
 
 
 def test_trace2cp_refined_segment_source_clips_off_strip_trace_points(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2673,7 +2605,7 @@ def test_trace2cp_refined_segment_source_clips_off_strip_trace_points(tmp_path: 
 def test_trace2cp_refined_segment_source_clips_off_strip_endpoint_points(
     tmp_path: Path,
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2713,7 +2645,7 @@ def test_trace2cp_refined_segment_source_clips_off_strip_endpoint_points(
 def test_trace2cp_refined_segment_source_rejects_all_off_strip_trace_points(
     tmp_path: Path,
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2740,7 +2672,10 @@ def test_trace2cp_refined_segment_source_rejects_all_off_strip_trace_points(
 
 
 def test_trace2cp_refined_segment_source_preserves_bidirectional_trace_starts(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    config_path = _write_config(tmp_path, batch_size=1)
+    # Keep the whole strip inside the volume: samples outside it are invalid.
+    _write_fiber(tmp_path / "fiber.json", points=[[12.0, 20.0, 20.0], [22.0, 20.0, 20.0], [32.0, 20.0, 20.0]])
+    loader = FiberStrip2DLoader(load_config(config_path))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2784,7 +2719,7 @@ def test_trace2cp_refined_segment_source_preserves_bidirectional_trace_starts(tm
 
 
 def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(
         0,
         target_control_point_index=1,
@@ -2839,7 +2774,7 @@ def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> N
 
 
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
 
     reference, _, _ = loader.build_trace2cp_segment_patch(
         0,
@@ -2869,7 +2804,7 @@ def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) 
 
 def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     fiber_path = json.loads(config_path.read_text(encoding="utf-8"))["datasets"][0]["fiber_paths"][0]
 
     assert loader.flat_sample_indices_for_fiber_json(fiber_path) == (0, 1, 2)
@@ -3036,7 +2971,7 @@ def test_loader_loads_nml_components_and_applies_dataset_transform(tmp_path: Pat
     config_path = tmp_path / "nml_config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     assert len(loader.records) == 2
     assert loader.sample_count == 4
@@ -3096,7 +3031,7 @@ def test_loader_accepts_transform_json_and_invert(tmp_path: Path) -> None:
     config_path = tmp_path / "transform_json_config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     assert loader.sample_count == 2
     np.testing.assert_allclose(loader.records[0].fiber.control_points_xyz[0], [1.0, 2.0, 3.0])
@@ -3108,7 +3043,7 @@ def test_trace2cp_fiber_json_config_narrows_loader_to_explicit_fiber(tmp_path: P
     requested_fiber = _write_fiber(tmp_path / "test" / "explicit_trace2cp_fiber.json")
 
     narrowed = _config_for_trace2cp_fiber_json(load_config(config_path), requested_fiber)
-    loader = _make_loader(narrowed)
+    loader = FiberStrip2DLoader(narrowed)
 
     assert tuple(narrowed.datasets[0]["fiber_paths"]) == (str(requested_fiber.resolve()),)
     assert "fiber_glob" not in narrowed.datasets[0]
@@ -3412,7 +3347,7 @@ def test_trace2cp_fiber_export_skips_invalid_pair_and_keeps_summary(
 
 
 def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     sample, _, _ = loader.build_trace2cp_segment_patch(
         0,
         target_control_point_index=1,
@@ -3439,7 +3374,7 @@ def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path)
 
 
 def test_trace2cp_tta_rotation_expands_canvas_and_contains_base_corners(tmp_path: Path) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     sample, _, _ = loader.build_trace2cp_segment_patch(
         0,
         target_control_point_index=1,
@@ -5367,19 +5302,6 @@ def test_config_prefetch_workers_is_not_capped_at_16(tmp_path: Path) -> None:
     assert parsed.prefetch_workers == 64
 
 
-def test_config_prefetch_sampler_workers_is_separate_from_download_workers(tmp_path: Path) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["prefetch_workers"] = 64
-    config["prefetch_sampler_workers"] = 3
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-
-    parsed = load_config(config_path)
-
-    assert parsed.prefetch_workers == 64
-    assert parsed.prefetch_sampler_workers == 3
-
-
 def test_config_loader_workers_defaults_to_logical_cpu_count(tmp_path: Path) -> None:
     parsed = load_config(_write_config(tmp_path, batch_size=1))
 
@@ -5436,55 +5358,32 @@ def test_config_parses_vc3d_cache_budget_and_io_threads(tmp_path: Path) -> None:
     assert parsed.volume_io_threads == 3
 
 
-def test_loader_clone_reuses_metadata_but_refreshes_sampler(tmp_path: Path) -> None:
-    created_samplers: list[_RecordingCoordinateSampler] = []
-
-    def factory(**kwargs):
-        sampler = _RecordingCoordinateSampler(
-            kwargs["array"],
-            level_spacing_base=kwargs["level_spacing_base"],
-        )
-        created_samplers.append(sampler)
-        return sampler
-
+def test_loader_clone_shares_records_and_readers(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["volume_cache_memory_mib"] = 500
     raw["volume_io_threads"] = 2
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     clone = loader.clone()
 
-    assert len(created_samplers) == 2
-    assert clone.records[0].fiber is loader.records[0].fiber
-    assert clone.records[0].volume is loader.records[0].volume
-    assert clone.records[0].grad_mag is loader.records[0].grad_mag
-    assert clone.records[0].sampler is not loader.records[0].sampler
+    assert clone.records[0] is loader.records[0]
+    assert clone.records[0].reader is loader.records[0].reader
     assert clone._sample_identity_keys is loader._sample_identity_keys
     assert clone._random_pass_cache is loader._random_pass_cache
     assert clone._geometry_store is loader._geometry_store
 
 
-def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Path) -> None:
-    array = zarr.open(str(_write_zarr(tmp_path / "vol.zarr") / "0"), mode="r")
-    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=1.0)
-    coords = np.zeros((2, 3, 3, 3), dtype=np.float32)
-    valid = np.ones((2, 3, 3), dtype=bool)
-    coords[0, ..., 0] = 20.0
-    coords[0, ..., 1] = np.arange(3, dtype=np.float32).reshape(3, 1) + 20.0
-    coords[0, ..., 2] = np.arange(3, dtype=np.float32).reshape(1, 3) + 20.0
-    coords[1] = coords[0] + np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+def test_record_reader_samples_volume_level_trilinearly(tmp_path: Path) -> None:
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
+    reader = loader.records[0].reader
+    points = np.asarray([[20.25, 21.5, 22.75], [1.0, 2.0, 3.0]], dtype=np.float32)
 
-    batch = sampler.sample_coord_batch(coords, valid)
-    repeated = [sampler.sample_coords(coords[index], valid[index]) for index in range(2)]
+    values = reader.sample(points, order=1)
 
-    assert batch.image.shape == (2, 3, 3)
-    assert batch.valid_mask.shape == (2, 3, 3)
-    np.testing.assert_allclose(batch.image, np.stack([item.image for item in repeated], axis=0))
-    np.testing.assert_array_equal(batch.valid_mask, np.stack([item.valid_mask for item in repeated], axis=0))
-    assert batch.stats["batch_patches"] == 2
-    assert batch.stats["batch_mode_flattened"] == 1
+    expected = points[:, 0] * 10000.0 + points[:, 1] * 100.0 + points[:, 2]
+    np.testing.assert_allclose(values, expected, rtol=1.0e-6)
 
 
 def test_config_rejects_strip_coord_cache_dir(tmp_path: Path) -> None:
@@ -5499,7 +5398,7 @@ def test_config_rejects_strip_coord_cache_dir(tmp_path: Path) -> None:
 
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=2))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(config)
     batch = loader.load_batch(0)
 
     assert batch.images.shape == (2, 3, 1, 3, 3)
@@ -5525,7 +5424,7 @@ def test_fiber_group_batch_concatenates_same_fiber_control_point_groups(tmp_path
     )
     raw["datasets"][0]["fiber_paths"] = [str(fiber_a), str(fiber_b)]
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     batch = loader.load_fiber_group_batch(
         0,
@@ -5546,7 +5445,7 @@ def test_fiber_group_batch_syncs_value_augmentation_but_not_geometry(tmp_path: P
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     batch = loader.load_fiber_group_batch(
         0,
@@ -5571,7 +5470,7 @@ def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     profile: dict[str, float] = {}
 
     batch = loader.load_batch(0, profile=profile)
@@ -5635,7 +5534,7 @@ def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Pat
     raw["datasets"][0]["fiber_paths"].append(str(bad_fiber))
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     assert loader.sample_count == 3
     assert len(loader.records) == 1
@@ -5681,7 +5580,7 @@ def test_loader_tolerates_invalid_remote_line_endpoints_outside_cp_window(tmp_pa
         ),
         encoding="utf-8",
     )
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     batch = loader.load_batch(0)
 
@@ -5742,7 +5641,7 @@ def test_loader_samples_only_cp_local_lasagna_normals(
         )
 
     monkeypatch.setattr(FiberStrip2DLoader, "_lasagna_normals_at_zyx_batch", fake_normal_batch)
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     startup_indices = list(sampled_indices)
 
     loader.build_center_strip_patch(0)
@@ -5760,7 +5659,7 @@ def test_vectorized_lasagna_normals_match_scalar_path(tmp_path: Path) -> None:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     record = loader.records[0]
     points_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
     line_indices = np.arange(points_xyz.shape[0], dtype=np.int64)
@@ -5799,14 +5698,14 @@ def test_parallel_startup_geometry_matches_serial(tmp_path: Path) -> None:
     raw["loader_workers"] = 1
     serial_path = tmp_path / "serial.json"
     serial_path.write_text(json.dumps(raw), encoding="utf-8")
-    serial = _make_loader(load_config(serial_path))
+    serial = FiberStrip2DLoader(load_config(serial_path))
 
     raw["loader_workers"] = 2
     parallel_path = tmp_path / "parallel.json"
     parallel_path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(loader_module, "ProcessPoolExecutor", loader_module.ThreadPoolExecutor)
-        parallel = _make_loader(load_config(parallel_path))
+        parallel = FiberStrip2DLoader(load_config(parallel_path))
 
     assert len(serial._geometry_store.by_record_index) == len(parallel._geometry_store.by_record_index)
     for serial_geometry, parallel_geometry in zip(
@@ -6207,8 +6106,8 @@ def test_augmented_loader_preserves_shape_and_changes_values(tmp_path: Path) -> 
     base_dir.mkdir()
     base_config = load_config(_write_config(base_dir, batch_size=1))
     aug_config = load_config(config_path)
-    base = _make_loader(base_config).load_batch(0)
-    augmented = _make_loader(aug_config).load_batch(0)
+    base = FiberStrip2DLoader(base_config).load_batch(0)
+    augmented = FiberStrip2DLoader(aug_config).load_batch(0)
 
     assert augmented.images.shape == base.images.shape
     assert augmented.valid_mask.shape == base.valid_mask.shape
@@ -6219,16 +6118,16 @@ def test_augment_center_patch_loads_one_zarr_sample(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(config)
     calls = 0
-    original = loader.records[0].sampler.sample_coords
+    original = loader.records[0].reader.sample
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
+    monkeypatch.setattr(loader.records[0].reader, "sample", counted)
 
     sample, image, valid = loader.build_center_strip_patch(0)
 
@@ -6247,10 +6146,10 @@ def test_compact_geometry_rebuilds_source_without_disk_cache(
 ) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     config = load_config(config_path)
-    first_loader = _make_loader(config)
+    first_loader = FiberStrip2DLoader(config)
     first_source = first_loader.build_strip_source(0, device=torch.device("cpu"))
 
-    second_loader = _make_loader(config)
+    second_loader = FiberStrip2DLoader(config)
 
     def forbidden(*args, **kwargs):
         del args, kwargs
@@ -6283,11 +6182,11 @@ def test_compact_geometry_source_shapes_are_generated_directly(tmp_path: Path) -
     raw = json.loads(large_path.read_text(encoding="utf-8"))
     raw["patch_shape_hw"] = [7, 7]
     large_path.write_text(json.dumps(raw), encoding="utf-8")
-    large_loader = _make_loader(load_config(large_path))
+    large_loader = FiberStrip2DLoader(load_config(large_path))
     large_source = large_loader.build_strip_source(0, device=torch.device("cpu"))
 
     small_path = _write_config(small_dir, batch_size=1)
-    small_loader = _make_loader(load_config(small_path))
+    small_loader = FiberStrip2DLoader(load_config(small_path))
     small_source = small_loader.build_strip_source(0, device=torch.device("cpu"))
 
     assert large_source.grid.coords_zyx.shape[:2] == (7, 7)
@@ -6415,7 +6314,7 @@ def test_trace2cp_segment_rejects_invalid_compact_geometry_between_cps() -> None
 def test_top_source_uses_compact_geometry_without_resampling_normals(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
 
     def forbidden(*args, **kwargs):
         del args, kwargs
@@ -6441,17 +6340,17 @@ def test_augmented_center_patch_loads_one_zarr_sample(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
     calls = 0
-    original = loader.records[0].sampler.sample_coords
+    original = loader.records[0].reader.sample
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
+    monkeypatch.setattr(loader.records[0].reader, "sample", counted)
 
     sample, image, valid, line = loader.build_augmented_center_strip_patch(
         0,
@@ -6475,7 +6374,7 @@ def test_augmented_patch_reuses_one_transform_for_coords_and_line(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
     original_factory = loader_module.strip_augment_transform
     calls = 0
@@ -6504,7 +6403,7 @@ def test_loader_maps_augmented_line_and_cp_in_one_batched_call(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     source = loader.build_strip_source(0, device=torch.device("cpu"), use_augmentation_envelope=True)
     params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
     original_factory = loader_module.strip_augment_transform
@@ -6546,7 +6445,7 @@ def test_build_sample_uses_batched_line_lookup_for_augmented_offsets(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     original = loader_module.sample_xy_maps_bilinear
     call_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
 
@@ -6573,7 +6472,7 @@ def test_deferred_batch_image_augmentation_matches_inline_batch(tmp_path: Path) 
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     inline = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=True)
     deferred_base = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=False)
     deferred = loader.apply_batch_image_augmentation(deferred_base)
@@ -6775,7 +6674,7 @@ def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     lower_entries, _ = limit_augmentation_rows(loader.config.augment, sample_index=0)
     params_by_name = dict(lower_entries)
 
@@ -6802,7 +6701,7 @@ def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path, capsys: pytest.
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     out = tmp_path / "aug_out"
 
     _export_augment_contact_sheet(loader, 0, out)
@@ -6841,7 +6740,7 @@ def test_augment_contact_sheet_profile_prints_cold_and_warm_tables(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     out = tmp_path / "aug_profile_out"
 
     _export_augment_contact_sheet(loader, 0, out, profile=True)
@@ -6858,8 +6757,8 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
     config_path = _write_config(tmp_path, batch_size=1)
     config_a = load_config(config_path)
     config_b = load_config(config_path)
-    loader_a = _make_loader(config_a)
-    loader_b = _make_loader(config_b)
+    loader_a = FiberStrip2DLoader(config_a)
+    loader_b = FiberStrip2DLoader(config_b)
 
     a = [loader_a.descriptor_for_sample_index(i)[2] for i in range(8)]
     b = [loader_b.descriptor_for_sample_index(i)[2] for i in range(8)]
@@ -6868,7 +6767,7 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
 
 def test_random_sample_mode_covers_all_control_points_before_repeating(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(config)
 
     first_pass = [loader._random_flat_index(i) for i in range(loader.sample_count)]
     second_pass = [
@@ -6884,222 +6783,41 @@ def test_random_sample_mode_covers_all_control_points_before_repeating(tmp_path:
 
 def test_flat_sample_mode_iterates_control_points_sequentially_for_debug(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(config)
 
     indices = [loader.descriptor_for_sample_index(i, sample_mode="flat")[2] for i in range(5)]
 
     assert indices == [0, 1, 2, 0, 1]
 
 
-def test_prefetch_uses_dependency_chunks_and_cache_markers(
+def test_prefetch_idx_stops_at_failed_sample(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
+    original_build_strip_source = loader.build_strip_source
 
-    class Store:
-        def __init__(self, root: Path) -> None:
-            self.root = root
-            self.calls: list[str] = []
+    def build_strip_source(sample_index: int, **kwargs):
+        if int(sample_index) == 1:
+            raise RuntimeError("network failed")
+        return original_build_strip_source(sample_index, **kwargs)
 
-    store = Store(tmp_path / "cache")
-    store.root.mkdir(parents=True)
-    (store.root / "hit.bin").write_bytes(b"cached")
-    (store.root / "known_missing.empty").write_bytes(b"")
+    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
 
-    def downloader(request: ZarrChunkRequest) -> bytes | None:
-        store.calls.append(request.key)
-        if request.key == "new_missing":
-            return None
-        return b"\x01\x02"
+    summary = loader.prefetch(0, 3, workers=1)
 
-    def request(key: str) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="test",
-            key=key,
-            cache_path=store.root / f"{key}.bin",
-            empty_path=store.root / f"{key}.empty",
-            remote_url=f"https://example.invalid/{key}",
-            cache_payload_format="source_bytes",
-            downloader=downloader,
-        )
-
-    def fake_chunk_requests(coords, valid):
-        del coords, valid
-        return [
-            request("hit"),
-            request("known_missing"),
-            request("download"),
-            request("new_missing"),
-            request("download"),
-        ]
-
-    def forbidden_prefetch(coords, valid):
-        del coords, valid
-        raise AssertionError("loader prefetch must not call sampler.prefetch_coords")
-
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
-    monkeypatch.setattr(loader.records[0].sampler, "prefetch_coords", forbidden_prefetch)
-
-    summary = loader.prefetch(0, 1, workers=8)
-
-    assert sorted(store.calls) == ["download", "new_missing"]
-    assert summary["patches"] == 3
-    assert summary["generated"] == 4
-    assert summary["cache_hits"] == 1
-    assert summary["known_missing"] == 1
-    assert summary["newly_missing"] == 1
-    assert summary["missing"] == 2
-    assert summary["downloaded"] == 1
-    assert summary["queued_for_download"] == 2
-    assert summary["download_done"] == 2
-    assert summary["bytes"] == 2
-    assert summary["errors"] == 0
-    assert summary["workers"] == 8
-    assert summary["producer_workers"] == 1
-    assert (store.root / "new_missing.empty").is_file()
-    assert (store.root / "new_missing.empty").read_bytes() == b""
-    assert (store.root / "download.bin").read_bytes() == b"\x01\x02"
+    assert summary["samples"] == 3
+    assert summary["errors"] == 1
+    assert "network failed" in summary["first_error"]
+    assert summary["max_exclusive_sample_index"] == 1
     output = capsys.readouterr().out
-    assert "samples[" in output
-    assert "downloads[" in output
     assert "idx=1" in output
-    assert "samplers=1" in output
-
-
-def test_prefetch_idx_requires_cache_complete_prefix(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["prefetch_sampler_workers"] = 1
-    raw["volume_cache_retry_seconds"] = 0.001
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
-
-    class Store:
-        def __init__(self, root: Path) -> None:
-            self.root = root
-
-    store = Store(tmp_path / "cache")
-    store.root.mkdir(parents=True)
-    (store.root / "hit.bin").write_bytes(b"cached")
-    call_count = 0
-
-    def failing_downloader(request: ZarrChunkRequest) -> bytes:
-        del request
-        raise RuntimeError("network failed")
-
-    def request(key: str) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="idx-test",
-            key=key,
-            cache_path=store.root / f"{key}.bin",
-            empty_path=store.root / f"{key}.empty",
-            remote_url=f"https://example.invalid/{key}",
-            cache_payload_format="source_bytes",
-            downloader=failing_downloader,
-        )
-
-    def fake_chunk_requests(coords, valid):
-        nonlocal call_count
-        del coords, valid
-        call_count += 1
-        return [request("error" if call_count <= len(loader.strip_z_offsets) else "hit")]
-
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
-
-    summary = loader.prefetch(0, 2, workers=1)
-
-    assert summary["errors"] == 1
-    assert summary["cache_hits"] == 1
-    assert summary["max_exclusive_sample_index"] == 0
-    output = capsys.readouterr().out
-    assert "idx=0" in output
-    assert "idx=1" not in output
-
-
-def test_prefetch_idx_waits_for_all_requests_in_stream_sample(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["prefetch_sampler_workers"] = 1
-    raw["strip_z_offset_count"] = 1
-    raw["volume_cache_retry_seconds"] = 0.001
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
-
-    class Store:
-        def __init__(self, root: Path) -> None:
-            self.root = root
-
-    store = Store(tmp_path / "cache")
-    store.root.mkdir(parents=True)
-    (store.root / "hit_0.bin").write_bytes(b"cached")
-    (store.root / "hit_1.bin").write_bytes(b"cached")
-    call_count = 0
-
-    def failing_downloader(request: ZarrChunkRequest) -> bytes:
-        del request
-        raise RuntimeError("network failed")
-
-    def request(key: str) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="idx-close-test",
-            key=key,
-            cache_path=store.root / f"{key}.bin",
-            empty_path=store.root / f"{key}.empty",
-            remote_url=f"https://example.invalid/{key}",
-            cache_payload_format="source_bytes",
-            downloader=failing_downloader,
-        )
-
-    def fake_chunk_requests(coords, valid):
-        nonlocal call_count
-        del coords, valid
-        call_count += 1
-        if call_count == 1:
-            return [request("hit_0"), request("error")]
-        return [request("hit_1")]
-
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
-
-    summary = loader.prefetch(0, 2, workers=1)
-
-    assert summary["errors"] == 1
-    assert summary["cache_hits"] == 2
-    assert summary["max_exclusive_sample_index"] == 0
-
-
-def test_prefetch_sampler_workers_limits_dependency_producers(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["prefetch_workers"] = 8
-    raw["prefetch_sampler_workers"] = 2
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
-
-    summary = loader.prefetch(0, 3)
-
-    assert summary["workers"] == 8
-    assert summary["producer_workers"] == 2
+    assert "idx=2" not in output
 
 
 def test_prefetch_limits_and_restores_torch_cpu_threads(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["prefetch_sampler_workers"] = 4
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=1)))
     thread_state = {"value": 32}
     calls: list[int] = []
 
@@ -7112,86 +6830,18 @@ def test_prefetch_limits_and_restores_torch_cpu_threads(
 
     monkeypatch.setattr(loader_module.torch, "get_num_threads", get_num_threads)
     monkeypatch.setattr(loader_module.torch, "set_num_threads", set_num_threads)
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
 
     summary = loader.prefetch(0, 1, workers=1)
 
     assert calls == [1, 32]
     assert thread_state["value"] == 32
-    assert summary["producer_workers"] == 1
-
-
-def test_prefetch_prioritizes_pending_downloads_by_earliest_sample(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["prefetch_sampler_workers"] = 2
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
-
-    class Store:
-        def __init__(self, root: Path) -> None:
-            self.root = root
-            self.calls: list[str] = []
-
-    store = Store(tmp_path / "cache")
-    store.root.mkdir(parents=True)
-    sample_one_requests_seen = threading.Event()
-
-    def downloader(request: ZarrChunkRequest) -> bytes:
-        store.calls.append(request.key)
-        return request.key.encode("utf-8")
-
-    def request(key: str) -> ZarrChunkRequest:
-        return ZarrChunkRequest(
-            store=store,
-            store_identity="priority",
-            key=key,
-            cache_path=store.root / f"{key}.bin",
-            empty_path=store.root / f"{key}.empty",
-            remote_url=f"https://example.invalid/{key}",
-            cache_payload_format="source_bytes",
-            downloader=downloader,
-        )
-
-    class Sampler:
-        def chunk_requests_for_coords(self, coords, valid):
-            del valid
-            sample_index = int(coords[0, 0, 0])
-            if sample_index == 0:
-                return [request("sample_0")]
-            sample_one_requests_seen.set()
-            return [request("sample_1_active"), request("sample_1_pending")]
-
-    sampler = Sampler()
-
-    def build_strip_source(sample_index: int, **kwargs):
-        del kwargs
-        if int(sample_index) == 0:
-            sample_one_requests_seen.wait(timeout=2.0)
-        return SimpleNamespace(sample_index=int(sample_index), record=SimpleNamespace(sampler=sampler))
-
-    def prefetch_envelope_coords_from_source(source, offset_index):
-        del offset_index
-        coords = np.asarray([[[float(source.sample_index), 0.0, 0.0]]], dtype=np.float32)
-        valid = np.ones((1, 1), dtype=bool)
-        return coords, valid
-
-    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
-    monkeypatch.setattr(loader, "_prefetch_envelope_coords_from_source", prefetch_envelope_coords_from_source)
-
-    summary = loader.prefetch(0, 2, workers=1)
-
-    assert store.calls == ["sample_0", "sample_1_active", "sample_1_pending"]
-    assert summary["downloaded"] == 3
-    assert summary["max_exclusive_sample_index"] == 2
+    assert summary["workers"] == 1
 
 
 def test_prefetch_skips_invalid_sample_construction(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=2)))
+    loader = FiberStrip2DLoader(load_config(_write_config(tmp_path, batch_size=2)))
     original_build_strip_source = loader.build_strip_source
 
     def build_strip_source(sample_index: int, **kwargs):
@@ -7200,13 +6850,17 @@ def test_prefetch_skips_invalid_sample_construction(
         return original_build_strip_source(sample_index, **kwargs)
 
     monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
-    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
 
     summary = loader.prefetch(0, 2, workers=2)
 
     assert summary["samples"] == 2
     assert summary["skipped_samples"] == 1
     assert summary["patches"] == 3
+    assert summary["valid_pixels"] > 0
+    assert summary["errors"] == 0
+    assert summary["max_exclusive_sample_index"] == 2
+    assert summary["remote_fetches"] == 0
+    assert summary["remote_bytes"] == 0
     assert "grad_mag sample is zero" in summary["first_sample_skip"]
     output = capsys.readouterr().out
     assert "skipped=1" in output
@@ -7218,7 +6872,7 @@ def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: 
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     original_prepare_sample = loader._prepare_sample
     attempted: list[int] = []
 
@@ -7243,7 +6897,7 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     attempted: list[int] = []
 
     original_prepare_sample = loader._prepare_sample
@@ -7273,7 +6927,7 @@ def test_bounded_sample_reuse_advances_augmentation_seed(tmp_path: Path) -> None
     raw["augment_device"] = "cpu"
     raw["strip_z_offset_count"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     first = loader.load_batch(
         0,
@@ -7301,7 +6955,7 @@ def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 4
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     original_prepare_sample = loader._prepare_sample
 
     def prepare_sample(
@@ -7327,7 +6981,7 @@ def test_parallel_load_batch_reuses_executor(tmp_path: Path, monkeypatch: pytest
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 2
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     def build_sample(
         sample_index: int,
@@ -7368,7 +7022,7 @@ def test_random_pass_order_is_cached_before_parallel_worker_lookup(
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 2
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     original_ensure = loader._ensure_random_pass_order
     calls: list[int] = []
 
@@ -7410,47 +7064,28 @@ def test_random_pass_order_is_cached_before_parallel_worker_lookup(
     assert loader._random_pass_cache[0].shape[0] == loader.sample_count
 
 
-class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
-    def __init__(self, array, *, level_spacing_base: float) -> None:
-        super().__init__(array, level_spacing_base=level_spacing_base)
-        self.sample_coords_calls: list[tuple[np.ndarray, np.ndarray]] = []
-        self.sample_coord_batch_calls: list[tuple[np.ndarray, np.ndarray]] = []
-        self.chunk_request_calls: list[tuple[np.ndarray, np.ndarray]] = []
-        self.prefetch_calls: list[tuple[np.ndarray, np.ndarray]] = []
+def _spy_reader_samples(monkeypatch: pytest.MonkeyPatch, reader) -> list[np.ndarray]:
+    calls: list[np.ndarray] = []
+    original = reader.sample
 
-    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
-        self.sample_coords_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
-        return super().sample_coords(coords_zyx_base, valid_mask)
+    def sample(points, **kwargs):
+        calls.append(np.array(points, copy=True))
+        return original(points, **kwargs)
 
-    def sample_coord_batch(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
-        self.sample_coord_batch_calls.append(
-            (np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True))
-        )
-        return super().sample_coord_batch(coords_zyx_base, valid_mask)
-
-    def chunk_requests_for_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
-        self.chunk_request_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
-        coords = np.asarray(coords_zyx_base, dtype=np.float64)
-        valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(coords).all(axis=-1)
-        if not bool(valid.any()):
-            return []
-        chunk_idx = np.floor(coords[valid] / 16.0).astype(np.int64)
-        unique = np.unique(chunk_idx, axis=0)
-        return [
-            ZarrChunkRequest(store={}, store_identity="recording", key=f"{z}.{y}.{x}")
-            for z, y, x in unique.tolist()
-        ]
-
-    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
-        self.prefetch_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
-        return super().prefetch_coords(coords_zyx_base, valid_mask)
+    monkeypatch.setattr(reader, "sample", sample)
+    return calls
 
 
-def _request_keys(requests: list[ZarrChunkRequest]) -> set[tuple[str, str]]:
-    return {(request.store_identity, request.key) for request in requests}
+def _touched_chunks(points: np.ndarray, chunk: int = 16) -> set[tuple[int, int, int]]:
+    """Chunks holding the trilinear neighbours of level-space ``points``."""
+    base = np.floor(np.asarray(points, dtype=np.float64).reshape(-1, 3)).astype(np.int64)
+    corners = np.concatenate([base + np.asarray(offset) for offset in itertools.product((0, 1), repeat=3)])
+    return {tuple(int(v) for v in row) for row in np.unique(corners // chunk, axis=0)}
 
 
-def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path) -> None:
+def test_prefetch_envelope_covers_augmented_loading_chunks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     fiber = _write_fiber(
@@ -7479,72 +7114,41 @@ def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path)
     raw["augment_noise_std"] = 0.0
     raw["augment_blur_sigma"] = 0.0
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    samplers: list[_RecordingCoordinateSampler] = []
-
-    def factory(**kwargs):
-        sampler = _RecordingCoordinateSampler(
-            kwargs["array"],
-            level_spacing_base=kwargs["level_spacing_base"],
-        )
-        samplers.append(sampler)
-        return sampler
-
-    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    loader = FiberStrip2DLoader(load_config(config_path))
+    calls = _spy_reader_samples(monkeypatch, loader.records[0].reader)
     sample_index = 4
 
-    prefetch_requests = loader.chunk_requests_for_sample_index(sample_index)
+    loader.prefetch(sample_index, 1, workers=1)
+    prefetch_chunks = set().union(*(_touched_chunks(points) for points in calls))
+    calls.clear()
     loader.build_sample(sample_index)
 
-    sampler = samplers[0]
-    assert len(sampler.chunk_request_calls) == 2
-    assert len(sampler.sample_coord_batch_calls) == 1
-    assert len(sampler.sample_coords_calls) == 1
-    prefetch_keys = _request_keys(prefetch_requests)
-    assert prefetch_keys
-    for load_coords, load_valid in sampler.sample_coord_batch_calls:
-        assert load_coords.shape[:3] == (2, 5, 5)
-        assert load_valid.shape == (2, 5, 5)
-        load_keys = _request_keys(sampler.chunk_requests_for_coords(load_coords, load_valid))
-        assert load_keys <= prefetch_keys
+    assert len(calls) == 1
+    assert prefetch_chunks
+    assert _touched_chunks(calls[0]) <= prefetch_chunks
 
 
-def test_prefetch_requests_can_include_top_view_dependencies(tmp_path: Path) -> None:
+def test_prefetch_can_include_top_view(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["strip_z_offset_count"] = 2
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    samplers: list[_RecordingCoordinateSampler] = []
+    loader = FiberStrip2DLoader(load_config(config_path))
+    calls = _spy_reader_samples(monkeypatch, loader.records[0].reader)
 
-    def factory(**kwargs):
-        sampler = _RecordingCoordinateSampler(
-            kwargs["array"],
-            level_spacing_base=kwargs["level_spacing_base"],
-        )
-        samplers.append(sampler)
-        return sampler
+    side = loader.prefetch(0, 1, workers=1)
+    with_top = loader.prefetch(0, 1, workers=1, include_top_view=True)
 
-    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
-
-    side_requests = loader.chunk_requests_for_sample_index(0)
-    side_call_count = len(samplers[0].chunk_request_calls)
-    top_requests = loader.chunk_requests_for_sample_index(0, include_top_view=True)
-
-    assert side_requests
-    assert top_requests
-    assert side_call_count == 2
-    assert len(samplers[0].chunk_request_calls) == 5
-    top_coords, top_valid = samplers[0].chunk_request_calls[-1]
-    assert top_coords.ndim == 3
-    assert top_coords.shape[-1] == 3
-    assert top_coords.shape[:2] == top_valid.shape
-    assert top_coords.shape[0] >= 3
-    assert top_coords.shape[1] >= 3
+    assert len(calls) == 2
+    assert 0 < calls[0].shape[0] < calls[1].shape[0]
+    assert calls[1].shape[1] == 3
+    assert with_top["valid_pixels"] > side["valid_pixels"]
 
 
 def test_load_top_batch_for_batch_returns_one_patch_per_control_point(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=2)
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
 
     top_batch = loader.load_top_batch_for_batch(side_batch)
@@ -7559,37 +7163,25 @@ def test_load_top_batch_for_batch_returns_one_patch_per_control_point(tmp_path: 
         np.testing.assert_allclose(sample.control_point_xy, np.asarray([1.0, 1.0], dtype=np.float32))
 
 
-def test_load_top_batch_for_batch_uses_grouped_coordinate_batch_sampling(tmp_path: Path) -> None:
+def test_load_top_batch_for_batch_samples_all_control_points_in_one_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     config_path = _write_config(tmp_path, batch_size=2)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["strip_z_offset_count"] = 1
     raw["augment_device"] = "cpu"
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    samplers: list[_RecordingCoordinateSampler] = []
-
-    def factory(**kwargs):
-        sampler = _RecordingCoordinateSampler(
-            kwargs["array"],
-            level_spacing_base=kwargs["level_spacing_base"],
-        )
-        samplers.append(sampler)
-        return sampler
-
-    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    loader = FiberStrip2DLoader(load_config(config_path))
+    calls = _spy_reader_samples(monkeypatch, loader.records[0].reader)
     side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
-    sampler = samplers[0]
-    side_call_count = len(sampler.sample_coord_batch_calls)
-    side_low_level_call_count = len(sampler.sample_coords_calls)
+    side_call_count = len(calls)
 
     top_batch = loader.load_top_batch_for_batch(side_batch)
 
     assert top_batch.images.shape == (2, 1, 1, 3, 3)
-    assert len(sampler.sample_coord_batch_calls) == side_call_count + 1
-    assert len(sampler.sample_coords_calls) == side_low_level_call_count + 1
-    top_coords, top_valid = sampler.sample_coord_batch_calls[-1]
-    assert top_coords.shape == (2, 3, 3, 3)
-    assert top_valid.shape == (2, 3, 3)
+    assert len(calls) == side_call_count + 1
+    assert calls[-1].shape == (int(np.count_nonzero(top_batch.valid_mask)), 3)
 
 
 def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -7597,7 +7189,7 @@ def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.Mon
     import vesuvius.neural_tracing.fiber_trace_2d.strip_geometry as strip_geometry_module
 
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = _make_loader(config)
+    loader = FiberStrip2DLoader(config)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("training loader must use shared torch source path")
@@ -7608,6 +7200,24 @@ def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.Mon
     batch = loader.load_batch(0)
 
     assert batch.images.shape == (1, 3, 1, 3, 3)
+
+
+def _prefetch_summary(**counts: int) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "samples": 0,
+        "skipped_samples": 0,
+        "patches": 0,
+        "valid_pixels": 0,
+        "errors": 0,
+        "first_error": "",
+        "first_sample_skip": "",
+        "workers": 1,
+        "max_exclusive_sample_index": 0,
+        "remote_fetches": 0,
+        "remote_bytes": 0,
+    }
+    summary.update(counts)
+    return summary
 
 
 def test_training_prefetch_maps_steps_to_sample_count(
@@ -7638,21 +7248,14 @@ def test_training_prefetch_maps_steps_to_sample_count(
     ):
         del self, workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
-        return {
-            "generated": 11,
-            "missing": 5,
-            "downloaded": 5,
-            "bytes": 123,
-            "errors": 0,
-            "workers": 1,
-        }
+        return _prefetch_summary(samples=11)
 
     monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
 
-    summary = prefetch_training(config_path, prefetch_steps=3, sampler_factory=_test_sampler_factory)
+    summary = prefetch_training(config_path, prefetch_steps=3)
 
     assert calls == [(0, 9, "random", 0)]
-    assert summary["generated"] == 11
+    assert summary["samples"] == 11
     assert not run_path.exists()
 
     calls.clear()
@@ -7660,7 +7263,6 @@ def test_training_prefetch_maps_steps_to_sample_count(
         config_path,
         prefetch_steps=None,
         prefetch_start_step=2,
-        sampler_factory=_test_sampler_factory,
     )
 
     assert calls == [(3, 21, "random", 0)]
@@ -7671,7 +7273,6 @@ def test_training_prefetch_maps_steps_to_sample_count(
         config_path,
         prefetch_steps=0,
         prefetch_start_step=2,
-        sampler_factory=_test_sampler_factory,
     )
 
     assert calls == [(0, 3, "random", 0)]
@@ -7703,11 +7304,11 @@ def test_training_prefetch_respects_max_sample_index_limit(
     ):
         del self, workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
-        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+        return _prefetch_summary()
 
     monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
 
-    prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+    prefetch_training(config_path, prefetch_steps=0)
 
     assert calls == [(0, 2, "random", 2)]
 
@@ -7738,11 +7339,11 @@ def test_training_prefetch_forwards_top_view_dependency_flag(
     ):
         del self, start_sample_index, sample_count, workers, sample_mode, sample_index_limit
         calls.append(bool(include_top_view))
-        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+        return _prefetch_summary()
 
     monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
 
-    prefetch_training(config_path, prefetch_steps=1, sampler_factory=_test_sampler_factory)
+    prefetch_training(config_path, prefetch_steps=1)
 
     assert calls == [True]
 
@@ -7772,20 +7373,11 @@ def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
     ):
         del workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
-        return {
-            "generated": 3,
-            "missing": 0,
-            "downloaded": 0,
-            "bytes": 0,
-            "errors": 0,
-            "workers": 1,
-            "samples": int(sample_count),
-            "loader_sample_count": int(self.sample_count),
-        }
+        return {**_prefetch_summary(samples=int(sample_count)), "loader_sample_count": int(self.sample_count)}
 
     monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
 
-    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+    summary = prefetch_training(config_path, prefetch_steps=0)
 
     assert calls == [(0, 3, "random")]
     assert summary["samples"] == 3
@@ -7824,19 +7416,11 @@ def test_training_prefetch_max_steps_zero_prefetches_test_datasets(
     ):
         del workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(self.sample_count)))
-        return {
-            "generated": int(sample_count),
-            "missing": 0,
-            "downloaded": 0,
-            "bytes": 0,
-            "errors": 0,
-            "workers": 1,
-            "samples": int(sample_count),
-        }
+        return _prefetch_summary(samples=int(sample_count))
 
     monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
 
-    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+    summary = prefetch_training(config_path, prefetch_steps=0)
 
     assert calls == [(0, 3, "random", 3), (0, 2, "random", 2)]
     assert summary["samples"] == 5
@@ -7846,7 +7430,7 @@ def test_training_prefetch_rejects_negative_steps(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
 
     with pytest.raises(ValueError, match="--prefetch-steps must be >= 0"):
-        prefetch_training(config_path, prefetch_steps=-1, sampler_factory=_test_sampler_factory)
+        prefetch_training(config_path, prefetch_steps=-1)
 
 
 def test_training_config_parses_test_settings() -> None:
@@ -8251,7 +7835,7 @@ def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> No
     raw["strip_z_offset_count"] = 16
     raw["training"] = {"control_points_per_step": 4}
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
 
     batch = loader.load_batch(0, batch_size=4)
 
@@ -8326,7 +7910,7 @@ def test_training_batch_keeps_full_centerline_for_visualization(tmp_path: Path) 
     raw["augment_enabled"] = False
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = _make_loader(load_config(config_path))
+    loader = FiberStrip2DLoader(load_config(config_path))
     training = FiberStripTrainingConfig(train_control_points_per_step=1)
 
     loaded = _load_training_batch(
@@ -8359,7 +7943,7 @@ def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    run_dir = run_training(config_path)
 
     assert (run_dir / "snapshots" / "current.pt").is_file()
     assert (run_dir / "snapshots" / "best.pt").is_file()
@@ -8380,7 +7964,7 @@ def test_training_resume_continues_existing_checkpoint(tmp_path: Path) -> None:
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    run_dir = run_training(config_path)
     current_path = run_dir / "snapshots" / "current.pt"
     first_current = torch.load(current_path, map_location="cpu", weights_only=False)
     assert first_current["step"] == 1
@@ -8389,7 +7973,6 @@ def test_training_resume_continues_existing_checkpoint(tmp_path: Path) -> None:
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     resumed_run_dir = run_training(
         config_path,
-        sampler_factory=_test_sampler_factory,
         resume_checkpoint=current_path,
     )
 
@@ -8415,7 +7998,7 @@ def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: P
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    summary = run_benchmark(config_path, sampler_factory=_test_sampler_factory, batches=2, profile=True)
+    summary = run_benchmark(config_path, batches=2, profile=True)
 
     assert summary.batches == 2
     assert summary.patches == 6
@@ -8445,7 +8028,6 @@ def test_training_load_only_benchmark_skips_image_aug_and_model_work(tmp_path: P
 
     summary = run_benchmark(
         config_path,
-        sampler_factory=_test_sampler_factory,
         batches=2,
         profile=True,
         load_only=True,
@@ -8485,7 +8067,7 @@ def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: P
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    run_dir = run_training(config_path)
 
     current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
     best = torch.load(run_dir / "snapshots" / "best.pt", map_location="cpu", weights_only=False)
@@ -8524,7 +8106,7 @@ def test_zero_test_control_points_runs_trace2cp_over_full_test_set(
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    run_dir = run_training(config_path)
     stdout = capsys.readouterr().out
 
     current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)

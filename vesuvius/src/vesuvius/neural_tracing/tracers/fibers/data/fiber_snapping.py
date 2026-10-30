@@ -75,7 +75,7 @@ def frames(tangents):
 
 
 class PresenceTiles:
-    """Blocks of a zyx presence array (anything with ``read(start_zyx, size_zyx)`` and ``shape``) around xyz tiles,
+    """Blocks of a zyx presence array (a vc_reader ``ZarrReader``: ``read_region`` and ``shape``) around xyz tiles,
     returned in pinned memory when ``pinned`` (for asynchronous transfer to the GPU)."""
     def __init__(self, array, tile, margin, pinned=False):
         self.array, self.tile, self.margin, self.pinned = array, int(tile), int(margin), pinned
@@ -87,7 +87,7 @@ class PresenceTiles:
         a, b = np.maximum(lo, 0), np.minimum(hi, self.shape)
         out = torch.zeros(tuple(hi-lo), dtype=torch.uint8, pin_memory=self.pinned)
         if (b > a).all():
-            out.numpy()[tuple(slice(x-l, y-l) for x, y, l in zip(a, b, lo))] = self.array.read(tuple(a), tuple(b-a))
+            out.numpy()[tuple(slice(x-l, y-l) for x, y, l in zip(a, b, lo))] = self.array.read_region(tuple(a), tuple(b-a))
         return lo, out
 
 

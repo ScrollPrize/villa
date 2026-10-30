@@ -91,7 +91,7 @@ class FiberFollow:
             gpu_chunks=args.gpu_chunks, axis_workers=0,
             **{k: getattr(args, k) for k in ('ct', 'ct_level', 'ct_grid_scale', 'grid_scale', 'cache_dir', 'frame_checkpoint')})
         Path(args.state_dir).mkdir(parents=True, exist_ok=True)
-        self.tracer, self.vol, self.spec, self.policy = build_tracer(options)
+        self.tracer, self.ct, self.spec, self.policy = build_tracer(options)
         self.base_um = model_base_um(self.spec, args.base_um)
         self.g = float(self.spec.grid_scale)
         self.lock = threading.Lock()
@@ -124,9 +124,9 @@ class FiberFollow:
                 path[-1] = pos
             predictor = self.tracer.frame_predictor
             if predictor is not None:
-                frame = predict_frames(predictor, self.vol, [pos], [heading], [path], [family])[0]
+                frame = predict_frames(predictor, self.ct, self.spec, [pos], [heading], [path], [family])[0]
             else:
-                frame = ct_frame(self.vol, pos, heading)
+                frame = ct_frame(self.ct, self.spec, pos, heading)
             hist, hmask = trace_history(list(path), self.tracer.n_history)
             first = path[min(len(path)-1, 12)]-path[0]
             state = dict(pos=pos, frame=np.asarray(frame), hist=hist, hmask=hmask, heading_start=0, observed_path=path,
@@ -135,7 +135,7 @@ class FiberFollow:
                          seed_age=float(arclength(path)[-1]), seed_valid=True)
             return pos, heading, state
         try:
-            heading = ct_seed_heading(self.vol, pos, family)
+            heading = ct_seed_heading(self.ct, self.spec, pos, family)
         except SeedHeadingError:  # no clear sheet at the seed: VC3D's direction instead
             heading = direction
         return pos, (heading if heading @ direction >= 0 else -heading), None
@@ -226,9 +226,9 @@ class FiberFollow:
             families.append(self.family(request, heading))
         predictor = self.tracer.frame_predictor
         if predictor is not None:
-            frames = predict_frames(predictor, self.vol, path, priors, histories, families)
+            frames = predict_frames(predictor, self.ct, self.spec, path, priors, histories, families)
         else:
-            frames = [ct_frame(self.vol, pos, heading) for pos, heading in zip(path, priors)]
+            frames = [ct_frame(self.ct, self.spec, pos, heading) for pos, heading in zip(path, priors)]
         normals = np.asarray(frames, np.float64)[:, :, 0].copy()
         if not np.isfinite(normals).all() or np.any(np.linalg.norm(normals, axis=1) < 1e-8):
             raise ValueError('frame predictor returned invalid sheet normals')

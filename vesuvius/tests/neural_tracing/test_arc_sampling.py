@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.zarr_utils import zarr_volume
+
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_3d.arc_sampling import FiberLocation, ScrollArcSampler
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
@@ -134,7 +136,7 @@ def test_invalid_lengths_fail(points):
 
 def make_loader(*, dense=True, balanced=True, extra=None, source=None, points=None):
     line = [[16, 32, 32], [32, 32, 32], [48, 32, 32]] if points is None else points
-    records = [{"volume": np.zeros((64, 64, 64), np.uint8),
+    records = [{"volume_path": zarr_volume(np.zeros((64, 64, 64), np.uint8)),
                 "fiber": fiber(line, [[32, 32, 32]], source),
                 "scroll_id": "A", "dense_supervision": dense}]
     if extra:
@@ -194,7 +196,7 @@ def test_length_probabilities_do_not_depend_on_volume_level():
 
 @pytest.mark.parametrize("stride", [1, 4])
 def test_dense_json_supervises_only_selected_line_and_matches_nml(stride):
-    extra = {"volume": np.zeros((64, 64, 64), np.uint8),
+    extra = {"volume_path": zarr_volume(np.zeros((64, 64, 64), np.uint8)),
              "fiber": fiber([[16, 38, 32], [48, 38, 32]]),
              "scroll_id": "A", "dense_supervision": True}
     loader = make_loader(extra=[extra])

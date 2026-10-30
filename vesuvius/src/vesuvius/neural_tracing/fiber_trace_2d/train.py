@@ -36,7 +36,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     embedding_similarity_to_cp,
     presence_loss,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, SamplerFactory, load_config
+from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, load_config
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
@@ -1230,7 +1230,6 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
 def run_benchmark(
     config_path: str | Path,
     *,
-    sampler_factory: SamplerFactory | None = None,
     batches: int = 100,
     profile: bool = False,
     load_only: bool = False,
@@ -1249,7 +1248,7 @@ def run_benchmark(
         )
         else None
     )
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     device = resolve_torch_device(training.device)
     model: FiberStripDirectionNet | None = None
     top_model: FiberStripDirectionNet | None = None
@@ -1679,16 +1678,25 @@ def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
     }
 
 
-def _merge_prefetch_summaries(*summaries: dict[str, Any]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for summary in summaries:
-        for key, value in summary.items():
-            if isinstance(value, bool):
-                merged[key] = value
-            elif isinstance(value, (int, float)):
-                merged[key] = merged.get(key, 0) + value
-            else:
-                merged.setdefault(key, value)
+_SUMMED_PREFETCH_KEYS = (
+    "samples",
+    "skipped_samples",
+    "patches",
+    "valid_pixels",
+    "errors",
+    "remote_fetches",
+    "remote_bytes",
+)
+
+
+def _merge_prefetch_summaries(train: dict[str, Any], *others: dict[str, Any]) -> dict[str, Any]:
+    """Totals of several loaders' prefetch summaries; the sample index and workers stay the training loader's."""
+    merged = dict(train)
+    for summary in others:
+        for key in _SUMMED_PREFETCH_KEYS:
+            merged[key] += summary[key]
+        for key in ("first_error", "first_sample_skip"):
+            merged[key] = merged[key] or summary[key]
     return merged
 
 
@@ -2001,7 +2009,6 @@ def _load_training_resume_checkpoint(
 def run_training(
     config_path: str | Path,
     *,
-    sampler_factory: SamplerFactory | None = None,
     resume_checkpoint: str | Path | None = None,
 ) -> Path:
     raw_config = _load_raw_config(config_path)
@@ -2017,12 +2024,12 @@ def run_training(
         )
         else None
     )
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
     test_loader = (
         None
         if test_loader_config is None
-        else FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+        else FiberStrip2DLoader(test_loader_config)
     )
     device = resolve_torch_device(training.device)
     model = FiberStripDirectionNet(
@@ -2554,7 +2561,6 @@ def prefetch_training(
     *,
     prefetch_steps: int | None = None,
     prefetch_start_step: int = 1,
-    sampler_factory: SamplerFactory | None = None,
 ) -> dict[str, Any]:
     raw_config = _load_raw_config(config_path)
     training = _training_config_from_raw(raw_config)
@@ -2564,7 +2570,7 @@ def prefetch_training(
         raise ValueError("--prefetch-steps must be >= 0")
 
     loader_config = load_config(config_path)
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     sample_mode = "random"
     requested_prefetch_steps = None if prefetch_steps is None else int(prefetch_steps)
     prefetch_full_dataset = requested_prefetch_steps == 0 or (
@@ -2598,7 +2604,7 @@ def prefetch_training(
     if prefetch_full_dataset:
         test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
         if test_loader_config is not None:
-            test_loader = FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+            test_loader = FiberStrip2DLoader(test_loader_config)
             print(
                 "fiber_trace_2d prefetch test_datasets "
                 f"sample_mode={sample_mode} start_sample_index=0 samples={int(test_loader.sample_count)}",
@@ -2613,8 +2619,9 @@ def prefetch_training(
             summary = _merge_prefetch_summaries(summary, test_summary)
     print(
         "fiber_trace_2d prefetch complete "
-        f"generated={int(summary.get('generated', 0))} missing={int(summary.get('missing', 0))} "
-        f"downloaded={int(summary.get('downloaded', 0))} errors={int(summary.get('errors', 0))}",
+        f"samples={summary['samples']} skipped={summary['skipped_samples']} "
+        f"remote_fetches={summary['remote_fetches']} remote_bytes={summary['remote_bytes']} "
+        f"errors={summary['errors']}",
         flush=True,
     )
     return summary

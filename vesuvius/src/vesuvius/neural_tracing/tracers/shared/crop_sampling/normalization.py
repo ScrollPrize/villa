@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 import numba
 import numpy as np
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import open_ct_array
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 
 ZSCORE_METHOD = 'crop_zscore_v1'
@@ -46,7 +46,7 @@ def prepare_normalization(out, specs, *, known=None):
     document = json.loads(json.dumps(document))
     for spec in specs:
         key = volume_key(spec)
-        ct = open_ct_array(spec, 32 << 20)
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir)
         if (known is not None and key in known['volumes'] and key in document['volumes']
                 and known['volumes'][key] != document['volumes'][key]):
             print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)

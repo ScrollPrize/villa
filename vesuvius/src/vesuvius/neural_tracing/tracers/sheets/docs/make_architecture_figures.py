@@ -193,7 +193,7 @@ def load(checkpoint: str, path_map: list[str], device: str):
 
 def real_data(checkpoint: str, path_map: list[str], device: str):
     """Crops the model sees at the seed of a benchmark trace, and that trace."""
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+    from vc_reader.reader import open_zarr
     from vesuvius.neural_tracing.tracers.sheets.geometry import point_frames
     from vesuvius.neural_tracing.tracers.sheets.tracing.inference import read_block, resample, trace
     from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
@@ -212,7 +212,7 @@ def real_data(checkpoint: str, path_map: list[str], device: str):
     prev = torch.tensor(seed-d.step*unit, dtype=torch.float32, device=device)[None]
     front = Front(pos, prev, torch.ones(1, len(seed), device=device))
     tracer = Tracer(model, cfg, device)
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 29)
+    volume = open_zarr(d.volume, level=d.volume_level, memory_cache=1 << 29)
     block, origin = read_block(volume, seed, view_radius(cfg.model)+d.step+4, d.volume_level)
     block = torch.from_numpy(block).to(device).float()[None, None]
     origin = torch.from_numpy(origin).to(device)[None]
@@ -317,7 +317,7 @@ def crops_xy(checkpoint: str, path_map: list[str], device: str, name: str = 'cro
     """An xy slice (z = const) of the CT through a real seed whose advance is close to z, with the actual sample
     positions of the point and grid-column crops that fall in the slice."""
     from scipy.spatial import ConvexHull
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+    from vc_reader.reader import open_zarr
     from vesuvius.neural_tracing.tracers.sheets.geometry import chord_tangents, normalize, point_frames
     from vesuvius.neural_tracing.tracers.sheets.tracing.inference import resample
     from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
@@ -354,10 +354,10 @@ def crops_xy(checkpoint: str, path_map: list[str], device: str, name: str = 'cro
     z0 = float(seed[:, 2].mean())
     lo, hi = seed[:, :2].min(0)-70, seed[:, :2].max(0)+70
     level = cfg.data.volume_level
-    vol = ChunkedArray(f'{cfg.data.volume}/{level}', 1 << 28)
+    vol = open_zarr(cfg.data.volume, level=level, memory_cache=1 << 28)
     to_i = lambda v: int(np.floor((v+.5)/(1 << level)-.5))
     x0, x1, y0, y1, zi = to_i(lo[0]), to_i(hi[0])+2, to_i(lo[1]), to_i(hi[1])+2, int(round((z0+.5)/(1 << level)-.5))
-    img = vol.read((zi, y0, x0), (1, y1-y0, x1-x0))[0].astype(np.float32)
+    img = vol.read_region((zi, y0, x0), (1, y1-y0, x1-x0))[0].astype(np.float32)
     ext = [(x0+.5)*(1 << level)-.5, (x1+.5)*(1 << level)-.5, (y1+.5)*(1 << level)-.5, (y0+.5)*(1 << level)-.5]
     fig, axes = plt.subplots(1, 2, figsize=(17, 8.5), gridspec_kw=dict(width_ratios=[1.35, 1]))
     for ax, zoom in zip(axes, (None, 1)):

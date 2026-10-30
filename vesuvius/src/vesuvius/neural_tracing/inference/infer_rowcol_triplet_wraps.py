@@ -11,7 +11,7 @@ from scipy import ndimage
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-import vc
+from vc_reader.reader import open_group
 
 try:
     import trimesh
@@ -23,10 +23,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
-from vesuvius.neural_tracing.datasets.common import (
-    _read_volume_crop,
-    voxelize_surface_grid_masked,
-)
+from vesuvius.image_proc.intensity.normalization import normalize_zscore
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
     TTA_TRANSFORM_MODES,
@@ -99,72 +97,22 @@ _COPY_ARG_TO_CLI = {
 _DEFAULT_VOLUME_CHUNK_CACHE_GB = 20.0
 
 
-class _VcVolumeLevel:
-    """Small array adapter over vc.Volume for the crop reader used here."""
-
-    def __init__(self, volume, level):
-        self._volume = volume
-        self._level = int(level)
-        self.shape = tuple(int(v) for v in volume.shape_at(self._level))
-        self.dtype = np.dtype(volume.dtype)
-        self.chunks = tuple(int(v) for v in volume.chunk_shape(self._level))
-
-    def __getitem__(self, key):
-        if not isinstance(key, tuple) or len(key) != 3:
-            raise TypeError(f"vc volume reads require 3 ZYX slices, got {key!r}")
-        starts = []
-        stops = []
-        for axis, item in enumerate(key):
-            if not isinstance(item, slice):
-                raise TypeError(f"vc volume reads require slices, got axis {axis}: {item!r}")
-            step = 1 if item.step is None else int(item.step)
-            if step != 1:
-                raise ValueError(f"vc volume reads only support unit-step slices, got axis {axis} step={step}")
-            start = 0 if item.start is None else int(item.start)
-            stop = self.shape[axis] if item.stop is None else int(item.stop)
-            starts.append(start)
-            stops.append(stop)
-        read_shape = [stop - start for start, stop in zip(starts, stops)]
-        if any(v < 0 for v in read_shape):
-            raise ValueError(f"Invalid vc volume slice {key!r} for shape {self.shape}")
-        if any(v == 0 for v in read_shape):
-            return np.empty(tuple(read_shape), dtype=self.dtype)
-        return np.asarray(
-            self._volume.read_zyx(starts, read_shape, level=self._level, missing_policy="all_fill")
-        )
-
-
-def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
+def _open_volume_level(volume_path, volume_scale, chunk_cache_gb):
+    """Open pyramid level ``volume_scale`` of the OME-Zarr at ``volume_path``, or the nearest existing level."""
     path = str(volume_path)
-    cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
-    vc.set_chunk_cache_budget(cache_bytes)
-
+    remote = path.startswith(("http://", "https://", "s3://"))
+    # Remote chunks are cached under VC3D's remote cache root (viewer/remote_cache_dir).
+    group = open_group(
+        path,
+        cache_dir="vc3d" if remote else None,
+        memory_cache=int(round(float(chunk_cache_gb) * (1024 ** 3))),
+    )
+    levels = [int(v) for v in group.levels if v.isdigit()]
+    if not levels:
+        raise RuntimeError(f"volume {path!r} does not have any scale levels")
     target_level = int(volume_scale)
-    if path.startswith(("http://", "https://", "s3://")):
-        # Remote chunks are cached under VC3D's remote cache root (viewer/remote_cache_dir).
-        volume = vc.Volume.open_url(path)
-    else:
-        try:
-            volume = vc.Volume.open(path)
-        except RuntimeError as exc:
-            scale_path = Path(path) / str(target_level)
-            if not scale_path.exists():
-                raise
-            try:
-                volume = vc.Volume.open(str(scale_path))
-            except RuntimeError:
-                raise exc
-            return _VcVolumeLevel(volume, 0), target_level
-
-    if volume.has_scale_level(target_level):
-        level = target_level
-    else:
-        present_levels = [int(v) for v in volume.present_scale_levels()]
-        if not present_levels:
-            raise RuntimeError(f"vc volume {path!r} does not report any scale levels")
-        level = min(present_levels, key=lambda v: abs(v - target_level))
-
-    return _VcVolumeLevel(volume, level), level
+    level = target_level if target_level in levels else min(levels, key=lambda v: abs(v - target_level))
+    return group.array(str(level)), level
 
 
 def _empty_uv(dtype=np.int64):
@@ -262,38 +210,6 @@ def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
         )
 
     return tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc
-
-
-def _resolve_segment_volume(segment, volume_scale=None):
-    volume = segment.volume
-    if hasattr(volume, "read_zyx") and hasattr(volume, "shape_at"):
-        target_level = 0 if volume_scale is None else int(volume_scale)
-        return _VcVolumeLevel(volume, target_level)
-    if hasattr(volume, "keys") and not hasattr(volume, "shape"):
-        target_level = None
-        if volume_scale is not None:
-            target_level = int(volume_scale)
-        else:
-            extra = getattr(segment, "extra", None)
-            if isinstance(extra, dict):
-                for key in ("volume_scale", "vol_scale", "zarr_level", "volume_level", "level"):
-                    if key in extra:
-                        try:
-                            target_level = int(extra[key])
-                            break
-                        except (TypeError, ValueError):
-                            continue
-        if target_level is None:
-            target_level = 0
-        level_key = str(target_level)
-        if level_key in volume:
-            return volume[level_key]
-        numeric_levels = sorted([k for k in volume.keys() if k.isdigit()], key=int)
-        if numeric_levels:
-            level_ints = [int(k) for k in numeric_levels]
-            nearest = min(level_ints, key=lambda v: abs(v - target_level))
-            return volume[str(nearest)]
-    return volume
 
 
 def _bbox_to_min_corner_and_bounds_array(bbox):
@@ -1751,8 +1667,7 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
 
     cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
-    vol_crop = _read_volume_crop(volume_arr, crop_size, min_corner, max_corner)
-    vol_crop = vol_crop.astype(np.float32, copy=False)
+    vol_crop = normalize_zscore(volume_arr.read_region(min_corner, crop_size)).astype(np.float32, copy=False)
 
     return {
         "bbox_id": int(record.get("bbox_id", -1)),
@@ -2814,15 +2729,14 @@ def run(args):
                 "Triplet wrap inference currently requires isotropic stored scale; "
                 f"got scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
             )
-    volume_arr, resolved_volume_level = _open_vc_volume_level(
+    volume_arr, resolved_volume_level = _open_volume_level(
         args.volume_path,
         volume_scale=args.volume_scale,
-        cache_dir=args.volume_cache_dir,
         chunk_cache_gb=args.volume_chunk_cache_gb,
     )
     _log(
         args.verbose,
-        "resolved vc volume level "
+        "resolved volume level "
         f"shape={tuple(int(v) for v in volume_arr.shape)} "
         f"volume_scale={int(args.volume_scale)} "
         f"resolved_level={int(resolved_volume_level)} "

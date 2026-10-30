@@ -135,14 +135,15 @@ def path_features(path, pos, frame, window):
     return out.ravel()
 
 
-def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_targets=False, crops=None):
-    """CT patches (tracer sampler and normalization, or ``crops`` with the same values) and path features per head."""
+def model_inputs(ct, spec, cfg, positions, frames, paths, pool=None, *, normal_targets=False, crops=None):
+    """CT patches (tracer sampler and normalization, or ``crops`` with the same values) and path features per head;
+    ``pool`` computes the normal targets."""
     items = [dict(pos=np.asarray(p, np.float64), frame=np.asarray(f, np.float64)) for p, f in zip(positions, frames)]
     if normal_targets:
         from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import sample_training_crops
-        patch, normals, weights = sample_training_crops(items, vol, cfg, pool)
+        patch, normals, weights = sample_training_crops(items, ct, spec, cfg, pool)
     else:
-        patch = (crops or scalar_crops)(items, vol, cfg.patch, pool)
+        patch = (crops or scalar_crops)(items, ct, spec, cfg.patch)
     path = torch.from_numpy(np.stack([path_features(q, p, f, cfg.window) for q, p, f in zip(paths, positions, frames)]))
     return (patch, path, normals, weights) if normal_targets else (patch, path)
 
@@ -167,25 +168,25 @@ class HeadingPredictor:
     """Crop headings for tracer heads from (position, prior heading, observed path)."""
     def __init__(self, model, device='cpu', crops=None):
         self.model, self.device = model.to(device).eval(), torch.device(device)
-        self.crops = crops  # optional crop backend with crops.scalar_crops values (e.g. GPUChunkCache.crops)
+        self.crops = crops  # optional crop backend (items, ct, spec, crop) with crops.scalar_crops values (e.g. CUDA crops)
 
     @classmethod
     def load(cls, path, device='cpu'):
         return cls(load_heading_model(path, device)[0], device)
 
     @torch.no_grad()
-    def predict_with_normals(self, vol, positions, priors, paths, pool=None, *, families=None):
+    def predict_with_normals(self, ct, spec, positions, priors, paths, *, families=None):
         """World headings and unsigned world sheet-normal axes, using only the inference patch."""
         if not self.model.cfg.predict_normals:
             raise ValueError('This checkpoint has no normal head')
         if not len(positions):
             return [], []
-        frames, out = self._predict_local(vol, positions, priors, paths, pool, families)
+        frames, out = self._predict_local(ct, spec, positions, priors, paths, families)
         return self._world_normals(frames, out, priors)
 
-    def _predict_local(self, vol, positions, priors, paths, pool, families, *, non_blocking=False):
+    def _predict_local(self, ct, spec, positions, priors, paths, families, *, non_blocking=False):
         frames = prior_frames(priors)
-        patch, path = model_inputs(vol, self.model.cfg, positions, frames, paths, pool, crops=self.crops)
+        patch, path = model_inputs(ct, spec, self.model.cfg, positions, frames, paths, crops=self.crops)
         def transfer(value):
             if non_blocking and self.device.type == 'cuda' and value.device.type == 'cpu':
                 return value.pin_memory().to(self.device, non_blocking=True)
@@ -211,7 +212,7 @@ class HeadingPredictor:
         return family_ids(families, self.device)
 
     @torch.no_grad()
-    def predict_frames(self, vol, positions, priors, paths, families, previous=None, pool=None):
+    def predict_frames(self, ct, spec, positions, priors, paths, families, previous=None):
         """World crop frames (u,v,forward); H/V supplied explicitly, optional previous frames prevent roll flips."""
         if not self.model.cfg.predict_frames:
             raise ValueError('This checkpoint is not a family-conditioned frame model')
@@ -219,7 +220,7 @@ class HeadingPredictor:
             return []
         if previous is not None and len(previous) != len(positions):
             raise ValueError('Previous frames must match the position count')
-        heads, normals = self.predict_with_normals(vol, positions, priors, paths, pool, families=families)
+        heads, normals = self.predict_with_normals(ct, spec, positions, priors, paths, families=families)
         return self._world_frames(heads, normals, previous)
 
     @staticmethod
@@ -232,7 +233,7 @@ class HeadingPredictor:
         return list(frames.numpy())
 
     @torch.no_grad()
-    def predict_frames_batched(self, vol, positions, priors, paths, families, previous=None, pool=None, *, chunk=64):
+    def predict_frames_batched(self, ct, spec, positions, priors, paths, families, previous=None, *, chunk=64):
         """Queue the same chunked forwards before waiting for their small outputs.
 
         Crop/model/CPU frame batch sizes and arithmetic remain unchanged. Only
@@ -247,7 +248,7 @@ class HeadingPredictor:
         frames, outputs = [], []
         for start in range(0, len(positions), chunk):
             part = slice(start, start+chunk)
-            local_frames, out = self._predict_local(vol, positions[part], priors[part], paths[part], pool, families[part],
+            local_frames, out = self._predict_local(ct, spec, positions[part], priors[part], paths[part], families[part],
                                                   non_blocking=True)
             frames.extend(local_frames)
             outputs.append(out)

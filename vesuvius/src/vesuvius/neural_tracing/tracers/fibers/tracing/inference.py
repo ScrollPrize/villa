@@ -22,12 +22,13 @@ from datetime import datetime, timezone
 
 import numpy as np
 from scipy.spatial import cKDTree
+from vc_reader.reader import ZarrReader, open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
     ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY)
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
@@ -82,7 +83,7 @@ def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) ->
     }
 
 
-def trace_bidirectional(tracer: ModelTracer, vol: CTVolume, seeds_grid_xyz: np.ndarray, families):
+def trace_bidirectional(tracer: ModelTracer, ct: ZarrReader, spec: CTVolumeSpec, seeds_grid_xyz: np.ndarray, families):
     """Per-seed full polylines (grid xyz, backward->forward) and stop reasons.
 
     A seed without a usable CT heading yields ``(None, error message)`` and the rest of
@@ -98,7 +99,7 @@ def trace_bidirectional(tracer: ModelTracer, vol: CTVolume, seeds_grid_xyz: np.n
     axes, usable = [], []
     for index, (seed, family) in enumerate(zip(seeds, families)):
         try:
-            axes.append(ct_seed_heading(vol, seed, family))
+            axes.append(ct_seed_heading(ct, spec, seed, family))
             usable.append(index)
         except SeedHeadingError as error:
             out[index] = (None, str(error))
@@ -112,7 +113,7 @@ def trace_bidirectional(tracer: ModelTracer, vol: CTVolume, seeds_grid_xyz: np.n
     return out
 
 
-def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_length, dedupe, cp_every, provenance):
+def export_seeds(tracer, ct, spec, seeds, families, out, *, grid_scale, batch, min_length, dedupe, cp_every, provenance):
     """Trace seed batches and write fibers plus one status record per seed (``seeds.json``).
 
     Valid polylines are exported regardless of length unless ``min_length`` (base voxels)
@@ -136,7 +137,7 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
             keep = d * g > dedupe
             for index in np.flatnonzero(~keep):
                 record(int(index), 'skipped_duplicate_seed', distance_base=float(d[index]*g))
-        traced = trace_bidirectional(tracer, vol, chunk[keep], chunk_families[keep]) if keep.any() else []
+        traced = trace_bidirectional(tracer, ct, spec, chunk[keep], chunk_families[keep]) if keep.any() else []
         for index, (poly, reasons) in zip(np.flatnonzero(keep), traced):
             if poly is None:
                 record(int(index), 'unavailable', reason=reasons)
@@ -198,9 +199,10 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument('--crops', choices=('gpu', 'cpu'),
-                    help='gpu (default on CUDA): crops from a GPU chunk cache (within ~3e-5 of the CPU sampler) and the '
-                         'frame model on the GPU; cpu: the CPU sampler in a thread pool and the CPU frame model')
-    ap.add_argument('--gpu-chunks', type=int, default=512, help='GPU chunk cache slots (2 MiB each for 128^3 uint8)')
+                    help="gpu (default on CUDA): crops sampled by vc_reader's CUDA reader and the frame model on the GPU; "
+                         'cpu: the CPU sampler and the CPU frame model')
+    ap.add_argument('--gpu-chunks', type=int, default=512,
+                    help="CT chunks in the CUDA reader's device cache (2 MiB each for 128^3 uint8)")
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     ap.add_argument("--flow-samples", type=int, help="flow: Gaussian-start proposals per decision (default: checkpoint)")
     ap.add_argument("--flow-sample-scale", type=float, help="flow: their standard deviation in residual-scale units")
@@ -231,12 +233,12 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit, gate=gate)
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
-    vol = CTVolume(spec, cache_bytes=8 << 30)
-    tracer = tracer_class(model, vol, crop, n_hist, TraceParams.from_policy(policy, max_len=args.max_len,
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=8 << 30)
+    tracer = tracer_class(model, ct, spec, crop, n_hist, TraceParams.from_policy(policy, max_len=args.max_len,
         seed=args.sampling_seed, precision=args.precision, refit_retry=args.refit_retry), device=args.device)
     crops = args.crops or ('gpu' if str(args.device).startswith('cuda') else 'cpu')
     if crops == 'gpu' and isinstance(tracer, FiberTracer):  # legacy tracers keep their own sampler
-        use_gpu_crops(tracer, vol, args.device, args.gpu_chunks)
+        use_gpu_crops(tracer, args.device, args.gpu_chunks)
     g = spec.grid_scale
 
     seeds = [np.array([float(v) for v in s.split(",")]) for s in args.seed]
@@ -254,7 +256,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
                   "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
                   "checkpoint": checkpoint_source(args.checkpoint, checkpoint)}
     try:
-        written, statuses = export_seeds(tracer, vol, seeds, families, args.out, grid_scale=g, batch=args.batch,
+        written, statuses = export_seeds(tracer, ct, spec, seeds, families, args.out, grid_scale=g, batch=args.batch,
                                          min_length=args.min_length, dedupe=args.dedupe, cp_every=args.cp_every,
                                          provenance=provenance)
     finally:

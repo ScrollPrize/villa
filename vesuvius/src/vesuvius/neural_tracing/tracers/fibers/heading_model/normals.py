@@ -29,14 +29,14 @@ def normal_target_policy(cfg):
                 correction_weight='squared_projection_length')
 
 
-def training_crop(cfg, vol):
+def training_crop(cfg, spec):
     """Enclose the input and a head-centered tensor stencil, without shifting either grid.
 
     38 CT voxels = four integration sigmas + three derivative sigmas.
     For the current sources the shared crop is 44x34x34; input remains 32 cubed.
     """
     patch = cfg.patch
-    radius = math.ceil(NORMAL_TARGET_POLICY['context_radius_ct']/(patch.spacing*vol.input_scale))
+    radius = math.ceil(NORMAL_TARGET_POLICY['context_radius_ct']/(patch.spacing*spec.input_scale))
     before = max(0, radius-patch.behind)
     after = max(0, radius-(patch.depth-1-patch.behind))
     side = max(0, math.ceil(radius-(patch.width-1)/2))
@@ -59,9 +59,9 @@ def normal_target(raw, center, spacing):
     return vectors[:, -1].astype(np.float32), min(1., gap)
 
 
-def sample_training_crops(items, vol, cfg, pool=None):
-    crop, slices, radius = training_crop(cfg, vol)
-    raw = scalar_crops(items, vol, crop, pool, normalize=False).numpy()
+def sample_training_crops(items, ct, spec, cfg, pool=None):
+    crop, slices, radius = training_crop(cfg, spec)
+    raw = scalar_crops(items, ct, spec, crop, normalize=False).numpy()
     # Normalize only the actual input, not the larger context. Copy makes every patch contiguous.
     patch = raw[(slice(None), slice(None), *slices)].copy()
     center = np.array([crop.behind, (crop.width-1)/2, (crop.width-1)/2])
@@ -70,8 +70,8 @@ def sample_training_crops(items, vol, cfg, pool=None):
     stencil = tuple(slice(a, b) for a, b in zip(lo, hi))
 
     def finish(i):
-        target = normal_target(raw[(i, 0, *stencil)], center-lo, crop.spacing*vol.input_scale)
-        normalize_ct(patch[i, 0], vol.spec.ct_normalization)
+        target = normal_target(raw[(i, 0, *stencil)], center-lo, crop.spacing*spec.input_scale)
+        normalize_ct(patch[i, 0], spec.ct_normalization)
         return target
 
     targets = list(map(finish, range(len(items))) if pool is None else pool.map(finish, range(len(items))))

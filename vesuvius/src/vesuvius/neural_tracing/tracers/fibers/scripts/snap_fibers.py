@@ -15,16 +15,16 @@ from pathlib import Path
 import time
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_snapping import SnapConfig, snap_json, snap_store
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input', type=Path)
     ap.add_argument('output', type=Path)
-    ap.add_argument('--presence', required=True, help='Presence zarr array (a level directory, uint8, decoded)')
+    ap.add_argument('--presence', required=True, help='Presence zarr array (a level directory, uint8)')
     ap.add_argument('--native-per-voxel', type=float, required=True, help='Native base voxels per presence voxel')
     ap.add_argument('--offset', type=float, default=0., help='Presence-voxel offset subtracted after scaling')
     ap.add_argument('--output-step', type=float, default=1., help='Presence voxels between written points')
@@ -34,9 +34,9 @@ def main(argv=None):
         ap.add_argument('--'+field.replace('_', '-'), type=type(value), default=value)
     args = ap.parse_args(argv)
     cfg = SnapConfig(**{f: getattr(args, f) for f in SnapConfig().to_dict()})
-    presence = ChunkedArray(args.presence, 4 << 30)
+    presence = open_zarr(args.presence, memory_cache=4 << 30)
     if presence.dtype != np.dtype('uint8'):
-        raise ValueError('Presence must be a decoded uint8 array')
+        raise ValueError('Presence must be a uint8 array')
     provenance = dict(method='presence centroid snapping (data/fiber_snapping.py)', presence=str(Path(args.presence).resolve()),
                       native_per_voxel=args.native_per_voxel, offset=args.offset, output_step=args.output_step,
                       config=cfg.to_dict())

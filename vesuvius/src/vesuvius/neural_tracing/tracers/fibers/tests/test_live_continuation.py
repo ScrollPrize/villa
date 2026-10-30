@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import zarr
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, LiveContinuationSource
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
@@ -32,12 +34,12 @@ class Values:
 
 
 @pytest.fixture
-def setup(monkeypatch):
+def setup(monkeypatch, tmp_path):
     import vesuvius.neural_tracing.tracers.fibers.train.live_continuation as module
     # Deterministic in-process queues.
     monkeypatch.setattr(module.mp, 'get_context', lambda: SimpleNamespace(Queue=Queue, Value=Values))
     monkeypatch.setattr('vesuvius.neural_tracing.tracers.fibers.frames.ct.ct_tensor',
-                        lambda vol, pos: np.diag([3., 1., .1]))
+                        lambda ct, spec, pos: np.diag([3., 1., .1]))
     z = np.arange(500.)
     p = np.c_[100.+.4*np.sin(z/20), np.full(len(z), 100.), z+100.]
     fiber = TracedFiber('live', p, arclength(p), 'V', endpoint_stop=(True, True))
@@ -45,14 +47,18 @@ def setup(monkeypatch):
     cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32, n_future=16,
                        startup_shares=(0., 0., 0., 1.), excursion_probability=0., trace_noise_sigma=(0., 0.),
                        trace_noise_smoothing=0.)
-    ds = FollowDataset([fiber], CTVolumeSpec('unused'), cfg, chunk=2)
+    # An empty 1000^3 CT: only its shape (the trace bounds) is read; frames come from the patched CT tensor.
+    zarr.create_array(str(tmp_path/'ct'/'0'), shape=(1000,)*3, chunks=(250,)*3, dtype='u1', fill_value=0,
+                      zarr_format=2, compressors=None)
+    spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level)
+    ds = FollowDataset([fiber], spec, cfg, chunk=2)
     live = LiveContinuationSource(policy=POLICY, steps=(4, 4), step=ds.step)
     ds.live_continuation = live
-    vol = SimpleNamespace(shape=(1000,)*3)
     rng = np.random.default_rng(5)
     item = start(ds, fiber, 100., False, rng)
-    orient_item(item, vol)
-    return live, ds, vol, rng, item
+    orient_item(item, ct, spec)
+    return live, ds, ct, rng, item
 
 
 def start(ds, fiber, t, reverse, rng):
@@ -76,13 +82,13 @@ def proposal(live, item, step=100, confidence=None, lateral=.2, drift=0.):
 
 
 def test_live_state_matches_next_inference_observation(setup):
-    live, ds, vol, rng, item = setup
+    live, ds, ct, rng, item = setup
     reverse = True
     item = start(ds, ds.fibers[0], 100., True, rng)
-    orient_item(item, vol)
+    orient_item(item, ct, ds.vol_spec)
     state = proposal(live, item, confidence=[.9]*7+[.1]*9)
     assert state['commit'] == 7
-    result = live.advance(state, ds, vol, rng)
+    result = live.advance(state, ds, ct, rng)
     assert result['live_continuation'] and result['live_depth'] == 1
     assert result['supervision'] == FOLLOWING and not result['live_terminal']
 
@@ -96,7 +102,7 @@ def test_live_state_matches_next_inference_observation(setup):
         def build_inputs(self, *args):
             return None
 
-    tracer = Tracer(Policy(), vol, ds.cfg.crop, ds.cfg.n_history, TraceParams(n_commit=16, gate='prefix'), device='cpu')
+    tracer = Tracer(Policy(), ct, ds.vol_spec, ds.cfg.crop, ds.cfg.n_history, TraceParams(n_commit=16, gate='prefix'), device='cpu')
     initial = dict(item, hist=item['hist_local'] @ item['frame'].T+item['pos'], heading_start=0)
     observations = []
     def observe(i, decision):

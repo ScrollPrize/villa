@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, tangent_a
 from vesuvius.neural_tracing.tracers.shared.io import jsonable
 
 
-def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
+def make_seeds(fibers: list[TracedFiber], ct, spec, per_fiber: int = 3,
                margin: float = 32.0, seed: int = 0):
     """Annotated positions, CT/HV axes; one entry per (seed, direction).
 
@@ -34,7 +34,7 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
             p = interp_at(f.points, f.s, np.array([t]))[0]
             tau = tangent_at(f.points, f.s, t)
             try:
-                ax = oriented_seed_heading(vol, p, f.tag, tau)
+                ax = oriented_seed_heading(ct, spec, p, f.tag, tau)
             except SeedHeadingError as error:
                 warnings.warn(f'Skipping seed for {f.name} at {p.tolist()}: {error}', stacklevel=2)
                 continue
@@ -45,7 +45,7 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
     return out
 
 
-def directed_seed(fiber: TracedFiber, vol, rng, sign: float, margin: float = 32.0):
+def directed_seed(fiber: TracedFiber, ct, spec, rng, sign: float, margin: float = 32.0):
     """One annotated position and its CT/HV axis in one traversal direction.
 
     Returns None for a fiber too short for the margin. Missing CT orientation raises
@@ -56,7 +56,7 @@ def directed_seed(fiber: TracedFiber, vol, rng, sign: float, margin: float = 32.
     ts = np.arange(margin, fiber.length-margin, 4.0)
     t = float(ts[int(rng.integers(len(ts)))])
     p = interp_at(fiber.points, fiber.s, np.array([t]))[0]
-    axis = oriented_seed_heading(vol, p, fiber.tag, tangent_at(fiber.points, fiber.s, t))
+    axis = oriented_seed_heading(ct, spec, p, fiber.tag, tangent_at(fiber.points, fiber.s, t))
     return dict(t=t, sign=float(sign), pos=p, heading=float(sign)*axis, family=fiber.tag,
                 seed_heading_policy=SEED_HEADING_POLICY)
 

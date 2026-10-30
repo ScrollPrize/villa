@@ -1,11 +1,14 @@
-"""CPU crop sampling: the fused sampler and per-crop z-score equal their plain NumPy definitions bit for bit."""
+"""CPU crop sampling: vc_reader crops (crops.scalar_crops) equal their plain NumPy definition up to float32
+interpolation, and the per-crop z-score equals its NumPy definition bit for bit."""
 import numpy as np
 import pytest
+import zarr
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.fast_sample import sample_scalar_crop
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
     ZSCORE_EPSILON, ZSCORE_METHOD, normalize_ct)
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, crop_local_grid
 
 RECORD = dict(method=ZSCORE_METHOD)
@@ -33,17 +36,24 @@ def reference_crop(raw, start, pos, frame, crop):
 
 @pytest.mark.parametrize('crop', [CropSpec(depth=20, width=16, behind=10, spacing=.5),
                                   CropSpec(depth=12, width=10, height=6, behind=3.5, spacing=1.)])
-@pytest.mark.parametrize('clip', [0, 5])
-def test_sampler_matches_reference(crop, clip):
-    rng = np.random.default_rng(clip)
-    for _ in range(3):
-        frame = np.linalg.qr(rng.normal(size=(3, 3)))[0]*1.5
-        pos = rng.uniform(40, 60, 3)
-        start, size = tight_block(pos, frame, crop, 1.)
-        raw = rng.integers(0, 256, (1, *(size-clip)), dtype=np.uint8)  # clipped: samples reach past the block
-        out = np.empty((crop.depth, crop.height or crop.width, crop.width), np.float32)
-        sample_scalar_crop(raw, start, pos, frame, crop, out)
-        assert np.array_equal(out.view(np.uint32), reference_crop(raw, start, pos, frame, crop).view(np.uint32))
+@pytest.mark.parametrize('input_scale', [1, 2])
+def test_scalar_crops_match_reference(tmp_path, crop, input_scale):
+    """Crop geometry (``crop_grids``: positions, frames and the CT scale) and trilinear values, zero outside the
+    array, on a chunked local Zarr; rows near the edge reach past the array."""
+    rng = np.random.default_rng(input_scale)
+    raw = rng.integers(0, 256, (40, 44, 48), dtype=np.uint8)
+    array = zarr.create_array(str(tmp_path/'ct'/'0'), shape=raw.shape, chunks=(16, 16, 16), dtype='u1', fill_value=0,
+                              zarr_format=2, compressors=None)
+    array[:] = raw
+    spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0, ct_grid_scale=4., grid_scale=4.*input_scale)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level)
+    frames = [np.linalg.qr(rng.normal(size=(3, 3)))[0]*1.5 for _ in range(4)]
+    positions = [rng.uniform(2, 38, 3)/input_scale for _ in range(4)]
+    items = [dict(pos=p, frame=f) for p, f in zip(positions, frames)]
+    crops = scalar_crops(items, ct, spec, crop, normalize=False).numpy()
+    for crop_values, p, f in zip(crops, positions, frames):
+        expected = reference_crop(raw[None], np.zeros(3), p*input_scale, f*input_scale, crop)
+        np.testing.assert_allclose(crop_values[0], expected, rtol=0, atol=1e-5)
 
 
 def test_normalize_matches_numpy():
