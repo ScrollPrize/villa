@@ -716,3 +716,7 @@ Workflow:
 - click `Similarity For Selected Points` or `Similarity For All Points`
 
 The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid only inside the active bbox for the selected OME-Zarr scale, and limits the PCA and cosine-similarity outputs to that same crop. The dock widget opens on the bottom of the napari window.
+
+## Parting: layer contacts
+
+`dinovol_2/eval/parting/` scores, at a contact where two traced papyrus layers touch, whether a candidate point lies on the same layer as a given point, from the released `scrollprize/dinovol_ps8_9.6um_101626` teacher tokens plus CT profiles. It is headless (`python -m dinovol_2.eval.parting sites|features|fit|score|compare|frag3`), its trained model is [`SharpMeow/parting-v1`](https://huggingface.co/SharpMeow/parting-v1) on Hugging Face, and it needs the `parting` extra (`uv sync --extra parting`). See [its README](dinovol_2/eval/parting/README.md).
