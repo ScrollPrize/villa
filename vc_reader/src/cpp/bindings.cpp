@@ -90,8 +90,6 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
     return counts;
 }
 
-#include "aligned/bindings.hpp"
-#include "surface/bindings.hpp"
 #include "sheet_normal/bindings.hpp"
 #include "geometry/bindings.hpp"
 #include "grid/bindings.hpp"
@@ -134,8 +132,6 @@ NB_MODULE(_reader, m)
 #else
     m.def("reader_cuda_available", &vcr::cuda::available);
 #endif
-    vcr::aligned::bind(m);
-    vcr::surface::bind(m);
     vcr::sheet_normal::bind(m);
     vcr::geometry::bind(m);
     vcr::grid::python::bind(m);

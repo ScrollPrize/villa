@@ -274,7 +274,7 @@ def surface_workload(args, volume_shape):
     scale = np.asarray(meta["scale"], dtype=np.float32)
     with SurfaceGeometry(surface) as geometry:
         # tifxyz scale is XY; public patch dimensions and starts are YX.
-        extent = np.floor((np.asarray(geometry.geometry.shape)-1)/scale[::-1]).astype(int)+1
+        extent = np.floor((np.asarray(geometry.shape)-1)/scale[::-1]).astype(int)+1
         size = np.asarray(args.surface_size)
         if np.any(size > extent):
             raise ValueError(f"--surface-size does not fit supported UV extent {extent.tolist()}")
@@ -293,9 +293,8 @@ def surface_workload(args, volume_shape):
             col = tiles[index]
             points, _ = geometry.read_points((row,col),tuple(size))
             # Keep coordinates local before applying a requested volume-level scale.
-            from vc_reader.surface import _transform
-            local, base = _transform(points[0], Affine.scale(args.surface_coordinate_scale))
-            local = np.ascontiguousarray(local[...,::-1]); base = tuple(reversed(base))
+            local = np.asarray(points[0], np.float32) * np.float32(args.surface_coordinate_scale)
+            local = np.ascontiguousarray(local[...,::-1]); base = (0, 0, 0)
             shape = tuple(int(n) for n in size)
             lower = local.reshape(-1,3).min(axis=0)
             upper = local.reshape(-1,3).max(axis=0)
@@ -305,7 +304,7 @@ def surface_workload(args, volume_shape):
             descriptions.append(dict(uv_start=[row,col],shape=list(shape),coordinate_origin=base,
                 local_coordinates_sha256=hashlib.sha256(local.tobytes()).hexdigest(),
                 bounds_zyx=[[float(v)+b for v,b in zip(lower,base)],[float(v)+b for v,b in zip(upper,base)]]))
-        stored_shape = geometry.geometry.shape
+        stored_shape = geometry.shape
     filenames = ["meta.json","x.tif","y.tif","z.tif"] + (["mask.tif"] if (path/"mask.tif").exists() else [])
     return requests, dict(path=str(path),uuid=meta.get("uuid"),stored_shape=stored_shape,
         scale_xy=scale.tolist(),voxel_size_um=meta.get("voxel_size_um"),

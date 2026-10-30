@@ -77,7 +77,7 @@ class TrainingTests(unittest.TestCase):
         result = dataset[0]
         np.testing.assert_array_equal(result['label_valid'][..., :2], False)
         np.testing.assert_array_equal(result['label'][0, :, 2:], np.tile([0, 1, 2], (4, 1)))
-        self.assertIs(dataset.reader(0)._options['memory_cache'], dataset.reader(1)._options['memory_cache'])
+        self.assertIs(dataset.reader(0)._memory, dataset.reader(1)._memory)
         self.assertLessEqual(dataset._runtime[2].nbytes, dataset.memory_cache_bytes)
         with data_loader(dataset, workers=1, batch_size=1) as loader:
             actual = next(iter(loader))

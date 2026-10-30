@@ -9,21 +9,10 @@ from .. import _reader
 from ..sources import Source
 from ._indexing import parse_index
 from .decoded_cache import DEFAULT_DECODE_BYTES, DecodedCache
-from .zarr_reader import ZarrReader, _make_settings, _memory_cache, _open_options
+from .zarr_reader import _make_settings, _memory_cache, _open_options
 
 _ZARR_OPTIONS = {'auth', 'cache_dir', 'cache_writes', 'cache_max_bytes', 'offline', 'memory_cache', 'compress_cache',
                  'allow_lossy_cache', 'threads', 'connections', 'read_mode'}
-
-
-class _ZarrBackend:
-    """The opened Zarr array as a :class:`ZarrReader`, for samplers that read it directly."""
-
-    def __init__(self, native, options, cache):
-        self._native = native
-        self.fill_value = native.fill_value
-        opened = native.zarr_array()
-        settings, _ = _make_settings(opened.location, **{k: v for k, v in options.items() if k != 'memory_cache'})
-        self.reader = ZarrReader(settings, cache, opened=opened)
 
 
 class SourceReader:
@@ -64,7 +53,6 @@ class SourceReader:
         self._pid = os.getpid()
         self._memory = _memory_cache(self._options.get('memory_cache'))
         self._native = None
-        self._backend_cache = None
 
     def _options_for(self, location):
         """The native options of one location, in this process."""
@@ -76,9 +64,7 @@ class SourceReader:
             raise ValueError('reader is closed')
         if self._native is None:
             self._native = _reader.SourceReader(self.source, self._options_for, self.decoded_cache)
-        if self._pid != os.getpid():
-            self._pid = os.getpid()
-            self._backend_cache = None
+        self._pid = os.getpid()
         return self._native
 
     @classmethod
@@ -92,7 +78,6 @@ class SourceReader:
         reader._pid = os.getpid()
         reader._memory = parent._memory
         reader._native = native
-        reader._backend_cache = None
         return reader
 
     @property
@@ -132,19 +117,6 @@ class SourceReader:
         engine = self._engine()
         return {name: SourceReader._wrap(engine.companion(name), self) for name in engine.companion_names}
 
-    @property
-    def _is_direct(self):
-        return self._engine().is_direct
-
-    @property
-    def _backend(self):
-        engine = self._engine()
-        if not engine.is_zarr:
-            return None
-        if self._backend_cache is None:
-            self._backend_cache = _ZarrBackend(engine, self._options, self._memory)
-        return self._backend_cache
-
     def __getitem__(self, key):
         """Read a NumPy-style selection of the selected, encoded source array."""
         engine = self._engine()
@@ -169,17 +141,10 @@ class SourceReader:
         return self._engine().read_many([(list(map(operator.index, start)), list(map(operator.index, size))) for start, size in regions])
 
     def stats(self):
-        engine = self._engine()
-        result = engine.stats()
-        if engine.is_zarr:
-            result['zarr'] = self._backend.reader.stats()
-        else:
-            del result['zarr_cache_bytes'], result['zarr_chunk_bytes']
-        return result
+        return self._engine().stats()
 
     def close(self):
         if not self._closed:
-            self._backend_cache = None
             if self._native is not None:
                 self._native.close()
             self._native = None

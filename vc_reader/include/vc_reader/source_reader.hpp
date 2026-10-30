@@ -37,6 +37,9 @@ struct DecodeBudgetError : std::runtime_error {
 // Its name as numpy prints it: "uint8", "float32"; a typestr in the other byte order is kept.
 [[nodiscard]] std::string dtypeName(std::string_view typestr);
 
+// The bytes of a number as an element of a dtype; std::invalid_argument when it cannot hold it.
+[[nodiscard]] std::vector<std::uint8_t> elementBytes(const nlohmann::json& value, const std::string& typestr);
+
 // An owned C-order block of elements.
 struct Block {
     std::vector<std::int64_t> shape;
@@ -281,6 +284,7 @@ public:
         DecodedCache::Stats decodedCache;
         std::size_t remoteBytes = 0, encodedCacheHits = 0, imagePayloadBytes = 0;
         std::size_t zarrCacheBytes = 0, zarrChunkBytes = 0;
+        nlohmann::json zarr;  // the array's own counters; null for image files
     };
     [[nodiscard]] Stats stats();
     [[nodiscard]] std::string temporaryDirectory() const;

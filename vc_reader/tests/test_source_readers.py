@@ -312,7 +312,7 @@ class SourceReaderTests(unittest.TestCase):
 
         def threads(reader):
             reader.read((0, 0, 0), (1, 1, 2))
-            return reader._backend.reader.threads
+            return reader._engine().zarr_array().array.threads
 
         default = min(16, os.cpu_count() or 4)
         with source.open() as reader:

@@ -160,7 +160,7 @@ class PairedTests(unittest.TestCase):
         asset = self.pair(render, label)
         for backend in self.backends():
             with asset.open_paired(level=1, backend=backend) as reader:
-                self.assertEqual(reader.metadata['label_selection'].array_path, '2')
+                self.assertEqual(reader.metadata['label_selection']['array_path'], '2')
                 result = reader[:, :]
                 np.testing.assert_array_equal(host(result['image'].data), image[None, :, ::2, ::2])
                 np.testing.assert_array_equal(host(result['label'].data), labels[None, ::2, ::2])

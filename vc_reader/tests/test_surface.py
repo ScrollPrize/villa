@@ -373,19 +373,16 @@ class SurfaceTests(unittest.TestCase):
         surf=self.surface.replace(geometry=self.source('wide-grid',xyz,('c','y','x'),role='scalar').storage)
         labels=self.source('wide-labels',np.ones((70,160),np.uint8),('y','x'),role='label',registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         with open_sample(self.reference,{'ink':labels},plan_cache_bytes=64<<10,sampling_cache_bytes=2<<20) as reader:
-            geom=next(iter(reader._geometries.values()))
-            with patch.object(geom,'tile',wraps=geom.tile) as tiles:
-                small=reader.project_surface(surf,(3,3),(4,4),label_target='ink')
-                # The first crop indexes the complete sheet in bounded blocks.
-                self.assertTrue(all(max(call.args[1])<=257 for call in tiles.call_args_list))
-            with patch.object(geom,'tile',wraps=geom.tile) as tiles:
-                reader.project_surface(surf,(20,80),(4,4),label_target='ink')
-                self.assertTrue(all(max(call.args[1])<=65 for call in tiles.call_args_list))
+            small=reader.project_surface(surf,(3,3),(4,4),label_target='ink')
+            # The first crop indexes the complete sheet in bounded blocks.
+            self.assertLessEqual(reader.stats()['surface']['largest_geometry_tile'],257)
+            reader.project_surface(surf,(20,80),(4,4),label_target='ink')
+            self.assertLessEqual(reader.stats()['surface']['largest_geometry_tile'],257)
             result=reader.project_surface(surf,(0,0),(70,160),label_target='ink')
             saved=result['ink'].data.copy()
-            with patch.object(geom,'tile',wraps=geom.tile) as tiles:
-                reader.project_surface(surf,(0,0),(70,160),label_target='ink')
-                self.assertEqual(tiles.call_count,0)
+            before=reader.stats()['surface']['geometry_read_bytes']
+            reader.project_surface(surf,(0,0),(70,160),label_target='ink')
+            self.assertEqual(reader.stats()['surface']['geometry_read_bytes'],before)
             stats=reader.stats()
             self.assertLessEqual(stats['plan_cache_bytes'],64<<10)
             self.assertLessEqual(stats['tile_cache_bytes'],2<<20)

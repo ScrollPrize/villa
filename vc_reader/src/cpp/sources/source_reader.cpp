@@ -94,51 +94,6 @@ json elementValue(const std::uint8_t* p, const ElementType& type)
     }
 }
 
-// The bytes of a fill value in a dtype; std::invalid_argument when it cannot hold it.
-std::vector<std::uint8_t> elementBytes(const json& value, const std::string& typestr)
-{
-    const auto type = elementType(typestr);
-    const auto unrepresentable = [&] { bad("fill value " + value.dump() + " is not representable in " + dtypeName(typestr)); };
-    std::uint8_t b[8]{};
-    if (type.kind == 'f') {
-        const double v = value.get<double>();
-        if (type.itemsize == 4) {
-            const auto f = float(v);
-            if (std::isfinite(v) && !std::isfinite(f)) unrepresentable();
-            std::memcpy(b, &f, 4);
-        } else {
-            std::memcpy(b, &v, 8);
-        }
-    } else {
-        const bool isSigned = type.kind == 'i';
-        const int bits = type.kind == 'b' ? 1 : int(type.itemsize) * 8;
-        if (value.is_number_float()) {
-            const double v = value.get<double>();
-            if (!std::isfinite(v) || v != std::floor(v) || std::abs(v) >= 1.8446744073709552e19) unrepresentable();
-        }
-        std::uint64_t magnitude = 0;
-        bool negative = false;
-        if (value.is_number_float()) {
-            const double v = value.get<double>();
-            negative = v < 0;
-            magnitude = std::uint64_t(std::abs(v));
-        } else if (value.is_number_unsigned()) {
-            magnitude = value.get<std::uint64_t>();
-        } else {
-            const auto v = value.get<std::int64_t>();
-            negative = v < 0;
-            magnitude = negative ? ~std::uint64_t(v) + 1 : std::uint64_t(v);
-        }
-        const std::uint64_t maximum = type.kind == 'b' ? 1 : isSigned ? (std::uint64_t(1) << (bits - 1)) - 1 : (bits == 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << bits) - 1);
-        if (negative && (!isSigned || magnitude > maximum + 1)) unrepresentable();
-        if (!negative && magnitude > maximum) unrepresentable();
-        const std::uint64_t raw = negative ? ~magnitude + 1 : magnitude;
-        std::memcpy(b, &raw, type.itemsize);
-    }
-    if (type.swap) std::reverse(b, b + type.itemsize);
-    return std::vector<std::uint8_t>(b, b + type.itemsize);
-}
-
 void fillBlock(Block& block, const std::vector<std::uint8_t>& element)
 {
     const auto size = element.size();
@@ -256,6 +211,50 @@ Block takeAlong(const Block& block, std::size_t axis, const std::vector<std::int
     return out;
 }
 } // namespace
+
+std::vector<std::uint8_t> elementBytes(const json& value, const std::string& typestr)
+{
+    const auto type = elementType(typestr);
+    const auto unrepresentable = [&] { throw std::invalid_argument("fill value " + value.dump() + " is not representable in " + dtypeName(typestr)); };
+    std::uint8_t b[8]{};
+    if (type.kind == 'f') {
+        const double v = value.get<double>();
+        if (type.itemsize == 4) {
+            const auto f = float(v);
+            if (std::isfinite(v) && !std::isfinite(f)) unrepresentable();
+            std::memcpy(b, &f, 4);
+        } else {
+            std::memcpy(b, &v, 8);
+        }
+    } else {
+        const bool isSigned = type.kind == 'i';
+        const int bits = type.kind == 'b' ? 1 : int(type.itemsize) * 8;
+        if (value.is_number_float()) {
+            const double v = value.get<double>();
+            if (!std::isfinite(v) || v != std::floor(v) || std::abs(v) >= 1.8446744073709552e19) unrepresentable();
+        }
+        std::uint64_t magnitude = 0;
+        bool negative = false;
+        if (value.is_number_float()) {
+            const double v = value.get<double>();
+            negative = v < 0;
+            magnitude = std::uint64_t(std::abs(v));
+        } else if (value.is_number_unsigned()) {
+            magnitude = value.get<std::uint64_t>();
+        } else {
+            const auto v = value.get<std::int64_t>();
+            negative = v < 0;
+            magnitude = negative ? ~std::uint64_t(v) + 1 : std::uint64_t(v);
+        }
+        const std::uint64_t maximum = type.kind == 'b' ? 1 : isSigned ? (std::uint64_t(1) << (bits - 1)) - 1 : (bits == 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << bits) - 1);
+        if (negative && (!isSigned || magnitude > maximum + 1)) unrepresentable();
+        if (!negative && magnitude > maximum) unrepresentable();
+        const std::uint64_t raw = negative ? ~magnitude + 1 : magnitude;
+        std::memcpy(b, &raw, type.itemsize);
+    }
+    if (type.swap) std::reverse(b, b + type.itemsize);
+    return std::vector<std::uint8_t>(b, b + type.itemsize);
+}
 
 // ---- exact encodings ----
 // Sorted lookup; no label passes through a float.
@@ -1336,6 +1335,11 @@ SourceReader::Stats SourceReader::stats()
         const auto& options = backend_->options;
         out.zarrCacheBytes = options.memoryCache ? options.memoryCache->nbytes() : 0;
         out.zarrChunkBytes = backend_->reader->meta.chunkBytes();
+        auto& array = *backend_->reader->array;
+        const auto& counters = array.stats();
+        out.zarr = {{"memory_hits", counters.memory_hits.load()}, {"pending_hits", counters.pending_hits.load()}, {"pending_writes", array.pending_writes()},
+                    {"disk_hits", counters.disk_hits.load()}, {"remote_fetches", counters.remote_fetches.load()}, {"remote_missing", counters.remote_missing.load()},
+                    {"remote_bytes", counters.remote_bytes.load()}, {"write_errors", counters.write_errors.load()}, {"last_write_error", array.last_write_error()}};
     }
     return out;
 }

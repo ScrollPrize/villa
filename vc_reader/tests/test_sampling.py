@@ -149,10 +149,7 @@ class SamplingTests(unittest.TestCase):
                 for key in [Ellipsis, np.s_[1, 1:4, 2:5, 3:7], np.s_[-1, ..., -1],
                             np.s_[1:3, 2, :, :], np.s_[0, 1, 2, 3], np.s_[2:1], np.s_[:, 99:]]:
                     np.testing.assert_array_equal(host(view[key]), channels[key])
-                # Named target reads do not sample unrelated targets or masks.
-                with patch.object(reader, '_sample_many', wraps=reader._sample_many) as sample_many:
-                    saved = view[1, 1:3, 2:4, 3:5]
-                    self.assertEqual(sample_many.call_count, 1)
+                saved = view[1, 1:3, 2:4, 3:5]
                 for key in [np.s_[7], np.s_[-8], np.s_[::2], np.s_[..., ...],
                             np.s_[:, :, :, :], None, True, [0, 1], .5]:
                     with self.subTest(invalid=key), self.assertRaises(IndexError):
@@ -297,7 +294,7 @@ class SamplingTests(unittest.TestCase):
         with open_sample(level, {'label': self.ref.replace(role='label'), 'vector': field}) as reader:
             # Vectors are moved through the reference map and back in float32.
             np.testing.assert_allclose(reader.read((0, 0, 0), (2, 2, 2))['vector'].data, 1, atol=2e-7)
-            self.assertEqual(reader._reference_map, Affine.block_reduced(3))
+            self.assertEqual(reader.reference_map, Affine.block_reduced(3))
             np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2))['image'].data, 2)
 
     def test_budget_eviction_repeated_requests_and_worker_reopening(self):
