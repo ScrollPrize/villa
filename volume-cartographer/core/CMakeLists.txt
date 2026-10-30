@@ -25,7 +25,6 @@ add_library(vc_core
         src/UnixSocket.cpp
         src/VoxelSizeMetadata.cpp
         src/SparseChunkSpool.cpp
-        src/Compositing.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
@@ -34,7 +33,6 @@ add_library(vc_core
         src/SurfaceMeshing.cpp
         src/Tiff.cpp
         src/Zarr.cpp
-        src/VcDataset.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp
@@ -47,13 +45,8 @@ add_library(vc_core
         src/StoredCollection.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/ChunkCache.cpp
-        src/render/ChunkRequestScheduler.cpp
-        src/render/DecodedChunkCacheBudget.cpp
-        src/render/PersistentZarrCacheBudget.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
-        src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -71,15 +64,10 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored c3d and volcomp codecs.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:utils_c3d_codec>
-    vc_delta3d::vc_delta3d
-    $<BUILD_INTERFACE:utils_volcomp_codec>
 )
 target_link_libraries(vc_core PRIVATE
-    Blosc::blosc
     ${VC_LIBBACKTRACE}
 )
 

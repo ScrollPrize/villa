@@ -1291,12 +1291,6 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 // }
 
 
-// struct DSReader
-// {
-//     z5::Dataset *ds;
-//     float scale;
-//     ChunkCache *cache;
-// };
 
 
 

@@ -1608,7 +1608,7 @@ static int run_main(int argc, char *argv[])
     }
 
 #if defined(_WIN32)
-    // Skip CRT shutdown: live worker threads (ChunkCache IO pool, OpenMP)
+    // Skip CRT shutdown: live worker threads (vc_reader pools, OpenMP)
     // deadlock Windows DLL-detach/static-destructor teardown, leaving the
     // process alive after main() returns — VC3D then never sees the tool
     // finish. Same approach as VC3D's own main().

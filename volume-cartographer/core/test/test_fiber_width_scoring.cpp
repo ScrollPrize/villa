@@ -4,7 +4,7 @@
 #include "vc/fiber_tracer/FiberWidth.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
 #include "vc/lasagna/Dataset.hpp"
-#include <utils/zarr.hpp>
+#include <vc_reader/zarr.hpp>
 #include <fstream>
 #include <random>
 #include <cstdlib>
@@ -16,15 +16,13 @@ TEST_CASE("packed uint8 base widths are converted into tracing coordinates") {
     namespace fs = std::filesystem;
     const auto root = fs::temp_directory_path() / ("fiber_width_packed_" + std::to_string(std::random_device{}()));
     fs::create_directories(root / "sd1");
-    utils::ZarrMetadata meta;
-    meta.version = utils::ZarrVersion::v2;
-    meta.shape = {4,4,4,4}; meta.chunks = {4,4,4,4};
-    meta.dtype = utils::ZarrDtype::uint8; meta.fill_value = 0.; meta.compressor_id.clear();
-    auto array = utils::ZarrArray::create(root / "sd1/1", meta);
-    std::vector<std::byte> bytes(4*64, std::byte{255});
-    std::fill(bytes.begin()+128, bytes.begin()+192, std::byte{128});
-    std::fill(bytes.begin()+192, bytes.end(), std::byte{80});
-    array.write_chunk(std::vector<size_t>{0,0,0,0}, bytes);
+    vcr::zarr::CreateOptions create;
+    create.shape = {4,4,4,4}; create.chunks = {4,4,4,4}; create.compressor.clear();
+    auto array = vcr::zarr::Writer::create(root / "sd1/1", create);
+    std::vector<std::uint8_t> bytes(4*64, 255);
+    std::fill(bytes.begin()+128, bytes.begin()+192, 128);
+    std::fill(bytes.begin()+192, bytes.end(), 80);
+    array.writeChunk({0,0,0,0}, bytes.data(), bytes.size());
     { std::ofstream out(root / ".zattrs"); out << R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[8,8,8],"validity_channel":"presence","width_encoding":"uint8-base-voxels","groups":{"sd1":{"zarr":"sd1/1","scaledown":1,"channels":["presence","nx","ny","width"]}}}})"; }
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale = 2;

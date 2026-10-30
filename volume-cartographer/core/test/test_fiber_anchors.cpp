@@ -6,7 +6,7 @@
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
-#include "utils/zarr.hpp"
+#include "vc_reader/zarr.hpp"
 #include "../src/fiber_tracer/FiberAnchorObjectives.hpp"
 #include "../src/fiber_tracer/FiberAnchorFinalEvaluation.hpp"
 
@@ -821,20 +821,16 @@ std::filesystem::path temporaryDirectory(const std::string& tag)
 
 void createConstantZarr(const std::filesystem::path& path, const std::array<size_t, 3>& shape, const std::array<size_t, 3>& chunks, uint8_t value)
 {
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {shape[0], shape[1], shape[2]};
-    metadata.chunks = {chunks[0], chunks[1], chunks[2]};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    metadata.fill_value = 0.0;
-    auto array = utils::ZarrArray::create(path, metadata);
-    std::vector<std::byte> payload(chunks[0] * chunks[1] * chunks[2], static_cast<std::byte>(value));
+    vcr::zarr::CreateOptions create;
+    create.shape = {shape[0], shape[1], shape[2]};
+    create.chunks = {chunks[0], chunks[1], chunks[2]};
+    create.compressor.clear();
+    auto array = vcr::zarr::Writer::create(path, create);
+    std::vector<std::uint8_t> payload(chunks[0] * chunks[1] * chunks[2], value);
     for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
         for (size_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y) {
             for (size_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x) {
-                const std::array<size_t, 3> chunk{z, y, x};
-                array.write_chunk(chunk, payload);
+                array.writeChunk({z, y, x}, payload.data(), payload.size());
             }
         }
     }
@@ -842,14 +838,11 @@ void createConstantZarr(const std::filesystem::path& path, const std::array<size
 
 void createEmptyFourDimensionalZarr(const std::filesystem::path& path)
 {
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {3, 4, 4, 4};
-    metadata.chunks = {3, 4, 4, 4};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    metadata.fill_value = 0.0;
-    (void)utils::ZarrArray::create(path, metadata);
+    vcr::zarr::CreateOptions create;
+    create.shape = {3, 4, 4, 4};
+    create.chunks = {3, 4, 4, 4};
+    create.compressor.clear();
+    (void)vcr::zarr::Writer::create(path, create);
 }
 
 void writeText(const std::filesystem::path& path, const std::string& text)
@@ -2572,20 +2565,15 @@ TEST_CASE("fiber stored-grid metadata rejects missing explicit source scale")
 TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty chunks")
 {
     const auto directory = temporaryDirectory("presence_chunk_scan");
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {2, 2, 6};
-    metadata.chunks = {2, 2, 2};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    metadata.fill_value = 0.0;
-    auto presence = utils::ZarrArray::create(directory / "presence.zarr", metadata);
-    const std::vector<std::byte> empty(8, std::byte{0});
-    const std::vector<std::byte> nonempty(8, std::byte{17});
-    const std::array<size_t, 3> emptyKey{0, 0, 0};
-    const std::array<size_t, 3> nonemptyKey{0, 0, 2};
-    presence.write_chunk(emptyKey, empty);
-    presence.write_chunk(nonemptyKey, nonempty);
+    vcr::zarr::CreateOptions create;
+    create.shape = {2, 2, 6};
+    create.chunks = {2, 2, 2};
+    create.compressor.clear();
+    auto presence = vcr::zarr::Writer::create(directory / "presence.zarr", create);
+    const std::vector<std::uint8_t> empty(8, 0);
+    const std::vector<std::uint8_t> nonempty(8, 17);
+    presence.writeChunk({0, 0, 0}, empty.data(), empty.size());
+    presence.writeChunk({0, 0, 2}, nonempty.data(), nonempty.size());
     createConstantZarr(directory / "nx.zarr", {2, 2, 6}, {2, 2, 2}, 255);
     createConstantZarr(directory / "ny.zarr", {2, 2, 6}, {2, 2, 2}, 128);
     const auto manifestPath = directory / "fiber.lasagna.json";
@@ -2608,8 +2596,8 @@ TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty ch
     CHECK(report.emptyChunks == 1);
     CHECK(report.nonemptyChunksZYX == std::vector<std::array<size_t, 3>>{{0, 0, 2}});
     // Missing chunks are only safely skipped when their logical fill is zero.
-    metadata.fill_value = 17.0;
-    utils::ZarrArray::create(directory / "nonzero.zarr", metadata);
+    create.fillValue = 17;
+    (void)vcr::zarr::Writer::create(directory / "nonzero.zarr", create);
     auto nonzeroManifest = nlohmann::json::parse(std::ifstream(manifestPath));
     nonzeroManifest["groups"]["presence"]["zarr"] = "nonzero.zarr";
     writeText(directory / "nonzero.lasagna.json", nonzeroManifest.dump());

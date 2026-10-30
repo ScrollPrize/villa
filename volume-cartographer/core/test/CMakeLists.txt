@@ -443,7 +443,6 @@ vc_add_test(NAME test_point_index)
 
 vc_add_test(NAME test_plane_surface)
 
-vc_add_test(NAME test_compositing)
 
 vc_add_test(NAME test_quadsurface_basics)
 
@@ -544,7 +543,6 @@ vc_add_test(NAME test_viewer_sampling
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerSampling.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_zarr)
 
 
 # Real PHerc 0172 segments committed under core/test/data/segments/.

@@ -55,7 +55,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec PROPERTIES
+set_target_properties(vc_core vc_lasagna utils PROPERTIES
     INSTALL_RPATH "${VC_PY_RPATH_SELF}"
 )
 
@@ -107,7 +107,7 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d utils_volcomp_codec
+install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .

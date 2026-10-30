@@ -8,7 +8,7 @@
 struct CompositeParams {
     // Compositing method: "mean", "max", "min", "alpha", "beerLambert",
     // "volumetric" (GUI-only perspective volumetric mode; ignored by the
-    // shared compositeLayerStack dispatch)
+    // shared composite dispatch)
     std::string method = "mean";
 
     // Alpha compositing parameters
@@ -81,29 +81,3 @@ struct OverlayCompositeSettings {
 
     bool operator==(const OverlayCompositeSettings&) const = default;
 };
-
-// Layer values for a single pixel across all layers
-// Used by compositing methods to process per-pixel data
-struct LayerStack {
-    std::vector<float> values;  // Values at each layer (after cutoff/equalization)
-    int validCount = 0;         // Number of valid (sampled) layers
-};
-
-// Compositing method interface
-// Each method takes a stack of layer values and returns a single output value
-namespace CompositeMethod {
-
-float mean(const LayerStack& stack) noexcept;
-float max(const LayerStack& stack) noexcept;
-float min(const LayerStack& stack) noexcept;
-float alpha(const LayerStack& stack, const CompositeParams& params) noexcept;
-float beerLambert(const LayerStack& stack, const CompositeParams& params) noexcept;
-
-} // namespace CompositeMethod
-
-// Apply compositing to a single pixel's layer stack
-// Returns the final composited value (0-255)
-float compositeLayerStack(
-    const LayerStack& stack,
-    const CompositeParams& params
-) noexcept;

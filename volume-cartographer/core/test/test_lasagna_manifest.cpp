@@ -5,7 +5,6 @@
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <utils/zarr.hpp>
 
 #include <cstdlib>
 #include <filesystem>
