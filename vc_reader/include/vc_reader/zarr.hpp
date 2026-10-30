@@ -192,6 +192,17 @@ struct LevelPlacement {
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
     double toLevel0(int axis, double index) const { return scale[axis] * index + offset[axis]; }
     double fromLevel0(int axis, double level0) const { return (level0 - offset[axis]) / scale[axis]; }
+    // The map from indices of the level `other` places to this level's indices:
+    // index = scale[axis] * other_index + offset[axis] (ZYX axes, as vcr::grid::Level).
+    LevelPlacement indexMapFrom(const LevelPlacement& other) const
+    {
+        LevelPlacement m;
+        for (std::size_t a = 0; a < 3; ++a) {
+            m.scale[a] = other.scale[a] / scale[a];
+            m.offset[a] = (other.offset[a] - offset[a]) / scale[a];
+        }
+        return m;
+    }
 };
 
 struct OpenedArray {

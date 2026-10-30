@@ -142,10 +142,45 @@ void testResample()
     }
 
     // Two pieces: no point between them, positions inside each from that piece.
-    vcr::grid::Surface pieces(v, {vcr::grid::Interpolation::Linear, {{0, 4}, {4, 8}}});
-    const vcr::grid::Raster across{2.5, 1.0, 1.0, 1.0, 3, 1};  // grid x 2.5, 3.5 (the seam cell), 4.5
-    pieces.resample(across, out, nullptr);
-    require(near(out[0], 5.0f) && std::isnan(out[3]) && near(out[6], 9.0f), "pieces are not interpolated across");
+    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+        vcr::grid::Surface pieces(v, {mode, {{0, 4}, {4, 8}}});
+        const vcr::grid::Raster across{2.5, 1.0, 1.0, 1.0, 3, 1};  // grid x 2.5, 3.5 (the seam cell), 4.5
+        pieces.resample(across, out, nullptr);
+        require(near(out[0], 5.0f) && std::isnan(out[3]) && near(out[6], 9.0f), "pieces are not interpolated across");
+    }
+
+    // A cylinder of radius 40 about the y axis, a vertex every 0.05 rad: smooth normals
+    // follow the analytic normal (sin a, 0, cos a) far closer than the linear patches'
+    // and change continuously across cell edges, where the linear ones step.
+    {
+        const int rows = 6, cols = 24;
+        std::vector<float> cylinder(std::size_t(rows) * cols * 3);
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                float* q = &cylinder[(std::size_t(r) * cols + std::size_t(c)) * 3];
+                q[0] = 40.0f * std::sin(0.05f * float(c));
+                q[1] = 3.0f * float(r);
+                q[2] = 40.0f * std::cos(0.05f * float(c));
+            }
+        const vcr::grid::Raster line{2.0, 2.5, 0.01, 1.0, 1801, 1};  // grid x 2 .. 20 on one row
+        float error[2]{}, step[2]{};
+        for (const int k : {0, 1}) {
+            vcr::grid::Surface surface({cylinder.data(), rows, cols, std::size_t(cols) * 3},
+                                       {k ? vcr::grid::Interpolation::Smooth : vcr::grid::Interpolation::Linear});
+            std::vector<float> p(1801 * 3), n(p.size());
+            surface.resample(line, p.data(), n.data());
+            for (int i = 0; i < 1801; ++i) {
+                const float a = 0.05f * float(2.0 + 0.01 * i);
+                const float* m = &n[std::size_t(i) * 3];
+                const float dot = std::abs(m[0] * std::sin(a) + m[2] * std::cos(a));
+                error[k] = std::max(error[k], std::acos(std::min(1.0f, dot)));
+                if (i)
+                    step[k] = std::max(step[k], std::abs(m[0] - n[std::size_t(i - 1) * 3]));
+            }
+        }
+        require(error[1] < 0.1f * error[0] && error[1] < 1e-3f, "smooth normals follow a cylinder");
+        require(step[1] < 0.1f * step[0], "smooth normals are continuous across cells");
+    }
 }
 
 }  // namespace
