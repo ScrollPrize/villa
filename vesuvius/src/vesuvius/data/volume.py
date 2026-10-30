@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
+import posixpath
 import time
+import warnings
 import yaml
 import json
 from numpy.typing import NDArray
@@ -769,15 +771,19 @@ class Volume:
 
         # Construct inklabel URL (heuristic based on typical naming)
         base_url = self.url.rstrip('/')
+        # URLs always use '/'. os.path is ntpath on Windows, whose join puts a
+        # backslash between the parent URL and the file name; the request then
+        # fails and the ink label silently became the all-zero placeholder.
+        path_mod = posixpath if '://' in base_url else os.path
         # Extract parent URL and segment ID
-        parent_url = os.path.dirname(base_url)
-        segment_id_str = os.path.basename(base_url)
+        parent_url = path_mod.dirname(base_url)
+        segment_id_str = path_mod.basename(base_url)
         # Remove .zarr extension if present (fixes URL construction bug)
         if segment_id_str.endswith('.zarr'):
             segment_id_str = segment_id_str[:-5]
         # Construct ink label path
         inklabel_filename = f"{segment_id_str}_inklabels.png"
-        inklabel_url = os.path.join(parent_url, inklabel_filename)
+        inklabel_url = path_mod.join(parent_url, inklabel_filename)
 
         if self.verbose:
             print(f"Attempting to load ink label from: {inklabel_url}")
@@ -805,8 +811,14 @@ class Volume:
                 print(f"Successfully loaded ink label with shape: {self.inklabel.shape}, dtype: {self.inklabel.dtype}")
 
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Could not load ink label from {inklabel_url}: {e}")
+            # Not only in verbose mode: the placeholder below is all zeros, which
+            # reads as "no ink anywhere" to anything that trains or evaluates on it.
+            warnings.warn(
+                f"Could not load ink label from {inklabel_url} ({type(e).__name__}: {e}); "
+                "Volume.inklabel is an all-zero placeholder.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             
             # Create an empty/dummy ink label array based on data shape if possible
             if hasattr(self, 'data') and self.data:
