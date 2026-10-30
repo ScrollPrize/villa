@@ -658,8 +658,13 @@ void ProjectWorkspace::rebuildResources()
         const auto shape = volume.shapeXyz();
         item->setText(ResShape, QStringLiteral("%1 × %2 × %3").arg(shape[0]).arg(shape[1]).arg(shape[2]));
         if (volume.voxelSize() > 0) item->setText(ResVoxel, tr("%1 µm").arg(volume.voxelSize()));
-        item->setText(ResLevels, QString::number(volume.numScales()));
-        item->setText(ResType, dtypeName(volume.dtype()));
+        try {
+            const auto& pyramid = _state->openedVolumes()->pyramid(volume);
+            item->setText(ResLevels, QString::number(pyramid.levels.size()));
+            item->setText(ResType, dtypeName(pyramid.dtype));
+        } catch (const std::exception& error) {
+            item->setToolTip(ResLevels, QString::fromUtf8(error.what()));
+        }
         if (volume.isRemote()) {
             const auto cache = QString::fromStdString(volume.remotePersistentCachePath().string());
             const auto measured = _cacheBytes.find(cache);

@@ -2,12 +2,14 @@
 
 #include <vc_reader/zarr.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 class Volume;
 
@@ -34,6 +36,18 @@ public:
     // array->placement.fromLevel0(axis, working.toLevel0(axis, c)). Thread-safe.
     Level level(const Volume& volume, int level);
 
+    // What a volume's pyramid holds, from its metadata alone. Working levels: index
+    // level + baseScaleLevel() of the physical pyramid; finer physical levels are not
+    // listed. Read once per volume. Thread-safe; throws when the metadata cannot be read.
+    struct Pyramid {
+        std::vector<int> levels;  // the present working levels, ascending
+        std::string dtype;        // NumPy typestr: |u1, <u2, <f4, ...
+
+        int count() const { return levels.empty() ? 0 : levels.back() + 1; }
+        bool has(int level) const { return std::binary_search(levels.begin(), levels.end(), level); }
+    };
+    const Pyramid& pyramid(const Volume& volume);
+
     struct CacheStats {
         std::size_t bytes = 0, capacity = 0;
     };
@@ -48,4 +62,5 @@ private:
     std::size_t gpuCacheBytes_ = 0;
     std::map<std::pair<std::string, int>, std::shared_ptr<vcr::zarr::OpenedArray>> levels_;  // (location, level)
     std::map<const vcr::Array*, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
+    std::map<std::string, Pyramid> pyramids_;  // by location
 };

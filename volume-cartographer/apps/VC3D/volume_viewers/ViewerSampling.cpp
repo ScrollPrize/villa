@@ -44,10 +44,9 @@ vcr::grid::Level ViewerLevels::gridLevel(int level) const
 ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume)
 {
     ViewerLevels result;
-    result.levels.resize(volume.numScales());
-    for (int level = 0; level < result.count(); ++level) {
-        if (!volume.hasScaleLevel(level))
-            continue;
+    const auto& pyramid = opened.pyramid(volume);
+    result.levels.resize(std::size_t(pyramid.count()));
+    for (const int level : pyramid.levels) {
         try {
             result.levels[std::size_t(level)] = opened.level(volume, level);
         } catch (const std::exception& error) {

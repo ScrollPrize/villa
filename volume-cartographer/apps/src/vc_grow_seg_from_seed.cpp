@@ -335,20 +335,17 @@ static int run_main(int argc, char *argv[])
     auto volume = remote_volume
         ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
         : Volume::New(vol_path);
-    if (!volume->hasScaleLevel(0)) {
-        // The tracer reads scale group 0 only; on a sparse pyramid those reads
-        // would silently come back as fill value instead of failing.
-        std::cerr << "ERROR: volume has no full-resolution level 0, which the tracer reads;"
-                  << " present levels:";
-        for (int level : volume->presentScaleLevels())
-            std::cerr << " " << level;
-        std::cerr << std::endl;
-        return EXIT_FAILURE;
-    }
     auto level0_options = volume->sourceOpenOptions();
     level0_options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
-    auto level0 = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
-        volume->sourceLocation(), volume->baseScaleLevel(), level0_options));
+    // The tracer reads this level only: a sparse pyramid without it fails here.
+    std::shared_ptr<vcr::zarr::OpenedArray> level0;
+    try {
+        level0 = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
+            volume->sourceLocation(), volume->baseScaleLevel(), level0_options));
+    } catch (const std::out_of_range& e) {
+        std::cerr << "ERROR: the tracer needs the volume's full-resolution level: " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
     if (level0->meta.type.kind != 'u' || level0->meta.itemsize() != 1) {
         std::cerr << "ERROR: the tracer reads uint8 volumes, not " << level0->meta.dtype << std::endl;
         return EXIT_FAILURE;

@@ -1,4 +1,5 @@
 #include "MenuActionController.hpp"
+#include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include "VolumeAttachmentController.hpp"
@@ -1016,9 +1017,14 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     const int logicalPrefillLevel = volume
         ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
         : -1;
-    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0 ||
-        !volume->hasScaleLevel(logicalPrefillLevel)) {
+    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0) {
         return;
+    }
+    try {
+        if (!_window->_state->openedVolumes()->pyramid(*volume).has(logicalPrefillLevel))
+            return;
+    } catch (const std::exception&) {
+        return;  // the volume's viewers report what cannot be opened
     }
     if (volume->remoteCacheRoot().empty()) {
         return;

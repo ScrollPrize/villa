@@ -3,7 +3,6 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -551,6 +550,53 @@ static const char* voxelSizeSourceName(VoxelSizeSource source)
 
 // The OME-Zarr axis unit and the numeric value that must accompany it.
 //
+// Levels above level 0 of a rendered Zarr: Z keeps its layers, Y/X halve per level.
+const vcr::zarr::PyramidOptions kRenderPyramid{5, {1, 2, 2}};
+
+// The render's .zattrs: what it rendered, and its OME multiscales. With a known
+// physical size (baseVoxelSize > 0, one source voxel at the rendered level) the
+// scales are physical: Z = baseVoxelSize * sliceStep, Y/X = baseVoxelSize /
+// pixelsPerVoxel, and the axes carry `voxelUnit`. Without one they state only each
+// level's factor over level 0 and no unit, as OME-NGFF 0.4 asks, and say why.
+void writeZarrAttrs(const std::filesystem::path& outDir,
+                    const std::filesystem::path& volPath, int groupIdx,
+                    size_t baseZ, double sliceStep, double accumStep,
+                    const std::string& accumTypeStr, size_t accumSamples,
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize, const std::string& voxelUnit,
+                    double pixelsPerVoxel)
+{
+    vcr::zarr::MultiscalesOptions ome;
+    ome.name = "render";
+    ome.levels = kRenderPyramid.levels;
+    ome.factors = kRenderPyramid.factors;
+    const bool physicalSizeKnown = std::isfinite(baseVoxelSize) && baseVoxelSize > 0.0;
+    if (physicalSizeKnown) {
+        const double px = std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0 ? pixelsPerVoxel : 1.0;
+        const double step = std::isfinite(sliceStep) && sliceStep > 0.0 ? sliceStep : 1.0;
+        ome.scale = {baseVoxelSize * step, baseVoxelSize / px, baseVoxelSize / px};
+        ome.unit = voxelUnit;
+    }
+    auto multiscales = vcr::zarr::omeMultiscales(ome);
+    if (!physicalSizeKnown)
+        multiscales["metadata"]["physical_size"] = "unknown";
+
+    vcr::zarr::Json attrs{{"source_zarr", volPath.string()},
+                          {"source_group", groupIdx},
+                          {"num_slices", baseZ},
+                          {"slice_step", sliceStep},
+                          {"canvas_size", {canvasSize.width, canvasSize.height}},
+                          {"chunk_size", {int(CZ), int(CH), int(CW)}},
+                          {"note_axes_order", "ZYX (slice, row, col)"},
+                          {"multiscales", vcr::zarr::Json::array({std::move(multiscales)})}};
+    if (accumSamples > 0) {
+        attrs["accum_step"] = accumStep;
+        attrs["accum_type"] = accumTypeStr;
+        attrs["accum_samples"] = int(accumSamples);
+    }
+    vcr::zarr::writeAttributes(outDir, attrs);
+}
+
 // These travel as a PAIR: `writeZarrAttrs` writes `scale = <value> / pixelsPerVoxel`
 // and `axis.unit = <unit>` independently, with nothing checking that they agree. A
 // micrometre number labelled "nanometer" is therefore a silent 1000x error -- the
@@ -1296,15 +1342,16 @@ int main(int argc, char *argv[])
         std::unique_ptr<vcr::zarr::Writer> dsOut;
         std::filesystem::path outFilePath(wantZarr ? zarrOutputArg : "/dev/null");
 
+        vcr::zarr::CreateOptions outputOptions;
+        outputOptions.shape.assign(shape0.begin(), shape0.end());
+        outputOptions.chunks.assign(chunks0.begin(), chunks0.end());
+        outputOptions.dtype = useU16 ? "<u2" : "|u1";
+        outputOptions.compressor = zarrCompressor;
+        outputOptions.separator = zarrSeparator;
+        outputOptions.level = zarrCompressionLevel;
+
         if (wantZarr) {
             outFilePath = zarrOutputArg;
-            vcr::zarr::CreateOptions outputOptions;
-            outputOptions.shape.assign(shape0.begin(), shape0.end());
-            outputOptions.chunks.assign(chunks0.begin(), chunks0.end());
-            outputOptions.dtype = useU16 ? "<u2" : "|u1";
-            outputOptions.compressor = zarrCompressor;
-            outputOptions.separator = zarrSeparator;
-            outputOptions.level = zarrCompressionLevel;
 
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
@@ -1312,8 +1359,7 @@ int main(int argc, char *argv[])
                 vcr::zarr::Writer::create(outFilePath / "0", outputOptions);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
-                                          zarrCompressor, zarrCompressionLevel, zarrSeparator);
+                    vcr::zarr::createPyramidLevels(outFilePath, outputOptions, kRenderPyramid);
 
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), outXY, baseZ, CH, CW,
@@ -1387,8 +1433,7 @@ int main(int argc, char *argv[])
 
         // Single-part: create the pyramid datasets now; multi-part/resume: --pre created them.
         if (wantZarr && wantPyramid && !pre_flag && numParts <= 1 && !resumeFlag)
-            createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
-                                  zarrCompressor, zarrCompressionLevel, zarrSeparator);
+            vcr::zarr::createPyramidLevels(outFilePath, outputOptions, kRenderPyramid);
 
         // Each part renders a contiguous range of tile rows. With a pyramid the
         // ranges are multiples of 32 rows, so a part builds levels 1-5 of its rows alone.
@@ -1426,8 +1471,15 @@ int main(int argc, char *argv[])
                 logPrintf(stdout, "[pyramid] building from L0...\n");
                 for (int level = 1; level <= 5; level++) {
                     const size_t first = rowStart >> level, last = (size_t(rowEnd) + (1u << level) - 1) >> level;
-                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, first, last);
-                    else        buildPyramidLevel<uint8_t>(outFilePath, level, first, last);
+                    vcr::zarr::writePyramidLevel(
+                        outFilePath, level, kRenderPyramid,
+                        vcr::zarr::ChunkRange{{0, std::int64_t(first), 0},
+                                              {std::numeric_limits<std::int64_t>::max(), std::int64_t(last),
+                                               std::numeric_limits<std::int64_t>::max()}},
+                        [level](std::size_t done, std::size_t total) {
+                            if (done == total)
+                                logPrintf(stdout, "[pyramid L%d] %zu chunks\n", level, total);
+                        });
                 }
             }
 

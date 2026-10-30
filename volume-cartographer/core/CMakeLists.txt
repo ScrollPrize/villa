@@ -32,7 +32,6 @@ add_library(vc_core
         src/StoreSurfaces.cpp
         src/SurfaceMeshing.cpp
         src/Tiff.cpp
-        src/Zarr.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp

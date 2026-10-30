@@ -30,18 +30,6 @@ configure_file(vc/fiber_evaluation.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_eval
 install(FILES vc/fiber_evaluation.py DESTINATION vc)
 configure_file(vc/fiber_evaluation_vis.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation_vis.py" COPYONLY)
 install(FILES vc/fiber_evaluation_vis.py DESTINATION vc)
-configure_file(vc/compression/__init__.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
-    COPYONLY
-)
-configure_file(vc/compression/vcz1_numcodecs.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
-    COPYONLY
-)
-configure_file(vc/compression/vcz1.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1.py"
-    COPYONLY
-)
 
 nanobind_add_module(vc_lasagna_amgx
     NOMINSIZE
@@ -123,9 +111,3 @@ if(TARGET vc_fiberlets)
     install(TARGETS vc_fiberlets RUNTIME DESTINATION vc/bin)
 endif()
 configure_file(vc/fiberlets_cli.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiberlets_cli.py" COPYONLY)
-install(FILES vc/compression/__init__.py DESTINATION vc/compression)
-install(FILES
-    vc/compression/vcz1.py
-    vc/compression/vcz1_numcodecs.py
-    DESTINATION vc/compression
-)

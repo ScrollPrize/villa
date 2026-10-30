@@ -74,14 +74,10 @@ public:
     [[nodiscard]] int numSlices() const noexcept;
     // Zarr/storage order: [z, y, x] = [slices, height, width].
     [[nodiscard]] std::array<int, 3> shape() const noexcept;
-    [[nodiscard]] std::array<int, 3> shape(int level) const;
     // Coordinate/UI order: [x, y, z] = [width, height, slices].
     [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
-    // NumPy typestr of the source: |u1, <u2, <f4, ...
-    [[nodiscard]] const std::string& dtype() const noexcept { return zarrDtype_; }
 
-    [[nodiscard]] size_t numScales() const noexcept;
     // The working level: the source pyramid level this volume opened as its
     // level 0 (a remote locator's #vc-base-scale=N), so one voxel is 2^N
     // source voxels. The volume keeps its ID at every working level.
@@ -90,8 +86,6 @@ public:
     {
         return hasExplicitVoxelSizeOverride_;
     }
-    [[nodiscard]] bool hasScaleLevel(int level) const noexcept;
-    [[nodiscard]] std::vector<int> presentScaleLevels() const;
 
 protected:
     std::filesystem::path path_;
@@ -102,8 +96,6 @@ protected:
     int _height{0};
     int _slices{0};
 
-    std::vector<std::array<int, 3>> zarrLevelShapes_;
-    std::string zarrDtype_ = "|u1";
     void zarrOpen();
 
     void loadMetadata();
@@ -117,5 +109,4 @@ protected:
     bool hasExplicitVoxelSizeOverride_ = false;
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
-    size_t remoteNumScales_ = 0;
 };

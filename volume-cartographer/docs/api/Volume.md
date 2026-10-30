@@ -69,7 +69,7 @@ VC3D.
 | `remoteUrl()` | `const std::string&` | Normalized remote URL for remote volumes |
 | `remoteAuth()` | `const vc::HttpAuth&` | Auth used for remote chunk reads |
 
-### Dimensions, Dtype, and Scales
+### Dimensions
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -77,17 +77,12 @@ VC3D.
 | `sliceHeight()` | `int` | Y dimension at base scale |
 | `numSlices()` | `int` | Z dimension at base scale |
 | `shape()` | `std::array<int, 3>` | Base shape as `{z, y, x}` |
-| `shape(int level)` | `std::array<int, 3>` | Present scale shape as `{z, y, x}` |
 | `shapeXyz()` | `std::array<int, 3>` | Base shape as `{x, y, z}` |
 | `voxelSize()` | `double` | Physical voxel size from metadata |
-| `dtype()` | `const std::string&` | NumPy typestr of the source (`\|u1`, `<u2`, `<f4`) |
-| `numScales()` | `size_t` | Number of scale slots known to the volume |
 | `baseScaleLevel()` | `int` | Working level: the source pyramid level opened as level 0 (remote `#vc-base-scale=N`), else `0`; the ID does not change with it |
-| `hasScaleLevel(int level)` | `bool` | Whether a physical zarr array exists for the level |
-| `presentScaleLevels()` | `std::vector<int>` | Physical scale levels |
 
-`numScales()` can include missing scale slots. Check `hasScaleLevel()` or
-`presentScaleLevels()` before reading a specific level.
+Which pyramid levels exist, and their dtype, come from the source's metadata:
+`vcr::zarr::pyramidLevels`, or `OpenedVolumes::pyramid` in VC3D.
 
 ### Opening the Source
 

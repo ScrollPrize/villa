@@ -41,3 +41,18 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
 #endif
     return {opened, open(volume, base)->placement, std::move(reader)};
 }
+
+const OpenedVolumes::Pyramid& OpenedVolumes::pyramid(const Volume& volume)
+{
+    std::lock_guard lock(mutex_);
+    const auto location = volume.sourceLocation();
+    if (const auto found = pyramids_.find(location); found != pyramids_.end())
+        return found->second;
+    Pyramid result;
+    for (const auto& level : vcr::zarr::pyramidLevels(location, volume.sourceOpenOptions())) {
+        if (level.level >= volume.baseScaleLevel())
+            result.levels.push_back(level.level - volume.baseScaleLevel());
+        result.dtype = level.meta.dtype;
+    }
+    return pyramids_.emplace(location, std::move(result)).first->second;
+}

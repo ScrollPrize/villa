@@ -706,7 +706,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     ensureDefaultSurface();
     if (_volume && isAxisAlignedView() && !hadVolume) {
-        const int n = _levels ? _levels->count() : static_cast<int>(_volume->numScales());
+        const int n = _levels ? _levels->count() : 1;
         _scale = scaleForCoarsestPlaneRenderLevel(n);
     }
     recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
@@ -883,8 +883,7 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
             (void)setSegmentationPointerFromFocus();
         }
         setZOffset(0.0f);
-        const int n = _levels ? _levels->count()
-                              : (_volume ? static_cast<int>(_volume->numScales()) : 1);
+        const int n = _levels ? _levels->count() : 1;
         if (_resetViewOnSurfaceChange) {
             _scale = scaleForCoarsestSegmentationRenderLevel(n);
             recalcPyramidLevel();
@@ -893,8 +892,7 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
         setZOffset(0.0f);
-        const int n = _levels ? _levels->count()
-                              : (_volume ? static_cast<int>(_volume->numScales()) : 1);
+        const int n = _levels ? _levels->count() : 1;
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
         recalcPyramidLevel();
     } else if (preservedViewCenter) {
@@ -1084,7 +1082,7 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         const double extent = vc3d::maximumBaseVoxelExtent(*_levels, _dsScaleIdx);
         _dsScale = std::isfinite(extent) ? static_cast<float>(extent) : 1.0f;
     } else {
-        const int n = _volume ? static_cast<int>(_volume->numScales()) : 1;
+        const int n = 1;  // no opened levels: this frame has only a nominal level
         const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
         _dsScaleIdx = std::clamp(
             static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),

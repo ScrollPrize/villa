@@ -63,8 +63,6 @@ TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
     const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
     REQUIRE(prepared.size() == 1);
     CHECK(prepared[0].volume->shape() == std::array<int, 3>{2, 2, 2});
-    CHECK(prepared[0].volume->hasScaleLevel(0));
-    CHECK(prepared[0].volume->shape(0) == std::array<int, 3>{2, 2, 2});
     CHECK(prepared[0].location ==
           fs::absolute(dir / "pred.zarr").lexically_normal().string());
     CHECK(prepared[0].tags == std::vector<std::string>{
@@ -273,10 +271,6 @@ TEST_CASE("Lasagna project preparation leaves scale handling to native volume lo
     const auto& volume = prepared[0].volume;
     CHECK(volume->shape() == std::array<int, 3>{8, 12, 12});
     CHECK(volume->shapeXyz() == std::array<int, 3>{12, 12, 8});
-    CHECK_FALSE(volume->hasScaleLevel(0));
-    CHECK_FALSE(volume->hasScaleLevel(1));
-    CHECK(volume->hasScaleLevel(2));
-    CHECK(volume->shape(2) == std::array<int, 3>{2, 3, 3});
 
     fs::remove_all(dir);
 }

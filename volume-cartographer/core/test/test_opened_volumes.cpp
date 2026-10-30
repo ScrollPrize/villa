@@ -35,6 +35,12 @@ TEST_CASE("OpenedVolumes shares opened levels and maps coordinates through place
     vcr::zarr::Writer::open(dir / "1").writeRegion({0, 0, 0}, {8, 8, 8}, level1.data());
 
     OpenedVolumes opened(64 << 20);
+    const auto& pyramid = opened.pyramid(*volume);
+    CHECK(pyramid.levels == std::vector<int>{0, 1});
+    CHECK(pyramid.count() == 2);
+    CHECK(pyramid.has(1));
+    CHECK_FALSE(pyramid.has(2));
+    CHECK(pyramid.dtype == "|u1");
     const auto a = opened.level(*volume, 0);
     const auto b = opened.level(*volume, 0);
     CHECK(a.array == b.array);

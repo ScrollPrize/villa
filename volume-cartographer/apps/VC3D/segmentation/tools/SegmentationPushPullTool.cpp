@@ -1123,7 +1123,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
-    if (!volume->hasScaleLevel(datasetIndex)) {
+    if (!volumes.pyramid(*volume).has(datasetIndex)) {
         result.noMovementReason = "Alpha push/pull requested missing OME-Zarr scale " +
                                   std::to_string(datasetIndex) + ".";
         return result;
@@ -1245,7 +1245,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
-    if (!volume->hasScaleLevel(datasetIndex)) {
+    if (!volumes.pyramid(*volume).has(datasetIndex)) {
         if (outUnavailable) {
             *outUnavailable = true;
         }

@@ -321,10 +321,9 @@ void Volume::zarrOpen()
     if (levels.empty()) {
         throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
     }
-    zarrLevelShapes_ = levelShapes(levels, path_.string());
-    zarrDtype_ = levels.front().meta.dtype;
+    const auto levelShapesZYX = levelShapes(levels, path_.string());
     // The padding a level's shape may have over its downscaled dimensions.
-    std::vector<std::array<int, 3>> storageChunkShapes(zarrLevelShapes_.size(), {128, 128, 128});
+    std::vector<std::array<int, 3>> storageChunkShapes(levelShapesZYX.size(), {128, 128, 128});
     for (const auto& level : levels)
         storageChunkShapes[static_cast<std::size_t>(level.level)] = shape3(level.meta.chunks, path_.string());
 
@@ -334,8 +333,8 @@ void Volume::zarrOpen()
         int baseHeight = 0;
         int baseWidth = 0;
 
-        for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
-            const auto& shape = zarrLevelShapes_[level];
+        for (size_t level = 0; level < levelShapesZYX.size(); ++level) {
+            const auto& shape = levelShapesZYX[level];
             if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
                 continue;
             }
@@ -378,8 +377,8 @@ void Volume::zarrOpen()
     // zarr shape is [z, y, x] = [slices, height, width]
     if (!skipShapeCheck) {
         bool hasAnyPhysicalScale = false;
-        for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
-            const auto& shape = zarrLevelShapes_[level];
+        for (size_t level = 0; level < levelShapesZYX.size(); ++level) {
+            const auto& shape = levelShapesZYX[level];
             if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
                 continue;
             }
@@ -473,7 +472,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
     if (spec.baseScaleLevel > 0)
         validateWorkingLevel(allLevels, spec.baseScaleLevel, remoteUrl);
-    const auto dtype = allLevels.front().meta.dtype;
     auto shapes = levelShapes(allLevels, remoteUrl);
     // A working level's voxels are its level 0: drop the finer physical levels.
     shapes.erase(shapes.begin(), shapes.begin() + spec.baseScaleLevel);
@@ -497,9 +495,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->baseScaleLevel_ = spec.baseScaleLevel;
     vol->remoteAuth_ = auth;
     vol->remoteCacheRoot_ = vc::settings::remoteCachePath();
-    vol->remoteNumScales_ = shapes.size();
-    vol->zarrLevelShapes_ = shapes;
-    vol->zarrDtype_ = dtype;
     const auto& firstShape = shapes[static_cast<std::size_t>(firstPresentLevel)];
     const size_t firstScale = spec.baseScaleLevel > 0 ? 1 : size_t{1} << firstPresentLevel;
     vol->_slices = static_cast<int>(static_cast<size_t>(firstShape[0]) * firstScale);
@@ -618,25 +613,6 @@ int Volume::sliceWidth() const noexcept { return _width; }
 int Volume::sliceHeight() const noexcept { return _height; }
 int Volume::numSlices() const noexcept { return _slices; }
 std::array<int, 3> Volume::shape() const noexcept { return {_slices, _height, _width}; }
-std::array<int, 3> Volume::shape(int level) const
-{
-    if (level < 0) {
-        throw std::out_of_range("Volume::shape level must be non-negative");
-    }
-    const auto index = static_cast<std::size_t>(level);
-    if (index < zarrLevelShapes_.size()) {
-        const auto shapeZYX = zarrLevelShapes_[index];
-        if (shapeZYX[0] == 0 && shapeZYX[1] == 0 && shapeZYX[2] == 0) {
-            throw std::out_of_range("Volume::shape level is not present");
-        }
-        return shapeZYX;
-    }
-    if (level == 0) {
-        return shape();
-    }
-    throw std::out_of_range("Volume::shape level out of range");
-}
-
 std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
@@ -645,31 +621,4 @@ double Volume::voxelSize() const
     // than throw from deep inside whatever asked for it.
     const double value = vc::json::number_or(metadata_, "voxelsize", 0.0);
     return std::isfinite(value) && value > 0.0 ? value : 0.0;
-}
-
-size_t Volume::numScales() const noexcept {
-    if (isRemote_)
-        return remoteNumScales_;
-    return zarrLevelShapes_.size();
-}
-
-bool Volume::hasScaleLevel(int level) const noexcept
-{
-    if (level < 0)
-        return false;
-    const auto index = static_cast<std::size_t>(level);
-    if (index >= zarrLevelShapes_.size())
-        return false;
-    const auto& shape = zarrLevelShapes_[index];
-    return shape[0] != 0 || shape[1] != 0 || shape[2] != 0;
-}
-
-std::vector<int> Volume::presentScaleLevels() const
-{
-    std::vector<int> levels;
-    for (std::size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
-        if (hasScaleLevel(static_cast<int>(level)))
-            levels.push_back(static_cast<int>(level));
-    }
-    return levels;
 }
