@@ -14,7 +14,8 @@ Checks, on a resume of that seed under the same limits:
   - growth escapes the imported grid and ends before the generation limit;
   - the grown surface does not fold back onto itself (a layer jump);
   - with disable_grid_expansion (what VC3D's Fill mode sends) nothing is placed
-    outside the imported grid and the run still succeeds.
+    outside the imported grid and the run still succeeds;
+  - a fully valid crop also respects Fill and explicit row/column expansion limits.
 These are geometric checks, not a review of anatomical correctness.
 """
 
@@ -42,14 +43,14 @@ def load(surface):
     return xyz.astype(np.float64), valid
 
 
-def outside_imported(seed_valid, surface):
+def outside_imported(seed_valid, surface, extra_rows=0, extra_cols=0):
     # Output coordinates = input coordinates + grid_offset. Count valid
     # vertices outside the imported rectangle, not the padding rows/cols.
     _, valid = load(surface)
     dx, dy = json.loads((surface / "meta.json").read_text()).get("grid_offset", [0, 0])
     rows, cols = np.nonzero(valid)
-    return int(((rows < dy) | (rows >= dy + seed_valid.shape[0]) |
-                (cols < dx) | (cols >= dx + seed_valid.shape[1])).sum())
+    return int(((rows < dy - extra_rows) | (rows >= dy + seed_valid.shape[0] + extra_rows) |
+                (cols < dx - extra_cols) | (cols >= dx + seed_valid.shape[1] + extra_cols)).sum())
 
 
 def closest_far_pair(surface, min_grid_sep=6):
@@ -118,9 +119,39 @@ def main():
     fill_escaped = outside_imported(seed_valid, filled)
     assert fill_escaped == 0, f"disable_grid_expansion resume grew {fill_escaped} vertices outside the grid"
 
+    # Crop real traced points to exercise the fully valid rectangular-frontier branch,
+    # which previously bypassed the expansion limits checked by the outward pass.
+    crop_size = 5
+    crop_origin = next(((int(row), int(col)) for row, col in np.argwhere(seed_valid)
+                        if seed_valid[row:row + crop_size, col:col + crop_size].shape == (crop_size, crop_size)
+                        and seed_valid[row:row + crop_size, col:col + crop_size].all()), None)
+    assert crop_origin is not None, "Seed has no fully valid 5x5 crop"
+    row, col = crop_origin
+    rectangle = args.output / "rectangle-seed"
+    rectangle.mkdir()
+    for channel in ("x", "y", "z", "generations"):
+        source = seed / f"{channel}.tif"
+        if source.exists():
+            with Image.open(source) as image:
+                image.crop((col, row, col + crop_size, row + crop_size)).save(rectangle / source.name)
+    meta = json.loads((seed / "meta.json").read_text())
+    meta["uuid"] = rectangle.name
+    meta.pop("grid_offset", None)
+    (rectangle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    _, rectangle_valid = load(rectangle)
+    rectangle_resume = ["--resume", str(rectangle.resolve())]
+
+    rectangle_fill = run("rectangle-fill", fill, rectangle_resume)
+    assert outside_imported(rectangle_valid, rectangle_fill) == 0, "Rectangular Fill exceeded its grid"
+    limited = run("rectangle-limited", {**base, "grow_max_extra_rows": 1,
+                                       "grow_max_extra_cols": 2}, rectangle_resume)
+    assert outside_imported(rectangle_valid, limited) > 0, "Rectangular resume did not expand"
+    assert outside_imported(rectangle_valid, limited, extra_rows=1, extra_cols=2) == 0, \
+        "Rectangular resume exceeded its row/column expansion limits"
+
     print(f"PASS: {seed_valid.sum()} -> {valid.sum()} valid vertices; {escaped} outside "
           f"the imported grid; stopped at generation {last_gen}; closest far pair "
-          f"{gap:.1f} voxels; fill-style resume stayed inside")
+          f"{gap:.1f} voxels; irregular and rectangular resumes respected expansion limits")
 
 
 if __name__ == "__main__":

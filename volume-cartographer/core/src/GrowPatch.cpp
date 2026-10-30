@@ -3503,7 +3503,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         };
 
         auto append_candidate = [&](const cv::Vec2i& p) {
+            // Enforce resume limits for both hole-filling and rectangular-frontier growth.
             if (!bounds.contains(cv::Point(p[1], p[0])) ||
+                (resume_surf && !resume_growth_limit.contains(cv::Point(p[1], p[0]))) ||
                 (trace_params.state(p) & STATE_PROCESSING) != 0 ||
                 (trace_params.state(p) & STATE_LOC_VALID) != 0) {
                 return;
@@ -3543,8 +3545,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                         const cv::Vec2i candidate = p + n;
                         if (is_inside_used_area(candidate)) {
                             append_candidate(candidate);
-                        } else if (resume_surf &&
-                                   resume_growth_limit.contains(cv::Point(candidate[1], candidate[0]))) {
+                        } else if (resume_surf) {
                             outward_candidates.push_back(candidate);
                         }
                     }
