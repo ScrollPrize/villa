@@ -83,7 +83,7 @@ def tables(f):
                for p, pm in prob for l, lm in length]
     groups += [('confidence_cutoff', f'>={p:g}', f['joint_probability'] >= p)
                for p in [0, .25, .5, .7, .9]]
-    groups += [('gt_source', str(int(s)), f['gt_source'] == s)
+    groups += [('gt_source', str(s), f['gt_source'] == s)
                for s in np.unique(f['gt_source'])]
     rows = []
     for kind, type_mask in [('all', np.ones(len(f['source']), bool)),
@@ -123,15 +123,15 @@ def run(root, events, config, order, saved, output):
         i = np.flatnonzero(mask)[0]
         for kind, select in [('all', mask), ('parallel', mask & f['parallel']),
                               ('perpendicular', mask & ~f['parallel'])]:
-            fibers.append(dict(source=int(s), kind=kind, family=int(f['family'][i]),
+            fibers.append(dict(source=str(s), kind=kind, family=int(f['family'][i]),
                 length_base_vx=float(f['length'][i]),
                 enabled_probability=float(f['enabled_probability'][i]),
                 map_probability=float(f['map_probability'][i]),
                 joint_probability=float(f['joint_probability'][i]),
                 **summarize(f, select & f['enabled'])))
     fibers.sort(key=lambda r: (-r['violations'], -(r['l1'] or 0), r['source'], r['kind']))
-    records = [dict(event_id=e['event_id'], source=int(f['source'][i]),
-                    gt_source=int(f['gt_source'][i]), parallel=bool(f['parallel'][i]),
+    records = [dict(event_id=e['event_id'], source=str(f['source'][i]),
+                    gt_source=str(f['gt_source'][i]), parallel=bool(f['parallel'][i]),
                     enabled=bool(f['enabled'][i]), length_base_vx=float(f['length'][i]),
                     enabled_probability=float(f['enabled_probability'][i]),
                     map_probability=float(f['map_probability'][i]),

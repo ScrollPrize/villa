@@ -45,6 +45,27 @@ void ChunkRequestSelectionGate::publish(const std::function<void()>& update)
     update();
 }
 
+void ChunkRequestSelectionGate::publish(std::mutex& prerequisite,
+                                       const std::function<void()>& update)
+{
+    std::lock_guard sourceLock(prerequisite);
+    publish(update);
+}
+
+void ChunkRequestSelectionGate::publish(std::span<std::mutex* const> prerequisites,
+                                       const std::function<void()>& update)
+{
+    // Stable order for multi-source operations (e.g. closing a viewport).
+    // Source registration is snapshotted before entering this operation.
+    std::vector<std::mutex*> ordered(prerequisites.begin(), prerequisites.end());
+    std::sort(ordered.begin(), ordered.end(), std::less<std::mutex*>{});
+    ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(ordered.size());
+    for (auto* mutex : ordered) locks.emplace_back(*mutex);
+    publish(update);
+}
+
 struct ChunkRequestScheduler::Impl {
     using Clock = std::chrono::steady_clock;
 
@@ -938,7 +959,15 @@ struct ChunkRequestScheduler::Impl {
             item.reset();
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
-            cv.notify_all();
+            // Ordinary completion frees one admission slot, and this worker
+            // also loops back to select work. Waking the entire read/decode
+            // pool for every chunk causes a mutex/futex herd at large pools.
+            // Maintenance head transitions can change effective admission by
+            // more than one slot, so preserve their broadcast behavior.
+            if constexpr (ReserveMaintenanceCapacity)
+                cv.notify_all();
+            else
+                cv.notify_one();
             if (gui.empty() && foreground.empty() && background.empty() && maintenance.empty() &&
                 activeCount.load(std::memory_order_acquire) == 0) {
                 idleCv.notify_all();

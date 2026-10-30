@@ -104,7 +104,7 @@ def evaluate(candidate,ref,meta):
     per_fiber=[]
     for owner,source in enumerate(ref['source_id']):
         fiber_mask=ref['identity'][:,0]==owner
-        per_fiber.append(dict(source_id=int(source),family='HV'[int(ref['family'][owner])],
+        per_fiber.append(dict(source_id=str(source),family='HV'[int(ref['family'][owner])],
                               scored=bool(included[owner]),
                               winding_error=stats(error[fiber_mask,0]),vertical_error_vx=stats(error[fiber_mask,1])))
     return dict(root=candidate['root'],evaluation_layer=candidate.get('evaluation_layer','bucket'),passed=all(checks.values()),checks=checks,

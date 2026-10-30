@@ -1,4 +1,5 @@
 import os
+import contextlib
 import queue
 import threading
 import uuid
@@ -226,6 +227,45 @@ def test_old_installed_manager_rejected_before_probing_or_starting(monkeypatch):
         with pytest.raises(RuntimeError, match="upgrade the installed"):
             IncrementalWorkers.connect_local((torch.device("cuda:0"),), [None], [queue.Queue()], None, 1)
     start.assert_not_called()
+
+
+@pytest.mark.parametrize("hard_exit", [False, True])
+def test_slow_flush_keeps_coordinator_polling_and_clears_in_workers(tmp_path, hard_exit):
+    import time
+    from lasagna import tiled_predict3d as tiled
+    from lasagna.tests.predict3d_spawn_helpers import SpawnIdentityAdapter, SpawnFileOutputAdapter
+    product = tiled.OutputProductSpec(name="identity", level=0, scaledown=1,
+        inference_scaledown=1, channels=("value",), chunk_size=4)
+    client = EngineClient()
+    ticks = []
+    def factory(devices, workers, queues, start, cores):
+        class Observed(IncrementalWorkers):
+            def tick(self, outstanding):
+                ticks.append(time.monotonic())
+                return super().tick(outstanding)
+        return Observed(client, dict(REQUEST, max_gpus=1, allowed_gpu_uuids=["GPU-a"]),
+                        ["GPU-a"], workers, queues, lambda i, u, b: start(i, None, b))
+    volume = np.full((24,4,4), 127, np.uint8)
+    output = SpawnFileOutputAdapter(str(tmp_path / "output"), delay_s=1.5, hard_exit=hard_exit)
+    with mock.patch.object(tiled._CircularZBand, "clear", side_effect=AssertionError("coordinator cleared data")), \
+         mock.patch.object(tiled, "_input_has_chunks", return_value=True), \
+         (pytest.raises(RuntimeError, match="flush worker .* exited unexpectedly with code 24")
+          if hard_exit else contextlib.nullcontext()):
+        tiled.run_tiled_inference_3d(None, volume, crop_slices=(0,24,0,4,0,4),
+            device=torch.device("cpu"), devices=(torch.device("cpu"),),
+            model_adapter=SpawnIdentityAdapter(product), output_adapter=output, products=(product,),
+            output_regions_zyx={"identity": (0,0,0,24,4,4)}, full_output_shapes_zyx={"identity": volume.shape},
+            tile_size=4, border=0, overlap=0, tmp_dir=str(tmp_path),
+            flush_workers=2, cooperative_factory=factory)
+    if hard_exit:
+        assert not list(tmp_path.glob('.predict3d_*.tmp'))
+        return
+    assert len(ticks) > 100
+    assert max(np.diff(ticks)) < 1.0  # Deliberate 1.5s writes must not block polling.
+    chunks = list((tmp_path / "output").glob("*.npy"))
+    assert len(chunks) == 6
+    for path in chunks:
+        np.testing.assert_array_equal(np.load(path), np.full((4,4,4),127,np.uint8))
 
 
 @pytest.mark.parametrize("device_count", [1, 2])

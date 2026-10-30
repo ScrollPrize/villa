@@ -34,8 +34,14 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
+    // Hosted-store bookkeeping for the active write (see hub/HubRules.hpp):
+    // cursors at BEGIN, and whether this write applies hub state verbatim.
+    bool hubApply = false;
+    std::optional<std::string> actingHolder;
+    int64_t startJournal = 0, startGeometry = 0;
     std::map<std::string, std::vector<int64_t>> components;
     size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
@@ -43,16 +49,21 @@ struct StatementPool {
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;
     ~StatementPool() { for (auto& [sql, stmt] : idle) sqlite3_finalize(stmt); }
 };
-inline thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
+// Defined in Database.cpp: MinGW GCC emits a non-COMDAT TLS init function for
+// a dynamically initialized inline thread_local, so each TU would define it.
+extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 namespace detail {
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
 }
+// Hosting role, fixed at open by the presence of the hub_* tables.
+enum class HubRole { None, Hub, Replica };
 struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
+    HubRole hubRole = HubRole::None;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;

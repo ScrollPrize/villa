@@ -77,11 +77,11 @@ Targets represent what the model predicts (e.g., ink detection, damage segmentat
 ```python
 targets = {
     "ink": {
-        "out_channels": 1,
-        "activation": "sigmoid",
+        "out_channels": 2,
+        "activation": "none",
         "losses": [
             {
-                "name": "SoftDiceLoss",
+                "name": "nnUNet_DC_and_CE_loss",
                 "weight": 1.0,
                 "kwargs": {}
             }

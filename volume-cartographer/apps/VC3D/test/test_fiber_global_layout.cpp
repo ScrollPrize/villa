@@ -552,8 +552,8 @@ private slots:
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
         std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
-        fibers[0].links.push_back({1, fibers[1].id, 1, false, true, true});
-        fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true});
+        fibers[0].links.push_back({1, fibers[1].id, 1, false, true});
+        fibers[1].links.push_back({1, fibers[0].id, 1, false, false});
         const GlobalResult result =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
         QCOMPARE(result.links.size(), std::size_t(1));
@@ -564,21 +564,7 @@ private slots:
         const GlobalPlacedFiber* v = findFiber(result, 901);
         QVERIFY(v != nullptr);
         QVERIFY(!v->meta.linked);
-        // At the layout API, an unspecified ordinary kind does not disagree
-        // with the adjacent ref. Change only this field to exercise its
-        // effect on both the solver output and the verification input digest.
-        std::vector<InputFiber> implicitKind = fibers;
-        implicitKind[1].links.front().adjacentExplicit = false;
-        const GlobalResult fine =
-            vc3d::fiber_map::buildGlobalLayout(implicitKind, umbilicus, defaultParams());
-        QCOMPARE(fine.links.size(), std::size_t(1));
-        QVERIFY(!fine.links.front().adjacentDisagrees);
-        QVERIFY(fine.links.front().adjacent);
-        QVERIFY(!fine.links.front().suspect);
-        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(result) ==
-                  vc3d::fiber_map::digestGlobalResult(fine)));
-        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams()) ==
-                  vc3d::fiber_map::digestGlobalInputs(implicitKind, umbilicus, defaultParams())));
+
     }
 
     // A pair that is not one H and one V has no inside: the link is an
@@ -2237,8 +2223,8 @@ private slots:
             std::vector<InputFiber> fibers = adjacentPair(4000.0, 0.0, 0.3 * kTwoPi, 'V');
             fibers[0].links.clear();
             fibers[1].links.clear();
-            fibers[0].links.push_back({1, fibers[1].id, 1, true, false, true, true});
-            fibers[1].links.push_back({1, fibers[0].id, 1, true, false, true, false});
+            fibers[0].links.push_back({1, fibers[1].id, 1, true, false, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, true, false, false});
             const GlobalResult mixed =
                 vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
             QCOMPARE(mixed.links.size(), std::size_t{1});
@@ -2271,8 +2257,8 @@ private slots:
             std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
             fibers[0].links.clear();
             fibers[1].links.clear();
-            fibers[0].links.push_back({1, fibers[1].id, 1, true, true, true, true});
-            fibers[1].links.push_back({1, fibers[0].id, 1, true, true, true, true});
+            fibers[0].links.push_back({1, fibers[1].id, 1, true, true, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, true, true, true});
             const GlobalResult result =
                 vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
             QCOMPARE(result.links.size(), std::size_t{1});
@@ -2283,8 +2269,8 @@ private slots:
             std::vector<InputFiber> fibers = adjacentPair(4000.0, 0.0, 0.3 * kTwoPi, 'V');
             fibers[0].links.clear();
             fibers[1].links.clear();
-            fibers[0].links.push_back({1, fibers[1].id, 1, false, false, true, true});
-            fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true, true});
+            fibers[0].links.push_back({1, fibers[1].id, 1, false, false, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true});
             const GlobalResult result =
                 vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
             QCOMPARE(result.links.size(), std::size_t{1});

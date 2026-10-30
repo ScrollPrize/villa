@@ -97,7 +97,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval)
 
 			result = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(30.0, 30.0, 100.0),
 				mesh_step=10.0,
 				existing_corr_points=existing,
@@ -131,7 +131,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval)
 
 			result = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(30.0, 30.0, 100.0),
 				mesh_step=10.0,
 				output_mask=True,
@@ -174,13 +174,13 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval)
 
 			result_a = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(20.0, 20.0, 100.0),
 				mesh_step=10.0,
 				output_mask=True,
 			)
 			result_b = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(40.0, 40.0, 100.0),
 				mesh_step=10.0,
 				output_mask=True,
@@ -202,12 +202,12 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval)
 
 			result_a = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(20.0, 20.0, 100.0),
 				mesh_step=10.0,
 			)
 			result_b = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(40.0, 40.0, 100.0),
 				mesh_step=10.0,
 			)
@@ -229,7 +229,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval, xy_step=100.0)
 
 			result = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(300.0, 300.0, 100.0),
 				mesh_step=10.0,
 				padding_frac=0.0,
@@ -249,13 +249,13 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval)
 
 			result_16 = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(30.0, 30.0, 100.0),
 				mesh_step=16.0,
 				corr_spacing=10.0,
 			)
 			result_25 = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(30.0, 30.0, 100.0),
 				mesh_step=25.0,
 				corr_spacing=10.0,
@@ -278,7 +278,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 			_write_tifxyz(tifxyz, approval, d_value=None)
 
 			result = approval_inpaint.build_approval_inpaint(
-				tifxyz_path=tifxyz,
+				surface=approval_inpaint.load_approval_surface(tifxyz),
 				seed=(30.0, 30.0, 100.0),
 				mesh_step=10.0,
 			)
@@ -299,7 +299,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 
 			with self.assertRaisesRegex(ValueError, "missing required file\\(s\\): approval.tif"):
 				approval_inpaint.build_approval_inpaint(
-					tifxyz_path=tifxyz,
+					surface=approval_inpaint.load_approval_surface(tifxyz),
 					seed=(30.0, 30.0, 100.0),
 					mesh_step=10.0,
 				)
@@ -315,7 +315,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 
 			with self.assertRaisesRegex(ValueError, "does not project"):
 				approval_inpaint.build_approval_inpaint(
-					tifxyz_path=tifxyz,
+					surface=approval_inpaint.load_approval_surface(tifxyz),
 					seed=(10.0, 10.0, 100.0),
 					mesh_step=10.0,
 				)

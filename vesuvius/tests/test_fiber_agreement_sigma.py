@@ -5,6 +5,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_agreement_sigma import (
     evidence_moments,combine_evidence,source_moments,AgreementSigma)
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def combine(means,variances):
     m=torch.tensor(means,dtype=torch.float64);v=torch.tensor(variances,dtype=torch.float64)
     return combine_evidence(evidence_moments(m,v,torch.ones_like(m)).sum(0),m.new_tensor(0),4.,8)
@@ -38,7 +42,7 @@ def test_live_continuation_and_roundtrip(monkeypatch):
             return ((a[:,:,0]+a[:,:,1],a[:,:,1],a[:,:,2]),
                     (b[:,:,0]+b[:,:,1],b[:,:,1],b[:,:,2]))
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_trace_3d.fiber_intermediate_uv.SharedPairGeometry',Geometry)
-    d=dict(source_id=np.array([1,1,2]),family=np.array([0,0,1]),i=np.array([1]),j=np.array([2]),
+    d=dict(source_id=np.array([fid(1),fid(1),fid(2)]),family=np.array([0,0,1]),i=np.array([1]),j=np.array([2]),
         ds_a=np.zeros(1),ds_b=np.zeros(1),sign=np.ones(1),distance=np.array([.5]),parallel=np.array([False]),
         links=np.array([[0,1,0,0]]))
     cfg=dict(winding_sigma=.5,sigma_max=4,cavity_damping=1,cavity_update_every=1,cavity_constraint_sigma=.25)

@@ -61,7 +61,7 @@ void verifyFiberConstraintDatabaseMeasurements(const std::filesystem::path& path
 }
 
 nlohmann::json writeFiberConstraintDatabase(
-    const std::filesystem::path& output, const std::vector<int64_t>& sourceIds,
+    const std::filesystem::path& output, const std::vector<std::string>& sourceIds,
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata)
 {
@@ -83,9 +83,10 @@ nlohmann::json writeFiberConstraintDatabase(
     const auto text=[&](sqlite3_stmt* p,int col,const std::string& value){check(sqlite3_bind_text(p,col,value.c_str(),int(value.size()),SQLITE_TRANSIENT));};
     exec("PRAGMA application_id=1447249475; PRAGMA user_version=1; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;"
          "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
-         "CREATE TABLE fibers(id INTEGER PRIMARY KEY,source_index INTEGER UNIQUE NOT NULL,length_base REAL NOT NULL);"
-         "CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a INTEGER NOT NULL REFERENCES fibers(id),"
-         "fiber_b INTEGER NOT NULL REFERENCES fibers(id),arc_a REAL NOT NULL,arc_b REAL NOT NULL,"
+         // Fibers are identified by their object-store UUIDs.
+         "CREATE TABLE fibers(id TEXT PRIMARY KEY,source_index INTEGER UNIQUE NOT NULL,length_base REAL NOT NULL);"
+         "CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a TEXT NOT NULL REFERENCES fibers(id),"
+         "fiber_b TEXT NOT NULL REFERENCES fibers(id),arc_a REAL NOT NULL,arc_b REAL NOT NULL,"
          "ax REAL NOT NULL,ay REAL NOT NULL,az REAL NOT NULL,bx REAL NOT NULL,by REAL NOT NULL,bz REAL NOT NULL,"
          "parallel_score REAL NOT NULL,perpendicular_score REAL NOT NULL,winding_distance REAL NOT NULL,"
          "parallel_winding_distance REAL NOT NULL,evidence_weight REAL NOT NULL,"
@@ -98,7 +99,7 @@ nlohmann::json writeFiberConstraintDatabase(
     if(report.pieces.size()!=sourceIds.size())throw std::runtime_error("Export requires whole source fibers");
     std::vector<size_t> degree(sourceIds.size());
     for(const auto& p:report.pieces) {
-        check(sqlite3_bind_int64(fiber.get(),1,sourceIds.at(p.traceIndex)));
+        text(fiber.get(),1,sourceIds.at(p.traceIndex));
         check(sqlite3_bind_int64(fiber.get(),2,p.traceIndex));
         check(sqlite3_bind_double(fiber.get(),3,p.endArcBaseVoxels-p.beginArcBaseVoxels));
         check(sqlite3_step(fiber.get()));check(sqlite3_reset(fiber.get()));
@@ -119,7 +120,7 @@ nlohmann::json writeFiberConstraintDatabase(
             const auto& c=report.constraints[i];
             const auto a=report.pieces.at(c.pieceA).traceIndex,b=report.pieces.at(c.pieceB).traceIndex;
             ++degree.at(a);++degree.at(b);parallel+=c.parallelScore>c.perpendicularScore;
-            check(sqlite3_bind_int64(insert.get(),1,i));check(sqlite3_bind_int64(insert.get(),2,sourceIds.at(a)));check(sqlite3_bind_int64(insert.get(),3,sourceIds.at(b)));
+            check(sqlite3_bind_int64(insert.get(),1,i));text(insert.get(),2,sourceIds.at(a));text(insert.get(),3,sourceIds.at(b));
             const double values[]={c.arcABaseVoxels,c.arcBBaseVoxels,c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2],c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2],c.parallelScore,c.perpendicularScore,c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
             for(int k=0;k<13;++k)check(sqlite3_bind_double(insert.get(),4+k,values[k]));
             for(int side=0;side<2;++side) {
@@ -152,7 +153,7 @@ nlohmann::json writeFiberConstraintDatabase(
 
 nlohmann::json orientFiberConstraintDatabase(
     const std::filesystem::path& input, const std::filesystem::path& output,
-    const std::vector<int64_t>& sourceIds,
+    const std::vector<std::string>& sourceIds,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
     double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus,
@@ -197,21 +198,25 @@ nlohmann::json orientFiberConstraintDatabase(
     if((priorUmbilicus || exportNormalCurves) && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
         throw std::runtime_error("Prior sweep spacing must match baked orientation");
     const auto original=metaValue("provenance");
-    for(const char* key:{"afv_uuid","normal_manifest","normal_provenance"})
+    for(const char* key:{"fibers_store_uuid","normal_manifest","normal_provenance"})
         if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
 
     struct Endpoint { size_t slot; double arc; cv::Vec3d point; };
     std::vector<std::vector<Endpoint>> endpoints(sourceIds.size());
-    std::unordered_map<int64_t,size_t> index;
+    std::unordered_map<std::string,size_t> index;
     std::vector<double> lengths(sourceIds.size());
     for(size_t i=0;i<sourceIds.size();++i) {
         if(!index.emplace(sourceIds[i],i).second)throw std::runtime_error("Duplicate source fiber");
         lengths[i]=makePolylineArcGeometry(lines[i].pointsBaseXYZ).length();
     }
     auto fiberQuery=prepare(src.get(),"SELECT id,source_index,length_base FROM fibers ORDER BY source_index");
+    const auto columnText=[](sqlite3_stmt* s,int col) {
+        const auto* value=sqlite3_column_text(s,col);
+        return value ? std::string(reinterpret_cast<const char*>(value)) : std::string{};
+    };
     size_t fiberCount=0; int rc;
     while((rc=sqlite3_step(fiberQuery.get()))==SQLITE_ROW) {
-        if(fiberCount>=sourceIds.size() || sqlite3_column_int64(fiberQuery.get(),0)!=sourceIds[fiberCount] ||
+        if(fiberCount>=sourceIds.size() || columnText(fiberQuery.get(),0)!=sourceIds[fiberCount] ||
            sqlite3_column_int64(fiberQuery.get(),1)!=static_cast<int64_t>(fiberCount) ||
            std::abs(sqlite3_column_double(fiberQuery.get(),2)-lengths[fiberCount])>1e-6)
             throw std::runtime_error("Source fiber identity/order/length differs");
@@ -224,7 +229,7 @@ nlohmann::json orientFiberConstraintDatabase(
     while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
         if(sqlite3_column_int64(query.get(),0)!=static_cast<int64_t>(events))throw std::runtime_error("Non-contiguous constraint IDs");
         for(int side=0;side<2;++side) {
-            const auto i=index.at(sqlite3_column_int64(query.get(),1+side));
+            const auto i=index.at(columnText(query.get(),1+side));
             const double arc=sqlite3_column_double(query.get(),3+side);
             if(!std::isfinite(arc) || arc<0 || arc>lengths[i]+1e-6)throw std::runtime_error("Invalid constraint arc");
             const int c=5+side*3;
@@ -245,7 +250,7 @@ nlohmann::json orientFiberConstraintDatabase(
     if(exportNormalCurves) {
         if(priorUmbilicus)throw std::invalid_argument("Choose curve export OR outward priors");
         // Portable explicit little-endian float64 payload, regular arc + normal
-        // + validity. Geometry remains in the original AFV, not this cache.
+        // + validity. Geometry remains in the object store, not this cache.
         std::filesystem::create_directories(partial);
         curveStream.open(partial/"normals.bin",std::ios::binary);
         if(!curveStream)throw std::runtime_error("Cannot create normal curve payload");

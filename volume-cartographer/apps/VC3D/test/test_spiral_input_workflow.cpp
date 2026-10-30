@@ -35,6 +35,31 @@ class SpiralInputWorkflowTests : public QObject {
         return {};
     }
 private slots:
+    void fiberDraftsUseObjectUuidsForUpdatesAndRetirement() {
+        QTemporaryDir root;
+        SpiralServiceManager client;
+        const QString a = "12345678-1234-1234-1234-123456789abc";
+        const QString b = "12345678-1234-1234-1234-123456789abd";
+        const auto aPath = root.filePath(a + ".json"), bPath = root.filePath(b + ".json");
+        write(aPath, QJsonDocument(QJsonObject{{"type","vc3d_fiber"},{"uuid",a},{"name","same name"},
+            {"branches",QJsonArray{QJsonObject{{"branch_file",b+".json"},{"control_point_index",0},{"branch_control_point_index",1}}}}}).toJson());
+        write(bPath, QJsonDocument(QJsonObject{{"type","vc3d_fiber"},{"uuid",b},{"name","same name"}}).toJson());
+        client.stageJsonInput("fiber", aPath, a);
+        client.stageJsonInput("fiber", bPath, b);
+        QVERIFY(client._inputDrafts.contains(a));
+        QVERIFY(client._inputDrafts.contains(b));
+        QCOMPARE(client._inputDrafts.size(), 2);
+        const auto first = client._inputDrafts[a]->snapshot();
+        const auto captured = document(first.content.manifest.value("path").toString());
+        QCOMPARE(captured.value("branches").toArray()[0].toObject().value("branch_file").toString(), b+".json");
+        client.stageJsonInput("fiber", aPath, a);
+        QCOMPARE(client._inputDrafts.size(), 2);
+        QVERIFY(client._inputDrafts[a]->snapshot().localRevision > first.localRevision);
+        client.removeInputDraft(a);
+        QVERIFY(client._inputDrafts[a]->deleted());
+        QVERIFY(!client._inputDrafts[b]->deleted());
+    }
+
     void pclEditsResolveSourceDocument() {
         SpiralServiceManager client;
         const QJsonObject first{{"id", "a"}, {"kind", "pcl"}, {"role", "same_winding"},
@@ -365,14 +390,18 @@ private slots:
         QSignalSpy conflicts(&client, &SpiralServiceManager::inputConflict);
         client.applyInputDrafts(true);
         QTRY_VERIFY_WITH_TIMEOUT(!conflicts.isEmpty(), 10000);
-        // A mutable editor copy must never be reused as the saved snapshot.
+        // Fiber editors consume immutable artifacts and stage separate store exports.
         QSignalSpy editors(&client, &SpiralServiceManager::inputEditorRequested);
         client.editInputDraft(firstId);
         QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 1, 10000);
         const auto editorPath = editors.last()[1].toString();
+        const auto objectUuid = original.value(QStringLiteral("uuid")).toString();
+        QVERIFY(!objectUuid.isEmpty() && objectUuid != firstId);
+        QCOMPARE(client.logicalInputId(QStringLiteral("fiber"), objectUuid, {}, {}, {}), firstId);
         auto edited = original;
         edited[QStringLiteral("name")] = QStringLiteral("unsaved editor change");
-        write(editorPath, QJsonDocument(edited).toJson());
+        const auto editedPath = root.filePath(QStringLiteral("store-export.json"));
+        write(editedPath, QJsonDocument(edited).toJson());
         QSignalSpy copies(&client, &SpiralServiceManager::inputCopyProgress);
         client.resolveInputConflict(conflicts.last()[0].toJsonObject(), QStringLiteral("save_as_new"));
         QTRY_COMPARE_WITH_TIMEOUT(client.inputDraftStatus().size(), qsizetype(2), 10000);
@@ -387,7 +416,7 @@ private slots:
             QVERIFY(savedPath != editorPath);
             QCOMPARE(document(savedPath), original);
             edited[QStringLiteral("name")] = QStringLiteral("later editor change");
-            write(editorPath, QJsonDocument(edited).toJson());
+            write(editedPath, QJsonDocument(edited).toJson());
             QCOMPARE(document(savedPath), original);
         }
         QVERIFY(!newId.isEmpty());
@@ -395,30 +424,23 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
         QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/%1.json").arg(newId))), original);
         QCOMPARE(document(baseline), external);
-        // Conflict resolution accepted the external revision. Open and mutate it,
-        // then discard without changing that accepted revision again.
+        // Discard affects the service draft, never durable object-store edits
+        // or the cached immutable accepted artifact.
         client.editInputDraft(firstId);
         QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 2, 10000);
         const auto acceptedEditorPath = editors.last()[1].toString();
         QCOMPARE(document(acceptedEditorPath), external);
-        write(acceptedEditorPath, QJsonDocument(edited).toJson());
-        client.discardInputDraft(firstId);
+        write(editedPath, QJsonDocument(edited).toJson());
+        client.stageJsonInput(QStringLiteral("fiber"), editedPath, objectUuid);
+        QCOMPARE(client.inputDraftStatus().size(), qsizetype(2));
+        client.editInputDraft(firstId);
         QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 3, 10000);
-        const auto restoredPath = editors.last()[1].toString();
-        QVERIFY(restoredPath != acceptedEditorPath);
-        QCOMPARE(document(restoredPath), external);
-        client.editInputDraft(firstId);
-        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 4, 10000);
-        QCOMPARE(editors.last()[1].toString(), restoredPath);
-        QCOMPARE(document(editors.last()[1].toString()), external);
-        // Also discard after staging and opening a separate local snapshot.
-        write(restoredPath, QJsonDocument(edited).toJson());
-        client.stageJsonInput(QStringLiteral("fiber"), restoredPath, firstId);
-        client.editInputDraft(firstId);
-        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 5, 10000);
         QCOMPARE(document(editors.last()[1].toString()), edited);
         client.discardInputDraft(firstId);
-        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 6, 10000);
+        QCOMPARE(editors.size(), qsizetype(3));
+        QCOMPARE(document(acceptedEditorPath), external);
+        client.editInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 4, 10000);
         QCOMPARE(document(editors.last()[1].toString()), external);
         client.disconnectFromService();
         service.terminate();
@@ -486,12 +508,12 @@ private slots:
         QVERIFY(!client.hasInputDrafts());
         QVERIFY(fiberRow(client).value(QStringLiteral("session_changed")).toBool());
 
-        // Establish an alias and an explicit selection in the old workspace.
+        // Stage against the selected service identity, without filename aliases.
         const auto local = root.filePath(QStringLiteral("local.json"));
         auto edited = original;
         edited[QStringLiteral("name")] = QStringLiteral("before restart");
         write(local, QJsonDocument(edited).toJson());
-        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.stageJsonInput(QStringLiteral("fiber"), local, firstId);
         client.setInputSelection({firstId});
         client.applyInputDrafts(true);
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
@@ -511,7 +533,7 @@ private slots:
         QVERIFY(secondId != firstId);
         edited[QStringLiteral("name")] = QStringLiteral("after restart");
         write(local, QJsonDocument(edited).toJson());
-        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.stageJsonInput(QStringLiteral("fiber"), local, secondId);
         QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
         QCOMPARE(fiberRow(client).value(QStringLiteral("id")).toString(), secondId);
         client.applyInputDrafts(true);
@@ -526,7 +548,7 @@ private slots:
         auto disposable = edited;
         disposable[QStringLiteral("name")] = QStringLiteral("discard on exit");
         write(local, QJsonDocument(disposable).toJson());
-        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.stageJsonInput(QStringLiteral("fiber"), local, secondId);
         client.applyInputDrafts();
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 5, 10000);
         bool released = false;
@@ -565,12 +587,15 @@ private slots:
             const auto workspace = client.inputWorkspaceId();
             const QString source = root.filePath(QStringLiteral("draft.json"));
             auto templateFiber = document(root.filePath(QStringLiteral("fiber-template.json")));
+            const auto objectUuid = QStringLiteral("12345678-1234-1234-1234-123456789abc");
+            templateFiber[QStringLiteral("uuid")] = objectUuid;
+            const auto publishedFiber = root.filePath(QStringLiteral("dataset/fibers/%1.json").arg(objectUuid));
             templateFiber[QStringLiteral("name")] = QStringLiteral("first");
             const auto first = QJsonDocument(templateFiber).toJson();
             templateFiber[QStringLiteral("name")] = QStringLiteral("second");
             const auto second = QJsonDocument(templateFiber).toJson();
             write(source, first);
-            client.stageJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
+            client.stageJsonInput(QStringLiteral("fiber"), source, objectUuid);
             QVERIFY(client.hasInputDrafts());
             QVERIFY(!fiberRow(client).isEmpty());
             client.stageJsonInput(QStringLiteral("pcl"), root.filePath(QStringLiteral("pcl-template.json")),
@@ -603,7 +628,7 @@ private slots:
             QTest::qWait(100);
             QVERIFY(!QFile::exists(root.filePath(QStringLiteral("applying"))));
             write(source, second);
-            client.stageJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
+            client.stageJsonInput(QStringLiteral("fiber"), source, objectUuid);
             // Repeated Apply while preparing must not start an early transfer.
             client.applyInputDrafts();
             release.release();
@@ -611,17 +636,8 @@ private slots:
             QFile::remove(root.filePath(QStringLiteral("hold-apply")));
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));
-            QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))).value(QStringLiteral("name")).toString(), QStringLiteral("first"));
+            QCOMPARE(document(publishedFiber).value(QStringLiteral("name")).toString(), QStringLiteral("first"));
             QVERIFY(fiberRow(client).value(QStringLiteral("dirty")).toBool());
-            // Managed editor/autosave destinations are copies, including peers
-            // needed by linked save batches. Mutating one cannot publish bytes.
-            QString copyError;
-            const auto fiberDirectory = root.filePath(QStringLiteral("dataset/fibers"));
-            const auto working = client.workingCopy(fiberDirectory, &copyError);
-            QVERIFY2(!working.isEmpty(), qPrintable(copyError));
-            write(QDir(working).filePath(QStringLiteral("fiber.json")), second);
-            QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))).value(QStringLiteral("name")).toString(), QStringLiteral("first"));
-            QCOMPARE(client.workingCopy(fiberDirectory), working);
             client.reconnect();
             QTRY_VERIFY_WITH_TIMEOUT(client.isReady() && client.ownsInputWorkspace(), 10000);
             QTest::qWait(200);
@@ -630,12 +646,12 @@ private slots:
             client.applyInputDrafts(true);
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));
-            QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))).value(QStringLiteral("name")).toString(), QStringLiteral("second"));
+            QCOMPARE(document(publishedFiber).value(QStringLiteral("name")).toString(), QStringLiteral("second"));
             QVERIFY(!client.hasInputDrafts());
             client.removeInputDraft(id);
             client.applyInputDrafts();
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
-            QVERIFY(QFile::exists(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))));
+            QVERIFY(QFile::exists(publishedFiber));
             QVERIFY(fiberRow(client).value(QStringLiteral("can_restore")).toBool());
             client.restoreInputDraft(id);
             client.applyInputDrafts(true);
@@ -644,7 +660,7 @@ private slots:
             client.removeInputDraft(id);
             client.applyInputDrafts(true);
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 5, 10000);
-            QVERIFY(!QFile::exists(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))));
+            QVERIFY(!QFile::exists(publishedFiber));
             QVERIFY(!fiberRow(client).value(QStringLiteral("can_restore")).toBool());
             if (qEnvironmentVariableIsSet("SPIRAL_REVISION_DROP_REPLIES")) {
                 QFile drops(root.filePath(QStringLiteral("dropped.json")));

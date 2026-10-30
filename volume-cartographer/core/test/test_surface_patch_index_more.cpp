@@ -27,7 +27,7 @@ fs::path fixtureSegment(const std::string& name)
     return fs::path(VC_TEST_FIXTURES_DIR) / "segments" / name;
 }
 
-std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 0.f)
+std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 1.f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r)
@@ -65,7 +65,7 @@ TEST_CASE("rebuild against a path-backed (tifxyz) fixture exercises the mapped-c
     auto qs = std::make_shared<QuadSurface>(seg);
     qs->ensureLoaded();
     SurfacePatchIndex idx;
-    idx.rebuild({qs}, /*bboxPadding=*/0.5f);
+    idx.rebuild({qs}, /*bboxPadding=*/0.5f, /*useMappedSurfaces=*/true);
     CHECK(idx.surfaceCount() == 1);
     CHECK(idx.patchCount() > 0);
 

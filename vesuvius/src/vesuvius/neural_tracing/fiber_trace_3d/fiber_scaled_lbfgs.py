@@ -325,7 +325,7 @@ def managed_solve(config,state,raw,widths,data,nodes,d,extension,pair_cost,diagn
         raise ValueError('Scaled L-BFGS does not support learned sigma')
     fixed=None
     if config.get('force_keep_source_ids'):
-        sources=np.asarray(config['force_keep_source_ids'],dtype=np.int64)
+        sources=np.asarray(config['force_keep_source_ids'],dtype=str)
         if not np.isin(sources,d['source_id']).all():raise ValueError('Missing forced-enabled source')
         fixed=np.isin(d['source_id'],sources)
         with torch.no_grad():state[torch.as_tensor(fixed,device=state.device),3]=100.
