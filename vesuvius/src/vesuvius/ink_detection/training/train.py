@@ -19,6 +19,7 @@ from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
     resolve_checkpoint_path,
     restore_training_state,
+    validate_optimizer_step,
 )
 from vesuvius.ink_detection.config import (
     InkDataConfig,
@@ -362,6 +363,7 @@ def build_training_checkpoint_payload(
         "lr_scheduler": scheduler.state_dict(),
         "config": canonical,
         "step": step,
+        "optimizer_step": validate_optimizer_step(optimizer_step),
         "wandb_run_id": (
             run.id if run is not None else config.wandb_run_id
         ),
@@ -863,7 +865,11 @@ def _run_training(request: TrainingRequest) -> int:
             ):
                 write_gradient_health()
             optimizer.zero_grad(set_to_none=True)
-            if accelerator.sync_gradients:
+            # AMP overflow can skip the update even on a sync step.
+            if (
+                accelerator.sync_gradients
+                and not accelerator.optimizer_step_was_skipped
+            ):
                 scheduler.step()
                 optimizer_step += 1
                 ema = config.ema
