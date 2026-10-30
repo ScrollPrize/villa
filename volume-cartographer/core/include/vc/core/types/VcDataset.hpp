@@ -30,7 +30,6 @@ public:
     VcDtype getDtype() const;
     size_t dtypeSize() const;  // 1 for uint8, 2 for uint16
     const std::filesystem::path& path() const;
-    const std::string& delimiter() const;
 
     // --- Decompression ---
     // Decompress raw compressed bytes into output buffer.
@@ -82,21 +81,12 @@ public:
                                   const std::vector<size_t>& regionShape,
                                   void* output) const;
 
-    [[nodiscard]] bool writeRegion(const std::vector<size_t>& offset,
-                                   const std::vector<size_t>& regionShape,
-                                   const void* data);
-
     struct Impl;
 private:
     std::unique_ptr<Impl> impl_;
 };
 
 // --- Factory functions ---
-
-// Open zarr root and return one VcDataset per pyramid level.
-// Scans subdirectories for .zarray files, sorts numerically.
-std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
-    const std::filesystem::path& zarrRoot);
 
 // Read .zattrs JSON from a zarr group directory.
 utils::Json readZarrAttributes(const std::filesystem::path& groupPath);

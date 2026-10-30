@@ -33,7 +33,7 @@ cv::Mat_<cv::Vec3f> makeWavyGrid(int rows, int cols)
     for (int r = 0; r < rows; ++r)
         for (int c = 0; c < cols; ++c) {
             const float u = float(c), v = float(r);
-            m(r, c) = cv::Vec3f(u, v, 3.0f * std::sin(0.35f * u) * std::cos(0.27f * v));
+            m(r, c) = cv::Vec3f(u, v, 10.0f + 3.0f * std::sin(0.35f * u) * std::cos(0.27f * v));
         }
     return m;
 }
@@ -58,13 +58,16 @@ cv::Mat_<cv::Vec3f> makeCylinderGrid(int rows, int cols, float R, float du)
     for (int r = 0; r < rows; ++r)
         for (int c = 0; c < cols; ++c) {
             const float a = float(c) * du;
-            m(r, c) = cv::Vec3f(R * std::cos(a), R * std::sin(a), float(r));
+            m(r, c) = cv::Vec3f(R * std::cos(a), R * std::sin(a), 1.0f + float(r));
         }
     return m;
 }
 
 // A patch of a sphere of radius R centred at the origin. Unlike the cylinder
 // both principal curvatures are non-zero, so a swapped cross-product axis shows.
+// Above z = 0, where surface vertices are valid.
+constexpr float kSphereCenterZ = 100.0f;
+
 cv::Mat_<cv::Vec3f> makeSphereGrid(int rows, int cols, float R, float dth)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
@@ -74,7 +77,7 @@ cv::Mat_<cv::Vec3f> makeSphereGrid(int rows, int cols, float R, float dth)
             const float th  = 0.35f * kPi + float(r) * dth;   // polar, away from the poles
             m(r, c) = cv::Vec3f(R * std::sin(th) * std::cos(phi),
                                 R * std::sin(th) * std::sin(phi),
-                                R * std::cos(th));
+                                kSphereCenterZ + R * std::cos(th));
         }
     return m;
 }
@@ -382,7 +385,8 @@ TEST_CASE("smooth normals track a sphere's analytic normal, with the right sign"
             if (!finiteVec(p) || !finiteVec(gs.normals(r, c))
                 || !finiteVec(gl.normals(r, c))) continue;
             if (!centeredSupported(smo, pts, cv::Size(160, 160), 8.0f, c, r)) continue;
-            cv::Vec3f radial = p / float(cv::norm(p));
+            const cv::Vec3f fromCenter = p - cv::Vec3f(0.f, 0.f, kSphereCenterZ);
+            cv::Vec3f radial = fromCenter / float(cv::norm(fromCenter));
             // Both modes must agree on orientation; compare each against the
             // radial axis, allowing a consistent global sign.
             const cv::Vec3f& ns = gs.normals(r, c);

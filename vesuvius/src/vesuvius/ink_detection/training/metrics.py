@@ -18,12 +18,14 @@ class Confusion:
 
     @staticmethod
     def zero_counts(*, device=None) -> ConfusionCounts:
+        # Exact integer counts: int64 exists on every device, float64 does
+        # not exist on MPS, and float32 stops being exact above 2**24 pixels.
         kwargs = {} if device is None else {"device": device}
         return ConfusionCounts(
-            tp=torch.zeros((), dtype=torch.float64, **kwargs),
-            fp=torch.zeros((), dtype=torch.float64, **kwargs),
-            fn=torch.zeros((), dtype=torch.float64, **kwargs),
-            tn=torch.zeros((), dtype=torch.float64, **kwargs),
+            tp=torch.zeros((), dtype=torch.int64, **kwargs),
+            fp=torch.zeros((), dtype=torch.int64, **kwargs),
+            fn=torch.zeros((), dtype=torch.int64, **kwargs),
+            tn=torch.zeros((), dtype=torch.int64, **kwargs),
         )
 
     @staticmethod
@@ -59,26 +61,33 @@ class Confusion:
         predictions = torch.sigmoid(logits).to(torch.float32) >= self.threshold
         targets = targets.to(torch.float32) >= 0.5
         return ConfusionCounts(
-            tp=(predictions & targets).sum(dtype=torch.float64),
-            fp=(predictions & ~targets).sum(dtype=torch.float64),
-            fn=(~predictions & targets).sum(dtype=torch.float64),
-            tn=(~predictions & ~targets).sum(dtype=torch.float64),
+            tp=(predictions & targets).sum(dtype=torch.int64),
+            fp=(predictions & ~targets).sum(dtype=torch.int64),
+            fn=(~predictions & targets).sum(dtype=torch.int64),
+            tn=(~predictions & ~targets).sum(dtype=torch.int64),
         )
 
 
 class BalancedAccuracy:
     @staticmethod
     def from_counts(counts: ConfusionCounts) -> torch.Tensor:
-        positive_denominator = counts.tp + counts.fn
-        negative_denominator = counts.tn + counts.fp
+        # The ratio stays float64, computed on the CPU for devices without it.
+        # Move first, then cast: torch 2.14 turns a fused MPS->CPU float64
+        # .to(device="cpu", dtype=torch.float64) into zeros without an error.
+        tp, fp, fn, tn = (
+            value.detach().cpu().to(torch.float64)
+            for value in (counts.tp, counts.fp, counts.fn, counts.tn)
+        )
+        positive_denominator = tp + fn
+        negative_denominator = tn + fp
         positive_recall = torch.where(
             positive_denominator > 0,
-            counts.tp / positive_denominator,
+            tp / positive_denominator,
             torch.full_like(positive_denominator, torch.nan),
         )
         negative_recall = torch.where(
             negative_denominator > 0,
-            counts.tn / negative_denominator,
+            tn / negative_denominator,
             torch.full_like(negative_denominator, torch.nan),
         )
         recalls = torch.stack((positive_recall, negative_recall))

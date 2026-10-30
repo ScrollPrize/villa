@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/PointCollections.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -72,14 +72,14 @@ TEST_CASE("tags and anchor2d + offset")
     const uint64_t cid = c.getCollectionId("a").value();
 
     c.setCollectionTag(cid, "k", "v");
-    CHECK(c.getCollectionTag(cid, "k") == std::optional<std::string>("v"));
+    CHECK(c.getAllCollections().at(cid).tags.at("k") == "v");
     c.removeCollectionTag(cid, "k");
-    CHECK_FALSE(c.getCollectionTag(cid, "k").has_value());
+    CHECK_FALSE(c.getAllCollections().at(cid).tags.contains("k"));
 
     c.setCollectionAnchor2d(cid, cv::Vec2f(10, 20));
-    REQUIRE(c.getCollectionAnchor2d(cid).has_value());
+    REQUIRE(c.getAllCollections().at(cid).anchor2d.has_value());
     c.applyAnchorOffset(5, -5);
-    auto a = c.getCollectionAnchor2d(cid);
+    auto a = c.getAllCollections().at(cid).anchor2d;
     REQUIRE(a.has_value());
     CHECK((*a)[0] == doctest::Approx(15));
     CHECK((*a)[1] == doctest::Approx(15));
@@ -151,7 +151,7 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 
     c.setAutoFillMode(cid, PointCollections::WindingFillMode::Constant, 4.0f);
     CHECK(c.getAutoFillMode(cid) == PointCollections::WindingFillMode::Constant);
-    CHECK(c.getAutoFillConstant(cid) == doctest::Approx(4.0f));
+    CHECK(c.getAllCollections().at(cid).autoFillConstant == doctest::Approx(4.0f));
     CHECK(c.computeAutoFillValue(cid) == doctest::Approx(4.0f));
 
     // Incremental → max existing winding + 1; none set yet → 1.
@@ -170,36 +170,35 @@ TEST_CASE("missing-id queries are safe")
     CHECK(c.getAutoFillMode(999) == PointCollections::WindingFillMode::None);
 }
 
-TEST_CASE("segment-path round-trip (anchored collections only)")
+TEST_CASE("anchored collections round-trip (anchored collections only)")
 {
-    const fs::path dir = fs::temp_directory_path() /
-        ("pc_seg_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-
     PointCollections c;
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
     const uint64_t anchored = c.getCollectionId("anchored").value();
     const std::string anchoredUuid = c.getAllCollections().at(anchored).uuid;
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
-    REQUIRE(c.saveToSegmentPath(dir));
-    CHECK(fs::exists(dir / "corrections.json"));
+    const auto saved = c.anchoredCollections();
+    REQUIRE(saved.size() == 1);
 
     PointCollections loaded;
-    REQUIRE(loaded.loadFromSegmentPath(dir));
-    // Only the anchored collection is persisted.
-    bool has_anchored = false, has_plain = false;
+    loaded.addPoint("previous", {0, 0, 0});
+    loaded.setCollectionAnchor2d(loaded.getCollectionId("previous").value(), cv::Vec2f(1, 1));
+    REQUIRE(loaded.replaceAnchoredCollections(saved));
+    // Only the anchored collection is carried, and it replaces the previous surface's.
+    bool has_anchored = false, has_plain = false, has_previous = false;
     for (const auto& [id, col] : loaded.getAllCollections()) {
         if (col.name == "anchored") {
             has_anchored = true;
             CHECK(col.uuid == anchoredUuid);
+            CHECK(col.anchor2d == cv::Vec2f(8, 9));
         }
         if (col.name == "plain") has_plain = true;
+        if (col.name == "previous") has_previous = true;
     }
     CHECK(has_anchored);
     CHECK_FALSE(has_plain);
-
-    fs::remove_all(dir);
+    CHECK_FALSE(has_previous);
 }
 
 TEST_CASE("JSON round-trip preserves data")
@@ -210,7 +209,7 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("beta", {7, 8, 9});
     const uint64_t alpha = c.getCollectionId("alpha").value();
     const std::string alphaUuid = c.getAllCollections().at(alpha).uuid;
-    CHECK(vc::util::isUuid(alphaUuid));
+    CHECK(vc::objects::util::isUuid(alphaUuid));
     CHECK(c.getAllCollections().at(c.getCollectionId("beta").value()).uuid != alphaUuid);
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
@@ -229,7 +228,7 @@ TEST_CASE("JSON round-trip preserves data")
     CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
-    CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+    CHECK(loaded.getAllCollections().at(la).tags.at("kind") == "correction");
     loaded.renameCollection(la, "renamed");
     CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
 }
@@ -376,7 +375,7 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     PointCollections loaded;
     REQUIRE(loaded.loadFromJSON(tmp.string()));
     const std::string uuid = loaded.getAllCollections().begin()->second.uuid;
-    CHECK(vc::util::isUuid(uuid));
+    CHECK(vc::objects::util::isUuid(uuid));
     REQUIRE(loaded.saveToJSON(tmp.string()));
     PointCollections reloaded;
     REQUIRE(reloaded.loadFromJSON(tmp.string()));
@@ -448,56 +447,6 @@ TEST_CASE("loadFromJSON rejects bad input and returns false")
     fs::remove(tmp);
 }
 
-TEST_CASE("top-level coordinate metadata is saved and loaded")
-{
-    const fs::path tmp = fs::temp_directory_path() /
-        ("pc_coordinate_metadata_" + std::to_string(::getpid()) + ".json");
-
-    PointCollections original;
-    original.addPoint("source", {1, 2, 3});
-    utils::Json metadata = utils::Json::object();
-    metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
-    metadata["vc_open_data_source_path"] = "s3://path/to/the/source/volume";
-    metadata["vc_open_data_source_coordinate_level"] = 2;
-    metadata["vc_open_data_source_coordinate_scale_factor"] = uint64_t{4};
-    metadata["vc_open_data_source_original_resolution"] = 2.4;
-    original.setFileMetadata(metadata);
-    REQUIRE(original.saveToJSON(tmp.string()));
-
-    const auto saved = utils::Json::parse_file(tmp);
-    CHECK(saved["vc_open_data_coordinate_space"].get_string() ==
-          "PHerc1451/20260319101107@L2");
-    CHECK(saved["vc_open_data_source_coordinate_scale_factor"].get_uint64() == 4);
-
-    PointCollections loaded;
-    REQUIRE(loaded.loadFromJSON(tmp.string()));
-    CHECK(loaded.fileMetadata()["vc_open_data_source_path"].get_string() ==
-          "s3://path/to/the/source/volume");
-    CHECK(loaded.fileMetadata()["vc_open_data_source_original_resolution"].get_double() ==
-          doctest::Approx(2.4));
-    fs::remove(tmp);
-}
-
-TEST_CASE("segment correction files carry top-level coordinate metadata")
-{
-    const fs::path dir = fs::temp_directory_path() /
-        ("pc_segment_coordinate_metadata_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-
-    PointCollections points;
-    points.addPoint("correction", {1, 2, 3});
-    points.setCollectionAnchor2d(points.getCollectionId("correction").value(), cv::Vec2f(4, 5));
-    utils::Json metadata = utils::Json::object();
-    metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
-    points.setFileMetadata(metadata);
-    REQUIRE(points.saveToSegmentPath(dir));
-
-    const auto saved = utils::Json::parse_file(dir / "corrections.json");
-    CHECK(saved["vc_open_data_coordinate_space"].get_string() ==
-          "PHerc1451/20260319101107@L2");
-    fs::remove_all(dir);
-}
-
 TEST_CASE("saveToJSON fails on an unwritable path")
 {
     PointCollections c;
@@ -555,24 +504,11 @@ TEST_CASE("an invalid collection uuid leaves the store unchanged")
     CHECK(c.getPoints("kept").size() == 1);
     fs::remove(tmp);
 
-    // A segment corrections file fails the same way: nothing is half-loaded.
-    const fs::path segDir = fs::temp_directory_path() /
-        ("pc_bad_uuid_seg_" + std::to_string(::getpid()));
-    fs::create_directories(segDir);
-    {
-        std::ofstream o(segDir / "corrections.json");
-        o << R"({
-            "vc_pointcollections_json_version": "1",
-            "collections": {
-                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1],
-                      "anchor2d": [1, 2]},
-                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
-                      "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]}
-            }
-        })";
-    }
-    CHECK_FALSE(c.loadFromSegmentPath(segDir));
+    // Anchored corrections fail the same way: nothing is half-loaded.
+    std::map<uint64_t, utils::Json> corrections;
+    corrections[1] = utils::Json::parse(R"({"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [1, 2]})");
+    corrections[2] = utils::Json::parse(R"({"uuid": "not-a-uuid", "name": "bad", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]})");
+    CHECK_FALSE(c.replaceAnchoredCollections(corrections));
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getCollectionId("good") == std::nullopt);
-    fs::remove_all(segDir);
 }

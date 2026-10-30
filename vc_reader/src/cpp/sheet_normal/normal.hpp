@@ -10,7 +10,15 @@
 #else
 #define VCR_SHEET_HD
 #endif
+#ifdef VC_READER_CUDA
+#include "../cuda_buffer.hpp"
+#endif
 namespace vcr::sheet_normal {
+#ifdef VC_READER_CUDA
+// image/output are device storage; centers are host XYZ/validity metadata.
+device::Storage cuda(const void* image, bool floating, const float* centers,
+                     std::size_t batch, int device, device::Storage output = {});
+#endif
 constexpr int width=109, sites=33, count=sites*sites*sites;
 constexpr int zcount=sites*width*width, ycount=sites*sites*width;
 struct Kernels {

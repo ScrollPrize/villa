@@ -55,7 +55,7 @@ REFINE_ALL = 2.  # retry threshold above any confidence: every path refinement p
 @dataclass
 class DataOptions:
     index: str = ''  # sheet_strip/build_index.py output
-    afv: str = ''  # the AFV the index was built from
+    fibers: str = ''  # the fiber store (.vcobj) the index was built from
     full_tube_share: float = .5  # decisions shown the whole (matched) fiber, not just the trace up to the head
     max_patches: int = 4
     length_power: float = 1.  # fibers drawn in proportion to matched length**power
@@ -126,8 +126,8 @@ class RunConfig:
         run = cls(**{k: v for k, v in document.items() if k not in sections},
                   **{k: s(**document.get(k, {})) for k, s in sections.items()})
         run.out_root, run.init_checkpoint = resolve(run.out_root), resolve(run.init_checkpoint)
-        run.data.index, run.data.afv, run.data.umbilicus = (resolve(run.data.index), resolve(run.data.afv),
-                                                            resolve(run.data.umbilicus))
+        run.data.index, run.data.fibers, run.data.umbilicus = (resolve(run.data.index), resolve(run.data.fibers),
+                                                               resolve(run.data.umbilicus))
         return run
 
     def to_dict(self):
@@ -275,7 +275,7 @@ def build_data(run, cfg, spec, checkpoint, split, *, augment, seed, workers, ful
     index = StripIndex(d.index, split)
     if not len(index):
         raise ValueError(f'No fiber runs in the {split} split of {d.index}')
-    fibers = RunFibers(d.afv, index, spec.grid_scale, d.length_power)
+    fibers = RunFibers(d.fibers, index, spec.grid_scale, d.length_power)
     trace_per_patch = spec.ct_grid_scale/spec.grid_scale
     builder = builder_type(cfg, fibers, sampling, augment=augment, trace_per_patch=trace_per_patch,
                            full_tube_share=d.full_tube_share if full_tube_share is None else full_tube_share,

@@ -1,5 +1,6 @@
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "support/TestProject.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -21,6 +22,70 @@ class CatalogProjectDialogTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void attachRepresentations()
+    {
+        vcr::catalog::OpenDataManifest manifest;
+        vcr::catalog::OpenDataSample sample;
+        sample.id = "test";
+        vcr::catalog::OpenDataVolume volume;
+        volume.id = "scan";
+        const QStringList types{"ink-detection-3d-zarr", "ink_detection_3d_zarr",
+            "surface-prediction-zarr", "lasagna", "normal-grids", "surface-prediction-mesh"};
+        for (const auto& type : types) {
+            vcr::catalog::OpenDataArtifact artifact;
+            artifact.type = type.toStdString();
+            artifact.resolvedUrl = "https://example.invalid/" + artifact.type;
+            artifact.levelParameterPresent = true;
+            artifact.sourceCoordinateLevel = 2;
+            volume.artifacts.push_back(artifact);
+        }
+        auto unresolved = volume.artifacts.front();
+        unresolved.resolvedUrl.clear();
+        volume.artifacts.push_back(unresolved);
+        auto invalidNormal = volume.artifacts[4];
+        invalidNormal.levelParameterPresent = true;
+        invalidNormal.sourceCoordinateLevel.reset();
+        volume.artifacts.push_back(invalidNormal);
+        sample.volumes.push_back(volume);
+        manifest.samples.push_back(sample);
+        OpenDataCatalogWindow catalog(manifest);
+        std::vector<vcr::catalog::OpenDataRepresentationRef> attached;
+        catalog.setAttachRepresentationHandler([&](const vcr::catalog::OpenDataSample& selected,
+                const vcr::catalog::OpenDataRepresentationRef& ref) {
+            QCOMPARE(selected.id, sample.id);
+            QCOMPARE(ref.volumeIndex, std::size_t(0));
+            attached.push_back(ref);
+        });
+        for (auto* table : catalog.findChildren<QTableWidget*>()) {
+            if (table->horizontalHeaderItem(0)->text() == "Sample ID")
+                table->setCurrentCell(0, 0);
+        }
+        auto* table = catalog.findChild<QTableWidget*>("catalogRepresentations");
+        auto* button = catalog.findChild<QPushButton*>("attachCatalogRepresentation");
+        QVERIFY(table);
+        QVERIFY(button);
+        QCOMPARE(table->rowCount(), 8);
+        QSignalSpy volumes(&catalog, &OpenDataCatalogWindow::attachVolumeRequested);
+        for (int row = 0; row < table->rowCount(); ++row) {
+            table->setCurrentCell(row, 0);
+            QCOMPARE(button->isEnabled(), row < 5);
+            button->click();
+        }
+        QCOMPARE(volumes.count(), 0); // Representations must not take the URL-only path.
+        // The three zarr predictions, the Lasagna and the normal grids, each
+        // with its own artifact; not the mesh, the unresolved artifact or the
+        // levelless normal grids.
+        using Kind = vcr::catalog::OpenDataRepresentationKind;
+        const std::vector<std::pair<std::size_t, Kind>> expected{
+            {0, Kind::Prediction}, {1, Kind::Prediction}, {2, Kind::Prediction}, {3, Kind::Lasagna},
+            {4, Kind::NormalGrids}};
+        QCOMPARE(attached.size(), expected.size());
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            QCOMPARE(attached[i].artifactIndex, expected[i].first);
+            QCOMPARE(attached[i].kind, expected[i].second);
+        }
+    }
+
     void openAndCancel()
     {
         QTemporaryDir temp(QDir::current().filePath("catalog-dialog-XXXXXX"));
@@ -30,26 +95,24 @@ private slots:
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, temp.filePath("cache"));
         settings.sync();
-        const auto oldRoot = VolumePkg::autosaveRoot();
-        VolumePkg::setAutosaveRoot(temp.path().toStdString());
-        OpenDataManifest manifest;
-        OpenDataSample sample;
+        vcr::catalog::OpenDataManifest manifest;
+        vcr::catalog::OpenDataSample sample;
         sample.id = "PHercParis4";
-        OpenDataVolume volume;
+        vcr::catalog::OpenDataVolume volume;
         volume.id = "test-volume";
         volume.dataFormat = "zarr";
         volume.pixelSizeUm = 2.4;
-        OpenDataArtifact raw, prediction;
+        vcr::catalog::OpenDataArtifact raw, prediction;
         raw.type = "ome-zarr";
         raw.resolvedUrl = "https://example.invalid/source.zarr";
         prediction.type = "surface-prediction-zarr";
         prediction.resolvedUrl = "https://example.invalid/prediction.zarr";
         volume.artifacts = {raw, prediction};
         sample.volumes = {volume};
-        OpenDataSegment segment;
+        vcr::catalog::OpenDataSegment segment;
         segment.id = "segment";
         segment.originalVolumeId = volume.id;
-        OpenDataArtifact tifxyz;
+        vcr::catalog::OpenDataArtifact tifxyz;
         tifxyz.type = "tifxyz";
         tifxyz.resolvedUrl = "https://example.invalid/segment";
         segment.artifacts = {tifxyz};
@@ -64,7 +127,7 @@ private slots:
         sample.volumes.push_back(more);
         manifest.samples = {first, sample};
         if (qEnvironmentVariableIsSet("VC_CATALOG_TEST_MANIFEST")) {
-            manifest = loadOpenDataManifestFile(qgetenv("VC_CATALOG_TEST_MANIFEST").toStdString());
+            manifest = vcr::catalog::loadOpenDataManifestFile(qgetenv("VC_CATALOG_TEST_MANIFEST").toStdString());
             for (auto& entry : manifest.samples) entry.artifacts.clear();
         }
         OpenDataCatalogWindow catalog(manifest);
@@ -94,7 +157,7 @@ private slots:
             opened = true;
             QVERIFY(dialog->windowTitle().contains("PHercParis4"));
             const auto trees = dialog->findChildren<QTreeWidget*>();
-            QCOMPARE(trees.size(), 3);
+            QCOMPARE(trees.size(), 2);  // volumes and representations; surfaces come from the sample store
             for (auto* tree : trees) {
                 QVERIFY(tree->columnCount() >= 9);
                 QVERIFY(tree->topLevelItemCount() > 0);
@@ -122,13 +185,11 @@ private slots:
                 QCOMPARE(selection.rawVolumeIds->front(), std::string("test-volume"));
                 QVERIFY(selection.representations.has_value());
                 QVERIFY(selection.representations->empty());
-                QVERIFY(selection.segmentIds.has_value());
-                QVERIFY(selection.segmentIds->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
-                QCOMPARE(project.path.string(), temp.filePath("my-selection.VOLPKG.JSON").toStdString());
+                QCOMPARE(project.path.string(), temp.filePath("my-selection.VCPROJ").toStdString());
                 vc::project::LoadOptions options;
                 options.deferResolution = true;
-                auto pkg = VolumePkg::newDetached(options);
+                auto pkg = vc::test::emptyProject(options);
                 attachOpenDataSampleVolumes(*pkg, selectedSample, &selection);
                 QCOMPARE(pkg->volumeEntries().size(), std::size_t{1});
                 QCOMPARE(pkg->volumeEntries().front().location, raw.resolvedUrl);
@@ -141,7 +202,7 @@ private slots:
                 QVERIFY(dialog);
                 auto* path = dialog->findChild<QLineEdit*>("catalogProjectPath");
                 QVERIFY(path);
-                path->setText(temp.filePath("my-selection.VOLPKG.JSON"));
+                path->setText(temp.filePath("my-selection.VCPROJ"));
                 auto trees = dialog->findChildren<QTreeWidget*>();
                 for (auto* tree : trees) {
                     if (tree->topLevelItem(0)->text(0) == "Source volumes")
@@ -152,7 +213,6 @@ private slots:
             QVERIFY(QMetaObject::invokeMethod(&catalog, "createSelectedProject", Qt::DirectConnection));
             QVERIFY(created);
         }
-        VolumePkg::setAutosaveRoot(oldRoot);
         if (oldConfig.isNull()) qunsetenv("VC3D_CONFIG_DIR");
         else qputenv("VC3D_CONFIG_DIR", oldConfig);
     }

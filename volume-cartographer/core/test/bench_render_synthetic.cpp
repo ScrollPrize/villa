@@ -67,10 +67,6 @@ enum class Scenario {
     Fallback3,
     MixedCorrelated,
     MixedShuffled,
-    FullResShuffled,
-    Fallback3Shuffled,
-    FullResCacheStress,
-    FullResCacheStressShuffled,
 };
 
 struct FixtureSize {
@@ -97,14 +93,6 @@ const char* scenarioName(Scenario scenario)
             return "mixed_correlated";
         case Scenario::MixedShuffled:
             return "mixed_shuffled";
-        case Scenario::FullResShuffled:
-            return "full_res_shuffled";
-        case Scenario::Fallback3Shuffled:
-            return "fallback_3_shuffled";
-        case Scenario::FullResCacheStress:
-            return "full_res_cache_stress";
-        case Scenario::FullResCacheStressShuffled:
-            return "full_res_cache_stress_shuffled";
     }
     throw std::runtime_error("unknown scenario");
 }
@@ -121,14 +109,6 @@ Scenario parseScenario(std::string_view value)
         return Scenario::MixedCorrelated;
     if (value == "mixed_shuffled")
         return Scenario::MixedShuffled;
-    if (value == "full_res_shuffled")
-        return Scenario::FullResShuffled;
-    if (value == "fallback_3_shuffled")
-        return Scenario::Fallback3Shuffled;
-    if (value == "full_res_cache_stress")
-        return Scenario::FullResCacheStress;
-    if (value == "full_res_cache_stress_shuffled")
-        return Scenario::FullResCacheStressShuffled;
     throw std::runtime_error("unknown scenario: " + std::string(value));
 }
 
@@ -351,12 +331,11 @@ struct Fixture {
 
 int desiredLevel(Scenario scenario, int x, int width)
 {
-    if (scenario == Scenario::FullRes || scenario == Scenario::FullResShuffled || scenario == Scenario::FullResCacheStress ||
-        scenario == Scenario::FullResCacheStressShuffled)
+    if (scenario == Scenario::FullRes)
         return 0;
     if (scenario == Scenario::Fallback1)
         return 1;
-    if (scenario == Scenario::Fallback3 || scenario == Scenario::Fallback3Shuffled)
+    if (scenario == Scenario::Fallback3)
         return 3;
     return std::min(3, x * 4 / width);
 }
@@ -383,23 +362,14 @@ Fixture makeFixture(Scenario scenario, const FixtureSize& size)
         auto* levelRow = fixture.expectedLevels.ptr<uint8_t>(y);
         for (int x = 0; x < size.width; ++x) {
             const int level = desiredLevel(scenario, x, size.width);
-            const bool cacheStress = scenario == Scenario::FullResCacheStress || scenario == Scenario::FullResCacheStressShuffled;
-            if (cacheStress) {
-                const int chunk = (y * size.width + x) % 512;
-                levelRow[x] = 0;
-                coordRow[x] = {float((chunk % 128) * kChunkShape[2]) + 8.25f, float(((chunk / 128) % 4) * kChunkShape[1]) + 8.25f, 256.25f};
-                continue;
-            }
-            const bool uniformLevel = scenario == Scenario::FullRes || scenario == Scenario::Fallback1 || scenario == Scenario::Fallback3 ||
-                                      scenario == Scenario::FullResShuffled || scenario == Scenario::Fallback3Shuffled;
+            const bool uniformLevel = scenario == Scenario::FullRes || scenario == Scenario::Fallback1 || scenario == Scenario::Fallback3;
             const int regionWidth = uniformLevel ? size.width : size.width / 4;
             const int localX = x % regionWidth;
             levelRow[x] = uint8_t(level);
             coordRow[x] = {kRegionBaseX[level] + 8.25f + float(localX) * 0.5f, 256.25f + float(y) * 0.5f, 256.25f + float(x) * 0.0625f + float(y) * 0.03125f};
         }
     }
-    if (scenario == Scenario::MixedShuffled || scenario == Scenario::FullResShuffled || scenario == Scenario::Fallback3Shuffled ||
-        scenario == Scenario::FullResCacheStressShuffled)
+    if (scenario == Scenario::MixedShuffled)
         deterministicShuffle(fixture);
     return fixture;
 }

@@ -1,44 +1,17 @@
 """Consumer-owned outputs and device storage lifetime across CUDA streams."""
 import gc
-import os
-from pathlib import Path
-import sys
 
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
-from vc_reader import cuda, _reader, transforms
+from vc_reader import cuda, transforms
 from vc_reader.reader import ZarrReader
 from vc_reader.sheet_normal import sheet_normals
 from test_source_storage import array
 from test_sheet_normal import examples
-
-
-def test_cpu_normal_output():
-    patches = examples()[:1]
-    expected = sheet_normals(patches)
-    out = np.empty((1,4),np.float32)
-    assert sheet_normals(patches, out=out) is out
-    np.testing.assert_array_equal(out, expected)
-    for bad in [np.empty((4,),np.float32), np.empty((1,4),np.int32), np.empty((1,8),np.float32)[:,::2]]:
-        with pytest.raises(ValueError):
-            sheet_normals(patches,out=bad)
-    floats = patches.astype(np.float32)
-    with pytest.raises(ValueError, match='overlap'):
-        sheet_normals(floats,out=floats.reshape(-1)[:4].reshape(1,4))
-
-
-@pytest.fixture
-def torch_cuda():
-    torch = pytest.importorskip('torch')
-    if not cuda.is_available() or not torch.cuda.is_available():
-        pytest.skip('CUDA build/device required')
-    return torch
 
 
 def test_reader_output_and_validation(tmp_path, torch_cuda):
@@ -63,31 +36,6 @@ def test_reader_output_and_validation(tmp_path, torch_cuda):
         with pytest.raises((TypeError,RuntimeError)):
             gpu.read_affine_batch((3,4,5),origins,axes,out=torch.empty((2,3,4,10),device='cuda')[...,::2])
     np.testing.assert_array_equal(out.cpu(), expected)
-
-
-def test_normal_output_other_stream(torch_cuda):
-    torch = torch_cuda
-    host = examples()[:2]
-    expected = sheet_normals(host)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        patches = torch.as_tensor(host,device='cuda')
-        out = torch.empty((2,4),device='cuda')
-        stream.synchronize()
-        _reader._set_stream(stream.cuda_stream)
-        try:
-            assert sheet_normals(patches,out=out) is out
-            result = out.clone()
-            with pytest.raises(ValueError, match='out'):
-                sheet_normals(patches,out=torch.empty((2,4),device='cuda',dtype=torch.int32))
-            floats = patches.float()
-            stream.synchronize()
-            with pytest.raises(ValueError, match='overlap'):
-                sheet_normals(floats,out=floats.flatten()[:8].reshape(2,4))
-        finally:
-            stream.synchronize()
-            _reader._set_stream(0)
-    np.testing.assert_allclose(result.cpu(),expected,atol=2e-5)
 
 
 @pytest.mark.parametrize('inplace',[False,True])
