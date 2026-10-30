@@ -2,7 +2,6 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
@@ -84,21 +83,12 @@ std::string fileBytes(const std::filesystem::path& path)
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-// The manifest's provenance record (its "provenance" file, beside it), empty
-// when it names none.
-std::string provenanceText(const vc::lasagna::LasagnaDatasetManifest& manifest,
-                           const std::filesystem::path& remoteCacheRoot)
+// A local manifest's provenance record (its "provenance" file, beside it),
+// empty when it names none.
+std::string provenanceText(const vc::lasagna::LasagnaDatasetManifest& manifest)
 {
     const auto name = manifest.raw.value("provenance", std::string{});
-    if (name.empty()) return {};
-    if (!manifest.manifestIsRemote) return fileBytes(manifest.baseDirectory / name);
-    const std::string location = manifest.remoteSourceBaseLocation + "/" + name;
-    namespace util = vc::core::util;
-    util::RemoteFileCacheOptions options;
-    options.cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
-    options.destination = util::remoteFileCachePath(location);
-    options.discoverAwsCredentials = manifest.discoverAwsCredentials;
-    return fileBytes(util::cacheRemoteFile(location, options).path);
+    return name.empty() ? std::string{} : fileBytes(manifest.baseDirectory / name);
 }
 } // namespace
 
@@ -114,7 +104,7 @@ std::string datasetLocation(const VolumePkg& pkg, const std::string& selected)
 
 struct OpenedDataset {
     vc::lasagna::LasagnaDatasetManifest manifest;
-    std::string identity;
+    std::string identity;  // empty for a remote dataset
 };
 
 OpenedDataset openDataset(const std::string& location, const std::filesystem::path& remoteCacheRoot)
@@ -122,10 +112,12 @@ OpenedDataset openDataset(const std::string& location, const std::filesystem::pa
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = remoteCacheRoot;
     auto manifest = vc::lasagna::LasagnaDataset::openLocation(location, options).manifest();
+    // The service identifies a remote dataset by its URL, the location sent.
+    if (manifest.manifestIsRemote) return {std::move(manifest), {}};
     const auto file = std::filesystem::is_directory(manifest.manifestPath)
         ? manifest.manifestPath / ".zattrs" : manifest.manifestPath;
     auto identity = lasagnaIdentity(fileBytes(file), manifest.manifestPath.filename().string(),
-                                    provenanceText(manifest, remoteCacheRoot));
+                                    provenanceText(manifest));
     return {std::move(manifest), std::move(identity)};
 }
 } // namespace
@@ -257,7 +249,8 @@ QJsonObject projectBlock(const std::string& name,
         if (!readable) {
             value[QStringLiteral("error")] = QString::fromStdString(lasagna->error);
         } else {
-            value[QStringLiteral("identity")] = QString::fromStdString(lasagna->identity);
+            if (!lasagna->identity.empty())
+                value[QStringLiteral("identity")] = QString::fromStdString(lasagna->identity);
             value[QStringLiteral("group")] = QString::fromStdString(lasagna->group);
             for (const auto& [input, store] : lasagna->stores)
                 value[QString::fromStdString(input)] = QString::fromStdString(store);
@@ -266,10 +259,10 @@ QJsonObject projectBlock(const std::string& name,
     }
     if (fiberInference) {
         QJsonObject value{{QStringLiteral("location"), QString::fromStdString(fiberInference->location)}};
-        if (fibers)
-            value[QStringLiteral("identity")] = QString::fromStdString(fiberInference->identity);
-        else
+        if (!fibers)
             value[QStringLiteral("error")] = QString::fromStdString(fiberInference->error);
+        else if (!fiberInference->identity.empty())
+            value[QStringLiteral("identity")] = QString::fromStdString(fiberInference->identity);
         block[QStringLiteral("fiber_inference")] = value;
     }
     return block;

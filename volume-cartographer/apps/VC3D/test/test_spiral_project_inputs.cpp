@@ -100,6 +100,12 @@ void describesTheLasagnaDataset()
                 && value.value("identity").toString() == "run-1"
                 && value.value("normal_y").toString() == "/data/s_ny.ome.zarr",
             "the block carries the identity, the stores and their array");
+    auto remote = lasagna;
+    remote.location = "https://data.example/s.lasagna.json";
+    remote.identity.clear();
+    require(!vc3d::spiral::projectBlock("PHerc", volumes, remote, std::nullopt, nullptr, std::nullopt)
+                 .value("lasagna").toObject().contains("identity"),
+            "a remote dataset is sent without an identity");
 
     const auto shared = vc3d::spiral::projectLasagna(LasagnaDatasetManifest::parseText(R"({
         "version": 2, "groups": {"normals": {"zarr": "n.zarr/0", "scaledown": 2, "channels": ["nx", "ny"]}}})",
@@ -144,14 +150,22 @@ void describesTheFiberInferenceDataset()
     quarter.baseShapeZYX = std::array<std::size_t, 3>{100, 64, 48};
     std::map<std::string, ProjectVolumeFacts> volumes{{"quarter", quarter}, {"unknown", {}}};
     ProjectDataset fibers;
-    fibers.location = "https://data.example/f.lasagna.json";
+    fibers.location = "/data/f.lasagna.json";
     fibers.identity = "run-4";
     fibers.baseShapeZYX = std::array<std::size_t, 3>{400, 256, 192};
     const QJsonObject block = vc3d::spiral::projectBlock("PHerc", volumes, std::nullopt, fibers, nullptr,
                                                          std::nullopt);
     require(block.value("fiber_inference").toObject()
-                == QJsonObject{{"location", "https://data.example/f.lasagna.json"}, {"identity", "run-4"}},
+                == QJsonObject{{"location", "/data/f.lasagna.json"}, {"identity", "run-4"}},
             "the dataset and its identity");
+    // A remote dataset is sent by its URL alone: the service identifies it.
+    ProjectDataset remote = fibers;
+    remote.location = "https://data.example/f.lasagna.json";
+    remote.identity.clear();
+    require(vc3d::spiral::projectBlock("PHerc", volumes, std::nullopt, remote, nullptr, std::nullopt)
+                    .value("fiber_inference").toObject()
+                == QJsonObject{{"location", "https://data.example/f.lasagna.json"}},
+            "a remote dataset's URL, and no identity");
     const QJsonObject entries = block.value("volumes").toObject();
     require(entries.value("quarter").toObject().value("fiber_scale").toDouble() == 4,
             "4 base voxels per voxel of a quarter-resolution volume");

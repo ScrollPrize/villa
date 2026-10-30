@@ -14,7 +14,8 @@ The scroll's facts, the umbilicus and the Lasagna stores are the open
 project's: every build request sends the service, which cannot read the
 project file, each project volume's voxel size, a catalog volume's
 orientation and full-resolution shape, the umbilicus the project's umbilicus
-store holds for it, and the selected Lasagna dataset's identity, its nx, ny
+store holds for it, and the selected Lasagna dataset (a local one with its
+identity; the service identifies a remote one by its URL), its nx, ny
 and grad_mag stores and their scale relative to each volume (see "The VC3D
 project's inputs" in the README). The fit reads the dataset's packed pools
 from the service's cache by that identity: pack them with

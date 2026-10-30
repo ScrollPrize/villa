@@ -38,8 +38,9 @@ struct ProjectVolumeFacts {
 // inputs name, so entries no fit uses (a Lasagna channel) are harmless.
 std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pkg);
 
-// The project's Lasagna dataset as a Spiral fit reads it: its identity
-// (lasagnaIdentity), the OME-Zarr store of each of its nx, ny and grad_mag
+// The project's Lasagna dataset as a Spiral fit reads it: a local one's
+// identity (lasagnaIdentity; empty for a remote one, which the service
+// identifies by its location's URL), the OME-Zarr store of each of its nx, ny and grad_mag
 // channels (by fit input: normal_x, normal_y, gradient_magnitude; a path or
 // a remote location) and the array of each, which must be one name; the
 // arrays' downsampling relative to the dataset's base volume (source_to_base
@@ -56,7 +57,7 @@ struct ProjectLasagna {
     std::string error;
 };
 
-// The identity a Spiral cache keys a Lasagna dataset's packs by
+// The identity a Spiral cache keys a local Lasagna dataset's packs by
 // (spiral-fitting's lasagna_source.manifest_identity): the run_uuid of the
 // manifest's provenance record when that record names this manifest (or
 // none), else "sha256-" and the SHA-256 of the manifest file's bytes.
@@ -72,7 +73,8 @@ std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg,
                                              const std::filesystem::path& remoteCacheRoot);
 
 // The project's selected fiber-inference dataset: its identity, keying the
-// fiber-direction samples a Spiral cache holds for it, and its base shape;
+// fiber-direction samples a Spiral cache holds for it (empty for a remote
+// dataset, identified by its URL), and its base shape;
 // `error` says why it cannot be read. nullopt when the project selects none.
 struct ProjectDataset {
     std::string location;
