@@ -1,5 +1,5 @@
 """Monitor rollouts during training: EMA proposal and refinement images, the primary source's monitor rollouts
-with their images, and each AFV source's monitor rollouts."""
+with their images, and each fiber-store source's monitor rollouts."""
 from pathlib import Path
 
 import torch
@@ -60,10 +60,10 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
         tracer.p.confidence = threshold_before
 
 
-def monitor_afv_sources(model, sources, datasets, cfg, policy, step, log, *, max_len, device):
-    """Monitor rollouts of each AFV source's validation fibers, recorded per dataset."""
+def monitor_store_sources(model, sources, datasets, cfg, policy, step, log, *, max_len, device):
+    """Monitor rollouts of each fiber-store source's validation fibers, recorded per dataset."""
     for source, source_dataset in zip(sources, datasets):
-        if source['kind'] != 'afv':
+        if source['kind'] != 'fibers':
             continue
         source_tracer = FiberTracer(model,CTVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
             TraceParams.from_policy(policy,max_len=max_len),device=device)

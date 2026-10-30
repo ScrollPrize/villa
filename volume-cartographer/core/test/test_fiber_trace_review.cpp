@@ -78,11 +78,8 @@ TEST_CASE("deriveTraceState maps producer and mode to the panel state")
           FiberTraceState::Legacy);
 }
 
-// Golden fixture pinning the default lasagna segment descriptor — the
-// exact document fiberSaveSnapshotToJson emits for a v1-upgraded span.
-// External tooling (fiber_merge validators, offline upgraders) relies on
-// these bytes staying stable.
-TEST_CASE("default lasagna segment metadata matches the migration fixture")
+// Golden fixture pinning the default Lasagna segment descriptor.
+TEST_CASE("default lasagna segment metadata matches the current format")
 {
     const auto expected = nlohmann::json::parse(R"({
         "optimizer": "native_fiber_trace3d",
