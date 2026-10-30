@@ -62,12 +62,12 @@ class CMakeConfigureTests(unittest.TestCase):
             self.skipTest("set CUDACXX or put nvcc on PATH")
         return compiler
 
-    def test_cuda_default_architectures(self):
-        self.configure(True, "-DVC_READER_ENABLE_CUDA=ON",
-                       f"-DCMAKE_CUDA_COMPILER={self.cuda_compiler()}")
-
     def test_auto_with_compiler(self):
-        self.configure(True, f"-DCMAKE_CUDA_COMPILER={self.cuda_compiler()}")
+        compiler = self.cuda_compiler()
+        # Automatic and required CUDA both use the compiler's default architectures.
+        for settings in ((), ("-DVC_READER_ENABLE_CUDA=ON",)):
+            with self.subTest(settings=settings):
+                self.configure(True, *settings, f"-DCMAKE_CUDA_COMPILER={compiler}")
 
     def test_auto_with_toolkit(self):
         root = Path(self.cuda_compiler()).resolve().parent.parent

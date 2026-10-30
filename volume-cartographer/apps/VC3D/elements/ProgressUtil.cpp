@@ -11,14 +11,6 @@ namespace {
 constexpr int kDefaultProgressMinimum = 0;
 constexpr int kDefaultProgressMaximum = 100;
 
-QString replaceToken(QString text, const QString& token, const QString& value)
-{
-    if (text.contains(token)) {
-        text.replace(token, value);
-    }
-    return text;
-}
-
 } // namespace
 
 
@@ -299,20 +291,6 @@ void ProgressUtil::updateProgressFormat()
             formatted = QStringLiteral("%1 done : %2 left").arg(value).arg(remaining);
         } else {
             formatted = QStringLiteral("%1 done").arg(value);
-        }
-        break;
-    }
-    case ProgressTextMode::Custom: {
-        formatted = options.customFormat;
-        formatted = replaceToken(formatted, QStringLiteral("{value}"), QString::number(value));
-        formatted = replaceToken(formatted, QStringLiteral("{total}"), total > 0 ? QString::number(total) : QStringLiteral("-"));
-        formatted = replaceToken(formatted, QStringLiteral("{remaining}"), QString::number(remaining));
-        if (percentPrecision == 0) {
-            formatted = replaceToken(formatted, QStringLiteral("{percent}"),
-                                     QString::number(static_cast<int>(std::round(percent))));
-        } else {
-            formatted = replaceToken(formatted, QStringLiteral("{percent}"),
-                                     QString::number(percent, 'f', percentPrecision));
         }
         break;
     }

@@ -4,6 +4,7 @@
 #include "SpiralPatchProjection.hpp"
 #include "SpiralInputRows.hpp"
 #include "SpiralInputFilter.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include <QTest>
 #include <QDir>
 #include <QImage>
@@ -27,18 +28,34 @@ private slots:
         };
         const auto source = makeSurface(100, 7);
         const auto target = makeSurface(102, 7);
-        SurfacePatchIndex index;
-        index.rebuild({source, target});
+        // Patches are drafts of a store session; the locator asks it.
+        vc::objects::ObjectStoreSession session;
+        const std::string volume = "spiral-test-volume";
+        for (const auto& surface : {source, target}) {
+            surface->id = vc::objects::util::newUuid();
+            session.setDraft(surface->id, quad_surface_grid(*surface), vc::objects::volumeCoordinates(volume, 1));
+        }
+        const vc3d::spiral::PatchLocator locate = [&](const QuadSurface& surface, const cv::Vec3f& point,
+                                                      float tolerance) -> std::optional<cv::Vec3f> {
+            vc::objects::SurfaceProximityQuery query;
+            query.point = {point[0], point[1], point[2]};
+            query.tolerance = tolerance;
+            query.uuids = std::vector{surface.id};
+            query.volume = volume;
+            const auto hits = session.nearestSurfaces({}, query);
+            if (hits.empty()) return std::nullopt;
+            return surface.gridToPtr({float(hits.front().hit.grid[0]), float(hits.front().hit.grid[1])});
+        };
         const auto a = source->gridToSurface({1, 1});
         const auto b = source->gridToSurface({3, 3});
         QPainterPath original;
         original.addRect(QRectF(QPointF(a[0], a[1]), QPointF(b[0], b[1])).normalized());
         const auto saved = original;
-        const auto mapped = vc3d::spiral::projectPatchShape(original, source, target, &index, 10);
+        const auto mapped = vc3d::spiral::projectPatchShape(original, source, target, locate, 10);
         QVERIFY(mapped.has_value());
         QVERIFY(!mapped->isEmpty());
         target->setChannel("d", cv::Mat1f(5, 5, 8.0f));
-        QVERIFY(!vc3d::spiral::projectPatchShape(original, source, target, &index, 10));
+        QVERIFY(!vc3d::spiral::projectPatchShape(original, source, target, locate, 10));
         QCOMPARE(original, saved);
     }
     void localRowsRetainIdentityColorErrorsAndRemoval()

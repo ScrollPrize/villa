@@ -51,6 +51,18 @@ std::set<std::string> HubLeaseCounts::held()
     return result;
 }
 
+bool HubLeaseCounts::retain(const std::vector<std::string>& objects, const HubStatus& status, int64_t validThroughUs)
+{
+    std::lock_guard lock(mutex);
+    if (!std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
+            return counts.contains(id) && std::any_of(status.leases.begin(), status.leases.end(), [&](const auto& lease) {
+                return lease.objectUuid == id && lease.holder == status.replica && lease.expiresUs > validThroughUs;
+            });
+        })) return false;
+    for (const auto& id : objects) ++counts.at(id);
+    return true;
+}
+
 HubWorker::HubWorker(ObjectStore& replica, const HubSessionOptions& options, std::function<void()> statusChanged)
     : replica_(replica), options_(options), statusChanged_(std::move(statusChanged))
 {
@@ -78,6 +90,18 @@ void HubWorker::requestSync(bool afterAction)
     wake_.notify_all();
 }
 
+HubSessionStatus HubWorker::syncAndWait(std::chrono::milliseconds timeout)
+{
+    std::unique_lock lock(mutex_);
+    const auto target = started_ + 1;
+    due_ = std::chrono::steady_clock::now();
+    wake_.notify_all();
+    if (!synced_.wait_for(lock, timeout, [&] { return finished_ >= target; }))
+        throw std::runtime_error("hub: no sync finished within " + std::to_string(timeout.count()) + " ms" +
+                                 (status_.error.empty() ? std::string() : ": " + status_.error));
+    return status_;
+}
+
 void HubWorker::requestResolve(const std::string& keep)
 {
     if (keep != "hub" && keep != "local") throw std::invalid_argument("hub: keep must be \"hub\" or \"local\"");
@@ -98,6 +122,17 @@ LeaseHold HubWorker::hold(const std::vector<std::string>& objects)
 {
     std::vector<std::string> ids;
     for (const auto& object : objects) ids.push_back(formatUuid(parseUuid(object)));
+    LeaseHold result;
+    // An existing editor already prevents sync from releasing this lease.
+    // Read the local mirror, not a second lease cache: other tools may also
+    // acquire, renew or release leases through this replica. Checking a held
+    // lease must not wait behind the worker's remote I/O.
+    const auto local = hubStatus(replica_);
+    if (leases_->retain(ids, *local, nowMicros() + kHoldMarginUs)) {
+        result.counts_ = leases_;
+        result.objects_ = std::move(ids);
+        return result;
+    }
     {
         std::lock_guard hub(hub_);
         const auto status = hubStatus(replica_);
@@ -117,9 +152,8 @@ LeaseHold HubWorker::hold(const std::vector<std::string>& objects)
                 acquireLeases(replica_, missing);
             }
         }
-    }
-    LeaseHold result;
-    {
+        // Register before releasing hub_: otherwise sync could decide to
+        // release a newly acquired lease before its first hold was counted.
         std::lock_guard lock(leases_->mutex);
         for (const auto& id : ids) ++leases_->counts[id];
     }
@@ -180,6 +214,7 @@ void HubWorker::run()
         wake_.wait_until(lock, due_, [&] { return stopping_ || std::chrono::steady_clock::now() >= due_; });
         if (stopping_) return;
         due_ = std::chrono::steady_clock::now() + options_.syncInterval;
+        ++started_;
         const auto resolve = std::exchange(resolve_, std::nullopt);
         const auto previous = status_;
         lock.unlock();
@@ -194,6 +229,8 @@ void HubWorker::run()
         }
         lock.lock();
         status_ = next;
+        ++finished_;
+        synced_.notify_all();
         lock.unlock();
         statusChanged_();
         lock.lock();

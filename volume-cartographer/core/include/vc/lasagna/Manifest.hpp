@@ -113,4 +113,7 @@ struct LasagnaDatasetManifest {
 
 [[nodiscard]] std::string toString(NormalSourceKind kind);
 
+// Alias predicted sheet_* heads as normals without changing packed channel indices.
+[[nodiscard]] LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest&);
+
 } // namespace vc::lasagna

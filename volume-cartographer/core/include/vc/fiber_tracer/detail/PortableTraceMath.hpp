@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstddef>
+#include <utility>
 #ifdef __CUDACC__
 #define VC_TRACE_HD __host__ __device__
 #else
@@ -24,17 +25,26 @@ struct FiberLocalSmoothnessConfig {
     float freeAngleRadians = 0.0f;
 };
 
-struct FiberLocalSmoothnessCost {
-    float isotropic = 0.0f;
-    float normal = 0.0f;
-    float tangent = 0.0f;
+template<class Scalar> struct BasicFiberLocalSmoothnessCost {
+    Scalar isotropic = 0.0f;
+    Scalar normal = 0.0f;
+    Scalar tangent = 0.0f;
     FiberLocalSmoothnessMode mode = FiberLocalSmoothnessMode::None;
 
-    VC_TRACE_HD float total() const noexcept { return isotropic + normal + tangent; }
+    VC_TRACE_HD Scalar total() const noexcept { return isotropic + normal + tangent; }
 };
 
+using FiberLocalSmoothnessCost = BasicFiberLocalSmoothnessCost<float>;
 
 namespace portable {
+template<class V> using ScalarOf = decltype(std::declval<V>().dot(std::declval<V>()));
+// ADL permits analytic scalar types while preserving the existing float path.
+template<class S> VC_TRACE_HD auto mathSqrt(S x) { using std::sqrt; return sqrt(x); }
+template<class S> VC_TRACE_HD auto mathAcos(S x) { using std::acos; return acos(x); }
+template<class S> VC_TRACE_HD auto mathAsin(S x) { using std::asin; return asin(x); }
+template<class S> VC_TRACE_HD auto mathAbs(S x) { using std::abs; return abs(x); }
+template<class S> VC_TRACE_HD bool mathFinite(S x) { using std::isfinite; return isfinite(x); }
+
 template<class V> VC_TRACE_HD V traceUnit(const V& v,const V& fallback) {
     const float len=std::sqrt(v.dot(v));
     return len>1.0e-6f && std::isfinite(len)?v/len:fallback;
@@ -69,36 +79,36 @@ enum class FiberLocalPreparedCandidateSmoothnessMode : std::uint8_t {
 template<class V> struct FiberLocalPreparedCandidateSmoothness {
     V normal{0.0f, 0.0f, 0.0f};
     V tangent{0.0f, 0.0f, 0.0f};
-    float normalAngle = 0.0f;
+    ScalarOf<V> normalAngle = 0.0f;
     FiberLocalPreparedCandidateSmoothnessMode mode =
         FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection;
 };
 
 
-VC_TRACE_HD static inline float clampFiberLocalUnit(float value)
+template<class S> VC_TRACE_HD static inline S clampFiberLocalUnit(S value)
 {
-    if (!std::isfinite(value))
+    if (!mathFinite(value))
         return 0.0f;
-    return std::clamp(value, -1.0f, 1.0f);
+    return std::clamp(value, S(-1.0f), S(1.0f));
 }
 
-VC_TRACE_HD static inline float clampFiberLocalPositiveUnit(float value)
+template<class S> VC_TRACE_HD static inline S clampFiberLocalPositiveUnit(S value)
 {
-    if (!std::isfinite(value))
+    if (!mathFinite(value))
         return 0.0f;
-    return std::clamp(value, 0.0f, 1.0f);
+    return std::clamp(value, S(0.0f), S(1.0f));
 }
 
-VC_TRACE_HD static inline float clampFiberLocalFinitePositiveUnit(float value)
+template<class S> VC_TRACE_HD static inline S clampFiberLocalFinitePositiveUnit(S value)
 {
-    return std::min(std::max(value, 0.0f), 1.0f);
+    return std::min(std::max(value, S(0.0f)), S(1.0f));
 }
 
 template<class V>
 VC_TRACE_HD static inline V finiteFiberLocalOrZero(const V& value)
 {
-    if (!std::isfinite(value[0]) || !std::isfinite(value[1]) ||
-        !std::isfinite(value[2])) {
+    if (!mathFinite(value[0]) || !mathFinite(value[1]) ||
+        !mathFinite(value[2])) {
         return {0.0f, 0.0f, 0.0f};
     }
     return value;
@@ -107,41 +117,41 @@ VC_TRACE_HD static inline V finiteFiberLocalOrZero(const V& value)
 template<class V>
 VC_TRACE_HD static inline V normalizeFiberLocalOrZero(const V& value)
 {
-    const float length = std::sqrt(value.dot(value));
-    if (!(length > kFiberLocalEpsilon) || !std::isfinite(length))
+    const auto length = mathSqrt(value.dot(value));
+    if (!(length > kFiberLocalEpsilon) || !mathFinite(length))
         return {0.0f, 0.0f, 0.0f};
     return value / length;
 }
 
 template<class V>
-VC_TRACE_HD static inline float fiberLocalAngleBetweenUnit(
+VC_TRACE_HD static inline ScalarOf<V> fiberLocalAngleBetweenUnit(
     const V& left, const V& right)
 {
-    return std::acos(clampFiberLocalUnit(left.dot(right)));
+    return mathAcos(clampFiberLocalUnit(left.dot(right)));
 }
 
-VC_TRACE_HD static inline float fiberLocalExcessAngleSquared(float angle, float freeAngle)
+template<class S> VC_TRACE_HD static inline S fiberLocalExcessAngleSquared(S angle, float freeAngle)
 {
-    const float excess = std::max(0.0f, angle - freeAngle);
+    const auto excess = std::max(S(0.0f), angle - freeAngle);
     return excess * excess;
 }
 
 template<class V>
-VC_TRACE_HD static inline float fiberLocalAlignmentLossInline(
-    float presence,
+VC_TRACE_HD static inline ScalarOf<V> fiberLocalAlignmentLossInline(
+    ScalarOf<V> presence,
     const V& previousStepDirection,
     const V& candidateStepDirection,
     const V& currentPredictionDirection,
     const V& candidatePredictionDirection,
-    std::array<float, 6>* factors = nullptr, bool boundUnknownPrediction = false)
+    std::array<ScalarOf<V>, 6>* factors = nullptr, bool boundUnknownPrediction = false)
 {
     size_t index = 0;
-    const auto factor = [&](float value) {
-        const float f = clampFiberLocalPositiveUnit(value);
+    const auto factor = [&](ScalarOf<V> value) {
+        const auto f = clampFiberLocalPositiveUnit(value);
         if (factors) (*factors)[index++] = f;
         return f;
     };
-    float score = clampFiberLocalPositiveUnit(presence);
+    auto score = clampFiberLocalPositiveUnit(presence);
     score *= factor(
         previousStepDirection.dot(candidateStepDirection));
     score *= factor(
@@ -175,11 +185,11 @@ prepareFiberLocalCandidateSmoothnessInline(
         return prepared;
     }
 
-    const float candidateNormal = clampFiberLocalUnit(
+    const auto candidateNormal = clampFiberLocalUnit(
         candidateStepDirection.dot(normal));
     prepared.tangent = normalizeFiberLocalOrZero(
         candidateStepDirection - normal * candidateNormal);
-    prepared.normalAngle = std::asin(candidateNormal);
+    prepared.normalAngle = mathAsin(candidateNormal);
     prepared.mode = prepared.tangent.dot(prepared.tangent) > epsilon2
         ? FiberLocalPreparedCandidateSmoothnessMode::NormalAware
         : FiberLocalPreparedCandidateSmoothnessMode::NormalAwareDegenerateTangent;
@@ -187,14 +197,14 @@ prepareFiberLocalCandidateSmoothnessInline(
 }
 
 template<class V>
-VC_TRACE_HD static inline FiberLocalSmoothnessCost
+VC_TRACE_HD static inline BasicFiberLocalSmoothnessCost<ScalarOf<V>>
 fiberLocalSmoothnessCostCandidatePreparedInline(
     const V& previousStepDirection,
     const V& candidateStepDirection,
     const FiberLocalPreparedCandidateSmoothness<V>& candidatePrepared,
     const FiberLocalSmoothnessConfig& config)
 {
-    FiberLocalSmoothnessCost cost;
+    BasicFiberLocalSmoothnessCost<ScalarOf<V>> cost;
     constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
     if (previousStepDirection.dot(previousStepDirection) <= epsilon2 ||
         candidatePrepared.mode ==
@@ -204,7 +214,7 @@ fiberLocalSmoothnessCostCandidatePreparedInline(
 
     if (candidatePrepared.mode ==
         FiberLocalPreparedCandidateSmoothnessMode::IsotropicFallback) {
-        const float isotropicAngle = fiberLocalAngleBetweenUnit(
+        const auto isotropicAngle = fiberLocalAngleBetweenUnit(
             previousStepDirection, candidateStepDirection);
         cost.isotropic = config.isotropicWeight *
                          fiberLocalExcessAngleSquared(
@@ -213,7 +223,7 @@ fiberLocalSmoothnessCostCandidatePreparedInline(
         return cost;
     }
 
-    const float previousNormal = clampFiberLocalUnit(
+    const auto previousNormal = clampFiberLocalUnit(
         previousStepDirection.dot(candidatePrepared.normal));
     const V previousTangent = normalizeFiberLocalOrZero(
         previousStepDirection - candidatePrepared.normal * previousNormal);
@@ -221,13 +231,13 @@ fiberLocalSmoothnessCostCandidatePreparedInline(
         previousTangent.dot(previousTangent) > epsilon2 &&
         candidatePrepared.mode ==
             FiberLocalPreparedCandidateSmoothnessMode::NormalAware;
-    const float tangentAngle = tangentValid
+    const auto tangentAngle = tangentValid
         ? fiberLocalAngleBetweenUnit(
               previousTangent, candidatePrepared.tangent)
         : fiberLocalAngleBetweenUnit(
               previousStepDirection, candidateStepDirection);
-    const float normalAngle = std::abs(
-        candidatePrepared.normalAngle - std::asin(previousNormal));
+    const ScalarOf<V> normalAngle = mathAbs(
+        candidatePrepared.normalAngle - mathAsin(previousNormal));
     cost.tangent = config.tangentWeight * fiberLocalExcessAngleSquared(
         tangentAngle, config.freeAngleRadians);
     cost.normal = config.normalWeight * fiberLocalExcessAngleSquared(
@@ -237,7 +247,7 @@ fiberLocalSmoothnessCostCandidatePreparedInline(
 }
 
 template<class V>
-VC_TRACE_HD static inline FiberLocalSmoothnessCost fiberLocalSmoothnessCostInline(
+VC_TRACE_HD static inline BasicFiberLocalSmoothnessCost<ScalarOf<V>> fiberLocalSmoothnessCostInline(
     const V& previousStepDirection,
     const V& candidateStepDirection,
     const V& normal,

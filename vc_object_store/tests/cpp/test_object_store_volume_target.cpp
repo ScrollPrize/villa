@@ -68,7 +68,8 @@ int main() try
             for (const auto& row : rows) paged.push_back(row.name);
             const auto& last = rows.back();
             const auto toVolume = geometryScaleToVolume(nlohmann::json::parse(last.meta), volume);
-            page.afterUuid = last.uuid; page.afterLength = last.fiber->length * *toVolume;
+            require(last.volumeLength == last.fiber->length * *toVolume, "rows carry the volume length they were ordered by");
+            page.afterUuid = last.uuid; page.afterLength = *last.volumeLength;
         }
         require(paged == ordered, "volume cursor pages without repeats or gaps");
     }
@@ -78,6 +79,13 @@ int main() try
     atLeast.minLength = std::nextafter(15.0, 16.0);
     require(names(store.selectObjects(txn, atLeast)) == std::vector<std::string>{"a40", "b72"},
             "minimum length is exact in volume voxels");
+    // At a working level, half the volume's voxels: lengths are measured there.
+    auto atHalf = byLength; atHalf.targetScale = 0.5; atHalf.minLength = 7.5;
+    const auto half = store.selectObjects(txn, atHalf, std::vector<std::string>{"name", "fiber"});
+    require(names(half) == std::vector<std::string>{"a40", "b72", "b60", "a30"} && half.front().volumeLength == 10.0,
+            "a target scale measures lengths in its voxels");
+    require(rejects([&] { auto bad = byLength; bad.targetScale = 0; (void)store.selectObjects(txn, bad); }),
+            "a target scale must be positive");
 
     // Unbound objects (including other volumes' frames) follow in UUID order.
     auto withUnbound = byLength; withUnbound.includeUnbound = true;

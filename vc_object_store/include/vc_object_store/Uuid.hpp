@@ -57,5 +57,7 @@ inline std::string newUuid()
 // same name always yields the same UUID, so independent imports of one
 // UUID-less source agree on its identity.
 std::string nameUuid(std::string_view name);
+// The same in another namespace (a UUID), e.g. one shared with other tools.
+std::string nameUuid(const std::string& namespaceUuid, std::string_view name);
 
 } // namespace vc::objects::util

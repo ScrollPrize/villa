@@ -1,4 +1,5 @@
 #include "vc_reader/reader.hpp"
+#include "vc_reader/catalog.hpp"
 #include "array.hpp"
 #include "sheet_normal/normal.hpp"
 
@@ -142,12 +143,7 @@ CtReader::CtReader(const std::string& input, int level, size_t cacheBytes)
     std::string location = input;
     while (location.size() > 1 && location.back() == '/') location.pop_back();
     if (location.empty()) throw std::invalid_argument("empty CT location");
-    if (location.starts_with("s3://")) {
-        const auto rest = location.substr(5);
-        const auto slash = rest.find('/');
-        if (slash == std::string::npos) throw std::invalid_argument("missing S3 key");
-        location = "https://" + rest.substr(0, slash) + ".s3.amazonaws.com/" + rest.substr(slash + 1);
-    }
+    location = catalog::resolveOpenDataUrl(location);
     auto raw = arrayMetadata(location);
     if (raw && level != 0) throw std::invalid_argument("array source has only level zero");
     if (!raw) {
