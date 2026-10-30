@@ -615,6 +615,9 @@ void validateTraceConfig(const FiberTraceConfig& config)
         config.endpointAcceptThresholdBaseVoxels,
         "endpoint accept threshold in base voxels");
     requireFinite(config.traceToBaseScale, "trace-to-base scale");
+    for (const double weight : config.stopScoreWeights)
+        requireFinite(weight, "stop score weight");
+    requireFinite(config.stopScoreBias, "stop score bias");
     if (config.baseVoxelSizeUm.has_value())
         requireFinite(*config.baseVoxelSizeUm, "base voxel size");
     if (!(config.stepVoxels > 0.0))
@@ -2589,8 +2592,10 @@ struct TraceStepper {
     auto observedPath = initial.path;
     bool invalidCommittedWidth = false;
     bool rejectedCommittedWidth = false;
+    const bool stopScore = fiberStopScoreEnabled(request.config);
+    bool stopScoreReached = false;
     const auto observeThrough = [&](std::shared_ptr<const BeamState::PathNode> path) {
-        if (!updateWidth && !committedStep && request.config.widthHardRelativeTolerance<=0) return true;
+        if (!updateWidth && !committedStep && request.config.widthHardRelativeTolerance<=0 && !stopScore) return true;
         std::vector<std::shared_ptr<const BeamState::PathNode>> pending;
         while (path && path != observedPath) {
             pending.push_back(path);
@@ -2599,6 +2604,12 @@ struct TraceStepper {
         if (!path)
             throw std::logic_error("fiber trace attempted to retract a committed prefix");
         for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+            if (stopScore && fiberStopScore(request.config, fiberStopScoreFeatures(predictions,
+                    toVec3d((*it)->point), toVec3d(observedPath->point),
+                    request.config.traceToBaseScale)) > 0.0) {
+                stopScoreReached = true;
+                return false;
+            }
             if (request.config.widthHardRelativeTolerance>0) {
                 const double value=(*it)->sampledWidth;
                 if (!std::isfinite(value) || value<=0 ||
@@ -2641,7 +2652,7 @@ struct TraceStepper {
         FiberTraceOneWayResult result;
         result.points = beamPathPoints(stopped);
         result.steps = static_cast<int>(result.points.size() - 1);
-        result.reason = rejectedCommittedWidth ? "width_cutoff" : invalidCommittedWidth ? "invalid_width" : "observer_stop";
+        result.reason = stopScoreReached ? "stop_score" : rejectedCommittedWidth ? "width_cutoff" : invalidCommittedWidth ? "invalid_width" : "observer_stop";
         if (request.config.widthRelativeTolerance > 0) {
             result.widthMean = request.config.widthReferenceMean;
             result.widthSamples = width.count;
@@ -2938,7 +2949,7 @@ struct TraceStepper {
             if (crossed) co_return finish(*std::min_element(beams.begin(),beams.end(),beamSearchLess),false,"chunk_boundary");
         }
 
-        if (updateWidth || committedStep) {
+        if (updateWidth || committedStep || stopScore) {
             auto common = lastValidState.path;
             for (const auto& beam : beams) {
                 auto other = beam.path;
@@ -3777,6 +3788,57 @@ double FiberTraceCoordinateAdapter::traceDistanceToBase(
 }
 
 void validateFiberTraceConfig(const FiberTraceConfig& config) { validateTraceConfig(config); }
+
+FiberStopScoreFeatures fiberStopScoreFeatures(
+    const FiberPredictionSource& predictions, const cv::Vec3d& point,
+    const cv::Vec3d& previous, double traceToBaseScale)
+{
+    const cv::Vec3d step = point - previous;
+    const double stepLength = cv::norm(step);
+    if (!finitePoint(point) || !(stepLength > kEpsilon) || !std::isfinite(stepLength) ||
+        !(traceToBaseScale > 0.0) || !std::isfinite(traceToBaseScale))
+        throw std::invalid_argument("stop score needs finite points, a nonzero step and a positive scale");
+    const cv::Vec3d tangent = step / stepLength;
+    const auto strongest = [&](const cv::Vec3d& at) {
+        FiberPredictionSampleOption best;
+        for (const auto& option : predictions.sample(at, tangent).options)
+            if (option.valid && std::isfinite(option.presence) && option.presence > best.presence)
+                best = option;
+        return best;
+    };
+    const auto here = strongest(point);
+    FiberStopScoreFeatures features;
+    features.presence = here.presence;
+    const cv::Vec3d direction(here.direction);
+    const double directionLength = cv::norm(direction);
+    if (here.valid && directionLength > kEpsilon && std::isfinite(directionLength))
+        features.axisAgreement = std::abs(direction.dot(tangent)) / directionLength;
+    cv::Vec3d side = tangent.cross(cv::Vec3d(0.0, 0.0, 1.0));
+    if (cv::norm(side) < 1.0e-6) side = tangent.cross(cv::Vec3d(0.0, 1.0, 0.0));
+    side /= cv::norm(side);
+    const cv::Vec3d other = tangent.cross(side);
+    double rival = 0.0;
+    for (const double offsetBase : {8.0, 16.0, 24.0}) {
+        const double offset = offsetBase / traceToBaseScale;
+        for (const cv::Vec3d& unit : {side, -side, other, -other})
+            rival = std::max(rival, double(strongest(point + offset * unit).presence));
+    }
+    features.lateralRival = rival - features.presence;
+    return features;
+}
+
+bool fiberStopScoreEnabled(const FiberTraceConfig& config)
+{
+    return std::any_of(config.stopScoreWeights.begin(), config.stopScoreWeights.end(),
+                       [](double weight) { return weight != 0.0; });
+}
+
+double fiberStopScore(const FiberTraceConfig& config, const FiberStopScoreFeatures& features)
+{
+    const auto& w = config.stopScoreWeights;
+    return config.stopScoreBias + w[0] * features.presence + w[1] * features.axisAgreement +
+           w[2] * features.lateralRival;
+}
 
 FiberPredictionTraceScales resolveFiberPredictionTraceScales(
     const vc::lasagna::LasagnaDatasetManifest& manifest,

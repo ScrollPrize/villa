@@ -88,6 +88,28 @@ def config(**overrides):
     return fiber_trace.TraceConfig(**values)
 
 
+def test_stop_score_config_features_and_stop(dataset):
+    root, field, normals = dataset
+    stock = config()
+    assert list(stock.to_dict()["stop_score_weights"]) == [0.0, 0.0, 0.0]
+    cfg = config(stop_score_weights=[-1.0, 0.0, 0.0], stop_score_bias=2.0)
+    assert fiber_trace.TraceConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
+    line = np.array([[8., 8., 8.], [12., 8., 8.], [16., 8., 8.]])
+    features = fiber_trace.stop_score_features(field, line)
+    assert features.shape == (3, 3)
+    np.testing.assert_allclose(features[:, :2], 1.0, atol=1e-6)  # full presence, axis along x
+    with pytest.raises(ValueError, match="at least two"):
+        fiber_trace.stop_score_features(field, line[:1])
+    # 2 - presence > 0 everywhere: no step is committed.
+    assert not fiber_trace.trace_segment(field, np.array([START, TARGET]), 0, 1, cfg, normals).accepted
+    # Never positive: the trace is the stock trace.
+    cfg.stop_score_bias = 0.5
+    same = fiber_trace.trace_segment(field, np.array([START, TARGET]), 0, 1, cfg, normals)
+    base = fiber_trace.trace_segment(field, np.array([START, TARGET]), 0, 1, stock, normals)
+    assert same.accepted and base.accepted
+    np.testing.assert_array_equal(same.fused_line, base.fused_line)
+
+
 def test_scales_config_and_segment(dataset):
     root, field, normals = dataset
     cfg = config()
