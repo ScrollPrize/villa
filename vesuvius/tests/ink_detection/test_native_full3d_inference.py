@@ -551,6 +551,9 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         prefetch_factor=2,
         cache_dir=None,
         cache_max_gb=None,
+        reader="zarr",
+        reader_connections=32,
+        reader_memory_cache_mb=512,
         downsample_workers=1,
     )
     assert native.run_command(args) == 0
@@ -566,3 +569,53 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
         for level in range(6)
     )
+
+
+def test_native_dataset_vc_reader_batches_match_zarr_reads(monkeypatch):
+    from torch.utils.data import DataLoader
+
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    array = np.random.default_rng(0).integers(0, 255, (6, 7, 8), dtype=np.uint8)
+
+    class RegionVolume:
+        shape, dtype = array.shape, array.dtype
+
+        def read_regions(self, regions):
+            calls.append(len(regions))
+            padded = np.pad(array, 8, constant_values=7)
+            return [
+                padded[tuple(slice(s + 8, s + n + 8) for s, n in zip(start, size))]
+                for start, size in regions
+            ]
+
+    calls = []
+    monkeypatch.setattr(native, "_open_shared_volume", lambda *a, **k: array)
+    monkeypatch.setattr(native, "open_vc_reader", lambda *a, **k: RegionVolume())
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            mode="full_3d", normalization=NormalizationConfig.from_value("none")
+        )
+    )
+    patches = [
+        native.PatchSpec(z, y, x)
+        for z, y, x in ((-2, 0, 1), (2, 3, 4), (5, 6, 7), (9, 0, 0))
+    ]
+    batches = {}
+    for reader in ("zarr", "vc_reader"):
+        dataset = native.NativePatchDataset(
+            tifxyz_dir=Path("unused"),
+            volume_path="memory://native",
+            resolution="0",
+            patches=patches,
+            patch_size_zyx=(3, 3, 3),
+            config=config,
+            reader=reader,
+        )
+        batches[reader] = list(DataLoader(dataset, batch_size=3))
+    assert calls == [3, 1]
+    for (image, starts), (want_image, want_starts) in zip(
+        batches["vc_reader"], batches["zarr"]
+    ):
+        assert torch.equal(image, want_image)
+        assert torch.equal(starts, want_starts)

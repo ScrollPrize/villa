@@ -6,6 +6,7 @@ import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import multiprocessing as mp
 import os
+import sys
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -423,3 +424,70 @@ def test_missing_node_error_has_zarr2_fallback(monkeypatch):
     assert isinstance(
         volume_io._missing_node_error("missing"), CompatiblePathError
     )
+
+
+class _RegionVolume:
+    """vc_reader-like stub: read_regions fills outside the array with 7."""
+
+    def __init__(self, array):
+        self.array = array
+        self.shape = array.shape
+        self.dtype = array.dtype
+        self.calls = 0
+
+    def read_regions(self, regions):
+        self.calls += 1
+        padded = np.pad(self.array, 8, constant_values=7)
+        crops = []
+        for start, size in regions:
+            index = tuple(slice(s + 8, s + n + 8) for s, n in zip(start, size))
+            crops.append(padded[index])  # views, like vc_reader's recycled buffers
+        return crops
+
+
+def test_read_bboxes_with_padding_matches_single_reads():
+    array = np.arange(6 * 7 * 8, dtype=np.uint8).reshape(6, 7, 8)
+    bboxes = [
+        (-1, 1, 3, 2, 5, 7),
+        (0, 0, 0, 6, 7, 8),
+        (4, 5, 6, 9, 9, 9),
+        (7, 0, 0, 9, 2, 2),
+    ]
+    expected = [
+        volume_io.read_bbox_with_padding(array, bbox, fill_value=0) for bbox in bboxes
+    ]
+    for (crop, valid), (want, want_valid) in zip(
+        volume_io.read_bboxes_with_padding(array, bboxes), expected
+    ):
+        np.testing.assert_array_equal(crop, want)
+        assert valid == want_valid
+    stub = _RegionVolume(array)
+    for (crop, valid), (want, want_valid) in zip(
+        volume_io.read_bboxes_with_padding(stub, bboxes), expected
+    ):
+        np.testing.assert_array_equal(crop, want)
+        assert valid == want_valid
+    assert stub.calls == 1
+
+
+def test_vc_reader_matches_zarr_reads(tmp_path):
+    pytest.importorskip("vc_reader.reader")
+    array = np.random.default_rng(0).integers(0, 255, (9, 10, 11), dtype=np.uint8)
+    _write_pyramid(tmp_path / "volume.zarr", array)
+    bboxes = [(-2, 3, 4, 4, 9, 12), (5, 0, 0, 9, 10, 11), (8, 8, 8, 12, 12, 12)]
+    zarr_reads = volume_io.read_bboxes_with_padding(
+        open_volume(tmp_path / "volume.zarr", 0), bboxes
+    )
+    vc_reads = volume_io.read_bboxes_with_padding(
+        volume_io.open_vc_reader(tmp_path / "volume.zarr", 0), bboxes
+    )
+    for (crop, valid), (want, want_valid) in zip(vc_reads, zarr_reads):
+        np.testing.assert_array_equal(crop, want)
+        assert valid == want_valid
+
+
+def test_open_vc_reader_without_package_says_how_to_fix(monkeypatch):
+    monkeypatch.setitem(sys.modules, "vc_reader", None)
+    monkeypatch.setitem(sys.modules, "vc_reader.reader", None)
+    with pytest.raises(ImportError, match="needs the vc_reader package"):
+        volume_io.open_vc_reader("volume.zarr", 0)
