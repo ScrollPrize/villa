@@ -523,7 +523,9 @@ sys.exit(spiral_service.main(sys.argv[1:]))
     result = subprocess.run(
         [sys.executable, '-c', script, '--port', str(port),
          '--api-key-file', str(tmp_path / 'key'), '--dataset', str(dataset.root),
-         '--output', str(dataset.output / 'svc'), '--object-store', filled_store],
+         '--output', str(dataset.output / 'svc'), '--object-store', filled_store,
+         # The store has no outer shell, so the shell losses are off.
+         '--config', json.dumps(NO_DENSE)],
         cwd=str(Path(spiral_service.__file__).parent), capture_output=True,
         text=True, timeout=120, env=dict(os.environ))
     line = next(line for line in result.stderr.splitlines() if line.startswith('RESULT'))

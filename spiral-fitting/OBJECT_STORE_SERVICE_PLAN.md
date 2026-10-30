@@ -1351,6 +1351,21 @@ Follow-up the same day (API 41):
   session's dataset paths (it reads the project's selected dataset, which the
   session now fits too).
 
+The outer shell moved into the store the same day: the active surface tagged
+`spiral-outer-shell` (`object_store_inputs.OUTER_SHELL_TAG`). Selection leaves
+it out of the patches (like attached data: refused when named), so the
+detectors never link it; `read_snapshot` reads it alongside, in the same fit
+volume (it counts towards the volume inference), as `InputSnapshot.outer_shell`
+and the manifest's `outer_shell`, so its revision is part of the digest.
+`InputRequest.outer_shell` is `off`/`optional`/`required` from the
+configuration (`input_use_outer_shell`; shell losses or winding-model
+supervision). The fit materializes it whole (`FitInputs.outer_shell`) in
+place of the dataset's `outer_shell/` tifxyz, which is no longer an input (a
+specification's `outer_shell` path override is ignored as retired). An input
+update changing it is refused. The service's shell-filtered-tracks rebuild
+rule reads the session's `input_summary.outer_shell`; VC3D shows the shell
+from the fit's manifest instead of loading the service's dataset path.
+
 ## Implementation and validation workflow
 
 Keep service and VC3D changes in reviewable patches, with their protocol changes

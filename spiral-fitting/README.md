@@ -208,6 +208,7 @@ $ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
     --point-collections dataset/relative_windings.json \
     --point-collections dataset/same_windings.json
 $ingest --scale-factor 4 --drop-dangling-branches --fiber dataset/fibers
+$ingest --scale-factor 1 --tag spiral-outer-shell --surface dataset/outer_shell
 ```
 
 `VOLUME` names the reference volume (its catalog `metadata.json` id, or any
@@ -218,7 +219,8 @@ instead of 4. The two repair flags handle the 2026-10 Spiral dataset's defects
 that each number their points from 0) and are recorded on the objects.
 
 What the ingest covers: tifxyz patches (`--surface`, one directory each,
-stored as kind `surface`), the PCL role documents, and the fiber directory with
+stored as kind `surface`), the outer shell (a tifxyz surface tagged
+`spiral-outer-shell`), the PCL role documents, and the fiber directory with
 its same-winding branches
 (which become `fiber_branch` relationships; adjacent branches are kept but
 never used by the fit). A collection is absolute-winding when its
@@ -251,6 +253,15 @@ reconciles them). `object_store_refresh_links: false` reads the store's
 current relationships read-only. Pending and approved relationships are used
 and rejected ones never; `object_store_approved_links_only` uses approved ones
 only (refresh still runs, so new links stay pending and unused).
+
+The outer shell is the one active surface tagged `spiral-outer-shell` (two are
+an error). It is never a patch: the default and tag selections leave it out,
+and naming it in `object_store_patch_uuids` is refused, so no detector links
+it. It is read with the selection, in the same fit volume, and its revision
+is part of the input manifest and digest; a fit with shell losses or
+winding-model supervision refuses a store without one, and with
+`input_use_outer_shell` off it is not read. An input update that changes the
+shell is refused (the fit consumed it at build): rebuild instead.
 
 Fiber-patch refresh uses the fit's lasagna normals when `input_use_normals` is
 on and the normal stores exist (whatever the dense-normal loss weight), else
@@ -544,13 +555,14 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the inputs: it is launched
-with `--dataset` (tracks, fiber directions, winding inference, the outer
-shell and an optional scroll specification), `--object-store`
+with `--dataset` (tracks, fiber directions, winding inference and an
+optional scroll specification), `--object-store`
 (patches, point collections, fibers and their links; see
 [Object-store inputs](#object-store-inputs)) and `--output` (all generated
 state), resolves them once at startup, and advertises the result through
 `/dataset`. The scroll's facts, the umbilicus and the Lasagna stores come
-from the client's project with each session request (below). `--output` must resolve outside the dataset root;
+from the client's project with each session request (below); the outer shell
+is the store's surface tagged `spiral-outer-shell`. `--output` must resolve outside the dataset root;
 the optional `--cache` (derived host caches) defaults to the documented user
 cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
 run parameters but cannot repoint the session at other host paths or another

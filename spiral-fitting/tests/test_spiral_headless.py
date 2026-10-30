@@ -141,11 +141,12 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertIn("scroll_spec", invalid.missing_required)
             self.assertTrue(any("spiral-scroll.json" in warning
                                 for warning in invalid.warnings))
-            write_scroll_spec(root, paths={"outer_shell": "normals"})
+            write_scroll_spec(root, paths={"winding_inference": "normals"})
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
             self.assertEqual(result.scroll_spec["name"], "s1")
-            self.assertEqual(result.resolved["outer_shell"], str(root.resolve() / "normals"))
+            self.assertEqual(result.resolved["winding_inference"],
+                             str(root.resolve() / "normals"))
             # The project supplies the umbilicus, never the dataset.
             self.assertNotIn("umbilicus", result.resolved)
 

@@ -76,6 +76,8 @@ class FakeSession:
         # publishes it once it has one; a checkpoint refusal is analysed
         # against this.
         self.applied_config = None
+        # The object-store inputs' summary, as a real session reports it.
+        self.input_summary = None
         self.default_advanced_config = {
             "optimizer_learning_rate": 3e-5,
             "sample_count_patches_per_step": 360,
@@ -100,6 +102,8 @@ class FakeSession:
     def status(self):
         applied = ({"applied_config": dict(self.applied_config)}
                    if self.applied_config is not None else {})
+        if self.input_summary is not None:
+            applied["input_summary"] = dict(self.input_summary)
         return {
             **applied,
             "state": self.state, "phase": str(self.state),
@@ -962,17 +966,18 @@ class DatasetOwnershipTests(unittest.TestCase):
     def test_shell_atlas_settings_rebuild_everything_once_tracks_were_shell_filtered(self):
         # Without a shell-filtered track pool the atlas settings are ordinary
         # run-boundary knobs the model rebuild applies through apply_config.
-        self._attach_session_for_request()
+        session = self._attach_session_for_request()
         self.assertEqual(
             self._stage_for(self._base_request({"shell_num_theta_bins": 360})),
             "model")
-        # A session that loaded both a tracks store and an outer shell
-        # filtered the tracks against the shell; apply_config refuses the
-        # atlas settings there, so the request has to rebuild the host inputs.
+        # A session that loaded both a tracks store and the store's outer
+        # shell filtered the tracks against the shell; apply_config refuses
+        # the atlas settings there, so the request has to rebuild the host
+        # inputs.
+        session.input_summary = {"outer_shell": "6d1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e12"}
         live = SpiralInputPaths.from_mapping({
             **self.state.session_paths.manifest(),
             "tracks_dbm": str(self.root / "tracks.dbm"),
-            "outer_shell": str(self.root / "outer_shell"),
         })
         self.state.session_paths = live
         self.state.session_request["paths"] = live.manifest()
@@ -1081,8 +1086,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             "artifact_type": "winding_inference_crossings",
             "format_version": 1,
         }))
-        shell = self.root / "outer_shell"
-        shell.mkdir()
         self.state.dataset_resolution = spiral_service.bind_service_paths(
             resolve_dataset_root(self.root), self.output, self.cache)
 
@@ -1101,7 +1104,6 @@ class DatasetOwnershipTests(unittest.TestCase):
         }, _PROJECT, include_input_config=True)
 
         self.assertEqual(request["paths"]["winding_inference"], str(winding))
-        self.assertEqual(request["paths"]["outer_shell"], str(shell))
         self.assertEqual(input_config["dense_spacing_mode"], "winding_model")
 
         # Preflight validates against the same checkpoint-derived selection

@@ -3,8 +3,8 @@
 from config import Config
 from fit_session import (FIT_INPUT_CATALOG, RETIRED_PATH_OVERRIDE_KEYS,
                          SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
-                         fit_input, input_source_enabled, parse_scroll_spec,
-                         winding_inference_enabled)
+                         fit_input, input_source_enabled, outer_shell_required,
+                         parse_scroll_spec, winding_inference_enabled)
 
 
 def test_catalog_covers_every_fit_input_path_field():
@@ -28,15 +28,15 @@ def test_omitted_spacing_mode_uses_fitter_default():
 
 
 def test_outer_shell_is_required_by_shell_losses_or_winding_model():
-    spec = fit_input("outer_shell")
-    assert spec.kind == "directory"
-    # Required by the outer shell loss weight (which defaults on) or by
-    # winding-model supervision even when the shell loss is disabled.
-    assert spec.required({}) is True
-    assert spec.required({"dense_spacing_mode": "phase",
-                          "loss_weight_shell_outer": 0.0}) is False
-    assert spec.required({"dense_spacing_mode": "winding_model",
-                          "loss_weight_shell_outer": 0.0}) is True
+    # The store's tagged surface, not a dataset path: required by the outer
+    # shell loss weight (which defaults on) or by winding-model supervision
+    # even when the shell loss is disabled.
+    assert "outer_shell" not in {spec.key for spec in FIT_INPUT_CATALOG}
+    assert outer_shell_required({}) is True
+    assert outer_shell_required({"dense_spacing_mode": "phase",
+                                 "loss_weight_shell_outer": 0.0}) is False
+    assert outer_shell_required({"dense_spacing_mode": "winding_model",
+                                 "loss_weight_shell_outer": 0.0}) is True
 
 
 def test_no_input_path_is_advertised_as_takeable_by_a_resident_session():
@@ -83,8 +83,8 @@ def test_a_specification_naming_retired_patch_or_fiber_paths_still_parses(tmp_pa
         "spiral_outward_sense": "CW",
         "paths": {"verified_patches": "patches", "fibers": "fibers",
                   "outer_shell": "shell"}}, tmp_path)
-    assert dict(spec.path_overrides) == {"outer_shell": str(tmp_path / "shell")}
-    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {"verified_patches", "fibers"}
+    assert dict(spec.path_overrides) == {}
+    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {"verified_patches", "fibers", "outer_shell"}
 
 
 def test_source_toggles_and_dependencies_are_centralized():

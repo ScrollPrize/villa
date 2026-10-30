@@ -35,6 +35,9 @@ from collections import Counter
 import numpy as np
 
 KINDS = ('surface', 'point_collection', 'fiber')
+# The tag of the scroll's outer shell: a surface the fit reads on its own
+# (InputSnapshot.outer_shell, FitInputs.outer_shell), never as a patch.
+OUTER_SHELL_TAG = 'spiral-outer-shell'
 KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
                'fiber': 'fibers'}
 
@@ -131,6 +134,10 @@ class InputRequest:
     fit_volume_uuid: str = None
     approved_links_only: bool = False
     position: InputPosition = None
+    # Whether the fit reads the outer shell: 'off' (input_use_outer_shell
+    # false), 'optional' (it filters tracks when present) or 'required' (shell
+    # losses, winding-model supervision; a store without one is refused).
+    outer_shell: str = 'optional'
 
     def __post_init__(self):
         # An unknown key would otherwise leave its kind unselected-by-default:
@@ -268,6 +275,9 @@ class InputSnapshot:
     relationships: list
     exclusions: Counter
     notes: list
+    # The outer shell (StoredObject), read with the selection but not part
+    # of it; None when the store has none.
+    outer_shell: StoredObject = None
 
     @property
     def position(self):
@@ -293,6 +303,7 @@ class InputSnapshot:
                        'count': len(self.objects_of(kind))}
                 for kind in KINDS},
             'objects': [obj.provenance() for obj in self.objects.values()],
+            'outer_shell': self.outer_shell.provenance() if self.outer_shell else None,
             'relationships': [rel.provenance() for rel in self.relationships],
             'excluded_relationships': dict(sorted(self.exclusions.items())),
         }
@@ -309,21 +320,29 @@ def attached_data(record):
     return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
 
 
+def outer_shell(record):
+    """Whether an object is the scroll's outer shell (OUTER_SHELL_TAG): read
+    on its own, never as a patch."""
+    return record['kind'] == 'surface' and OUTER_SHELL_TAG in (record.get('tags') or ())
+
+
 def resolve_selector(store, kind, selector, records=None):
     """Explicit sorted UUIDs selected by ``selector`` among active objects.
 
-    Default and tag selections leave out attached data; naming it by UUID is
-    an error. ``records`` ({UUID: record} of every object at a position,
-    retired ones included) replaces the store's current objects."""
+    Default and tag selections leave out attached data and the outer shell;
+    naming either by UUID is an error. ``records`` ({UUID: record} of every
+    object at a position, retired ones included) replaces the store's current
+    objects."""
     def matching(tag=None):
         if records is not None:
             return [uuid for uuid, record in records.items()
                     if record['kind'] == kind and not record.get('retired')
                     and (tag is None or tag in (record.get('tags') or ()))
-                    and not attached_data(record)]
+                    and not attached_data(record) and not outer_shell(record)]
         query = {} if tag is None else {'tag': tag}
         return [record['uuid'] for record in store.select_objects(
-            object_kind=kind, fields=['uuid', 'meta'], **query) if not attached_data(record)]
+            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
+            if not attached_data(record) and not outer_shell(record)]
 
     if selector.is_default:
         return sorted(matching())
@@ -341,6 +360,9 @@ def resolve_selector(store, kind, selector, records=None):
         elif attached_data(record):
             problems.append(f'selected {kind} {uuid} is attached data with role '
                             f'{record["meta"]["role"]!r}, not a fit input')
+        elif outer_shell(record):
+            problems.append(f'selected {kind} {uuid} is the outer shell (tagged '
+                            f'{OUTER_SHELL_TAG}), not a patch')
         else:
             selected.add(record['uuid'])
     if problems:
@@ -499,6 +521,22 @@ def resolve_selection(store, request):
             for kind in KINDS}
 
 
+def resolve_outer_shell(store, request):
+    """The active surface tagged OUTER_SHELL_TAG at the request's position
+    (or now), or None; several are an error."""
+    if request.position is None:
+        shells = [record['uuid'] for record in store.select_objects(
+            object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+    else:
+        shells = [uuid for uuid, record in _position_records(store, request.position).items()
+                  if outer_shell(record) and not record.get('retired')]
+    if len(shells) > 1:
+        raise ObjectStoreInputError([
+            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(shells))}); '
+            'the outer shell must be one'])
+    return shells[0] if shells else None
+
+
 def read_snapshot(store, request, uuids=None):
     """Resolve, validate and freeze one selection of the store.
 
@@ -507,11 +545,18 @@ def read_snapshot(store, request, uuids=None):
     ``uuids`` (resolve_selection's result) reuses a selection resolved
     earlier, so one startup reads exactly the objects it refreshed.
     Every selected object must declare a frame in the fit volume; all frame
-    problems are reported together.
+    problems are reported together. The outer shell (resolve_outer_shell) is
+    read alongside, in the same volume, but is not among ``objects``.
     """
     if uuids is None:
         uuids = resolve_selection(store, request)
+    shell = None if request.outer_shell == 'off' else resolve_outer_shell(store, request)
+    if shell is None and request.outer_shell == 'required':
+        raise ObjectStoreInputError([
+            f'the fit needs the outer shell, and no surface is tagged {OUTER_SHELL_TAG}'])
     selection = {uuid: None for kind in KINDS for uuid in uuids[kind]}
+    if shell is not None:
+        selection[shell] = None
     if request.position is None:
         view = store.revision_read_view(selection)
     else:
@@ -542,26 +587,37 @@ def read_snapshot(store, request, uuids=None):
         else:
             problems.extend(f'selected {kind} {uuid} has no geometry'
                             for uuid in without_geometry)
+    shell_revision = None if shell is None else revisions[shell]
+    if shell_revision is not None and shell_revision['geometry_revision'] is None:
+        problems.append(f'the outer shell {shell} has no geometry')
     if problems:
         raise ObjectStoreInputError(problems)
 
     volume_uuid, volume_source = infer_fit_volume(
-        [revision['record'] for revision in usable], request.fit_volume_uuid)
-    objects = {}
-    for revision in usable:
+        [revision['record'] for revision in usable]
+        + ([shell_revision['record']] if shell_revision is not None else []),
+        request.fit_volume_uuid)
+
+    def stored(revision):
         record = revision['record']
         try:
             frame = object_frame(record['meta'], volume_uuid)
         except ValueError as error:
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
-            continue
-        objects[record['uuid']] = StoredObject(
+            return None
+        return StoredObject(
             uuid=record['uuid'], kind=record['kind'], name=record['name'],
             meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
             object_revision=revision['uuid'],
             geometry_revision=revision['geometry_revision'], frame=frame,
             fiber=record.get('fiber'))
+
+    objects = {}
+    for revision in usable:
+        if (obj := stored(revision)) is not None:
+            objects[obj.uuid] = obj
+    shell_object = None if shell_revision is None else stored(shell_revision)
     if problems:
         raise ObjectStoreInputError(problems)
 
@@ -570,7 +626,8 @@ def read_snapshot(store, request, uuids=None):
     return InputSnapshot(
         store_path=store.path, store_uuid=store.uuid, volume_uuid=volume_uuid,
         volume_source=volume_source, request=request, objects=objects,
-        relationships=relationships, exclusions=exclusions, notes=notes)
+        relationships=relationships, exclusions=exclusions, notes=notes,
+        outer_shell=shell_object)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +700,9 @@ class FitInputs:
     counts: Counter
     dropped_attachments: list = dataclasses.field(default_factory=list)
     patch_overlaps: dict = dataclasses.field(default_factory=dict)
+    # The outer shell as a fit-frame tifxyz.Patch (materialize_outer_shell),
+    # or None.
+    outer_shell: object = None
     # Complete input/frame provenance and its digest (load_fit_inputs).
     manifest: dict = None
     digest: str = None
@@ -660,6 +720,38 @@ class FitInputs:
                 f'the z window or a detached island) and were dropped: {named}'
                 + (f', and {more} more' if more > 0 else ''))
         return lines
+
+
+def _surface_zyxs(store, obj, what):
+    """``(zyxs, grid scale)`` of a stored surface in the fit frame; invalid
+    vertices (and holes in its ``valid`` channel) carry the -1 sentinel."""
+    arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'],
+                                       optional=['valid'])
+    points = arrays['points']
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ObjectStoreInputError([f'{what} {obj.uuid} points have shape {points.shape}'])
+    invalid = np.all(points == -1, axis=-1)
+    if 'valid' in arrays:
+        # The store's per-vertex validity channel (ingested from mask.tif):
+        # zero marks a hole even where coordinates remain.
+        if arrays['valid'].shape != invalid.shape:
+            raise ObjectStoreInputError(
+                [f'{what} {obj.uuid} validity has shape {arrays["valid"].shape}'])
+        invalid |= arrays['valid'] == 0
+    return (obj.frame.xyz_to_fit_zyx(points, invalid), invalid,
+            obj.frame.grid_scale_to_fit(attributes['scale']))
+
+
+def materialize_outer_shell(store, snapshot):
+    """The snapshot's outer shell as a fit-frame tifxyz.Patch (whole: no z
+    window or erosion), or None."""
+    obj = snapshot.outer_shell
+    if obj is None:
+        return None
+    import torch
+    from tifxyz import Patch
+    zyxs, _, scale = _surface_zyxs(store, obj, 'outer shell')
+    return Patch(torch.from_numpy(zyxs), torch.tensor(scale), None, None, obj.uuid, None)
 
 
 def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
@@ -680,29 +772,14 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
 
     patches, counts = {}, Counter()
     for obj in snapshot.objects_of('surface'):
-        arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'],
-                                           optional=['valid'])
-        points = arrays['points']
-        if points.ndim != 3 or points.shape[-1] != 3:
-            raise ObjectStoreInputError(
-                [f'patch {obj.uuid} points have shape {points.shape}'])
-        invalid = np.all(points == -1, axis=-1)
-        if 'valid' in arrays:
-            # The store's per-vertex validity channel (ingested from mask.tif):
-            # zero marks a hole even where coordinates remain.
-            if arrays['valid'].shape != invalid.shape:
-                raise ObjectStoreInputError(
-                    [f'patch {obj.uuid} validity has shape {arrays["valid"].shape}'])
-            invalid |= arrays['valid'] == 0
-        zyxs = obj.frame.xyz_to_fit_zyx(points, invalid)
+        zyxs, invalid, scale = _surface_zyxs(store, obj, 'patch')
         valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
                        & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
         if not valid_quads.any():
             counts['patches without valid quads'] += 1
             continue
         erosion = (obj.meta.get('source') or {}).get('spiral_patch_erode_cells')
-        patch = Patch(torch.from_numpy(zyxs),
-                      torch.tensor(obj.frame.grid_scale_to_fit(attributes['scale'])),
+        patch = Patch(torch.from_numpy(zyxs), torch.tensor(scale),
                       None, None, obj.uuid, erosion)
         if not patch_intersects_z_roi(patch, z_begin, z_end):
             counts['patches outside z ROI'] += 1
@@ -1162,7 +1239,8 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
     counts.update(overlap_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
                      fiber_links, counts, dropped_attachments=dropped,
-                     patch_overlaps=patch_overlaps)
+                     patch_overlaps=patch_overlaps,
+                     outer_shell=materialize_outer_shell(store, snapshot))
 
 
 def materialize_from_config(store, snapshot, config):
@@ -1303,6 +1381,8 @@ def snapshot_summary(snapshot):
         'approved_links_only': snapshot.request.approved_links_only,
         'selection': selection,
         'objects': objects,
+        'outer_shell': (snapshot.outer_shell.provenance()
+                        if snapshot.outer_shell else None),
         'relationships': dict(sorted(
             Counter(rel.family for rel in snapshot.relationships).items())),
         'excluded_relationships': dict(sorted(snapshot.exclusions.items())),
@@ -1327,6 +1407,9 @@ def snapshot_report(snapshot):
             f'{KIND_LABELS[kind]}: {selected["count"]} selected '
             f'({selected["description"]})'
             + (f'; {scale_text}' if scale_text else ''))
+    shell = summary['outer_shell']
+    lines.append(f'outer shell: {shell["name"]!r} ({shell["uuid"]})' if shell
+                 else f'outer shell: none (no surface tagged {OUTER_SHELL_TAG})')
     mode = 'approved only' if summary['approved_links_only'] else 'pending and approved'
     lines.append(f'relationships consumed ({mode}): ' + (', '.join(
         f'{family} {count}' for family, count in summary['relationships'].items())
@@ -1405,8 +1488,12 @@ def request_from_config(config):
             f'PCL role toggles must all agree ({roles})'])
     if not any(roles.values()):
         selectors['point_collection'] = _NONE
+    from fit_session import input_source_enabled, outer_shell_required
+    shell = ('required' if outer_shell_required(config)
+             else 'optional' if input_source_enabled(config, 'outer_shell') else 'off')
     return InputRequest(selectors, config['fit_volume_uuid'],
-                        bool(config['object_store_approved_links_only']))
+                        bool(config['object_store_approved_links_only']),
+                        outer_shell=shell)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1984,6 +2071,7 @@ def input_summary(inputs):
         'excluded_relationships': manifest['excluded_relationships'],
         'constraints': dict(sorted(inputs.counts.items())),
         'link_refresh': manifest['link_refresh']['enabled'],
+        'outer_shell': (manifest.get('outer_shell') or {}).get('uuid'),
     }
 
 

@@ -176,7 +176,11 @@ from surface_orientation import spiral_outward_sense_for
 # A service no longer reads spiral-scroll.json's scroll facts or Lasagna
 # layout (they are the command-line fit's); its path overrides and
 # num_windings still apply.
-API_VERSION = 41
+# 42: the outer shell is the object store's surface tagged spiral-outer-shell,
+# read with the selection (never a patch). /dataset no longer resolves an
+# outer_shell path; the input manifest carries "outer_shell" (its provenance,
+# or null) and input_summary its UUID.
+API_VERSION = 42
 
 
 class SessionState(str, Enum):
@@ -306,7 +310,9 @@ def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
     )
 
 
-def _outer_shell_required(config: Mapping[str, Any]) -> bool:
+def outer_shell_required(config: Mapping[str, Any]) -> bool:
+    """Whether the fit needs the outer shell (the object store's surface
+    tagged spiral-outer-shell): shell losses or winding-model supervision."""
     return _shell_losses_enabled(config) or _winding_model_enabled(config)
 
 
@@ -353,10 +359,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  conventional_relative="fiber_directions.npz",
                  enabled=_fiber_directions_enabled,
                  required=_fiber_directions_enabled),
-    FitInputSpec("outer_shell", "directory",
-                 conventional_relative="outer_shell",
-                 enabled=lambda config: input_source_enabled(config, "outer_shell"),
-                 required=_outer_shell_required),
     FitInputSpec("tracks_dbm", "dbm",
                  conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm",
                  enabled=_tracks_enabled),
@@ -394,7 +396,6 @@ class SpiralInputPaths:
     umbilicus: str = ""
     fiber_directions: str = ""
     tracks_dbm: str = ""
-    outer_shell: str = ""
     normal_x: str = ""
     normal_y: str = ""
     gradient_magnitude: str = ""
@@ -516,9 +517,10 @@ SCROLL_SPEC_SCHEMA_VERSION = 1
 # the spec file are resolved relative to the dataset root; conventional paths
 # need no entry at all.
 SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(spec.key for spec in FIT_INPUT_CATALOG)
-# Overrides of inputs that now come from the object store. A specification
-# written for the file-input service may still name them; they are ignored.
-RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers")
+# Overrides of inputs that now come from the object store (the outer shell is
+# its surface tagged spiral-outer-shell). A specification written for the
+# file-input service may still name them; they are ignored.
+RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers", "outer_shell")
 
 # Conventional dataset layout for the headless CLI, mirroring the historical
 # fit_spiral module-global defaults. resolve_dataset_root() shares the same
@@ -1123,7 +1125,6 @@ def conventional_input_paths(
         umbilicus=resolve("umbilicus"),
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
-        outer_shell=resolve("outer_shell"),
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),
         gradient_magnitude=resolve("gradient_magnitude"),

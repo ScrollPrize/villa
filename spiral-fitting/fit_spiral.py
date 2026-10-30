@@ -46,8 +46,9 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS,
-                         fit_input, input_source_enabled, lasagna_normal_inputs,
-                         shell_losses_enabled, winding_inference_enabled)
+                         input_source_enabled, lasagna_normal_inputs,
+                         outer_shell_required, shell_losses_enabled,
+                         winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
 
@@ -68,7 +69,6 @@ from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
-from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
 from pcl_views import (
     _UnattachedPclStripList,
@@ -1068,9 +1068,6 @@ class FitContext:
         self.fiber_directions_path = (
             (paths.fiber_directions or None)
             if input_source_enabled(config, 'fiber_directions') else None)
-        self.shell_path = (
-            (paths.outer_shell or None)
-            if input_source_enabled(config, 'outer_shell') else None)
         self.tracks_dbm_path = (
             (paths.tracks_dbm or None)
             if input_source_enabled(config, 'tracks_dbm') else None)
@@ -1096,9 +1093,9 @@ class FitContext:
         return shell_losses_enabled(self.config)
 
     def outer_shell_required(self):
-        # The outer-shell requirement is fit-input catalog data, shared with
-        # request validation and run admission.
-        return fit_input('outer_shell').required(self.config)
+        # Shared with the object-store request, which refuses a store without
+        # the shell when the fit needs it.
+        return outer_shell_required(self.config)
 
     def _prepare_patch_sampling_cache(self, patches):
         progress = progress_or_null(self.progress)
@@ -1384,24 +1381,20 @@ class FitContext:
         # Outer shell and object-store inputs
         # ==========================================================================
 
-        filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
-        shell_patch = None
-        if self.outer_shell_required() or filter_tracks_by_shell:
-            if not self.shell_path:
-                raise RuntimeError(
-                    'the outer shell is required by shell losses or winding-model '
-                    'supervision, but no outer shell path is set')
-            progress.begin('loading', 'Loading outer shell')
-            shell_patch = load_tifxyz(self.shell_path)
-
-        # Patches, PCLs and fibers come only from the object store, linked by
-        # its detectors; nothing here reads them from files or links them.
+        # Patches, PCLs, fibers and the outer shell come only from the object
+        # store, linked by its detectors; nothing here reads them from files
+        # or links them.
         if self.object_store_inputs is None:
             if not self.config['object_store_path']:
                 raise RuntimeError(
                     'patches, fibers and point collections are read from an '
                     'object store: set object_store_path')
             self.object_store_inputs = self._load_object_store_inputs()
+        # The store's surface tagged spiral-outer-shell; the object-store
+        # request refused a store without one when the fit needs it.
+        shell_patch = (self.object_store_inputs.outer_shell
+                       if input_source_enabled(self.config, 'outer_shell') else None)
+        filter_tracks_by_shell = bool(self.tracks_dbm_path) and shell_patch is not None
         verified_patches = dict(self.object_store_inputs.patches)
         print(f' loaded {len(verified_patches)} patches from the object store')
         self._derive_object_store_point_inputs(
@@ -1702,8 +1695,7 @@ class FitContext:
                                  'downsampling': int(self.lasagna_scale)}
         if self.tracks_dbm_path:
             frames['tracks'] = {'scale_factor': self._object_store_track_scale()}
-        for name, path in (('outer_shell', self.shell_path),
-                           ('fiber_directions', self.fiber_directions_path),
+        for name, path in (('fiber_directions', self.fiber_directions_path),
                            ('winding_inference', self.winding_inference_path)):
             if path:
                 frames[name] = {'units': 'fit-volume voxels'}
@@ -3983,7 +3975,9 @@ class FitContext:
         if current is None or current.manifest is None:
             raise InputReplacementRefused('this fit has no object-store inputs to replace')
         problems = []
-        for key in ('volume_uuid', 'units', 'external_frames', 'materialization'):
+        # The outer shell is consumed at build (shell map, track filtering).
+        for key in ('volume_uuid', 'units', 'external_frames', 'materialization',
+                    'outer_shell'):
             if current.manifest.get(key) != inputs.manifest.get(key):
                 problems.append(f'{key} differs from the fit\'s ({current.manifest.get(key)!r}, '
                                 f'not {inputs.manifest.get(key)!r})')

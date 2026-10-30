@@ -58,14 +58,13 @@ class TestModeContract:
         })
         fields = {error['field']
                   for error in validate_session_request(paths, run)}
-        assert {'winding_inference', 'outer_shell'} <= fields
+        # The outer shell is the store's tagged surface, checked when the
+        # inputs are read.
+        assert 'winding_inference' in fields and 'outer_shell' not in fields
 
         store = tmp_path / 'winding_inference'
         store.mkdir()
-        shell = tmp_path / 'outer_shell'
-        shell.mkdir()
-        paths = replace(
-            paths, winding_inference=str(store), outer_shell=str(shell))
+        paths = replace(paths, winding_inference=str(store))
         messages = {error['field']: error['message']
                     for error in validate_session_request(paths, run)}
         assert messages['winding_inference'] == 'manifest.json is missing'
@@ -85,7 +84,7 @@ class TestModeContract:
         paths, run = self.base_request(tmp_path, {})
         assert run.config.get('dense_spacing_mode') is None
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert {'winding_inference', 'outer_shell'} <= fields
+        assert 'winding_inference' in fields
 
     def test_grad_mag_mode_requires_grad_mag_only(self, tmp_path):
         paths, run = self.base_request(tmp_path, {

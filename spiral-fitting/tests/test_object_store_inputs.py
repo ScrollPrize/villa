@@ -9,7 +9,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    VOLUME, branch, frame, pcl_patch_edge, put_fiber, put_patch, put_pcl)
+    VOLUME, array, branch, frame, pcl_patch_edge, put_fiber, put_patch, put_pcl)
 
 
 @pytest.fixture()
@@ -193,3 +193,56 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     written = json.loads(report.read_text())
     assert written['manifest']['volume_uuid'] == VOLUME
     assert any('pcl_patch 1' in line for line in written['report'])
+
+
+def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
+    patch = put_patch(db, _grid(10.0), tags=['keep'])
+    shell = put_patch(db, _grid(30.0, size=8), tags=[osi.OUTER_SHELL_TAG, 'keep'])
+    # Neither the default selection nor a tag it shares makes it a patch...
+    for selected in (request(), request(surface={'tags': ('keep',)})):
+        snapshot = osi.read_snapshot(db, selected)
+        assert [obj.uuid for obj in snapshot.objects_of('surface')] == [patch]
+        assert snapshot.outer_shell.uuid == shell
+    # ...and naming it as one is refused.
+    with pytest.raises(osi.ObjectStoreInputError, match='is the outer shell'):
+        osi.read_snapshot(db, request(surface={'uuids': (shell,)}))
+    # Its revision is part of the manifest and so of the digest.
+    snapshot = osi.read_snapshot(db, request())
+    assert snapshot.manifest()['outer_shell']['uuid'] == shell
+    assert any(line.startswith('outer shell: ') and shell in line
+               for line in osi.snapshot_report(snapshot))
+    moved = _grid(31.0, size=8)[..., ::-1].astype('<f4')
+    db.put_geometry(shell, {'kind': 'surface', 'attributes': {'scale': [1, 1]},
+                            'arrays': [array('points', moved, '<f4')]},
+                    expected_revision=db.current_geometry(shell)['uuid'])
+    assert osi.read_snapshot(db, request()).digest() != snapshot.digest()
+    # It materializes whole, in the fit frame, beside the patches.
+    inputs = osi.materialize(db, osi.read_snapshot(db, request()), z_begin=0, z_end=64,
+                             z_margin=0, erode_cells_default=0)
+    assert list(inputs.patches) == [patch]
+    assert inputs.outer_shell.zyxs.shape == (8, 8, 3)
+    assert float(inputs.outer_shell.zyxs[0, 0, 0]) == 31.0
+
+
+def test_the_outer_shell_is_one_surface_and_required_when_the_fit_needs_it(db):
+    put_patch(db, _grid(10.0))
+    required = osi.InputRequest(outer_shell='required')
+    with pytest.raises(osi.ObjectStoreInputError, match=f'no surface is tagged {osi.OUTER_SHELL_TAG}'):
+        osi.read_snapshot(db, required)
+    assert osi.read_snapshot(db, request()).outer_shell is None
+    first = put_patch(db, _grid(30.0), tags=[osi.OUTER_SHELL_TAG])
+    # A fit that does not read the shell ignores it.
+    assert osi.read_snapshot(db, osi.InputRequest(outer_shell='off')).outer_shell is None
+    second = put_patch(db, _grid(40.0), tags=[osi.OUTER_SHELL_TAG])
+    with pytest.raises(osi.ObjectStoreInputError, match='2 surfaces are tagged') as refused:
+        osi.read_snapshot(db, request())
+    assert first in str(refused.value) and second in str(refused.value)
+    # The configuration decides the mode.
+    from config import Config
+    assert osi.request_from_config(Config().as_dict()).outer_shell == 'required'
+    assert osi.request_from_config(Config({
+        'loss_weight_shell_outer': 0, 'dense_spacing_mode': 'grad_mag'}).as_dict()
+    ).outer_shell == 'optional'
+    assert osi.request_from_config(Config({
+        'input_use_outer_shell': False, 'loss_weight_shell_outer': 0,
+        'dense_spacing_mode': 'grad_mag'}).as_dict()).outer_shell == 'off'

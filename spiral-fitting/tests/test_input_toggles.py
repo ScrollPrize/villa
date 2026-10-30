@@ -38,7 +38,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
         normal_y="/inputs/ny.zarr",
         gradient_magnitude="/inputs/grad.zarr",
         winding_inference="/inputs/winding",
-        outer_shell="/inputs/shell",
     )
 
     context = make_context(config, paths)
@@ -48,7 +47,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.normal_ny_zarr_path is None
     assert context.grad_mag_zarr_path is None
     assert context.winding_inference_path is None
-    assert context.shell_path is None
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234
 

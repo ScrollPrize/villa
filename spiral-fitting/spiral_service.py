@@ -1188,7 +1188,6 @@ class ServiceState:
         # validating any client-selectable override so the manifest, validator,
         # and fitter all describe the same source set.
         selected_paths = {
-            "outer_shell": "outer_shell",
             "tracks_dbm": "tracks_dbm",
             "normal_x": "normals",
             "normal_y": "normals",
@@ -1653,7 +1652,7 @@ class ServiceState:
         ``config.rebuild_stage`` over the keys whose requested value differs
         from the live session's, which is "model" only for the audited
         allowlist and "all" for everything else. The shell atlas keys widen
-        to "all" when the session loaded both a tracks store and an outer
+        to "all" when the session loaded both a tracks store and the outer
         shell, because it filtered the tracks against the shell then.
 
         Call with the lock held.
@@ -1695,14 +1694,14 @@ class ServiceState:
         }
         # The service pins the position; a request never carries the live one.
         changed.discard("object_store_input_position")
-        # _prepare_session_request already blanked either path when its
-        # input toggle is off, so both being named means the resident
-        # session filtered its tracks against the shell at load: the fitter
-        # refuses the shell atlas settings there, and only the full rebuild
-        # can apply them.
+        # A session that read tracks and the store's outer shell filtered
+        # its tracks against the shell at load: the fitter refuses the shell
+        # atlas settings there, and only the full rebuild can apply them.
         return rebuild_stage(
             changed,
-            shell_filtered_tracks=bool(paths.tracks_dbm and paths.outer_shell))
+            shell_filtered_tracks=bool(
+                paths.tracks_dbm
+                and (self.session.status().get("input_summary") or {}).get("outer_shell")))
 
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
