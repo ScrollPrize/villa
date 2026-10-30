@@ -28,7 +28,6 @@
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/hash.hpp"
 #include "vc_reader/zarr.hpp"
 
@@ -116,7 +115,7 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& location,
         }
         // Resolve from the document as published, before `scan` is flattened
         // into the root.
-        const auto voxelSize = vc::metadata::voxelSizeFromStoreMetadata(json);
+        const auto voxelSize = vcr::zarr::voxelSizeUm(vcr::zarr::Json::parse(*body));
         if (json.contains("scan") && json["scan"].is_object()) {
             json.update(json["scan"]);
         }
@@ -276,7 +275,7 @@ void Volume::loadMetadata()
         }
         // Resolve from the document as published, before `scan` is flattened
         // into the root.
-        const auto voxelSize = vc::metadata::voxelSizeFromStoreMetadata(full);
+        const auto voxelSize = vcr::zarr::voxelSizeUm(vcr::zarr::Json::parse(full.dump()));
         metadata_ = full;
         metadata_.update(full["scan"]);
         if (!metadata_.contains("format")) {

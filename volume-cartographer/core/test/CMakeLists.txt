@@ -71,7 +71,6 @@ vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
 
-vc_add_test(NAME test_voxel_size_metadata)
 
 vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest

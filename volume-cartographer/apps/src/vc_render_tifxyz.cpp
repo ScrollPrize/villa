@@ -8,7 +8,6 @@
 #include "vc/core/types/Volume.hpp"
 #include <vc_reader/composite.hpp>
 #include <vc_reader/zarr.hpp>
-#include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/Json.hpp"
 #include <vc_reader/affine.hpp>
 
@@ -667,7 +666,7 @@ static std::optional<double> explicitMicrometerPerVoxel(double value,
 // Resolve the physical voxel size this render must use, in micrometres.
 //
 // The store's own document is the authority, and it is read the way every other
-// VC3D tool reads it -- vc::metadata::resolveLocalStoreVoxelSize(), which
+// VC3D tool reads it -- vcr::zarr::storeVoxelSizeUm(), which
 // Volume::NewFromUrl() and vc_grow_seg_from_segments already share. The reader
 // that used to live here looked only for a top-level "voxelsize", so a store
 // publishing its resolution as an acquisition record resolved to nothing and the
@@ -706,7 +705,7 @@ static ResolvedVoxelSize resolveRenderVoxelSize(
             return {fromVolume, VoxelSizeSource::RemoteVolume};
     }
 
-    if (const auto local = vc::metadata::resolveLocalStoreVoxelSize(volPath))
+    if (const auto local = vcr::zarr::storeVoxelSizeUm(volPath.string()))
         return {*local, VoxelSizeSource::LocalStoreMetadata};
 
     return {};

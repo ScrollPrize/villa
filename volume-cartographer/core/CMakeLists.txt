@@ -23,7 +23,6 @@ add_library(vc_core
         src/CrashHandler.cpp
         src/MemMap.cpp
         src/UnixSocket.cpp
-        src/VoxelSizeMetadata.cpp
         src/SparseChunkSpool.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp

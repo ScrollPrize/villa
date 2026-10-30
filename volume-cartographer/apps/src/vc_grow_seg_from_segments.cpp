@@ -23,7 +23,7 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/VoxelSizeMetadata.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -1211,7 +1211,7 @@ int main(int argc, char *argv[])
     // only through an acquisition record is not read as 0.
     // 0 still means unknown, and every cm^2 below is then reported as null.
     float voxelsize = 0.0f;
-    if (const auto resolved = vc::metadata::resolveLocalStoreVoxelSize(vol_path)) {
+    if (const auto resolved = vcr::zarr::storeVoxelSizeUm(vol_path.string())) {
         voxelsize = static_cast<float>(*resolved);
     }
     std::cout << "voxelsize: " << voxelsize << std::endl;
