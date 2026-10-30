@@ -8,7 +8,7 @@ import math
 import shutil
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -405,6 +405,7 @@ class FlatPatchReader:
         self.input_path = input_path
         self.chunk_cache_size = max(0, int(chunk_cache_size))
         self._chunk_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._chunk_inflight: dict[tuple[int, int], Future[np.ndarray]] = {}
         self._chunk_lock = threading.Lock()
         self.resolution = str(resolution)
         self.depth_axis_first = bool(depth_axis_first)
@@ -438,6 +439,7 @@ class FlatPatchReader:
         state = dict(self.__dict__)
         state["_array"] = None
         state["_chunk_cache"] = OrderedDict()
+        state["_chunk_inflight"] = {}
         state["_chunk_lock"] = None
         return state
 
@@ -459,19 +461,38 @@ class FlatPatchReader:
             if chunk is not None:
                 self._chunk_cache.move_to_end(key)
                 return chunk
-        _, chunk_h, chunk_w = array.chunks
-        chunk = np.asarray(
-            array[
-                self._z_start : self._z_stop,
-                row * chunk_h : min(self.height, (row + 1) * chunk_h),
-                col * chunk_w : min(self.width, (col + 1) * chunk_w),
-            ]
-        )
-        with self._chunk_lock:
-            self._chunk_cache[key] = chunk
-            if len(self._chunk_cache) > self.chunk_cache_size:
-                self._chunk_cache.popitem(last=False)
-        return chunk
+            pending = self._chunk_inflight.get(key)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                self._chunk_inflight[key] = pending
+        if not owner:
+            return pending.result()
+
+        # Share both successful reads and failures without serializing reads
+        # of different chunks. Failed reads can be retried by a later request.
+        try:
+            _, chunk_h, chunk_w = array.chunks
+            chunk = np.asarray(
+                array[
+                    self._z_start : self._z_stop,
+                    row * chunk_h : min(self.height, (row + 1) * chunk_h),
+                    col * chunk_w : min(self.width, (col + 1) * chunk_w),
+                ]
+            )
+            with self._chunk_lock:
+                self._chunk_cache[key] = chunk
+                if len(self._chunk_cache) > self.chunk_cache_size:
+                    self._chunk_cache.popitem(last=False)
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        else:
+            pending.set_result(chunk)
+            return chunk
+        finally:
+            with self._chunk_lock:
+                del self._chunk_inflight[key]
 
     def _read_raw_cached(self, array, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         """Assemble a Z/Y/X block from cached chunks; overlapping patches share decodes."""
@@ -1454,9 +1475,10 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument(
         "--chunk-cache-size",
         type=int,
-        default=256,
+        default=0,
         help="Decoded source chunks kept per loader worker so overlapping "
-        "patches reuse reads (0 disables)",
+        "patches reuse reads (default: 0, disabled); RAM use scales with "
+        "chunk dimensions, dtype, selected depth, and worker count",
     )
     parser.add_argument(
         "--overlap",
