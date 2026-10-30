@@ -3,7 +3,8 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/util/TexturedMesh.hpp"
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 
 #include <algorithm>
@@ -75,7 +76,7 @@ vc::core::util::TexturedMesh faceMesh(const BoxFace& face)
 }  // namespace
 
 void writeFiberletCropBoxVisualization(
-    ::Volume& volume, const std::string& sourceLocator, const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ, const std::filesystem::path& outputStem, int maximumTextureDimension)
+    const vcr::zarr::OpenedArray& ct, const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ, const std::filesystem::path& outputStem, int maximumTextureDimension)
 {
     if (maximumTextureDimension < 2)
         throw std::invalid_argument("Fiberlet crop texture dimension must be at least two");
@@ -84,7 +85,7 @@ void writeFiberletCropBoxVisualization(
             throw std::invalid_argument("Fiberlet crop visualization bounds are invalid");
         }
     }
-    const auto source = validateFiberReplayStripCtVolume(volume, sourceLocator);
+    const auto source = validateFiberReplayStripCtVolume(ct);
     const auto directory = outputStem.parent_path();
     const auto stem = outputStem.stem().string();
     const auto mtlName = stem + ".mtl";
@@ -102,7 +103,7 @@ void writeFiberletCropBoxVisualization(
         const std::string materialName = "fiberlet_crop_" + std::string(face.name);
         vc::core::util::writeUncompressedTextureTiff(
             directory / textureName,
-            vc::core::util::renderCoordsTextureFineToCoarse(coordinates, volume, 0, 1, "Fiberlet crop texture sampling"));
+            vc::core::util::renderCoordsTexture(coordinates, {ct.array.get(), ct.meta.type}, 1, "Fiberlet crop texture sampling"));
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);
         vc::core::util::atomicWriteString(
             directory / (stem + "_" + face.name + ".obj"),

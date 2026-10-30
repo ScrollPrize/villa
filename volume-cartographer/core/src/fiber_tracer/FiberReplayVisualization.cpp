@@ -2,12 +2,12 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include <iomanip>
 #include <sstream>
-#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <limits>
 #include <opencv2/imgproc.hpp>
 namespace vc::fiber_tracer {
@@ -45,177 +45,6 @@ nlohmann::json failureJson(
     });
     return result;
 }
-struct OmeZarrGroupTransform {
-    std::array<double, 3> scaleFromBaseXYZ{};
-    std::array<double, 3> offsetFromBaseXYZ{};
-};
-
-struct OmeCoordinateTransform {
-    std::array<double, 3> scaleZYX{1.0, 1.0, 1.0};
-    std::array<double, 3> translationZYX{0.0, 0.0, 0.0};
-};
-
-OmeCoordinateTransform omeCoordinateTransform(
-    const nlohmann::json& dataset,
-    const std::filesystem::path& attrsPath)
-{
-    OmeCoordinateTransform result;
-    if (!dataset.contains("coordinateTransformations")) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset is missing coordinateTransformations: " +
-            attrsPath.string());
-    }
-    const auto& transforms = dataset.at("coordinateTransformations");
-    if (!transforms.is_array()) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset coordinateTransformations must be an array: " +
-            attrsPath.string());
-    }
-    bool sawScale = false;
-    bool sawTranslation = false;
-    for (const auto& transform : transforms) {
-        if (!transform.is_object() || !transform.contains("type") ||
-            !transform.at("type").is_string()) {
-            throw std::invalid_argument(
-                "OME-Zarr dataset has an invalid coordinate transformation: " +
-                attrsPath.string());
-        }
-        const std::string type = transform.at("type").get<std::string>();
-        if (type != "scale" && type != "translation")
-            continue;
-        if (!transform.contains(type) || !transform.at(type).is_array() ||
-            transform.at(type).size() != 3 ||
-            (type == "scale" && sawScale) ||
-            (type == "translation" && sawTranslation)) {
-            throw std::invalid_argument(
-                "OME-Zarr dataset has an invalid " + type +
-                " transformation: " + attrsPath.string());
-        }
-        auto& target = type == "scale" ? result.scaleZYX : result.translationZYX;
-        for (size_t axis = 0; axis < 3; ++axis) {
-            if (!transform.at(type).at(axis).is_number()) {
-                throw std::invalid_argument(
-                    "OME-Zarr dataset transformation values must be numeric: " +
-                    attrsPath.string());
-            }
-            target[axis] = transform.at(type).at(axis).get<double>();
-            if (!std::isfinite(target[axis]) ||
-                (type == "scale" && !(target[axis] > 0.0))) {
-                throw std::invalid_argument(
-                    "OME-Zarr dataset transformation values are invalid: " +
-                    attrsPath.string());
-            }
-        }
-        sawScale = sawScale || type == "scale";
-        sawTranslation = sawTranslation || type == "translation";
-    }
-    if (!sawScale) {
-        throw std::invalid_argument(
-            "OME-Zarr dataset is missing a scale transformation: " +
-            attrsPath.string());
-    }
-    return result;
-}
-
-OmeZarrGroupTransform omeZarrGroupTransform(
-    const std::filesystem::path& groupPath)
-{
-    const auto normalizeDirectory = [](const std::filesystem::path& path) {
-        auto normalized = std::filesystem::absolute(path).lexically_normal();
-        while (normalized != normalized.root_path() &&
-               normalized.filename().empty()) {
-            normalized = normalized.parent_path();
-        }
-        return normalized;
-    };
-    const auto selected = normalizeDirectory(groupPath);
-    if (!std::filesystem::exists(selected / ".zarray") &&
-        !std::filesystem::exists(selected / "zarr.json")) {
-        throw std::invalid_argument(
-            "replay strip CT --volume must name a concrete Zarr array/group");
-    }
-
-    for (auto root = selected.parent_path(); !root.empty();
-         root = root.parent_path()) {
-        const auto attrsPath = root / ".zattrs";
-        if (!std::filesystem::exists(attrsPath)) {
-            if (root == root.root_path())
-                break;
-            continue;
-        }
-        std::ifstream input(attrsPath);
-        if (!input)
-            throw std::runtime_error("cannot read OME-Zarr attributes: " + attrsPath.string());
-        nlohmann::json attrs;
-        input >> attrs;
-        if (!attrs.contains("multiscales") || !attrs.at("multiscales").is_array())
-            continue;
-        for (const auto& multiscale : attrs.at("multiscales")) {
-            if (!multiscale.is_object() || !multiscale.contains("datasets") ||
-                !multiscale.at("datasets").is_array() ||
-                multiscale.at("datasets").empty()) {
-                continue;
-            }
-            if (multiscale.contains("axes")) {
-                const auto& axes = multiscale.at("axes");
-                if (!axes.is_array() || axes.size() != 3) {
-                    throw std::invalid_argument(
-                        "replay strip CT OME-Zarr must have three Z,Y,X axes");
-                }
-                constexpr std::array<const char*, 3> expected{"z", "y", "x"};
-                for (size_t axis = 0; axis < 3; ++axis) {
-                    if (!axes.at(axis).is_object() ||
-                        axes.at(axis).value("name", std::string{}) != expected[axis]) {
-                        throw std::invalid_argument(
-                            "replay strip CT OME-Zarr axes must be ordered Z,Y,X");
-                    }
-                }
-            }
-
-            const auto& datasets = multiscale.at("datasets");
-            const nlohmann::json* selectedDataset = nullptr;
-            for (const auto& dataset : datasets) {
-                if (!dataset.is_object() || !dataset.contains("path") ||
-                    !dataset.at("path").is_string()) {
-                    continue;
-                }
-                const auto candidate = normalizeDirectory(
-                    root / dataset.at("path").get<std::string>());
-                if (candidate == selected) {
-                    selectedDataset = &dataset;
-                    break;
-                }
-            }
-            if (selectedDataset == nullptr)
-                continue;
-            const auto& baseDataset = datasets.front();
-            if (!baseDataset.is_object() || !baseDataset.contains("path") ||
-                !baseDataset.at("path").is_string()) {
-                throw std::invalid_argument(
-                    "OME-Zarr base dataset descriptor is invalid: " +
-                    attrsPath.string());
-            }
-            const auto base = omeCoordinateTransform(baseDataset, attrsPath);
-            const auto group = omeCoordinateTransform(*selectedDataset, attrsPath);
-            OmeZarrGroupTransform result;
-            for (size_t xyzAxis = 0; xyzAxis < 3; ++xyzAxis) {
-                const size_t zyxAxis = 2 - xyzAxis;
-                result.scaleFromBaseXYZ[xyzAxis] =
-                    base.scaleZYX[zyxAxis] / group.scaleZYX[zyxAxis];
-                result.offsetFromBaseXYZ[xyzAxis] =
-                    (base.translationZYX[zyxAxis] -
-                     group.translationZYX[zyxAxis]) /
-                    group.scaleZYX[zyxAxis];
-            }
-            return result;
-        }
-        if (root == root.root_path())
-            break;
-    }
-    throw std::invalid_argument(
-        "replay strip CT --volume group is not advertised by parent OME-Zarr multiscales metadata");
-}
-
 cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
     const cv::Mat_<cv::Vec3f>& basePoints,
     const FiberReplayStripTextureSource& source, double baseSamplesPerPixel = 0,
@@ -1211,29 +1040,19 @@ std::string segmentedLineObj(const char* header, const std::vector<std::vector<c
 
 }  // namespace
 FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
-    ::Volume& volume,
-    const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
-    if (sourceLocator.empty())
-        throw std::invalid_argument("replay strip CT source locator is empty");
-    auto* cache = volume.chunkedCache();
-    if (cache == nullptr)
-        throw std::runtime_error("replay strip CT volume has no chunk cache");
-    if (cache->numLevels() != 1 || !volume.hasScaleLevel(0)) {
-        throw std::invalid_argument(
-            "replay strip CT --volume must name one concrete Zarr array/group");
+    if (ct.meta.shape.size() != 3)
+        throw std::invalid_argument("replay strip CT volume must be a 3-D array");
+    if (ct.meta.type.kind != 'u' || ct.meta.type.itemsize != 1)
+        throw std::invalid_argument("replay strip CT volume must use uint8 voxels");
+    const auto fromBase = ct.placement.indexMapFrom({});
+    FiberReplayStripTextureSource source{ct.location, {}, {}, {}};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        source.shapeZYX[axis] = static_cast<int>(ct.meta.shape[axis]);
+        source.scaleFromBaseXYZ[axis] = fromBase.scale[2 - axis];
+        source.offsetFromBaseXYZ[axis] = fromBase.offset[2 - axis];
     }
-    if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
-        throw std::invalid_argument(
-            "replay strip CT volume must use uint8 voxels");
-    }
-    const auto transform = omeZarrGroupTransform(sourceLocator);
-    FiberReplayStripTextureSource source{
-        sourceLocator,
-        volume.shape(0),
-        transform.scaleFromBaseXYZ,
-        transform.offsetFromBaseXYZ,
-    };
     validateTextureSource(source);
     return source;
 }
@@ -1468,7 +1287,7 @@ FiberReplayOverview renderFiberReplayOverview(
     const FiberletGraphReplayResult& fiberletReplay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
     if (referenceGeometryBase.size() < 2 || !(normalWorkingToBaseScale > 0.0) ||
         !std::isfinite(normalWorkingToBaseScale) || parallelThreads < 1)
@@ -1485,10 +1304,10 @@ FiberReplayOverview renderFiberReplayOverview(
         matchedGreedySegments(greedyReplay, reference), matchedFiberletSegments(fiberletReplay, reference),
         greedyReplay.failures, fiberletReplay.failures, normalSampler,
         normalWorkingToBaseScale, parallelThreads,
-        validateFiberReplayStripCtVolume(volume, sourceLocator),
-        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-            return vc::core::util::renderCoordsTextureFineToCoarse(
-                coords, volume, 0, scale, "Replay overview CT sampling");
+        validateFiberReplayStripCtVolume(ct),
+        [&](const auto& coords, int scale) {
+            return vc::core::util::renderCoordsTexture(
+                coords, {ct.array.get(), ct.meta.type}, scale, "Replay overview CT sampling");
         });
 }
 
@@ -1497,14 +1316,14 @@ FiberReplayOverview renderFiberReplayTraceOverview(
     const FiberReplayTraceResult& replay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator)
+    const vcr::zarr::OpenedArray& ct)
 {
     return renderFiberReplayTraceOverview(referenceGeometryBase, replay, normalSampler,
         normalWorkingToBaseScale, parallelThreads,
-        validateFiberReplayStripCtVolume(volume, sourceLocator),
-        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-            return vc::core::util::renderCoordsTextureFineToCoarse(
-                coords, volume, 0, scale, "Replay overview CT sampling");
+        validateFiberReplayStripCtVolume(ct),
+        [&](const auto& coords, int scale) {
+            return vc::core::util::renderCoordsTexture(
+                coords, {ct.array.get(), ct.meta.type}, scale, "Replay overview CT sampling");
         });
 }
 

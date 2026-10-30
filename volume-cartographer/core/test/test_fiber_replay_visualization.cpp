@@ -12,6 +12,8 @@
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/lasagna/Dataset.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include <cstdlib>
 #include <iostream>
 
@@ -35,6 +37,12 @@ std::filesystem::path temporaryDirectory()
     return path;
 }
 
+// Level `key` of the CT pyramid at `group`, placed relative to its level 0.
+vcr::zarr::OpenedArray openCtLevel(const std::filesystem::path& group, const std::string& key)
+{
+    return vcr::zarr::Group::open(group.string(), {}).array(key);
+}
+
 class RecordingNormalSampler final : public vc::lasagna::NormalSampler
 {
 public:
@@ -48,6 +56,42 @@ public:
     mutable std::vector<cv::Vec3d> points;
 };
 
+TEST_CASE("coordinate textures sample the upsampled vertex grid trilinearly")
+{
+    const auto directory = temporaryDirectory();
+    vcr::zarr::CreateOptions create;
+    create.shape = {8, 8, 8};
+    create.chunks = {4, 4, 4};
+    auto writer = vcr::zarr::Writer::create(directory / "ct", create);
+    std::vector<std::uint8_t> voxels(8 * 8 * 8);
+    for (int z = 0; z < 8; ++z)
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x)
+                voxels[std::size_t((z * 8 + y) * 8 + x)] = std::uint8_t(x + 2 * y + 3 * z);
+    writer.writeRegion({0, 0, 0}, {8, 8, 8}, voxels.data());
+    const auto ct = vcr::zarr::openArray((directory / "ct").string(), {});
+
+    // 3 x 4 vertices at x = 1 + column, y = 2 + row, z = 3; one vertex missing.
+    cv::Mat_<cv::Vec3f> coords(3, 4);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            coords(r, c) = {float(1 + c), float(2 + r), 3.0f};
+    coords(2, 3) = {-1, -1, -1};
+    const auto texture = vc::core::util::renderCoordsTexture(coords, {ct.array.get(), ct.meta.type}, 2, "test");
+    REQUIRE(texture.rows == 6);
+    REQUIRE(texture.cols == 8);
+    // Pixel (i, j) sits at grid column 0.5 i - 0.25, row 0.5 j - 0.25; the volume is
+    // linear, so trilinear samples are exact before truncation.
+    for (int j = 0; j < 6; ++j)
+        for (int i = 0; i < 8; ++i) {
+            const double column = 0.5 * i - 0.25, row = 0.5 * j - 0.25;
+            const bool inside = column >= 0 && column <= 3 && row >= 0 && row <= 2 && !(column > 2 && row > 1);
+            const auto expected = inside ? std::uint8_t((1 + column) + 2 * (2 + row) + 9) : std::uint8_t(0);
+            CHECK_MESSAGE(texture(j, i) == expected, "pixel " << i << "," << j);
+        }
+    std::filesystem::remove_all(directory);
+}
+
 TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offsets")
 {
     using namespace vc::fiber_tracer;
@@ -59,7 +103,6 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     options.numLevels = 2;
     auto pyramid = vc::test::createZarrVolume(directory / "ct", options);
     REQUIRE(pyramid);
-    CHECK_THROWS(validateFiberReplayStripCtVolume(*pyramid, (directory / "ct").string()));
     pyramid.reset();
     const auto attrsPath = directory / "ct/.zattrs";
     nlohmann::json attrs;
@@ -72,46 +115,23 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
         {{"type","scale"},{"scale",{2,4,6}}},
         {{"type","translation"},{"translation",{2,2,2}}}};
     vc::core::util::atomicWriteString(attrsPath, attrs.dump());
-    auto volume = Volume::New(directory / "ct/1");
-    REQUIRE(volume);
-    const auto source = validateFiberReplayStripCtVolume(*volume, (directory / "ct/1").string());
+    const auto ct = openCtLevel(directory / "ct", "1");
+    const auto source = validateFiberReplayStripCtVolume(ct);
+    CHECK(source.locator == (directory / "ct/1").string());
+    CHECK(source.shapeZYX == std::array<int,3>{4,4,4});
     CHECK(source.scaleFromBaseXYZ == std::array<double,3>{0.5,0.5,0.5});
     CHECK(source.offsetFromBaseXYZ == std::array<double,3>{1,1,1});
-    // Both datasets establish the lattice conversion. Neither an omitted nor
-    // an incomplete scale may silently become the identity transform.
-    for (const size_t index : {size_t{0}, size_t{1}}) {
-        const auto original = datasets[index]["coordinateTransformations"];
-        datasets[index].erase("coordinateTransformations");
-        vc::core::util::atomicWriteString(attrsPath, attrs.dump());
-        CHECK_THROWS_AS(validateFiberReplayStripCtVolume(*volume, source.locator), std::invalid_argument);
-        for (const auto& invalid : {
-                 nlohmann::json(nullptr), nlohmann::json::object(),
-                 nlohmann::json::array(),
-                 nlohmann::json::array({{{"type", "translation"}, {"translation", {0, 0, 0}}}})}) {
-            datasets[index]["coordinateTransformations"] = invalid;
-            vc::core::util::atomicWriteString(attrsPath, attrs.dump());
-            CHECK_THROWS_AS(validateFiberReplayStripCtVolume(*volume, source.locator), std::invalid_argument);
-        }
-        datasets[index]["coordinateTransformations"] = original;
-    }
-    vc::core::util::atomicWriteString(attrsPath, attrs.dump());
-    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+    CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {1,1,1}, directory / "box", 1));
-    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+    CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {0,1,1}, directory / "box"));
-    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+    CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {1,1,std::numeric_limits<double>::infinity()}, directory / "box"));
-    attrs["multiscales"][0]["axes"][0]["name"] = "x";
-    vc::core::util::atomicWriteString(attrsPath, attrs.dump());
-    CHECK_THROWS(validateFiberReplayStripCtVolume(*volume, source.locator));
-    volume.reset();
     options.dtype = vc::render::ChunkDtype::UInt16;
     options.numLevels = 1;
     auto wider = vc::test::createZarrVolume(directory / "uint16", options);
     wider.reset();
-    wider = Volume::New(directory / "uint16/0");
-    CHECK_THROWS(validateFiberReplayStripCtVolume(*wider, (directory / "uint16/0").string()));
-    wider.reset();
+    CHECK_THROWS(validateFiberReplayStripCtVolume(openCtLevel(directory / "uint16", "0")));
     std::filesystem::remove_all(directory);
 }
 
@@ -398,10 +418,8 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
     options.chunkShapeZYX = {16, 16, 16};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 1;
-    auto volume = vc::test::createZarrVolume(directory / "ct", options);
-    volume.reset();
-    const auto ct = (directory / "ct/0").string();
-    volume = Volume::New(ct);
+    vc::test::createZarrVolume(directory / "ct", options).reset();
+    const auto ct = openCtLevel(directory / "ct", "0");
     const std::vector<cv::Vec3d> reference{{8, 32, 32}, {40, 32, 32}};
     vc::fiber_tracer::FiberReplayTraceResult greedy;
     greedy.referenceEndArcBase = 32;
@@ -422,7 +440,7 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
     failure.referencePointBase = reference.back();
     fiberlet.failures.push_back(failure);
     RecordingNormalSampler normals;
-    const auto overview = vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 1, 1, *volume, ct);
+    const auto overview = vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 1, 1, ct);
     REQUIRE(overview.pages.size() == 1);
     const auto& page = overview.pages.front();
     REQUIRE(page.panels.size() == 1);
@@ -448,7 +466,6 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
     CHECK(referenceRed > 0); // native trace projected into reference strip
     CHECK(traceRed > 0); // other trace projected into resampled trace frame
     CHECK(traceYellow > 0); // reference projected into resampled trace frame
-    volume.reset();
     std::filesystem::remove_all(directory);
 }
 
@@ -465,8 +482,7 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     Array3D<uint8_t> values({32, 32, 32}, uint8_t(96));
     vc::test::writeZYX(*pyramid, values, {0, 0, 0});
     pyramid.reset();
-    auto volume = Volume::New(directory / "1");
-    REQUIRE(volume);
+    const auto ct = openCtLevel(directory, "1");
 
     const std::vector<cv::Vec3d> reference{
         {6.0, 16.0, 16.0},
@@ -554,11 +570,14 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
 
     RecordingNormalSampler normals;
     const auto overview =
-        vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 2.0, 4, *volume, (directory / "1").string());
+        vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 2.0, 4, ct);
     CHECK(overview.renderScale == 8);
     CHECK(overview.markerWidthPixels == 3);
     CHECK(overview.textureSource.scaleFromBaseXYZ ==
           std::array<double, 3>{0.5, 0.5, 0.5});
+    // A scale-only level is block-reduced: its voxel 0 is centred at base 0.5.
+    CHECK(overview.textureSource.offsetFromBaseXYZ ==
+          std::array<double, 3>{-0.25, -0.25, -0.25});
     const int expectedHeight = static_cast<int>((vc::lasagna::kLineViewCrossSampleCount - 1) *
         vc::lasagna::kLineViewCrossRowSpacingBaseVoxels * 0.5 + 1) * overview.renderScale;
     CHECK(overview.referenceTopShapeYX == std::array<int, 2>{expectedHeight, 72});
@@ -676,10 +695,9 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     auto malformed = greedy;
     malformed.segments.front().matches.pop_back();
     CHECK_THROWS_WITH_AS(
-        vc::fiber_tracer::renderFiberReplayOverview(reference, malformed, fiberlet, normals, 2.0, 4, *volume, (directory / "1").string()),
+        vc::fiber_tracer::renderFiberReplayOverview(reference, malformed, fiberlet, normals, 2.0, 4, ct),
         doctest::Contains("one match per non-seed point"),
         std::invalid_argument);
-    volume.reset();
     std::filesystem::remove_all(directory.parent_path());
 }
 

@@ -5,7 +5,9 @@
 #include <functional>
 #include <filesystem>
 #include <opencv2/core/mat.hpp>
-class Volume;
+namespace vcr::zarr {
+struct OpenedArray;
+}
 namespace vc::fiber_tracer {
 [[nodiscard]] nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult&, double normalThresholdBaseVoxels);
 [[nodiscard]] FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json&);
@@ -76,14 +78,13 @@ struct FiberReplayOverview {
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
     int parallelThreads,
-    ::Volume& volume,
-    const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 [[nodiscard]] FiberReplayOverview renderFiberReplayTraceOverview(
     const std::vector<cv::Vec3d>& referenceGeometryBase,
     const FiberReplayTraceResult& replay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 
 // Coordinates supplied to the texture callback are in the declared source
 // lattice, resampled at native spacing. The callback applies renderScale.
@@ -134,9 +135,10 @@ struct FiberReplaySectionFrame {
     const FiberReplayStripTextureSource& source, double workingToBaseScale,
     const FiberPredictionSource& predictions);
 
+// The texture source of a uint8 CT pyramid level, opened as a level of its group
+// (vcr::zarr::Group::array, which places it relative to the group's level 0).
 [[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
-    ::Volume& volume,
-    const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 #ifdef VC_TESTING
 namespace testing
 {

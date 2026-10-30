@@ -13,6 +13,9 @@
 #include "vc/core/util/GlobalCacheRoot.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/array.hpp>
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include "vc/core/render/ChunkCache.hpp"
 
 #if defined(__APPLE__)
@@ -39,7 +42,20 @@ namespace {
 using namespace vc::fiber_tracer;
 using Json = nlohmann::json;
 
-// One budget for all native sources and sampling paths, configured before binding.
+// A CT pyramid level named by its path (group/level), opened as a level of its group
+// so that it is placed relative to the group's level 0.
+vcr::zarr::OpenedArray openCtLevel(const std::string& locator, std::shared_ptr<vcr::MemoryCache> cache)
+{
+    auto path = std::filesystem::path(locator).lexically_normal();
+    if (path.filename().empty())
+        path = path.parent_path();
+    vcr::zarr::OpenOptions options;
+    options.memoryCache = std::move(cache);
+    return vcr::zarr::Group::open(path.parent_path().string(), options).array(path.filename().string());
+}
+
+// The decoded-chunk budget, configured before binding: the chunk cache service of
+// the prediction and normal sources, and the render CT levels' MemoryCache.
 size_t configureEvaluationCache(const Json& settings)
 {
     if (settings.contains("cache_bytes_per_channel"))
@@ -172,8 +188,12 @@ struct Source {
     Json provenance;
     vc::lasagna::LasagnaDatasetManifest predictionManifest;
     std::unique_ptr<FiberChunkTraceCache> chunkCache;
-    std::shared_ptr<Volume> renderVolume;
     std::string renderCt;
+    // The CT level strips are textured from (working level 1 of a base pyramid when
+    // present), mapped from the strips' coordinates.
+    std::shared_ptr<vcr::zarr::OpenedArray> renderLevel;
+    vcr::grid::Level renderGridLevel;
+    int renderLevelIndex = 0;
     FiberReplayStripTextureSource renderSource;
 };
 
@@ -460,7 +480,8 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (document.at("format") != "vc_native_replay_artifact" || document.at("version") != 1)
         throw std::invalid_argument("unsupported replay artifact");
     const auto settings = readJson(settingsPath);
-    configureEvaluationCache(settings);
+    // Render CT chunks are decoded into their own cache of the configured budget.
+    const auto ctCache = std::make_shared<vcr::MemoryCache>(configureEvaluationCache(settings));
     const auto replay = fiberReplayTraceFromJson(document.at("replay"));
     std::vector<cv::Vec3d> reference;
     for (const auto& point : document.at("reference_points_base_xyz")) {
@@ -485,9 +506,9 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
         throw std::invalid_argument("render CT differs from or is absent in the evaluated source binding");
     if (ct.find("://") != std::string::npos)
         throw std::invalid_argument("post-hoc strip rendering currently requires local OME-Zarr CT metadata");
-    auto volume = Volume::New(ct);
+    const auto ctLevel = openCtLevel(ct, ctCache);
     auto overview = renderFiberReplayTraceOverview(reference, replay, normals,
-        normalOptions.workingToBaseScale, settings.value("threads", 1), *volume, ct);
+        normalOptions.workingToBaseScale, settings.value("threads", 1), ctLevel);
     const auto output = localPath(settingsPath.parent_path(), settings.at("output").get<std::string>());
     writeRenderedOverview(output, overview, Json{
         {"artifact", std::filesystem::absolute(artifact).string()}, {"settings", settings}});
@@ -540,7 +561,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     persistedConfig.erase("resume_visualization");
     persistedConfig.erase("resume_render_limit");
     persistedConfig.erase("resume_render_cases");
-    persistedConfig["decoded_cache_bytes"] = configureEvaluationCache(config);
+    const size_t decodedCacheBytes = configureEvaluationCache(config);
+    persistedConfig["decoded_cache_bytes"] = decodedCacheBytes;
+    // Render CT levels share one cache of the configured budget.
+    const auto ctCache = std::make_shared<vcr::MemoryCache>(decodedCacheBytes);
     const bool render = config.value("render", false) || renderFlag;
     persistedConfig["render"] = render;
     if (live) persistedConfig["live_endpoint"].erase("token");
@@ -641,21 +665,44 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (remoteCt && std::filesystem::weakly_canonical(options.remoteCacheRoot) !=
                     std::filesystem::weakly_canonical(vc::settings::remoteCachePath()))
                     throw std::invalid_argument("render CT cache root must match the process-wide VC3D cache root");
-                source.renderVolume = remoteCt
-                    ? Volume::NewFromUrl(source.renderCt)
-                    : Volume::New(source.renderCt);
-                if (source.renderVolume->dtype() != vc::render::ChunkDtype::UInt8 ||
-                    !source.renderVolume->hasScaleLevel(0))
+                // A remote CT opens through Volume for VC3D's cache directory and
+                // working level (physical level baseScaleLevel()).
+                std::string location = source.renderCt;
+                vcr::zarr::OpenOptions ctOptions;
+                int working = 0;
+                if (remoteCt) {
+                    const auto volume = Volume::NewFromUrl(source.renderCt);
+                    location = volume->sourceLocation();
+                    ctOptions = volume->sourceOpenOptions();
+                    working = volume->baseScaleLevel();
+                }
+                ctOptions.memoryCache = ctCache;
+                auto base = std::make_shared<vcr::zarr::OpenedArray>(
+                    vcr::zarr::openPyramidLevel(location, working, ctOptions));
+                if (base->meta.shape.size() != 3 || base->meta.type.kind != 'u' || base->meta.type.itemsize != 1)
                     throw std::invalid_argument("render CT base volume requires uint8 level zero");
-                source.renderSource = {source.renderCt, source.renderVolume->shape(0), {1, 1, 1}, {0, 0, 0}};
+                source.renderSource = {source.renderCt, {}, {1, 1, 1}, {0, 0, 0}};
+                for (size_t axis = 0; axis < 3; ++axis)
+                    source.renderSource.shapeZYX[axis] = int(base->meta.shape[axis]);
+                source.renderLevel = base;
+                try {
+                    source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(
+                        vcr::zarr::openPyramidLevel(location, working + 1, ctOptions));
+                    source.renderLevelIndex = 1;
+                } catch (const std::out_of_range&) {
+                }
+                const auto map = source.renderLevel->placement.indexMapFrom(base->placement);
+                source.renderGridLevel = {source.renderLevel->array.get(), source.renderLevel->meta.type,
+                                          map.scale, map.offset};
                 for (size_t axis = 0; axis < 3; ++axis)
                     if (source.renderSource.shapeZYX[axis] != dataset.manifest().baseShapeZYX->at(axis))
                         throw std::invalid_argument("render CT base shape differs from predictions");
             } else {
                 if (source.renderCt.find("://") != std::string::npos)
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
-                source.renderVolume = Volume::New(source.renderCt);
-                source.renderSource = validateFiberReplayStripCtVolume(*source.renderVolume, source.renderCt);
+                source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, ctCache));
+                source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);
+                source.renderGridLevel = {source.renderLevel->array.get(), source.renderLevel->meta.type};
             }
         }
         if(backend=="chunk-beam") {
@@ -1059,17 +1106,16 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     // prediction and normal chunk caches are concurrent; all
                     // selected directions may render and request data together.
                     const auto& predictions = livePredictions ? *livePredictions : *source.predictions;
-                    // Coordinates stay in the bound source lattice; Volume applies
-                    // the pyramid transform. Do not divide coordinates a second time.
-                    const int ctLevel = source.provenance.value("ct_base_volume", false) &&
-                        source.renderVolume->hasScaleLevel(1) ? 1 : 0;
+                    // Coordinates stay in the bound source lattice; renderGridLevel maps
+                    // them to the rendered level. Do not divide coordinates a second time.
+                    const int ctLevel = source.renderLevelIndex;
                     const std::string ctSampling = "source level " + std::to_string(ctLevel) +
-                        "; trilinear; fine-to-coarse fallback";
+                        "; trilinear";
                     auto inspection = renderFiberReplayInspection(item.points, replay,
                         *referenceNormals, source.traceScale, source.renderSource,
                         [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-                            return vc::core::util::renderCoordsTextureFineToCoarse(
-                                coords, *source.renderVolume, ctLevel, scale, "Replay CT");
+                            return vc::core::util::renderCoordsTexture(
+                                coords, source.renderGridLevel, scale, "Replay CT");
                         },
                         [&](const auto& coords, int scale) {
                             return renderFiberReplayPresenceTexture(coords, scale, source.renderSource,
