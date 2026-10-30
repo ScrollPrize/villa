@@ -662,7 +662,7 @@ private:
 
 std::uint64_t finalTupleSize(
     const vc::fiber_tracer::FiberletChunkDataset& dataset,
-    const vc::render::ChunkKey& owner)
+    const vc::fiber_tracer::FiberletChunkKey& owner)
 {
     return existingFileSize(dataset.chunkPath(
         vc::fiber_tracer::FiberletStorageChunkKind::PublishedFiberlets,
@@ -757,13 +757,8 @@ int runWholeVolumePreprocessing(
               << " input_chunks=" << totalInput << " missing_chunks=" << scan.missingChunks << " empty_chunks=" << scan.emptyChunks
               << " nonempty_chunks=" << scan.nonemptyChunksZYX.size() << " active_output_chunks=" << activeChunks.size() << '\n';
 
-    auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
-    vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
-    cacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
-    cacheOptions.service.decodedByteBudget = budget;
+    auto memoryCache = std::make_shared<vcr::MemoryCache>(options.decodedCacheBytes);
     const auto workerCount = static_cast<std::size_t>(std::max(1, options.anchors.parallelThreads));
-    cacheOptions.service.fetchConcurrency.workerCapacity = workerCount;
-    cacheOptions.service.fetchConcurrency.maxConcurrentReads = workerCount;
 
     // Whole-volume parallelism is across chunks so one global worker budget can
     // move dynamically between ready fiberlets and their anchor dependencies.
@@ -772,7 +767,7 @@ int runWholeVolumePreprocessing(
         grid, options.anchors, options.paths,
         [&field](const auto& indices, int threads, auto& samples) {
             field.sampleStoredGridBatch(indices, threads, samples);
-        }, normalSampler, cacheOptions);
+        }, normalSampler, memoryCache);
     if (options.printStats) {
         onDemand.progress = [](const FiberletOnDemandProgress& progress) {
             if (progress.status == "completed") {
@@ -786,7 +781,7 @@ int runWholeVolumePreprocessing(
     auto preprocessor = FiberletOnDemandPreprocessor::create(std::move(onDemand));
 
     std::set<std::array<int, 4>> dependencyCoordinates;
-    std::vector<std::vector<vc::render::ChunkKey>> outputDependencies;
+    std::vector<std::vector<FiberletChunkKey>> outputDependencies;
     outputDependencies.reserve(activeChunks.size());
     for (const auto& key : activeChunks) {
         auto dependencies = preprocessor->anchorDependencies(key);
@@ -794,12 +789,12 @@ int runWholeVolumePreprocessing(
             dependencyCoordinates.insert({dependency.level, dependency.iz, dependency.iy, dependency.ix});
         outputDependencies.push_back(std::move(dependencies));
     }
-    std::vector<vc::render::ChunkKey> anchorChunks;
+    std::vector<FiberletChunkKey> anchorChunks;
     anchorChunks.reserve(dependencyCoordinates.size());
     for (const auto& coordinate : dependencyCoordinates)
         anchorChunks.push_back({coordinate[0], coordinate[1], coordinate[2], coordinate[3]});
 
-    std::vector<vc::render::ChunkKey> completedOutputs;
+    std::vector<FiberletChunkKey> completedOutputs;
     completedOutputs.reserve(activeChunks.size());
     std::uint64_t fiberletPayloadBytes = 0;
     for (const auto& key : activeChunks) {
@@ -809,7 +804,7 @@ int runWholeVolumePreprocessing(
         fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
     }
 
-    std::vector<vc::render::ChunkKey> availableAnchors;
+    std::vector<FiberletChunkKey> availableAnchors;
     availableAnchors.reserve(anchorChunks.size());
     std::uint64_t anchorPayloadBytes = 0;
     for (const auto& key : anchorChunks) {
@@ -845,33 +840,25 @@ int runWholeVolumePreprocessing(
     const auto submit = [&](const FiberletPreprocessWork& work) {
         return workers.submit([&, work] {
             if (work.kind == FiberletPreprocessWorkKind::Anchor) {
-                const auto chunk = preprocessor->anchorCache()->getChunkBlocking(work.key.level, work.key.iz, work.key.iy, work.key.ix);
-                if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
-                    throw std::runtime_error(
-                        "whole-volume anchor chunk generation failed at " + std::to_string(work.key.iz) + '/' +
-                        std::to_string(work.key.iy) + '/' + std::to_string(work.key.ix) +
-                        (chunk.error.empty() ? std::string{} : ": " + chunk.error));
-                }
-                return existingFileSize(
-                    preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, work.key));
+                (void)preprocessor->anchorRead()(work.key);
+                // Sparse empty chunks stay absent.
+                const auto anchorPath = preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, work.key);
+                return std::filesystem::exists(anchorPath) ? existingFileSize(anchorPath) : std::uint64_t{0};
             }
 
-            const auto anchorChunk =
-                preprocessor->anchorCache()->getChunkBlocking(work.key.level, work.key.iz, work.key.iy, work.key.ix);
-            const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(anchorChunk.payload);
-            if (anchorChunk.status != vc::render::ChunkStatus::Data || !anchors)
+            const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
+                preprocessor->anchorRead()(work.key));
+            if (!anchors)
                 throw std::runtime_error("whole-volume final anchor source is unavailable");
-            const auto prefixChunk = preprocessor->fiberletCache()->getChunkBlocking(
-                0, work.key.iz, work.key.iy, work.key.ix);
-            const auto routeChunk = preprocessor->fiberletCache()->getChunkBlocking(
-                1, work.key.iz, work.key.iy, work.key.ix);
-            const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(prefixChunk.payload);
-            const auto routes = std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(routeChunk.payload);
-            if (prefixChunk.status != vc::render::ChunkStatus::Data ||
-                routeChunk.status != vc::render::ChunkStatus::Data || !prefixes || !routes)
-                throw std::runtime_error("whole-volume fiberlet generation failed: " +
-                    prefixChunk.error + " " + routeChunk.error);
+            const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
+                preprocessor->fiberletRead()({0, work.key.iz, work.key.iy, work.key.ix}));
+            const auto routes = std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(
+                preprocessor->fiberletRead()({1, work.key.iz, work.key.iy, work.key.ix}));
+            if (!prefixes || !routes)
+                throw std::runtime_error("whole-volume fiberlet generation returned the wrong payload");
 
+            // Endpoints of one output share neighbouring chunks: decode each once.
+            std::map<std::array<int, 3>, std::shared_ptr<const FiberletAnchorChunkPayload>> endpointChunks;
             std::map<FiberletStorageKey, FiberletStoredAnchor>
                 referencedByKey;
             const auto ownedContains = [&](const FiberletStorageKey& key) {
@@ -886,17 +873,14 @@ int runWholeVolumePreprocessing(
                     const auto endpointChunkKey =
                         preprocessor->anchorDataset()->chunkOwningAnchor(
                             endpoint);
-                    const auto endpointChunk =
-                        preprocessor->anchorCache()->getChunkBlocking(
-                            endpointChunkKey.level, endpointChunkKey.iz,
-                            endpointChunkKey.iy, endpointChunkKey.ix);
-                    const auto endpointAnchors = std::dynamic_pointer_cast<
-                        const FiberletAnchorChunkPayload>(endpointChunk.payload);
+                    auto& endpointAnchors = endpointChunks[
+                        {endpointChunkKey.iz, endpointChunkKey.iy, endpointChunkKey.ix}];
+                    if (!endpointAnchors)
+                        endpointAnchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
+                            preprocessor->anchorRead()(endpointChunkKey));
                     const auto* endpointAnchor = endpointAnchors
                         ? endpointAnchors->find(endpoint) : nullptr;
-                    if (endpointChunk.status !=
-                            vc::render::ChunkStatus::Data ||
-                        !endpointAnchor) {
+                    if (!endpointAnchor) {
                         throw std::runtime_error(
                             "whole-volume final endpoint anchor is unavailable");
                     }
@@ -975,7 +959,6 @@ int runWholeVolumePreprocessing(
         running.erase(completed);
     }
     progress.finish();
-    preprocessor->shutdown();
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(fiberletRoot);
@@ -997,7 +980,6 @@ int runWholeVolumePreprocessing(
 int main(int argc, char** argv) {
     try {
         CliOptions options = parseArgs(argc, argv);
-        vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.decodedCacheBytes);
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
         openOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
