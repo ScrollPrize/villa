@@ -2221,7 +2221,7 @@ void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
     }
 
     emit statusMessage(
-        tr("Rotated %1 by 90 degrees clockwise")
+        tr("Rotated %1 by 90 degrees counter-clockwise")
             .arg(QString::fromStdString(segmentId)),
         5000);
 }
