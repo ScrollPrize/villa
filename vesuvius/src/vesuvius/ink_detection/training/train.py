@@ -6,6 +6,7 @@ import argparse
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -341,6 +342,59 @@ def _distributed_mean_metrics(accelerator, metrics) -> dict[str, float]:
     }
 
 
+def _finite_best_checkpoint_value(value) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)):
+        raise ValueError("best checkpoint value must be a finite number")
+    return float(value)
+
+
+def restore_best_checkpoint_value(request: TrainingRequest) -> float | None:
+    """Restore tracking history on full resume without borrowing another run's files."""
+    config = request.config
+    metric = config.best_checkpoint_metric
+    if metric is None or request.checkpoint is None or config.ink.checkpoint.weights_only:
+        return None
+
+    checkpoint = request.checkpoint
+    state = checkpoint.get("best_checkpoint")
+    if state is not None:
+        if not isinstance(state, Mapping):
+            raise ValueError("best checkpoint state must be a mapping")
+        if state.get("metric") != metric:
+            return None
+        best = _finite_best_checkpoint_value(state.get("value"))
+    else:
+        saved_config = checkpoint.get("config", {})
+        saved_metric = (saved_config.get("best_checkpoint_metric")
+                        if isinstance(saved_config, Mapping) else None)
+        if saved_metric is not None and saved_metric != metric:
+            return None
+        best = None
+
+    # Legacy checkpoints stored this history only in the output directory.
+    # A same-directory full resume may also have a better artifact than an
+    # older checkpoint being restored; preserve the existing best in that case.
+    if (request.checkpoint_path is not None
+            and Path(request.checkpoint_path).resolve().parent == config.out_dir.resolve()):
+        filename = f"best_{metric}.pth"
+        sidecar = config.out_dir / "best_checkpoint.json"
+        if sidecar.is_file() and (config.out_dir / filename).is_file():
+            with sidecar.open("r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, Mapping):
+                raise ValueError("best checkpoint metadata must be a mapping")
+            if metadata.get("metric") == metric and metadata.get("checkpoint") == filename:
+                value = _finite_best_checkpoint_value(metadata.get("value"))
+                if best is None:
+                    best = value
+                elif metric == "val_loss":
+                    best = min(best, value)
+                else:
+                    best = max(best, value)
+    return best
+
+
 def build_training_checkpoint_payload(
     *,
     accelerator,
@@ -353,6 +407,7 @@ def build_training_checkpoint_payload(
     ema_model,
     wandb_module,
     validation_metrics: Mapping | None = None,
+    best_checkpoint_value: float | None = None,
 ) -> dict:
     canonical = config.to_mapping()
     run = None if wandb_module is None else wandb_module.run
@@ -368,6 +423,11 @@ def build_training_checkpoint_payload(
     }
     if validation_metrics is not None:
         payload["validation_metrics"] = dict(validation_metrics)
+    if config.best_checkpoint_metric is not None and best_checkpoint_value is not None:
+        payload["best_checkpoint"] = {
+            "metric": config.best_checkpoint_metric,
+            "value": _finite_best_checkpoint_value(best_checkpoint_value),
+        }
     if ema_model is not None and config.ema.save_in_checkpoint:
         payload["ema_model"] = ema_model.state_dict()
         payload["ema_optimizer_step"] = optimizer_step
@@ -405,6 +465,7 @@ def _run_training(request: TrainingRequest) -> int:
     from vesuvius.ink_detection.training.samplers import build_sampling_policy
 
     config = request.config
+    best_checkpoint_value = restore_best_checkpoint_value(request)
     canonical = config.to_mapping()
     # Only CUDA gets non_blocking, and Accelerate places batches on CUDA only
     # when torch.cuda.is_available(). On torch 2.11/2.12 an MPS copy can read a
@@ -717,6 +778,7 @@ def _run_training(request: TrainingRequest) -> int:
             ema_model=ema_model,
             wandb_module=wandb_module,
             validation_metrics=validation_metrics,
+            best_checkpoint_value=best_checkpoint_value,
         )
         torch.save(
             payload,
@@ -728,7 +790,6 @@ def _run_training(request: TrainingRequest) -> int:
     train_iterator = iter(train_loader)
     latest_val_loss = None
     latest_ema_val_loss = None
-    best_checkpoint_value = None
     confusion_metric = Confusion()
     progress = tqdm(
         range(start_step, config.num_iterations),
@@ -1193,7 +1254,7 @@ def _run_training(request: TrainingRequest) -> int:
                 )
                 if config.best_checkpoint_metric is not None:
                     candidate = record[config.best_checkpoint_metric]
-                    improved = (
+                    improved = math.isfinite(candidate) and (
                         best_checkpoint_value is None
                         or (
                             config.best_checkpoint_metric == "val_loss"
