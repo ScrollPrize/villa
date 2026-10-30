@@ -143,77 +143,22 @@ std::optional<std::array<std::size_t, 3>> parseBaseShapeZYX(
 std::optional<int> omeScaledownForGroup(
     const QString& rootPath, const QString& group, QString* errorMessage)
 {
-    QFile attributesFile(QDir(rootPath).filePath(QStringLiteral(".zattrs")));
-    if (!attributesFile.open(QIODevice::ReadOnly)) {
-        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1")
-            .arg(attributesFile.fileName());
-        return std::nullopt;
-    }
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(
-        attributesFile.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        if (errorMessage) *errorMessage = QObject::tr("Malformed OME metadata at %1: %2")
-            .arg(attributesFile.fileName(), parseError.errorString());
-        return std::nullopt;
-    }
-    const QJsonArray multiscales = document.object()
-        .value(QStringLiteral("multiscales")).toArray();
-    if (multiscales.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("OME multiscales metadata is missing");
-        return std::nullopt;
-    }
-    const QJsonArray datasets = multiscales.at(0).toObject()
-        .value(QStringLiteral("datasets")).toArray();
-    auto datasetScale = [&](const QString& wanted) -> std::optional<double> {
-        for (const QJsonValue& value : datasets) {
-            const QJsonObject dataset = value.toObject();
-            if (dataset.value(QStringLiteral("path")).toString() != wanted) continue;
-            std::optional<double> scale;
-            for (const QJsonValue& transformValue : dataset.value(
-                     QStringLiteral("coordinateTransformations")).toArray()) {
-                const QJsonObject transform = transformValue.toObject();
-                const QString type = transform.value(QStringLiteral("type")).toString();
-                const QJsonArray values = transform.value(type).toArray();
-                if (values.size() != 3) return std::nullopt;
-                if (type == QStringLiteral("translation")) {
-                    for (const QJsonValue& component : values)
-                        if (!component.isDouble() || !std::isfinite(component.toDouble()) ||
-                            std::abs(component.toDouble()) > 1.0e-9) return std::nullopt;
-                } else if (type == QStringLiteral("scale")) {
-                    const double first = values.at(0).toDouble(
-                        std::numeric_limits<double>::quiet_NaN());
-                    if (!std::isfinite(first) || first <= 0.0) return std::nullopt;
-                    for (const QJsonValue& component : values) {
-                        const double current = component.toDouble(
-                            std::numeric_limits<double>::quiet_NaN());
-                        if (!std::isfinite(current) || current <= 0.0 ||
-                            std::abs(current - first) >
-                                1.0e-9 * std::max({1.0, current, first})) return std::nullopt;
-                    }
-                    scale = first;
-                } else return std::nullopt;
-            }
-            return scale;
+    try {
+        const auto scale = vcr::zarr::Group::open(rootPath.toStdString(), {}).placement(group.toStdString()).scale;
+        const double levelValue = std::log2(scale[0]);
+        const int level = static_cast<int>(std::llround(levelValue));
+        if (scale[1] != scale[0] || scale[2] != scale[0] || level < 0 || level > 30 ||
+            std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
+            if (errorMessage) *errorMessage = QObject::tr(
+                "OME scale for group %1 is not a dyadic L0 scale").arg(group);
+            return std::nullopt;
         }
-        return std::nullopt;
-    };
-    const auto baseScale = datasetScale(QStringLiteral("0"));
-    const auto groupScale = datasetScale(group);
-    if (!baseScale || !groupScale) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale metadata for groups 0 and %1 is required").arg(group);
+        return level;
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QObject::tr("Cannot read OME metadata at %1: %2")
+            .arg(rootPath, QString::fromUtf8(error.what()));
         return std::nullopt;
     }
-    const double levelValue = std::log2(*groupScale / *baseScale);
-    const int level = static_cast<int>(std::llround(levelValue));
-    if (level < 0 || level > 30 || !std::isfinite(levelValue) ||
-        std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
-        if (errorMessage) *errorMessage = QObject::tr(
-            "OME scale for group %1 is not a dyadic L0 scale").arg(group);
-        return std::nullopt;
-    }
-    return level;
 }
 
 // Shape of an OME store's level-zero array, the grid its group scaledowns
