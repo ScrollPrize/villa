@@ -522,9 +522,7 @@ if(APPLE)
     unset(_vc_opencv_library)
 endif()
 find_package(nlohmann_json REQUIRED)
-find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
-find_package(ZLIB REQUIRED)
 if(MSVC)
     # On MSVC, zstd/lz4 come from vcpkg CMake configs (below), and the
     # pkg-config-only consumers (vendored libbacktrace, avahi) are Linux-only,
@@ -533,31 +531,6 @@ if(MSVC)
 else()
     find_package(PkgConfig REQUIRED)
 endif()
-# Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
-# CMake config is shipped, so locate by header+lib and wrap in an imported
-# target consumers link as Blosc::blosc.
-#
-# Note on package collision: libblosc-dev installs <blosc.h>; libblosc2-dev
-# installs <blosc2.h> (a *different* header, not a compat shim). Searching
-# `NAMES blosc.h` therefore only matches Blosc1. The matching libraries
-# also have distinct SONAMEs (libblosc.so vs libblosc2.so), so a system
-# with both packages installed cannot accidentally hybridize.
-find_path(BLOSC_INCLUDE_DIR NAMES blosc.h
-    HINTS $ENV{HOMEBREW_PREFIX}/opt/c-blosc/include
-          $ENV{HOMEBREW_PREFIX}/include)
-find_library(BLOSC_LIBRARY NAMES blosc
-    HINTS $ENV{HOMEBREW_PREFIX}/opt/c-blosc/lib
-          $ENV{HOMEBREW_PREFIX}/lib)
-if(NOT BLOSC_INCLUDE_DIR OR NOT BLOSC_LIBRARY)
-    message(FATAL_ERROR "Blosc1 (libblosc-dev / c-blosc) not found")
-endif()
-if(NOT TARGET Blosc::blosc)
-    add_library(Blosc::blosc UNKNOWN IMPORTED)
-    set_target_properties(Blosc::blosc PROPERTIES
-        IMPORTED_LOCATION "${BLOSC_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${BLOSC_INCLUDE_DIR}")
-endif()
-
 if(VC_ENABLE_AMGX)
     if(DEFINED AMGX_INCLUDE_DIR AND "${AMGX_INCLUDE_DIR}" STREQUAL "")
         unset(AMGX_INCLUDE_DIR CACHE)
@@ -589,9 +562,8 @@ endif()
 if(MSVC)
     # vcpkg ships CMake configs for these (no .pc/pkg-config on MSVC). Normalize
     # whatever target each exports to the names the tree consumes: utils links
-    # zstd::libzstd and LZ4::lz4.
+    # zstd::libzstd.
     find_package(zstd CONFIG REQUIRED)
-    find_package(lz4 CONFIG REQUIRED)
     if(NOT TARGET zstd::libzstd)
         if(TARGET zstd::libzstd_shared)
             add_library(zstd::libzstd ALIAS zstd::libzstd_shared)
@@ -599,17 +571,10 @@ if(MSVC)
             add_library(zstd::libzstd ALIAS zstd::libzstd_static)
         endif()
     endif()
-    if(NOT TARGET LZ4::lz4 AND TARGET lz4::lz4)
-        add_library(LZ4::lz4 ALIAS lz4::lz4)
-    endif()
 else()
     pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
-    pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
     if(NOT TARGET zstd::libzstd)
         add_library(zstd::libzstd ALIAS PkgConfig::zstd)
-    endif()
-    if(NOT TARGET LZ4::lz4)
-        add_library(LZ4::lz4 ALIAS PkgConfig::lz4)
     endif()
 endif()
 if(VC_BUILD_PYTHON)
@@ -625,23 +590,6 @@ if(VC_BUILD_PYTHON)
         list(APPEND CMAKE_PREFIX_PATH "${VC_NANOBIND_CMAKE_DIR}")
     endif()
     find_package(nanobind CONFIG REQUIRED)
-endif()
-
-# VC-Delta3D is maintained as a standalone first-party codec. Prefer an
-# installed package (useful for distro builds and local development), then
-# fetch the reviewed 0.2.0 release for ordinary builds.
-find_package(vc_delta3d CONFIG QUIET)
-if(NOT TARGET vc_delta3d::vc_delta3d)
-    include(FetchContent)
-    set(VC_DELTA3D_BUILD_PYTHON OFF)
-    set(VC_DELTA3D_BUILD_TESTS OFF)
-    # vc_reader's installed native target exports this dependency.
-    set(VC_DELTA3D_INSTALL_CPP ON)
-    FetchContent_Declare(vc_delta3d
-        GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG v0.2.0
-    )
-    FetchContent_MakeAvailable(vc_delta3d)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR MSVC)
