@@ -63,12 +63,14 @@ class ZarrGroup:
         connections: int = 16,
         read_mode: str = "mmap",
         offline: bool = False,
+        refresh: bool = False,
     ) -> ZarrGroup:
         """Open the Zarr v2/v3 group at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
         The arguments are those of :meth:`ZarrReader.open`, applied to every
         array opened through the group. A ``memory_cache`` byte budget becomes
-        one :class:`MemoryCache` that the group's arrays share.
+        one :class:`MemoryCache` that the group's arrays share. ``refresh`` replaces
+        the metadata kept with the volume (see :meth:`ZarrReader.open`).
         """
         loc = os.fspath(location).rstrip("/")
         options = dict(cache_dir=cache_dir, cache_writes=cache_writes, compress_cache=compress_cache,
@@ -107,7 +109,7 @@ class ZarrGroup:
             if remote and cache_writes and spec["cache_dirs"]:
                 _cache_group_metadata(spec["cache_dirs"], cache_url(loc, access), zgroup, zattrs)
         group = cls(loc, options, cache, access, attrs, version)
-        _ = group.metadata
+        group._metadata = read_store_metadata(loc, access, group._metadata_settings, refresh=refresh)
         return group
 
     @property

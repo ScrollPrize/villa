@@ -20,8 +20,9 @@ training pipelines; its Zarr reader and transforms also work with your own data.
 
 Opening a volume also gathers what is known about it, from the store's `meta.json` /
 `metadata.json` and the Open Data catalog, merged into one value per field (the store's
-own documents win). Remote stores do this on first open only; the result is kept in the
-disk cache.
+own documents win). Remote stores do this on first open only; the result is kept with
+the volume in the disk cache. `ZarrReader.open(url, refresh=True)` reads both sources again
+and replaces it.
 
 ```python
 volume = ZarrReader.open(url, level=2, cache_dir=cache)

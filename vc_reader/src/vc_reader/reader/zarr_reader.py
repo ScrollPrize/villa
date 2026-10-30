@@ -180,6 +180,7 @@ class ZarrReader:
         read_mode: str = "mmap",
         auth: Any = "auto",
         offline: bool = False,
+        refresh: bool = False,
     ) -> ZarrReader:
         """Open the Zarr v2/v3 array at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
@@ -223,6 +224,10 @@ class ZarrReader:
         ``read_mode`` is how uncompressed chunk files are read: ``"mmap"``
         (persistent memory maps, the default) or ``"slab"`` (``pread``).
 
+        ``refresh`` reads the store's documents and the catalog as published now and
+        replaces the metadata kept with the volume (see :attr:`metadata`), which is
+        otherwise gathered only the first time a volume is opened.
+
         The reader works on background threads. In a process forked after this
         call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
         """
@@ -234,7 +239,7 @@ class ZarrReader:
         reader = cls(spec, cache)
         settings = reader._spec
         store = settings["group"] or reader.location
-        metadata = settings["store_metadata"] = read_store_metadata(store, reader.access, settings)
+        metadata = settings["store_metadata"] = read_store_metadata(store, reader.access, settings, refresh=refresh)
         if settings["group"]:
             settings["level_scale"] = level_scale(metadata.documents.get(".zattrs", {}), settings["level_key"])
         return reader

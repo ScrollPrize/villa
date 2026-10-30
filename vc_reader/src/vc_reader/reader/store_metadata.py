@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .auth import Access, is_remote
-from .disk_cache import VC3D, atomic_write, cached_node_dirs, decoded_cache_path
+from .disk_cache import atomic_write, cache_roots, cached_node_dirs, decoded_cache_path
 from .transport import cache_url, read_node_file
 
 
@@ -45,7 +45,7 @@ class StoreMetadata:
 _known: dict[str, StoreMetadata] = {}
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=2)
 def _catalog_manifest(offline: bool):
     """The Open Data catalog's native manifest (from its cache file alone when offline);
     ``None`` when it is unavailable."""
@@ -59,14 +59,24 @@ def _catalog_manifest(offline: bool):
         return None
 
 
-def _catalog_entry(location: str, offline: bool) -> tuple[dict[str, Any] | None, bool]:
+def _fresh_catalog_manifest():
+    """The catalog as published now, which later lookups in this process also use."""
+    from ..catalog import Catalog
+    _catalog_manifest.cache_clear()
+    try:
+        return Catalog.load(timeout=15, refresh=True)._native
+    except Exception:
+        return None
+
+
+def _catalog_entry(location: str, offline: bool, refresh: bool = False) -> tuple[dict[str, Any] | None, bool]:
     """The catalog's entry for a remote store, and whether the catalog could answer. Stores
     outside the public channels are not in it, so the catalog is not loaded for them."""
     from .. import _catalog
 
     if _catalog.to_s3(location) is None:
         return None, True
-    manifest = _catalog_manifest(offline)
+    manifest = _fresh_catalog_manifest() if refresh else _catalog_manifest(offline)
     if manifest is None:
         return None, False
     return manifest.volume_at(location), True
@@ -88,23 +98,44 @@ def _merged(sidecars: dict[str, Any], catalog: dict[str, Any] | None) -> StoreMe
     return StoreMetadata(**values)
 
 
-def read_store_metadata(location: str, access: Access, spec: dict[str, Any]) -> StoreMetadata:
+def _keep(metadata: StoreMetadata, key: str, cache_dirs: list[Any]) -> None:
+    """Saves the merged metadata with the volume: in a folder of its cache that already
+    exists (e.g. VC3D's), else its folder under the first cache directory that takes it."""
+    candidates = [*cached_node_dirs(cache_dirs, key),
+                  *(decoded_cache_path(root, key) for root in cache_roots(cache_dirs))]
+    data = json.dumps(asdict(metadata)).encode()
+    for candidate in candidates:
+        target = Path(candidate)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            atomic_write(target / _METADATA_FILE, data)
+            return
+        except OSError:
+            continue  # read-only: this process still remembers it
+
+
+def read_store_metadata(location: str, access: Access, spec: dict[str, Any], refresh: bool = False) -> StoreMetadata:
     """The metadata of the store at ``location``: its sidecar documents and, for a remote
     store, the catalog, consulted only the first time: a remote store's merged result is
-    kept in the disk cache (or for this process, without one), and a kept copy is trusted
-    like a chunk. A local store's documents are cheap to read at each open."""
+    kept with the volume in the disk cache (or for this process, without one), and a kept
+    copy is trusted like a chunk. A local store's documents are cheap to read at each open.
+
+    ``refresh`` reads both sources as published now and replaces what was kept. If a source
+    cannot be read, nothing kept changes and the kept metadata is returned when there is one.
+    """
     from .. import _reader
 
     remote = is_remote(location)
-    key = cache_url(location, access) if remote else location
-    if remote and key in _known:
-        return _known[key]
-    cache_dirs = spec.get("cache_dirs") or []
     offline = bool(spec.get("offline")) and remote
-    cached = cached_node_dirs(cache_dirs, key) if remote and cache_dirs else []
+    if refresh and offline:
+        raise ValueError("refresh needs the network; it cannot be combined with offline")
+    key = cache_url(location, access) if remote else location
+    cache_dirs = spec.get("cache_dirs") or []
 
-    if remote:
-        for directory in cached:
+    def kept() -> StoreMetadata | None:
+        if key in _known:
+            return _known[key]
+        for directory in cached_node_dirs(cache_dirs, key) if cache_dirs else []:
             path = Path(directory, _METADATA_FILE)
             if path.is_file():
                 try:
@@ -116,15 +147,29 @@ def read_store_metadata(location: str, access: Access, spec: dict[str, Any]) -> 
                     return _known[key]
                 except (OSError, ValueError, TypeError):
                     pass  # a damaged copy: read the sources again
+        return None
+
+    if remote and not refresh:
+        known = kept()
+        if known is not None:
+            return known
+
+    failed = False
 
     def read(node: str, name: str) -> str | None:
-        for directory in cached_node_dirs(cache_dirs, cache_url(node, access)) if remote and cache_dirs else []:
-            path = Path(directory, name)
-            if path.is_file():
-                return path.read_text()
+        nonlocal failed
+        if remote and cache_dirs and not refresh:
+            for directory in cached_node_dirs(cache_dirs, cache_url(node, access)):
+                path = Path(directory, name)
+                if path.is_file():
+                    return path.read_text()
         if offline:
             return None
-        data = read_node_file(node, name, access)
+        try:
+            data = read_node_file(node, name, access)
+        except Exception:
+            failed = True  # not the same as a store without this document
+            raise
         return None if data is None else data.decode()
 
     sidecars = json.loads(_reader.store_metadata_json(location, read))
@@ -132,21 +177,19 @@ def read_store_metadata(location: str, access: Access, spec: dict[str, Any]) -> 
         attrs = read(location, ".zattrs")
         if attrs:
             sidecars["documents"][".zattrs"] = json.loads(attrs)
-    except (OSError, ValueError):
-        pass
-    catalog, answered = _catalog_entry(location, offline) if remote else (None, True)
+    except Exception:
+        pass  # malformed says nothing; a failed read is noted above
+    catalog, answered = _catalog_entry(location, offline, refresh) if remote else (None, True)
     metadata = _merged(sidecars, catalog)
     # Keep it only once both sources have answered, so a later open can fill what is missing.
-    if remote and answered and not offline:
+    if remote and answered and not failed and not offline:
         _known[key] = metadata
-        root = next((d for d in cache_dirs if os.fspath(d) != VC3D), None)
-        if remote and root is not None and spec.get("cache_writes", True):
-            target = Path(decoded_cache_path(Path(root).expanduser(), key))
-            try:
-                target.mkdir(parents=True, exist_ok=True)
-                atomic_write(target / _METADATA_FILE, json.dumps(asdict(metadata)).encode())
-            except OSError:
-                pass  # a read-only cache directory: this process still remembers it
+        if cache_dirs and spec.get("cache_writes", True):
+            _keep(metadata, key, cache_dirs)
+    elif refresh:
+        known = kept()
+        if known is not None:
+            return known
     return metadata
 
 
