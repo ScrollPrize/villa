@@ -233,7 +233,8 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
             for ty, tx, b, _ in tb:
                 h, w = b.shape[:2]
                 if img is not None:
-                    img[:, ty * CH:ty * CH + h, tx * CW:tx * CW + w] =                         torch.from_numpy(out[:, o:o + h * w].reshape(S, h, w))
+                    img[:, ty * CH:ty * CH + h, tx * CW:tx * CW + w] = \
+                        torch.from_numpy(out[:, o:o + h * w].reshape(S, h, w))
                 futs.append(wpool.submit(write_chunk, ty, tx, out[:, o:o + h * w].reshape(S, h, w)))
                 o += h * w
             if bi + 1 < len(batches):
@@ -242,7 +243,7 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
 
     # Pyramid L1..L5, as renderTiles builds it: L1 = rounded 2x2 mean of L0 with partial
     # windows at the image edge; L2+ cascade from zero-padded chunk buffers (count 4).
-    # L1 is built on the host from L0; L2+ (1/16 of L0 and smaller) on the GPU
+    # the whole cascade runs on the host so no level sits on the GPU next to the chunk pool
     prev = img
     del img
     for li, lvl in enumerate(levels):
@@ -267,7 +268,7 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
             for cx in range(0, lw, cw):
                 futs.append(wpool.submit(write_chunk, cy // ch, cx // cw,
                                          cn[:, cy:cy + ch, cx:cx + cw], lvl, (cz, ch, cw)))
-        prev = cur.to(dev)
+        prev = cur
     del prev
 
     def finish():
@@ -295,7 +296,8 @@ def main():
     ap.add_argument("vol", help="volume level dir, e.g. VOLUME.zarr/0")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--batch-tiles", type=int, default=64)
-    ap.add_argument("--pool-gb", type=float, default=8.0)
+    ap.add_argument("--pool-gb", type=float, default=None,
+                    help="GPU memory for volume chunks (default: free memory minus 2 GB)")
     ap.add_argument("--writers", type=int, default=8)
     ap.add_argument("--rm-dump", action="store_true", help="delete each dump dir once its zarr is written")
     ap.add_argument("--wait", action="store_true",
@@ -317,6 +319,8 @@ def main():
 
     dev = torch.device(a.device)
     torch.cuda.set_device(dev)  # the kernels launch on the current device
+    if a.pool_gb is None:
+        a.pool_gb = torch.cuda.mem_get_info(dev)[0] / 2**30 - 2
     pool = ChunkPool(a.vol, dev, a.pool_gb)
     kernel = rgpu_kernel.load(dev)
     t0 = time.time()

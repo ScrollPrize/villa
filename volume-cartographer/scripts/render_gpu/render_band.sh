@@ -12,7 +12,7 @@
 #   A remote (http/s3) VOLUME, or no PyTorch GPU, falls back to the CPU path.
 #
 # env: VC_RENDER_TIFXYZ (default: vc_render_tifxyz on PATH), PYTHON (default: python3),
-#      RENDER_N=31, RENDER_FLIP=1, RGPU_DEVICE=cuda:0, RGPU_POOL_GB=10 (GPU memory for volume chunks)
+#      RENDER_N=31, RENDER_FLIP=1, RGPU_DEVICE=cuda:0, RGPU_POOL_GB (GPU memory for volume chunks; default free memory minus 2 GB)
 set -u -o pipefail
 if [ $# -ne 2 ]; then
   echo "usage: $0 LIST VOLUME" >&2
@@ -35,7 +35,7 @@ check_out() {
     *) echo "render_band: OUT_ZARR must end in .zarr: '$1'" >&2; exit 2 ;;
   esac
 }
-while read -r S O; do
+while read -r S O || [ -n "$S" ]; do
   [ -z "$S" ] && continue
   check_out "${O:-}"
 done < "$LIST"
@@ -56,7 +56,7 @@ if [ "$GPU" = 1 ] && ! "$PY" -c "import sys, torch; sys.exit(not torch.cuda.is_a
 fi
 if [ "$GPU" != 1 ]; then
   fails=0
-  while read -r S O; do
+  while read -r S O || [ -n "$S" ]; do
     [ -z "$S" ] && continue
     s=$(date +%s.%N)
     render "$S" "$O"
@@ -73,11 +73,11 @@ fi
 GL=$(mktemp)
 producer=
 trap '[ -n "$producer" ] && kill "$producer" 2>/dev/null; rm -f "$GL"' EXIT
-while read -r S O; do
+while read -r S O || [ -n "$S" ]; do
   [ -n "$S" ] && echo "$O.rgpu_dump $O" >> "$GL"
 done < "$LIST"
 (
-  while read -r S O; do
+  while read -r S O || [ -n "$S" ]; do
     [ -z "$S" ] && continue
     D=$O.rgpu_dump
     s=$(date +%s.%N)
@@ -91,7 +91,7 @@ done < "$LIST"
 ) &
 producer=$!
 "$PY" "$HERE/render_gpu.py" "@$GL" "$V/0" --device "${RGPU_DEVICE:-cuda:0}" \
-  --pool-gb "${RGPU_POOL_GB:-10}" --wait --producer-pid "$producer" --rm-dump
+  ${RGPU_POOL_GB:+--pool-gb "$RGPU_POOL_GB"} --wait --producer-pid "$producer" --rm-dump
 rc=$?
 [ $rc = 0 ] || kill "$producer" 2>/dev/null
 wait "$producer"
