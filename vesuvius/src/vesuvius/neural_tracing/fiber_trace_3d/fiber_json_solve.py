@@ -1,24 +1,30 @@
 """Reviewed-JSON adapter with caller-configured extraction and solver stages."""
 import json
-import hashlib
+import uuid
 import sqlite3
 from pathlib import Path
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
 
 
-def convert(source_dir, template, destination, *, expected_manifest_tokens):
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import write_afv, read_afv_polylines
-    with sqlite3.connect(Path(template).resolve().as_uri()+'?mode=ro', uri=True) as db:
-        metadata = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM metadata')}
+def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tokens):
+    """Reviewed VC3D fiber JSON -> a store of fibers bound to ``volume`` (base voxels, shape ``shape_zyx``); each
+    fiber keeps its document's own ``uuid``."""
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers, read_polylines
     if not expected_manifest_tokens or any(not str(token) for token in expected_manifest_tokens):
         raise ValueError('Provide expected_manifest_tokens to verify the source scan')
+    shape=list(shape_zyx)
     fibers=[]; records=[]
-    for i, path in enumerate(sorted(Path(source_dir).glob('*.json')), 1):
+    for path in sorted(Path(source_dir).glob('*.json')):
         doc=json.loads(path.read_text()); xyz=np.asarray(doc['line_points'], dtype=np.float64)
-        shape=metadata['root']['coordinate_base_shape_zyx']
+        fid=str(uuid.UUID(str(doc['uuid'])))
         if doc.get('coordinate_base_shape_zyx',shape) != shape:
             raise ValueError('Coordinate shape mismatch: '+str(path))
+        # Unbound documents carry base voxels; bound ones store volume voxel * scale_factor.
+        coordinates=doc.get('coordinates') or {}
+        if coordinates.get('volume_uuid') not in (None,str(volume)):
+            raise ValueError('Fiber bound to another volume: '+str(path))
+        if coordinates.get('volume_uuid') is not None:xyz=xyz/float(coordinates['scale_factor'])
         if xyz.ndim!=2 or xyz.shape[1]!=3 or len(xyz)<2 or not np.isfinite(xyz).all():
             raise ValueError('Invalid curve: '+str(path))
         if doc.get('branches') or doc.get('adjacent_branches'):
@@ -28,23 +34,23 @@ def convert(source_dir, template, destination, *, expected_manifest_tokens):
             raise ValueError('Unverified source scan: '+str(path))
         if np.any(xyz<0) or np.any(xyz>=np.asarray(shape)[::-1]):
             raise ValueError('Curve outside verified source scan: '+str(path))
-        row=dict(id=i,name=path.name,family='unknown',annotation=json.dumps(doc))
+        row=dict(id=fid,name=path.name,family='unknown',meta=dict(annotation=doc))
         fibers.append((row,xyz))
-        records.append(dict(id=i,file=str(path),sha256=sha256_file(path),points=len(xyz),
+        records.append(dict(id=fid,file=str(path),sha256=sha256_file(path),points=len(xyz),
                             saved_hv=doc['hv_classification'],
                             segment_modes=[c.get('segment_to_next',{}).get('interp_mode') for c in doc['control_points'][:-1]]))
     if not fibers: raise ValueError('No input fibers')
+    if len({r['id'] for r in records})!=len(records): raise ValueError('Duplicate fiber UUID')
     manifest=Path(destination).with_suffix('.sources.json')
     if Path(destination).exists():
         if json.loads(manifest.read_text())!=records: raise ValueError('Changed source fibers')
     else:
-        write_afv(template,destination,fibers,dict(uuid='reviewed-json-'+hashlib.sha256(json.dumps(records,sort_keys=True).encode()).hexdigest()[:24],
-                  source='reviewed_vc3d_json', source_files=records))
+        write_fibers(destination,fibers,volume=volume)
         atomic_write(manifest,records,durable=False)
-    actual=read_afv_polylines(destination)
+    actual=read_polylines(destination,volume=str(volume))
     if len(actual)!=len(fibers): raise ValueError('Roundtrip fiber count')
-    for (row,a),(other,b) in zip(fibers,actual):
-        if row['id']!=other['id'] or not np.array_equal(a,b): raise ValueError('AFV roundtrip differs')
+    for (row,a),(other,b) in zip(sorted(fibers,key=lambda f:f[0]['id']),actual):
+        if row['id']!=other['id'] or not np.array_equal(a,b): raise ValueError('Store roundtrip differs')
     return records
 
 
@@ -53,14 +59,14 @@ def run(config):
     root=Path(config['output_root']); root.mkdir(parents=True,exist_ok=True)
     if any(key in config for key in ('templates','template_files','solve_parameters','trusted_gt')):
         raise ValueError('Use explicit stages and stage parameters; implicit pipeline presets are not supported')
-    afv=str(root/'fibers.afv')
-    stages=stage_requests(config.get('stages',[]),root,afv)
-    signature=dict(config=config,stages=stages,afv_template_sha256=sha256_file(config['afv_template']))
+    fibers=str(root/'fibers.vcobj')
+    stages=stage_requests(config.get('stages',[]),root,fibers)
+    signature=dict(config=config,stages=stages)
     manifest=root/'pipeline_inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:
         raise ValueError('Changed pipeline inputs: use a new output directory')
     atomic_write(manifest,signature,durable=False)
-    records=convert(config['source_dir'],config['afv_template'],afv,
+    records=convert(config['source_dir'],fibers,volume=config['volume'],shape_zyx=config['volume_shape_zyx'],
                     expected_manifest_tokens=config['expected_manifest_tokens'])
     for stage in stages:
         path=root/(stage['name']+'_request.json')
@@ -70,14 +76,14 @@ def run(config):
         dispatch(stage['request'])
     if config.get('layout_output'):
         return report(root,config['layout_output'])
-    return dict(afv=afv,sources=records,stages=[stage['name'] for stage in stages])
+    return dict(fibers=fibers,sources=records,stages=[stage['name'] for stage in stages])
 
 
-def stage_requests(stages,root,afv):
+def stage_requests(stages,root,fibers):
     """Resolve explicit workflow requests without injecting model/run settings."""
     names=set();result=[]
     def expand(value):
-        if isinstance(value,str):return value.replace('{output_root}',str(root)).replace('{afv}',str(afv))
+        if isinstance(value,str):return value.replace('{output_root}',str(root)).replace('{fibers}',str(fibers))
         if isinstance(value,list):return [expand(v) for v in value]
         if isinstance(value,dict):return {k:expand(v) for k,v in value.items()}
         return value
@@ -107,18 +113,18 @@ def report(root,uv_name='uv'):
     q_end,_=uv.geometry_points(d,u,v,b,widths,np.arange(len(keep)),d['node_ds'][:,-1])
     sources=json.loads((root/'fibers.sources.json').read_text())
     names={r['id']:Path(r['file']).name for r in sources}
-    pieces=[dict(piece=i,source_id=int(d['source_id'][i]),file=names[int(d['source_id'][i])],
+    pieces=[dict(piece=i,source_id=str(d['source_id'][i]),file=names[str(d['source_id'][i])],
                  family='HV'[d['family'][i]],start_arc=float(d['start'][i]),end_arc=float(d['end'][i]),
                  retained=bool(keep[i]),bucket=int(pick[i]),anchor_q=float(q[i]),end_q=float(q_end[i]),
                  u=float(u[i]),v=float(v[i]),broken_probability=float(p[i,-1]),
                  chosen_joint_probability=float(p[i,pick[i]])) for i in range(len(keep))]
     with sqlite3.connect(Path(cfg['database']).resolve().as_uri()+'?mode=ro',uri=True) as db:
-        pairs=[dict(a=int(a),b=int(b),events=int(n),winding_mean=mean,winding_min=lo,winding_max=hi)
+        pairs=[dict(a=a,b=b,events=int(n),winding_mean=mean,winding_min=lo,winding_max=hi)
                for a,b,n,mean,lo,hi in db.execute('SELECT fiber_a,fiber_b,count(*),avg(winding_distance),min(winding_distance),max(winding_distance) FROM constraints GROUP BY fiber_a,fiber_b')]
     e=np.arange(len(d['i']));qa,qb,delta,active=uv.edge_readout(d,geometry,widths,e,cfg,state)
     positional=qb-qa-d['phase_delta']+.5*(d['family'][d['j']]-d['family'][d['i']])
-    constraints=[dict(event_id=int(d['event_ids'][n]),a=int(d['source_id'][d['i'][n]]),
-                      b=int(d['source_id'][d['j'][n]]),measured_distance=float(d['distance'][n]),
+    constraints=[dict(event_id=int(d['event_ids'][n]),a=str(d['source_id'][d['i'][n]]),
+                      b=str(d['source_id'][d['j'][n]]),measured_distance=float(d['distance'][n]),
                       sign=int(d['sign'][n]),bucket_delta=float(delta[n]),position_delta=float(positional[n]),
                       sign_satisfied=bool(delta[n]*d['sign'][n]>=-1e-4)) for n in e]
     result=dict(final=summary['final'],pieces=pieces,constraint_pairs=pairs,

@@ -40,9 +40,12 @@ bash scripts/stop.sh NAME                                      # the trainer and
 ```
 
 - `dataset` is the dataset configuration (data/datasets.py): exactly one `paris4` source (fibers, CT,
-  seed manifest, `val_z`) and any number of `afv` sources, each with a weight and validation split. Neighboring
-  annotations of AFV sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4
-  has no neighbor paths.
+  seed manifest, `val_z`) and any number of `fibers` sources, each with a weight and validation split. A `fibers`
+  source is a VC object store (`path`, a `.vcobj`) of fibers bound to the open-data volume its `coordinate_space`
+  (`SAMPLE/VOLUME_ID`) names; its `ct` (or, for a local copy, `ct_mirror_of`) must be that volume. Fibers are
+  identified by their store UUIDs; validation holds out whole fibers by UUID. Neighboring annotations of fiber-store
+  sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4 has no neighbor
+  paths.
 - `model` takes `type` plus any field of that type's configuration class (`RegressionConfig`, `FlowConfig`,
   `SequenceConfig`), including `fine` (the crop) and `frame_checkpoint` (the frozen heading/normal model; its path
   and SHA-256 are recorded with the model).
@@ -121,18 +124,20 @@ python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint 
 
 Trace every fiber of a volume (or a box) from a fiber presence prediction on the trace grid (the presence zarr level
 whose voxel is `grid_scale` base voxels; the next, coarser level is used for progress if present). Each fiber is
-written once; the output is `OUT/fibers.afv` (an Automated Fiber Volume for VC3D's fiber collection dock), plus
-per-tile results that make a rerun resume. `--ct-z` is a z range in CT voxels of the checkpoint's CT level, `--box`
+written once; the output is `OUT/fibers.vcobj` (a VC object store of the fibers, for VC3D), plus per-tile results
+that make a rerun resume. `--ct-z` is a z range in CT voxels of the checkpoint's CT level, `--box`
 a trace-grid box `x0,y0,z0,x1,y1,z1`:
 
 ```bash
 python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --presence presence.ome.zarr/3 \
   --ct-z 7000,17000 --out paris4_fibers/ | tee -a paris4_fibers.log
-python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv paris4_fibers/   # fibers.afv from the tiles so far
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume_store paris4_fibers/   # fibers.vcobj from the tiles so far
 ```
 
-The AFV's coordinate frame is the CT's when it is a Vesuvius open-data store (`s3://vesuvius-challenge-open-data/...`);
-for any other CT, pass an `.afv` of the same scan as `--afv-template` (`volume_afv.py --template`). Status lines
+The fibers are bound to the CT's volume when it is a Vesuvius open-data store (`s3://vesuvius-challenge-open-data/...`);
+for any other CT, pass a fiber store of the same scan as `--fibers-template` (`volume_store.py --template`). Each
+fiber's UUID is derived from the run's `fiber_namespace` (run.json) and its id in the run, so re-exports keep them;
+`meta['fiber_follow']` holds its seed, stop reasons and links (the UUIDs of the fibers its ends touch). Status lines
 (progress, decisions/s, ETA) print every minute. One process uses one GPU; the Paris4 run held about 23 GB with
 `--gpu-chunks 1024 --forward-chunk 64` and 27 GB with `--gpu-chunks 3072` (each chunk slot is 2 MiB; more slots
 load fewer CT chunks).
@@ -174,14 +179,15 @@ heads, whole-crop planes); there is no training support.
 
 `scripts/snap_fibers.py` (`data/fiber_snapping.py`) moves fiber labels onto the centre of a fiber presence prediction:
 at every point, the centroid of the upper half of the presence on a perpendicular disk (radius 2.5 voxels, averaged over
-+-1 voxel along the fiber), smoothed along the fiber (sigma 2), two passes. It reads an AFV (writing a new AFV with the
-same ids, names, families and annotations and a `snapping` metadata record) or VC3D fiber JSONs (writing snapped
++-1 voxel along the fiber), smoothed along the fiber (sigma 2), two passes. It reads a fiber store (writing a new store
+with the same UUIDs, names, families and meta, the snapping parameters in each fiber's `meta['snapping']`) or VC3D
+fiber JSONs (writing snapped
 `line_points`, controls moved onto the line, and `snapping.json`). The work is tiled over the presence volume and
-batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 trace voxels from the manual annotations
+batched on the GPU. On the automated Paris4 fibers it brought labels from a median 1.46 to 0.68 trace voxels from the manual annotations
 (`output/paris4_annotation_audit_20261006/`).
 
 ```bash
-../../../../../.venv/bin/python scripts/snap_fibers.py datasets/automated_fiber_volumes/IN.afv OUT.afv \
+../../../../../.venv/bin/python scripts/snap_fibers.py datasets/automated_fiber_volumes/IN.vcobj OUT.vcobj \
   --presence /path/PHercParis4-..._presence.ome.zarr/3 --native-per-voxel 8   # level 3 = 8 native voxels per voxel
 ```
 
@@ -202,17 +208,17 @@ its continuation:
   (4 voxels), surfaces steeper than 70 degrees against the crop's `(v, f)` plane and heights outside the crop carry
   no loss.
 - **Data** (`sheet_strip/data.py`): the follower's own fresh decisions (simulated traces, frame model, augmentation)
-  with their heads on the spans where an AFV fiber lies on a patch. Half the decisions are shown the whole fiber
+  with their heads on the spans where a fiber-store fiber lies on a patch. Half the decisions are shown the whole fiber
   (over its matched spans +-8 voxels; its path is then not supervised), half only their simulated trace up to the
   head.
 
 ```bash
-# 1. Fibers on patches (sheets/scripts/match_fibers_to_patches.py), per family, AFV voxels = 4 patch voxels
-python ../sheets/scripts/match_fibers_to_patches.py --afv FIBERS.afv --grid-scale 4 --family H --min-run 40 \
+# 1. Fibers on patches (sheets/scripts/match_fibers_to_patches.py), per family, fiber voxels = 4 patch voxels
+python ../sheets/scripts/match_fibers_to_patches.py --fibers FIBERS.vcobj --grid-scale 4 --family H --min-run 40 \
   --patches-dir /mnt/raid_nvme/spiral_dataset_working/verified_patches \
   --umbilicus /mnt/raid_nvme/spiral_dataset_working/umbilicus.json --out H_runs.jsonl
 # 2. The run index; runs inside the z band 11250-12125 (patch voxels: the fiber runs' val_z) validate
-python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --afv FIBERS.afv \
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --fibers FIBERS.vcobj \
   --runs H_runs.jsonl V_runs.jsonl --patches-dir /mnt/raid_nvme/spiral_dataset_working/verified_patches --out INDEX
 # 3. Train (detached; log in output/logs/NAME.log)
 TRAINER=sheet_strip/train.py bash scripts/launch_train.sh configs/sheet_strip/paris4_slim50k.json
@@ -221,17 +227,17 @@ TRAINER=sheet_strip/train.py bash scripts/launch_train.sh configs/sheet_strip/pa
 The run folder holds `log.jsonl`, `curves.png` (strip error against the frame model's plane, per tube mode, losses,
 path error), `figures/` (every `figure_every` updates, validation and training decisions: CT slices along the fiber
 and across it with the patch sheet, the prediction and the tube, and the error map), `best.pt` (lowest validation
-strip error) and `last.pt`; `sheet_strip.train.load_strip_model` loads one. The Paris4 slim-50k AFV gave 617k training
+strip error) and `last.pt`; `sheet_strip.train.load_strip_model` loads one. The Paris4 slim-50k fibers gave 617k training
 runs on 155k fibers and 60k validation runs on 17.8k fibers (`output/sheet_strip_data/`).
 
-`sheet_strip/infer.py` walks one AFV fiber and writes the predicted strip as a tifxyz (patch voxels; rows every 4
+`sheet_strip/infer.py` walks one fiber-store fiber (`--fiber UUID`) and writes the predicted strip as a tifxyz (patch voxels; rows every 4
 voxels along the fiber, 25 columns 5 voxels apart across it). The checkpoint defaults to the Hugging Face repo
 `scrollprize/fiber_strip_small_v1` (`sheet_strip_paris4_slim50k_v3`, update 15000), downloaded into the Hugging Face
 cache; `--checkpoint` takes another repo (`ORG/NAME[@REVISION]`) or a local file. It reads the CT recorded in the
 checkpoint (Paris4 on the public S3 bucket; `--ct`, `--cache-dir` and the other volume options of
 `fibers/tracing/runtime.py` override it). The frame model and the umbilicus are taken from their recorded paths when
 those exist on this machine, else from `heading_model.pt` and `umbilicus.json` next to the checkpoint (in its
-Hugging Face repo), else `--frame-checkpoint` and `--umbilicus` must be given; `--afv` is needed off this machine,
+Hugging Face repo), else `--frame-checkpoint` and `--umbilicus` must be given; `--fibers` is needed off this machine,
 and scoring is skipped when the recorded index is not here. Outputs record the checkpoint as
 `hf://REPO@COMMIT/last.pt`. It makes a decision every `--step` (default 8) trace voxels,
 built as in training without augmentation. The fiber up to the head is the observed trace, and the tube shows the
@@ -243,15 +249,15 @@ there is one. `--render-only` redraws it for an existing output folder. Nodes wi
 voxels of either fiber end are left out, as in `infer_all.py`.
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --afv FIBERS.afv --fiber 469373 \
-  --out output/sheet_strip_infer/fiber_469373
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --fibers FIBERS.vcobj --fiber UUID \
+  --out output/sheet_strip_infer/fiber_UUID
 ```
 
 On validation fiber 469373 (6100 voxels, 758 decisions, 2.5 minutes), the update-16000 checkpoint gave 1.22 voxels
 mean error against 6.89 for the frame plane, with 82% of points within 2 voxels.
 
-`sheet_strip/infer_all.py` runs the same per-fiber inference over every AFV fiber above a length, without scoring or
-renders, sharded over processes. Each strip is written as a tifxyz in `OUT/strips/BUCKET/fiber_ID`, with
+`sheet_strip/infer_all.py` runs the same per-fiber inference over every fiber of a store above a length, without scoring or
+renders, sharded over processes. Each strip is written as a tifxyz in `OUT/strips/BUCKET/fiber_UUID` (BUCKET: the UUID's first two digits), with
 `expected_error.tif` when the model predicts its error. An H fiber runs along the strip's columns and a V fiber along
 its rows, higher z at the top (row 0); the TIFFs are uncompressed single strips, which VC3D memory-maps as written
 (it rewrites tiled LZW bands in place before mapping them). Nodes within `--trim` (default 75) patch voxels of either
@@ -261,7 +267,7 @@ restarted shard skips them:
 
 ```bash
 for k in $(seq 0 17); do
-  python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --afv FIBERS.afv --out OUT \
+  python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers FIBERS.vcobj --out OUT \
     --batch 4 --threads 1 --shard $k 18 &
 done
 ```
@@ -336,9 +342,9 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | --- | --- |
 | `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
 | `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors, the CT structure tensor (`ct_structure.py`), training-run pieces (`training.py`: run dirs, log, LR schedule, EMA) and compile options |
-| `tracers/shared/annotations` | Fiber annotations: AFV collections, VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
+| `tracers/shared/annotations` | Fiber annotations: fiber stores (VC object store), VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
 | `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling (CPU kernel for data workers, GPU sampler for in-step crops), remote prefetch |
-| `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
+| `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, fiber-store sources and neighbors |
 | `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
 | `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
 | `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |
@@ -349,7 +355,7 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | `scripts` | Launch/stop, label snapping, checkpoint conversion, the pre-launch sampler check |
 | `configs` | Run (`runs/`), dataset (`datasets/`) and heading-model (`heading/`) configurations |
 
-Run artifacts are in `output/` and AFV datasets in `datasets/` (both untracked). Three files in `output/` are inputs of
+Run artifacts are in `output/` and fiber-store datasets in `datasets/` (both untracked). Three files in `output/` are inputs of
 current runs: the Paris 4 seed manifest `single_path_v11_preparation/seeds.json`, the frame model
 `heading_model_l0_w16_centered_frame/ckpt_064000.pt` and `heading_model_l0_w16_centered_normals/ct_normalization.json`.
 

@@ -16,6 +16,7 @@ from lasagna.inference_provenance import atomic_write, sha256_file
 from .fiber_normal_sign import launch_tensor_solve
 from .fiber_normal_convention import inward_solution
 from .fiber_geometry_cache import profile_geometry
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 
 
 DEFAULT_STATE_LR = 0.07348469228349533
@@ -86,7 +87,7 @@ def direction_inputs(config, signature, ids, labels):
     for key in ('h_direction_solution','v_direction_solution'):
         path=Path(config[key])
         meta=json.loads((path.parent/'summary.json').read_text())['input']['signature']
-        for source in ('database','afv','features','stage1','hv_solution','umbilicus'):
+        for source in ('database','fibers','features','stage1','hv_solution','umbilicus'):
             if meta[source]!=signature[source]:raise ValueError('Direction provenance mismatch: '+source)
         with np.load(path) as src:outputs.append({k:src[k] for k in src.files})
     h,v=outputs
@@ -114,10 +115,10 @@ def prepare(config):
         validate_cache(config)
         return
     from .fiber_hv_stage import verify_feature_source
-    from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+    from .fiber_normal_sign_visualization import umbilicus_frame
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fiber_volume, read_polylines
     started=time.monotonic();cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
-    signature={key:sha256_file(config[key]) for key in ('database','features','stage1','hv_solution','afv','umbilicus')}
+    signature={key:(fibers_digest if key=='fibers' else sha256_file)(config[key]) for key in ('database','features','stage1','hv_solution','fibers','umbilicus')}
     signature.update(version=2,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
     signature['keep_whole_fibers']=bool(config.get('keep_whole_fibers',False))
@@ -136,23 +137,23 @@ def prepare(config):
     with np.load(config['stage1']) as src:normal=inward_solution({k:src[k] for k in src.files})
     with np.load(config['hv_solution']) as h:ids=h['ids'].copy();labels=h['labels'].copy()
     if not np.array_equal(ids,normal['ids']):raise ValueError('Normal/HV IDs mismatch')
-    if not np.all(np.diff(ids)>0) or not np.isin(labels,[0,1,2]).all():raise ValueError('Invalid IDs/labels')
+    if not np.all(ids[1:]>ids[:-1]) or not np.isin(labels,[0,1,2]).all():raise ValueError('Invalid IDs/labels')
     if np.any(normal['broken']&(labels!=2)):raise ValueError('Stage1 exclusions not preserved')
     if anchored(config):labels,directions=direction_inputs(config,signature,ids,labels)
-    if signature['afv']!=feature['afv_sha256'] or signature['umbilicus']!=feature['umbilicus_sha256']:
+    if signature['fibers']!=feature['fibers_digest'] or signature['umbilicus']!=feature['umbilicus_sha256']:
         raise ValueError('Geometry/axial input mismatch')
-    with _ro(config['afv']) as db:meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    axis=load_umbilicus_frame(config['umbilicus'],meta['root'])
+    volume=fiber_volume(config['fibers']);axis,voxel_size_mm=umbilicus_frame(config['umbilicus'],volume)
     kept=labels!=2
     if config.get('force_keep_fibers',False) and not kept.all():
         raise ValueError('Trusted GT cannot inherit rejected fibers')
     pilot=int(config.get('pilot_fibers',0))
     if pilot:
         # Deterministic central-z induced subgraph, used ONLY for timing pilot.
-        with _ro(config['afv']) as db:rows=np.asarray(db.execute('SELECT id,(min_z+max_z)/2 FROM fibers ORDER BY id').fetchall())
-        if not np.array_equal(rows[:,0],ids):raise ValueError('Pilot AFV IDs mismatch')
-        center=np.median(rows[kept,1]);select=np.flatnonzero(kept)
-        select=select[np.argsort(abs(rows[select,1]-center),kind='stable')[:pilot]]
+        catalog=fiber_catalog(config['fibers'],volume)
+        if [r['id'] for r in catalog]!=ids.tolist():raise ValueError('Pilot fiber store IDs mismatch')
+        zmid=np.asarray([(r['bbox'][2]+r['bbox'][5])/2 for r in catalog])
+        center=np.median(zmid[kept]);select=np.flatnonzero(kept)
+        select=select[np.argsort(abs(zmid[select]-center),kind='stable')[:pilot]]
         kept[:]=False;kept[select]=True
     print(f'UV prepare: {kept.sum():,} retained fibers; reading events',flush=True)
     columns='id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,winding_distance,parallel_winding_distance,normal_a,normal_b'
@@ -161,9 +162,10 @@ def prepare(config):
         cursor=db.execute('SELECT '+columns+' FROM constraints ORDER BY id')
         while rows:=cursor.fetchmany(65536):
             original+=len(rows)
-            numeric=np.asarray([r[:15] for r in rows],dtype=float)
-            ends=np.searchsorted(ids,numeric[:,1:3].astype(np.int64))
-            if np.any(ends>=len(ids)) or not np.array_equal(ids[ends],numeric[:,1:3]):raise ValueError('Unknown constraint fiber')
+            pairs=np.asarray([r[1:3] for r in rows],dtype=str);ends=np.searchsorted(ids,pairs)
+            if np.any(ends>=len(ids)) or not np.array_equal(ids[ends],pairs):raise ValueError('Unknown constraint fiber')
+            # Endpoint columns hold the fibers' positions in ids, not their UUIDs.
+            numeric=np.asarray([(r[0],0,0,*r[3:15]) for r in rows],dtype=float);numeric[:,1:3]=ends
             keep=kept[ends].all(1)
             chosen=np.flatnonzero(keep);n=numeric[keep]
             def normals(column):
@@ -180,13 +182,13 @@ def prepare(config):
     # One sorted adjacency index for both endpoint columns, no per-fiber E scan.
     ecount=len(events);end_ids=events[:,1:3].astype(np.int64).T.reshape(-1)
     endpoint_arcs=events[:,3:5].T.reshape(-1);order=np.argsort(end_ids,kind='stable')
-    sorted_ids=end_ids[order];positions=np.searchsorted(sorted_ids,ids)
-    last=np.searchsorted(sorted_ids,ids,side='right')
+    sorted_ids=end_ids[order];positions=np.searchsorted(sorted_ids,np.arange(len(ids)))
+    last=np.searchsorted(sorted_ids,np.arange(len(ids)),side='right')
     owner=np.empty(2*ecount,np.int64);offset=np.empty(2*ecount,np.float32)
     phase=np.empty(2*ecount,np.float32);zpos=np.empty(2*ecount,np.float32)
     pieces=[];links=[];nodes=[]
-    minimum=signature['minimum_length_mm']/meta['root']['voxel_size_mm']
-    geometry=read_afv_polylines(config['afv'],ids[kept]);print('UV prepare: events loaded; deriving pieces',flush=True)
+    minimum=signature['minimum_length_mm']/voxel_size_mm
+    geometry=read_polylines(config['fibers'],ids[kept],volume=volume);print('UV prepare: events loaded; deriving pieces',flush=True)
     for fi,(row,xyz) in enumerate(geometry):
         idx=np.searchsorted(ids,row['id']);family=labels[idx]
         if anchored(config):
@@ -203,7 +205,7 @@ def prepare(config):
         tr=np.interp(anchors,arc,travel);ph=np.interp(anchors,arc,angle)
         for p in range(len(middle)):
             a,b=bounds[p:p+2];m=middle[p]
-            pieces.append((idx,row['id'],a,b,family,tr[p],ph[p],np.interp(anchors[p],arc,xyz[:,2]),np.interp(m,arc,radius)))
+            pieces.append((idx,a,b,family,tr[p],ph[p],np.interp(anchors[p],arc,xyz[:,2]),np.interp(m,arc,radius)))
             # Uniform piece regularizer evaluates both ends and midpoint.
             nodes.append((np.interp([a,m,b],arc,travel)-tr[p],np.interp([a,m,b],arc,angle),np.interp([a,m,b],arc,xyz[:,2])))
             if p:
@@ -217,13 +219,13 @@ def prepare(config):
     ds_a,ds_b=offset.reshape(2,-1);phi_a,phi_b=phase.reshape(2,-1)
     phase_delta=(phi_b-phi_a+.5)%1-.5
     degree=np.bincount(owner,minlength=len(p)).astype(np.float32)
-    lengths=p[:,3]-p[:,2];r=p[:,8]
+    lengths=p[:,2]-p[:,1];r=p[:,7]
     # Geometric initialization only; no winding labels/radii are hard evidence.
     lo,hi=np.quantile(r,[.001,.999]);initial_k=np.clip(5+85*(r-lo)/max(hi-lo,1),0,99)
     radii=np.interp(np.arange(100),np.linspace(5,90,100),np.linspace(lo,hi,100))
     width_initial=np.maximum(2*np.pi*radii,100.)
-    arrays=dict(ids=ids,earlier_labels=labels,source_index=p[:,0].astype(np.int64),source_id=p[:,1].astype(np.int64),
-        start=p[:,2],end=p[:,3],family=p[:,4].astype(np.int64),phase=p[:,6]%1,z=p[:,7],radius=r,
+    arrays=dict(ids=ids,earlier_labels=labels,source_index=p[:,0].astype(np.int64),source_id=ids[p[:,0].astype(np.int64)],
+        start=p[:,1],end=p[:,2],family=p[:,3].astype(np.int64),phase=p[:,5]%1,z=p[:,6],radius=r,
         lengths=lengths,degree=degree,initial_k=initial_k.astype(np.float32),width_initial=width_initial.astype(np.float32),
         i=i,j=j,ds_a=ds_a,ds_b=ds_b,phase_a=phi_a,phase_b=phi_b,phase_delta=phase_delta,
         distance=events[:,12].astype(np.float32),sign=events[:,13].astype(np.float32),
@@ -1483,8 +1485,8 @@ def report(config):
         k=int(cfg.get('winding_count',100))
         if s['state'].shape!=(len(d['family']),3*k+(3 if anchored(cfg) else 1)) or s['widths'].shape!=(k,):raise ValueError('State shape')
         signature=summary['input']['signature']
-        for key in ('database','features','stage1','hv_solution','afv','umbilicus'):
-            if sha256_file(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
+        for key in ('database','features','stage1','hv_solution','fibers','umbilicus'):
+            if (fibers_digest if key=='fibers' else sha256_file)(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
         if anchored(cfg):
             for key in ('h_direction_solution','v_direction_solution'):
                 if sha256_file(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
@@ -1494,19 +1496,21 @@ def report(config):
         if np.any(d['earlier_labels'][d['source_index']]==2):raise ValueError('Earlier rejection reintroduced')
         with _ro(cfg['database']) as db:
             lengths=dict(db.execute('SELECT id,length_base FROM fibers'))
-            events=np.asarray(db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b,parallel_score,perpendicular_score FROM constraints ORDER BY id').fetchall())
-        included=np.unique(d['source_id']);mask=np.isin(events[:,1],included)&np.isin(events[:,2],included)
-        events=events[mask]
+            records=db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b,parallel_score,perpendicular_score FROM constraints ORDER BY id').fetchall()
+        events=np.asarray([(r[0],r[3],r[4]) for r in records],dtype=float).reshape(-1,3)
+        ends=np.asarray([r[1:3] for r in records],dtype=str).reshape(-1,2)
+        included=np.unique(d['source_id']);mask=np.isin(ends[:,0],included)&np.isin(ends[:,1],included)
+        events=events[mask];ends=ends[mask]
         if not np.array_equal(events[:,0],d['event_ids']):raise ValueError('Observation IDs lost/duplicated')
         for endpoint,key in enumerate(('i','j')):
-            owner=d[key];ea=events[:,3+endpoint]
-            if not np.array_equal(d['source_id'][owner],events[:,1+endpoint]):raise ValueError('Endpoint fiber ownership')
+            owner=d[key];ea=events[:,1+endpoint]
+            if not np.array_equal(d['source_id'][owner],ends[:,endpoint]):raise ValueError('Endpoint fiber ownership')
             if np.any(ea<d['start'][owner]-1e-5) or np.any(ea>d['end'][owner]+1e-5):raise ValueError('Endpoint arc ownership')
         perp=~d['parallel'];counts=np.bincount(np.r_[d['i'][perp],d['j'][perp]],minlength=len(d['family']))
-        starts=np.r_[0,np.flatnonzero(np.diff(d['source_id']))+1];ends=np.r_[starts[1:],len(d['family'])]
+        starts=np.r_[0,np.flatnonzero(d['source_id'][1:]!=d['source_id'][:-1])+1];ends=np.r_[starts[1:],len(d['family'])]
         expected_links=[];split_fibers=0
         for a,b in zip(starts,ends):
-            fid=int(d['source_id'][a])
+            fid=str(d['source_id'][a])
             if abs(d['start'][a])>1e-6 or abs(d['end'][b-1]-lengths[fid])>1e-4:raise ValueError('Missing source coverage')
             if not np.array_equal(d['end'][a:b-1],d['start'][a+1:b]):raise ValueError('Gap/overlap in partition')
             if b-a>1:

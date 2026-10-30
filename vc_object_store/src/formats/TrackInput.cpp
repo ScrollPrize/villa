@@ -1,5 +1,5 @@
 #include "formats/GeometryInput.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "formats/TrackInput.hpp"
 #include <cmath>

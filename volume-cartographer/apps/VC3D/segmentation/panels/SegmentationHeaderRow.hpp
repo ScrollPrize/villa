@@ -3,6 +3,7 @@
 #include <QWidget>
 
 class QCheckBox;
+class QDoubleSpinBox;
 class QLabel;
 class QString;
 
@@ -14,21 +15,21 @@ public:
     explicit SegmentationHeaderRow(QWidget* parent = nullptr);
 
     void setEditingChecked(bool checked);
-    [[nodiscard]] bool isEditingChecked() const;
     void setAnnotateChecked(bool checked);
-    [[nodiscard]] bool isAnnotateChecked() const;
     void setDrawMaskChecked(bool checked);
-    [[nodiscard]] bool isDrawMaskChecked() const;
+    void setMaskBrushRadius(float radius);
     void setStatusText(const QString& text);
 
 signals:
     void editingToggled(bool enabled);
     void annotateToggled(bool enabled);
     void drawMaskToggled(bool enabled);
+    void maskBrushRadiusChanged(float radius);
 
 private:
     QCheckBox* _chkEditing{nullptr};
     QCheckBox* _chkAnnotate{nullptr};
     QCheckBox* _chkDrawMask{nullptr};
+    QDoubleSpinBox* _spinMaskBrushRadius{nullptr};
     QLabel* _lblStatus{nullptr};
 };

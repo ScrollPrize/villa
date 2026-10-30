@@ -1,7 +1,6 @@
 #include "SegmentationModule.hpp"
 
 #include "tools/SegmentationEditManager.hpp"
-#include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "SegmentationWidget.hpp"
 
@@ -48,36 +47,6 @@ void SegmentationModule::setDragSigma(float sigmaSteps)
     }
 }
 
-void SegmentationModule::setLineRadius(float radiusSteps)
-{
-    const float sanitized = std::clamp(radiusSteps, 0.25f, 512.0f);
-    if (nearlyEqual(sanitized, _lineRadiusSteps)) {
-        return;
-    }
-    _lineRadiusSteps = sanitized;
-    if (_activeFalloff == FalloffTool::Line) {
-        useFalloff(FalloffTool::Line);
-    }
-    if (_widget) {
-        _widget->setLineRadius(_lineRadiusSteps);
-    }
-}
-
-void SegmentationModule::setLineSigma(float sigmaSteps)
-{
-    const float sanitized = std::clamp(sigmaSteps, 0.05f, 256.0f);
-    if (nearlyEqual(sanitized, _lineSigmaSteps)) {
-        return;
-    }
-    _lineSigmaSteps = sanitized;
-    if (_activeFalloff == FalloffTool::Line) {
-        useFalloff(FalloffTool::Line);
-    }
-    if (_widget) {
-        _widget->setLineSigma(_lineSigmaSteps);
-    }
-}
-
 void SegmentationModule::setPushPullRadius(float radiusSteps)
 {
     const float sanitized = std::clamp(radiusSteps, 0.25f, 512.0f);
@@ -113,8 +82,6 @@ float SegmentationModule::falloffRadius(FalloffTool tool) const
     switch (tool) {
     case FalloffTool::Drag:
         return _dragRadiusSteps;
-    case FalloffTool::Line:
-        return _lineRadiusSteps;
     case FalloffTool::PushPull:
         return _pushPullRadiusSteps;
     }
@@ -126,8 +93,6 @@ float SegmentationModule::falloffSigma(FalloffTool tool) const
     switch (tool) {
     case FalloffTool::Drag:
         return _dragSigmaSteps;
-    case FalloffTool::Line:
-        return _lineSigmaSteps;
     case FalloffTool::PushPull:
         return _pushPullSigmaSteps;
     }
@@ -189,9 +154,6 @@ void SegmentationModule::setSmoothingStrength(float strength)
     if (_widget) {
         _widget->setSmoothingStrength(_smoothStrength);
     }
-    if (_lineTool) {
-        _lineTool->setSmoothing(_smoothStrength, _smoothIterations);
-    }
 }
 
 void SegmentationModule::setSmoothingIterations(int iterations)
@@ -203,9 +165,6 @@ void SegmentationModule::setSmoothingIterations(int iterations)
     _smoothIterations = clamped;
     if (_widget) {
         _widget->setSmoothingIterations(_smoothIterations);
-    }
-    if (_lineTool) {
-        _lineTool->setSmoothing(_smoothStrength, _smoothIterations);
     }
 }
 

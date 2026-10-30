@@ -34,20 +34,6 @@ void AgentBridgeServer::registerSurfaceOpsHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segment.recalc_area"),
-            .params = {
-                Params::requiredArray(
-                    QStringLiteral("segmentIds"),
-                    Params::requiredString(QString())),
-            },
-            .errors = {-32602, -32000, -32001},
-            .mcp =
-                Mcp::snakeCase(QStringLiteral("vc3d_recalc_segment_area")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentRecalcArea(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("segment.reoptimize"),
             .params = {
                 Params::requiredString(QStringLiteral("segmentId")),
@@ -83,13 +69,13 @@ void AgentBridgeServer::registerSurfaceOpsHandlers()
                 Params::optionalBoolean(
                     QStringLiteral("genVertexColor"),
                     false),
-                Params::optionalBoolean(QStringLiteral("overwrite"), true),
                 Params::optionalNumber(QStringLiteral("readerScale"), 0.5),
                 Params::optionalString(
                     QStringLiteral("scaleGroup"),
                     QStringLiteral("1")),
                 Params::optionalInteger(QStringLiteral("ompThreads")),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputName")),
+                Params::optionalBoolean(QStringLiteral("inPlace"), false),
             },
             .errors = {
                 -32602, -32000, -32001, -32004, -32005, -32006, -32007,
@@ -102,30 +88,4 @@ void AgentBridgeServer::registerSurfaceOpsHandlers()
         [this](const QJsonValue& p) {
             return handleSegmentRefineAlphaComp(p);
         });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segment.generate_mask"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-            },
-            .errors = {-32602, -32000, -32004, -32005, -32007},
-            .mcp = Mcp::snakeCase(
-                QStringLiteral("vc3d_generate_segment_mask")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentGenerateMask(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segment.append_mask"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-            },
-            .errors = {
-                -32602, -32000, -32001, -32004, -32005, -32007,
-            },
-            .mcp =
-                Mcp::snakeCase(QStringLiteral("vc3d_append_segment_mask")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentAppendMask(p); });
 }

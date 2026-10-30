@@ -21,7 +21,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         for (const auto& field : fields) if (valid.contains(field)) selected.push_back(field);
         return selected;
     };
-    const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "data_generation", "data_checksum", "fiber", "patch", "track"});
+    const auto objectProjection = projection({"name", "format_version", "storage_kind", "storage_ref", "data_generation", "data_checksum", "fiber", "surface", "track"});
     const auto edgeProjection = projection({"a", "b", "a_anchor", "b_anchor"});
     ObjectFields edgeFields = edgeProjection ? ObjectFields(std::in_place, edgeProjection->begin(), edgeProjection->end()) : std::nullopt;
     // Export canonicalizes endpoint order, including self-link dependency order.

@@ -119,3 +119,58 @@ def test_signed_boundary_no_reflection_swap_and_negative_gradient():
     assert value>loss(a,-b,1)
     torch.testing.assert_close(value,loss(b,a,-1))
     assert abs(loss(a,z-1e-6,1)-loss(a,z+1e-6,1))<.001
+
+
+def test_prepare_reads_store_fibers_by_uuid(tmp_path):
+    import json,sqlite3
+    from lasagna.inference_provenance import sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import prepare
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    ids=['00000000-0000-4000-8000-000000000003','4a000000-0000-4000-8000-000000000001','f0000000-0000-4000-8000-000000000002']
+    theta=np.linspace(0,1,11)
+    curves=[np.c_[50+20*np.cos(theta),50+20*np.sin(theta),np.full(11,40.)],
+            np.c_[50+30*np.cos(theta),50+30*np.sin(theta),np.full(11,40.)],
+            np.c_[np.full(11,75.),np.full(11,50.),np.linspace(10,90,11)]]
+    store=tmp_path/'fibers.vcobj'
+    write_fibers(store,[(dict(id=f),xyz) for f,xyz in zip(ids,curves)],volume='123')
+    lengths=[float(np.linalg.norm(np.diff(x,axis=0),axis=1).sum()) for x in curves]
+    axis=tmp_path/'axis.json'
+    axis.write_text(json.dumps(dict(metadata=dict(volume='123-scan.zarr',volume_slices=100,volume_height=100,volume_width=100,
+        voxelsize_um=2.4),control_points=[dict(x=50,y=50,z=0),dict(x=50,y=50,z=99)])))
+    database=tmp_path/'constraints.sqlite';db=sqlite3.connect(database)
+    db.executescript('CREATE TABLE metadata(key,value);CREATE TABLE fibers(id TEXT PRIMARY KEY,source_index,length_base);'
+        'CREATE TABLE constraints(id,fiber_a TEXT,fiber_b TEXT,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,'
+        'winding_distance,parallel_winding_distance,normal_a,normal_b);')
+    db.executemany('INSERT INTO metadata VALUES(?,?)',[(k,json.dumps(v)) for k,v in dict(complete=True,
+        provenance=dict(fibers_store_uuid='s',config=dict(fibers=str(store),coordinate_space='scroll/123'))).items()])
+    db.executemany('INSERT INTO fibers VALUES(?,?,?)',[(f,k,lengths[k]) for k,f in enumerate(ids)])
+    normal=json.dumps(dict(valid=True,xyz=[1.,0.,0.]))
+    def event(n,a,b,arc_a,arc_b,parallel):
+        pa,pb=curves[a][1],curves[b][1]
+        return (n,ids[a],ids[b],arc_a,arc_b,*pa,*pb,float(parallel),float(not parallel),1.,.5,normal,normal)
+    # Endpoint arcs need not match points here; prepare only checks they lie on the fiber.
+    db.executemany('INSERT INTO constraints VALUES('+','.join('?'*17)+')',
+        [event(7,0,1,1.,2.,False),event(9,1,2,3.,4.,False),event(11,0,2,5.,6.,True)])
+    db.commit();db.close()
+    stage1=tmp_path/'stage1.npz'
+    np.savez(stage1,ids=ids,normal_sign=np.ones(3,np.int8),sign_logit=np.ones(3),sign_probability=np.ones(3),
+             broken=np.zeros(3,bool),normal_convention=np.asarray('inward'))
+    hv=tmp_path/'hv'/'solution.npz';hv.parent.mkdir()
+    np.savez(hv,ids=np.asarray(ids),labels=np.array([0,0,1],np.uint8))
+    (hv.parent/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database=sha256_file(database),stage1=sha256_file(stage1))))))
+    features=tmp_path/'features.json'
+    features.write_text(json.dumps(dict(format='fiber-axial-priors',version=1,fibers_store_uuid='s',source_ids=ids,
+        agreement=[0,0,0],fibers_digest=fibers_digest(store),umbilicus_sha256=sha256_file(axis))))
+    cache=tmp_path/'tensors.npz'
+    prepare(dict(tensor_cache=str(cache),database=str(database),features=str(features),stage1=str(stage1),
+                 hv_solution=str(hv),fibers=str(store),umbilicus=str(axis)))
+    with np.load(cache) as d:
+        assert d['ids'].dtype.kind=='U' and d['ids'].tolist()==ids
+        assert d['source_id'].dtype.kind=='U' and d['source_id'].tolist()==ids
+        np.testing.assert_array_equal(d['source_index'],[0,1,2])
+        np.testing.assert_allclose(d['end'],lengths)
+        np.testing.assert_array_equal(d['event_ids'],[7,9,11])
+        assert [(d['source_id'][a],d['source_id'][b]) for a,b in zip(d['i'],d['j'])]==[(ids[0],ids[1]),(ids[1],ids[2]),(ids[0],ids[2])]
+        np.testing.assert_array_equal(d['parallel'],[False,False,True])
+    stats=json.loads(cache.with_suffix('.json').read_text())
+    assert stats['signature']['fibers']==fibers_digest(store) and stats['active_fibers']==3

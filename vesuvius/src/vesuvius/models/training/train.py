@@ -30,6 +30,7 @@ from vesuvius.models.training.save_checkpoint import (
 )
 
 from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
@@ -307,11 +308,7 @@ class BaseTrainer:
         # is lazy: without this check the failure escapes the try/except below
         # and surfaces as TritonMissing at the first forward pass (e.g. on
         # Windows, where CUDA wheels do not bundle triton).
-        try:
-            from torch.utils._triton import has_triton
-        except ImportError:
-            has_triton = None
-        if has_triton is not None and not has_triton():
+        if not has_triton():
             if not self.is_distributed or self.rank == 0:
                 print(
                     "torch.compile requires a working triton installation, "

@@ -437,6 +437,7 @@ the second output.
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
+| `--chunk-cache-size` | Decoded source chunks retained per worker; default `0` disables caching. RAM use scales with chunk dimensions, dtype, selected depth, and worker count. Concurrent threads share pending reads. |
 | `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |

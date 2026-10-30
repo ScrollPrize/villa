@@ -60,7 +60,7 @@ def select(d,sol,config,gt_ids,curves,z_range,confidence):
     gt=np.isin(d['source_id'],gt_ids)
     span_owners=[];arc_pairs=[]
     for i,sid in enumerate(d['source_id']):
-        for lo,hi in z_spans(curves[int(sid)][1],z_range):
+        for lo,hi in z_spans(curves[str(sid)][1],z_range):
             lo=max(lo,d['start'][i]);hi=min(hi,d['end'][i])
             if hi>lo:span_owners.append(i);arc_pairs.append((lo,hi))
     owners=np.asarray(span_owners,int)
@@ -74,20 +74,20 @@ def select(d,sol,config,gt_ids,curves,z_range,confidence):
     active=((probability>=confidence)&inside)|gt
     active=anchored_mask(d,np.flatnonzero(gt),active)
     keep=active|gt
-    records=[dict(source_id=int(s),probability=float(probability[i]),in_h_range=bool(inside[i]),
+    records=[dict(source_id=str(s),probability=float(probability[i]),in_h_range=bool(inside[i]),
                   selected=bool(keep[i]),gt=bool(gt[i])) for i,s in enumerate(d['source_id'])]
-    return set(map(int,d['source_id'][keep&~gt])),dict(gt_h_winding_ranges=h_ranges.tolist(),
+    return set(map(str,d['source_id'][keep&~gt])),dict(gt_h_winding_ranges=h_ranges.tolist(),
         input_fibers=len(gt),selected_ordinary=int((keep&~gt).sum()),records=records)
 
 
 def warm_state(d,old_d,old_sol,config):
     """Carry exact old anchors; initialize new neighbors using geometric votes."""
-    lookup={int(s):i for i,s in enumerate(old_d['source_id'])}
+    lookup={str(s):i for i,s in enumerate(old_d['source_id'])}
     n=len(d['family']);state=np.column_stack((np.zeros(n),d['phase'],d['z'],np.full(n,4.))).astype(float)
-    known=np.array([int(s) in lookup for s in d['source_id']])
+    known=np.array([str(s) in lookup for s in d['source_id']])
     for i,s in enumerate(d['source_id']):
         if known[i]:
-            j=lookup[int(s)];state[i]=old_sol['state'][j]
+            j=lookup[str(s)];state[i]=old_sol['state'][j]
             state[i,1]=old_sol['straight_anchor_u'][j];state[i,2]=old_sol['straight_anchor_v'][j]
     _,query=map_geometry(old_d,old_sol,config)
     widths=torch.as_tensor(old_sol['widths'],dtype=torch.float64)
@@ -99,7 +99,7 @@ def warm_state(d,old_d,old_sol,config):
         edges=np.flatnonzero(~known[a]&known[b]&(d['sign']!=0))
         if not len(edges):continue
         aa,bb=a[edges],b[edges]
-        old_ids=np.array([lookup[int(s)] for s in d['source_id'][bb]])
+        old_ids=np.array([lookup[str(s)] for s in d['source_id'][bb]])
         qb,vb=query(old_ids,d['start'][bb]+db[edges]*np.sign(d['node_ds'][bb,-1]))
         # Measurement only seeds the optimizer, never becomes a frozen assignment.
         delta=d['sign'][edges]*d['distance'][edges]*config.get('lasagna_winding_scale',1.)
@@ -122,18 +122,18 @@ def run(settings):
         return finish_existing(settings)
     from .fiber_workflows import run as dispatch
     from .fiber_gt_constraint_score import run as extract_cross
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines,write_afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog,fiber_volume,fibers_digest,read_polylines,write_fibers
     torch.set_num_threads(4)
     started=time.monotonic();root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     seed=Path(settings['seed_solve']);cfg=clean_config(json.loads((seed/'config.json').read_text()))
-    paths=[seed/'solution.npz',seed/'config.json',Path(settings['parent_tensors']),Path(settings['afv']),Path(__file__)]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+    paths=[seed/'solution.npz',seed/'config.json',Path(settings['parent_tensors']),Path(__file__)]
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},fibers=fibers_digest(settings['fibers']))
     stamp=root/'inputs.json'
     if stamp.exists():
         prior=json.loads(stamp.read_text())
         old_inputs={k:v for k,v in prior['inputs'].items() if k!=str(Path(__file__))}
         new_inputs={k:v for k,v in signature['inputs'].items() if k!=str(Path(__file__))}
-        if prior['settings']!=signature['settings'] or old_inputs!=new_inputs:
+        if prior['settings']!=signature['settings'] or old_inputs!=new_inputs or prior['fibers']!=signature['fibers']:
             raise ValueError('Expansion inputs changed; use a new directory')
         if prior!=signature:
             revisions=root/'resume_code_revisions.json'
@@ -145,25 +145,20 @@ def run(settings):
     parent=arrays(settings['parent_tensors'])
     parent,_=soft.constraint_family_filter(parent,True)
     if len(np.unique(parent['source_id']))!=len(parent['source_id']):raise ValueError('Whole-fiber parent required')
-    with uv._ro(settings['afv']) as db:
-        eligible=np.array([r[0] for r in db.execute('SELECT id FROM fibers WHERE max_z >= ? AND min_z <= ?',settings['z_range'])])
+    volume=fiber_volume(settings['fibers']);zlo,zhi=settings['z_range']
+    eligible=np.asarray([r['id'] for r in fiber_catalog(settings['fibers'],volume)
+                         if r['bbox'] is not None and r['bbox'][5]>=zlo and r['bbox'][2]<=zhi],dtype=str)
     # Cheap Z bounding selection only; exact physical slab spans are checked later.
     parent=induced_graph(parent,eligible,cfg)
     previous_d=arrays(cfg['tensor_cache']);previous=arrays(seed/'solution.npz')
-    old_gt=np.asarray(cfg['force_keep_source_ids'])
+    old_gt=np.asarray(cfg['force_keep_source_ids'],dtype=str)
     gtroot=Path(settings['gt_root']);gcfg=json.loads((gtroot/'uv_whole/config.json').read_text());gd=arrays(gcfg['tensor_cache'])
-    if len(old_gt)!=len(gd['source_id']):raise ValueError('GT mapping mismatch')
-    with uv._ro(settings['afv']) as db:max_id=db.execute('SELECT MAX(id) FROM fibers').fetchone()[0]
-    gt_ids=np.arange(max_id+1,max_id+1+len(old_gt),dtype=np.int64)
-    for a,b in zip(old_gt,gt_ids):previous_d['source_id'][previous_d['source_id']==a]=b
-    previous['source_id']=previous_d['source_id'].copy()
-    atomic_write(root/'gt_ids.json',dict(original=gd['source_id'].tolist(),old_solve=old_gt.tolist(),new=gt_ids.tolist()),durable=False)
-    gt_curves=list(read_afv_polylines(gcfg['afv'],gd['source_id']))
-    mapping=dict(zip(map(int,gd['source_id']),map(int,gt_ids)))
-    curves={mapping[int(r['id'])]:(dict(r,id=mapping[int(r['id'])]),x) for r,x in gt_curves}
+    gt_ids=np.asarray(gd['source_id'],dtype=str)
+    if not np.array_equal(np.sort(old_gt),np.sort(gt_ids)):raise ValueError('GT fiber mismatch')
+    curves={r['id']:(r,x) for r,x in read_polylines(gcfg['fibers'],gt_ids,volume=volume)}
     def load_curves(ids):
-        missing=[int(s) for s in ids if int(s) not in curves]
-        for row,xyz in read_afv_polylines(settings['afv'],missing) if missing else []:curves[int(row['id'])]=(row,xyz)
+        missing=sorted({str(s) for s in ids}-set(curves))
+        for row,xyz in read_polylines(settings['fibers'],missing,volume=volume) if missing else []:curves[row['id']]=(row,xyz)
     load_curves(previous_d['source_id'])
     selected,selection=select(previous_d,previous,cfg,gt_ids,curves,settings['z_range'],settings.get('confidence',.5))
     history=[];seen=[];stable=0
@@ -177,7 +172,7 @@ def run(settings):
             return cached_d,arrays(folder/'solve/solution.npz'),sc
         d=induced_graph(parent,sorted(sources),cfg)
         load_curves(sources)
-        candidate_cfg=dict(cfg,afv=settings['afv'],tensor_cache=str(folder/'ordinary.npz'))
+        candidate_cfg=dict(cfg,fibers=settings['fibers'],tensor_cache=str(folder/'ordinary.npz'))
         np.savez(folder/'ordinary.npz',**d)
         atomic_write(folder/'candidate_config.json',{'fiber_uv_layout':candidate_cfg},durable=False)
         cross=folder/'cross'
@@ -192,21 +187,21 @@ def run(settings):
                 threads=settings.get('threads',128),events_only=True,
                 native_binary=settings.get('native_binary','vc_fiber_constraints')))
         events=remap_events(json.loads((cross/'cross_events.json').read_text())['events'],d)
-        merged,_,_=combine(d,gd,events,cfg,gt_source_ids=gt_ids)
+        merged,_,_=combine(d,gd,events,cfg)
         merged,_=perpendicular_supported_graph(merged,cfg)
         if not np.isin(gt_ids,merged['source_id']).all():raise ValueError('GT lost perpendicular support')
         load_curves(merged['source_id'])
-        afv=folder/'fibers.afv'
-        if not afv.exists():write_afv(settings['afv'],afv,[curves[int(s)] for s in merged['source_id']],dict(source='iterative_GT_neighbor_expansion'))
+        store=folder/'fibers.vcobj'
+        if not store.exists():write_fibers(store,[curves[str(s)] for s in merged['source_id']],volume=volume)
         tensor=folder/'tensors.npz';np.savez(tensor,**merged)
         state=warm_state(merged,old_d,old_sol,cfg);state[np.isin(merged['source_id'],gt_ids),3]=100.
         init=folder/'init';init.mkdir(exist_ok=True)
         np.savez(init/'solution.npz',state=state,widths=old_sol['widths'],**{k:merged[k] for k in ('source_id','start','end','family')})
-        config=dict(cfg,afv=str(afv),tensor_cache=str(tensor),initial_solution=str(init/'solution.npz'),
+        config=dict(cfg,fibers=str(store),tensor_cache=str(tensor),initial_solution=str(init/'solution.npz'),
             output_root=str(folder/'solve'),force_keep_source_ids=gt_ids.tolist(),devices=settings.get('devices','0'))
         config.pop('freeze_source_ids',None);config.pop('freeze_widths',None)
         if frozen is not None:
-            config.update(freeze_source_ids=np.intersect1d(list(frozen),merged['source_id']).tolist(),freeze_widths=True)
+            config.update(freeze_source_ids=np.intersect1d(np.asarray(sorted(frozen),dtype=str),merged['source_id']).tolist(),freeze_widths=True)
         config['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False,label='iterative-GT-neighbor-expansion')
         np.savez(init/'samples.npz',**soft.prepare_samples(config,merged))
         atomic_write(init/'config.json',dict(tensor_sha256=sha256_file(tensor),soft_samples=str(init/'samples.npz')),durable=False)
@@ -216,10 +211,10 @@ def run(settings):
         if not np.all(sol['state'][np.isin(merged['source_id'],gt_ids),3]==100):raise ValueError('GT was disabled')
         if frozen is not None:
             if not np.allclose(sol['widths'],old_sol['widths'],rtol=1e-12,atol=1e-8):raise ValueError('Conditional widths changed')
-            lookup={int(s):i for i,s in enumerate(old_d['source_id'])}
+            lookup={str(s):i for i,s in enumerate(old_d['source_id'])}
             for i,s in enumerate(merged['source_id']):
-                if int(s) not in frozen:continue
-                j=lookup[int(s)]
+                if str(s) not in frozen:continue
+                j=lookup[str(s)]
                 if not np.allclose(sol['state'][i,[0,3]],old_sol['state'][j,[0,3]],rtol=0,atol=1e-10):raise ValueError('Frozen state moved')
                 for k in ('straight_anchor_u','straight_anchor_v'):
                     if not np.allclose(sol[k][i],old_sol[k][j],rtol=0,atol=1e-8):raise ValueError('Frozen geometry moved')
@@ -231,10 +226,10 @@ def run(settings):
         # Expand only via signed constraints from the currently retained set.
         active=np.isin(parent['source_id'],sorted(selected));signed=parent['sign']!=0
         edge=signed&(active[parent['i']]|active[parent['j']])
-        candidates=set(map(int,np.r_[parent['source_id'][parent['i'][edge]],parent['source_id'][parent['j'][edge]]]))|selected
+        candidates=set(map(str,np.r_[parent['source_id'][parent['i'][edge]],parent['source_id'][parent['j'][edge]]]))|selected
         print(json.dumps(dict(round=round_id,selected=len(selected),candidates=len(candidates),new_candidates=len(candidates-selected))),flush=True)
         if candidates-selected:
-            cd,cs,cc=solve_graph(rr/'conditional',candidates,previous_d,previous,selected|set(map(int,gt_ids)))
+            cd,cs,cc=solve_graph(rr/'conditional',candidates,previous_d,previous,selected|set(map(str,gt_ids)))
         else:cd,cs,cc=previous_d,previous,cfg
         filtered,audit=select(cd,cs,cc,gt_ids,curves,settings['z_range'],settings.get('confidence',.5))
         atomic_write(rr/'conditional_selection.json',audit,durable=False)
@@ -260,8 +255,8 @@ def run(settings):
         if termination!='round_limit':break
     # Ordinary-only export is compatible with the established selected dataset runner.
     export=induced_graph(parent,sorted(selected),cfg);np.savez(root/'tensors.npz',**export)
-    path=root/'selected.afv'
-    if not path.exists():write_afv(settings['afv'],path,[curves[s] for s in sorted(selected)],dict(source='iterative_GT_selected',gt_assisted=True))
+    path=root/'selected.vcobj'
+    if not path.exists():write_fibers(path,[curves[s] for s in sorted(selected)],volume=volume)
     cross=root/'cross';cross.mkdir(exist_ok=True)
     final_events=json.loads((Path(history[-1]['solve']).parent/'cross/cross_events.json').read_text())['events']
     atomic_write(cross/'cross_events.json',dict(events=remap_events(final_events,export)),durable=False)

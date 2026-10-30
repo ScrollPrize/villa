@@ -24,8 +24,8 @@ int main()
         const std::vector<Op> operations{multiply, Flip{"x", 1., 1.}};
         Pipeline cpu(operations, {{"image",image}}, true, "cpu");
         Pipeline gpu(operations, {{"image",image}}, true, "cuda");
-        auto expected = cpu.run(input, 42, true, false);
-        auto result = gpu.run(input, 42, true, false);
+        auto expected = cpu.run(input, 42, true);
+        auto result = gpu.run(input, 42, true);
         require(std::memcmp(expected.sample.at("image").array.data(), result.sample.at("image").array.data(),
                             12*sizeof(float)) == 0, "CUDA transform values differ from CPU");
         auto replay = gpu.replay(input, load_plan(gpu.program(), save_plan(result.plan)));

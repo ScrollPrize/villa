@@ -85,22 +85,6 @@ void AgentBridgeServer::registerSeedingHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("seeding.preview_rays"),
-            .errors = {-32000, -32001, -32007, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_preview_rays")),
-        },
-        [this](const QJsonValue& p) { return handleSeedingPreviewRays(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("seeding.cast_rays"),
-            .errors = {-32000, -32001, -32007, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_cast_rays")),
-        },
-        [this](const QJsonValue& p) { return handleSeedingCastRays(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("seeding.reset_points"),
             .errors = {-32000, -32001, -32010},
             .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_reset_points")),
@@ -204,7 +188,8 @@ void AgentBridgeServer::registerSeedingHandlers()
                     QStringLiteral("paramOverrides"),
                     {})),
                 Params::optionalInteger(QStringLiteral("ompThreads")),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("sourceTag"), QStringLiteral("paths")),
+                Params::optionalString(QStringLiteral("outputTag"), QStringLiteral("traces")),
             },
             .errors = {
                 -32602, -32000, -32004, -32005, -32006, -32007, -32009,

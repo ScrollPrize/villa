@@ -10,7 +10,7 @@ from .fiber_gt_constraint_score import arrays,piece_at,event_residuals,enabled_l
 
 
 def remap_events(events,d):
-    sources=set(map(int,d['source_id']));result=[]
+    sources=set(map(str,d['source_id']));result=[]
     for event in events:
         if event['test_source'] not in sources:continue
         piece=piece_at(d,event['test_source'],event['test_arc'])
@@ -25,7 +25,7 @@ def initialization_config(template, config, output, initial=None):
     result={k:v for k,v in template.items() if not (
         k.startswith(('reference_', 'fixed_reference', 'executed_')) or
         k.endswith('_sha256') or k in ('code_provenance','initial_solution','soft_samples'))}
-    for key in ('tensor_cache','afv','umbilicus','devices','gpu_manager','layout_mode','filter_constraint_families'):
+    for key in ('tensor_cache','fibers','umbilicus','devices','gpu_manager','layout_mode','filter_constraint_families'):
         result[key]=config[key]
     result.update(output_root=str(output))
     if initial is not None:result['initial_solution']=str(initial)
@@ -54,7 +54,7 @@ def checkpoint_scores(settings):
     _,_,gkeep,gpick=uv.hard_assignment(gs['state'],len(gs['widths']),gcfg,best_nonbroken=True)
     if not gkeep.all():raise ValueError('Trusted GT disabled')
     for e in events:
-        if int(gd['source_id'][e['gt_piece']])!=e['gt_source']:raise ValueError('GT event identity mismatch')
+        if str(gd['source_id'][e['gt_piece']])!=e['gt_source']:raise ValueError('GT event identity mismatch')
     parallel=np.array([e['parallel'] for e in events]);owner=np.array([e['test_piece'] for e in events])
     rows=[]
     for record in json.loads((root/'solve/history.json').read_text()):
@@ -82,17 +82,17 @@ def run(settings):
     from .fiber_workflows import run as dispatch
     from .fiber_implicit_match_report import run as match_report
     from .fiber_uv_arc_phase import event_arc_points
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest,read_polylines
     started=time.monotonic();root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     dataset=Path(settings['dataset']);base_path=Path(settings['base_config'])
     config=json.loads(base_path.read_text())['fiber_implicit_winding']
     config.update(settings.get('parameters',{}))
     parent=arrays(dataset/'tensors.npz')
-    curves=read_afv_polylines(dataset/'selected.afv');sources=np.array([r['id'] for r,_ in curves])
+    curves=read_polylines(dataset/'selected.vcobj');sources=np.asarray([r['id'] for r,_ in curves],dtype=str)
     if len(sources)!=len(np.unique(sources)):raise ValueError('Duplicate selected source')
-    for (row,xyz),(original,points) in zip(curves,read_afv_polylines(config['afv'],sources)):
+    for (row,xyz),(original,points) in zip(curves,read_polylines(config['fibers'],sources)):
         if row['id']!=original['id'] or not np.array_equal(xyz,points):raise ValueError('Changed selected geometry')
-    paths=[base_path,dataset/'selected.afv',dataset/'tensors.npz',dataset/'cross/cross_events.json',Path(__file__),Path(soft.__file__),Path(config['afv']),Path(config['umbilicus'])]
+    paths=[base_path,dataset/'tensors.npz',dataset/'cross/cross_events.json',Path(__file__),Path(soft.__file__),Path(config['umbilicus'])]
     gtroot=Path(settings['gt_root']);gcfg_path=gtroot/'uv_whole/config.json'
     gcfg=json.loads(gcfg_path.read_text())
     paths += [gcfg_path,gtroot/'uv_whole/solution.npz',Path(gcfg['tensor_cache'])]
@@ -109,7 +109,8 @@ def run(settings):
     if width_source and settings.get('initialization_stages'):
         raise ValueError('Width diagnostic requires fresh fiber state')
     if width_source.get('solution'):paths.append(Path(width_source['solution']))
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
+                   fibers=dict(selected=fibers_digest(dataset/'selected.vcobj'),source=fibers_digest(config['fibers'])))
     stamp=root/'inputs.json'
     if stamp.exists() and json.loads(stamp.read_text())!=signature:raise ValueError('Changed evaluation inputs/code')
     atomic_write(stamp,signature,durable=False)
@@ -239,7 +240,7 @@ def score_completed(settings,initialization=None,stages=None,started=None):
     events=remap_events(json.loads((dataset/'cross/cross_events.json').read_text())['events'],d)
     gd=arrays(gcfg['tensor_cache']);gs=arrays(gtroot/'uv_whole/solution.npz')
     for event in events:
-        if int(d['source_id'][event['test_piece']])!=event['test_source'] or int(gd['source_id'][event['gt_piece']])!=event['gt_source']:
+        if str(d['source_id'][event['test_piece']])!=event['test_source'] or str(gd['source_id'][event['gt_piece']])!=event['gt_source']:
             raise ValueError('Cross-event source identity mismatch')
     _,_,gkeep,gpick=uv.hard_assignment(gs['state'],len(gs['widths']),gcfg,best_nonbroken=True)
     if not gkeep.all():raise ValueError('GT must retain every manual reference')
