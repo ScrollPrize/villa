@@ -30,6 +30,8 @@ struct ViewerLevels {
     std::array<double, 3> voxelExtent(int level) const;
     // `level` for vcr::grid: working level-0 XYZ points to its indices.
     vcr::grid::Level gridLevel(int level) const;
+    // The relative size of one working level-0 voxel along X, Y, Z, finest axis 1.
+    std::array<float, 3> vertexSpacing() const;
 };
 
 // Opens every present working level of `volume`. Levels that fail to open are absent.
@@ -47,8 +49,8 @@ int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, in
 
 // The vertex grid of a QuadSurface for vcr::grid, with its interpolation mode,
 // quad validity and components. It views the surface's points: rebuild it after
-// any edit.
-std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface);
+// any edit. Normals and layer offsets are taken in the levels' voxel spacing.
+std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface, const std::array<float, 3>& spacing = {1, 1, 1});
 
 // What a frame samples: a plane, or a raster over a grid surface.
 struct ViewerGeometry {

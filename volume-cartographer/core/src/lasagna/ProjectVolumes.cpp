@@ -2,6 +2,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -34,11 +35,7 @@ bool isDigits(std::string_view value)
 
 bool isLocalZarrRoot(const std::filesystem::path& path)
 {
-    return path.extension() == ".zarr" ||
-           std::filesystem::exists(path / ".zarray") ||
-           std::filesystem::exists(path / ".zgroup") ||
-           std::filesystem::exists(path / ".zattrs") ||
-           std::filesystem::exists(path / "zarr.json");
+    return path.extension() == ".zarr" || vcr::zarr::isLocalZarrNode(path);
 }
 
 std::filesystem::path localAttachmentRoot(const LasagnaChannelGroup& group)

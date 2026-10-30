@@ -25,6 +25,18 @@ bool ViewerLevels::has(int level) const
     return level >= 0 && level < count() && levels[std::size_t(level)].array;
 }
 
+std::array<float, 3> ViewerLevels::vertexSpacing() const
+{
+    for (const auto& l : levels) {
+        if (!l.array)
+            continue;
+        const auto& scale = l.working.scale;  // ZYX
+        const double finest = std::min({scale[0], scale[1], scale[2]});
+        return {float(scale[2] / finest), float(scale[1] / finest), float(scale[0] / finest)};
+    }
+    return {1, 1, 1};
+}
+
 std::array<double, 3> ViewerLevels::voxelExtent(int level) const
 {
     const auto& l = levels[std::size_t(level)];
@@ -106,15 +118,17 @@ int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, in
     return lastLevel - startLevel;
 }
 
-std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface)
+std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface, const std::array<float, 3>& spacing)
 {
     const auto* points = surface.rawPointsPtr();
     if (!points || points->empty())
         return nullptr;
+    auto options = surface.gridOptions();
+    options.spacing = spacing;
     return std::make_shared<const vcr::grid::Surface>(
         vcr::grid::Vertices{reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
                             points->step1()},
-        surface.gridOptions());
+        std::move(options));
 }
 
 vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const

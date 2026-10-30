@@ -204,23 +204,22 @@ vcr::zarr::OpenedArray openPooledPredictionArray(
         source=sources[identity].lock();
         if(!source) {source=std::make_shared<Source>(root,sourceConfig,cache);sources[identity]=source;}
     }
-    const auto meta=readJson(path/".zarray");
-    if(meta.at("dtype")!=(channel==3?"<f4":"|u1"))
-        throw std::runtime_error("native pooled view dtype mismatch");
-    if(!meta.at("compressor").is_null() || !meta.at("filters").is_null() ||
-       meta.at("order")!="C" || meta.at("dimension_separator")!="/")
-        throw std::runtime_error("native pooled view requires raw C-order metadata");
-    for(size_t d=0;d<3;++d)
-        if(meta.at("shape")[d]!=(source->shape[d]+1)/2 || meta.at("chunks")[d]!=source->chunk[d]/2)
-            throw std::runtime_error("native pooled view geometry mismatch");
     vcr::zarr::OpenedArray opened;
     opened.location=path.string();
-    opened.meta=vcr::zarr::parseArrayMeta(meta);
+    opened.meta=vcr::zarr::parseArrayMeta(readJson(path/".zarray"));
+    const auto& meta=opened.meta;
+    if(meta.dtype!=(channel==3?"<f4":"|u1"))
+        throw std::runtime_error("native pooled view dtype mismatch");
+    if(!meta.compressor.is_null() || !meta.filters.is_null() || meta.order!="C" || meta.separator!="/")
+        throw std::runtime_error("native pooled view requires raw C-order metadata");
+    for(size_t d=0;d<3;++d)
+        if(meta.shape[d]!=std::int64_t((source->shape[d]+1)/2) || meta.chunks[d]!=std::int64_t(source->chunk[d]/2))
+            throw std::runtime_error("native pooled view geometry mismatch");
     vcr::computed::Options options;
     options.shape=opened.meta.shape;
     options.chunks=opened.meta.chunks;
     options.dtype=opened.meta.dtype;
-    options.fillValue=meta.at("fill_value");
+    options.fillValue=meta.raw.at("fill_value");
     // The memory-cache namespace of the view's chunks.
     options.identity=identity+"/top2_spatial_comp/v1/"+name;
     options.memoryCache=std::move(cache);

@@ -167,6 +167,19 @@ TEST_CASE("pixels outside the volume read as fill and are not read in the backgr
     CHECK(r.values[0] == float(f.at0(3, 3, 28)));
 }
 
+TEST_CASE("vertex spacing is the working level's voxel shape")
+{
+    Fixture f;
+    OpenedVolumes opened(64 << 20);
+    auto levels = *openLevels(opened, *f.volume);
+    REQUIRE(levels.count() > 0);
+    CHECK(levels.vertexSpacing() == std::array<float, 3>{1, 1, 1});
+    levels.levels[0].working.scale = {4, 4, 4};
+    CHECK(levels.vertexSpacing() == std::array<float, 3>{1, 1, 1});
+    levels.levels[0].working.scale = {1, 2, 4};  // ZYX
+    CHECK(levels.vertexSpacing() == std::array<float, 3>{4, 2, 1});
+}
+
 TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites reduce its layers")
 {
     Fixture f;

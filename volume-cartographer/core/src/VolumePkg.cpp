@@ -23,6 +23,7 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
+#include <vc_reader/zarr.hpp>
 
 namespace fs = std::filesystem;
 
@@ -75,25 +76,17 @@ std::string asciiLower(std::string value)
     return value;
 }
 
-bool hasZarrMarkerAtRoot(const fs::path& dir)
-{
-    return fs::exists(dir / ".zarray")
-        || fs::exists(dir / ".zgroup")
-        || fs::exists(dir / ".zattrs")
-        || fs::exists(dir / "zarr.json");
-}
-
 bool isSingleZarrVolumeDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
-    if (fs::exists(dir / ".zarray") || fs::exists(dir / "zarr.json"))
+    if (vcr::zarr::isLocalZarrArray(dir))
         return true;
     bool meta = fs::exists(dir / "meta.json")
              || fs::exists(dir / "metadata.json")
-             || hasZarrMarkerAtRoot(dir);
+             || vcr::zarr::isLocalZarrNode(dir);
     if (!meta) return false;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.is_directory() && hasZarrMarkerAtRoot(e.path())) return true;
+        if (e.is_directory() && vcr::zarr::isLocalZarrNode(e.path())) return true;
     }
     return false;
 }

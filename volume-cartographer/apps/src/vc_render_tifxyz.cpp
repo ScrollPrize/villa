@@ -1368,11 +1368,11 @@ int main(int argc, char *argv[])
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
-                if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
+                if (!vcr::zarr::isLocalZarrArray(std::filesystem::path(zarrOutputArg) / "0")) {
                     logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return false;
                 }
                 dsOut = std::make_unique<vcr::zarr::Writer>(vcr::zarr::Writer::open(outFilePath / "0"));
-            } else if (resumeFlag && std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
+            } else if (resumeFlag && vcr::zarr::isLocalZarrArray(std::filesystem::path(zarrOutputArg) / "0")) {
                 dsOut = std::make_unique<vcr::zarr::Writer>(vcr::zarr::Writer::open(outFilePath / "0"));
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {

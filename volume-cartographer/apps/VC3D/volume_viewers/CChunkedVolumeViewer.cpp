@@ -615,6 +615,7 @@ void CChunkedVolumeViewer::setPinnedSurfaceY(std::optional<float> surfaceY)
 void CChunkedVolumeViewer::openLevels()
 {
     _levels.reset();
+    _gridSurface.reset();  // its normals follow the levels' voxel spacing
     _lastRenderResult.reset();
     if (!_volume || !_state || !_state->openedVolumes())
         return;
@@ -1824,7 +1825,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     // The surface's vertex grid, rebuilt after every edit of the surface.
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         if (!_gridSurface || _gridSurfaceFor != quad)
-            _gridSurface = vc3d::gridSurface(*quad);
+            _gridSurface = vc3d::gridSurface(*quad, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
         _gridSurfaceFor = quad;
     } else {
         _gridSurface.reset();

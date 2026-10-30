@@ -92,12 +92,13 @@ server requires clearing its old cache, as does changing data behind an HTTP URL
   POSIX-only. Uploads are deliberately outside this read-only feature.
 
 ```sh
-cmake --build volume-cartographer/build --target VC3D vc_volume test_sftp_fetch test_remote_url test_remote_file_cache test_unified_browser_dialog test_chunk_cache test_chunk_cache_persist -j8
-ctest --test-dir volume-cartographer/build -R '^(test_(sftp_fetch|remote_url|remote_file_cache|chunk_cache|chunk_cache_persist)|python_sftp_volume|unified_browser_dialog)$' --output-on-failure
+cmake --build volume-cartographer/build --target VC3D test_remote_url test_remote_file_cache test_unified_browser_dialog -j16
+ctest --test-dir volume-cartographer/build -R '^(test_(remote_url|remote_file_cache)|unified_browser_dialog)$' --output-on-failure
+cmake --build vc_reader/build-native-cuda --target test_native_sftp -j16
+ctest --test-dir vc_reader/build-native-cuda -R '^test_native_sftp$' --output-on-failure
 ```
 
-The Python test is registered when `VC_BUILD_PYTHON=ON` and requires NumPy.
-It reports a CTest skip on Windows or when no POSIX OpenSSH SFTP server is
-installed; the protocol-level C++ fixture does not require that server.
+SFTP reads are vc_reader's and are tested there; `test_native_sftp`'s protocol
+fixture does not require an installed OpenSSH SFTP server.
 
 Protocol reference: [SFTP v3 specification](https://www.openssh.org/txt/draft-ietf-secsh-filexfer-02.txt).
