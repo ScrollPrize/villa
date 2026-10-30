@@ -13,6 +13,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 
@@ -185,6 +186,10 @@ class _CompiledWithEagerFallback(nn.Module):
             return self.model(*args, **kwargs)
 
 
+def _uses_cuda(model: nn.Module) -> bool:
+    return any(parameter.is_cuda for parameter in model.parameters())
+
+
 def maybe_compile_model(
     model: nn.Module,
     *,
@@ -203,6 +208,11 @@ def maybe_compile_model(
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         LOGGER.warning("torch.compile is unavailable; continuing eagerly")
+        return model, False
+    if _uses_cuda(model) and not has_triton():
+        # Inductor needs Triton for CUDA kernels. Without it (e.g. native Windows),
+        # compilation only fails at the first forward, after tracing has been paid for.
+        LOGGER.info("Triton is not installed; skipping torch.compile for the CUDA model")
         return model, False
     try:
         compiled_model = compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False)

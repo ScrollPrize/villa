@@ -1,6 +1,7 @@
 #include "SegmentationHeaderRow.hpp"
 
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QSignalBlocker>
@@ -25,13 +26,24 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
 
     _chkDrawMask = new QCheckBox(tr("Draw mask"), this);
     _chkDrawMask->setToolTip(tr("Right-drag on the surface view to mark grid cells invalid in the surface."));
+    _spinMaskBrushRadius = new QDoubleSpinBox(this);
+    _spinMaskBrushRadius->setDecimals(0);
+    _spinMaskBrushRadius->setRange(1.0, 1000.0);
+    _spinMaskBrushRadius->setSingleStep(1.0);
+    _spinMaskBrushRadius->setPrefix(tr("Radius "));
+    _spinMaskBrushRadius->setToolTip(tr("Draw mask brush radius in voxels."));
+    auto* drawMaskLayout = new QHBoxLayout();
+    drawMaskLayout->setContentsMargins(0, 0, 0, 0);
+    drawMaskLayout->addWidget(_chkDrawMask);
+    drawMaskLayout->addWidget(_spinMaskBrushRadius);
+    drawMaskLayout->addStretch(1);
 
     _lblStatus = new QLabel(this);
     _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
     checkLayout->addWidget(_chkAnnotate);
     checkLayout->addWidget(_chkEditing);
-    checkLayout->addWidget(_chkDrawMask);
+    checkLayout->addLayout(drawMaskLayout);
     layout->addLayout(checkLayout);
     layout->addSpacing(8);
     layout->addWidget(_lblStatus, 1);
@@ -39,6 +51,9 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
     connect(_chkAnnotate, &QCheckBox::toggled, this, &SegmentationHeaderRow::annotateToggled);
     connect(_chkEditing, &QCheckBox::toggled, this, &SegmentationHeaderRow::editingToggled);
     connect(_chkDrawMask, &QCheckBox::toggled, this, &SegmentationHeaderRow::drawMaskToggled);
+    connect(_spinMaskBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        emit maskBrushRadiusChanged(static_cast<float>(value));
+    });
 }
 
 void SegmentationHeaderRow::setEditingChecked(bool checked)
@@ -50,11 +65,6 @@ void SegmentationHeaderRow::setEditingChecked(bool checked)
     _chkEditing->setChecked(checked);
 }
 
-bool SegmentationHeaderRow::isEditingChecked() const
-{
-    return _chkEditing && _chkEditing->isChecked();
-}
-
 void SegmentationHeaderRow::setAnnotateChecked(bool checked)
 {
     if (!_chkAnnotate) {
@@ -62,11 +72,6 @@ void SegmentationHeaderRow::setAnnotateChecked(bool checked)
     }
     const QSignalBlocker blocker(_chkAnnotate);
     _chkAnnotate->setChecked(checked);
-}
-
-bool SegmentationHeaderRow::isAnnotateChecked() const
-{
-    return _chkAnnotate && _chkAnnotate->isChecked();
 }
 
 void SegmentationHeaderRow::setDrawMaskChecked(bool checked)
@@ -78,9 +83,13 @@ void SegmentationHeaderRow::setDrawMaskChecked(bool checked)
     _chkDrawMask->setChecked(checked);
 }
 
-bool SegmentationHeaderRow::isDrawMaskChecked() const
+void SegmentationHeaderRow::setMaskBrushRadius(float radius)
 {
-    return _chkDrawMask && _chkDrawMask->isChecked();
+    if (!_spinMaskBrushRadius) {
+        return;
+    }
+    const QSignalBlocker blocker(_spinMaskBrushRadius);
+    _spinMaskBrushRadius->setValue(static_cast<double>(radius));
 }
 
 void SegmentationHeaderRow::setStatusText(const QString& text)

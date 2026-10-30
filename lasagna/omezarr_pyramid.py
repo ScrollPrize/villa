@@ -221,10 +221,15 @@ def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
 	return acc / np.maximum(cnt, 1.0)
 
 
-def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
 	if nx_u8.shape != ny_u8.shape:
 		raise ValueError(f"normal channel shape mismatch: nx={nx_u8.shape} ny={ny_u8.shape}")
 	nx, ny, nz = _decode_normals(nx_u8, ny_u8)
+	if validity is not None:
+		if validity.shape != nx.shape:
+			raise ValueError("normal validity shape mismatch")
+		valid = validity != 0
+		nx, ny, nz = (v * valid for v in (nx, ny, nz))
 	xx = _mean_pool2x_f32(nx * nx)
 	xy = _mean_pool2x_f32(nx * ny)
 	xz = _mean_pool2x_f32(nx * nz)

@@ -10,16 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Mapping
-
-OPEN_DATA_S3_ROOT = "s3://vesuvius-challenge-open-data"
-OPEN_DATA_HTTPS_ROOT = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
-
-# s3:// <-> https:// equivalences for the two public channels. These match the
-# rewrites used by the scrollprize.org data browser (src/data/atlasDataAccess.json).
-HTTPS_REWRITES: tuple[tuple[str, str], ...] = (
-    (OPEN_DATA_S3_ROOT + "/", OPEN_DATA_HTTPS_ROOT + "/"),
-    ("s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"),
-)
+from . import _catalog
 
 
 class ArtifactType:
@@ -69,33 +60,18 @@ _PYRAMID_GRID_LEVEL: dict[str, int | None] = {
 }
 
 
-def pyramid_sublevel(grid_level: int | None, volume_level: int) -> int | None:
-    """Catalog-convention sublevel; negative means finer than the artifact."""
-    return None if grid_level is None else volume_level - grid_level
-
-
 def join_url(root: str, path: str) -> str:
-    return root.rstrip("/") + "/" + path.lstrip("/")
+    return _catalog.join_url(root, path)
 
 
 def to_https(url: str) -> str | None:
-    """HTTPS form of ``url``, or None if no public HTTPS equivalent is known."""
-    if url.startswith(("https://", "http://")):
-        return url
-    for s3, https in HTTPS_REWRITES:
-        if url.startswith(s3):
-            return https + url[len(s3):]
-    return None
+    """Public HTTPS location resolved by the shared native catalog."""
+    return _catalog.to_https(url)
 
 
 def to_s3(url: str) -> str | None:
-    """``s3://`` form of ``url``, or None if it is not under a known bucket."""
-    if url.startswith("s3://"):
-        return url
-    for s3, https in HTTPS_REWRITES:
-        if url.startswith(https):
-            return s3 + url[len(https):]
-    return None
+    """``s3://`` form of ``url``, or None if it is not in a public channel."""
+    return _catalog.to_s3(url)
 
 
 @dataclass(frozen=True)
@@ -129,6 +105,12 @@ class Origin:
         return tuple(join_url(r.url, self.path) for r in self.access_roots)
 
 
+def _native_values(native) -> dict[str, Any]:
+    return dict(level=native.level, target=native.target_volume_id, model=native.model_id, url=native.url,
+                source_path=native.source_path, label_set=native.label_set, render_level=native.render_level,
+                arrays=tuple(native.arrays), supersedes=tuple(native.supersedes))
+
+
 @dataclass(frozen=True, eq=False)
 class Artifact:
     """One data entry of a sample, volume or segment."""
@@ -140,18 +122,30 @@ class Artifact:
     creation_info: Mapping[str, Any] | None = field(default=None, repr=False)
     id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    _parsed: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    def _native_values(self):
+        if not self._parsed:
+            native = _catalog.parse_artifacts([self.raw or dict(type=self.type,
+                parameters=dict(self.parameters), properties=dict(self.properties), origins=[
+                dict(path=o.path, access_roots=[dict(type=r.type, url=r.url, usage=r.usage) for r in o.access_roots])
+                for o in self.origins])])[0]
+            object.__setattr__(self, '_parsed', _native_values(native))
+        return self._parsed
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> Artifact:
-        return cls(
-            type=d.get("type") or "",
-            origins=tuple(Origin.from_json(o) for o in d.get("origins") or ()),
-            parameters=d.get("parameters") or {},
-            properties=d.get("properties") or {},
-            creation_info=d.get("creation_info"),
-            id=d.get("id"),
-            raw=d,
-        )
+        return cls.from_native(_catalog.parse_artifacts([d])[0])
+
+    @classmethod
+    def from_native(cls, native) -> Artifact:
+        d = native.raw
+        return cls(type=native.type,
+                   origins=tuple(Origin(o.path, tuple(AccessRoot(r.type, r.url, r.usage) for r in o.access_roots),
+                                        o.raw.get('copy_info')) for o in native.origins),
+                   parameters=native.parameters, properties=native.properties,
+                   creation_info=native.creation_info or None, id=d.get('id'), raw=d,
+                   _parsed=_native_values(native))
 
     def __repr__(self) -> str:
         params = ", ".join(f"{k}={v!r}" for k, v in self.parameters.items())
@@ -165,32 +159,36 @@ class Artifact:
         return self.origins[0].path if self.origins else None
 
     @property
-    def is_directory(self) -> bool:
-        """True for prefix artifacts (zarr stores, tifxyz folders, bundles)."""
-        return bool(self.path and self.path.endswith("/"))
-
-    @property
     def target_volume_id(self) -> str | None:
-        return self.parameters.get("target_volume")
+        return self._native_values()["target"]
 
     @property
     def model_id(self) -> str | None:
-        return self.parameters.get("model_id")
+        return self._native_values()["model"]
 
     @property
     def label_set(self) -> str | None:
-        return self.parameters.get("label_set")
+        return self._native_values()["label_set"] or None
 
     @property
     def render_level(self) -> int:
         """Pyramid level of ``target_volume`` a render was computed from (0 when absent)."""
-        return int(self.parameters.get("render_level") or 0)
+        return self._native_values()["render_level"] or 0
+
+    @property
+    def arrays(self) -> tuple[str, ...]:
+        """Label arrays of an ``ink-labels`` artifact (``properties.arrays``)."""
+        return self._native_values()["arrays"]
+
+    @property
+    def supersedes(self) -> tuple[str, ...]:
+        """Artifacts this one replaces (``properties.supersedes``)."""
+        return self._native_values()["supersedes"]
 
     @property
     def level(self) -> int | None:
         """``parameters.level``: the source pyramid level a volume prediction ran on."""
-        level = self.parameters.get("level")
-        return None if level is None else int(level)
+        return self._native_values()["level"]
 
     @property
     def grid_level(self) -> int | None:
@@ -218,17 +216,11 @@ class Artifact:
         None to keep the location's own scheme. The open-data bucket is
         preferred over other channels; otherwise metadata order is kept.
         """
-        convert = {"https": to_https, "s3": to_s3, None: lambda u: u}.get(scheme)
-        if convert is None:
+        if scheme not in ('https', 's3', None):
             raise ValueError(f"unknown scheme {scheme!r}; use 'https', 's3' or None")
-        ranked = []
-        for i, o in enumerate(self.origins):
-            for r in o.access_roots:
-                url = convert(join_url(r.url, o.path))
-                if url is not None:
-                    open_data = r.url.rstrip("/") in (OPEN_DATA_S3_ROOT, OPEN_DATA_HTTPS_ROOT)
-                    ranked.append((not open_data, i, url))
-        return min(ranked)[2] if ranked else None
+        values = self._native_values()
+        url = values['url'] if scheme == 'https' else values['source_path']
+        return (to_s3(url) if scheme == 's3' else url) or None
 
     @property
     def usage(self) -> tuple[str, ...]:
@@ -237,4 +229,4 @@ class Artifact:
 
 
 def parse_artifacts(entries: Any) -> tuple[Artifact, ...]:
-    return tuple(Artifact.from_json(e) for e in entries or ())
+    return tuple(Artifact.from_native(a) for a in _catalog.parse_artifacts(entries or []))

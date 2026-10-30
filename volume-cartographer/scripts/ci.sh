@@ -9,7 +9,6 @@
 #   ci.sh coverage [image]                                 # coverage report (in volume-cartographer/coverage/)
 #   ci.sh patch-coverage <base_ref> [image]                # diff-cover gate vs base_ref
 #   ci.sh coverage-regression <base_ref> [image]           # total-coverage non-regression vs base_ref
-#   ci.sh dead-code [image] [compiler]                     # unused-* warnings + linker --print-gc-sections report
 #
 # Environment knobs:
 #   PATCH_COVERAGE_MIN  minimum % required by `patch-coverage` (default 0)
@@ -311,24 +310,6 @@ cmd_coverage_regression() {
     fi
 }
 
-cmd_dead_code() {
-    local image=${1:-ubuntu-26.04}
-    local compiler=${2:-clang}
-    local build_dir="build/ci-dead-code-$compiler-$image"
-    cmd_builder "$image"
-    mkdir -p "$REPO_ROOT/dead-code"
-
-    # Build inside the container; capture full build log for compile-warning
-    # extraction. Then run nm-based analysis (approach B): symbols defined
-    # somewhere in our source .o files but absent from every final binary.
-    # pipefail required so the `tee` doesn't mask a failed cmake --build.
-    run_in_builder "$image" "$REPO_ROOT" "
-        set -o pipefail &&
-        cmake --preset ci-dead-code-$compiler &&
-        cmake --build --preset ci-dead-code-$compiler 2>&1 | tee dead-code/build.log &&
-        scripts/dead-code-analysis.sh $build_dir"
-}
-
 cmd_all() {
     # cmd_compile/cmd_test each call cmd_builder up-front; repeats are cheap
     # (pull+buildx cached), so no pre-warm here.
@@ -351,7 +332,6 @@ case "${1:-all}" in
     coverage)             shift; cmd_coverage "$@" ;;
     patch-coverage)       shift; cmd_patch_coverage "$@" ;;
     coverage-regression)  shift; cmd_coverage_regression "$@" ;;
-    dead-code)            shift; cmd_dead_code "$@" ;;
     publish)              shift; cmd_publish "$@" ;;
     *)
         cat >&2 <<EOF
@@ -362,8 +342,7 @@ Usage: $0 [all
           | compile <image> <compiler> <preset>
           | coverage [image]
           | patch-coverage <base_ref> [image]
-          | coverage-regression <base_ref> [image]
-          | dead-code [image] [compiler]]
+          | coverage-regression <base_ref> [image]]
 EOF
         exit 1
         ;;

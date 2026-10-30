@@ -1,4 +1,4 @@
-"""H-anchored tifxyz surfaces from fixed UV assignments and original AFV curves."""
+"""H-anchored tifxyz surfaces from fixed UV assignments and original fiber curves."""
 import json
 import time
 from pathlib import Path
@@ -7,7 +7,7 @@ import numpy as np
 
 from . import fiber_uv_layout as uv
 from .fiber_normal_convention import inward_solution
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from vesuvius.tifxyz.types import Tifxyz
 from vesuvius.tifxyz.writer import write_tifxyz
 
@@ -153,11 +153,11 @@ def construct(d,state,widths,cfg,bank,settings):
 
 def validate_sources(cfg,normal_doc):
     signature=json.loads(Path(cfg['tensor_cache']).with_suffix('.json').read_text())['signature']
-    hashes={key:uv.sha256_file(cfg[key]) for key in ('database','afv','stage1')}
+    hashes={key:(fibers_digest if key=='fibers' else uv.sha256_file)(cfg[key]) for key in ('database','fibers','stage1')}
     for key,value in hashes.items():
         if value!=signature[key]:raise ValueError('Surface source hash mismatch: '+key)
     native=normal_doc['provenance']['config']
-    if Path(native['orient_database']).resolve()!=Path(cfg['database']).resolve() or Path(native['afv']).resolve()!=Path(cfg['afv']).resolve():
+    if Path(native['orient_database']).resolve()!=Path(cfg['database']).resolve() or Path(native['fibers']).resolve()!=Path(cfg['fibers']).resolve():
         raise ValueError('Native normal source mismatch')
     return hashes
 
@@ -182,14 +182,14 @@ def run(settings):
         accepted=p[np.arange(len(p)),pick]>settings.get('joint_threshold',.5)
         del p
         print(f'{item["label"]}: loading {accepted.sum():,} selected piece curves',flush=True)
-        bank=CurveBank(cfg['afv'],d['source_id'][accepted],settings['normal_curves'],normal)
+        bank=CurveBank(cfg['fibers'],d['source_id'][accepted],settings['normal_curves'],normal)
         xyz,valid,stats=construct(d,state,widths,cfg,bank,settings)
         if not valid.any():raise ValueError('No supported surface vertices')
         coordinate_space=settings.get('coordinate_space') or cfg.get('coordinate_space')
         if not coordinate_space:raise ValueError('Supply the source coordinate_space for surface metadata')
         meta=dict(uv_origin=stats['uv_origin'],coordinate_space=coordinate_space,
             provenance=dict(solution=str(run_root/'solution.npz'),solution_sha256=uv.sha256_file(run_root/'solution.npz'),
-                afv_sha256=uv.sha256_file(cfg['afv']),tensor_sha256=uv.sha256_file(cfg['tensor_cache']),
+                fibers_digest=fibers_digest(cfg['fibers']),tensor_sha256=uv.sha256_file(cfg['tensor_cache']),
                 normal_sign_sha256=uv.sha256_file(cfg['stage1']),normal_curves=str(Path(settings['normal_curves']).resolve()),
                 normal_index_sha256=uv.sha256_file(Path(settings['normal_curves'])/'index.json'),settings=settings),
             method='H ruled surface plus scalar normal V chord residual; joint>0.5; bounded brackets; holes')

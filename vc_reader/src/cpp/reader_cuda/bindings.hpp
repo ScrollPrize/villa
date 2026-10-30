@@ -1,6 +1,6 @@
 #pragma once
 #include "reader.hpp"
-#include "../cuda_event.hpp"
+#include "../cuda_stream.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
@@ -46,12 +46,6 @@ inline void bind(nb::module_& m) {
           storage=device::allocate(count*item,id); device::complete(); }
         return owned(std::move(storage),count,{std::uint8_t(code),std::uint8_t(item*8),1},id);
     });
-    nb::class_<device::Event>(m,"CudaEvent")
-        .def("synchronize",&device::Event::synchronize,nb::call_guard<nb::gil_scoped_release>())
-        .def("wait",&device::Event::wait)
-        .def("done",&device::Event::done);
-    m.def("_record_event",[] { return std::make_shared<device::Event>(); });
-    nb::class_<PointPlan>(m,"CudaPointPlan");
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }
         if (offset>input.size() || n>input.size()-offset) throw nb::value_error("view exceeds storage");
@@ -111,18 +105,6 @@ inline void bind(nb::module_& m) {
         .def(nb::init<Array&,std::size_t,int>(),nb::keep_alive<1,2>())
         .def("clear",&Reader::clear,nb::call_guard<nb::gil_scoped_release>())
         .def("stats",&Reader::stats,nb::call_guard<nb::gil_scoped_release>())
-        .def("read_plan",[](Reader& r,const PointPlan& plan,const std::string& source,bool valid) {
-            Result result; { nb::gil_scoped_release release; result=r.read_plan(plan,source,valid); }
-            return outputs(std::move(result),r.device_id());
-        },"plan"_a,"source"_a,"valid"_a=false)
-        .def("prepare_points",[](Reader& r,Host points,const Index& base,int kind,int order) {
-            const auto dtype=points.dtype();
-            if (points.ndim()!=2 || points.shape(1)!=3 || dtype.lanes!=1 ||
-                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (dtype.bits!=32 && dtype.bits!=64)) :
-                           (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Int) || (dtype.bits!=32 && dtype.bits!=64)))) throw nb::value_error("invalid point array");
-            nb::gil_scoped_release release;
-            return r.prepare_points(points.data(),points.shape(0),dtype.bits,base,kind,order);
-        },nb::keep_alive<0,1>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,
             const std::vector<std::array<std::int64_t,3>>& bases,const std::vector<std::array<float,3>>& origins,
             const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid,nb::object out) -> nb::object {

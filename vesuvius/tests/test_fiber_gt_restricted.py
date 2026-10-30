@@ -4,15 +4,19 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_current_gt_solve import enclos
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_implicit_winding import pair_cost
 
 
+def U(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
 def test_enclosure_targets_orientation_and_subset():
-    d=dict(family=np.array([0,1,1]),source_id=np.array([10,20,30]),
+    d=dict(family=np.array([0,1,1]),source_id=np.array([U(10),U(20),U(30)]),
         i=np.array([0,1,0]),j=np.array([1,0,2]),ds_a=np.array([0.,0.,5.]),
         ds_b=np.array([0.,10.,5.]),sign=np.array([1.,1.,1.]),
         parallel=np.array([False,False,True]),distance=np.array([.2,.9,1.]))
     selected,audit=enclosure_subset(d)
     assert selected['distance'].tolist()==[0.,1.]
     assert audit['original_events']==[0,1]
-    assert audit['unconnected_sources']==[30]
+    assert audit['unconnected_sources']==[U(30)]
 
 
 def test_sign_only_ignores_distance_and_calibration():

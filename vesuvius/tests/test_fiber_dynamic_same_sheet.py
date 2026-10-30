@@ -32,13 +32,13 @@ def test_joint_gate_rejects_competing_alternatives():
 def test_dynamic_loss_roundtrip_and_geometry_response():
     import numpy as np
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_bucket_uv import BucketUV
-    d=dict(source_id=np.array([11,12]),family=np.array([0,1]),start=np.zeros(2),end=np.full(2,300.),
+    d=dict(source_id=np.array(['00000000-0000-4000-8000-000000000011','00000000-0000-4000-8000-000000000012']),family=np.array([0,1]),start=np.zeros(2),end=np.full(2,300.),
            node_ds=np.array([[0,150,300],[0,150,300.]]),i=np.zeros(3,dtype=np.int64),
            j=np.ones(3,dtype=np.int64),ds_a=np.array([10.,100.,250.]),ds_b=np.array([20.,110.,260.]),
            parallel=np.zeros(3,dtype=bool),sign=np.ones(3),distance=np.full(3,.5))
     cfg=dict(sigma_max=1.,winding_count=10,bucket_uv_match_weight=10.,
              bucket_uv_attach_weight=.1,bucket_uv_bend_weight=1.,bucket_uv_lr=2.)
-    td={k:torch.as_tensor(v) for k,v in d.items()};td['class_weight']=torch.ones(3)
+    td={k:torch.as_tensor(v) for k,v in d.items() if k!='source_id'};td['class_weight']=torch.ones(3)
     s=torch.tensor([[2.2,.1,0.,4.],[3.,-.85,0.,4.]],requires_grad=True)
     w=torch.full((10,),1000.,requires_grad=True)
     cfg.update(bucket_uv_dynamic_same_sheet=True,cavity_winding_sigma=False,winding_sigma=.2)

@@ -36,7 +36,7 @@ def test_saved_cavity_sigma_changes_tails_and_confidence(tmp_path):
     state=np.array([[2.,.2,0.,4.],[2.,.2,0.,4.]],dtype=np.float32)
     d=dict(i=np.array([0]),j=np.array([1]),family=np.array([0,1]),ds_a=np.zeros(1,dtype=np.float32),
         ds_b=np.zeros(1,dtype=np.float32),parallel=np.array([False]),sign=np.array([1.],dtype=np.float32),
-        source_id=np.array([10,11]),start=np.zeros(2),end=np.ones(2))
+        source_id=np.array(['00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000011']),start=np.zeros(2),end=np.ones(2))
     cache=tmp_path/'tensors.npz';np.savez(cache,**d)
     root=tmp_path/'solve';root.mkdir()
     np.savez(root/'solution.npz',state=state,widths=np.ones(10,dtype=np.float32)*100,

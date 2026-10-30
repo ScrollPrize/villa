@@ -172,7 +172,7 @@ CREATE TABLE history_validated_edges(uuid TEXT PRIMARY KEY, a_meta TEXT NOT NULL
             return "INSERT INTO " + table + " " + values + " ON CONFLICT(uuid) DO NOTHING;";
         };
         trigger("objects", mark("history_dirty_objects", "VALUES(" + row + ".uuid)"));
-        for (const auto* table : {"fibers", "patches", "tracks", "object_tags"})
+        for (const auto* table : {"fibers", "surfaces", "tracks", "object_tags"})
             trigger(table, mark("history_dirty_objects", "SELECT uuid FROM objects WHERE id=" + row + ".object_id"));
         trigger("geometry_heads", mark("history_dirty_objects", "VALUES(" + row + ".object_uuid)"));
         trigger("edges",
@@ -291,7 +291,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}})
                 affected |= endpoint == object && dependencyMetadata(before, anchor) != dependencyMetadata(p.record, anchor);
             if (!affected) continue;
-            // Synchronization imports a previously published lifecycle decision.
+            // A hub pull imports a previously published lifecycle decision.
             // Preserve recorded pins; imported edge bindings below carry any
             // separate revalidation. It does not import the peer's timeline.
             if (importedBindings && lifecycleChanged) recordRelationshipValidation(db, edge, true);
@@ -420,7 +420,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             if (!epoch || metadata(db, s.text(0)).value("lifecycle_epoch", "") == *epoch) return s.text(0);
         if (!importedBindings)
             throw std::runtime_error("object history: relationship binding has no object revision");
-        // Current-state sync imports can supply older geometry
+        // Hub pulls can supply older geometry
         // without its object history. Preserve that binding with an explicitly
         // incomplete, untimed baseline, never fabricated historical metadata.
         const auto uuid = util::newUuid();
@@ -507,6 +507,15 @@ RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publi
     while (s.row())
         if (includeRetired || !objectRevision(txn, s.text(1))->record.retired)
             result.emplace(s.text(0), s.text(1));
+    return result;
+}
+
+RevisionSelection ObjectStore::currentRevisions(const Txn& txn, const ObjectSelection& selection) const
+{
+    const auto heads = revisionSelectionAt(txn, std::numeric_limits<int64_t>::max(), true);
+    RevisionSelection result;
+    for (const auto& object : selectObjects(txn, selection, std::vector<std::string>{}))
+        if (const auto head = heads.find(object.uuid); head != heads.end()) result.emplace(head->first, head->second);
     return result;
 }
 
@@ -600,6 +609,11 @@ void ObjectStore::retainRelationship(WriteTxn& txn, const std::string& uuid)
     repairEdgeGeometry(txn, repair);
     recordRelationshipValidation(db, *edge);
     savepoint.release();
+}
+
+void ObjectStore::keepRecordedRelationshipsOf(WriteTxn& txn, const std::string& objectUuid)
+{
+    for (const auto& edge : edgesOf(txn, objectUuid, true)) keepRecordedRelationship(txn, edge.uuid);
 }
 
 void ObjectStore::keepRecordedRelationship(WriteTxn& txn, const std::string& uuid)

@@ -144,6 +144,17 @@ void validateChunk(const vc::render::ChunkResult& result)
             throw std::runtime_error("Lasagna uint8 Zarr has an invalid fill_value: " + binding.path.string());
         return static_cast<uint8_t>(*fill);
     }
+    if (chunk.dtype == vc::render::ChunkDtype::Float32 && chunk.bytes) {
+        const auto at = chunk.byteOffset + offset * sizeof(float);
+        if (at + sizeof(float) > chunk.bytes->size())
+            throw std::runtime_error("packed float channel payload too small");
+        float value;
+        std::memcpy(&value, chunk.bytes->data() + at, sizeof(value));
+        if (!std::isfinite(value) || value < 0 || value > 255)
+            throw std::runtime_error("invalid packed encoded byte value");
+        return static_cast<uint8_t>(std::lround(value));
+    }
+    offset += chunk.byteOffset;
     if (chunk.dtype != vc::render::ChunkDtype::UInt8 || !chunk.bytes || offset >= chunk.bytes->size())
         throw std::runtime_error("Lasagna decoded chunk has invalid dtype/size: " + binding.path.string());
     return std::to_integer<uint8_t>((*chunk.bytes)[offset]);
@@ -182,10 +193,10 @@ void validateChunk(const vc::render::ChunkResult& result)
         if (chunk.status == vc::render::ChunkStatus::Missing || chunk.status == vc::render::ChunkStatus::AllFill)
             return binding.array->metadata().fill_value;
         if (chunk.dtype != vc::render::ChunkDtype::Float32 || !chunk.bytes ||
-            (offset + 1) * sizeof(float) > chunk.bytes->size())
+            chunk.byteOffset + (offset + 1) * sizeof(float) > chunk.bytes->size())
             throw std::runtime_error("invalid float32 Lasagna chunk: " + binding.path.string());
         float value;
-        std::memcpy(&value, chunk.bytes->data() + offset * sizeof(float), sizeof(value));
+        std::memcpy(&value, chunk.bytes->data() + chunk.byteOffset + offset * sizeof(float), sizeof(value));
         return value;
     }
     const auto value = chunkByte(binding, chunk, offset);
@@ -242,7 +253,7 @@ bool readSingleChunkCube(const LasagnaChannelBinding& binding,
     const bool floats=binding.array->metadata().dtype==utils::ZarrDtype::float32;
     if constexpr(std::is_same_v<Output,uint8_t>) {if(floats)return false;}
     if(chunk.dtype!=(floats?vc::render::ChunkDtype::Float32:vc::render::ChunkDtype::UInt8)) return false;
-    const size_t offset=originalChunkOffset(binding,request.z0%binding.chunksZYX[0],request.y0%binding.chunksZYX[1],request.x0%binding.chunksZYX[2]);
+    const size_t offset=chunk.byteOffset/(floats?sizeof(float):1)+originalChunkOffset(binding,request.z0%binding.chunksZYX[0],request.y0%binding.chunksZYX[1],request.x0%binding.chunksZYX[2]);
     const size_t sx=request.x0+1<binding.shapeZYX[2]?1:0;
     const size_t sy=request.y0+1<binding.shapeZYX[1]?binding.chunksZYX[2]:0;
     const size_t sz=request.z0+1<binding.shapeZYX[0]?binding.chunksZYX[1]*binding.chunksZYX[2]:0;
@@ -318,13 +329,7 @@ bool readSingleChunkCube(const LasagnaChannelBinding& binding,
 
 [[nodiscard]] double interpolateChannelValues(const std::array<double,8>& values,const LasagnaCubeRequest& request)
 {
-    const double c00 = values[0] * (1.0 - request.fx) + values[1] * request.fx;
-    const double c01 = values[2] * (1.0 - request.fx) + values[3] * request.fx;
-    const double c10 = values[4] * (1.0 - request.fx) + values[5] * request.fx;
-    const double c11 = values[6] * (1.0 - request.fx) + values[7] * request.fx;
-    const double c0 = c00 * (1.0 - request.fy) + c01 * request.fy;
-    const double c1 = c10 * (1.0 - request.fy) + c11 * request.fy;
-    return c0 * (1.0 - request.fz) + c1 * request.fz;
+    return interpolateLasagnaScalarCorners(values,{request.fx,request.fy,request.fz});
 }
 
 [[nodiscard]] std::optional<double> sampleLasagnaChannelValues(
@@ -629,7 +634,7 @@ public:
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
-    std::shared_ptr<vc::render::ChunkCache> cache_;
+    std::shared_ptr<vc::render::IChunkedArray> cache_;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
@@ -719,7 +724,8 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     LasagnaCornerBatch& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     samples.values.assign(
         samplers.size(),
@@ -748,18 +754,19 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
         volumePoints,
         &context,
         materialize,
-        parallelThreads);
+        parallelThreads, false, pinnedRegion);
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     std::vector<std::vector<LasagnaCornerSample>>& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     LasagnaCornerBatch batch;
     const NormalPrefetchReport report = sampleLasagnaChannelCornerBatch(
-        samplers, volumePoints, batch, parallelThreads);
+        samplers, volumePoints, batch, parallelThreads, pinnedRegion);
     samples.assign(
         samplers.size(),
         std::vector<LasagnaCornerSample>(volumePoints.size()));
@@ -1186,17 +1193,21 @@ LasagnaChannelBinding bindLasagnaChannel(
                       manifest.sourceToBase / manifest.workingToBaseScale;
 
     const auto meta = binding.array->metadata();
-    if (allowFloat32 && meta.dtype == utils::ZarrDtype::float32) {
+    if ((allowFloat32 || meta.shape.size() == 4) && meta.dtype == utils::ZarrDtype::float32) {
         binding.array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, *group, 4));
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' must be uint8");
     }
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
+    const bool packed = meta.shape.size() == 4 && meta.chunks.size() == 4;
+    if ((packed && manifest.version != 3 && !manifest.raw.value("packed_channel_view", false)) ||
+        (!packed && (meta.shape.size() != 3 || meta.chunks.size() != 3)) ||
+        (packed && (meta.shape[0] != group->channels.size() || meta.chunks[0] != meta.shape[0]))) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
                                  "' must reference a 3D (Z,Y,X) zarr");
     }
-    binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
-    binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    const size_t first = packed ? 1 : 0;
+    binding.shapeZYX = {meta.shape[first], meta.shape[first+1], meta.shape[first+2]};
+    binding.chunksZYX = {meta.chunks[first], meta.chunks[first+1], meta.chunks[first+2]};
 
     if (binding.spacing <= 0.0 || !std::isfinite(binding.spacing)) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has invalid spacing");
@@ -1223,10 +1234,10 @@ LasagnaChannelBinding bindLasagnaChannel(
     cacheOptions.decodedEvictionPreferSelf = true;
     // Without an explicit fill, a stored all-zero chunk is still valid data.
     cacheOptions.detectAllFillChunks = binding.array->metadata().fill_value.has_value();
-    binding.chunkSource = vc::render::acquireProcessChunkCache(
-        "lasagna-channel|" + sourcePath.lexically_normal().string() +
-            "|channel=" + std::to_string(binding.channelIndex),
+    binding.chunkSource = vc::render::acquireProcessZarrChannel(
+        "lasagna-channel|" + sourcePath.lexically_normal().string(),
         binding.array,
+        binding.channelIndex,
         std::move(cacheOptions));
     return binding;
 }
@@ -1497,22 +1508,49 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
         return std::nullopt;
     }
 
+    return interpolateLasagnaCompactTensorCorners(nxValues,nyValues,
+        {nxRequest.fx,nxRequest.fy,nxRequest.fz},mask);
+}
+
+double interpolateLasagnaScalarCorners(const std::array<double,8>& values,const cv::Vec3d& f)
+{
+    const double c00 = values[0] * (1.0 - f[0]) + values[1] * f[0];
+    const double c01 = values[2] * (1.0 - f[0]) + values[3] * f[0];
+    const double c10 = values[4] * (1.0 - f[0]) + values[5] * f[0];
+    const double c11 = values[6] * (1.0 - f[0]) + values[7] * f[0];
+    const double c0 = c00 * (1.0 - f[1]) + c01 * f[1];
+    const double c1 = c10 * (1.0 - f[1]) + c11 * f[1];
+    return c0 * (1.0 - f[2]) + c1 * f[2];
+}
+
+std::optional<double> interpolateLasagnaMaskedScalarCorners(const std::array<double,8>& samples,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
+    if(std::all_of(mask.begin(),mask.end(),[](uint8_t v){return v!=0;}))
+        return interpolateLasagnaScalarCorners(samples,f);
+    double sum=0,denom=0;
+    for(size_t k=0;k<8;++k) if(mask[k]) {
+        const double w=((k&1)?f[0]:1-f[0])*((k&2)?f[1]:1-f[1])*((k&4)?f[2]:1-f[2]);
+        if(w>0){sum+=w*samples[k];denom+=w;}
+    }
+    if(denom>0)return sum/denom;
+    return std::nullopt;
+}
+
+LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
     const auto& normalTable = decodedCompactNormalTable();
-    double t00 = 0.0;
-    double t01 = 0.0;
-    double t02 = 0.0;
-    double t11 = 0.0;
-    double t12 = 0.0;
-    double t22 = 0.0;
-    cv::Vec3d hint{0.0, 0.0, 0.0};
-    double totalWeight = 0.0;
+    LasagnaCompactTensor tensor;
+    auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     size_t cubeIndex = 0;
     for (int dz = 0; dz <= 1; ++dz) {
-        const double wz = dz == 0 ? (1.0 - nxRequest.fz) : nxRequest.fz;
+        const double wz = dz == 0 ? (1.0 - f[2]) : f[2];
         for (int dy = 0; dy <= 1; ++dy) {
-            const double wy = dy == 0 ? (1.0 - nxRequest.fy) : nxRequest.fy;
+            const double wy = dy == 0 ? (1.0 - f[1]) : f[1];
             for (int dx = 0; dx <= 1; ++dx) {
-                const double wx = dx == 0 ? (1.0 - nxRequest.fx) : nxRequest.fx;
+                const double wx = dx == 0 ? (1.0 - f[0]) : f[0];
                 const double weight = wx * wy * wz;
                 if (weight <= 0.0 || !mask[cubeIndex]) {
                     ++cubeIndex;
@@ -1541,6 +1579,12 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
             }
         }
     }
+    return tensor;
+}
+
+std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor& tensor)
+{
+    const auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     if (totalWeight <= kEpsilon) {
         return std::nullopt;
     }
@@ -1550,6 +1594,13 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
         return std::nullopt;
     }
     return normal;
+}
+
+std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
+    return finalizeLasagnaCompactTensor(accumulateLasagnaCompactTensorCorners(nxValues,nyValues,f,mask));
 }
 
 std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
@@ -1619,12 +1670,8 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
                 const bool available=pinned?haveSamples:readInterpolationCubeValues(channels[c],request,samples);
                 value=std::nullopt;
                 if (available) {
-                    double sum=0,denom=0;
-                    for (size_t k=0;k<8;++k) if (mask[k]) {
-                        const double w=((k&1)?request.fx:1-request.fx)*((k&2)?request.fy:1-request.fy)*((k&4)?request.fz:1-request.fz);
-                        if (w>0) { sum+=w*samples[k]; denom+=w; }
-                    }
-                    if (denom>0) value=sum/denom;
+                    value=interpolateLasagnaMaskedScalarCorners(samples,
+                        {request.fx,request.fy,request.fz},mask);
                 }
             }
             if (!value || !std::isfinite(*value)) { vector.clear(); break; }

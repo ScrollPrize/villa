@@ -179,23 +179,6 @@
            </widget>
           </item>
           <item>
-           <widget class="QLabel" name="lblSegDir">
-            <property name="text">
-             <string>Segmentation Directory:</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QComboBox" name="cmbSegmentationDir">
-            <property name="sizePolicy">
-             <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-              <horstretch>0</horstretch>
-              <verstretch>0</verstretch>
-             </sizepolicy>
-            </property>
-           </widget>
-          </item>
-          <item>
            <widget class="QLineEdit" name="lineEditSurfaceFilter">
             <property name="placeholderText">
              <string>Filter by surface ID...</string>
@@ -217,7 +200,7 @@
              <bool>true</bool>
             </property>
             <property name="columnCount">
-             <number>7</number>
+             <number>6</number>
             </property>
             <attribute name="headerVisible">
              <bool>true</bool>
@@ -241,7 +224,7 @@
             </column>
             <column>
              <property name="text">
-              <string>Surface ID</string>
+              <string>Name</string>
              </property>
             </column>
             <column>
@@ -261,24 +244,9 @@
             </column>
             <column>
              <property name="text">
-              <string>Overlaps</string>
-             </property>
-            </column>
-            <column>
-             <property name="text">
               <string>Last Modified</string>
              </property>
             </column>
-           </widget>
-          </item>
-          <item>
-           <widget class="QPushButton" name="btnReloadSurfaces">
-            <property name="text">
-             <string>Reload Surfaces</string>
-            </property>
-            <property name="icon">
-             <iconset theme="view-refresh"/>
-            </property>
            </widget>
           </item>
           <item>
@@ -1489,132 +1457,6 @@
    </widget>
    </widget>
   </widget>
-   <widget class="QDockWidget" name="dockWidgetRenderSettings">
-     <property name="minimumSize">
-      <size>
-       <width>150</width>
-       <height>40</height>
-      </size>
-     </property>
-     <property name="windowTitle">
-      <string>Segment Overlaps</string>
-     </property>
-     <attribute name="dockWidgetArea">
-      <number>1</number>
-     </attribute>
-     <widget class="QScrollArea" name="scrollAreaRenderSettings">
-      <property name="frameShape">
-       <enum>QFrame::NoFrame</enum>
-      </property>
-      <property name="widgetResizable">
-       <bool>true</bool>
-      </property>
-      <property name="horizontalScrollBarPolicy">
-       <enum>Qt::ScrollBarAlwaysOff</enum>
-      </property>
-      <widget class="QWidget" name="dockWidgetRenderSettingsContents">
-       <property name="geometry">
-        <rect>
-         <x>0</x>
-         <y>0</y>
-         <width>250</width>
-         <height>150</height>
-        </rect>
-       </property>
-       <layout class="QGridLayout" name="gridLayoutRenderSettings">
-        <property name="leftMargin">
-         <number>2</number>
-        </property>
-        <property name="topMargin">
-         <number>2</number>
-        </property>
-        <property name="rightMargin">
-         <number>2</number>
-        </property>
-        <property name="bottomMargin">
-         <number>2</number>
-        </property>
-        <property name="horizontalSpacing">
-         <number>4</number>
-        </property>
-        <property name="verticalSpacing">
-         <number>2</number>
-        </property>
-       <item row="0" column="0" colspan="3">
-        <widget class="QCheckBox" name="chkSurfaceOverlay">
-         <property name="text">
-          <string>Show surface overlap</string>
-         </property>
-         <property name="toolTip">
-          <string>Highlight regions where another surface is within threshold distance</string>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="0">
-        <widget class="QLabel" name="labelOverlaySurface">
-         <property name="text">
-          <string>Overlay surfaces</string>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="1" colspan="2">
-        <widget class="QPushButton" name="surfaceOverlaySelect">
-         <property name="text">
-          <string>Select...</string>
-         </property>
-        </widget>
-       </item>
-       <item row="2" column="0">
-        <widget class="QLabel" name="labelOverlapThreshold">
-         <property name="text">
-          <string>Threshold</string>
-         </property>
-        </widget>
-       </item>
-       <item row="2" column="1">
-        <widget class="QDoubleSpinBox" name="spinOverlapThreshold">
-         <property name="minimum">
-          <double>0.100000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>50.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.500000000000000</double>
-         </property>
-         <property name="value">
-          <double>5.000000000000000</double>
-         </property>
-         <property name="suffix">
-          <string> vox</string>
-         </property>
-         <property name="toolTip">
-          <string>Distance threshold in voxels for overlap detection</string>
-         </property>
-        </widget>
-       </item>
-       <item row="3" column="0" colspan="3">
-        <spacer name="verticalSpacerRenderSettings">
-         <property name="orientation">
-          <enum>Qt::Vertical</enum>
-         </property>
-         <property name="sizeHint" stdset="0">
-          <size>
-           <width>20</width>
-           <height>40</height>
-          </size>
-         </property>
-        </spacer>
-       </item>
-      </layout>
-     </widget>
-     </widget>
-    </widget>
-  <action name="actionOpen">
-   <property name="text">
-    <string>Open</string>
-   </property>
-  </action>
  </widget>
  <customwidgets>
  <customwidget>

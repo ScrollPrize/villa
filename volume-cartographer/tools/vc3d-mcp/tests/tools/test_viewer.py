@@ -49,7 +49,6 @@ class ViewerBridge(FakeBridgeServer):
             "normalArrowLengthScale": 1.0,
             "normalMaxArrows": 32,
             "segmentationCursorMirroring": False,
-            "samplingStride": 1,
             "zScrollSensitivity": 1.0,
             "highlightedSurfaceIds": [],
         }
@@ -148,7 +147,6 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
             normal_arrow_length_scale=1.5,
             normal_max_arrows=50,
             segmentation_cursor_mirroring=True,
-            sampling_stride=2,
             z_scroll_sensitivity=5.0,
         )
         self.assertEqual(
@@ -158,11 +156,9 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
                 "normalArrowLengthScale": 1.5,
                 "normalMaxArrows": 50,
                 "segmentationCursorMirroring": True,
-                "samplingStride": 2,
                 "zScrollSensitivity": 5.0,
             },
         )
-        self.assertEqual(result["samplingStride"], 2)
         self.assertTrue(result["segmentationCursorMirroring"])
 
     async def test_set_render_settings_clamps_normal_arrow_fields(self) -> None:

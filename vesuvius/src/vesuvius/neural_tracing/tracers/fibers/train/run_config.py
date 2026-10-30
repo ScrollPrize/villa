@@ -52,15 +52,15 @@ TRAINING = dict(
     startup_shares=[.35, .15, .15, .35], excursion_probability=.2, excursion_amplitude=[3., 6.],
     excursion_rise=[16., 128.], synthetic_tail=[4., 16.], live_continuation_steps=[32, 256],
     seed_offset=[0., 1.5], seed_offset_ramp=16., live_seed_start=.7,
-    # Neighbour banks, augmentation and AFV sampling.
+    # Neighbour banks, augmentation and fiber-store source sampling.
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
-    blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,
+    blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, store_length_power=3.,
     crop_tilt_probability=.25, crop_tilt_deg=6., crop_tilt_max_deg=20.,
     # Fresh locations at heavy bends / compressed sheets: extra weight over 1 (data/location_weights.py); '' = default
     # cache folder (output/location_weights).
     oversample_bend=1., oversample_compression=1., location_weights_dir='',
     # On-policy collection (DAgger) and replay.
-    dagger_every=1000, dagger_fibers=128, afv_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
+    dagger_every=1000, dagger_fibers=128, store_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
     dagger_trace_len=6000., dagger_before=48., dagger_after=64., dagger_stride=16., replay_keep=4,
     # Logging, checkpoints and diagnostics.
     log_every=50, ckpt_every=1000, diag_every=5000, batch_diag_every=1000, diag_max_len=400., recovery_every=1000,
@@ -222,8 +222,8 @@ def validate(run):
     if min(t['steps'], t['batch'], t['grad_steps'], t['log_every'], t['ckpt_every'], r['threads'], r['dagger_threads'],
            t['flow_calibration_states'], t['replay_keep'], t['dagger_fibers'], t['dagger_batch'], t['recovery_seeds']) < 1:
         raise ValueError('Positive counts required, including batch and grad steps')
-    if t['afv_dagger_fibers'] is not None and t['afv_dagger_fibers'] < 1:
-        raise ValueError('AFV collection fiber count must be positive')
+    if t['store_dagger_fibers'] is not None and t['store_dagger_fibers'] < 1:
+        raise ValueError('Fiber-store collection fiber count must be positive')
     if min(r['workers'], t['warmup'], t['diag_every'], t['batch_diag_every'], t['dagger_every'],
            t['recovery_every'], t['confidence_weight']) < 0:
         raise ValueError('Invalid training settings')
@@ -231,8 +231,8 @@ def validate(run):
                                           t['diag_max_len'], t['dagger_trace_len'],
                                           t['recovery_length']) <= 0:
         raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
-    if not math.isfinite(t['afv_length_power']) or t['afv_length_power'] < 0:
-        raise ValueError('AFV length power must be finite and nonnegative')
+    if not math.isfinite(t['store_length_power']) or t['store_length_power'] < 0:
+        raise ValueError('Fiber-store length power must be finite and nonnegative')
     if not 1 <= t['live_continuation_steps'][0] <= t['live_continuation_steps'][1]:
         raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
     if run['model']['type'] == 'sequence' and any(t['task_shares'].get(name) for name in ('live', 'synthetic_terminal')):

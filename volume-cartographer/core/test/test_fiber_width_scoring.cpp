@@ -2,16 +2,51 @@
 #include <doctest/doctest.h>
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
+#include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include <utils/zarr.hpp>
+#include <fstream>
+#include <random>
 #include <cstdlib>
 #include <iostream>
 
 using namespace vc::fiber_tracer;
+
+TEST_CASE("packed uint8 base widths are converted into tracing coordinates") {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / ("fiber_width_packed_" + std::to_string(std::random_device{}()));
+    fs::create_directories(root / "sd1");
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = {4,4,4,4}; meta.chunks = {4,4,4,4};
+    meta.dtype = utils::ZarrDtype::uint8; meta.fill_value = 0.; meta.compressor_id.clear();
+    auto array = utils::ZarrArray::create(root / "sd1/1", meta);
+    std::vector<std::byte> bytes(4*64, std::byte{255});
+    std::fill(bytes.begin()+128, bytes.begin()+192, std::byte{128});
+    std::fill(bytes.begin()+192, bytes.end(), std::byte{80});
+    array.write_chunk(std::vector<size_t>{0,0,0,0}, bytes);
+    { std::ofstream out(root / ".zattrs"); out << R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[8,8,8],"validity_channel":"presence","width_encoding":"uint8-base-voxels","groups":{"sd1":{"zarr":"sd1/1","scaledown":1,"channels":["presence","nx","ny","width"]}}}})"; }
+    vc::lasagna::LasagnaDatasetOpenOptions open;
+    open.workingToBaseScale = 2;
+    const auto dataset = vc::lasagna::LasagnaDataset::open(root, open);
+    FiberPredictionFieldOptions options; options.enableWidth = true;
+    FiberPredictionField field(dataset, options);
+    std::vector<float> widths;
+    field.sampleWidths({cv::Vec3f{1,1,1}}, widths);
+    REQUIRE(widths.size() == 1);
+    CHECK(widths[0] == doctest::Approx(40));
+    const auto sample = field.sample(cv::Vec3d{1,1,1}, cv::Vec3d{1,0,0});
+    REQUIRE(sample.options.size() == 1);
+    CHECK(sample.options[0].presence == doctest::Approx(1));
+    fs::remove_all(root);
+}
 namespace {
 class WidthPrediction final : public FiberPredictionSource {
 public:
     mutable size_t sampled = 0;
     bool fork = false, malformed = false, invalidSeed = false;
     double end = 1000;
+    double invalidWidthFrom = 1000;
     bool supportsConcurrentSampling() const noexcept override { return true; }
     FiberPredictionSample sample(const cv::Vec3d& p, const cv::Vec3d&) const override {
         FiberPredictionSample out;
@@ -20,6 +55,7 @@ public:
     }
     float width(const cv::Vec3f& p) const {
         if (invalidSeed && p[0] == 0) return 0;
+        if (p[0] >= invalidWidthFrom) return 0;
         return fork ? (p[0] == 0 || p[1] > .5 ? 10.f : 20.f) : 10 + p[0]*.01f;
     }
     void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& out) const override {
@@ -134,9 +170,56 @@ TEST_CASE("width input errors fail explicitly") {
     CHECK_THROWS(traceFiberExtrapolation(source,{0,0,0},{1,0,0},8,c));
     c.widthReferenceMean=0;
     source.malformed=false; source.invalidSeed=true;
-    CHECK_THROWS(traceFiberExtrapolation(source,{0,0,0},{1,0,0},8,c));
+    const auto missing=traceFiberExtrapolation(source,{0,0,0},{1,0,0},8,c);
+    CHECK(missing.reason=="invalid_width");
+    CHECK(missing.points==std::vector<cv::Vec3d>{{0,0,0}});
+    CHECK(missing.widthSamples==0);
     c.widthRelativeTolerance=-1;
     CHECK_THROWS_AS(traceFiberExtrapolation(source,{0,0,0},{1,0,0},8,c),std::invalid_argument);
+}
+
+TEST_CASE("missing committed width stops at the last valid prefix") {
+    WidthPrediction source; source.invalidWidthFrom=12;
+    auto c=config(); c.widthRelativeTolerance=.4;
+    for (int depth : {1,2,3}) {
+        c.beamLookaheadSteps=depth;
+        const auto result=traceFiberExtrapolation(source,{0,0,0},{1,0,0},32,c);
+        CHECK(result.reason=="invalid_width");
+        REQUIRE(result.points.size()>1);
+        for (const auto& point : result.points) CHECK(point[0]<source.invalidWidthFrom);
+        checkMean(source,result);
+    }
+}
+
+TEST_CASE("reference replay counts missing widths as filtered stops not failures") {
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {
+            return {{0,1,0},true,{}};
+        }
+    } normals;
+    WidthPrediction source; source.invalidWidthFrom=12;
+    auto c=config(); c.widthRelativeTolerance=.4;
+    const auto reference=makePolylineArcGeometry({{0,0,0},{32,0,0}});
+    ReplayConsistencyPolicy policy;
+    policy.nextSeed=[&](double arc)->std::optional<PolylineArcSample> {
+        return samplePolylineArc(reference,arc);
+    };
+    const ReplaySegmentRunner runner=[&](const PolylineArcSample& seed,double,int maximumSteps,
+            const ReplayPointObserver& observe,const FiberTraceProgressCallback& progress) {
+        return traceFiberExtrapolation(source,seed.point,seed.tangent,maximumSteps*c.stepVoxels,
+            c,&normals,progress,false,observe).reason;
+    };
+    const auto result=traceReferenceReplayCore(reference,0,32,4,3,20,0,2,1,normals,1,
+        runner,{},{},policy);
+    CHECK(result.failures.empty());
+    CHECK_FALSE(result.filteredStops.empty());
+    CHECK(result.completedReferenceArcBase==32);
+    REQUIRE_FALSE(result.segments.empty());
+    for (const auto& segment : result.segments) {
+        // A rejected seed remains as a zero-length segment, never a traced step.
+        for (size_t i=1; i<segment.tracePointsBase.size(); ++i)
+            CHECK(segment.tracePointsBase[i][0]<12);
+    }
 }
 
 TEST_CASE("real cached width predictions have reproducible committed means") {
@@ -171,4 +254,94 @@ TEST_CASE("real cached width predictions have reproducible committed means") {
         << "; baseline=" << baseline.points.size() << " points; gated="
         << serial.points.size() << "; committed mean=" << serial.widthMean
         << "; serial/parallel exact\n";
+}
+
+namespace {
+class GatePrediction final : public FiberPredictionSource {
+public:
+    float candidateWidth=109, presence=.8f;
+    bool alternating=false;
+    cv::Vec3d direction{1,0,0};
+    bool supportsConcurrentSampling() const noexcept override {return true;}
+    FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d&) const override {
+        FiberPredictionSample s;s.options.push_back({p[0]==0 ? cv::Vec3d{1,0,0} : direction,presence,true});return s;
+    }
+    void sampleWidths(const std::vector<cv::Vec3f>& points,std::vector<float>& out) const override {
+        out.clear();for(const auto& p:points)out.push_back(p[0]==0 ? 100.f :
+            alternating ? (p[0]<=4 ? 105.f : 95.f) : candidateWidth);
+    }
+};
+FiberTraceConfig gateConfig() {
+    auto c=config();c.coneAngleDegrees=0;c.beamWidth=3;c.beamLookaheadSteps=2;
+    c.widthRelativeTolerance=.3;c.widthCosineWeight=true;c.widthReferenceMean=100;
+    c.replayPresenceModulated=true;c.replayPresenceCutoff=.75;return c;
+}
+}
+
+TEST_CASE("separate width and direction presence gates preserve soft objective") {
+    GatePrediction source;auto c=gateConfig();
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).points.size()==1);
+    c.replayPresenceIgnoreWidth=true;c.widthHardRelativeTolerance=.1;
+    const auto accepted=traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c);
+    CHECK(accepted.points.size()>1);
+    c.widthHardRelativeTolerance=.05;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).reason=="width_cutoff");
+    c.replayPresenceCutoff=0; // hard width gate does not depend on presence gate
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).reason=="width_cutoff");
+    source.candidateWidth=105;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).points.size()>1);
+    source.candidateWidth=95;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).points.size()>1);
+    source.candidateWidth=0;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).reason=="width_cutoff");
+    source.candidateWidth=NAN;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).reason=="width_cutoff");
+    source.candidateWidth=140;c.widthHardRelativeTolerance=0;c.replayPresenceCutoff=.75;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).points.size()>1); // zero soft weight, finite raw score
+    source.candidateWidth=100;source.direction={std::sqrt(.75),.5,0};
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c).reason=="presence_cutoff");
+    c.widthHardRelativeTolerance=.05;c.widthRelativeTolerance=0;
+    CHECK_THROWS_AS(traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c),std::invalid_argument);
+}
+
+TEST_CASE("hard width rechecks precommit mean before consuming lookahead nodes") {
+    GatePrediction source;source.alternating=true;source.presence=1;
+    auto c=gateConfig();c.widthReferenceMean=0;c.widthHardRelativeTolerance=.05;
+    c.replayPresenceIgnoreWidth=true;c.replayPresenceCutoff=.25;c.beamLookaheadSteps=3;
+    const auto result=traceFiberExtrapolation(source,{0,0,0},{1,0,0},16,c);
+    CHECK(result.reason=="width_cutoff");
+    CHECK(result.points==std::vector<cv::Vec3d>{{0,0,0},{4,0,0}});
+    CHECK(result.widthMean==doctest::Approx(102.5));CHECK(result.widthSamples==2);
+}
+
+TEST_CASE("replay receives width independent eligibility while loss remains width weighted") {
+    class Normal final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {return {{0,1,0},true,{}};}
+    } normals;
+    GatePrediction source;auto c=gateConfig();
+    c.replayPresenceIgnoreWidth=true;c.widthHardRelativeTolerance=.1;
+    FiberTraceOneWayRequest r;r.startPoint={0,0,0};r.initialDirection={1,0,0};r.config=c;
+    double mean=0;float eligible=0;int count=0;
+    (void)traceFiberReplaySegment(source,r,3,normals,{},[&](const auto&,double loss,int step){
+        CHECK(eligible==doctest::Approx(.8));
+        const double expected=step*(1-.8*std::cos(.3*std::acos(-1.)/2));
+        CHECK(loss==doctest::Approx(expected).epsilon(1e-5));++count;return true;
+    },mean,&eligible);
+    CHECK(count>0);
+}
+
+TEST_CASE("reference replay classifies hard width rejection as filtered") {
+    class Normal final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {return {{0,1,0},true,{}};}
+    } normals;
+    const auto reference=makePolylineArcGeometry({{0,0,0},{32,0,0}});
+    ReplayConsistencyPolicy policy;
+    policy.nextSeed=[&](double at)->std::optional<PolylineArcSample>{return samplePolylineArc(reference,at);};
+    const ReplaySegmentRunner run=[](const PolylineArcSample& seed,double,int,
+        const ReplayPointObserver& observe,const FiberTraceProgressCallback&){
+        (void)observe(seed.point+cv::Vec3d{4,0,0},0.,1);return std::string("width_cutoff");
+    };
+    const auto result=traceReferenceReplayCore(reference,0,32,4,3,20,0,2,1,normals,1,run,{},{},policy);
+    CHECK(result.failures.empty());CHECK_FALSE(result.filteredStops.empty());
+    CHECK(result.completedReferenceArcBase==32);
 }
