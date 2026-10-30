@@ -202,6 +202,66 @@ class ArchiveLocalGit(unittest.TestCase):
         self.addCleanup(fixture.close)
         return fixture
 
+    def test_stable_publish_refuses_tag_race_after_archive_step(self):
+        """Execute the actual stable publish Bash step with an offline gh sentinel.
+
+        --verify-tag only verifies existence; without a final read-only
+        receipt probe, a concurrent tag move can attach the wrong build.
+        """
+        workflow = SCRIPTS.parent / "workflows" / "vc3d-promote-stable.yml"
+        lines = workflow.read_text().splitlines()
+        marker = "      - name: Publish stable release"
+        self.assertIn(marker, lines)
+        start = lines.index(marker)
+        run = lines.index("        run: |", start)
+        indented = []
+        for line in lines[run + 1:]:
+            if line and not line.startswith("          "):
+                break
+            indented.append(line[10:] if line else "")
+        body = "\n".join(indented) + "\n"
+
+        for race in (False, True):
+            with self.subTest(tag_raced=race):
+                f = self.fixture("stable")
+                receipt = f.receipt(f.new)
+                f.prestage(receipt, f.new)
+                # No new rolling release exists yet: exactly the window
+                # between "Move stable tag" and "Publish stable release".
+                if race:
+                    f.git("tag", "-a", "actor", f.third,
+                          "-m", "Concurrent actor moved stable to another source")
+                    f.git("push", "--force", "origin",
+                          "refs/tags/actor:refs/tags/stable")
+                # A fake gh release-create records the call; it never uploads
+                # a file or accesses GitHub. gh api stays the original mock.
+                gh_script = f.root / "bin" / "gh"
+                marker_path = f.root / "publish-attempted.log"
+                original = gh_script.read_text()
+                gh_script.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = release ] && [ \"$2\" = create ]; then\n"
+                    "  printf '%s\\n' \"$*\" >> "
+                    + shlex.quote(str(marker_path)) + "\n  exit 0\nfi\n"
+                    + original.split("\n", 1)[1]
+                )
+                gh_script.chmod(0o700)
+                f.env["PROMOTION_SHA"] = f.new
+                # The actual Actions checkout contains the helper at this path.
+                helper_target = f.work / ".github" / "scripts" / "vc3d_archive_zero_copy.py"
+                helper_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(SCRIPTS / "vc3d_archive_zero_copy.py", helper_target)
+                (f.work / "stable-assets").mkdir()
+                (f.work / "stable-assets" / "sample.bin").write_bytes(b"fixture only")
+                result = f.run("bash", "-c", body, check=False)
+                self.assertEqual(marker_path.exists(), not race,
+                                 f"rc={result.returncode} stdout={result.stdout} "
+                                 f"stderr={result.stderr}")
+                if race:
+                    self.assertNotEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_two_promotions_preserve_original_ids_and_exact_tag_objects(self):
         for channel in CHANNELS:
             with self.subTest(channel=channel):

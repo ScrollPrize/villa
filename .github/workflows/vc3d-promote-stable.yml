@@ -292,6 +292,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A separate job step may have completed tag promotion minutes ago.
+          # --verify-tag checks only that the tag exists; require its exact
+          # receipt and the absence of an interrupted draft before uploading.
+          replay="$(python3 .github/scripts/vc3d_archive_zero_copy.py stable "$PROMOTION_SHA" --probe-only)"
+          replay_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$replay")"
+          case "$replay_status" in
+            REPAIR_RELEASE_ONLY) ;;
+            ALREADY_PUBLISHED)
+              echo "Stable release was published concurrently; skip duplicate."
+              exit 0 ;;
+            *) echo "::error::stable publication receipt changed: $replay_status" >&2; exit 1 ;;
+          esac
+
           gh release create stable stable-assets/* \
             --verify-tag \
             --title "VC3D Stable" \

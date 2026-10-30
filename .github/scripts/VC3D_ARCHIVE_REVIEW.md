@@ -27,7 +27,7 @@ The local-Git suite checks two successive promotions, exact historical tag objec
 
 On 29 October 2026, the P140 candidate passed all **19 distinct public test methods** in one uninterrupted local invocation without skips: eight metadata methods and eleven local-Git methods, each with both channels where relevant. Channel subtests are not counted as extra methods. The replacement-ID regression failed on the original helper (`a6aba4c2e2b4c30b42f804b4a01b1b9ef2b24f36`) and the interrupted-draft regression failed on P139 (`bef8c97d`), both for latest and stable, then passed on their corrected versions.
 
-The separate P135 harness remains historical evidence: 24 distinct local methods passed on the earlier candidate in its originating environment, using actual workflow Bash blocks, local Git and a simulated API. It has **not** been rerun on this correction and is not included in this PR. Its old/new comparison lost twelve prior IDs in the deletion-based baseline and retained twelve plus twelve new IDs in the candidate model. Do not add that historical count to the current 17 tests. An earlier private V5 test used a temporary PAT; neither it nor these local tests establishes native token behavior.
+The separate P135 harness remains historical evidence: 24 distinct local methods passed on the earlier candidate in its originating environment, using actual workflow Bash blocks, local Git and a simulated API. It has **not** been rerun on this correction and is not included in this PR. Its old/new comparison lost twelve prior IDs in the deletion-based baseline and retained twelve plus twelve new IDs in the candidate model. Do not add that historical count to the current public suite. An earlier private V5 test used a temporary PAT; neither it nor these local tests establishes native token behavior.
 
 ## Interruption boundary corrected on 29 October
 
@@ -92,3 +92,28 @@ native `GITHUB_TOKEN` permissions. The documented authoring and REST semantics
 are: https://cli.github.com/manual/gh_release_create ,
 https://cli.github.com/manual/gh_api ,
 https://docs.github.com/en/rest/releases/releases .
+
+## Final read-only stable-release prepublish check (P141, 30 October)
+
+The stable promotion workflow uses two separate steps to move its annotated
+tag and to create the GitHub Release. A concurrent tag change between those
+steps could make the old publish command attach artifacts for commit A to a
+valid but different stable tag (commit B). GitHub CLI's --verify-tag confirms
+tag existence, **not that it still resolves to the intended commit**.
+
+Immediately before `gh release create stable`, the workflow now invokes
+the existing archive helper using `--probe-only`. Only an intact predecessor
+receipt, exact staged alias and absent current release (status
+`REPAIR_RELEASE_ONLY`) permit the new upload. If another actor already
+published the correct release (`ALREADY_PUBLISHED`), the step does nothing;
+all other states stop without changing a tag, release or assets.
+
+The new offline integration method extracts and executes the actual stable
+publish Bash step with disposable Git. In the previous workflow, a forced
+change of the stable tag after the archive step still invoked a fake
+`gh release create` and passed; the new prepublish probe blocks it. An
+unchanged tag still reaches the fake create. This reduces one identified
+window; it does not make API and Git operations globally atomic or prove
+real GitHub permissions. No real GitHub release, tags or scroll data are used.
+
+The 30 October P141 candidate passed all **20 distinct public test methods** in one uninterrupted local run (8 metadata plus 12 local-Git integration methods), no skips. The new negative control on the old stable workflow failed as expected and passed after the read-only check. Repeating a method or running both channel subtests does not increase the method count. The test's GitHub CLI upload is a recording stub, not a real upload.
