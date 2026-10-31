@@ -21,7 +21,7 @@ import torch
 from vc_reader.reader import ZarrWriter, open_zarr
 from tqdm import tqdm
 
-from vesuvius.image_proc.geometry.diffusion import coherence_enhancing_diffusion as run_coherence_diffusion
+from vesuvius.image_proc.geometry.diffusion.coherence_enhancing_diffusion import coherence_enhancing_diffusion as run_coherence_diffusion
 try:
     from skimage.filters import threshold_otsu
     _HAVE_SKIMAGE = True
