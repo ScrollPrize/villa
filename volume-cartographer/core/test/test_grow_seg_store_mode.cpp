@@ -126,7 +126,8 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     const auto meta = nlohmann::json::parse(store.objectByUuid(txn, copied)->meta);
     CHECK(meta.at("provenance").at("sources") == nlohmann::json::array({grown}));
     CHECK(meta.at("vc_gsfs_mode") == "resume");  // the projection was refined in the same run
-    CHECK(load_quad_from_store(store, txn, copied)->countValidPoints() > 4);
+    // The source's vertices outside this small volume are invalid, which leaves one quad to copy.
+    CHECK(load_quad_from_store(store, txn, copied)->countValidPoints() >= 4);
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }

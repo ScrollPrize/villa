@@ -1749,11 +1749,11 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     std::vector<std::uint8_t> mask;
     if (!(flags & SURF_LOAD_IGNORE_MASK)) mask = vcr::tifxyz::readMask(path.string(), stored.whole[0], stored.whole[1]);
     const auto offsetY = window ? (*window)[0] : 0, offsetX = window ? (*window)[1] : 0;
-    // Missing vertices by the store's validity rule, and the mask.
+    // Missing vertices: vc_reader's rule, the store's (z > 0), and the mask.
     for (int j = 0; j < points->rows; ++j)
         for (int i = 0; i < points->cols; ++i) {
             const bool masked = !mask.empty() && !mask[std::size_t(j + offsetY) * std::size_t(stored.whole[1]) + std::size_t(i + offsetX)];
-            if (masked || !vc::geometry::validSurfacePoint((*points)(j, i)))
+            if (masked || !vcr::tifxyz::vertexPresent((*points)(j, i).val) || !vc::geometry::validSurfacePoint((*points)(j, i)))
                 (*points)(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
         }
 
