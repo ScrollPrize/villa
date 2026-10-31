@@ -111,3 +111,9 @@ def test_write_pyramid_level_ranges_and_multiscales(tmp_path):
     entry = ome_multiscales(levels=1, factors=(1, 2, 2), reduction="nearest", axes=("x", "z", "y"))
     assert [axis["name"] for axis in entry["axes"]] == ["x", "z", "y"]
     assert entry["datasets"][1]["coordinateTransformations"][1]["translation"] == [0.0, 0.0, 0.0]
+
+
+def test_writer_converts_to_numpy(tmp_path):
+    writer = ZarrWriter.create(tmp_path / "a", shape=(2, 2), chunks=(2, 2), dtype="u1")
+    writer[0, 1] = 5
+    np.testing.assert_array_equal(np.asarray(writer), [[0, 5], [0, 0]])

@@ -234,6 +234,13 @@ class ZarrWriter:
             self._reader = ZarrReader.open(self.path, read_mode="slab", auth=self._access)
         return self._reader[key]
 
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        """What is stored now, as with ``writer[...]``."""
+        if copy is False:
+            raise ValueError("reading a Zarr array requires a copy")
+        values = self[...]
+        return values if dtype is None else values.astype(dtype, copy=False)
+
     def set_fill_value(self, value: Any) -> None:
         """Change the fill of absent chunks, keeping stored ones. No other writer may be in use."""
         self._native.set_fill_value(_plain(value))
