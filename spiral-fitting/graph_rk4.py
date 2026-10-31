@@ -121,7 +121,8 @@ def _evict(cache):
 
 
 def _fwd_entry(nb, low, high, h, n_steps, dtype):
-    key = (nb, low.data_ptr(), high.data_ptr(), tuple(low.shape), h, n_steps, dtype)
+    key = (nb, low.data_ptr(), high.data_ptr(), tuple(low.shape), low.stride(), high.stride(),
+           h, n_steps, dtype)
     e = _FWD.get(key)
     if e is None:
         _evict(_FWD)
@@ -129,13 +130,15 @@ def _fwd_entry(nb, low, high, h, n_steps, dtype):
         stages = torch.empty((4 * n_steps, nb, 3), device=low.device, dtype=dtype)
         y_out = torch.empty((nb, 3), device=low.device, dtype=dtype)
         g = _capture(lambda: _forward_body(y_in, stages, y_out, low, high, h, n_steps))
-        e = _FWD[key] = (g, y_in, stages, y_out)
+        # Entries hold the fields (and acc) so their memory can't be reused by
+        # another tensor while a graph keyed on its address is cached.
+        e = _FWD[key] = (g, y_in, stages, y_out, low, high)
     return e
 
 
 def _bwd_entry(nb, low, high, acc, h, n_steps, dtype):
     key = (nb, low.data_ptr(), high.data_ptr(), None if acc is None else acc.data_ptr(),
-           tuple(low.shape), h, n_steps, dtype)
+           tuple(low.shape), low.stride(), high.stride(), h, n_steps, dtype)
     e = _BWD.get(key)
     if e is None:
         _evict(_BWD)
@@ -144,14 +147,14 @@ def _bwd_entry(nb, low, high, acc, h, n_steps, dtype):
         g_out = torch.empty((nb, 3), device=low.device, dtype=dtype)
         # Warmup and capture run with zero gradient, so they add 0 to acc.
         g = _capture(lambda: _backward_body(g_in, stages, g_out, low, high, acc, h, n_steps))
-        e = _BWD[key] = (g, g_in, stages, g_out)
+        e = _BWD[key] = (g, g_in, stages, g_out, low, high, acc)
     return e
 
 
 class RK4GraphIntegrate(torch.autograd.Function):
     # Drop-in for _RK4SparseFlowIntegrate.apply(y0, low, high, 1.0, acc, h, n_steps).
-    # low, high and acc must keep their storage across calls (graphs bake in
-    # their pointers).
+    # Graphs bake in the pointers of low, high and acc; keep their storage
+    # across calls, or each new buffer is captured (and held) again.
 
     @staticmethod
     def forward(ctx, y0, low, high, acc, h, n_steps):
@@ -159,7 +162,7 @@ class RK4GraphIntegrate(torch.autograd.Function):
         h, n_steps = float(h), int(n_steps)
         n = y0.shape[0]
         nb = _bucket(n)
-        g, y_in, stages, y_out = _fwd_entry(nb, low, high, h, n_steps, y0.dtype)
+        g, y_in, stages, y_out = _fwd_entry(nb, low, high, h, n_steps, y0.dtype)[:4]
         y_in[:n].copy_(y0)
         if nb > n:
             y_in[n:].fill_(0.5)
@@ -175,7 +178,8 @@ class RK4GraphIntegrate(torch.autograd.Function):
             return None, None, None, None, None, None
         (saved,) = ctx.saved_tensors
         n, nb = ctx.n, ctx.nb
-        g, g_in, stages, g_out = _bwd_entry(nb, ctx.low, ctx.high, ctx.acc, ctx.h, ctx.n_steps, grad_y.dtype)
+        g, g_in, stages, g_out = _bwd_entry(
+            nb, ctx.low, ctx.high, ctx.acc, ctx.h, ctx.n_steps, grad_y.dtype)[:4]
         stages.copy_(saved)
         g_in[:n].copy_(grad_y.reshape(n, 3))
         if nb > n:

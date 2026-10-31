@@ -45,6 +45,17 @@ comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
 
+## Opt-in flow-field switches
+
+Both are off by default and do not change the math.
+`FIT_SPIRAL_SEP_UPSAMPLE=1` upsamples the LR flow field with three separable
+1D passes instead of `F.interpolate` (the values can differ by float rounding).
+`FIT_SPIRAL_GRAPH_RK4=1` replays the eager RK4 slab integration as CUDA/HIP
+graphs when the fields are on a GPU and the Triton kernel is not used
+(`graph_rk4.py`); it helps on devices where kernel launch overhead dominates.
+`FIT_SPIRAL_GRAPH_RK4_MAX` caps the graphs kept for the forward and the backward
+pass each (default 256, oldest evicted first).
+
 ## Editing input snapshots
 
 The service snapshots patch directories, fiber JSON files and point collections

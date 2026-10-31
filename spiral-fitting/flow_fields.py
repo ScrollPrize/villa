@@ -471,6 +471,9 @@ class CartesianFlowField(nn.Module):
             buf.copy_(low_field)
             low_field = buf
         if self._field_grad_acc is None or self._field_grad_acc.shape != high_field.shape:
+            if self._field_grad_acc is not None and _graph_rk4_enabled():
+                import graph_rk4
+                graph_rk4.clear()
             self._field_grad_acc = torch.zeros_like(high_field)
         else:
             self._field_grad_acc.zero_()
