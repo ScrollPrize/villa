@@ -177,7 +177,10 @@ Small outputs do not retain uncached whole-image allocations.
 Shared decode work is serialized, including conversions. Source readers default
 to one decode/read thread per worker. Pickle stores configuration and descriptors;
 fork/spawn workers reopen resources and caches lazily. Closing is idempotent and
-preserves explicitly shared cache ownership.
+preserves explicitly shared cache ownership. On macOS, forked workers cannot open
+a disk cache when the reader links Apple's system SQLite ("locking protocol"
+errors or a crash in the child): use spawn workers, the macOS default, or install
+with `--config-settings=cmake.define.SQLite3_ROOT=$(brew --prefix sqlite)`.
 
 ## Zarr v3 support
 
