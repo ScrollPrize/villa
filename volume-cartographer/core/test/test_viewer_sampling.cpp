@@ -204,6 +204,62 @@ TEST_CASE("vertex spacing is the working level's voxel shape")
     CHECK(levels.vertexSpacing() == std::array<float, 3>{4, 2, 1});
 }
 
+TEST_CASE("a frame on an anisotropic level samples where the level's placement says")
+{
+    // Level 1 halves x and y only: z stays at level 0's spacing.
+    Fixture f;
+    vcr::zarr::removeNode(f.dir / "1");
+    vcr::zarr::CreateOptions options;
+    options.shape = {32, 16, 16};
+    options.chunks = {8, 8, 8};
+    auto coarse = vcr::zarr::Writer::create(f.dir / "1", options);
+    const auto ramp = [](double z, double y, double x) { return 10.0 + 2.0 * z + 1.0 * y + 3.0 * x; };
+    std::vector<std::uint8_t> values0(32 * 32 * 32), values1(32 * 16 * 16);
+    for (int z = 0; z < 32; ++z)
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x)
+                values0[std::size_t((z * 32 + y) * 32 + x)] = std::uint8_t(ramp(z, y, x));
+    for (int z = 0; z < 32; ++z)
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x)  // the block's centre, at (2x + 0.5, 2y + 0.5) of level 0
+                values1[std::size_t((z * 16 + y) * 16 + x)] = std::uint8_t(ramp(z, 2 * y + 0.5, 2 * x + 0.5));
+    vcr::zarr::Writer::open(f.dir / "0").writeRegion({0, 0, 0}, {32, 32, 32}, values0.data());
+    coarse.writeRegion({0, 0, 0}, {32, 16, 16}, values1.data());
+    using vcr::zarr::Json;
+    const auto level = [](const char* path, Json scale, Json translation) {
+        return Json{{"path", path},
+                    {"coordinateTransformations", Json::array({Json{{"type", "scale"}, {"scale", scale}},
+                                                               Json{{"type", "translation"}, {"translation", translation}}})}};
+    };
+    vcr::zarr::writeAttributes(f.dir, {{"multiscales", Json::array({Json{
+        {"version", "0.4"},
+        {"axes", Json::array({Json{{"name", "z"}, {"type", "space"}}, Json{{"name", "y"}, {"type", "space"}}, Json{{"name", "x"}, {"type", "space"}}})},
+        {"datasets", Json::array({level("0", {1, 1, 1}, {0, 0, 0}), level("1", {1, 2, 2}, {0, 0.5, 0.5})})}}})}});
+
+    OpenedVolumes opened(64 << 20);
+    const auto levels = openLevels(opened, *f.volume);
+    REQUIRE(levels->has(1));
+    CHECK(levels->voxelExtent(1) == std::array<double, 3>{1, 2, 2});
+    CHECK(vc3d::maximumBaseVoxelExtent(*levels, 1) == doctest::Approx(2.0));
+    const auto frame = [&](int start, int fallback) {
+        const vc3d::ViewerSample what{levels, start, fallback, vc::Sampling::Trilinear, {0.0f}, std::nullopt};
+        vc3d::ViewerLoad load;
+        (void)vc3d::sampleCached(planeAt(5, 28, 28), what, &load);
+        vc3d::loadPending(load, [] { return true; });
+        return vc3d::sampleCached(planeAt(5, 28, 28), what, nullptr);
+    };
+    const auto fine = frame(0, 0);
+    const auto wide = frame(1, 0);
+    REQUIRE(wide.values.size() == std::size_t(28 * 28));
+    for (int y = 1; y < 28; ++y)
+        for (int x = 1; x < 28; ++x) {
+            const auto q = std::size_t(y) * 28 + std::size_t(x);
+            // A linear ramp: level 1 gives what level 0 does, within the stored values' rounding.
+            REQUIRE(std::abs(wide.values[q] - fine.values[q]) <= 1.0f);
+            REQUIRE(fine.values[q] == doctest::Approx(float(ramp(5, y, x))).epsilon(0.02));
+        }
+}
+
 TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites reduce its layers")
 {
     Fixture f;
