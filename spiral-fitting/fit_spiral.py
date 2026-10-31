@@ -86,6 +86,7 @@ from point_collection import (
     normalise_pcl_winding_annotations,
     umbilicus_inward_direction,
 )
+from auto_steps import auto_steps_should_stop
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -183,6 +184,9 @@ def largest_patch_quad_component(mask):
 
 
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
+# The automatic stop reads the loss once per block (its lowest value in the
+# block), the cadence log_step_metrics already syncs at, instead of every step.
+_AUTO_STEPS_BLOCK = 200
 
 
 class CheckpointVerdict:
@@ -5411,8 +5415,31 @@ class FitContext:
                     else:
                         wandb.log(payload)
 
+    def _auto_steps_settings(self):
+        """Resolve the opt-in automatic stop: None when off, else
+        (window in blocks, minimum iterations, relative threshold).
+
+        A multi-process fit runs to its horizon with a printed warning: the
+        stop decision would have to agree across ranks.
+        """
+        if not self.config.get('optimizer_auto_steps', False):
+            return None
+        window = int(self.config['optimizer_auto_steps_window'])
+        if window < _AUTO_STEPS_BLOCK or window % _AUTO_STEPS_BLOCK:
+            raise ValueError(
+                f'optimizer_auto_steps_window must be a positive multiple of '
+                f'{_AUTO_STEPS_BLOCK}, got {window}')
+        if self.dist.is_distributed:
+            print('WARNING: optimizer_auto_steps supports single-process fits only; '
+                  'running to optimizer_num_training_steps')
+            return None
+        min_iterations = int(self.config['optimizer_auto_steps_min']) or 2 * window
+        threshold = float(self.config['optimizer_auto_steps_rel_threshold'])
+        return window // _AUTO_STEPS_BLOCK, min_iterations, threshold
+
     def run(self):
-        """Drive one complete headless fit to the configured horizon.
+        """Drive one complete headless fit to the configured horizon, or to an
+        automatic stop when optimizer_auto_steps is on.
 
         Interactive sessions are not driven here: spiral_runtime owns the
         context, its ready signal, and the resident optimizer loop.
@@ -5433,6 +5460,10 @@ class FitContext:
             'optimizing', 'Optimizing',
             step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
             unit='iterations')
+        auto_steps = self._auto_steps_settings()
+        window_blocks, min_iterations, threshold = auto_steps or (0, 0, 0.0)
+        completed_iterations = self.num_training_steps
+        loss_history, block_min = [], None
         for iteration in tqdm(
                 range(self.start_iteration, self.num_training_steps),
                 disable=not self.dist.is_main_process or has_progress):
@@ -5440,6 +5471,23 @@ class FitContext:
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
             self._maybe_save_headless_checkpoint(iteration + 1)
+            if auto_steps is None:
+                continue
+            loss_now = loss.detach()
+            block_min = loss_now if block_min is None else torch.minimum(block_min, loss_now)
+            if (iteration + 1) % _AUTO_STEPS_BLOCK:
+                continue
+            value = block_min.item()
+            block_min = None
+            if math.isfinite(value):
+                loss_history.append(value)
+            if (iteration + 1 >= min_iterations
+                    and auto_steps_should_stop(loss_history, window=window_blocks, rel_threshold=threshold)):
+                completed_iterations = iteration + 1
+                print(f'auto steps: stopping after {completed_iterations} iterations; the best loss '
+                      f'of the last {window_blocks * _AUTO_STEPS_BLOCK} iterations is less than '
+                      f'{threshold:g} (relative) below the best before them')
+                break
 
         # ==========================================================================
         # Final outputs
@@ -5450,7 +5498,7 @@ class FitContext:
             progress.begin(
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
-            self._save_model(suffix, self.num_training_steps)
+            self._save_model(suffix, completed_iterations)
             if self.config.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')

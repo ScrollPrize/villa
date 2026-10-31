@@ -406,6 +406,13 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
+        # Opt-in automatic stop of a headless fit once the loss levels off
+        # (lasagna's "auto" steps rule; see auto_steps.py and README.md,
+        # "Stopping a fit automatically"). Off by default.
+        self.optimizer_auto_steps = False
+        self.optimizer_auto_steps_window = 1000
+        self.optimizer_auto_steps_min = 0
+        self.optimizer_auto_steps_rel_threshold = 1.0e-4
         # Flow-lattice gradient conditioning (see descriptions.json and
         # README.md, "Flow-gradient conditioning").
         # All are read live every step, so they apply at a run boundary
