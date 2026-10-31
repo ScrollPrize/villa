@@ -42,6 +42,16 @@ before inheriting the parent's placement. Changing a parent selection does not
 silently change independently declared companion selections: declare matching
 companion grids when choosing a different pyramid level.
 
+## Plain image files
+
+`vc_reader.images` needs no descriptor. `read(path)` is the whole file, `read(path, page=0)` one
+page, `open(path)` a `SourceReader` for windows; they take the first series and level and name a page
+stack's axes `z, y, x`. `memmap(path)` maps a local uncompressed single-page TIFF, or with `shape` and
+`dtype` creates one of zeros and maps it. `write_tiff(path, image, compression=, tile=)` writes
+atomically (none, lzw, deflate, packbits, zstd; a third axis of more than 4 is pages), and
+`TiffWriter(path, shape, dtype, tile=, compression=)` writes one too large to hold, tile by tile.
+They are `vcr::sources::imageSource`, `readImage`, `readImagePage`, `tiffMapping`, `writeTiff`, `TiffWriter` in C++.
+
 ## Values and selection
 
 Indexing follows `reader.axes` and `reader.shape`, including the channel axis:

@@ -1,9 +1,12 @@
 // vcr::tifxyz: a surface written and read back, listing, retargeting, points between vertices.
+#include "vc_reader/image_write.hpp"
+#include "vc_reader/source_reader.hpp"
 #include "vc_reader/tifxyz.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
@@ -128,6 +131,55 @@ int main()
             surface.resample(grid::Raster{2.5, 3.25, 1, 1, 1, 1}, mode, r.data());
             CHECK(r[0] == p[0] && r[1] == p[1]);
         }
+    }
+    // Plain images: strips, tiles in any order, page stacks, zero pages, first page, mappable or not.
+    {
+        namespace src = vcr::sources;
+        const auto path = (root / "image.tif").string();
+        std::vector<std::uint16_t> image(3 * 40 * 50);
+        for (std::size_t i = 0; i < image.size(); ++i) image[i] = std::uint16_t(i);
+        src::TiffOptions pages;
+        pages.pages = 3;
+        pages.compression = "lzw";
+        src::writeTiff(path, image.data(), "<u2", 40, 50, 1, pages);
+        auto whole = src::readImage(path);
+        CHECK(whole.shape == (std::vector<std::int64_t>{3, 40, 50}) && whole.dtype == "<u2");
+        CHECK(std::memcmp(whole.data.get(), image.data(), whole.nbytes) == 0);
+        auto second = src::readImagePage(path, 1);
+        CHECK(second.shape == (std::vector<std::int64_t>{40, 50}));
+        CHECK(reinterpret_cast<const std::uint16_t*>(second.data.get())[0] == image[2000]);
+        CHECK(src::imageSource(path).axes == (std::vector<std::string>{"z", "y", "x"}));
+        bool refused = false;
+        try {
+            (void)src::tiffMapping(path);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        CHECK(refused);
+
+        const auto tiled = (root / "tiled.tif").string();
+        src::TiffOptions tiles;
+        tiles.tile = std::array<int, 2>{32, 32};
+        tiles.compression = "zstd";
+        {
+            src::TiffWriter writer(tiled, "<u2", 40, 50, 1, tiles);
+            std::vector<std::uint16_t> tile(8 * 18, 7);
+            writer.writeTile(32, 32, tile.data(), 8, 18);
+            writer.finish();
+        }
+        auto back = src::readImage(tiled);
+        const auto* values = reinterpret_cast<const std::uint16_t*>(back.data.get());
+        CHECK(values[0] == 0 && values[39 * 50 + 49] == 7);
+        CHECK(!fs::exists(tiled + "." + std::to_string(::getpid()) + ".tmp"));
+
+        const auto blank = (root / "blank.tif").string();
+        {
+            src::TiffWriter writer(blank, "|u1", 3000, 200);
+            writer.writeBlankPage();
+            writer.finish();
+        }
+        const auto mapping = src::tiffMapping(blank);
+        CHECK(mapping.shape == (std::vector<std::int64_t>{3000, 200}) && mapping.dtype == "|u1" && mapping.offset > 0);
     }
     fs::remove_all(root);
     return 0;

@@ -219,6 +219,24 @@ inline void bind(nb::module_& m)
         .def("working", &DecodedCache::working, "nbytes"_a, "Reserve scratch for a read that retains nothing, as a context manager.")
         .def("__getstate__", [](const DecodedCache& c) { return nb::make_tuple(c.maxBytes(), c.maxDecodeBytes()); })
         .def("__setstate__", [](DecodedCache& c, const std::pair<std::size_t, std::size_t>& state) { new (&c) DecodedCache(state.first, state.second); });
+    m.def("_image_source", [](const std::string& location, nb::object options) {
+        auto opened = optionsFrom(std::move(options));
+        nb::gil_scoped_release release;
+        return imageSource(location, opened);
+    }, "location"_a, "options"_a);
+    m.def("_read_image", [](const std::string& location, nb::object options, std::optional<std::int64_t> page) {
+        auto opened = optionsFrom(std::move(options));
+        Block block;
+        {
+            nb::gil_scoped_release release;
+            block = page ? readImagePage(location, *page, opened) : readImage(location, opened);
+        }
+        return toArray(block);
+    }, "location"_a, "options"_a, "page"_a = nb::none());
+    m.def("_tiff_mapping", [](const std::string& path) {
+        const auto mapping = tiffMapping(path);
+        return nb::make_tuple(mapping.offset, tupleOf(mapping.shape), mapping.dtype);
+    }, "path"_a);
     nb::class_<SourceReader>(m, "SourceReader")
         .def("__init__", [](SourceReader* self, const Source& source, nb::object options, std::shared_ptr<DecodedCache> cache) {
             SourceReader::Settings settings;

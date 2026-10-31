@@ -792,6 +792,75 @@ void SourceReader::ready()
     }
 }
 
+Source imageSource(const std::string& location, const OptionsFor& options)
+{
+    Source source;
+    source.id = location;
+    source.storage.location = location;
+    source.role = "scalar";
+    auto files = std::make_shared<EncodedFiles>(options ? options : defaultOptions());
+    Selection selection;
+    selection.series = std::int64_t(0);
+    selection.level = std::int64_t(0);
+    try {
+        ImageFile image(location, std::nullopt, selection, std::nullopt, files, true);
+        source.axes = image.info().axes;
+        source.storage.format = image.format();
+        source.storage.selection = std::move(selection);
+    } catch (const ImageFormatError&) {
+        throw;
+    } catch (const std::invalid_argument&) {
+        // PNG and JPEG select nothing.
+        ImageFile image(location, std::nullopt, {}, std::nullopt, files);
+        source.axes = image.info().axes;
+        source.storage.format = image.format();
+    }
+    files->close();
+    return finished(std::move(source));
+}
+
+Block readImage(const std::string& location, const OptionsFor& options, const std::optional<std::vector<std::string>>& axes)
+{
+    SourceReader::Settings settings;
+    settings.options = options;
+    settings.decodedCacheBytes = 0;
+    settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
+    auto source = [&] {
+        if (!axes) return imageSource(location, options);
+        Source declared;
+        declared.id = location;
+        declared.storage.location = location;
+        declared.role = "scalar";
+        declared.axes = axes;
+        return finished(std::move(declared));
+    }();
+    SourceReader reader(std::move(source), std::move(settings));
+    std::vector<std::int64_t> size;
+    for (const auto& axis : reader.spatialAxes())
+        size.push_back(reader.shape()[std::size_t(std::find(reader.axes().begin(), reader.axes().end(), axis) - reader.axes().begin())]);
+    return reader.read(std::vector<std::int64_t>(size.size(), 0), size);
+}
+
+Block readImagePage(const std::string& location, std::int64_t page, const OptionsFor& options)
+{
+    SourceReader::Settings settings;
+    settings.options = options;
+    settings.decodedCacheBytes = 0;
+    settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
+    SourceReader reader(imageSource(location, options), std::move(settings));
+    const auto& axes = reader.axes();
+    std::vector<std::int64_t> start, size;
+    for (const auto& axis : reader.spatialAxes()) {
+        const auto n = reader.shape()[std::size_t(std::find(axes.begin(), axes.end(), axis) - axes.begin())];
+        start.push_back(axis == "z" ? page : 0);
+        size.push_back(axis == "z" ? 1 : n);
+    }
+    auto block = reader.read(start, size);
+    const auto z = std::find(axes.begin(), axes.end(), "z");
+    if (z != axes.end()) block.shape.erase(block.shape.begin() + (z - axes.begin()));
+    return block;
+}
+
 ImageFile& SourceReader::file(std::int64_t index)
 {
     const auto found = files_.find(index);

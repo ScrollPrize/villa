@@ -12,7 +12,6 @@ from typing import Any
 
 from . import _reader
 from ._reader import TifxyzSurface as Surface
-from ._reader import write_tiff
 
 
 def _options_for(reader_options):
@@ -75,4 +74,4 @@ def full_extent(stored, scale):
     return _reader._tifxyz_full_extent(stored, scale)
 
 
-__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_mask', 'read_metadata', 'write', 'write_tiff']
+__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_mask', 'read_metadata', 'write']

@@ -52,17 +52,10 @@ sources::SourceReader::Settings settingsOf(const sources::OptionsFor& options)
     settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
     return settings;
 }
-// One image, whole, as stored values.
-sources::Block readImage(const std::string& location, const sources::OptionsFor& options)
+// One coordinate image, whole, as stored values.
+sources::Block readGrid(const std::string& location, const sources::OptionsFor& options)
 {
-    sources::Source source;
-    source.id = location;
-    source.storage.location = location;
-    source.storage.format = "tiff";
-    source.role = "scalar";
-    source.axes = std::vector<std::string>{"y", "x"};
-    sources::SourceReader reader(sources::finished(std::move(source)), settingsOf(options));
-    return reader.read({0, 0}, reader.shape());
+    return sources::readImage(location, resolved(options), std::vector<std::string>{"y", "x"});
 }
 template <class T>
 void toFloats(const std::uint8_t* data, std::size_t n, float* out, std::size_t stride)
@@ -274,9 +267,9 @@ Metadata readMetadata(const std::string& location, const sources::OptionsFor& op
 Surface read(const std::string& location, bool useMask, const sources::OptionsFor& options)
 {
     auto metadata = readMetadata(location, options);
-    const auto x = readImage(child(location, "x.tif"), options);
-    const auto y = readImage(child(location, "y.tif"), options);
-    const auto z = readImage(child(location, "z.tif"), options);
+    const auto x = readGrid(child(location, "x.tif"), options);
+    const auto y = readGrid(child(location, "y.tif"), options);
+    const auto z = readGrid(child(location, "z.tif"), options);
     if (x.shape.size() != 2 || x.shape != y.shape || x.shape != z.shape) bad(location + ": tifxyz coordinates require matching YX grids");
     const auto cells = std::size_t(x.shape[0]) * std::size_t(x.shape[1]);
     std::vector<float> xyz(cells * 3);

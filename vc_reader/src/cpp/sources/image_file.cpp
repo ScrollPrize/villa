@@ -652,7 +652,7 @@ struct ImageFile::Tiff {
 };
 
 ImageFile::ImageFile(std::string location, const std::optional<std::string>& format, const Selection& selection,
-                     const std::optional<std::vector<std::string>>& axes, std::shared_ptr<EncodedFiles> files)
+                     const std::optional<std::vector<std::string>>& axes, std::shared_ptr<EncodedFiles> files, bool namePageAxis)
     : location_(std::move(location)), files_(std::move(files))
 {
     if (format) {
@@ -670,13 +670,33 @@ ImageFile::ImageFile(std::string location, const std::optional<std::string>& for
     ::fstat(opened.fd, &st);
     encodedSize_ = std::size_t(st.st_size);
     if (format_ == "tiff") {
-        openTiff(opened.fd, selection, axes);
+        openTiff(opened.fd, selection, axes, namePageAxis);
     } else {
         if (selection.series || selection.level) bad("PNG/JPEG sources do not have selectable series or levels");
         openRaster(opened.fd, axes);
     }
 }
 ImageFile::~ImageFile() = default;
+
+TiffMapping tiffMapping(const std::string& path)
+{
+    const auto refuse = [&](const std::string& why) { return std::invalid_argument(path + " cannot be memory-mapped: " + why); };
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> handle(TIFFOpen(path.c_str(), "r"), TIFFClose);
+    if (!handle) throw refuse("not a readable TIFF");
+    TIFF* tif = handle.get();
+    const auto page = readPage(tif);
+    if (TIFFReadDirectory(tif)) throw refuse("it has several pages");
+    if (!TIFFSetDirectory(tif, 0)) throw refuse("not a readable TIFF");
+    if (page.compression != COMPRESSION_NONE || page.bits < 8 || TIFFIsTiled(tif) || TIFFIsByteSwapped(tif) || (page.samples > 1 && page.planar != PLANARCONFIG_CONTIG))
+        throw refuse("its values are not stored as one uncompressed run");
+    const std::uint64_t* offsets = nullptr;
+    const std::uint64_t* counts = nullptr;
+    if (!TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets) || !TIFFGetField(tif, TIFFTAG_STRIPBYTECOUNTS, &counts) || !TIFFNumberOfStrips(tif)) throw refuse("it has no strips");
+    const auto strips = TIFFNumberOfStrips(tif);
+    for (std::uint32_t i = 1; i < strips; ++i)
+        if (offsets[i] != offsets[i - 1] + counts[i - 1]) throw refuse("its strips are not contiguous");
+    return {offsets[0], page.shape(), page.dtype()};
+}
 
 std::vector<std::int64_t> ImageFile::prefixShape() const
 {
@@ -698,7 +718,7 @@ void ImageFile::openRaster(int fd, const std::optional<std::vector<std::string>>
     palette_ = raster.palette;
 }
 
-void ImageFile::openTiff(int fd, const Selection& selection, const std::optional<std::vector<std::string>>& axes)
+void ImageFile::openTiff(int fd, const Selection& selection, const std::optional<std::vector<std::string>>& axes, bool namePageAxis)
 {
     auto handle = openTiffHandle(fd, location_);
     TIFF* tif = handle.get();
@@ -813,6 +833,7 @@ void ImageFile::openTiff(int fd, const Selection& selection, const std::optional
 
     std::vector<std::optional<std::string>> observed;
     for (const char letter : seriesAxes) observed.push_back(axisName(letter));
+    if (namePageAxis && observed.size() >= 3 && !observed[0] && std::count(observed.begin(), observed.end(), std::nullopt) == 1) observed[0] = "z";
     const auto resolved = resolveAxes(axes, observed, seriesShape);
     if (seriesShape.size() < own.size()) bad("TIFF series/page layout cannot be read as independent pages; use a chunked source");
     const auto prefix = seriesShape.size() - own.size();

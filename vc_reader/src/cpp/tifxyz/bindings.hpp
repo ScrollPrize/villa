@@ -6,6 +6,7 @@
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -15,6 +16,20 @@ namespace vcr::tifxyz::python {
 using FloatsIn = nb::ndarray<const float, nb::c_contig, nb::device::cpu>;
 using BytesIn = nb::ndarray<const std::uint8_t, nb::c_contig, nb::device::cpu>;
 
+// The typestr of an array's values; a kind the writer takes or one it names in its refusal.
+inline std::string typestrOf(nb::dlpack::dtype dtype)
+{
+    const char kind = dtype.code == std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' : dtype.code == std::uint8_t(nb::dlpack::dtype_code::UInt) ? 'u' : dtype.code == std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : 'b';
+    return std::string(dtype.bits == 8 ? "|" : "<") + kind + std::to_string(dtype.bits / 8);
+}
+// Rows and columns of an array about to be handed to a writer, which trusts its size.
+inline std::pair<std::int64_t, std::int64_t> checkedTile(const sources::TiffWriter& writer, const nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>& tile)
+{
+    const auto channels = writer.shape()[2];
+    if (typestrOf(tile.dtype()) != writer.dtype()) throw nb::value_error(("TiffWriter holds " + writer.dtype() + ", got " + typestrOf(tile.dtype())).c_str());
+    if (tile.ndim() < 2 || tile.ndim() > 3 || (tile.ndim() == 3 ? std::int64_t(tile.shape(2)) : 1) != channels) throw nb::value_error("TiffWriter takes (rows, cols) or (rows, cols, channels) of its channels");
+    return {std::int64_t(tile.shape(0)), std::int64_t(tile.shape(1))};
+}
 inline grid::Interpolation interpolationOf(const std::string& name)
 {
     if (name == "linear") return grid::Interpolation::Linear;
@@ -71,15 +86,66 @@ inline nb::tuple rasterOut(const Surface& s, const grid::Raster& raster, grid::I
 
 inline void bind(nb::module_& m)
 {
-    m.def("write_tiff", [](const std::filesystem::path& path, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, const std::string& dtype, const std::string& compression, std::optional<std::array<int, 2>> tile) {
-        if (image.ndim() != 2 && image.ndim() != 3) throw nb::value_error("write_tiff takes (rows, cols) or (rows, cols, channels)");
+    m.def("_write_tiff", [](const std::filesystem::path& path, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, const std::string& compression, std::optional<std::array<int, 2>> tile, std::optional<bool> stacked) {
+        // Unasked, a third axis of up to 4 is channels and of more is pages.
+        const bool pages = stacked.value_or(image.ndim() == 4 || (image.ndim() == 3 && image.shape(2) > 4));
+        const std::size_t at = pages ? 1 : 0;
+        if (image.ndim() != at + 2 && image.ndim() != at + 3) throw nb::value_error(pages ? "write_tiff with pages takes (pages, rows, cols) or (pages, rows, cols, channels)" : "write_tiff takes (rows, cols) or (rows, cols, channels)");
         sources::TiffOptions options;
         options.compression = compression;
         options.tile = tile;
-        const auto channels = image.ndim() == 3 ? std::int64_t(image.shape(2)) : 1;
+        if (pages) options.pages = std::int64_t(image.shape(0));
+        const auto channels = image.ndim() == at + 3 ? std::int64_t(image.shape(at + 2)) : 1;
+        const auto dtype = typestrOf(image.dtype());
         nb::gil_scoped_release release;
-        sources::writeTiff(path, image.data(), dtype, std::int64_t(image.shape(0)), std::int64_t(image.shape(1)), channels, options);
-    }, "path"_a, "image"_a, "dtype"_a, "compression"_a = "none", "tile"_a = nb::none());
+        sources::writeTiff(path, image.data(), dtype, std::int64_t(image.shape(at)), std::int64_t(image.shape(at + 1)), channels, options);
+    }, "path"_a, "image"_a, "compression"_a = "none", "tile"_a = nb::none(), "pages"_a = nb::none());
+
+    using Writer = sources::TiffWriter;
+    nb::class_<Writer>(m, "TiffWriter", "One TIFF written by tile or by page through a temporary; as a context manager it finishes, or on an exception abandons.")
+        .def("__init__", [](Writer* self, const std::filesystem::path& path, const std::string& dtype, std::int64_t rows, std::int64_t cols, std::int64_t channels, const std::string& compression, std::optional<std::array<int, 2>> tile, std::int64_t pages) {
+            sources::TiffOptions options;
+            options.compression = compression;
+            options.tile = tile;
+            options.pages = pages;
+            new (self) Writer(path, dtype, rows, cols, channels, std::move(options));
+        }, "path"_a, "dtype"_a, "rows"_a, "cols"_a, "channels"_a = 1, "compression"_a = "none", "tile"_a = nb::none(), "pages"_a = 1)
+        .def_prop_ro("tile", &Writer::tile)
+        .def("write_page", [](Writer& w, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image) {
+            const auto [rows, cols] = checkedTile(w, image);
+            if (rows != w.shape()[0] || cols != w.shape()[1]) throw nb::value_error("write_page takes a whole page");
+            nb::gil_scoped_release release;
+            w.writePage(image.data());
+        }, "image"_a)
+        .def("write_blank_page", &Writer::writeBlankPage, nb::call_guard<nb::gil_scoped_release>())
+        .def("write_tile", [](Writer& w, std::int64_t row, std::int64_t col, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> tile) {
+            const auto [rows, cols] = checkedTile(w, tile);
+            nb::gil_scoped_release release;
+            w.writeTile(row, col, tile.data(), rows, cols);
+        }, "row"_a, "col"_a, "tile"_a)
+        .def("write_tiles", [](Writer& w, nb::iterable tiles) {
+            std::int64_t row = 0, col = 0;
+            for (nb::handle item : tiles) {
+                const auto tile = nb::cast<nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>>(item);
+                const auto [rows, cols] = checkedTile(w, tile);
+                {
+                    nb::gil_scoped_release release;
+                    w.writeTile(row, col, tile.data(), rows, cols);
+                }
+                col += w.tile()[1];
+                if (col >= w.shape()[1]) {
+                    col = 0;
+                    row += w.tile()[0];
+                }
+            }
+        }, "tiles"_a, "Tiles from an iterable, row by row, with one tile size throughout.")
+        .def("finish", &Writer::finish, nb::call_guard<nb::gil_scoped_release>())
+        .def("abandon", &Writer::abandon, nb::call_guard<nb::gil_scoped_release>())
+        .def("__enter__", [](nb::handle self) { return nb::borrow(self); })
+        .def("__exit__", [](Writer& w, nb::handle type, nb::handle, nb::handle) {
+            if (type.is_none()) w.finish();
+            else w.abandon();
+        }, nb::arg().none(), nb::arg().none(), nb::arg().none());
 
     m.def("_tifxyz_full_extent", &fullExtent, "stored"_a, "scale"_a);
 

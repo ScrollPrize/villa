@@ -205,7 +205,7 @@ struct PageSlice {
 class ImageFile {
 public:
     ImageFile(std::string location, const std::optional<std::string>& format, const Selection& selection,
-              const std::optional<std::vector<std::string>>& axes, std::shared_ptr<EncodedFiles> files);
+              const std::optional<std::vector<std::string>>& axes, std::shared_ptr<EncodedFiles> files, bool namePageAxis = false);
     ~ImageFile();
     [[nodiscard]] const FileInfo& info() const { return info_; }
     [[nodiscard]] const std::string& format() const { return format_; }
@@ -220,7 +220,7 @@ public:
     [[nodiscard]] Block region(std::int64_t page, const std::vector<PageSlice>& slices, DecodedCache& cache, std::size_t scratchBytes);
 private:
     struct Tiff;
-    void openTiff(int fd, const Selection& selection, const std::optional<std::vector<std::string>>& axes);
+    void openTiff(int fd, const Selection& selection, const std::optional<std::vector<std::string>>& axes, bool namePageAxis);
     void openRaster(int fd, const std::optional<std::vector<std::string>>& axes);
     std::string location_, format_, token_;
     std::shared_ptr<EncodedFiles> files_;
@@ -328,5 +328,21 @@ private:
     std::optional<SourceRegistration> registration_;
     ResolvedSource resolved_;
 };
+
+// A plain image file as a source: its first series and level, and a page stack's anonymous axis named z.
+// TIFF and PNG/JPEG, by suffix. Opens the file once to learn its axes.
+[[nodiscard]] Source imageSource(const std::string& location, const OptionsFor& options = {});
+// The whole of such a file, retaining nothing, with no decode budget. `axes` skips learning them.
+[[nodiscard]] Block readImage(const std::string& location, const OptionsFor& options = {}, const std::optional<std::vector<std::string>>& axes = std::nullopt);
+// One page of such a file: of a page stack, that page; of anything else, the whole image.
+[[nodiscard]] Block readImagePage(const std::string& location, std::int64_t page, const OptionsFor& options = {});
+// Where a local single-page TIFF keeps its values when they lie uncompressed in one native-order run,
+// so they can be memory-mapped. std::invalid_argument for a file that cannot be.
+struct TiffMapping {
+    std::uint64_t offset = 0;
+    std::vector<std::int64_t> shape;
+    std::string dtype;
+};
+[[nodiscard]] TiffMapping tiffMapping(const std::string& path);
 
 } // namespace vcr::sources

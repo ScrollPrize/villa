@@ -115,18 +115,6 @@ def test_retarget_and_pickle(tmp_path):
     assert np.array_equal(again.xyz, surface.xyz) and again.scale == surface.scale and again.extra == {'k': [1, 2]} and again.uuid == 'u'
 
 
-def test_write_tiff_dtypes(tmp_path):
-    for dtype in (np.uint8, np.uint16, np.float32):
-        image = np.arange(64 * 48, dtype=dtype).reshape(64, 48)
-        tifxyz.write_tiff(tmp_path / 'a.tif', image, np.dtype(dtype).str, compression='lzw', tile=(32, 32))
-        assert np.array_equal(tifffile.imread(tmp_path / 'a.tif'), image)
-    rgb = np.arange(30, dtype=np.uint8).reshape(2, 5, 3)
-    tifxyz.write_tiff(tmp_path / 'c.tif', rgb, '|u1')
-    assert np.array_equal(tifffile.imread(tmp_path / 'c.tif'), rgb)
-    with pytest.raises(ValueError, match='compression'):
-        tifxyz.write_tiff(tmp_path / 'b.tif', rgb, '|u1', compression='jpeg')
-
-
 def test_resample_full_is_scaled_stored_positions():
     surface = tifxyz.Surface(_grid(), scale=(.5, .25))
     assert surface.full_shape == (40, 120)
