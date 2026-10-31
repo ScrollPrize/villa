@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import zarr
-import tifffile
+from vc_reader import images
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
@@ -159,7 +159,7 @@ class FittedZarrDataset(Dataset):
         z0 = int(round(origin[2]))
 
         # Load CT and crop to zarr extent
-        image = tifffile.imread(str(img_path))  # (D_full, H_full, W_full)
+        image = images.read(str(img_path))  # (D_full, H_full, W_full)
         if image.dtype == np.uint16:
             image = (image // 257).astype(np.uint8)
         image = image[z0:z0 + Z * step, y0:y0 + Y * step, x0:x0 + X * step]

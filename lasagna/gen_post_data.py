@@ -2,23 +2,23 @@ from pathlib import Path
 import argparse
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import cv2
 import monotone_norm
 import torch
 
 
 def load_label_layer(path: Path, layer: int) -> np.ndarray:
-	with tifffile.TiffFile(str(path)) as tif:
-		series = tif.series[0]
-		if len(series.shape) == 2:
+	with images.open(path) as reader:
+		shape = reader.shape
+		if len(shape) == 2:
 			if layer != 0:
-				raise ValueError(f"Requested layer {layer} but TIFF is single-layer with shape {series.shape}")
-			arr = series.asarray()
+				raise ValueError(f"Requested layer {layer} but TIFF is single-layer with shape {shape}")
+			arr = reader[...]
 		else:
-			if layer < 0 or layer >= series.shape[0]:
-				raise ValueError(f"Requested layer {layer} out of range for TIFF with {series.shape[0]} layers")
-			arr = series.asarray(key=layer)
+			if layer < 0 or layer >= shape[0]:
+				raise ValueError(f"Requested layer {layer} out of range for TIFF with {shape[0]} layers")
+			arr = reader[layer]
 	if arr.dtype != np.uint8:
 		arr = arr.astype(np.uint8)
 	return arr
@@ -530,7 +530,7 @@ def main() -> None:
 	results = compute_label_supervision(labels, dbg=True)
 
 	# Keep original lbl.tif dump for debugging.
-	tifffile.imwrite("lbl.tif", results["labels"])
+	images.write_tiff("lbl.tif", results["labels"])
 
 	if args.out is not None:
 		out_path = Path(args.out)
@@ -538,48 +538,48 @@ def main() -> None:
 		out_path = label_path.with_name("vis.tif")
 
 	# Signed-distance visualization.
-	tifffile.imwrite(str(out_path), results["signed_vis"])
+	images.write_tiff(str(out_path), results["signed_vis"])
 
 	# Also write the monotone-normalized visualization next to the main vis.
 	mono_out_path = out_path.with_name("vis_monotone.tif")
-	tifffile.imwrite(str(mono_out_path), results["mono_vis"])
+	images.write_tiff(str(mono_out_path), results["mono_vis"])
 
 	# Write single-sided and iterative visualizations.
 	mono_fg_out_path = out_path.with_name("vis_monotone_fg.tif")
-	tifffile.imwrite(str(mono_fg_out_path), results["mono_fg_vis"])
+	images.write_tiff(str(mono_fg_out_path), results["mono_fg_vis"])
 
 	mono_bg_out_path = out_path.with_name("vis_monotone_bg.tif")
-	tifffile.imwrite(str(mono_bg_out_path), results["mono_bg_vis"])
+	images.write_tiff(str(mono_bg_out_path), results["mono_bg_vis"])
 
 	if results["mono_iters"] is not None:
 		mono_iters_out_path = out_path.with_name("vis_monotone_iters.tif")
-		tifffile.imwrite(str(mono_iters_out_path), results["mono_iters"])
+		images.write_tiff(str(mono_iters_out_path), results["mono_iters"])
 
 	# Write skeletons.
 	skel_fg_out_path = out_path.with_name("vis_skeleton_fg.tif")
-	tifffile.imwrite(str(skel_fg_out_path), results["skel_fg_vis"])
+	images.write_tiff(str(skel_fg_out_path), results["skel_fg_vis"])
 
 	skel_bg_out_path = out_path.with_name("vis_skeleton_bg.tif")
-	tifffile.imwrite(str(skel_bg_out_path), results["skel_bg_vis"])
+	images.write_tiff(str(skel_bg_out_path), results["skel_bg_vis"])
 
 	# Write connected components on original labels.
 	cc_out_path = out_path.with_name("vis_labels_cc.tif")
-	tifffile.imwrite(str(cc_out_path), results["cc_vis"])
+	images.write_tiff(str(cc_out_path), results["cc_vis"])
 
 	# Write second CC pass (label/bg separated, ignore=2 as background).
 	cc_sep_out_path = out_path.with_name("vis_labels_cc_sep.tif")
-	tifffile.imwrite(str(cc_sep_out_path), results["cc_sep_vis"])
+	images.write_tiff(str(cc_sep_out_path), results["cc_sep_vis"])
 
 	# Write stepped & fractional order fields as float32 TIFFs.
 	frac_step_out_path = out_path.with_name("vis_frac_step.tif")
-	tifffile.imwrite(str(frac_step_out_path), results["frac_step"].astype(np.float32))
+	images.write_tiff(str(frac_step_out_path), results["frac_step"].astype(np.float32))
 
 	frac_out_path = out_path.with_name("vis_frac_pos.tif")
-	tifffile.imwrite(str(frac_out_path), results["frac_pos"].astype(np.float32))
+	images.write_tiff(str(frac_out_path), results["frac_pos"].astype(np.float32))
 
 	# Debug image near half-step boundaries.
 	frac_dbg_out_path = out_path.with_name("vis_frac_pos_dbg.tif")
-	tifffile.imwrite(str(frac_dbg_out_path), results["frac_dbg"].astype(np.float32))
+	images.write_tiff(str(frac_dbg_out_path), results["frac_dbg"].astype(np.float32))
 
 
 if __name__ == "__main__":

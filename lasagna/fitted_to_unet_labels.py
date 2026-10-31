@@ -19,7 +19,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import zarr
 
 
@@ -70,30 +70,29 @@ def convert(input_path: str, output_dir: str) -> None:
     dir0_x, dir1_x = _encode_dir(ny, nz)
 
     # Write TIFs
-    tifffile.imwrite(str(out / "cos.tif"), cos_label, compression="lzw")
+    images.write_tiff(str(out / "cos.tif"), cos_label, compression="lzw")
     print(f"[fitted_to_unet_labels] wrote cos.tif {cos_label.shape}", flush=True)
 
-    tifffile.imwrite(str(out / "grad_mag.tif"), grad_mag_label, compression="lzw")
+    images.write_tiff(str(out / "grad_mag.tif"), grad_mag_label, compression="lzw")
     print(f"[fitted_to_unet_labels] wrote grad_mag.tif {grad_mag_label.shape}", flush=True)
 
     # Dir TIFs: (2, Z, Y, X) -> (Z, 2, Y, X) for multi-page TIF
     dir_z = np.stack([dir0_z, dir1_z], axis=0)  # (2, Z, Y, X)
     dir_z_tif = dir_z.transpose(1, 0, 2, 3)     # (Z, 2, Y, X)
-    tifffile.imwrite(str(out / "dir_z.tif"), dir_z_tif, compression="lzw")
+    images.write_tiff(str(out / "dir_z.tif"), dir_z_tif, compression="lzw")
     print(f"[fitted_to_unet_labels] wrote dir_z.tif {dir_z_tif.shape}", flush=True)
 
     dir_y = np.stack([dir0_y, dir1_y], axis=0)
     dir_y_tif = dir_y.transpose(1, 0, 2, 3)
-    tifffile.imwrite(str(out / "dir_y.tif"), dir_y_tif, compression="lzw")
+    images.write_tiff(str(out / "dir_y.tif"), dir_y_tif, compression="lzw")
     print(f"[fitted_to_unet_labels] wrote dir_y.tif {dir_y_tif.shape}", flush=True)
 
     dir_x = np.stack([dir0_x, dir1_x], axis=0)
     dir_x_tif = dir_x.transpose(1, 0, 2, 3)
-    tifffile.imwrite(str(out / "dir_x.tif"), dir_x_tif, compression="lzw")
+    images.write_tiff(str(out / "dir_x.tif"), dir_x_tif, compression="lzw")
     print(f"[fitted_to_unet_labels] wrote dir_x.tif {dir_x_tif.shape}", flush=True)
 
-    tifffile.imwrite(str(out / "validity.tif"), validity.astype(np.float32),
-                     compression="lzw")
+    images.write_tiff(str(out / "validity.tif"), validity.astype(np.float32), compression="lzw")
     print(f"[fitted_to_unet_labels] wrote validity.tif {validity.shape}", flush=True)
 
     print(f"[fitted_to_unet_labels] done: {out}", flush=True)

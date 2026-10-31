@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import tifffile
+from vc_reader import images
 import zarr
 from zarr.codecs import BloscCodec
 
@@ -197,10 +197,9 @@ def save_vis(
         "pred_dir1_z", "gt_dir1_z",
     ]
 
-    with tifffile.TiffWriter(str(out_path)) as tw:
+    with images.TiffWriter(out_path, pages[0].shape, pages[0].dtype, pages=len(pages)) as writer:
         for page, name in zip(pages, page_names):
-            # Tag 285 = PageName, read by GIMP as layer name
-            tw.write(page, extratags=[(285, 's', 0, name, False)])
+            writer.write_page(page, name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +239,7 @@ def evaluate_sample(
     z0 = int(round(origin[2]))
 
     # Load CT, crop to zarr extent
-    image = tifffile.imread(str(img_path))
+    image = images.read(str(img_path))
     if image.dtype == np.uint16:
         image = (image // 257).astype(np.uint8)
     image = image[z0:z0 + Z * step, y0:y0 + Y * step, x0:x0 + X * step]

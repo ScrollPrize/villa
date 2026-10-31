@@ -17,7 +17,7 @@ from typing import Iterable
 import cv2
 import numcodecs
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import zarr
 
@@ -516,13 +516,9 @@ def _write_layered_tif(
         ("mask", _mask_to_rgb(keep_slice)),
         ("overlay", _overlay_rgb(original_slice, masked_out_slice, alpha=overlay_alpha)),
     ]
-    with tifffile.TiffWriter(str(out_path)) as tw:
+    with images.TiffWriter(out_path, layers[0][1].shape, layers[0][1].dtype, pages=len(layers)) as writer:
         for name, image in layers:
-            tw.write(
-                image,
-                photometric="rgb",
-                extratags=[(285, "s", 0, name, False)],
-            )
+            writer.write_page(image, name=name)
 
 
 def _overlay_mask_on_slice(

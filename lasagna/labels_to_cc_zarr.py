@@ -23,7 +23,7 @@ import zlib
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import zarr
 
 
@@ -162,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- read TIFF ----------------------------------------------------------
     print(f"[labels_to_cc] reading {input_path}", flush=True)
-    vol = tifffile.imread(str(input_path))
+    vol = images.read(str(input_path))
     if vol.ndim == 2:
         vol = vol[np.newaxis]  # single slice → (1, H, W)
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"

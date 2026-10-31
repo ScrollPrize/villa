@@ -59,7 +59,7 @@ def write_tiff(path, image, *, compression='none', tile=None, pages=None):
     ``compression``: none, lzw, deflate, packbits, zstd. ``tile``: rows and columns, rounded down to
     a multiple of 16 and capped to the image; without it, strips of about 256 KiB. 3 or 4 channels are RGB(A), else min-is-black.
     """
-    _reader._write_tiff(path, image, compression, tile, pages)
+    _reader._write_tiff(path, image, compression or 'none', tile, pages)
 
 
 def TiffWriter(path, shape, dtype, *, compression='none', tile=None, pages=1, pixel_um=None):
@@ -67,7 +67,7 @@ def TiffWriter(path, shape, dtype, *, compression='none', tile=None, pages=1, pi
 
     ``shape`` is ``(rows, cols)`` or ``(rows, cols, channels)``. ``pixel_um`` is written as the resolution tags. Use as a context manager.
     """
-    return _NativeWriter(path, np.dtype(dtype).str, *shape[:2], *(shape[2:] or (1,)), compression=compression, tile=tile, pages=pages, pixel_um=pixel_um)
+    return _NativeWriter(path, np.dtype(dtype).str, *shape[:2], *(shape[2:] or (1,)), compression=compression or 'none', tile=tile, pages=pages, pixel_um=pixel_um)
 
 
 __all__ = ['TiffWriter', 'memmap', 'open', 'read', 'write_tiff']

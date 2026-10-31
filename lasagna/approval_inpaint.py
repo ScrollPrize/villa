@@ -10,7 +10,7 @@ from typing import Iterable
 
 import numpy as np
 from dtypes import numpy_float_hi
-import tifffile
+from vc_reader import images
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ def load_approval_mask(path: str | Path, *, expected_shape: tuple[int, int] | No
 	p = Path(path)
 	if not p.exists():
 		raise ValueError(f"missing approval mask: {p}")
-	mask = _as_2d_nonzero(tifffile.imread(str(p)), name=str(p))
+	mask = _as_2d_nonzero(images.read(str(p)), name=str(p))
 	if expected_shape is not None and tuple(mask.shape) != tuple(expected_shape):
 		raise ValueError(f"approval mask shape mismatch: got {mask.shape}, expected {expected_shape}")
 	return mask.astype(bool, copy=False)
@@ -110,9 +110,9 @@ def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
 	if missing:
 		raise ValueError(f"approval inpaint tifxyz is missing required file(s): {', '.join(missing)}")
 
-	x = tifffile.imread(str(p / "x.tif")).astype(np.float32)
-	y = tifffile.imread(str(p / "y.tif")).astype(np.float32)
-	z = tifffile.imread(str(p / "z.tif")).astype(np.float32)
+	x = images.read(str(p / "x.tif")).astype(np.float32)
+	y = images.read(str(p / "y.tif")).astype(np.float32)
+	z = images.read(str(p / "z.tif")).astype(np.float32)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
 	if x.ndim != 2:
@@ -120,7 +120,7 @@ def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
 	xyz = np.stack([x, y, z], axis=-1)
 
 	d_path = p / "d.tif"
-	d = _d_channel(tifffile.imread(str(d_path)) if d_path.exists() else None, x.shape, name="d.tif")
+	d = _d_channel(images.read(str(d_path)) if d_path.exists() else None, x.shape, name="d.tif")
 
 	meta: dict = {}
 	try:

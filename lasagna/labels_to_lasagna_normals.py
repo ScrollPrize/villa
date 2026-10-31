@@ -22,7 +22,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import zarr
 from scipy.ndimage import distance_transform_edt
 
@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Step 1: Read TIFF, write binary zarr --------------------------------
     print(f"{TAG} step 1: reading {input_path}", flush=True)
-    vol = tifffile.imread(str(input_path))
+    vol = images.read(str(input_path))
     if vol.ndim == 2:
         vol = vol[np.newaxis]
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"

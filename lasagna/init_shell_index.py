@@ -8,7 +8,7 @@ import math
 import numpy as np
 from dtypes import numpy_float_hi
 import torch
-import tifffile
+from vc_reader import images
 
 
 WRAP_ATOL = 1.0e-3
@@ -66,9 +66,9 @@ def _load_wrapped_tifxyz(path: Path) -> torch.Tensor:
 	z_path = path / "z.tif"
 	if not x_path.exists() or not y_path.exists() or not z_path.exists():
 		raise ValueError(f"init shell is missing x.tif/y.tif/z.tif: {path}")
-	x = tifffile.imread(str(x_path)).astype(np.float32)
-	y = tifffile.imread(str(y_path)).astype(np.float32)
-	z = tifffile.imread(str(z_path)).astype(np.float32)
+	x = images.read(str(x_path)).astype(np.float32)
+	y = images.read(str(y_path)).astype(np.float32)
+	z = images.read(str(z_path)).astype(np.float32)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError(f"init shell tifxyz shape mismatch in {path}: x={x.shape} y={y.shape} z={z.shape}")
 	xyz_np = np.stack([x, y, z], axis=-1)

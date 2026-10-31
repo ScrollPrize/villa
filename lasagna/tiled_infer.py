@@ -2,7 +2,7 @@ from pathlib import Path
 import argparse
 from typing import Optional
 
-import tifffile
+from vc_reader import images
 import numpy as np
 import torch
 import cv2
@@ -18,16 +18,9 @@ def _load_tiff_layer_uint8_norm(path: Path, layer: Optional[int], device: torch.
     - If stack is 3D, use the given `layer` index (default 0 if None).
     - If dtype is uint16: downscale to uint8 via division by 257.
     """
-    with tifffile.TiffFile(str(path)) as tif:
-        series = tif.series[0]
-        shape = series.shape
-        if len(shape) == 2:
-            img = series.asarray()
-        elif len(shape) == 3:
-            idx = 0 if layer is None else int(layer)
-            img = series.asarray(key=idx)
-        else:
-            raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
+    img = images.read(path, page=0 if layer is None else int(layer))
+    if img.ndim != 2:
+        raise ValueError(f"Unsupported TIFF shape {img.shape} for {path}")
 
     if img.dtype == np.uint16:
         img = (img // 257).astype(np.uint8)
@@ -196,13 +189,13 @@ def tiled_unet_infer(
     dir1_np = pred_np[3] if pred_np.shape[0] > 3 else None
 
     # Float32 TIFFs.
-    tifffile.imwrite(f"{prefix}_cos.tif", cos_np, compression="lzw")
+    images.write_tiff(f"{prefix}_cos.tif", cos_np, compression="lzw")
     if mag_np is not None:
-        tifffile.imwrite(f"{prefix}_mag.tif", mag_np, compression="lzw")
+        images.write_tiff(f"{prefix}_mag.tif", mag_np, compression="lzw")
     if dir0_np is not None:
-        tifffile.imwrite(f"{prefix}_dir0.tif", dir0_np, compression="lzw")
+        images.write_tiff(f"{prefix}_dir0.tif", dir0_np, compression="lzw")
     if dir1_np is not None:
-        tifffile.imwrite(f"{prefix}_dir1.tif", dir1_np, compression="lzw")
+        images.write_tiff(f"{prefix}_dir1.tif", dir1_np, compression="lzw")
 
     # 8-bit JPGs for fast visualization.
     cos_u8 = _to_uint8(cos_np)

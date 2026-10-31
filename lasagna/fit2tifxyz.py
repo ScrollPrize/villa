@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 from dtypes import numpy_float_hi
-import tifffile
+from vc_reader import images
 import torch
 
 import cli_json
@@ -953,17 +953,9 @@ def _write_mask_debug_artifacts(
 		encoding="utf-8",
 	)
 	if raw_mask is not None:
-		tifffile.imwrite(
-			str(out_dir / "approval_inpaint_output_mask_raw.tif"),
-			raw_mask.astype(np.uint8) * 255,
-			compression="lzw",
-		)
+		images.write_tiff(str(out_dir / "approval_inpaint_output_mask_raw.tif"), raw_mask.astype(np.uint8) * 255, compression="lzw")
 	if mask is not None:
-		tifffile.imwrite(
-			str(out_dir / "approval_inpaint_output_mask_dilated.tif"),
-			mask.astype(np.uint8) * 255,
-			compression="lzw",
-		)
+		images.write_tiff(str(out_dir / "approval_inpaint_output_mask_dilated.tif"), mask.astype(np.uint8) * 255, compression="lzw")
 
 
 def _print_mask_debug(debug: dict) -> None:
@@ -1074,11 +1066,11 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		return _store_surface(store, out_dir.name, np.stack([xf, yf, zf], axis=-1), meta, channels, model_source)
 
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression=None)
-	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression=None)
-	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression=None)
+	images.write_tiff(str(out_dir / "x.tif"), xf, compression=None)
+	images.write_tiff(str(out_dir / "y.tif"), yf, compression=None)
+	images.write_tiff(str(out_dir / "z.tif"), zf, compression=None)
 	for file_name, arr in channels.items():
-		tifffile.imwrite(str(out_dir / file_name), arr, compression=None)
+		images.write_tiff(str(out_dir / file_name), arr, compression=None)
 	if model_source is not None:
 		_copy_model(model_source, out_dir)
 	return _Written(out_dir)

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -140,13 +140,13 @@ def _write_normal_vis_slices(
 		if validity is not None:
 			v_slice = (validity[z].clip(0, 1) * 255).astype(np.uint8)
 			v_fname = f"validity_z{z:04d}.tif"
-			tifffile.imwrite(str(out / v_fname), v_slice)
+			images.write_tiff(str(out / v_fname), v_slice)
 			print(f"[fit_data] wrote {v_fname}", flush=True)
 
 		# Write density TIF slice (float32)
 		if density is not None:
 			d_fname = f"density_z{z:04d}.tif"
-			tifffile.imwrite(str(out / d_fname), density[z].astype(np.float32))
+			images.write_tiff(str(out / d_fname), density[z].astype(np.float32))
 			print(f"[fit_data] wrote {d_fname}", flush=True)
 
 
@@ -1040,7 +1040,7 @@ def fit_data_to_model(
 		vis_ds = int(round(spacing[0]))
 		if labels_path is not None:
 			print(f"[fit_data] loading labels from {labels_path}", flush=True)
-			labels_full = tifffile.imread(str(labels_path))  # (Z_full, Y_full, X_full)
+			labels_full = images.read(str(labels_path))  # (Z_full, Y_full, X_full)
 			ox, oy, oz = origin
 			sx, sy, sz = spacing
 			# Crop in fullres coords (no downsample — compose at fullres)
@@ -1097,22 +1097,22 @@ def fit_data_to_model(
 		# Normal: (3, Z, Y, X) -> (Z, 3, Y, X) multi-page, 3 channels per page
 		normal_tif = final_normal.astype(np.float32).transpose(1, 0, 2, 3)  # (Z, 3, Y, X)
 		normal_path = tif_dir / "normal.tif"
-		tifffile.imwrite(str(normal_path), normal_tif, compression="lzw")
+		images.write_tiff(str(normal_path), normal_tif, compression="lzw")
 		print(f"[fit_data] wrote {normal_path}  shape={normal_tif.shape}", flush=True)
 		# Winding: (Z, Y, X) multi-page float32
 		winding_tif = final_winding.astype(np.float32)
 		winding_path = tif_dir / "winding.tif"
-		tifffile.imwrite(str(winding_path), winding_tif, compression="lzw")
+		images.write_tiff(str(winding_path), winding_tif, compression="lzw")
 		print(f"[fit_data] wrote {winding_path}  shape={winding_tif.shape}", flush=True)
 		# Validity: (Z, Y, X) multi-page float32
 		validity_tif = final_validity.astype(np.float32)
 		validity_path = tif_dir / "validity.tif"
-		tifffile.imwrite(str(validity_path), validity_tif, compression="lzw")
+		images.write_tiff(str(validity_path), validity_tif, compression="lzw")
 		print(f"[fit_data] wrote {validity_path}  shape={validity_tif.shape}", flush=True)
 		# Density: (Z, Y, X) multi-page float32
 		density_tif = final_density.astype(np.float32)
 		density_path = tif_dir / "density.tif"
-		tifffile.imwrite(str(density_path), density_tif, compression="lzw")
+		images.write_tiff(str(density_path), density_tif, compression="lzw")
 		print(f"[fit_data] wrote {density_path}  shape={density_tif.shape}", flush=True)
 
 	# --- Stats JSON ---
