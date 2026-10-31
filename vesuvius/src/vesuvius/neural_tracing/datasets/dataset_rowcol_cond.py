@@ -44,6 +44,7 @@ from vesuvius.neural_tracing.datasets.conditioning import (
 )
 from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditioning_surface
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vc_reader import transforms as A
 import warnings
 
 
@@ -78,6 +79,8 @@ class EdtSegDataset(Dataset):
         if apply_augmentation and aug_config.get('enabled', True):
             self._augmentations = create_training_transforms(
                 patch_size=self.crop_size,
+                label_names=["segmentation"],
+                extra_targets={"keypoints": A.Points(order="zyx", outside="keep")},
                 no_spatial=False,
                 no_scaling=False,
                 only_spatial_and_intensity=aug_config.get('only_spatial_and_intensity', False),

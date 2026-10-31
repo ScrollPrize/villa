@@ -4,46 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.models.augmentation.transforms.intensity.brightness import (
-    BrightnessAdditiveTransform,
-    MultiplicativeBrightnessTransform,
-)
-from vesuvius.models.augmentation.transforms.intensity.contrast import (
-    BGContrast,
-    ContrastTransform,
-)
-from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
-from vesuvius.models.augmentation.transforms.intensity.gaussian_noise import (
-    GaussianNoiseTransform,
-)
-from vesuvius.models.augmentation.transforms.intensity.illumination import (
-    InhomogeneousSliceIlluminationTransform,
-)
-from vesuvius.models.augmentation.transforms.intensity.inversion import (
-    InvertImageTransform,
-)
-from vesuvius.models.augmentation.transforms.local import (
-    BrightnessGradientAdditiveTransform,
-)
-from vesuvius.models.augmentation.transforms.noise import SharpeningTransform
-from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import (
-    BlankRectangleTransform,
-    SmearTransform,
-)
-from vesuvius.models.augmentation.transforms.noise.gaussian_blur import (
-    GaussianBlurTransform,
-)
-from vesuvius.models.augmentation.transforms.spatial.low_resolution import (
-    SimulateLowResolutionTransform,
-)
-from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
-from vesuvius.models.augmentation.transforms.spatial.rot90 import Rot90Transform
-from vesuvius.models.augmentation.transforms.spatial.transpose import (
-    TransposeAxesTransform,
-)
-from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
-from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
+from vc_reader import transforms as A
 
 
 NATIVE_CROP_TRANSLATION_PROBABILITY = 0.30
@@ -53,344 +14,122 @@ NATIVE_CROP_TRANSLATION_KEEP_FRACTION = 1.0 / 3.0
 NATIVE_CROP_TRANSLATION_MAX_AXES = 2
 NATIVE_CROP_TRANSLATION_MAX_ATTEMPTS = 24
 
-_GEOMETRIC_TRANSFORM_KEYWORDS = (
-    "Rot90",
-    "Mirror",
-    "Spatial",
-    "Affine",
-    "Elastic",
-    "CropPad",
-    "Resize",
-    "Transpose",
-)
+_TARGETS = {
+    "image": A.Image(),
+    "inklabels": A.Label(),
+    "supervision_mask": A.Label(),
+    "surface_mask": A.ScalarField(),
+    "image_mask_for_label": A.Label(),
+}
 
 
-def _is_geometric_transform(transform) -> bool:
-    """Return whether a possibly wrapped transform changes only geometry."""
-
-    if any(
-        keyword in type(transform).__name__
-        for keyword in _GEOMETRIC_TRANSFORM_KEYWORDS
-    ):
-        return True
-    inner = getattr(transform, "transform", None)
-    if inner is not None:
-        return _is_geometric_transform(inner)
-    alternatives = getattr(transform, "list_of_transforms", None)
-    if alternatives:
-        return all(_is_geometric_transform(item) for item in alternatives)
-    return False
-
-
-def split_augmentations_by_geometry(
-    compose: ComposeTransforms,
-) -> tuple[ComposeTransforms, ComposeTransforms]:
-    """Split one preset around the clean pseudo-label image boundary."""
-
-    geometric = []
-    photometric = []
-    for transform in compose.transforms:
-        (geometric if _is_geometric_transform(transform) else photometric).append(
-            transform
-        )
-    return ComposeTransforms(geometric), ComposeTransforms(photometric)
-
-
-def _mirror_axes(dimension: int) -> tuple[int, ...]:
-    if dimension == 2:
-        return 0, 1
-    if dimension == 3:
-        return 1, 2
-    raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3")
-
-
-def _rotation_axes(
+def _rotation_planes(
     patch_size: tuple[int, ...], requested: tuple[int, ...] | None
-) -> set[int] | None:
+) -> list[str]:
     if len(patch_size) == 2:
-        return {0, 1} if patch_size[0] == patch_size[1] else None
-    planes = {0: {1, 2}, 1: {0, 2}, 2: {0, 1}}
-    allowed: set[int] = set()
-    for rotation_axis in ({0} if requested is None else set(requested)):
+        return ["yx"] if patch_size[0] == patch_size[1] else []
+    planes = {0: (1, 2, "yx"), 1: (0, 2, "zx"), 2: (0, 1, "zy")}
+    chosen = []
+    for rotation_axis in sorted({0} if requested is None else set(requested)):
         plane = planes.get(rotation_axis)
-        if plane is None:
-            continue
-        axis_a, axis_b = sorted(plane)
-        if patch_size[axis_a] == patch_size[axis_b]:
-            allowed.update(plane)
-    return allowed or None
+        if plane is not None and patch_size[plane[0]] == patch_size[plane[1]]:
+            chosen.append(plane[2])
+    return chosen
 
 
-def create_spatial_only_transforms(
-    patch_size: tuple[int, ...], rotation_axes: tuple[int, ...] | None = None
-) -> ComposeTransforms:
-    """Create label-safe flips and rotations without intensity edits."""
-    dimension = len(patch_size)
-    transforms = [MirrorTransform(allowed_axes=_mirror_axes(dimension))]
-    allowed = _rotation_axes(patch_size, rotation_axes)
-    if allowed is not None:
-        transforms.append(
-            RandomTransform(
-                Rot90Transform(
-                    num_axis_combinations=1,
-                    num_rot_per_combination=(1, 2, 3),
-                    allowed_axes=allowed,
-                ),
-                apply_probability=0.3,
-            )
-        )
-    return ComposeTransforms(transforms)
+def _spatial(patch_size, rotation_axes) -> list:
+    """Label-safe flips and rotations."""
+    if len(patch_size) not in (2, 3):
+        raise ValueError(f"Invalid patch size dimension: {len(patch_size)}. Expected 2 or 3")
+    transforms = [A.Flip(axes="yx", p_axis=0.5)]
+    planes = _rotation_planes(patch_size, rotation_axes)
+    if planes:
+        transforms.append(A.Rotate90(planes=planes, turns=(1, 2, 3), p=0.3))
+    return transforms
 
 
-def create_spatial_intensity_no_clip_transforms(
-    patch_size: tuple[int, ...], rotation_axes: tuple[int, ...] | None = None
-) -> ComposeTransforms:
-    """Create the bounded no-clipping augmentation preset."""
-    transforms = list(
-        create_spatial_only_transforms(patch_size, rotation_axes).transforms
-    )
-    transforms.extend(
-        [
-            RandomTransform(
-                InvertImageTransform(
-                    p_invert_image=1.0,
-                    p_synchronize_channels=1.0,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.2,
-            ),
-            RandomTransform(
-                BrightnessAdditiveTransform(
-                    mu=(-0.15, 0.15),
-                    sigma=0.0,
-                    synchronize_channels=True,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.3,
-            ),
-            RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0.005, 0.03),
-                    p_per_channel=1.0,
-                    synchronize_channels=True,
-                ),
-                apply_probability=0.25,
-            ),
-        ]
-    )
-    return ComposeTransforms(transforms)
+def _no_clip_intensity() -> list:
+    return [
+        A.Invert(shared=True, p=0.2),
+        A.BrightnessAdd(shift=A.Uniform(-0.15, 0.15), shared=True, p=0.3),
+        A.GaussianNoise(std=A.Uniform(0.005, 0.03), shared=True, shared_noise=True, p=0.25),
+    ]
 
 
-def create_default_training_transforms(
-    patch_size: tuple[int, ...],
-) -> ComposeTransforms:
-    """Compose the default ink training transform graph."""
+def _default(patch_size) -> tuple[list, list]:
+    """The default ink training transforms: those changing geometry, then the others."""
     dimension = len(patch_size)
     if dimension not in (2, 3):
         raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3")
-    transforms = []
-    transpose_axes: set[int] = set()
-    if dimension == 3:
-        for axis_a, axis_b in ((0, 1), (0, 2), (1, 2)):
-            if patch_size[axis_a] == patch_size[axis_b]:
-                transpose_axes.update((axis_a, axis_b))
+    geometric = []
     if dimension == 2:
-        transforms.append(MirrorTransform(allowed_axes=(0, 1)))
-    else:
-        allowed = set()
-        if patch_size[1] == patch_size[2]:
-            allowed.update((1, 2))
-        if patch_size[0] == patch_size[2]:
-            allowed.update((0, 2))
-        if patch_size[0] == patch_size[1]:
-            allowed.update((0, 1))
-        if allowed:
-            transforms.append(
-                RandomTransform(
-                    Rot90Transform(
-                        num_axis_combinations=1,
-                        num_rot_per_combination=(1, 2, 3),
-                        allowed_axes=allowed,
-                    ),
-                    apply_probability=0.5,
-                )
-            )
-
-    blank_rectangle = RandomTransform(
-        BlankRectangleTransform(
-            rectangle_size=tuple(
-                (max(1, size // 6), size // 3) for size in patch_size
-            ),
-            rectangle_value=np.mean,
-            num_rectangles=(1, 5),
-            force_square=False,
-            p_per_sample=0.4,
-            p_per_channel=0.5,
-        ),
-        apply_probability=0.1,
-    )
-
-    common = [
-        OneOfTransform(
-            [
-                RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.3, 1.5),
-                        synchronize_channels=False,
-                        synchronize_axes=False,
-                        p_per_channel=0.5,
-                        benchmark=False,
-                    ),
-                    apply_probability=0.3,
-                )
-            ]
-        ),
-        RandomTransform(
-            GaussianNoiseTransform(
-                noise_variance=(0, 0.2),
-                p_per_channel=0.5,
-                synchronize_channels=True,
-            ),
-            apply_probability=0.3,
-        ),
-        RandomTransform(
-            SharpeningTransform(
-                strength=(0.1, 1.5),
-                p_same_for_each_channel=0.5,
-                p_per_channel=0.5,
-                p_clamp_intensities=0.5,
-            ),
-            apply_probability=0.2,
-        ),
+        geometric.append(A.Flip(axes="yx", p_axis=0.5))
+    elif len(set(patch_size)) < 3:
+        geometric.append(A.Rotate90(turns=(1, 2, 3), p=0.5))
+        geometric.append(A.Transpose(p=0.2))
+    photometric = [
+        A.BlankRectangle(
+            size=[A.Uniform(max(1, size // 6), size // 3) for size in patch_size],
+            value="mean",
+            count=A.Uniform(1, 5),
+            p=0.1 * 0.4,
+            p_channel=0.5,
+        )
     ]
-    common.extend(
-        [
-            OneOfTransform(
-                [
-                    RandomTransform(
-                        ContrastTransform(
-                            contrast_range=BGContrast((0.75, 1.25)),
-                            preserve_range=True,
-                            synchronize_channels=False,
-                            p_per_channel=0.5,
-                        ),
-                        apply_probability=0.3,
-                    ),
-                    RandomTransform(
-                        MultiplicativeBrightnessTransform(
-                            multiplier_range=BGContrast((0.75, 1.25)),
-                            synchronize_channels=False,
-                            p_per_channel=0.5,
-                        ),
-                        apply_probability=0.3,
-                    ),
-                ]
+    if dimension == 3:
+        photometric += [
+            A.Smear(axis="x", shift=[5, 0], alpha=0.2, previous=3, p=0.3),
+            A.SliceIllumination(
+                axis="z",
+                defects=A.Uniform(2, 5),
+                width=A.Uniform(25, 50),
+                reduction=A.Uniform(0.3, 1.5),
+                base_p=A.Uniform(0.2, 0.4),
+                base_reduction=A.Uniform(0.5, 0.9),
+                p=0.4,
+                p_channel=0.5,
             ),
-            RandomTransform(
-                BrightnessAdditiveTransform(
-                    mu=0,
-                    sigma=0.5,
-                    synchronize_channels=False,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.1,
+            A.BrightnessGradient(
+                scale=A.Uniform(min(patch_size) / 6, min(patch_size) / 2),
+                loc=A.Uniform(-0.5, 1.5),
+                strength=0.5,
+                mean_centered=True,
+                clip=False,
+                p=0.2,
+                p_channel=0.5,
             ),
         ]
-    )
-    common.append(
-        RandomTransform(
-            SimulateLowResolutionTransform(
-                scale=(0.25, 1),
-                synchronize_channels=False,
-                synchronize_axes=True,
-                ignore_axes=None,
-                allowed_channels=None,
-                p_per_channel=0.5,
-            ),
-            apply_probability=0.4,
-        )
-    )
-    common.extend(
-        [
-            RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=1,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1,
-                ),
-                apply_probability=0.2,
-            ),
-            RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1,
-                ),
-                apply_probability=0.4,
-            ),
-            RandomTransform(
-                InvertImageTransform(
-                    p_invert_image=1,
-                    p_synchronize_channels=0.5,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.2,
-            ),
-        ]
-    )
-    if dimension == 2:
-        transforms.append(blank_rectangle)
-        transforms.extend(common)
-        return ComposeTransforms(transforms)
-    if len(transpose_axes) >= 2:
-        transforms.append(
-            RandomTransform(
-                TransposeAxesTransform(allowed_axes=transpose_axes),
-                apply_probability=0.2,
-            )
-        )
-    transforms.append(blank_rectangle)
-    transforms.append(
-        RandomTransform(
-            SmearTransform(shift=(5, 0), alpha=0.2, num_prev_slices=3, smear_axis=3),
-            apply_probability=0.3,
-        )
-    )
-    transforms.extend(
-        [
-            RandomTransform(
-                InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),
-                    defect_width=(25, 50),
-                    mult_brightness_reduction_at_defect=(0.3, 1.5),
-                    base_p=(0.2, 0.4),
-                    base_red=(0.5, 0.9),
-                    p_per_sample=1.0,
-                    per_channel=True,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.4,
-            ),
-            RandomTransform(
-                BrightnessGradientAdditiveTransform(
-                    scale=(min(patch_size) / 6, min(patch_size) / 2),
-                    loc=(-0.5, 1.5),
-                    max_strength=0.5,
-                    same_for_all_channels=False,
-                    mean_centered=True,
-                    clip_intensities=False,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.2,
-            ),
-        ]
-    )
-    transforms.extend(common)
-    return ComposeTransforms(transforms)
+    photometric += [
+        A.GaussianBlur(sigma=A.Uniform(0.3, 1.5), shared_axes=False, p=0.3, p_channel=0.5),
+        A.GaussianNoise(std=A.Uniform(0, 0.2), shared=True, shared_noise=True, p=0.3, p_channel=0.5),
+        A.Sharpen(strength=A.Uniform(0.1, 1.5), p_clamp=0.5, p=0.2, p_channel=0.5),
+        A.OneOf(transforms=[
+            A.Contrast(factor=A.Uniform(0.75, 1.25), preserve_range=True, p=0.3, p_channel=0.5),
+            A.BrightnessMultiply(factor=A.Uniform(0.75, 1.25), p=0.3, p_channel=0.5),
+        ]),
+        A.BrightnessAdd(shift=A.Normal(0, 0.5), p=0.1, p_channel=0.5),
+        A.LowResolution(scale=A.Uniform(0.25, 1), shared_axes=True, p=0.4, p_channel=0.5),
+    ]
+    # Half the gamma draws below 1, half above.
+    for p_invert, p in ((1.0, 0.2), (0.0, 0.4)):
+        photometric.append(A.OneOf(transforms=[
+            A.Gamma(gamma=A.Uniform(0.7, 1), p_invert=p_invert, p_retain_stats=1),
+            A.Gamma(gamma=A.Uniform(1, 1.5), p_invert=p_invert, p_retain_stats=1),
+        ], p=p))
+    photometric.append(A.OneOf(transforms=[A.Invert(shared=True), A.Invert(p_channel=0.5)], p=0.2))
+    return geometric, photometric
+
+
+def _preset(preset: str, patch_size, rotation_axes) -> tuple[list, list] | None:
+    if preset == "none":
+        return None
+    if preset == "spatial_only":
+        return _spatial(patch_size, rotation_axes), []
+    if preset == "spatial_intensity_no_clip":
+        return _spatial(patch_size, rotation_axes), _no_clip_intensity()
+    if preset == "default":
+        return _default(patch_size)
+    raise ValueError(f"unknown augmentation preset {preset!r}")
 
 
 def build_augmentations(
@@ -398,18 +137,21 @@ def build_augmentations(
     patch_size: tuple[int, ...],
     *,
     rotation_axes: tuple[int, ...] | None,
-) -> ComposeTransforms | None:
-    """Build one configured preset, returning no transform for `none`."""
+) -> A.Pipeline | None:
+    """Build one configured preset, returning no pipeline for `none`."""
+    parts = _preset(preset, patch_size, rotation_axes)
+    return None if parts is None else A.Pipeline(parts[0] + parts[1], targets=_TARGETS)
 
-    if preset == "none":
-        return None
-    if preset == "spatial_only":
-        return create_spatial_only_transforms(patch_size, rotation_axes)
-    if preset == "spatial_intensity_no_clip":
-        return create_spatial_intensity_no_clip_transforms(patch_size, rotation_axes)
-    if preset == "default":
-        return create_default_training_transforms(patch_size)
-    raise ValueError(f"unknown augmentation preset {preset!r}")
+
+def build_split_augmentations(
+    preset: str,
+    patch_size: tuple[int, ...],
+    *,
+    rotation_axes: tuple[int, ...] | None,
+) -> tuple[A.Pipeline, A.Pipeline] | None:
+    """One preset split around the clean pseudo-label image boundary: geometry, then intensity."""
+    parts = _preset(preset, patch_size, rotation_axes)
+    return None if parts is None else (A.Pipeline(parts[0], targets=_TARGETS), A.Pipeline(parts[1], targets=_TARGETS))
 
 
 def maybe_translate_crop_bbox(

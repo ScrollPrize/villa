@@ -117,11 +117,6 @@ def update_config_from_args(mgr, args):
         source = "--val-every-n" if val_every_n is not None else "tr_config.val_every_n"
         raise ValueError(f"{source} must be >= 1, got {mgr.val_every_n}")
 
-    if getattr(args, 'profile_augmentations', False):
-        mgr.profile_augmentations = True
-        mgr.tr_configs["profile_augmentations"] = True
-        if mgr.verbose:
-            print("Augmentation profiling enabled")
     
     # Handle full_epoch flag - overrides max_steps_per_epoch and max_val_steps_per_epoch
     if args.full_epoch:

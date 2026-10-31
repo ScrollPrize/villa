@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 
 import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
+from vesuvius.models.augmentation.pipelines import sample_seed
 
 
 
@@ -901,19 +902,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_channels = uv_heatmaps_both.shape[0]
             regression_target = torch.cat([uv_heatmaps_both] + ([maybe_center_heatmap] if maybe_center_heatmap is not None else []), dim=0)
             seg_for_aug = seg[None] if seg is not None else None
-            while True:
-                augmented = self._augmentations(
-                    image=volume_crop[None],
-                    dist_map=localiser[None],
-                    regression_target=regression_target,
-                    segmentation=seg_for_aug,
-                    normals=normals,
-                    normals_mask=normals_mask,
-                )
-                if augmented['dist_map'] is not None:
-                    break
+            augmented = self._augmentations(
+                {
+                    'image': volume_crop[None],
+                    'regression_target': regression_target,
+                    'segmentation': seg_for_aug,
+                    'normals': normals,
+                    'normals_mask': normals_mask,
+                },
+                seed=sample_seed(0),
+            )
             volume_crop = augmented['image'].squeeze(0)
-            localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
             maybe_center_heatmap = regression_aug[..., uv_channels] if uv_channels < regression_aug.shape[-1] else None

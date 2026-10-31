@@ -30,7 +30,7 @@ from vesuvius.data import affine
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.utils import pad_or_crop_3d
 
-from ..augmentation.pipelines import create_training_transforms
+from ..augmentation.pipelines import create_training_transforms, sample_seed
 from ..training.normalization import get_normalization
 from .zarr_dataset import PatchInfo
 
@@ -217,6 +217,8 @@ class CrossFrameZarrDataset(Dataset):
         if self.is_training:
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=[self.target_name],
+                backend="cuda" if getattr(mgr, "augment_on_device", False) else "cpu",
                 no_spatial=bool(getattr(mgr, "no_spatial_augmentation", False)),
                 no_scaling=bool(getattr(mgr, "no_scaling_augmentation", False)),
                 skeleton_targets=skeleton_targets or None,
@@ -225,6 +227,7 @@ class CrossFrameZarrDataset(Dataset):
         elif skeleton_targets:
             from ..augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=[self.target_name],
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values or None,
             )
@@ -693,10 +696,10 @@ class CrossFrameZarrDataset(Dataset):
             },
         }
 
-        if self.transforms is not None:
+        if self.transforms is not None and not getattr(self.mgr, "augment_on_device", False):
             if debug:
                 t_aug_s = time.perf_counter()
-            result = self.transforms(**result)
+            result = self.transforms(result, seed=sample_seed(index))
             if debug:
                 t_aug_e = time.perf_counter()
                 _stage(f"__getitem__ {tag}: transforms {1e3*(t_aug_e-t_aug_s):.1f} ms")

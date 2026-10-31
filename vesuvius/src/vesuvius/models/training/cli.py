@@ -178,8 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Optional custom name for the Weights & Biases run")
     grp_logging.add_argument("--wandb-resume", nargs='?', const='allow', default=None,
                              help="Weights & Biases resume mode or run id. Provide a resume policy ('allow', 'auto', 'must', 'never') or a run id (defaults to 'allow' if flag used without value).")
-    grp_logging.add_argument("--profile-augmentations", action="store_true",
-                             help="Collect per-augmentation timing and report per-epoch totals")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 

@@ -24,8 +24,7 @@ from vesuvius.utils.utils import pad_or_crop_3d
 from .find_valid_patches import find_valid_patches
 from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
-from ..augmentation.pipelines import create_training_transforms
-from ..augmentation.transforms.utils.perf import collect_augmentation_names
+from ..augmentation.pipelines import create_training_transforms, sample_seed
 
 
 logger = logging.getLogger(__name__)
@@ -165,8 +164,6 @@ class MutexAffinityDataset(Dataset):
         self.mgr = mgr
         self.is_training = is_training
         self.targets = getattr(mgr, 'targets', {})
-        self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
-        self._augmentation_names: List[str] = []
 
         # Configuration
         self.patch_size = tuple(mgr.train_patch_size)
@@ -461,22 +458,21 @@ class MutexAffinityDataset(Dataset):
 
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=[n for name in self._affinity_handles for n in (name, f"{name}_mask")],
+                backend="cuda" if getattr(self.mgr, 'augment_on_device', False) else "cpu",
                 no_spatial=no_spatial,
                 no_scaling=no_scaling,
                 skeleton_targets=skeleton_targets if skeleton_targets else None,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
         elif skeleton_targets:
             # Validation: only apply skeleton generation (no augmentation)
             from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=[n for name in self._affinity_handles for n in (name, f"{name}_mask")],
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
 
     def _extract_patch(self, patch: PatchInfo) -> Dict[str, Any]:
         """Extract image and affinity patches."""
@@ -515,7 +511,7 @@ class MutexAffinityDataset(Dataset):
             if mask_handle is not None:
                 mask_data = mask_handle.read_window(start, size)
                 mask_bool = np.asarray(mask_data != 0)
-                result[f"{target_name}_mask"] = torch.from_numpy(np.ascontiguousarray(mask_bool))
+                result[f"{target_name}_mask"] = torch.from_numpy(np.ascontiguousarray(mask_bool))[None]
 
         return result
 
@@ -526,10 +522,8 @@ class MutexAffinityDataset(Dataset):
         patch = self._patches[index]
         data_dict = self._extract_patch(patch)
 
-        if self.transforms is not None:
-            if self._profile_augmentations and self._augmentation_names:
-                data_dict['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
-            data_dict = self.transforms(**data_dict)
+        if self.transforms is not None and not getattr(self.mgr, 'augment_on_device', False):
+            data_dict = self.transforms(data_dict, seed=sample_seed(index))
 
         return data_dict
 

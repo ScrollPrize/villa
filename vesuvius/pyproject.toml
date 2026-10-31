@@ -71,10 +71,7 @@ models = [
     "vc-reader",
     "villa-gpu-manager",
     "numba>=0.60.0",
-    "batchgenerators>=0.25.1",
-    "batchgeneratorsv2",
     "einops>=0.8.1",
-    "fft-conv-pytorch>=1.2.0",
     "fvcore>=0.1.5.post20221221",
     "scikit-image>=0.24.0",
     "scipy>=1.13.1",
@@ -163,10 +160,7 @@ all = [
     "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "vc-object-store",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "villa-gpu-manager",
-    "batchgenerators>=0.25.1",
-    "batchgeneratorsv2",
     "einops>=0.8.1",
-    "fft-conv-pytorch>=1.2.0",
     "fvcore>=0.1.5.post20221221",
     "scikit-image>=0.24.0",
     "scipy>=1.13.1",
@@ -267,5 +261,4 @@ vc-object-store = { path = "../vc_object_store", editable = true }
 vc-reader = { path = "../vc_reader", editable = true }
 villa-gpu-manager = { path = "../gpu_manager", editable = true }
 cucim-cu13 = { index = "nvidia" }
-batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }

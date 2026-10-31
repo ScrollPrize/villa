@@ -99,7 +99,7 @@ ___
 
 The model framework utilized by `vesuvius` is _heavily_ inspired by [nnUNetv2](https://github.com/MIC-DKFZ/nnUNet). The default configuration will use the same blocks and construct the same encoders/decoders as the default nnUNetv2 ResEncUNet. As such, a significant portion of the code from the nnUNetv2 repository is duplicated here, with modifications to enable multi-task support with dynamic decoder branches, as well as other data formats. 
 
-Additionally, the augmentations provided within this package are from another of [MIC-DKFZ's](https://github.com/MIC-DKFZ) fantastic array of machine learning libraries, in this case [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2). 
+Training augmentations come from `vc_reader.transforms`.
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 

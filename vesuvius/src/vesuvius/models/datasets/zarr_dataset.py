@@ -25,8 +25,7 @@ from torch.utils.data import Dataset
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
-from ..augmentation.pipelines import create_training_transforms
-from ..augmentation.transforms.utils.perf import collect_augmentation_names
+from ..augmentation.pipelines import create_training_transforms, sample_seed
 
 
 logger = logging.getLogger(__name__)
@@ -92,8 +91,6 @@ class ZarrDataset(Dataset):
         super().__init__()
         self.mgr = mgr
         self.is_training = is_training
-        self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
-        self._augmentation_names: List[str] = []
 
         # Configuration from manager
         self.data_path = Path(mgr.data_path)
@@ -800,22 +797,21 @@ class ZarrDataset(Dataset):
 
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
+                label_names=self.target_names,
+                backend="cuda" if getattr(self.mgr, 'augment_on_device', False) else "cpu",
                 no_spatial=no_spatial,
                 no_scaling=no_scaling,
                 skeleton_targets=skeleton_targets if skeleton_targets else None,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
         elif skeleton_targets:
             # Validation: only apply skeleton generation (no augmentation)
             from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
             self.transforms = create_validation_transforms(
+                label_names=self.target_names,
                 skeleton_targets=skeleton_targets,
                 skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
 
     # -------------------------------------------------------------------------
     # Dataset Interface
@@ -894,10 +890,8 @@ class ZarrDataset(Dataset):
 
         result['is_unlabeled'] = is_unlabeled or patch.is_unlabeled_fg
 
-        if self.transforms is not None:
-            if self._profile_augmentations and self._augmentation_names:
-                result['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
-            result = self.transforms(**result)
+        if self.transforms is not None and not getattr(self.mgr, 'augment_on_device', False):
+            result = self.transforms(result, seed=sample_seed(index))
 
         return result
 
