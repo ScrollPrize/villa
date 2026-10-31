@@ -70,7 +70,7 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
                  for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:]))]
         tag = fiber_tag(fib.metadata)
         endpoints = (False, False)
-        if fib.version == 3:
+        if fib.version >= 3:  # control point tags are the same in versions 3 and 4
             endpoints = tuple("kollesis_termination" in raw["control_points"][i].get("tags", [])
                               for i in (0, -1))
         full_s = arclength(line)
