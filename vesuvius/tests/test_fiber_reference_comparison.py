@@ -138,7 +138,7 @@ def test_surface_reader_and_restricted_projection(tmp_path):
     for name,array in zip('xyz',(c*10,r*10,np.full(r.shape,100))):
         tifffile.imwrite(tmp_path/(name+'.tif'),array.astype(np.float32))
     bounds=[dict(winding=i,column_begin=a,column_end=b) for i,a,b in ((10,0,6),(11,4,11),(12,9,16))]
-    (tmp_path/'meta.json').write_text(json.dumps(dict(winding_bounds=bounds,output_step_vx=10)))
+    (tmp_path/'meta.json').write_text(json.dumps(dict(scale=[1,1],winding_bounds=bounds,output_step_vx=10)))
     surface=Surface(tmp_path,scale=1,stride=1,workers=1,candidates=4)
     points=np.array([[52,22,105]],float)
     rc,dist=surface.project(points)
@@ -159,7 +159,7 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     for name,array in zip('xyz',(c*10,r*10,np.full(r.shape,100))):
         tifffile.imwrite(root/(name+'.tif'),array.astype(np.float32))
     bounds=[dict(winding=i,column_begin=a,column_end=b) for i,a,b in ((10,0,6),(11,4,11),(12,9,16))]
-    (root/'meta.json').write_text(json.dumps(dict(winding_bounds=bounds,output_step_vx=10)))
+    (root/'meta.json').write_text(json.dumps(dict(scale=[1,1],winding_bounds=bounds,output_step_vx=10)))
     source=tmp_path/'solve';source.mkdir();original=tmp_path/'source.vcobj'
     fid='00000000-0000-4000-8000-000000000001'
     write_fibers(original,[(dict(id=fid),np.array([[15.,20.,100.],[75.,20.,100.]]))],volume='20231117143551')

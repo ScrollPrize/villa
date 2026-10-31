@@ -17,7 +17,6 @@ from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
     StoredResolutionIndex,
-    catmull_rom_vertex_mask,
     filter_support_bands,
     filter_support_components,
     maybe_select_flat_pixels,
@@ -26,6 +25,7 @@ from vesuvius.ink_detection.data.geometry import (
     project_labels_and_supervision,
     read_tifxyz_on_flat_grid,
     select_flat_pixel_bands_via_stored_resolution,
+    read_normals_on_flat_grid,
     select_flat_pixels_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.patch_cache import (
@@ -47,7 +47,7 @@ from vesuvius.ink_detection.data.segment import (
     parse_label_asset_path,
 )
 from vesuvius.ink_detection.types import Patch, Segment
-from vesuvius.tifxyz import Tifxyz
+from vc_reader import tifxyz as vcr_tifxyz
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
@@ -563,39 +563,45 @@ def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch
     assert torch.count_nonzero(sample["supervision_mask"][:, :, 0, 0]) == 0
 
 
+def _sampled(origin, step, size):
+    rows = np.round(origin[0] + step[0] * np.arange(size[0])).astype(int)
+    columns = np.round(origin[1] + step[1] * np.arange(size[1])).astype(int)
+    return rows[:, None], columns[None, :]
+
+
 class _FakeTifxyz:
+    scale = (1.0, 1.0)
+
     def __init__(self, positions_zyx: np.ndarray):
         self.positions_zyx = positions_zyx
-        self.full_resolution_shape = positions_zyx.shape[:2]
+        self.xyz = positions_zyx[..., ::-1]
+        self.valid = np.ones(positions_zyx.shape[:2], dtype=bool)
+        self.full_shape = positions_zyx.shape[:2]
 
-    def get_zyxs(self, *, stored_resolution: bool):
-        assert stored_resolution
-        return self.positions_zyx
-
-    def __getitem__(self, index):
-        positions = self.positions_zyx[index]
-        valid = np.ones(positions.shape[:2], dtype=bool)
-        return positions[..., 2], positions[..., 1], positions[..., 0], valid
-
-    def get_normals(self, row_start, row_end, column_start, column_end):
-        shape = row_end - row_start, column_end - column_start
-        return (
-            np.zeros(shape, dtype=np.float32),
-            np.zeros(shape, dtype=np.float32),
-            np.ones(shape, dtype=np.float32),
-        )
+    def resample(self, origin, step, size, *, interpolation, normals=False):
+        rows, columns = _sampled(origin, step, size)
+        xyz = self.xyz[rows, columns]
+        valid = np.ones(xyz.shape[:2], dtype=bool)
+        if normals:
+            # The surface's column x row normal is opposite the ZYX (1, 0, 0) wanted here.
+            out = np.zeros(xyz.shape, dtype=np.float32)
+            out[..., 2] = -1.0
+            return xyz, valid, out
+        return xyz, valid
 
 
 class _PyramidFakeTifxyz:
+    scale = (1.0, 1.0)
+
     def __init__(self, full_positions_zyx: np.ndarray, *, stride: int):
         self.full_positions_zyx = full_positions_zyx
         self.stored_positions_zyx = full_positions_zyx[::stride, ::stride]
-        self.full_resolution_shape = full_positions_zyx.shape[:2]
+        self.full_shape = full_positions_zyx.shape[:2]
 
-    def __getitem__(self, index):
-        positions = self.full_positions_zyx[index]
-        valid = np.ones(positions.shape[:2], dtype=bool)
-        return positions[..., 2], positions[..., 1], positions[..., 0], valid
+    def resample(self, origin, step, size, *, interpolation, normals=False):
+        rows, columns = _sampled(origin, step, size)
+        xyz = self.full_positions_zyx[rows, columns][..., ::-1]
+        return xyz, np.ones(xyz.shape[:2], dtype=bool)
 
 
 def test_ragged_tifxyz_pyramid_refines_to_exact_flat_grid():
@@ -720,9 +726,9 @@ def test_patch_bbox_seeds_only_its_connected_support_component():
 
 def _spiral_tifxyz(
     rng, scale: float, *, shift: float = 0.0, non_finite: bool = True
-) -> Tifxyz:
+) -> vcr_tifxyz.Surface:
     # A sheet wound several times around an axis, with invalid and non-finite
-    # stored points, as a real Tifxyz (Catmull-Rom full resolution).
+    # stored points, as a real surface (smooth patches at full resolution).
     step = 1.0 / scale
     height, width = round(120 * scale), round(1800 * scale)
     rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
@@ -739,10 +745,10 @@ def _spiral_tifxyz(
         x[hole] = y[hole] = z[hole] = -1.0
     if non_finite:
         x[rng.integers(0, height), rng.integers(0, width)] = np.nan
-    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+    return vcr_tifxyz.Surface(np.stack([x, y, z], axis=-1), scale=(scale, scale))
 
 
-def _rippled_tifxyz(rng, scale: float) -> Tifxyz:
+def _rippled_tifxyz(rng, scale: float) -> vcr_tifxyz.Surface:
     # A sheet with diagonal ripples: a thin crop meets it in slanted stripes
     # whose bounding boxes overlap.
     step = 1.0 / scale
@@ -752,13 +758,13 @@ def _rippled_tifxyz(rng, scale: float) -> Tifxyz:
     y = 20 + rows * step + rng.normal(0, 0.2, rows.shape)
     z = 80 + 40 * np.sin((rows + columns) * step / 26.0)
     x, y, z = (values.astype(np.float32) for values in (x, y, z))
-    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+    return vcr_tifxyz.Surface(np.stack([x, y, z], axis=-1), scale=(scale, scale))
 
 
 def _spiral_selection(tifxyz, resolution: int) -> dict:
     stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(resolution)
-    coarse = np.asarray(tifxyz.get_zyxs(stored_resolution=True), dtype=np.float32)
-    coarse_valid = np.isfinite(coarse).all(axis=-1) & (coarse >= 0).all(axis=-1)
+    coarse = tifxyz.xyz[..., ::-1]
+    coarse_valid = tifxyz.valid
     return dict(
         coarse_native_pad=coarse_pad,
         coarse_positions_zyx=coarse,
@@ -805,7 +811,7 @@ def test_support_bands_hold_exactly_the_points_of_the_whole_window(
     rng = np.random.default_rng(11)
     tifxyz = surface(rng, scale)
     selection = _spiral_selection(tifxyz, resolution)
-    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    vertex_mask = tifxyz.valid
     several = 0
     for _ in range(50):
         crop = _random_spiral_crop(
@@ -865,8 +871,8 @@ def test_support_filter_drops_native_components_without_supervision():
 
 
 def _flat_normals(tifxyz, bbox):
-    nx, ny, nz = tifxyz.get_normals(*bbox)
-    return np.stack([nz, ny, nx], axis=-1).astype(np.float32)
+    y0, y1, x0, x1 = bbox
+    return read_normals_on_flat_grid(tifxyz, y0=y0, y1=y1, x0=x0, x1=x1)
 
 
 @pytest.mark.parametrize("max_distance", [None, 0.0, 3.0, 64.0])
@@ -874,7 +880,7 @@ def test_support_filter_and_projection_per_band_match_the_whole_window(max_dista
     rng = np.random.default_rng(5)
     tifxyz = _spiral_tifxyz(rng, 0.1)
     selection = _spiral_selection(tifxyz, 0)
-    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    vertex_mask = tifxyz.valid
     several = dropped = 0
     for _ in range(40):
         crop = _random_spiral_crop(rng)
@@ -1050,7 +1056,7 @@ def test_native_samples_are_the_same_with_and_without_bands(
     segments, surfaces = [], {}
     for name, shift in (("base", 0.0), ("other", 9.0)):
         tifxyz = _spiral_tifxyz(rng, 0.1, shift=shift, non_finite=False)
-        flat_shape = tuple(-(-size // stride) for size in tifxyz.full_resolution_shape)
+        flat_shape = tuple(-(-size // stride) for size in tifxyz.full_shape)
         arrays[f"{name}-ink"] = (rng.random((1, *flat_shape)) < 0.3).astype(np.uint8)
         arrays[f"{name}-supervision"] = (rng.random((1, *flat_shape)) < 0.6).astype(
             np.uint8

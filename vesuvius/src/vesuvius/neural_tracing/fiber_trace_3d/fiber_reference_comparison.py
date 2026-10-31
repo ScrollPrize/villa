@@ -270,12 +270,12 @@ def triangle_projection(p, vertices, coords):
 
 class Surface:
     def __init__(self, root, scale=4., stride=2, workers=32, candidates=4):
-        from vesuvius.tifxyz.reader import TifxyzReader
+        from vc_reader import tifxyz
         self.root = Path(root); self.meta = json.loads((self.root/'meta.json').read_text())
         self.x, self.q = landmarks(self.meta['winding_bounds'])
         self.limits=(self.q[0]-.5,self.q[-1]+.5)
-        reader = TifxyzReader(root)
-        self.full = [reader.read_coordinate(c) for c in 'xyz']
+        points = tifxyz.read(root, mask=False).xyz
+        self.full = [points[..., axis] for axis in range(3)]
         self.stride = stride; self.workers = workers; self.candidates = candidates
         self.xyz = np.stack([a[::stride, ::stride] for a in self.full], axis=-1)*scale
         # Every original grid vertex inside each coarse cell must be valid.
@@ -571,9 +571,10 @@ def metric_report(settings):
     """CPU-only saved-state diagnostics; no rendering or optimization."""
     result={'solutions':[]}
     if settings.get('reference'):
-        import tifffile
-        xyz=np.stack([tifffile.imread(Path(settings['reference'])/(c+'.tif'))[::32,::8] for c in 'xyz'],axis=-1)
-        valid=np.isfinite(xyz).all(-1)&(xyz>=0).all(-1)
+        from vc_reader import tifxyz
+        surface=tifxyz.read(settings['reference'],mask=False)
+        xyz=surface.xyz[::32,::8]
+        valid=surface.valid[::32,::8]
         xyz=xyz*settings.get('xyz_scale',4.)
         control=json.loads(Path(settings['umbilicus']).read_text())['control_points']
         axis=np.array([[p['x'],p['y'],p['z']] for p in control]);axis=axis[np.argsort(axis[:,2])]
@@ -604,13 +605,13 @@ def metric_report(settings):
 
 def projection_coverage_report(settings):
     """Read-only diagnosis of gray samples, in physical base-voxel Z."""
-    import tifffile
     root=Path(settings['run_root']);cfg=json.loads((root/'summary.json').read_text())['config']
     with np.load(cfg['tensor_cache']) as src:d={k:src[k] for k in src.files}
     with np.load(root/'solution.npz') as src:
         _,_,keep,*_=uv.hard_geometry(d,src['state'],src['widths'],cfg)
-    z=tifffile.imread(Path(settings['reference'])/'z.tif')
-    valid=np.isfinite(z)&(z>0)
+    from vc_reader import tifxyz
+    surface=tifxyz.read(settings['reference'],mask=False)
+    z,valid=surface.xyz[...,2],surface.valid
     zmin=float(z[valid].min()*settings.get('xyz_scale',4.))
     zmax=float(z[valid].max()*settings.get('xyz_scale',4.))
     with np.load(settings['projection_cache']) as src:

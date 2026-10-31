@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from tqdm.auto import tqdm
 
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 
 
 def parse_args(argv=None):
@@ -89,11 +89,8 @@ def _load_valid_points_zyx(tifxyz_path):
     if not tifxyz_path.is_dir():
         raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
 
-    surface = read_tifxyz(tifxyz_path)
-    surface.use_stored_resolution()
-    x, y, z, valid = surface[:]
-    points_zyx = np.stack([z, y, x], axis=-1)
-    points_zyx = points_zyx[np.asarray(valid, dtype=bool)]
+    surface = tifxyz.read(tifxyz_path)
+    points_zyx = surface.xyz[surface.valid][:, ::-1]
     if points_zyx.size == 0:
         raise RuntimeError("No valid tifxyz points found.")
     return np.asarray(points_zyx, dtype=np.float64)

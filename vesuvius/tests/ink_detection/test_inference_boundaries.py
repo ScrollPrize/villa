@@ -38,14 +38,10 @@ import os
 import sys
 import vesuvius
 os.environ.pop('OPENCV_IO_MAX_IMAGE_PIXELS', None)
-for name in tuple(sys.modules):
-    if name == 'vesuvius.tifxyz' or name.startswith('vesuvius.tifxyz.'):
-        sys.modules.pop(name)
 before = mp.get_start_method(allow_none=True)
 import vesuvius.ink_detection.inference.infer
 assert os.environ.get('OPENCV_IO_MAX_IMAGE_PIXELS') is None
 assert mp.get_start_method(allow_none=True) == before
-assert 'vesuvius.tifxyz.reader' not in sys.modules
 """
     environment = os.environ.copy()
     source_root = Path(__file__).parents[2] / "src"

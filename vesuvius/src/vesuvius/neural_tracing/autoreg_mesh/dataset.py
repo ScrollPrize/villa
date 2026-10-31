@@ -277,7 +277,7 @@ def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: b
     seg = wrap["segment"]
     r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
-    seg_h, seg_w = seg._valid_mask.shape
+    seg_h, seg_w = seg.shape
     r_min = max(0, int(r_min))
     r_max = min(seg_h - 1, int(r_max))
     c_min = max(0, int(c_min))
@@ -285,15 +285,13 @@ def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: b
     if r_max < r_min or c_max < c_min:
         return None
 
-    seg.use_stored_resolution()
-    x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-    if x_s.size == 0:
+    valid_s = seg.valid[r_min:r_max + 1, c_min:c_max + 1]
+    if require_all_valid and not bool(valid_s.all()):
         return None
-    if valid_s is not None:
-        if require_all_valid and not bool(valid_s.all()):
-            return None
-        if not require_all_valid and not bool(valid_s.any()):
-            return None
+    if not require_all_valid and not bool(valid_s.any()):
+        return None
+    xyz_s = seg.xyz[r_min:r_max + 1, c_min:c_max + 1]
+    x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
 
     trimmed = _trim_to_world_bbox(
         np.asarray(x_s, dtype=np.float32),
@@ -325,7 +323,7 @@ def create_split_conditioning_from_surface_grid(
     seg = wrap["segment"]
     r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
-    seg_h, seg_w = seg._valid_mask.shape
+    seg_h, seg_w = seg.shape
     r_min = max(0, int(r_min))
     r_max = min(seg_h - 1, int(r_max))
     c_min = max(0, int(c_min))

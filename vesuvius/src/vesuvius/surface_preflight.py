@@ -102,16 +102,10 @@ def _read_tiff(path: Path) -> np.ndarray:
         return tifffile.imread(path, out="memmap")
 
 
-def _load_tifxyz_mask(path: Path, xyz_shape: Sequence[int]) -> np.ndarray:
-    """Load a mask through the label-transfer implementation."""
-    try:
-        from vesuvius.tifxyz_label_transfer.io import load_tifxyz_mask
-    except ImportError as exc:  # pragma: no cover - depends on installation extras
-        raise RuntimeError(
-            "TIFXYZ preflight requires the label-transfer extra: "
-            "pip install 'vesuvius[label-transfer]'"
-        ) from exc
-    return load_tifxyz_mask(path, xyz_shape)
+def _load_tifxyz_mask(surface_path: Path, shape) -> np.ndarray:
+    from vc_reader import tifxyz
+
+    return tifxyz.read_mask(surface_path, shape)
 
 
 def _resolve_volume_array(opened: Any, array_key: str | None) -> tuple[Any, str]:
@@ -736,7 +730,7 @@ def inspect_pair(
         mask_path = surface_path / "mask.tif"
         if mask_path.is_file():
             try:
-                mask = _load_tifxyz_mask(mask_path, x.shape)
+                mask = _load_tifxyz_mask(surface_path, x.shape)
                 mask_error = None
             except ValueError as exc:
                 mask_error = str(exc)

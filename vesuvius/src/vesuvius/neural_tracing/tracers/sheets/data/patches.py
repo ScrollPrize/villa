@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 
 INDEX_VERSION = 4
 SCALE_TOLERANCE = .2  # relative difference between measured and stated cell size beyond which the measured one is used
@@ -71,14 +71,12 @@ class GridSpec:
 
 def _scan(path: Path) -> PatchInfo | None:
     try:
-        meta = json.loads((path/'meta.json').read_text())
-        xyz = [tifffile.memmap(path/f'{c}.tif') for c in 'xyz']
-    except (OSError, ValueError, json.JSONDecodeError):
+        surface = tifxyz.read(path, mask=False)
+    except (OSError, ValueError):
         return None
-    scale = float(meta.get('scale', [0])[0])
-    if scale <= 0 or xyz[0].ndim != 2:
-        return None
-    ok = np.all([np.asarray(a) != -1 for a in xyz], 0)
+    scale = surface.scale[1]
+    xyz = [surface.xyz[..., axis] for axis in range(3)]
+    ok = surface.valid
     count = int(np.count_nonzero(ok))
     if not count:
         return None
@@ -136,7 +134,8 @@ class PatchStore:
         path = info.path
         hit = self._open.get(path)
         if hit is None:
-            hit = tuple(tifffile.memmap(path/f'{c}.tif') for c in 'xyz')
+            surface = tifxyz.read(path, mask=False)
+            hit = tuple(surface.xyz[..., axis] for axis in range(3))
             self._open[path] = hit
             while len(self._open) > self.max_open:
                 self._open.popitem(last=False)

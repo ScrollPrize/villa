@@ -11,7 +11,7 @@ from typing import Iterable
 import numpy as np
 from vc_reader.reader import ZarrWriter, create_group, open_group
 from tqdm.auto import tqdm
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import compute_native_crop_bbox
@@ -707,17 +707,15 @@ def _build_segment_download_patches(
     surface = int(supervision_mask.shape[0] // 2)
     patch_size = tuple(int(v) for v in segment.patch_size)
     min_labeled_coverage = segment.data_config.patch_finding.min_labeled_coverage
-    patch_tifxyz = tifxyz.read_tifxyz(segment.segment_dir)
-    patch_tifxyz.use_full_resolution()
+    patch_tifxyz = tifxyz.read(segment.segment_dir)
 
     kept_patches: list[dict] = []
     for y0, x0 in candidates:
         patch_bbox_zyx = surface_patch_bbox(surface, y0, x0, patch_size)
-        flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[
-            int(y0):int(y0) + patch_size[1],
-            int(x0):int(x0) + patch_size[2],
-        ]
-        patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
+        flat_xyz, flat_valid = patch_tifxyz.resample_full(
+            (int(y0), int(x0)), (patch_size[1], patch_size[2]), interpolation="smooth"
+        )
+        patch_zyxs = flat_xyz[..., ::-1]
         native_world_bbox = compute_native_crop_bbox(
             patch_zyxs,
             flat_valid,

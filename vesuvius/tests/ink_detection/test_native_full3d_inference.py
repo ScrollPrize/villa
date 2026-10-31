@@ -309,24 +309,19 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert torch.all(image[0, 1:, 1:, 1:] == 1)
 
     class FakeTifxyz:
-        full_resolution_shape = (2, 2)
+        full_shape = (2, 2)
+        scale = (1.0, 1.0)
 
         def __init__(self):
             yy, xx = np.mgrid[:2, :2]
-            self.x = xx.astype(np.float32)
-            self.y = yy.astype(np.float32)
-            self.z = np.zeros((2, 2), dtype=np.float32)
+            self.xyz = np.stack((xx, yy, np.zeros((2, 2))), axis=-1).astype(np.float32)
+            self.valid = np.ones((2, 2), dtype=bool)
 
-        def get_zyxs(self, stored_resolution=False):
-            return np.stack((self.z, self.y, self.x), axis=-1)
-
-        def __getitem__(self, slices):
-            return (
-                self.x[slices],
-                self.y[slices],
-                self.z[slices],
-                np.ones(self.x[slices].shape, dtype=bool),
-            )
+        def resample(self, origin, step, size, *, interpolation, normals=False):
+            rows = int(origin[0]) + int(step[0]) * np.arange(size[0])
+            columns = int(origin[1]) + int(step[1]) * np.arange(size[1])
+            xyz = self.xyz[rows[:, None], columns[None, :]]
+            return xyz, np.ones(xyz.shape[:2], dtype=bool)
 
     wrap_config = SimpleNamespace(
         data=SimpleNamespace(

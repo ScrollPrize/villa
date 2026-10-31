@@ -38,7 +38,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 import torch
 from vc_reader.reader import open_zarr
 
@@ -229,7 +229,7 @@ def switch_summary(switches, reals, off_points: int, steps: int) -> dict:
 
 
 def _read_xyz(path: Path) -> np.ndarray:
-    return np.stack([tifffile.imread(path/f'{c}.tif') for c in 'xyz'], -1).astype(np.float32)
+    return np.asarray(tifxyz.read(path).xyz)
 
 
 def rescore(folder: Path, tolerance: float = C.LossConfig.sheet_tolerance) -> None:

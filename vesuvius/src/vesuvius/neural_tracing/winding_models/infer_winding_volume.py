@@ -507,7 +507,7 @@ def build_seed_rays_from_meshes(args):
     away from the sheet (its splice tolerance alone is ~0.5 windings).
     """
     import re
-    import vesuvius.tifxyz as tifxyz
+    from vc_reader import tifxyz
 
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
     cfg = dict(checkpoint["cfg"])
@@ -554,12 +554,10 @@ def build_seed_rays_from_meshes(args):
     umbilicus_path = _find_umbilicus(args)
 
     def load_grid(path):
-        surface = tifxyz.read_tifxyz(path)
-        grid = np.stack([surface._x, surface._y, surface._z],
-                        axis=-1).astype(np.float64)
-        valid = surface.valid_vertex_mask & np.isfinite(grid).all(-1)
-        grid[~valid] = np.nan
-        return grid, valid
+        surface = tifxyz.read(path)
+        grid = surface.xyz.astype(np.float64)
+        grid[~surface.valid] = np.nan
+        return grid, surface.valid
 
     def neighbor_vertices(winding):
         """Vertices of an adjacent winding's mesh and the sign of its offset."""

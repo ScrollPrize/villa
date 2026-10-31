@@ -68,7 +68,7 @@ def distance_transform_edt(mask: np.ndarray) -> np.ndarray:
     else:
         return scipy_edt(mask)
 
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 
 
 def parse_args() -> argparse.Namespace:
@@ -955,9 +955,7 @@ def preprocess_surface(
     label_img = read_label_image(label_file)
 
     # Load surface to get shape - use full resolution to match label images
-    surface = read_tifxyz(tifxyz_dir, load_mask=True)
-    surface.use_full_resolution()
-    surf_h, surf_w = surface.shape
+    surf_h, surf_w = tifxyz.read(tifxyz_dir).full_shape
 
     # Handle shape mismatch
     label_h, label_w = label_img.shape[:2]
@@ -1088,15 +1086,13 @@ def _get_surface_and_label(
 
     # Load surface if not cached - use full resolution to match label images
     if surface_dir not in _SURFACE_CACHE:
-        surface = read_tifxyz(Path(surface_dir), load_mask=True)
-        surface.use_full_resolution()
-        _SURFACE_CACHE[surface_dir] = surface
+        _SURFACE_CACHE[surface_dir] = tifxyz.read(surface_dir)
 
     # Load label if not cached
     if label_file not in _LABEL_CACHE:
         label_img = read_label_image(Path(label_file))
         surface = _SURFACE_CACHE[surface_dir]
-        surf_h, surf_w = surface.shape
+        surf_h, surf_w = surface.full_shape
 
         # Handle shape mismatch
         label_h, label_w = label_img.shape[:2]
@@ -1141,7 +1137,8 @@ def process_tile_worker(task: TileTask) -> int:
     tile_row, tile_row_end, tile_col, tile_col_end = task.tile_bounds
 
     # Get coordinates for this tile
-    x, y, z, valid = surface[tile_row:tile_row_end, tile_col:tile_col_end]
+    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="smooth")
+    x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
     # Get labels for this tile
     tile_labels = label_img[tile_row:tile_row_end, tile_col:tile_col_end]
@@ -1292,7 +1289,8 @@ def collect_tile_points(task: TileTask) -> Optional[Tuple[np.ndarray, np.ndarray
     tile_row, tile_row_end, tile_col, tile_col_end = task.tile_bounds
 
     # Get coordinates for this tile
-    x, y, z, valid = surface[tile_row:tile_row_end, tile_col:tile_col_end]
+    xyz, valid = surface.resample_full((tile_row, tile_col), (tile_row_end - tile_row, tile_col_end - tile_col), interpolation="smooth")
+    x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
     # Get labels for this tile
     tile_labels = label_img[tile_row:tile_row_end, tile_col:tile_col_end]

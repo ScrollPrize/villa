@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import http.client
-import io
 import json
 import threading
 import time
@@ -34,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 from scipy import ndimage
 
 ROOT = 'https://vesuvius-challenge-open-data.s3.amazonaws.com'
@@ -70,17 +69,16 @@ def read_segment(path: str, coord_scale: float) -> tuple[np.ndarray, dict]:
     """A bucket tifxyz as (rows, cols, 3) float32 ``x, y, z`` times ``coord_scale`` (-1 kept for invalid nodes),
     and its meta.json with ``scale`` (grid nodes per voxel) converted to the scaled coordinates."""
     meta = json.loads(fetch(f'{ROOT}/{path}/meta.json'))
-    xyz = np.stack([tifffile.imread(io.BytesIO(fetch(f'{ROOT}/{path}/{c}.tif'))).astype(np.float32) for c in 'xyz'], -1)
+    xyz = tifxyz.read(f'{ROOT}/{path}', mask=False).xyz
     xyz = np.where(xyz == -1, -1, xyz*coord_scale).astype(np.float32)
     meta['scale'] = [s/coord_scale for s in meta['scale']]
     return xyz, meta
 
 
 def write_segment(dst: Path, xyz: np.ndarray, meta: dict) -> None:
-    dst.mkdir(parents=True, exist_ok=True)
-    for i, c in enumerate('xyz'):
-        tifffile.imwrite(dst/f'{c}.tif', np.ascontiguousarray(xyz[..., i]))
-    (dst/'meta.json').write_text(json.dumps(meta))
+    extra = {k: v for k, v in meta.items() if k not in ('uuid', 'scale', 'bbox', 'area')}
+    surface = tifxyz.Surface(xyz, scale=tuple(meta['scale'][::-1]), uuid=meta.get('uuid', dst.name), area=meta.get('area'), extra=extra)
+    tifxyz.write(dst, surface, compression='none', tile=None, mask=False, overwrite=True)
 
 
 def mirror_array(src: str, dst: Path, attrs: dict) -> dict:

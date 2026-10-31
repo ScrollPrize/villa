@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     serialize_split_conditioning_example,
 )
 from vesuvius.neural_tracing.datasets.common import ChunkPatch
-from vesuvius.tifxyz import Tifxyz
+from vc_reader import tifxyz
 
 
 def _make_surface(rows: int, cols: int) -> np.ndarray:
@@ -180,15 +180,11 @@ def test_stored_surface_extraction_and_split_preserve_stored_lattice_shape() -> 
     x = 10.0 + col_grid
     y = 20.0 + row_grid
     z = 30.0 + (row_grid * 2.0) + col_grid
-    seg = Tifxyz(
-        _x=x.astype(np.float32),
-        _y=y.astype(np.float32),
-        _z=z.astype(np.float32),
+    seg = tifxyz.Surface(
+        np.stack([x, y, z], axis=-1).astype(np.float32),
         uuid="stored_test",
-        _scale=(0.5, 0.5),
+        scale=(0.5, 0.5),
         bbox=(float(x.min()), float(y.min()), float(z.min()), float(x.max()), float(y.max()), float(z.max())),
-        _mask=np.ones((4, 6), dtype=bool),
-        resolution="stored",
     )
     patch = ChunkPatch(
         chunk_id=(0, 0, 0),

@@ -5,7 +5,7 @@ import pytest
 from vc_object_store import ObjectStore
 
 from vesuvius.neural_tracing.inference import infer_rowcol_triplet_wraps as copy
-from vesuvius.tifxyz.store import create_surface, read_surface
+from vesuvius.neural_tracing.inference.surface_store import create_surface, read_surface
 
 
 def _store_with_surface(path, *, scale_factor=1, valid=None):
@@ -29,10 +29,10 @@ def test_read_surface_applies_validity_and_volume_scale(tmp_path):
     uid, _, points = _store_with_surface(tmp_path / 'objects.vcobj', scale_factor=2, valid=valid)
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
     assert surface.uuid == uid
-    assert surface.get_scale_tuple() == (1.0, 1.0)  # stored scale 0.5 per stored unit = 1 per voxel
-    assert not surface._mask[0, 0] and not surface._mask[2, 3] and surface._mask[1, 1]
-    assert surface._x[2, 3] == -1 and surface._x[0, 0] == -1
-    assert surface._x[1, 1] == pytest.approx(points[1, 1, 0] / 2)
+    assert surface.scale == (1.0, 1.0)  # stored scale 0.5 per stored unit = 1 per voxel
+    assert not surface.valid[0, 0] and not surface.valid[2, 3] and surface.valid[1, 1]
+    assert surface.xyz[..., 0][2, 3] == -1 and surface.xyz[..., 0][0, 0] == -1
+    assert surface.xyz[..., 0][1, 1] == pytest.approx(points[1, 1, 0] / 2)
     with pytest.raises(ValueError, match='does not map'):
         read_surface(tmp_path / 'objects.vcobj', uid, volume='other')
 
@@ -49,7 +49,7 @@ def test_read_surface_uses_the_store_missing_vertex_rule(tmp_path):
         db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
             dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())]))
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
-    assert surface._mask.tolist() == [[True, False, False], [False, True, True]]
+    assert surface.valid.tolist() == [[True, False, False], [False, True, True]]
 
 
 def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path):
@@ -66,9 +66,9 @@ def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path
         assert record['meta']['provenance'] == {'tool': 'test-tool', 'parameters': {'k': 1}, 'sources': [source]}
         assert record['meta']['area_vx2'] == 4
     surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
-    assert surface.get_scale_tuple() == (0.25, 0.25)
-    assert not surface._mask[1, 1] and not surface._mask[2, 2] and surface._mask[0, 0]
-    assert surface._z[0, 0] == 5.0  # zyx in, xyz stored
+    assert surface.scale == (0.25, 0.25)
+    assert not surface.valid[1, 1] and not surface.valid[2, 2] and surface.valid[0, 0]
+    assert surface.xyz[..., 2][0, 0] == 5.0  # zyx in, xyz stored
 
 
 def test_copy_store_mode_reads_the_pinned_revision_and_creates_sourced_outputs(tmp_path):

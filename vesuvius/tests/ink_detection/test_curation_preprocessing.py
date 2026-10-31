@@ -20,7 +20,7 @@ from vesuvius.ink_detection.preprocessing import download_required_zarr_chunks
 from vesuvius.ink_detection.preprocessing import merge_predictions
 from vesuvius.ink_detection.preprocessing import validate_segments
 from vesuvius.ink_detection.types import Segment
-from vesuvius.tifxyz import Tifxyz, write_tifxyz
+from vc_reader import tifxyz
 
 
 def _write_group(path: Path, arrays: dict[str, np.ndarray], *, chunks: tuple[int, ...]) -> None:
@@ -307,14 +307,8 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     segment = datasets_root / "dataset" / "segment"
     segment.mkdir(parents=True)
     grid_y, grid_x = np.mgrid[1:5, 1:5].astype(np.float32)
-    surface = Tifxyz(
-        _x=grid_x,
-        _y=grid_y,
-        _z=np.ones_like(grid_x),
-        uuid="segment",
-        _mask=np.ones_like(grid_x, dtype=bool),
-    )
-    write_tifxyz(segment, surface, overwrite=True)
+    surface = tifxyz.Surface(np.stack([grid_x, grid_y, np.ones_like(grid_x)], axis=-1), uuid="segment")
+    tifxyz.write(segment, surface, overwrite=True)
     label = np.zeros((3, 4, 4), dtype=np.uint8)
     label[1] = 255
     _write_group(segment / "segment_inklabels.zarr", {"0": label}, chunks=(1, 2, 2))

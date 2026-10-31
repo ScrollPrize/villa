@@ -1,8 +1,5 @@
-import os
-import cv2
 import json
 import warnings
-import glob
 import torch
 import random
 import numpy as np
@@ -13,6 +10,7 @@ from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+from vc_reader import tifxyz
 from vc_reader.reader import ZarrReader, open_group
 
 import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
@@ -1078,28 +1076,14 @@ def load_datasets(config, shard_idx=None, total_shards=None):
 
 def load_tifxyz_patches(segments_path, z_range, volume):
 
-    segment_paths = glob.glob(segments_path + "/*")
-    segment_paths = sorted([path for path in segment_paths if os.path.isdir(path)])
-    print(f'found {len(segment_paths)} tifxyz patches')
+    entries = tifxyz.list_surfaces(segments_path, recursive=False, z_range=z_range)
+    print(f'found {len(entries)} tifxyz patches')
 
     all_patches = []
-    for segment_path in tqdm(segment_paths, desc='loading tifxyz patches'):
-        try:  # TODO: remove
-            # TODO: move this bit to a method in tifxyz.py
-            with open(f'{segment_path}/meta.json', 'r') as meta_json:
-                metadata = json.load(meta_json)
-                bbox = metadata['bbox']
-                scale = torch.tensor(metadata['scale'])
-            if z_range is not None and (bbox['min'][2] > z_range[1] or bbox['max'][2] < z_range[0]):
-                continue
-            zyxs = torch.from_numpy(np.stack([
-                cv2.imread( f'{segment_path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
-                for coord in 'zyx'
-            ], axis=-1))
-            all_patches.append(Patch(zyxs, scale, volume))
-        except Exception as e:
-            print(f'error loading {segment_path}: {e}')
-            continue
+    for entry in tqdm(entries, desc='loading tifxyz patches'):
+        surface = tifxyz.read(entry.location, mask=False)
+        zyxs = torch.from_numpy(surface.xyz[..., ::-1].copy())
+        all_patches.append(Patch(zyxs, torch.tensor(surface.scale[::-1]), volume))
 
     print(f'loaded {len(all_patches)} tifxyz patches from {segments_path}')
     return all_patches

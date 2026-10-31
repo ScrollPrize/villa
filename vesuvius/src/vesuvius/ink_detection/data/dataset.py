@@ -22,7 +22,7 @@ from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
     StoredResolutionIndex,
-    catmull_rom_vertex_mask,
+    read_normals_on_flat_grid,
     compute_native_crop_bbox,
     filter_support_bands,
     native_tifxyz_pyramid_params,
@@ -249,10 +249,9 @@ class InkDataset(Dataset):
         key = str(segment.segment_dir)
         value = self._tifxyz_cache.get(key)
         if value is None:
-            import vesuvius.tifxyz as tifxyz
+            from vc_reader import tifxyz
 
-            value = tifxyz.read_tifxyz(segment.segment_dir)
-            value.use_full_resolution()
+            value = tifxyz.read(segment.segment_dir)
             self._tifxyz_cache[key] = value
         return value
 
@@ -260,12 +259,7 @@ class InkDataset(Dataset):
         key = str(segment.segment_dir)
         value = self._stored_resolution_cache.get(key)
         if value is None:
-            positions = np.asarray(
-                patch_tifxyz.get_zyxs(stored_resolution=True), dtype=np.float32
-            )
-            valid = np.isfinite(positions).all(axis=-1)
-            valid &= (positions >= 0).all(axis=-1)
-            value = positions, valid
+            value = patch_tifxyz.xyz[..., ::-1], patch_tifxyz.valid
             self._stored_resolution_cache[key] = value
         return value
 
@@ -290,7 +284,7 @@ class InkDataset(Dataset):
         )
         key = str(segment.segment_dir)
         if key not in self._vertex_mask_cache:
-            self._vertex_mask_cache[key] = catmull_rom_vertex_mask(patch_tifxyz)
+            self._vertex_mask_cache[key] = patch_tifxyz.valid
         return select_flat_pixel_bands_via_stored_resolution(
             patch_tifxyz,
             crop_bbox,
@@ -440,14 +434,13 @@ class InkDataset(Dataset):
             x0=support_x0,
             x1=support_x1,
         )
-        nx, ny, nz = patch_tifxyz.get_normals(
-            support_y0 * stride,
-            support_y1 * stride,
-            support_x0 * stride,
-            support_x1 * stride,
-        )
-        normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
-            np.float32, copy=False
+        normals = read_normals_on_flat_grid(
+            patch_tifxyz,
+            y0=support_y0,
+            y1=support_y1,
+            x0=support_x0,
+            x1=support_x1,
+            flat_grid_stride=stride,
         )
         image, valid_slices = read_bbox_with_padding(
             image_volume, crop_bbox, fill_value=0
@@ -540,11 +533,8 @@ class InkDataset(Dataset):
                     x0=x0,
                     x1=x1,
                 )
-                nx, ny, nz = patch_tifxyz.get_normals(
-                    y0 * stride, y1 * stride, x0 * stride, x1 * stride
-                )
-                normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
-                    np.float32, copy=False
+                normals = read_normals_on_flat_grid(
+                    patch_tifxyz, y0=y0, y1=y1, x0=x0, x1=x1, flat_grid_stride=stride
                 )
                 other_labels, other_supervision = project_labels_and_supervision(
                     positions_zyx=positions,

@@ -379,7 +379,7 @@ def test_inspect_pair_rejects_incompatible_tifxyz_mask(tmp_path, monkeypatch) ->
 
     assert report["status"] == "FAIL"
     assert gates["tifxyz_mask_shape"]["passed"] is False
-    assert "incompatible with XYZ shape" in gates["tifxyz_mask_shape"]["observed"]["error"]
+    assert "does not match" in gates["tifxyz_mask_shape"]["observed"]["error"]
 
 
 def test_inspect_pair_fails_nonfinite_implicit_valid_coordinate(

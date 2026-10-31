@@ -29,7 +29,7 @@ from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direct
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
 from vesuvius.neural_tracing.inference.napari_helpers import show_streamline_geometry_napari
 from vesuvius.neural_tracing.nets.models import load_checkpoint
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 
 
 TIFXYZ_PATH = None
@@ -551,13 +551,11 @@ def upsample_voxelize_tifxyz_surface_in_bboxes(
     x_min, x_max)` tuple produced by `get_cond_edge_bboxes`. The returned
     `voxels` are crop-local `(D, H, W)` uint8 masks.
     """
-    surface.use_stored_resolution()
-    scale_y, scale_x = surface._scale
+    scale_y, scale_x = surface.scale
     crop_shape = tuple(int(v) for v in crop_size)
 
     if stored_zyxs is None or valid is None:
-        x_s, y_s, z_s, valid_s = surface[:]
-        stored_zyxs = np.stack([z_s, y_s, x_s], axis=-1)
+        stored_zyxs, valid_s = surface.xyz[..., ::-1], surface.valid
         valid = np.asarray(valid_s, dtype=bool)
     else:
         stored_zyxs = np.asarray(stored_zyxs)
@@ -578,10 +576,9 @@ def upsample_voxelize_tifxyz_surface_in_bboxes(
             continue
 
         r_min, r_max, c_min, c_max = grid_bbox
-        x_s, y_s, z_s, valid_s = surface[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
-            trimmed = None
-        elif strict_valid and valid_s is not None and not np.asarray(valid_s, dtype=bool).all():
+        xyz_s = surface.xyz[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
+        if strict_valid and not surface.valid[r_min:r_max + 1, c_min:c_max + 1].all():
             trimmed = None
         else:
             x_full, y_full, z_full = _upsample_world_surface(x_s, y_s, z_s, scale_y, scale_x)
@@ -615,12 +612,9 @@ def _load_surface_zyx(tifxyz_path):
     if not tifxyz_path.is_dir():
         raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
 
-    surface = read_tifxyz(tifxyz_path)
-    surface.use_stored_resolution()
-    x, y, z, valid = surface[:]
-    stored_zyxs = np.stack([z, y, x], axis=-1)
-    valid = _sanitize_surface_validity(stored_zyxs, valid)
-    return stored_zyxs, valid
+    surface = tifxyz.read(tifxyz_path)
+    stored_zyxs = surface.xyz[..., ::-1].copy()
+    return stored_zyxs, surface.valid.copy()
 
 
 def _read_tifxyz_meta(tifxyz_path):
@@ -2581,8 +2575,8 @@ def _run_streamline_iteration(
         cond_valid=valid,
         integration_margin=bbox_integration_margin,
     )
-    surface = read_tifxyz(input_tifxyz_path)
-    edge_axis_scale = surface._scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
+    surface = tifxyz.read(input_tifxyz_path)
+    edge_axis_scale = surface.scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
     output_path = _output_zarr_path(iteration_idx)
     expected_output_tifxyz_path = None
     if context.is_rank0:

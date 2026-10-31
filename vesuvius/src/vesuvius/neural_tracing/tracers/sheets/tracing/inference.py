@@ -27,7 +27,6 @@ from uuid import uuid4
 
 import numpy as np
 from scipy import ndimage
-import tifffile
 import torch
 from vc_reader.reader import ZarrReader, open_zarr
 
@@ -38,7 +37,7 @@ from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
 from vesuvius.neural_tracing.tracers.sheets.sampling import view_radius
-from vesuvius.tifxyz import Tifxyz, write_tifxyz
+from vc_reader import tifxyz
 
 
 def resample(points: np.ndarray, spacing: float) -> np.ndarray:
@@ -55,7 +54,7 @@ def seed_from_patch(path, line: str, span: str, direction: str):
     axis, index = line.split(':')
     index = int(index)
     lo, hi = (int(v) for v in span.split(':'))
-    xyz = np.stack([tifffile.imread(Path(path)/f'{c}.tif') for c in 'xyz'], -1).astype(np.float64)
+    xyz = np.asarray(tifxyz.read(path).xyz, np.float64)
     sign = 1 if direction == '+' else -1
     if axis == 'col':
         xyz = xyz.transpose(1, 0, 2)
@@ -197,10 +196,9 @@ def write_surface(out: Path, rows: np.ndarray, keep: np.ndarray, row_step: float
             existing = None
         if isinstance(existing, str) and existing and existing != out.name:
             surface_uuid = existing
-    surface = Tifxyz(_x=xyz[..., 0], _y=xyz[..., 1], _z=xyz[..., 2], uuid=surface_uuid,
-                     _scale=(1./row_step, 1./column_step))
-    layout = dict(compression=None, tile_size=None) if mmap_layout else {}
-    write_tifxyz(out, surface, overwrite=overwrite, **layout)
+    surface = tifxyz.Surface(xyz, uuid=surface_uuid, scale=(1./row_step, 1./column_step))
+    layout = dict(compression='none', tile=None) if mmap_layout else {}
+    tifxyz.write(out, surface, overwrite=overwrite, **layout)
     add_area(out/'meta.json', xyz, voxel_size_um)
     if provenance is not None:
         (out/'trace.json').write_text(json.dumps(provenance, indent=2, default=str))

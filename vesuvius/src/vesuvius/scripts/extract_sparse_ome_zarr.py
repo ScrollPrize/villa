@@ -27,7 +27,7 @@ import numpy as np
 from vc_reader.reader import ZarrWriter, create_group, ome_multiscales, open_node
 from tqdm import tqdm
 
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -70,13 +70,8 @@ def load_surface_points(tifxyz_paths: List[Path]) -> Tuple[np.ndarray, List[str]
     surface_names = []
 
     for path in tqdm(tifxyz_paths, desc="Loading surfaces"):
-        surface = read_tifxyz(path)
-        mask = surface._valid_mask
-        points = np.column_stack([
-            surface._x[mask],
-            surface._y[mask],
-            surface._z[mask]
-        ])
+        surface = tifxyz.read(path)
+        points = surface.xyz[surface.valid]
         all_points.append(points)
         surface_names.append(path.name)
         logger.info(f"  {path.name}: {len(points):,} valid points")

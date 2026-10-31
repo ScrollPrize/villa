@@ -30,7 +30,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
-from vesuvius.tifxyz_canvas import full_resolution_extent
+from vc_reader.tifxyz import full_extent
 
 
 FloatArray = NDArray[np.floating]
@@ -161,12 +161,7 @@ class Surface:
     def full_resolution_shape(self) -> Tuple[int, int]:
         height, width = self.shape
         scale_y, scale_x = self.scale_yx
-        # Same definition as vesuvius.tifxyz.Tifxyz.full_resolution_shape:
-        # the canvas vc_render_tifxyz renders (float32 scale, lround).
-        return (
-            full_resolution_extent(height, scale_y),
-            full_resolution_extent(width, scale_x),
-        )
+        return full_extent(height, scale_y), full_extent(width, scale_x)
 
 
 @dataclass(frozen=True)
@@ -463,8 +458,8 @@ def infer_output_shape(
     # a small scale change that forces downstream resampling.
     native_candidates = (
         (
-            full_resolution_extent(target_height, target_scale_y),
-            full_resolution_extent(target_width, target_scale_x),
+            full_extent(target_height, target_scale_y),
+            full_extent(target_width, target_scale_x),
         ),
         (target_height, target_width),
     )

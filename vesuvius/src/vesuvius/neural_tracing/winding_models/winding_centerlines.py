@@ -57,7 +57,7 @@ from pathlib import Path
 import click
 import cv2
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 from numcodecs import Zstd, get_codec
 from scipy import ndimage
 from scipy.interpolate import interp1d
@@ -1008,12 +1008,7 @@ class TifxyzSpool:
 
         name = f'label_{label}.tifxyz'
         destination = output_directory / name
-        destination.mkdir(parents=True)
-        tifffile.imwrite(destination / 'x.tif', x, dtype=np.float32, compression=None)
-        tifffile.imwrite(destination / 'y.tif', y, dtype=np.float32, compression=None)
-        tifffile.imwrite(destination / 'z.tif', z_values, dtype=np.float32, compression=None)
         valid = x >= 0
-        xyz = np.column_stack([x[valid], y[valid], z_values[valid]])
         valid_right = valid[:, :-1] & valid[:, 1:]
         right_spacing = np.sqrt(
             np.diff(x, axis=1) ** 2
@@ -1026,12 +1021,11 @@ class TifxyzSpool:
             + np.diff(y, axis=0) ** 2
             + np.diff(z_values, axis=0) ** 2
         )[valid_down]
-        _write_json_atomic(destination / 'meta.json', {
-            'format': 'tifxyz',
-            'type': 'seg',
-            'uuid': str(uuid.uuid4()),
-            'scale': [1.0 / self.spacing, 1.0 / self.spacing],
-            'bbox': [xyz.min(axis=0).astype(float).tolist(), xyz.max(axis=0).astype(float).tolist()],
+        surface = tifxyz.Surface(
+            np.stack([x, y, z_values], axis=-1).astype(np.float32),
+            uuid=str(uuid.uuid4()),
+            scale=(1.0 / self.spacing, 1.0 / self.spacing),
+            extra={
             'source': f'Gaussian winding centerlines from {source}',
             'winding_label': label,
             'curve_points': columns,
@@ -1053,6 +1047,7 @@ class TifxyzSpool:
             'invalid_gap_rows': extra_rows,
             'coordinate_order': 'ZYX values stored in z.tif, y.tif, x.tif',
         })
+        tifxyz.write(destination, surface, compression='none', tile=None, mask=False)
         return destination
 
     def finalize(

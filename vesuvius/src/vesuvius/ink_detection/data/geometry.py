@@ -16,7 +16,9 @@ SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS = 10.0
 # are -t(1-t)^2/2 and -t^2(1-t)/2, which sum to t(1-t)/2 <= 1/8, so in 2D the
 # negative weights sum to at most 1/8 + 1/8 + 2/64. An interpolated coordinate
 # therefore lies within this fraction of the 16 points' range of their extremes.
-CATMULL_ROM_NEGATIVE_WEIGHT = 0.28125
+# One-sided derivatives at borders and holes (vc_reader's smooth patches) are at
+# most twice as large, so the bound doubles.
+SMOOTH_PATCH_NEGATIVE_WEIGHT = 0.5625
 
 
 def native_volume_downsample_factor(resolution: int) -> int:
@@ -41,6 +43,28 @@ def native_tifxyz_pyramid_params(resolution: int) -> tuple[int, float, int]:
     return factor, 1.0 / float(factor), pad
 
 
+def _flat_raster(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
+    """Stored-grid origin, step and size of the full-resolution samples y0:y1:stride, x0:x1:stride."""
+    scale_y, scale_x = patch_tifxyz.scale
+    size = ((int(y1) - int(y0) + stride - 1) // stride, (int(x1) - int(x0) + stride - 1) // stride)
+    return (int(y0) * scale_y, int(x0) * scale_x), (stride * scale_y, stride * scale_x), size
+
+
+def _flat_positions(patch_tifxyz, y0: int, y1: int, x0: int, x1: int, stride: int):
+    """ZYX positions (-1 where missing) and validity of those full-resolution samples."""
+    origin, step, size = _flat_raster(patch_tifxyz, y0, y1, x0, x1, stride)
+    xyz, valid = patch_tifxyz.resample(origin, step, size, interpolation="smooth")
+    return np.where(valid[..., None], xyz[..., ::-1], -1.0).astype(np.float32), valid
+
+
+def read_normals_on_flat_grid(patch_tifxyz, *, y0: int, y1: int, x0: int, x1: int, flat_grid_stride: int = 1) -> np.ndarray:
+    """ZYX unit normals (row direction x column direction, NaN off the surface) of flat-grid points y0:y1, x0:x1."""
+    stride = int(flat_grid_stride)
+    origin, step, size = _flat_raster(patch_tifxyz, int(y0) * stride, int(y1) * stride, int(x0) * stride, int(x1) * stride, stride)
+    _, _, normals = patch_tifxyz.resample(origin, step, size, interpolation="smooth", normals=True)
+    return -normals[..., ::-1]
+
+
 def read_tifxyz_on_flat_grid(
     patch_tifxyz,
     *,
@@ -58,16 +82,10 @@ def read_tifxyz_on_flat_grid(
     scale = float(native_coordinate_scale)
     if scale <= 0.0:
         raise ValueError(f"native_coordinate_scale must be positive, got {scale!r}")
-    full_x, full_y, full_z, valid = patch_tifxyz[
-        slice(int(y0) * stride, int(y1) * stride, stride),
-        slice(int(x0) * stride, int(x1) * stride, stride),
-    ]
-    positions_zyx = np.stack([full_z, full_y, full_x], axis=-1).astype(
-        np.float32, copy=False
-    )
+    positions_zyx, valid = _flat_positions(patch_tifxyz, int(y0) * stride, int(y1) * stride, int(x0) * stride, int(x1) * stride, stride)
     if scale != 1.0:
         positions_zyx = positions_zyx * scale
-    return positions_zyx, np.asarray(valid, dtype=bool)
+    return positions_zyx, valid
 
 
 def compute_native_crop_bbox(
@@ -247,7 +265,7 @@ def _stored_resolution_bounds(
             return None
         (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = selection
         stored_h, stored_w = (int(value) for value in coarse_positions_zyx.shape[:2])
-    full_h, full_w = (int(value) for value in patch_tifxyz.full_resolution_shape)
+    full_h, full_w = patch_tifxyz.full_shape
     if stored_h <= 0 or stored_w <= 0:
         raise ValueError(
             "stored-resolution tifxyz grid must have positive shape, "
@@ -278,17 +296,11 @@ def _read_flat_window(
     """Native positions and validity of the flat-grid points inside `bounds`."""
     y0, y1, x0, x1 = bounds
     stride = int(flat_grid_stride)
-    full_x, full_y, full_z, full_valid = patch_tifxyz[
-        slice(y0, y1, stride),
-        slice(x0, x1, stride),
-    ]
-    positions_zyx = np.stack([full_z, full_y, full_x], axis=-1).astype(
-        np.float32, copy=False
-    )
+    positions_zyx, full_valid = _flat_positions(patch_tifxyz, y0, y1, x0, x1, stride)
     scale = float(native_coordinate_scale)
     if scale != 1.0:
         positions_zyx *= scale
-    return positions_zyx, np.asarray(full_valid, dtype=bool)
+    return positions_zyx, full_valid
 
 
 def _stored_resolution_window(
@@ -376,30 +388,12 @@ def select_flat_pixels_via_stored_resolution(
     return support_bbox, support, support_valid
 
 
-def catmull_rom_vertex_mask(patch_tifxyz) -> np.ndarray | None:
-    """Stored-grid validity behind `patch_tifxyz`'s full-resolution positions.
-
-    Returns None unless those positions come from Tifxyz's Catmull-Rom
-    interpolation, the case `select_flat_pixel_bands_via_stored_resolution`
-    can bound.
-    """
-    if (
-        getattr(patch_tifxyz, "interp_method", None) != "catmull_rom"
-        or getattr(patch_tifxyz, "resolution", None) != "full"
-    ):
-        return None
-    return np.asarray(patch_tifxyz.valid_vertex_mask, dtype=bool)
-
-
 def _stored_cells(patch_tifxyz, start: int, stop: int, step: int, axis: int):
     """Stored-grid cell of each sampled full-resolution row or column.
 
-    Uses the float32 arithmetic of `Tifxyz.__getitem__`; a point in cell `c`
-    is interpolated from stored rows or columns `c - 1` to `c + 2`.
+    A point in cell `c` is interpolated from stored rows or columns `c - 1` to `c + 2`.
     """
-    stored = np.arange(start, stop, step).astype(np.float32)
-    stored = stored * patch_tifxyz.get_scale_tuple()[axis]
-    return np.asarray(stored, dtype=np.float32).astype(np.int64)
+    return (np.arange(start, stop, step) * patch_tifxyz.scale[axis]).astype(np.float32).astype(np.int64)
 
 
 def _reduce_4x4(values: np.ndarray, reduce) -> np.ndarray:
@@ -456,18 +450,19 @@ def _band_bounds(
     row0, row1 = int(rows[0]), int(min(rows[-1], height - 1)) + 1
     column0, column1 = int(columns[0]), int(min(columns[-1], width - 1)) + 1
     # A cell's points come from the 4x4 stored points around it, clamped to the
-    # grid, and are valid only when all 16 are.
+    # grid, and are valid only when its 4 corners are.
     near_rows = np.clip(np.arange(row0 - 1, row1 + 2), 0, height - 1)[:, None]
     near_columns = np.clip(np.arange(column0 - 1, column1 + 2), 0, width - 1)[None, :]
     controls = coarse_positions_zyx[near_rows, near_columns]
     lower = _reduce_4x4(controls, np.minimum).astype(np.float64)
     upper = _reduce_4x4(controls, np.maximum).astype(np.float64)
-    usable = _reduce_4x4(vertex_mask[near_rows, near_columns], np.logical_and)
+    corners = vertex_mask[near_rows, near_columns][1:-1, 1:-1]
+    usable = corners[:-1, :-1] & corners[1:, :-1] & corners[:-1, 1:] & corners[1:, 1:]
     scale = float(native_coordinate_scale)
     with np.errstate(invalid="ignore"):
         # One voxel on top of the bound covers float32 rounding of the result;
         # non-finite control points leave the cell unbounded.
-        margin = (upper - lower) * CATMULL_ROM_NEGATIVE_WEIGHT + 1.0
+        margin = (upper - lower) * SMOOTH_PATCH_NEGATIVE_WEIGHT + 1.0
         lower = np.where(np.isnan(margin), -np.inf, (lower - margin) * scale)
         upper = np.where(np.isnan(margin), np.inf, (upper + margin) * scale)
     candidate = usable & (upper >= np.asarray(crop_bbox_zyx[:3])).all(axis=-1)
@@ -510,8 +505,8 @@ def select_flat_pixel_bands_via_stored_resolution(
     """`select_flat_pixels_via_stored_resolution`, as separate bands.
 
     A crop that meets several windings of a segment refines a window spanning
-    all of them, mostly points far from the crop. Given `vertex_mask` from
-    `catmull_rom_vertex_mask`, only the stored cells of that window whose
+    all of them, mostly points far from the crop. Given `vertex_mask`, the surface's
+    `valid`, only the stored cells of that window whose
     interpolated points can land in the crop are refined, in disjoint bands.
     Returns `(support_bbox, positions, valid)` per band, each cropped to its
     in-crop points; together they hold exactly the in-crop points of the whole

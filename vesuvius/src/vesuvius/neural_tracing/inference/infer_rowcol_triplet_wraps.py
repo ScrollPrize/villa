@@ -40,9 +40,9 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _serialize_bbox_record,
 )
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import get_area, save_tifxyz
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 from vc_object_store import ObjectStore
-from vesuvius.tifxyz.store import create_surface, read_surface
+from vesuvius.neural_tracing.inference.surface_store import create_surface, read_surface
 
 _TTA_TRANSFORM_ALIASES = {
     "mirror+rot90": "rotate3",
@@ -917,19 +917,13 @@ def _canonicalize_tta_settings(args):
 
 
 def _load_input_grid(tifxyz_path, retarget_factor=1):
-    return _surface_grid(read_tifxyz(tifxyz_path), retarget_factor)
+    return _surface_grid(tifxyz.read(tifxyz_path), retarget_factor)
 
 
 def _surface_grid(surface, retarget_factor=1):
     if float(retarget_factor) != 1.0:
         surface = surface.retarget(float(retarget_factor))
-    surface.use_stored_resolution()
-    x_s, y_s, z_s, valid_s = surface[:]
-    grid = np.stack([z_s, y_s, x_s], axis=-1).astype(np.float32, copy=False)
-    valid = np.asarray(valid_s, dtype=bool) & np.isfinite(grid).all(axis=2)
-    grid = grid.copy()
-    grid[~valid] = -1.0
-    return surface, grid, valid
+    return surface, surface.xyz[..., ::-1].copy(), surface.valid
 
 
 def _generate_cover_bboxes_from_points(
@@ -2698,7 +2692,7 @@ def run(args):
         args,
         model_config,
         args.volume_scale,
-        input_scale=surface.get_scale_tuple(),
+        input_scale=surface.scale,
     )
     volume_voxel_size_um = args.tifxyz_voxel_size_um
     if volume_voxel_size_um is None:

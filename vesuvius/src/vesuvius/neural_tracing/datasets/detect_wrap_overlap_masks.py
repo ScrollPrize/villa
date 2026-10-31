@@ -11,7 +11,7 @@ import tifffile
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from vesuvius.tifxyz import list_tifxyz, read_tifxyz
+from vc_reader import tifxyz
 
 SIDE_FRONT = "front"
 SIDE_BACK = "back"
@@ -154,12 +154,12 @@ def _wrap_infos(paths_dir: Path) -> List[WrapInfo]:
         return [WrapInfo(path=paths_dir, name=name, wrap_ids=wrap_ids)]
 
     infos: List[WrapInfo] = []
-    for item in list_tifxyz(paths_dir, recursive=False):
-        name = item.path.name
-        wrap_ids = _extract_wrap_ids(name)
+    for item in tifxyz.list_surfaces(paths_dir, recursive=False):
+        path = Path(item.location)
+        wrap_ids = _extract_wrap_ids(path.name)
         if not wrap_ids:
             continue
-        infos.append(WrapInfo(path=item.path, name=name, wrap_ids=wrap_ids))
+        infos.append(WrapInfo(path=path, name=path.name, wrap_ids=wrap_ids))
     infos.sort(key=lambda x: (x.wrap_ids[0], x.wrap_ids[-1], x.name))
     return infos
 
@@ -546,13 +546,13 @@ class OverlapDetector:
 
 
 def _load_wrap(info: WrapInfo) -> LoadedWrap:
-    surface = read_tifxyz(info.path, load_mask=True, validate=True)
+    surface = tifxyz.read(info.path)
     return LoadedWrap(
         info=info,
-        x=np.asarray(surface._x, dtype=np.float32),
-        y=np.asarray(surface._y, dtype=np.float32),
-        z=np.asarray(surface._z, dtype=np.float32),
-        valid=np.asarray(surface._valid_mask, dtype=bool),
+        x=surface.xyz[..., 0],
+        y=surface.xyz[..., 1],
+        z=surface.xyz[..., 2],
+        valid=surface.valid,
     )
 
 

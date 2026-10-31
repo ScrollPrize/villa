@@ -374,12 +374,11 @@ def load_patch_metas(patches_dir, band, scratch):
 
 def _patch_samples(patch_dir, erode, subdiv):
     """World-space surface samples of one eroded tifxyz patch."""
-    import tifffile
     from scipy.ndimage import binary_erosion
+    from vc_reader import tifxyz
 
-    grids = [tifffile.imread(patch_dir / f"{axis}.tif") for axis in "xyz"]
-    xyz = np.stack(grids, axis=-1).astype(np.float32)
-    valid = np.all(xyz != -1, axis=-1)
+    surface = tifxyz.read(patch_dir, mask=False)
+    xyz, valid = surface.xyz, surface.valid
     if erode > 0:
         valid = binary_erosion(
             valid, structure=np.ones((3, 3), dtype=bool), iterations=erode)

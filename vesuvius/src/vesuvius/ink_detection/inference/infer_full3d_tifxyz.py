@@ -16,11 +16,10 @@ from urllib.parse import urlparse
 
 import numpy as np
 from vc_reader.reader import create_group, ome_multiscales, write_pyramid_level
-import tifffile
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
@@ -192,20 +191,12 @@ def read_tifxyz_points(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read level-0 XYZ TIFF coordinates and return scaled arrays plus validity."""
 
-    arrays = []
-    for name in ("x.tif", "y.tif", "z.tif"):
-        path = Path(tifxyz_dir) / name
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing tifxyz coordinate file: {path}")
-        arrays.append(np.asarray(tifffile.imread(path), dtype=np.float32))
-    x, y, z = arrays
-    if x.shape != y.shape or x.shape != z.shape:
-        raise ValueError(f"x/y/z tif shapes must match, got {x.shape}, {y.shape}, {z.shape}")
     scale = float(native_coordinate_scale)
     if scale <= 0.0:
         raise ValueError(f"native_coordinate_scale must be positive, got {scale}")
-    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-    valid &= (x >= 0.0) & (y >= 0.0) & (z >= 0.0)
+    surface = tifxyz.read(tifxyz_dir, mask=False)
+    x, y, z = surface.xyz[..., 0], surface.xyz[..., 1], surface.xyz[..., 2]
+    valid = surface.valid
     if scale != 1.0:
         x, y, z = x * scale, y * scale, z * scale
     return x, y, z, valid
@@ -800,24 +791,14 @@ class NativePatchDataset(Dataset):
 
     def _ensure_tifxyz(self):
         if self._tifxyz is None:
-            self._tifxyz = tifxyz.read_tifxyz(
-                self.tifxyz_dir,
-                load_mask=False,
-                validate=False,
-            )
-            self._tifxyz.use_full_resolution()
+            self._tifxyz = tifxyz.read(self.tifxyz_dir, mask=False)
         return self._tifxyz
 
     def _ensure_coarse_positions(self):
         if self._coarse_positions is None or self._coarse_valid is None:
-            positions = np.asarray(
-                self._ensure_tifxyz().get_zyxs(stored_resolution=True),
-                dtype=np.float32,
-            )
-            valid = np.isfinite(positions).all(axis=-1)
-            valid &= (positions >= 0).all(axis=-1)
-            self._coarse_positions = positions
-            self._coarse_valid = valid
+            surface = self._ensure_tifxyz()
+            self._coarse_positions = surface.xyz[..., ::-1]
+            self._coarse_valid = surface.valid
         return self._coarse_positions, self._coarse_valid
 
     def _ensure_coarse_index(self):

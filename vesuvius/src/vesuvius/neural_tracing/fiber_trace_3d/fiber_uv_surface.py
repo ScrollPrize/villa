@@ -8,8 +8,7 @@ import numpy as np
 from . import fiber_uv_layout as uv
 from .fiber_normal_convention import inward_solution
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
-from vesuvius.tifxyz.types import Tifxyz
-from vesuvius.tifxyz.writer import write_tifxyz
+from vc_reader import tifxyz
 
 
 def unit(v):
@@ -193,9 +192,9 @@ def run(settings):
                 normal_sign_sha256=uv.sha256_file(cfg['stage1']),normal_curves=str(Path(settings['normal_curves']).resolve()),
                 normal_index_sha256=uv.sha256_file(Path(settings['normal_curves'])/'index.json'),settings=settings),
             method='H ruled surface plus scalar normal V chord residual; joint>0.5; bounded brackets; holes')
-        surface=Tifxyz(xyz[:,:,0],xyz[:,:,1],xyz[:,:,2],uuid=settings.get('surface_uuid_prefix','fiber-uv-')+item['label'].lower(),
-            _scale=(1/stats['grid_step'],)*2,_mask=valid,extra=meta)
-        write_tifxyz(out,surface,compression='lzw')
+        surface=tifxyz.Surface(xyz,uuid=settings.get('surface_uuid_prefix','fiber-uv-')+item['label'].lower(),
+            scale=(1/stats['grid_step'],)*2,mask=valid,extra=meta)
+        tifxyz.write(out,surface,compression='lzw')
         uv.atomic_write(out/'source_validation.json',hashes,durable=False)
         stats.update(label=item['label'],output=str(out),seconds=time.monotonic()-started)
         uv.atomic_write(out/'surface_statistics.json',stats,durable=False);reports.append(stats)

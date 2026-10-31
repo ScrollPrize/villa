@@ -18,7 +18,7 @@ import torch
 from skimage.restoration import unwrap_phase
 from vc.grid_raycast import GridRaycaster
 
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
     SlabFrame,
     VolumeSlabExtractor,
@@ -254,16 +254,16 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 patch_bbox_min = pack.bbox_min
                 patch_bbox_max = pack.bbox_max
             else:
-                for info in tifxyz.list_tifxyz(volume_cfg["segments_path"]):
+                for info in tifxyz.list_surfaces(volume_cfg["segments_path"]):
                     segment = self._load_segment(
-                        info.path,
+                        Path(info.location),
                         erode_cells=erode_cells,
                         inner_fraction=inner_fraction,
                     )
                     if not len(segment.sample_cells):
                         print(
                             "winding dataset: skipping segment with no valid "
-                            f"inner quads: {info.path}"
+                            f"inner quads: {info.location}"
                         )
                         continue
                     segments.append(segment)
@@ -447,30 +447,25 @@ class WindingModelDataset(torch.utils.data.Dataset):
         build_raycaster: bool = True,
         need_turns: bool = True,
     ) -> Segment:
-        surface = tifxyz.read_tifxyz(path)
-        xyz = np.ascontiguousarray(
-            np.stack([surface._x, surface._y, surface._z], axis=-1),
-            dtype=np.float32,
-        )
+        surface = tifxyz.read(path)
+        xyz = np.array(surface.xyz, dtype=np.float32)
         winding_idx = self._winding_index(path)
 
         # Trim vertices near the border of the valid region, where annotation
         # errors concentrate — the same erosion fit_spiral applies to patches
         # before consuming them.
-        valid_vertex = surface.valid_vertex_mask
+        valid_vertex = surface.valid
         if erode_cells > 0:
             valid_vertex = scipy.ndimage.binary_erosion(
                 valid_vertex, iterations=erode_cells, border_value=0
             )
             xyz[~valid_vertex] = -1.0
-            quad_mask = (
-                valid_vertex[:-1, :-1]
-                & valid_vertex[1:, :-1]
-                & valid_vertex[:-1, 1:]
-                & valid_vertex[1:, 1:]
-            )
-        else:
-            quad_mask = surface.valid_quad_mask
+        quad_mask = (
+            valid_vertex[:-1, :-1]
+            & valid_vertex[1:, :-1]
+            & valid_vertex[:-1, 1:]
+            & valid_vertex[1:, 1:]
+        )
 
         # Winding turns are only needed for segments without an explicit
         # winding index; unwrapping the phase of a large grid is the one

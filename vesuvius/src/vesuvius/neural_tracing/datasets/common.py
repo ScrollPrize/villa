@@ -5,8 +5,7 @@ import os
 from numba import njit
 from dataclasses import dataclass
 from pathlib import Path
-from vesuvius.tifxyz import Tifxyz
-from vesuvius.tifxyz.upsampling import interpolate_at_points
+from vc_reader import tifxyz
 from vc_reader.reader import ZarrGroup, ZarrReader, load_basic_auth, open_node
 from typing import Any, Dict, List, Tuple
 import re
@@ -85,7 +84,7 @@ def _parse_z_range(z_range):
 
 
 def _segment_z_bounds(seg):
-    valid = seg._valid_mask
+    valid = seg.valid
     if not np.any(valid):
         return None
     if seg.bbox is not None:
@@ -93,7 +92,7 @@ def _segment_z_bounds(seg):
         z_min = float(seg.bbox[2])
         z_max = float(seg.bbox[5])
     else:
-        z_vals = seg._z[valid]
+        z_vals = seg.xyz[..., 2][valid]
         z_min = float(np.min(z_vals))
         z_max = float(np.max(z_vals))
     return z_min, z_max
@@ -166,7 +165,7 @@ def _wrap_chunk_has_overlap(mask: np.ndarray, wrap: dict, patch_world_bbox):
         return False
 
     r_min, r_max, c_min, c_max = [int(v) for v in wrap["bbox_2d"]]
-    seg_h, seg_w = seg._valid_mask.shape
+    seg_h, seg_w = seg.shape
     mask_h, mask_w = mask_arr.shape
     r0 = max(0, r_min)
     r1 = min(seg_h - 1, mask_h - 1, r_max)
@@ -179,10 +178,9 @@ def _wrap_chunk_has_overlap(mask: np.ndarray, wrap: dict, patch_world_bbox):
     if not bool(np.any(overlap_local)):
         return False
 
-    seg.use_stored_resolution()
-    x_s, y_s, z_s, valid_s = seg[r0:r1 + 1, c0:c1 + 1]
-    if x_s.size == 0:
-        return False
+    xyz_s = seg.xyz[r0:r1 + 1, c0:c1 + 1]
+    x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
+    valid_s = seg.valid[r0:r1 + 1, c0:c1 + 1]
 
     z_min, z_max, y_min, y_max, x_min, x_max = patch_world_bbox
     in_chunk = (
@@ -190,10 +188,7 @@ def _wrap_chunk_has_overlap(mask: np.ndarray, wrap: dict, patch_world_bbox):
         (y_s >= y_min) & (y_s < y_max) &
         (x_s >= x_min) & (x_s < x_max)
     )
-    finite = np.isfinite(z_s) & np.isfinite(y_s) & np.isfinite(x_s)
-    in_chunk &= finite
-    if valid_s is not None:
-        in_chunk &= np.asarray(valid_s, dtype=bool)
+    in_chunk &= valid_s
     return bool(np.any(overlap_local & in_chunk))
 
 
@@ -258,7 +253,7 @@ def _compute_wrap_order_stats(wrap):
     seg = wrap["segment"]
     r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
-    seg_h, seg_w = seg._valid_mask.shape
+    seg_h, seg_w = seg.shape
     r_min = max(0, r_min)
     r_max = min(seg_h - 1, r_max)
     c_min = max(0, c_min)
@@ -266,25 +261,12 @@ def _compute_wrap_order_stats(wrap):
     if r_max < r_min or c_max < c_min:
         return None
 
-    seg.use_stored_resolution()
-    x_s, y_s, _, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-    if x_s.size == 0:
+    valid_s = seg.valid[r_min:r_max + 1, c_min:c_max + 1]
+    if not valid_s.any():
         return None
-
-    if valid_s is not None:
-        if not valid_s.any():
-            return None
-        x_vals = x_s[valid_s]
-        y_vals = y_s[valid_s]
-    else:
-        x_vals = x_s.reshape(-1)
-        y_vals = y_s.reshape(-1)
-
-    finite = np.isfinite(x_vals) & np.isfinite(y_vals)
-    if not finite.any():
-        return None
-    x_vals = x_vals[finite]
-    y_vals = y_vals[finite]
+    xyz_s = seg.xyz[r_min:r_max + 1, c_min:c_max + 1]
+    x_vals = xyz_s[..., 0][valid_s]
+    y_vals = xyz_s[..., 1][valid_s]
 
     if x_vals.size == 0 or y_vals.size == 0:
         return None
@@ -614,7 +596,7 @@ def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
 
 
 def _upsample_world_surface(x_s, y_s, z_s, scale_y: float, scale_x: float):
-    """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
+    """Upsample (x, y, z) sampled grids, all present, by bicubic Hermite patches."""
     h_s, w_s = x_s.shape
     h_up = int(round(h_s / scale_y))
     w_up = int(round(w_s / scale_x))
@@ -622,30 +604,17 @@ def _upsample_world_surface(x_s, y_s, z_s, scale_y: float, scale_x: float):
     dense_cols = np.linspace(0, w_s - 1, w_up, dtype=np.float32)
     query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
 
-    x_src = np.asarray(x_s, dtype=np.float32)
-    y_src = np.asarray(y_s, dtype=np.float32)
-    z_src = np.asarray(z_s, dtype=np.float32)
-    valid_src = np.ones((h_s, w_s), dtype=bool)
-
-    x_up, y_up, z_up, valid = interpolate_at_points(
-        x_src,
-        y_src,
-        z_src,
-        valid_src,
-        query_row,
-        query_col,
-        scale=(1.0, 1.0),
-        method="catmull_rom",
-    )
+    surface = tifxyz.Surface(np.stack([x_s, y_s, z_s], axis=-1).astype(np.float32))
+    xyz, valid = surface.points_at(query_row, query_col, interpolation="smooth")
 
     if not np.all(valid):
         invalid_count = int((~valid).sum())
         raise ValueError(
-            "Invalid points from Catmull-Rom interpolation: "
+            "Invalid points from surface interpolation: "
             f"{invalid_count}/{valid.size}"
         )
 
-    return x_up, y_up, z_up
+    return xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
 
 def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
@@ -863,7 +832,7 @@ def voxelize_surface_grid_masked(
 @dataclass
 class Patch:
     """A single patch from the hierarchical tiling method."""
-    seg: Tifxyz                           # Reference to the segment
+    seg: tifxyz.Surface                   # Reference to the segment
     volume: ZarrReader                    # zarr volume
     scale: float                          # volume_scale from config
     grid_bbox: Tuple[int, int, int, int]  # (row_min, row_max, col_min, col_max) in the tifxyz grid
@@ -881,8 +850,8 @@ class ChunkPatch:
     volume: Any                            # ZarrReader or ZarrGroup
     scale: int                             # volume_scale from config
     world_bbox: Tuple[float, ...]          # (z_min, z_max, y_min, y_max, x_min, x_max)
-    wraps: List[Dict]                      # [{"segment": Tifxyz, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
-    segments: List[Tifxyz]                 # All segments (for lookup by segment_idx)
+    wraps: List[Dict]                      # [{"segment": tifxyz.Surface, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
+    segments: List[tifxyz.Surface]         # All segments (for lookup by segment_idx)
     dataset_idx: int = -1                  # index into config["datasets"] (-1 = unknown)
     dataset_name: str = ""                 # human-readable dataset name
     dataset_local_idx: int = -1            # per-dataset patch index (stable within a cache)
@@ -1003,7 +972,7 @@ def compute_heatmap_targets(
         cond_direction: One of "left", "right", "up", "down"
         r_split, c_split: Split boundary in UV grid
         r_min_full, r_max_full, c_min_full, c_max_full: Patch bounds in UV grid
-        patch_seg: Tifxyz segment for indexing world coords
+        patch_seg: tifxyz Surface for indexing world coords
         min_corner: Crop origin in world coords (ZYX)
         crop_size: Output crop size tuple (D, H, W)
         step_size: Spacing between gaussians in UV grid units (both row and col)
@@ -1025,10 +994,9 @@ def compute_heatmap_targets(
             if col >= c_max_full:
                 continue
             for row in row_indices:
-                x, y, z, valid = patch_seg[row:row+1, col:col+1]
-                if not valid.all():
+                if not patch_seg.valid[row, col]:
                     continue
-                world_zyx = np.array([z.item(), y.item(), x.item()])
+                world_zyx = patch_seg.xyz[row, col, ::-1].astype(np.float64)
                 all_local_coords.append(world_zyx - min_corner)
 
     elif cond_direction == "right":
@@ -1037,10 +1005,9 @@ def compute_heatmap_targets(
             if col < c_min_full:
                 continue
             for row in row_indices:
-                x, y, z, valid = patch_seg[row:row+1, col:col+1]
-                if not valid.all():
+                if not patch_seg.valid[row, col]:
                     continue
-                world_zyx = np.array([z.item(), y.item(), x.item()])
+                world_zyx = patch_seg.xyz[row, col, ::-1].astype(np.float64)
                 all_local_coords.append(world_zyx - min_corner)
 
     elif cond_direction == "up":
@@ -1050,10 +1017,9 @@ def compute_heatmap_targets(
             if row >= r_max_full:
                 continue
             for col in col_indices:
-                x, y, z, valid = patch_seg[row:row+1, col:col+1]
-                if not valid.all():
+                if not patch_seg.valid[row, col]:
                     continue
-                world_zyx = np.array([z.item(), y.item(), x.item()])
+                world_zyx = patch_seg.xyz[row, col, ::-1].astype(np.float64)
                 all_local_coords.append(world_zyx - min_corner)
 
     elif cond_direction == "down":
@@ -1063,10 +1029,9 @@ def compute_heatmap_targets(
             if row < r_min_full:
                 continue
             for col in col_indices:
-                x, y, z, valid = patch_seg[row:row+1, col:col+1]
-                if not valid.all():
+                if not patch_seg.valid[row, col]:
                     continue
-                world_zyx = np.array([z.item(), y.item(), x.item()])
+                world_zyx = patch_seg.xyz[row, col, ::-1].astype(np.float64)
                 all_local_coords.append(world_zyx - min_corner)
 
     if not all_local_coords:

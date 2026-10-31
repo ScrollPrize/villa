@@ -363,11 +363,11 @@ def save_render(path, image, origin, title, error=None, length=1200):
 
 def render_saved(out, ct, spec):
     """``render.png`` of an inference output folder: CT on its strip and the decisions' errors along it."""
-    import tifffile
+    from vc_reader import tifxyz
     out = Path(out)
     summary = json.loads((out/'summary.json').read_text())
     saved = np.load(out/'strip.npz')
-    rows = np.stack([tifffile.imread(out/'strip'/f'{axis}.tif') for axis in 'xyz'], -1).astype(np.float64)
+    rows = tifxyz.read(out/'strip').xyz.astype(np.float64)
     keep = np.all(rows != -1, -1)
     image = render_strip(ct, spec, rows, keep, summary['row_step_voxels'], summary['column_step_voxels'])
     filled = np.flatnonzero(np.isfinite(image).any(1))

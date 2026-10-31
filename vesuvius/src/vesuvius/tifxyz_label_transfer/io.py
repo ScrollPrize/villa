@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import queue
@@ -16,6 +15,8 @@ from numpy.typing import NDArray
 from PIL import Image
 import tifffile
 
+from vc_reader import tifxyz
+
 from .core import Surface
 
 
@@ -24,54 +25,6 @@ def _read_tiff(path: Path) -> NDArray:
         return tifffile.memmap(path, mode="r")
     except ValueError:
         return tifffile.imread(path)
-
-
-def load_tifxyz_mask(
-    path: Path | str,
-    xyz_shape: Sequence[int],
-) -> NDArray[np.bool_]:
-    """Load a TIFXYZ mask using the canonical stored-grid semantics."""
-    mask_path = Path(path)
-    target_shape = int(xyz_shape[0]), int(xyz_shape[1])
-    mask = np.asarray(_read_tiff(mask_path))
-
-    # mask.tif may be multipage; the first page is the validity mask.
-    if (
-        mask.ndim > 2
-        and mask.shape[-2] % target_shape[0] == 0
-        and mask.shape[-1] % target_shape[1] == 0
-    ):
-        mask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))[0]
-    elif (
-        mask.ndim > 2
-        and mask.shape[0] % target_shape[0] == 0
-        and mask.shape[1] % target_shape[1] == 0
-    ):
-        mask = mask.reshape((mask.shape[0], mask.shape[1], -1))[:, :, 0]
-
-    if mask.shape == target_shape:
-        return np.asarray(mask >= 255)
-    if (
-        mask.ndim == 2
-        and mask.shape[0] % target_shape[0] == 0
-        and mask.shape[1] % target_shape[1] == 0
-    ):
-        # QuadSurface accepts a higher-resolution mask when each dimension is
-        # an integer multiple of the XYZ grid. A stored-grid point is retained
-        # only when its complete mask block is valid.
-        factor_y = mask.shape[0] // target_shape[0]
-        factor_x = mask.shape[1] // target_shape[1]
-        return np.all(
-            mask.reshape(
-                target_shape[0], factor_y, target_shape[1], factor_x
-            )
-            >= 255,
-            axis=(1, 3),
-        )
-    raise ValueError(
-        f"mask shape {mask.shape} is incompatible with XYZ shape "
-        f"{target_shape}"
-    )
 
 
 def _open_zarr_label(path: Path):
@@ -144,45 +97,21 @@ def read_image_shape(path: Path | str) -> Tuple[int, int]:
 
 def load_surface(path: Path | str, use_mask: bool = True) -> Surface:
     surface_path = Path(path)
-    required = [
-        surface_path / "x.tif",
-        surface_path / "y.tif",
-        surface_path / "z.tif",
-        surface_path / "meta.json",
-    ]
-    missing = [str(item) for item in required if not item.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"not a TIFXYZ directory; missing: {', '.join(missing)}"
-        )
-
-    with (surface_path / "meta.json").open("r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    scale = metadata.get("scale", [1.0, 1.0])
-    if not isinstance(scale, list) or len(scale) < 2:
-        raise ValueError(f"invalid scale in {surface_path / 'meta.json'}")
-    # C++ metadata stores [x_scale, y_scale]; array indexing uses (y, x).
-    scale_yx = float(scale[1]), float(scale[0])
-
-    x = np.asarray(_read_tiff(surface_path / "x.tif"), dtype=np.float32)
-    y = np.asarray(_read_tiff(surface_path / "y.tif"), dtype=np.float32)
-    z = np.asarray(_read_tiff(surface_path / "z.tif"), dtype=np.float32)
-    valid = None
-    mask_path = surface_path / "mask.tif"
-    if use_mask and mask_path.is_file():
-        try:
-            valid = load_tifxyz_mask(mask_path, x.shape)
-        except ValueError as exc:
-            raise ValueError(
-                f"{exc}; pass --ignore-tifxyz-mask only if this mask should "
-                "intentionally be ignored"
-            ) from exc
+    try:
+        stored = tifxyz.read(surface_path, mask=use_mask)
+    except ValueError as exc:
+        if "mask" not in str(exc):
+            raise
+        raise ValueError(
+            f"{exc}; pass --ignore-tifxyz-mask only if this mask should "
+            "intentionally be ignored"
+        ) from exc
     return Surface(
-        x=x,
-        y=y,
-        z=z,
-        scale_yx=scale_yx,
-        valid=valid,
+        x=stored.xyz[..., 0],
+        y=stored.xyz[..., 1],
+        z=stored.xyz[..., 2],
+        scale_yx=stored.scale,
+        valid=stored.valid,
         name=surface_path.name,
     )
 
