@@ -4,23 +4,21 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import aiohttp
 import numpy as np
-import zarr
+from vc_reader.reader import create_group
+from vc_reader import transforms as A
+from dinovol_2.dataset.training_transforms import ViewAugmentation
+SPATIAL = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+def spatial_only():
+    image = A.Image(valid=None)
+    return ViewAugmentation(
+        full=A.Pipeline(SPATIAL, targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+        geometry=A.Pipeline(SPATIAL, targets={"image": image}),
+    )
+def names_of(pipeline):
+    return [repr(t).split("(")[0] for t in pipeline.transforms]
 
-from dinovol_2.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset, window_start_cells
-
-
-def _flatten_transforms(transform):
-    children = [transform]
-    for child in getattr(transform, "transforms", None) or []:
-        children += _flatten_transforms(child)
-    for child in getattr(transform, "list_of_transforms", None) or []:
-        children += _flatten_transforms(child)
-    if getattr(transform, "transform", None) is not None:
-        children += _flatten_transforms(transform.transform)
-    return children
 
 
 def _downsample(values: np.ndarray) -> np.ndarray:
@@ -35,7 +33,7 @@ def _make_masked_pyramid(root: Path) -> Path:
     level[40:80, 10:60, 20:90] = rng.integers(1, 256, size=(40, 50, 70))
     level[5, 5, 5] = 1  # isolated voxel that rounds away in coarser levels
     path = root / "masked.zarr"
-    group = zarr.open_group(str(path), mode="w", zarr_format=2)
+    group = create_group(path, auth=None)
     for index in range(4):
         group.create_array(str(index), shape=level.shape, chunks=(16, 16, 16), dtype="uint8", fill_value=0)[:] = level
         level = _downsample(level)
@@ -50,7 +48,7 @@ def _make_scroll_pyramid(root: Path) -> Path:
     level = np.where(r < 36, 20, 0).astype(np.uint8)
     level[(r < 30) & (r % 6 < 3)] = 200
     path = root / "scroll.zarr"
-    group = zarr.open_group(str(path), mode="w", zarr_format=2)
+    group = create_group(path, auth=None)
     for index in range(4):
         group.create_array(str(index), shape=level.shape, chunks=(16, 16, 16), dtype="uint8", fill_value=0)[:] = level
         level = _downsample(level)
@@ -240,32 +238,10 @@ class SourceSamplingTests(unittest.TestCase):
         self.assertIsNone(dataset._read_executor)
         self.assertEqual(len(dataset._pending_reads), 0)
 
-    def test_transient_read_errors_are_retried(self):
-        dataset = self.dataset(read_retry_backoff=0.0)
-        array = dataset._get_volume_array(dataset.volumes[0])
-        expected = dataset._read_source_window(array, (30, 10, 20))
-
-        class FlakyArray:
-            def __init__(self, failures):
-                self.failures = failures
-                self.calls = 0
-
-            def __getitem__(self, selection):
-                self.calls += 1
-                if self.calls <= self.failures:
-                    raise aiohttp.ClientPayloadError("Response payload is not completed")
-                return array[selection]
-
-        flaky = FlakyArray(failures=2)
-        np.testing.assert_array_equal(dataset._read_source_window(flaky, (30, 10, 20)), expected)
-        self.assertEqual(flaky.calls, 3)
-        with self.assertRaises(aiohttp.ClientPayloadError):
-            dataset._read_source_window(FlakyArray(failures=dataset.read_retries + 1), (30, 10, 20))
-
     def test_gaussian_blur_can_be_disabled(self):
         def has_blur(dataset):
             pipelines = dataset.global_transforms + dataset.local_transforms
-            return [any(isinstance(t, GaussianBlurTransform) for t in _flatten_transforms(p)) for p in pipelines]
+            return ['GaussianBlur' in names_of(p.full) for p in pipelines]
 
         self.assertTrue(all(has_blur(self.dataset())))
         self.assertFalse(any(has_blur(self.dataset(gaussian_blur=False))))

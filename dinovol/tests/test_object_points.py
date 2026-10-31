@@ -7,13 +7,20 @@ import unittest
 import numpy as np
 import torch
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import create_group
+from vc_reader import transforms as A
+from dinovol_2.dataset.training_transforms import ViewAugmentation
+SPATIAL = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+def spatial_only():
+    image = A.Image(valid=None)
+    return ViewAugmentation(
+        full=A.Pipeline(SPATIAL, targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+        geometry=A.Pipeline(SPATIAL, targets={"image": image}),
+    )
+def names_of(pipeline):
+    return [repr(t).split("(")[0] for t in pipeline.transforms]
 from scipy import ndimage as ndi
 
-from dinovol_2.augmentation.transforms.spatial.mirroring import MirrorTransform
-from dinovol_2.augmentation.transforms.spatial.rot90 import Rot90Transform
-from dinovol_2.augmentation.transforms.spatial.transpose import TransposeAxesTransform
-from dinovol_2.augmentation.transforms.utils.compose import ComposeTransforms
 from dinovol_2.dataset.object_labels import (
      build_mesh_segment_from_arrays,
     crop_mesh_objects,
@@ -53,9 +60,9 @@ def _encode(direction_zyx) -> tuple[int, int]:
 def _make_volume(root: Path) -> dict:
     coords = np.arange(SIZE, dtype=np.float32)
     ramp = (1.0 + 0.5 * coords[:, None, None] + 0.3 * coords[None, :, None] + 0.2 * coords[None, None, :])
-    image = zarr.open_group(str(root / "image.zarr"), mode="w", zarr_format=2)
+    image = create_group(root / "image.zarr", auth=None)
     image.create_array("0", shape=ramp.shape, chunks=(32, 32, 32), dtype="float32")[:] = ramp
-    surface = zarr.open_group(str(root / "surface.zarr"), mode="w", zarr_format=2)
+    surface = create_group(root / "surface.zarr", auth=None)
     surface.create_array("0", shape=ramp.shape, chunks=(32, 32, 32), dtype="uint8")[:] = _sheets(ramp.shape)
     # Fibers at half resolution: walls of fibers running along y, every 6 voxels in x.
     half = SIZE // 2
@@ -65,7 +72,7 @@ def _make_volume(root: Path) -> dict:
     paths = {}
     for name, value in (("presence", presence), ("nx", np.full_like(presence, nx_value)),
                         ("ny", np.full_like(presence, ny_value))):
-        group = zarr.open_group(str(root / f"{name}.zarr"), mode="w", zarr_format=2)
+        group = create_group(root / f"{name}.zarr", auth=None)
         group.create_array("1", shape=value.shape, chunks=(16, 16, 16), dtype="uint8")[:] = value
         paths[name] = str(root / f"{name}.zarr")
     # Cached mesh segments at x=30, 40, 60 with inklabels and supervision masks.
@@ -370,11 +377,7 @@ class ObjectPointDatasetTests(unittest.TestCase):
     def test_points_follow_crops_flips_rotations_and_transposes(self):
         # No intensity normalization: the robust scheme clips, which bends the ramp.
         dataset = SSLZarrDataset(self.dataset_config(normalization_scheme="none"), do_augmentations=True)
-        spatial = ComposeTransforms([
-            Rot90Transform(allowed_axes={0, 1, 2}),
-            MirrorTransform(allowed_axes=(0, 1, 2)),
-            TransposeAxesTransform(allowed_axes={0, 1, 2}),
-        ])
+        spatial = spatial_only()
         dataset.global_transforms = [spatial, spatial]
         for seed in range(4):
             np.random.seed(seed)
@@ -403,15 +406,8 @@ class ObjectPointDatasetTests(unittest.TestCase):
 
     def test_dino_augmentation_preset_keeps_spatial_and_intensity_jitter(self):
         dataset = SSLZarrDataset(self.dataset_config(augmentation="dino"), do_augmentations=True)
-        transforms = [getattr(t, "transform", t) for t in dataset.global_transforms[0].transforms]
-        names = {type(t).__name__ for t in transforms}
-        self.assertEqual(names, {
-            "Rot90Transform", "MirrorTransform", "TransposeAxesTransform", "OneOfTransform",
-            "BrightnessAdditiveTransform",
-        })
-        for transform in transforms:
-            if isinstance(transform, (Rot90Transform, TransposeAxesTransform)):
-                self.assertEqual(set(transform.allowed_axes), {0, 1, 2})
+        names = set(names_of(dataset.global_transforms[0].full))
+        self.assertEqual(names, {"Rotate90", "Flip", "Transpose", "OneOf", "BrightnessAdd"})
         dataset.close()
 
     def test_mesh_and_ink_oversampling_scales_with_point_counts(self):

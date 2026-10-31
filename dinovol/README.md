@@ -8,8 +8,6 @@ The canonical source is
 Run project commands from the monorepository's `dinovol/` directory.
 
 - `dinov2_eva` is adapted from [dynamic-network-architectures](https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py), with minimal changes.
-- The augmentation library is a modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2).
-- Normalization is mostly borrowed from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet).
 - RoPE is adapted from the [DINOv3 implementation](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py) and extended to support 3D.
 
 This implementation is still incomplete. Pretraining works, but finetuning has
@@ -164,11 +162,6 @@ mostly empty.
   windows in background threads while it augments the current sample. Window
   locations are still drawn in the loader process, so sampling stays
   deterministic, but enabling it changes the order of random draws.
-- `dataset.read_retries` (default 5) and `dataset.read_retry_backoff` (default
-  1 s): source-window and occupancy reads retry transient network errors
-  (dropped connections, truncated responses, timeouts) with doubling backoff,
-  re-reading the same window, so a single dropped S3 connection no longer kills
-  a run. Each retry is printed to stderr.
 - `dataset.gaussian_blur: true` and `dataset.global_crop_scale: [0.18, 0.45]` /
   `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
   from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)

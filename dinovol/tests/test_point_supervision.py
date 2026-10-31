@@ -11,7 +11,18 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import zarr
+from vc_reader.reader import create_group
+from vc_reader import transforms as A
+from dinovol_2.dataset.training_transforms import ViewAugmentation
+SPATIAL = [A.Rotate90(), A.Flip(axes="zyx"), A.Transpose()]
+def spatial_only():
+    image = A.Image(valid=None)
+    return ViewAugmentation(
+        full=A.Pipeline(SPATIAL, targets={"image": image, "keypoints": A.Points(order="zyx", outside="keep")}),
+        geometry=A.Pipeline(SPATIAL, targets={"image": image}),
+    )
+def names_of(pipeline):
+    return [repr(t).split("(")[0] for t in pipeline.transforms]
 
 from dinovol_2.dataset.point_annotations import (
     load_point_collection,
@@ -19,8 +30,6 @@ from dinovol_2.dataset.point_annotations import (
     xyz_to_zyx,
 )
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset, SampledCropRegion
-from dinovol_2.augmentation.transforms.spatial.mirroring import MirrorTransform
-from dinovol_2.augmentation.transforms.spatial.rot90 import Rot90Transform
 from dinovol_2.loss import PointCosineLoss
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
@@ -41,7 +50,7 @@ def _write_points(path: Path, collections: list[list[list[float]]], *, version=1
 
 def _make_pyramid(root: Path) -> Path:
     path = root / "points.zarr"
-    group = zarr.open_group(str(path), mode="w", zarr_format=2)
+    group = create_group(path, auth=None)
     group.create_array(
         "0", shape=(96, 96, 96), chunks=(24, 24, 24), dtype="float32", fill_value=1.0
     )
@@ -198,20 +207,13 @@ class PointPipelineTests(unittest.TestCase):
 
     def test_rotation_mirroring_and_type_stratified_cap_coordinates(self) -> None:
         keypoints = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-        rotation = Rot90Transform()
-        rotated = rotation._apply_to_keypoints(
-            keypoints,
-            num_rot_per_combination=[1],
-            axis_combinations=[[1, 2]],
-            crop_shape=(16, 16, 16),
-        )
-        torch.testing.assert_close(rotated[0], torch.tensor([13.0, 1.0, 3.0]))
-        mirrored = MirrorTransform((0, 1, 2))._apply_to_keypoints(
-            rotated,
-            axes=[2],
-            crop_shape=(16, 16, 16),
-        )
-        torch.testing.assert_close(mirrored[0], torch.tensor([13.0, 1.0, 12.0]))
+        def moved(transform, points):
+            return A.Pipeline([transform], targets={"image": A.Image(valid=None), "keypoints": A.Points(order="zyx", outside="keep")})(
+                {"image": np.zeros((1, 16, 16, 16), np.float32), "keypoints": points.numpy()}, seed=0)["keypoints"]
+        rotated = moved(A.Rotate90(planes=("zy",), turns=(1,)), keypoints)
+        torch.testing.assert_close(torch.from_numpy(rotated[0]), torch.tensor([13.0, 1.0, 3.0]))
+        mirrored = moved(A.Flip(axes="x", p_axis=1), torch.from_numpy(rotated))
+        torch.testing.assert_close(torch.from_numpy(mirrored[0]), torch.tensor([13.0, 1.0, 12.0]))
 
         dataset = SSLZarrDataset(self._dataset_config(max_points=3), do_augmentations=False)
         try:

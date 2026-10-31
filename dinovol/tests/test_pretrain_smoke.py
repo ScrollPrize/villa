@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import create_group
 
 from dinovol_2.loss import GramLoss
 from dinovol_2.pretrain import DinoIBOTPretrainer
@@ -16,7 +16,7 @@ from dinovol_2.verify import build_verification_report
 
 def _make_synthetic_zarr(root: Path, *, size: int = 224) -> Path:
     zarr_path = root / "synthetic.zarr"
-    group = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
+    group = create_group(zarr_path, auth=None)
     array = group.create_array("0", shape=(size, size, size), chunks=(32, 32, 32), dtype="float32")
 
     coords = np.linspace(-1.0, 1.0, size, dtype=np.float32)

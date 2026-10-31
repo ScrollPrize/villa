@@ -10,21 +10,19 @@ merged into one. Pairs of objects are marked as different only when that is prov
 from __future__ import annotations
 
 from dataclasses import dataclass
-import io
 import json
 import math
 from pathlib import Path
 import re
 from typing import Any, Mapping
 
-import fsspec
 import numpy as np
 from scipy import ndimage as ndi
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
-import tifffile
-import zarr
+from vc_reader import images
+from vc_reader.reader import ObjectStore, open_zarr
 
 from dinovol_2.dataset.point_annotations import map_scale0_voxel_centers, xyz_to_zyx
 
@@ -471,25 +469,21 @@ def parse_sample_and_volume_id(volume_path: str) -> tuple[str | None, str | None
     return None, None
 
 
+def s3_auth(storage_options: Mapping[str, Any] | None) -> str | None:
+    """How to reach ``s3://`` locations: anonymous unless ``anon`` is false, then AWS credentials from the environment."""
+    options = dict(storage_options or {})
+    unknown = set(options) - {"anon"}
+    if unknown:
+        raise ValueError(f"s3_storage_options supports only 'anon', got {sorted(unknown)}")
+    return None if options.get("anon", True) else "aws"
+
+
 def _read_tiff(url_or_path: str, storage_options: dict[str, Any] | None = None) -> np.ndarray:
-    path_str = str(url_or_path)
-    opts = dict(storage_options or {})
-    if path_str.startswith("s3://"):
-        opts.setdefault("anon", True)
-    with fsspec.open(path_str, "rb", **opts) as f:
-        data = f.read()
-    return np.asarray(tifffile.imread(io.BytesIO(data)))
+    return images.read(str(url_or_path), auth=s3_auth(storage_options))
 
 
 def _open_ink_zarr_level(url_or_path: str, level: str = "4", storage_options: dict[str, Any] | None = None) -> np.ndarray:
-    path_str = str(url_or_path).rstrip("/")
-    opts = dict(storage_options or {})
-    if path_str.startswith("s3://"):
-        opts.setdefault("anon", True)
-        arr = zarr.open(path_str, path=level, mode="r", storage_options=opts)
-    else:
-        arr = zarr.open(path_str, path=level, mode="r")
-    return np.asarray(arr[:])
+    return open_zarr(str(url_or_path).rstrip("/"), level=level, auth=s3_auth(storage_options))[...]
 
 
 def build_mesh_segment_from_arrays(
@@ -623,8 +617,14 @@ _METADATA_CACHE: dict[str, dict[str, Any]] = {}
 def _load_metadata_json(metadata_path: str | Path) -> dict[str, Any]:
     key = str(metadata_path)
     if key not in _METADATA_CACHE:
-        with fsspec.open(key, "rt", encoding="utf-8") as f:
-            _METADATA_CACHE[key] = json.load(f)
+        if key.startswith(("http://", "https://", "s3://")):
+            parent, _, name = key.rpartition("/")
+            text = ObjectStore(parent, auth=None).read(name)
+            if text is None:
+                raise FileNotFoundError(key)
+        else:
+            text = Path(key).read_text(encoding="utf-8")
+        _METADATA_CACHE[key] = json.loads(text)
     return _METADATA_CACHE[key]
 
 
