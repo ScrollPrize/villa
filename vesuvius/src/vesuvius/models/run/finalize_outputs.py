@@ -335,11 +335,12 @@ def finalize_logits(
         if is_multi_task and target_info:
             # For multi-task binary, output one channel per target
             num_targets = len(target_info)
+            ordered_target_names = sorted(target_info, key=lambda name: target_info[name]['start_channel'])
             output_shape = (num_targets, *spatial_shape)  # One mask per target
             if threshold_enabled:
-                print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_binary_mask" for k in sorted(target_info.keys())) + "]")
+                print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_binary_mask" for k in ordered_target_names) + "]")
             else:
-                print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
+                print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in ordered_target_names) + "]")
         else:
             if num_classes == 1:
                 output_shape = (1, *spatial_shape)
