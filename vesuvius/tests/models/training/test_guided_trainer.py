@@ -6,20 +6,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import create_group
 from torch.utils.data import DataLoader
 
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.run.inference import Inferer
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.utils.plotting import save_debug
-
-
-def _create_array(group, name, **kwargs):
-    create_array = getattr(group, "create_array", None)
-    if create_array is not None:
-        return create_array(name, **kwargs)
-    return group.create_dataset(name, **kwargs)
 
 
 def _tiny_dinovol_model_config() -> dict:
@@ -61,12 +54,12 @@ def _make_synthetic_dataset(root: Path) -> Path:
     label_root_ink = data_root / "labels" / "volume1_ink.zarr"
     label_root_surface = data_root / "labels" / "volume1_surface.zarr"
 
-    image_group = zarr.open_group(str(image_root), mode="w")
-    label_group_ink = zarr.open_group(str(label_root_ink), mode="w")
-    label_group_surface = zarr.open_group(str(label_root_surface), mode="w")
-    image_array = _create_array(image_group, "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="float32")
-    label_array_ink = _create_array(label_group_ink, "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
-    label_array_surface = _create_array(label_group_surface, "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    image_group = create_group(image_root)
+    label_group_ink = create_group(label_root_ink)
+    label_group_surface = create_group(label_root_surface)
+    image_array = image_group.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="float32")
+    label_array_ink = label_group_ink.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    label_array_surface = label_group_surface.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
 
     coords = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
     z = coords[:, None, None]

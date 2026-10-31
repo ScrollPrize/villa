@@ -5,7 +5,7 @@ import pytest
 import tifffile
 import torch
 from torch import nn
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.ink_detection.inference.infer import (
@@ -40,13 +40,11 @@ def _save_checkpoint(path, *, depth: int = 3, side: int = 16, seed: int = 0):
 
 
 def _write_surface(path, *, depth: int = 3, side: int = 16):
-    array = zarr.open(
+    array = ZarrWriter.create(
         path,
-        mode="w",
         shape=(depth, side, side),
         chunks=(depth, side, side),
         dtype="u1",
-        zarr_format=2,
     )
     array[:] = np.random.default_rng(0).integers(1, 255, size=(depth, side, side))
     return path

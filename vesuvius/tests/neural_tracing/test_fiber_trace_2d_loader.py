@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
 
 from tests.zarr_utils import create_v2_group_array
 

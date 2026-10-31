@@ -5,8 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
-from vc_reader.reader import open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, LiveContinuationSource
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
@@ -48,8 +47,7 @@ def setup(monkeypatch, tmp_path):
                        startup_shares=(0., 0., 0., 1.), excursion_probability=0., trace_noise_sigma=(0., 0.),
                        trace_noise_smoothing=0.)
     # An empty 1000^3 CT: only its shape (the trace bounds) is read; frames come from the patched CT tensor.
-    zarr.create_array(str(tmp_path/'ct'/'0'), shape=(1000,)*3, chunks=(250,)*3, dtype='u1', fill_value=0,
-                      zarr_format=2, compressors=None)
+    ZarrWriter.create(tmp_path/'ct'/'0', shape=(1000,)*3, chunks=(250,)*3, dtype='u1', fill_value=0, compressor=None)
     spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0)
     ct = open_zarr(spec.ct_zarr, level=spec.ct_level)
     ds = FollowDataset([fiber], spec, cfg, chunk=2)

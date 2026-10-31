@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group
 
 from vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input import (
     FORMAT_TAG,
@@ -19,15 +19,9 @@ from vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input import (
 
 
 def _write_source(path: Path, data_ZYX: np.ndarray, *, level: str = "2") -> None:
-    kwargs = {"mode": "w"}
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        kwargs["zarr_format"] = 2
-    group = zarr.open_group(path, **kwargs)
     chunks = (21, *(2 for _ in data_ZYX.shape[1:]))
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        group.create_array(level, data=data_ZYX, chunks=chunks)
-    else:
-        group.create_dataset(level, data=data_ZYX, chunks=chunks)
+    group = create_group(path, overwrite=True)
+    group.create_array(level, shape=data_ZYX.shape, chunks=chunks, dtype=data_ZYX.dtype)[...] = data_ZYX
 
 
 def test_centered_slice_places_an_odd_margin_before_the_slice():
@@ -47,9 +41,8 @@ def test_source_opening_accepts_bare_array_and_named_level(tmp_path):
         open_source_array(str(group_path), "4")
 
     array_path = tmp_path / "array.zarr"
-    zarr.open_array(
+    ZarrWriter.create(
         array_path,
-        mode="w",
         shape=data_ZYX.shape,
         chunks=(21, 2, 3),
         dtype=np.uint8,
@@ -73,7 +66,7 @@ def test_preparation_writes_exact_float32_rounded_means_and_metadata(tmp_path):
     expected_ZYX = np.rint(
         centered_ZYX.astype(np.float32).reshape(21, 4, 2, 3).mean(axis=1)
     ).astype(np.uint8)
-    group = zarr.open_group(output_path, mode="r")
+    group = open_group(output_path)
     np.testing.assert_array_equal(group["0"][:], expected_ZYX)
     assert dict(group.attrs) == {
         "format": FORMAT_TAG,
@@ -96,7 +89,7 @@ def test_preparation_uses_bankers_rounding_at_half_values(tmp_path):
     _write_source(input_path, source_ZYX)
 
     prepare_isotropic_input(str(input_path), output_path, workers=1)
-    output_ZYX = zarr.open_group(output_path, mode="r")["0"][:]
+    output_ZYX = open_group(output_path)["0"][:]
     assert output_ZYX[0, 0].tolist() == [0, 2]
     assert int(output_ZYX[1, 0, 0]) == 2
 
@@ -135,7 +128,7 @@ def test_preparation_command_and_cli_module_help(tmp_path):
     assert main(
         [str(input_path), str(output_path), "--level", "2", "--workers", "1"]
     ) == 0
-    assert zarr.open_group(output_path, mode="r")["0"].shape == (21, 1, 1)
+    assert open_group(output_path)["0"].shape == (21, 1, 1)
 
     completed = subprocess.run(
         [

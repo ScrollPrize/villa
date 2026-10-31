@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import open_group
 
 from vesuvius.ink_detection.inference import infer_full3d_tifxyz as native
 
@@ -400,7 +400,7 @@ def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
     native.build_downsample_levels(arrays, level0_written_chunks={target}, workers=2)
     expected = np.zeros((5, 4, 3), dtype=np.uint8)
     expected[:2, :2, :2] = values
-    multiscales = zarr.open_group(path, mode="r").attrs["multiscales"][0]
+    multiscales = open_group(path).attrs["multiscales"][0]
     assert multiscales["version"] == "0.4"
     assert [axis["name"] for axis in multiscales["axes"]] == ["z", "y", "x"]
     assert [dataset["path"] for dataset in multiscales["datasets"]] == [
@@ -454,7 +454,7 @@ def test_output_reject_overwrite_and_coherent_rerun(tmp_path):
         overwrite=True,
     )
     assert not np.asarray(second[0]).any()
-    assert len(list(zarr.open_group(output, mode="r").array_keys())) == 6
+    assert len(list(open_group(output).array_keys())) == 6
 
 
 def test_plan_only_does_not_load_runtime_or_touch_existing_output(tmp_path, monkeypatch):
@@ -558,15 +558,15 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         downsample_workers=1,
     )
     assert native.run_command(args) == 0
-    group = zarr.open_group(output, mode="r")
+    group = open_group(output)
     assert sorted(group.array_keys()) == [str(level) for level in range(6)]
     assert all(np.all(np.asarray(group[str(level)]) == 128) for level in range(6))
     with pytest.raises(FileExistsError):
         native.run_command(args)
-    assert np.all(np.asarray(zarr.open_group(output, mode="r")["0"]) == 128)
+    assert np.all(np.asarray(open_group(output)["0"]) == 128)
     args.overwrite = True
     assert native.run_command(args) == 0
     assert all(
-        np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
+        np.all(np.asarray(open_group(output)[str(level)]) == 128)
         for level in range(6)
     )

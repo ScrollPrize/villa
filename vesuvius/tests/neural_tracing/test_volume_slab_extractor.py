@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter
 from scipy import ndimage
 
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import VolumeSlabExtractor
@@ -10,8 +10,7 @@ from vesuvius.neural_tracing.winding_models.volume_slab_extractor import VolumeS
 def volume(tmp_path):
     data = np.random.default_rng(0).integers(0, 255, size=(20, 24, 28), dtype=np.uint8)
     path = tmp_path / "v.zarr" / "0"
-    zarr.open_array(str(path), mode="w", shape=data.shape, chunks=(8, 8, 8), dtype="u1",
-                    fill_value=0, zarr_format=2)[:] = data
+    ZarrWriter.create(path, shape=data.shape, chunks=(8, 8, 8), dtype="u1", fill_value=0)[...] = data
     return path, data
 
 

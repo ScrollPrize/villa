@@ -33,14 +33,13 @@ def test_parallel_advancement_whole_trace_exact(monkeypatch, tmp_path):
     import torch
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
-    import zarr
-    from vc_reader.reader import open_zarr
+    from vc_reader.reader import ZarrWriter, open_zarr
     from vesuvius.neural_tracing.tracers.fibers.tracing import trace
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
     # An empty 100^3 CT: only its shape (the trace bounds) is read; frames come from the patched ct_frame.
-    zarr.create_array(str(tmp_path/'ct'/'0'), shape=(100, 100, 100), chunks=(50, 50, 50), dtype='u1', fill_value=0,
-                      zarr_format=2, compressors=None)
+    ZarrWriter.create(tmp_path/'ct'/'0', shape=(100, 100, 100), chunks=(50, 50, 50), dtype='u1', fill_value=0,
+                      compressor=None)
     spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0, ct_grid_scale=8., grid_scale=8.)
     ct = open_zarr(spec.ct_zarr, level=spec.ct_level)
     monkeypatch.setattr(trace, 'ct_frame', lambda ct, spec, pos, *a, **k:

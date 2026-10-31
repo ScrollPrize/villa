@@ -4,8 +4,7 @@ interpolation, the per-crop z-score equals its NumPy definition within float32 r
 import numpy as np
 import pytest
 import torch
-import zarr
-from vc_reader.reader import open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import crop_grids, cuda_scalar_crops, scalar_crops
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
@@ -40,8 +39,8 @@ def ct_items(tmp_path, input_scale):
     """A chunked local uint8 Zarr CT, its spec and four oriented crop items, some reaching past the array."""
     rng = np.random.default_rng(input_scale)
     raw = rng.integers(0, 256, (40, 44, 48), dtype=np.uint8)
-    array = zarr.create_array(str(tmp_path/'ct'/'0'), shape=raw.shape, chunks=(16, 16, 16), dtype='u1', fill_value=0,
-                              zarr_format=2, compressors=None)
+    array = ZarrWriter.create(tmp_path/'ct'/'0', shape=raw.shape, chunks=(16, 16, 16), dtype='u1', fill_value=0,
+                              compressor=None)
     array[:] = raw
     spec = CTVolumeSpec(str(tmp_path/'ct'), ct_level=0, ct_grid_scale=4., grid_scale=4.*input_scale,
                         ct_normalization=RECORD)

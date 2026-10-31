@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import zarr
+from vc_reader.reader import open_node
 
 from vesuvius.models.run.inference import Inferer
 
@@ -30,8 +30,7 @@ def _inferer(tmp_path, *, do_tta: bool, tta_type: str = "mirroring") -> Inferer:
     inf.num_parts = 1
     inf.overlap = 0.5
     inf.verbose = False
-    # 'none' short-circuits _get_zarr_compressor, which reaches for zarr.Blosc - absent in
-    # zarr 3. Compression is irrelevant to the attributes under test.
+    # Compression is irrelevant to the attributes under test.
     inf.compressor_name = "none"
     inf.compression_level = 1
     inf.bbox = None
@@ -45,7 +44,7 @@ def _inferer(tmp_path, *, do_tta: bool, tta_type: str = "mirroring") -> Inferer:
 
 
 def _attrs(tmp_path):
-    return dict(zarr.open(str(tmp_path / "logits_part_0.zarr"), mode="r").attrs)
+    return dict(open_node(tmp_path / "logits_part_0.zarr").attrs)
 
 
 def test_records_tta_enabled(tmp_path):

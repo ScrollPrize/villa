@@ -157,14 +157,14 @@ def test_prefetch_batch_items_propagates_errors(monkeypatch):
 
 
 def _write_level_group(root, shapes):
-    import zarr
+    from vc_reader.reader import create_group
 
-    group = zarr.open_group(str(root), mode="w", zarr_format=2)
+    group = create_group(root, overwrite=True)
     rng = np.random.default_rng(0)
     data = {}
     for level, shape in enumerate(shapes):
         values = rng.integers(1, 255, size=shape, dtype=np.uint8)
-        group.create_array(str(level), shape=shape, chunks=(4, 4, 4), dtype="u1", fill_value=0)[:] = values
+        group.create_array(str(level), shape=shape, chunks=(4, 4, 4), dtype="u1", fill_value=0)[...] = values
         data[level] = values
     return data
 

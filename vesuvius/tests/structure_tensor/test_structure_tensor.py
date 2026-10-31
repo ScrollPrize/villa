@@ -3,7 +3,6 @@
 import pytest
 import torch
 import numpy as np
-import zarr
 import os
 from math import isfinite
 

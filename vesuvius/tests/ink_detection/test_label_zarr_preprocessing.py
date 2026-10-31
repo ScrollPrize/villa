@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pytest
 import tifffile
-import zarr
+from vc_reader.reader import open_group
 
 from vesuvius.ink_detection.preprocessing import (
     create_label_zarrs as create_label_zarrs_module,
@@ -83,8 +83,8 @@ def test_label_and_composite_pyramids_keep_nearest_and_mean_rounding(tmp_path):
     )
     write_label_pyramid(image_YX, tmp_path / "nearest.zarr", levels=2)
     write_label_pyramid(image_YX, tmp_path / "mean.zarr", levels=2, downsample_mode="mean")
-    nearest = zarr.open_group(tmp_path / "nearest.zarr", mode="r")
-    mean = zarr.open_group(tmp_path / "mean.zarr", mode="r")
+    nearest = open_group(tmp_path / "nearest.zarr")
+    mean = open_group(tmp_path / "mean.zarr")
 
     assert nearest["0"].shape == (65, 3, 3)
     np.testing.assert_array_equal(nearest["0"][DEFAULT_LABEL_SLICE], image_YX)
@@ -106,7 +106,7 @@ def test_conversion_writes_v2_ome_metadata_and_preserves_skip_overwrite(tmp_path
     output = label_path.with_suffix(".zarr")
     assert first["status"] == "written"
     assert _zarr_format(output) == 2
-    group = zarr.open_group(output, mode="r")
+    group = open_group(output)
     assert sorted(group.array_keys()) == ["0", "1", "2"]
     assert group.attrs["multiscales"][0]["axes"] == [
         {"name": "z", "type": "space"},
@@ -120,12 +120,12 @@ def test_conversion_writes_v2_ome_metadata_and_preserves_skip_overwrite(tmp_path
     tifffile.imwrite(label_path, replacement_YX)
     assert convert_image(label_path, levels=3)["status"] == "skipped"
     np.testing.assert_array_equal(
-        zarr.open_group(output, mode="r")["0"][DEFAULT_LABEL_SLICE], first_YX
+        open_group(output)["0"][DEFAULT_LABEL_SLICE], first_YX
     )
 
     assert convert_image(label_path, levels=3, overwrite=True)["status"] == "written"
     np.testing.assert_array_equal(
-        zarr.open_group(output, mode="r")["0"][DEFAULT_LABEL_SLICE],
+        open_group(output)["0"][DEFAULT_LABEL_SLICE],
         replacement_YX,
     )
 
@@ -137,7 +137,7 @@ def test_tiled_tiff_streaming_matches_flat_image(tmp_path):
 
     result = convert_image(label_path, levels=2)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
     np.testing.assert_array_equal(
         group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
@@ -158,7 +158,7 @@ def test_striped_tiff_streaming_matches_flat_image(tmp_path):
 
     result = convert_image(label_path, levels=2)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
     np.testing.assert_array_equal(
         group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
@@ -177,7 +177,7 @@ def test_striped_tiff_streaming_covers_common_codecs(tmp_path, compression):
 
     result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
@@ -191,7 +191,7 @@ def test_jpeg_tiff_streams(tmp_path):
 
     result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     # JPEG is lossy, so this is a sanity check on shape/dtype, not exact
     # pixel equality.
     assert group["0"][DEFAULT_LABEL_SLICE].shape == image_YX.shape
@@ -224,7 +224,7 @@ def test_one_row_strip_streams_correctly(tmp_path):
 
     result = convert_image(label_path, levels=2)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
     np.testing.assert_array_equal(
         group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
@@ -247,7 +247,7 @@ def test_every_strip_one_row_streams_correctly(tmp_path):
 
     result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
@@ -272,7 +272,7 @@ def test_tiled_input_streams_regardless_of_page_count_and_codec(tmp_path):
 
     result = convert_image(multipage_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(multipage_path.with_suffix(".zarr"), mode="r")
+    group = open_group(multipage_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(
         group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0]
     )
@@ -286,7 +286,7 @@ def test_tiled_input_streams_regardless_of_page_count_and_codec(tmp_path):
 
     result = convert_image(zstd_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(zstd_path.with_suffix(".zarr"), mode="r")
+    group = open_group(zstd_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
@@ -347,7 +347,7 @@ def test_streaming_decodes_each_source_chunk_exactly_once(
         f"chunks; each chunk must be decoded exactly once"
     )
 
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
@@ -415,7 +415,7 @@ def test_multipage_striped_tiff_converts_page_one_and_warns(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     converted = group["0"][DEFAULT_LABEL_SLICE]
     assert converted.shape == (20, 30), "page count must not become the height"
     np.testing.assert_array_equal(converted, volume_ZYX[0])
@@ -432,7 +432,7 @@ def test_multipage_tiled_tiff_streams_page_one_and_warns(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0])
     assert "has 5 pages; converting page 1 only" in caplog.text
 
@@ -444,7 +444,7 @@ def test_single_page_tiff_conversion_is_unchanged_and_silent(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     assert group["0"][DEFAULT_LABEL_SLICE].shape == (20, 30)
     assert "converting page 1 only" not in caplog.text
 
@@ -466,7 +466,7 @@ def test_pyramid_sub_ifds_are_not_extra_pages(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
-    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    group = open_group(label_path.with_suffix(".zarr"))
     assert group["0"][DEFAULT_LABEL_SLICE].shape == (64, 64)
     assert "converting page 1 only" not in caplog.text
 

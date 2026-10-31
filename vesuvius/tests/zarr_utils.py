@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrWriter, create_group
 
 
 def create_v2_array(
@@ -15,28 +15,9 @@ def create_v2_array(
     shape: tuple[int, ...],
     chunks: tuple[int, ...],
     dtype: Any,
-):
-    """Create a slash-keyed Zarr v2 array with either supported Zarr API."""
-    if hasattr(zarr.Group, "create_array"):
-        return zarr.open_array(
-            str(path),
-            mode="w",
-            shape=shape,
-            chunks=chunks,
-            dtype=dtype,
-            compressor=None,
-            zarr_format=2,
-            dimension_separator="/",
-        )
-    return zarr.open(
-        str(path),
-        mode="w",
-        shape=shape,
-        chunks=chunks,
-        dtype=dtype,
-        compressor=None,
-        dimension_separator="/",
-    )
+) -> ZarrWriter:
+    """Create an uncompressed, slash-keyed Zarr v2 array, replacing anything at ``path``."""
+    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=dtype, compressor=None, separator="/", overwrite=True)
 
 
 def create_v2_group_array(
@@ -46,27 +27,10 @@ def create_v2_group_array(
     shape: tuple[int, ...],
     chunks: tuple[int, ...],
     dtype: Any,
-):
-    """Create a Zarr v2 group and one slash-keyed child array."""
-    if hasattr(zarr.Group, "create_array"):
-        root = zarr.open_group(str(root_path), mode="w", zarr_format=2)
-        return root.create_array(
-            name,
-            shape=shape,
-            chunks=chunks,
-            dtype=dtype,
-            compressor=None,
-            chunk_key_encoding={"name": "v2", "separator": "/"},
-        )
-    root = zarr.open_group(str(root_path), mode="w")
-    return root.create_dataset(
-        name,
-        shape=shape,
-        chunks=chunks,
-        dtype=dtype,
-        compressor=None,
-        dimension_separator="/",
-    )
+) -> ZarrWriter:
+    """Create a Zarr v2 group, replacing anything at ``root_path``, and one child array as in :func:`create_v2_array`."""
+    group = create_group(root_path, overwrite=True)
+    return group.create_array(name, shape=shape, chunks=chunks, dtype=dtype, compressor=None, separator="/")
 
 
 _VOLUME_ROOT = tempfile.TemporaryDirectory(prefix="vesuvius-test-volumes-")

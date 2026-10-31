@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.ink_detection import volume_io
 from vesuvius.ink_detection.volume_io import (
@@ -21,15 +21,9 @@ from vesuvius.ink_detection.volume_io import (
 )
 
 
-_ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-
-
 def _write_pyramid(path: Path, array: np.ndarray) -> None:
-    root = zarr.open_group(path, mode="w")
-    if _ZARR_V3:
-        root.create_array("0", data=array, chunks=(3, 4, 5))
-    else:
-        root.create_dataset("0", data=array, chunks=(3, 4, 5))
+    root = create_group(path, overwrite=True)
+    root.create_array("0", shape=array.shape, chunks=(3, 4, 5), dtype=array.dtype)[...] = array
 
 
 
@@ -105,13 +99,11 @@ def test_public_substring_http_uses_real_backend_without_s3_options(tmp_path):
 
     source_path = tmp_path / "vesuvius-challenge-open-data.zarr"
     expected = np.arange(24, dtype=np.uint16).reshape(2, 3, 4)
-    zarr.open_array(
+    ZarrWriter.create(
         source_path,
-        mode="w",
         shape=expected.shape,
         chunks=expected.shape,
         dtype=expected.dtype,
-        zarr_format=2,
     )[:] = expected
     server = ThreadingHTTPServer(
         ("127.0.0.1", 0),
@@ -138,15 +130,9 @@ def test_public_substring_http_uses_real_backend_without_s3_options(tmp_path):
 
 def test_public_group_keys_include_arrays_and_groups(tmp_path):
     path = tmp_path / "mixed.zarr"
-    kwargs = {"mode": "w"}
-    if _ZARR_V3:
-        kwargs["zarr_format"] = 2
-    root = zarr.open_group(path, **kwargs)
+    root = create_group(path)
     root.create_group("child_group")
-    if _ZARR_V3:
-        root.create_array("child_array", shape=(1,), chunks=(1,), dtype="u1")
-    else:
-        root.create_dataset("child_array", shape=(1,), chunks=(1,), dtype="u1")
+    root.create_array("child_array", shape=(1,), chunks=(1,), dtype="u1")
     reopened = open_volume_root(path)
 
     assert reopened.keys() == ["child_array", "child_group"]

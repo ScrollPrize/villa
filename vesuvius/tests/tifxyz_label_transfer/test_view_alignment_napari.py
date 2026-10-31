@@ -8,6 +8,7 @@ from unittest import mock
 
 import numpy as np
 import tifffile
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.tifxyz_label_transfer import view_alignment_napari as viewer
 
@@ -118,20 +119,13 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
                     np.testing.assert_array_equal(actual, expected)
 
     def test_label_display_prefers_existing_zarr_pyramid(self) -> None:
-        import zarr
-
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "labels.tif"
             path.touch()
-            group_kwargs = {"mode": "w"}
-            if int(zarr.__version__.split(".", 1)[0]) >= 3:
-                group_kwargs["zarr_format"] = 2
-            group = zarr.open_group(
-                str(path.with_suffix(".zarr")), **group_kwargs
-            )
-            create = getattr(group, "create_array", None) or group.create_dataset
-            fine = create("0", shape=(65, 8, 10), dtype="u1")
-            coarse = create("1", shape=(65, 4, 5), dtype="u1")
+            root = path.with_suffix(".zarr")
+            create_group(root, auth=None)
+            fine = ZarrWriter.create(root / "0", shape=(65, 8, 10), chunks=(65, 8, 10), dtype="u1", auth=None)
+            coarse = ZarrWriter.create(root / "1", shape=(65, 4, 5), chunks=(65, 4, 5), dtype="u1", auth=None)
             values = np.arange(20, dtype=np.uint8).reshape(4, 5)
             fine[32] = viewer.resize_nearest(values, (8, 10))
             coarse[32] = values

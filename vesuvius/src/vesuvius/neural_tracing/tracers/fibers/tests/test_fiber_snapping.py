@@ -3,8 +3,7 @@ import json
 
 import numpy as np
 import pytest
-import zarr
-from vc_reader.reader import open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_snapping import SnapConfig, resample, snap_polylines
 
@@ -15,8 +14,7 @@ def tube_volume(path, centre, shape=(48, 48, 96), sigma=.8):
     from scipy.spatial import cKDTree
     z, y, x = np.indices(shape)
     distance = cKDTree(resample(centre, .1)).query(np.c_[x.ravel(), y.ravel(), z.ravel()])[0].reshape(shape)
-    array = zarr.create_array(str(path), shape=shape, chunks=(16, 16, 32), dtype='u1', fill_value=0, zarr_format=2,
-                              compressors=None)
+    array = ZarrWriter.create(path, shape=shape, chunks=(16, 16, 32), dtype='u1', fill_value=0, compressor=None)
     array[:] = (255*np.exp(-.5*(distance/sigma)**2)).astype(np.uint8)
     return open_zarr(path)
 

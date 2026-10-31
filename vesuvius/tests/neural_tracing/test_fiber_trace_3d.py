@@ -15,10 +15,9 @@ import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
-import zarr
 
 from tests.zarr_utils import create_v2_array, zarr_volume
-from vc_reader.reader import ZarrReader
+from vc_reader.reader import ZarrReader, open_zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vc3d_fiber_format import legacy_lasagna_segments
@@ -4093,7 +4092,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, 
         manifest = LasagnaVolume.load(tmp_path / "fiber_out.zarr")
         assert manifest.validity_channel == "presence"
         assert manifest.base_shape_zyx == (8, 8, 8)
-        data = zarr.open_array(str(tmp_path / "fiber_out.zarr/sd0/0"), mode="r")
+        data = open_zarr(tmp_path / "fiber_out.zarr/sd0/0")
         assert data.shape == (3,8,8,8)
         assert data.chunks == (3,4,4,4)
         assert (tmp_path / "fiber_out.zarr/sd0/1/.zarray").exists()
@@ -4104,7 +4103,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, 
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
         channel_level = tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "0"
         assert (channel_level / ".zarray").is_file()
-        data = zarr.open(str(channel_level), mode="r")
+        data = open_zarr(channel_level)
         assert tuple(int(v) for v in data.shape) == (8, 8, 8)
         assert tuple(int(v) for v in data.chunks) == (4, 4, 4)
         assert data.dtype == np.dtype(np.uint8)

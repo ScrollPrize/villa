@@ -11,7 +11,7 @@ import warnings
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import create_group
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
@@ -92,11 +92,8 @@ def _segment(
 
 
 def _write_pyramid(path: Path, array: np.ndarray) -> None:
-    root = zarr.open_group(path, mode="w")
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        root.create_array("0", data=array, chunks=array.shape)
-    else:
-        root.create_dataset("0", data=array, chunks=array.shape)
+    root = create_group(path, overwrite=True)
+    root.create_array("0", shape=array.shape, chunks=array.shape, dtype=array.dtype)[...] = array
 
 
 def test_config_rejects_undefined_subtiling_branch(tmp_path):

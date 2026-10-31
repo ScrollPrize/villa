@@ -6,8 +6,7 @@ import os
 
 import numpy as np
 import pytest
-import zarr
-from vc_reader.reader import create_group
+from vc_reader.reader import create_group, open_group
 
 from vesuvius.structure_tensor.vf_format import require_array, zarr_codec
 
@@ -49,7 +48,7 @@ def test_voxelize_rechunk_keeps_values_and_attributes(tmp_path):
     assert tuple(rechunked.chunks) == (4, 4, 4)
     assert not os.path.exists(path / "zarr.json")
     assert _is_v2_array_dir(str(path / "0"))
-    reopened = zarr.open_group(str(path), mode="r")
+    reopened = open_group(str(path))
     assert list(reopened.keys()) == ["0"]
     np.testing.assert_array_equal(reopened["0"][:], expected)
     assert reopened["0"].attrs["note"] == "kept"
@@ -82,7 +81,7 @@ def test_eigenanalysis_writes_ome_and_eigen_arrays(tmp_path):
         keep_eigen=True,
     )
 
-    out = zarr.open_group(zarr_path, mode="r")
+    out = open_group(zarr_path)
     for name in ("first_component", "second_component", "normal"):
         for axis in ("z", "y", "x"):
             assert tuple(out[f"{name}/{axis}/0"].shape) == (Z, Y, X)

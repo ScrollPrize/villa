@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 import pytest
 import tifffile
-import zarr
+from vc_reader.reader import create_group, open_group
 
 from vesuvius.ink_detection.preprocessing import clean_labels
 from vesuvius.ink_detection.preprocessing import composite_from_zarr
@@ -24,16 +24,9 @@ from vc_reader import tifxyz
 
 
 def _write_group(path: Path, arrays: dict[str, np.ndarray], *, chunks: tuple[int, ...]) -> None:
-    kwargs: dict[str, object] = {"mode": "w"}
-    zarr_v3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-    if zarr_v3:
-        kwargs["zarr_format"] = 2
-    group = zarr.open_group(path, **kwargs)
+    group = create_group(path, overwrite=True)
     for key, array in arrays.items():
-        if zarr_v3:
-            group.create_array(key, data=array, chunks=chunks)
-        else:
-            group.create_dataset(key, data=array, chunks=chunks)
+        group.create_array(key, shape=array.shape, chunks=chunks, dtype=array.dtype)[...] = array
 
 
 def _set_tiny_pillow_limit() -> None:
@@ -334,7 +327,7 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     assert download_required_zarr_chunks.main(args) == 0
     output_path = output_root / "dataset.zarr"
     assert json.loads((output_path / ".zgroup").read_text()) == {"zarr_format": 2}
-    output = zarr.open_group(output_path, mode="r")
+    output = open_group(output_path)
     plan = output.attrs[download_required_zarr_chunks.DOWNLOAD_PLAN_ATTR]
     progress = output.attrs[download_required_zarr_chunks.DOWNLOAD_PROGRESS_ATTR]
     assert plan["source"]["volume_path"] == str(source_path.resolve())
@@ -343,7 +336,7 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     first_export = np.asarray(output["0"])
     assert np.count_nonzero(first_export) > 0
     assert download_required_zarr_chunks.main(args) == 0
-    np.testing.assert_array_equal(zarr.open_group(output_path, mode="r")["0"], first_export)
+    np.testing.assert_array_equal(open_group(output_path)["0"], first_export)
 
     with pytest.raises(ValueError, match="source, chunk plan, array schema"):
         download_required_zarr_chunks.copy_chunks_to_output(
@@ -475,7 +468,7 @@ def test_downloader_records_only_completed_writes_and_resumes_after_failure(
     ):
         with pytest.raises(OSError, match="injected chunk failure"):
             download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
-    progress = zarr.open_group(output_path, mode="r").attrs[
+    progress = open_group(output_path).attrs[
         download_required_zarr_chunks.DOWNLOAD_PROGRESS_ATTR
     ]
     assert progress["completed_chunk_ids_by_scale"] == {"0": [[0, 0, 0]]}
@@ -486,6 +479,6 @@ def test_downloader_records_only_completed_writes_and_resumes_after_failure(
         "existing_counts_by_scale": {0: 1},
     }
     np.testing.assert_array_equal(
-        zarr.open_group(output_path, mode="r")["0"][2:4, 2:4, 2:4],
+        open_group(output_path)["0"][2:4, 2:4, 2:4],
         source[2:4, 2:4, 2:4],
     )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
@@ -35,7 +35,7 @@ def _covers(positions, axis: int, lo: int, hi: int) -> bool:
 @pytest.fixture(scope="module")
 def volume_path(tmp_path_factory) -> str:
     path = tmp_path_factory.mktemp("vcds_bbox") / "vol.zarr"
-    arr = zarr.open(str(path), mode="w", shape=SHAPE, chunks=(64, 64, 64), dtype="u1")
+    arr = ZarrWriter.create(path, shape=SHAPE, chunks=(64, 64, 64), dtype="u1")
     rng = np.random.default_rng(97)
     arr[:] = rng.integers(0, 255, size=SHAPE, dtype=np.uint8)
     return str(path)

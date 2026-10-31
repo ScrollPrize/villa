@@ -12,7 +12,7 @@ import pytest
 import tifffile
 import torch
 from torch import nn
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group
 
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
@@ -56,14 +56,8 @@ def test_temp_accumulation_array_is_explicit_v2(tmp_path):
 
 
 def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog):
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        group = zarr.open_group(
-            tmp_path / "pyramid.zarr", mode="w", zarr_format=2
-        )
-        group.create_array("1", shape=(2, 2), dtype="u1")
-    else:
-        group = zarr.open_group(tmp_path / "pyramid.zarr", mode="w")
-        group.create_dataset("1", shape=(2, 2), dtype="u1")
+    create_group(tmp_path / "pyramid.zarr").create_array("1", shape=(2, 2), chunks=(2, 2), dtype="u1")
+    group = open_group(tmp_path / "pyramid.zarr")
     mask_path = tmp_path / "mask.tif"
     tifffile.imwrite(mask_path, np.ones((2, 3), dtype=np.uint8))
 
@@ -132,22 +126,18 @@ def test_flat_axes_layers_reverse_and_short_depth_padding(tmp_path):
     depth_first_path = tmp_path / "depth-first.zarr"
     depth_last_path = tmp_path / "depth-last.zarr"
     values_ZYX = np.arange(3 * 5 * 7, dtype=np.uint8).reshape(3, 5, 7)
-    first = zarr.open(
+    first = ZarrWriter.create(
         depth_first_path,
-        mode="w",
         shape=values_ZYX.shape,
         chunks=values_ZYX.shape,
         dtype="u1",
-        zarr_format=2,
     )
     first[:] = values_ZYX
-    last = zarr.open(
+    last = ZarrWriter.create(
         depth_last_path,
-        mode="w",
         shape=(5, 7, 3),
         chunks=(5, 7, 3),
         dtype="u1",
-        zarr_format=2,
     )
     last[:] = np.moveaxis(values_ZYX, 0, -1)
     layers = select_layer_indices(
@@ -379,13 +369,11 @@ def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
     checkpoint = tmp_path / "model.pth"
     torch.save({"config": config_mapping, "model": model.state_dict()}, checkpoint)
     input_path = tmp_path / "surface.zarr"
-    array = zarr.open(
+    array = ZarrWriter.create(
         input_path,
-        mode="w",
         shape=(3, 16, 16),
         chunks=(3, 16, 16),
         dtype="u1",
-        zarr_format=2,
     )
     array[:] = 1
     output = tmp_path / "prediction.tif"
@@ -469,13 +457,11 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
     checkpoint = tmp_path / "model.pth"
     torch.save({"config": config_mapping, "model": model.state_dict()}, checkpoint)
     input_path = tmp_path / "surface.zarr"
-    array = zarr.open(
+    array = ZarrWriter.create(
         input_path,
-        mode="w",
         shape=(3, 16, 16),
         chunks=(3, 16, 16),
         dtype="u1",
-        zarr_format=2,
     )
     array[:] = 1
     output = tmp_path / "prediction.tif"
