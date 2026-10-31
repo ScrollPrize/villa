@@ -2073,7 +2073,6 @@ def _make_sparse_corner_normal_sampler(
         path=str(manifest_path),
         device=torch.device(device),
         skip_channels=skip_channels,
-        sparse_prefetch_backend="tensorstore",
     )
     if not getattr(data, "sparse_caches", None):
         raise ValueError(

@@ -3,6 +3,7 @@ import argparse
 from typing import Optional
 
 from vc_reader import images
+from vc_reader.reader import open_zarr
 import numpy as np
 import torch
 import cv2
@@ -73,14 +74,7 @@ def _load_omezarr_z_uint8_norm(
     - `path` must point directly to a zarr array (not a group).
     - array must have exactly 3 dims: (Z,Y,X).
     """
-    try:
-        import zarr  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise ImportError("OME-Zarr loading requires the 'zarr' package") from e
-
-    a = zarr.open(str(path), mode="r")
-    if not hasattr(a, "shape"):
-        raise ValueError(f"OME-Zarr path must point to an array, got non-array: {path}")
+    a = open_zarr(path)
     sh = tuple(int(v) for v in a.shape)
     if len(sh) != 3:
         raise ValueError(f"OME-Zarr array must have shape (Z,Y,X), got {sh} for {path}")

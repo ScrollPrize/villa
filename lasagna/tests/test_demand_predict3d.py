@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, decompress_bytes, open_zarr
 
 from lasagna import tiled_predict3d as tiled
 from lasagna.demand_predict3d import (
@@ -25,7 +25,7 @@ def test_parallel_startup_matches_serial_registration(tmp_path):
     adapter, output = outputs(tmp_path, geometry.shape, 4)
     with DemandStore(tmp_path, {}, geometry, adapter, output):
         pass  # Establish provenance before writing cached fixture payloads.
-    array = zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r+")
+    array = ZarrWriter.open(str(tmp_path / "value.zarr/0"))
     array[0:4] = 23
     array[4:8] = 42
     (tmp_path / "value.zarr/0/1/0/0").write_bytes(b"broken")
@@ -276,8 +276,8 @@ def test_deep_input_window_starts_128_readers_and_preserves_exact_values(tmp_pat
             for index in itertools.product(range(6), repeat=3):
                 control.request(index)
             drain_reverse(control, volume)
-        np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:],
-                                      zarr.open_array(str(control_root / "value.zarr/0"), mode="r")[:])
+        np.testing.assert_array_equal(open_zarr(str(tmp_path / "value.zarr/0"))[:],
+                                      open_zarr(str(control_root / "value.zarr/0"))[:])
 
 
 @pytest.mark.parametrize("slots", [0, -1, 1.5, True])
@@ -336,7 +336,7 @@ def test_gpu_lifetime_restart_retains_cpu_reads_and_exact_output(tmp_path):
                 assert not pool.busy
                 pool.stop_gpu()
                 assert not pool.processes
-        np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:],
+        np.testing.assert_array_equal(open_zarr(str(tmp_path / "value.zarr/0"))[:],
                                       np.full(geometry.shape, 255, np.uint8))
 
 
@@ -396,13 +396,11 @@ def test_demand_late_chunks_reverse_completion_matches_sequential(tmp_path, dtyp
     geometry = DemandGeometry((9, 11, 13), 6 if scale == 1 else 8, 2 if scale == 1 else 4,
                               scale, scale, 4)
     volume = np.random.default_rng(42).integers(0, 256, geometry.shape, dtype=np.uint8)
-    options = {"zarr_format": 2} if int(zarr.__version__.split(".")[0]) >= 3 else {"zarr_version": 2}
-    source = zarr.open_array(str(tmp_path / "input.zarr"), mode="w", shape=geometry.shape,
-                            chunks=(4, 4, 4), dtype="u1", **options)
+    source = ZarrWriter.create(tmp_path / "input.zarr", shape=geometry.shape, chunks=(4, 4, 4), dtype="u1")
     source[:] = volume
     sequential_adapter, sequential_output = outputs(tmp_path / "sequential", geometry.output_shape, geometry.chunk, scale)
     torch.set_num_threads(1)
-    tiled.run_tiled_inference_3d(object(), volume,
+    tiled.run_tiled_inference_3d(object(), open_zarr(tmp_path / "input.zarr"),
         crop_slices=(0, 9, 0, 11, 0, 13), device=torch.device("cpu"),
         model_adapter=sequential_adapter, output_adapter=sequential_output,
         products=sequential_adapter.output_products,
@@ -410,7 +408,7 @@ def test_demand_late_chunks_reverse_completion_matches_sequential(tmp_path, dtyp
         full_output_shapes_zyx={"identity": geometry.output_shape},
         input_zarr_path=str(tmp_path / "input.zarr"),
         output_scaledown_base={"identity": scale}, tile_size=geometry.tile, overlap=geometry.overlap, border=geometry.border,
-        tmp_dir=str(tmp_path), input_reader="python-zarr", flush_workers=0,
+        tmp_dir=str(tmp_path), flush_workers=0,
         accumulator_workers=0, product_accumulator_dtype=dtype)
     root = tmp_path / "demand"
     adapter, output = outputs(root, geometry.output_shape, geometry.chunk, scale)
@@ -438,10 +436,10 @@ def test_demand_late_chunks_reverse_completion_matches_sequential(tmp_path, dtyp
                 dst, src = geometry.intersection(touched, tile)
                 np.add(raw_oracle[dst], values["identity"][(0, *src)], out=raw_oracle[dst], casting="unsafe")
                 np.add(weight_oracle[dst], values["weight"][src], out=weight_oracle[dst])
-        actual = zarr.open_array(str(root / "value.zarr/0"), mode="r")[:]
+        actual = open_zarr(str(root / "value.zarr/0"))[:]
         expected_arrival = np.clip(raw_oracle.astype(np.float32) / np.maximum(weight_oracle, 1e-7) * 255, 0, 255).astype(np.uint8)
         np.testing.assert_array_equal(actual, expected_arrival)
-        expected = zarr.open_array(str(tmp_path / "sequential/value.zarr/0"), mode="r")[:]
+        expected = open_zarr(str(tmp_path / "sequential/value.zarr/0"))[:]
         # Arrival-order additions need not reproduce sequential f16 rounding.
         # This identity fixture bounds the resulting uint8 difference to 1.
         assert np.max(np.abs(actual.astype(int) - expected.astype(int))) <= 1
@@ -477,12 +475,10 @@ def test_direct_atomic_writer_encodes_padded_boundary_chunk_without_zarr_open(tm
         "dimension_separator": "/",
     }
     (level / ".zarray").write_text(json.dumps(metadata), encoding="utf-8")
-    monkeypatch.setattr(tiled.zarr, "open", lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("aligned chunk publication must not open a temporary Zarr array")))
     tiled._atomic_zarr_write(str(root), 0, 4, 4, 4, 5, 5, 5,
                              np.array([[[7]]], dtype=np.uint8), 4)
     payload = (level / "1" / "1" / "1").read_bytes()
-    decoded = tiled.numcodecs.get_codec(metadata["compressor"]).decode(payload)
+    decoded = decompress_bytes(payload, metadata["compressor"], 64)
     values = np.frombuffer(decoded, dtype=np.uint8).reshape(4, 4, 4)
     assert values[0, 0, 0] == 7 and np.count_nonzero(values) == 1
     assert not list(level.rglob(".tmp.*"))
@@ -880,7 +876,7 @@ def test_chunk_major_padded_edge_has_no_budget_and_preserves_values(tmp_path):
     # Preserve the existing fp16 input/accumulator and truncating finalizer,
     # rather than assuming byte-perfect identity through that numerical path.
     expected = np.uint8(np.float32(np.float16(85 / 255)) * 255)
-    np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:], expected)
+    np.testing.assert_array_equal(open_zarr(str(tmp_path / "value.zarr/0"))[:], expected)
 
 
 @pytest.mark.parametrize("profile_pipeline", [False, True])
@@ -924,13 +920,13 @@ def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline, max_b
                 assert len(pool.profile_samples) == pool.stats["tiles"]
                 assert all(s["worker_total_wall_s"] >= 0 and s["coordinator_receive_delay_s"] >= 0
                            for s in pool.profile_samples)
-        values = zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:4, :4, :4]
+        values = open_zarr(str(tmp_path / "value.zarr/0"))[:4, :4, :4]
         control_root = tmp_path / "control"
         control_adapter, control_output = outputs(control_root, geometry.output_shape, geometry.chunk)
         with DemandStore(control_root, {"test": "control"}, geometry, control_adapter, control_output) as control:
             control.request((0, 0, 0))
             drain_reverse(control, volume)
-        expected = zarr.open_array(str(control_root / "value.zarr/0"), mode="r")[:4, :4, :4]
+        expected = open_zarr(str(control_root / "value.zarr/0"))[:4, :4, :4]
         np.testing.assert_array_equal(values, expected)
 
 
@@ -952,7 +948,7 @@ def test_cache_writer_identity_and_corrupt_ready_recovery(tmp_path):
         assert not store.ready(origin)
         assert drain_reverse(store, volume)
         assert store.ready(origin)
-    assert np.all(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:] == 127)
+    assert np.all(open_zarr(str(tmp_path / "value.zarr/0"))[:] == 127)
 
 
 @pytest.mark.parametrize("shape,value", [((4, 4, 4), 0), ((5, 6, 7), 127)])
@@ -992,7 +988,7 @@ def test_legacy_database_is_not_opened_or_deleted(tmp_path):
 def test_unidentified_payloads_are_not_adopted(tmp_path):
     geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
     adapter, output = outputs(tmp_path, geometry.shape, 4)
-    array = zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r+")
+    array = ZarrWriter.open(str(tmp_path / "value.zarr/0"))
     array[:] = 42
     with pytest.raises(ValueError, match="unidentified cache payloads"):
         DemandStore(tmp_path, {}, geometry, adapter, output)
@@ -1091,13 +1087,13 @@ def test_interrupted_sibling_replacement_cannot_reuse_old_generation(tmp_path, m
     with DemandStore(tmp_path, {}, geometry, adapter, output):
         pass
     for name in ("a", "b"):
-        zarr.open_array(str(tmp_path / f"{name}.zarr/0"), mode="r+")[:] = 22
+        ZarrWriter.open(str(tmp_path / f"{name}.zarr/0"))[:] = 22
     a = tmp_path / "a.zarr/0/0/0/0"
     b = tmp_path / "b.zarr/0/0/0/0"
     a.write_bytes(b"corrupt")
     def interrupted(*args, **kwargs):
         assert not a.exists() and not b.exists()
-        zarr.open_array(str(tmp_path / "a.zarr/0"), mode="r+")[:] = 77
+        ZarrWriter.open(str(tmp_path / "a.zarr/0"))[:] = 77
         raise RuntimeError("publication interrupted")
     with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
         origin = store.request((0, 0, 0))
@@ -1113,8 +1109,8 @@ def test_interrupted_sibling_replacement_cannot_reuse_old_generation(tmp_path, m
         assert not store.ready(origin)
         drain_reverse(store, np.full(geometry.shape, 127, np.uint8))
         assert store.ready(origin)
-    assert np.all(zarr.open_array(str(tmp_path / "a.zarr/0"), mode="r")[:] == 127)
-    assert np.all(zarr.open_array(str(tmp_path / "b.zarr/0"), mode="r")[:] == 127)
+    assert np.all(open_zarr(str(tmp_path / "a.zarr/0"))[:] == 127)
+    assert np.all(open_zarr(str(tmp_path / "b.zarr/0"))[:] == 127)
 
 
 def test_store_plans_logical_chunk_without_full_volume_scratch(tmp_path, monkeypatch):
@@ -1327,7 +1323,7 @@ def test_parallel_sources_backpressure_and_publication_readiness(tmp_path, monke
             store = stores[name]
             assert store.ready((2, 2, 2))
             assert all(not e.get("pending") for e in store.chunks.values())
-            actual = zarr.open_array(str(tmp_path / name / "value.zarr/0"), mode="r")[2:4, 2:4, 2:4]
+            actual = open_zarr(str(tmp_path / name / "value.zarr/0"))[2:4, 2:4, 2:4]
             assert np.max(np.abs(actual.astype(int) - value)) <= 1
 
         # A neighboring complete incidental chunk needs publication, not another

@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 from dtypes import numpy_float_hi
 from vc_reader import images
-import zarr
+from vc_reader.reader import ZarrWriter
 from scipy.ndimage import distance_transform_edt, gaussian_filter, maximum_filter
 
 
@@ -438,15 +438,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Write zarr ---------------------------------------------------------
     cs = args.chunk_size
-    arr = zarr.open(
-        str(output_path),
-        mode="w",
-        shape=winding_ds.shape,
-        chunks=(cs, cs, cs),
-        dtype=np.float32,
-        fill_value=0.0,
-        zarr_format=2,
-    )
+    arr = ZarrWriter.create(output_path, shape=winding_ds.shape, chunks=(cs, cs, cs), dtype=np.float32, overwrite=True)
     arr[:] = winding_ds
     arr.attrs["scaledown"] = step
     arr.attrs["n_components"] = N

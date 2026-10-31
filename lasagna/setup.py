@@ -66,30 +66,29 @@ fit_service_requires = [
     "opencv-python-headless>=4.8",
     "scikit-image>=0.21",
     "scipy>=1.10",
-    "tensorstore>=0.1.60",
+    # snap_surf fixtures store N-D tensors with its shaped metadata.
     "tifffile>=2023.7.10",
     "torch>=2.1",
     # Monorepo-only: surfaces and fit artifacts are exchanged through the object
     # store; scripts/bootstrap_venv.py installs the sibling vc_object_store.
     "vc-object-store",
-    "zarr>=3.0,<4",
+    # Monorepo-only until published: Zarr, TIFF and S3.
+    "vc-reader",
 ]
-downloader_requires = ["boto3>=1.28"]
+downloader_requires = ["vc-reader"]
 preprocess_requires = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
     "torch>=2.1",
     "threadpoolctl>=3.1",
-    "zarr>=3.0,<4",
+    "vc-reader",
 ]
 preprocess_3d_requires = [
     *preprocess_requires,
     *downloader_requires,
     "edt>=3.0",
     "numba>=0.58",
-    "tensorstore>=0.1.60",
     "tensorboard>=2.14",
-    "tifffile>=2023.7.10",
     *sibling_dependencies("vesuvius", extra="models"),
 ]
 all_requires = sorted(set(

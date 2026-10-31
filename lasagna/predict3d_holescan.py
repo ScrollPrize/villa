@@ -24,8 +24,12 @@ from typing import Callable, Iterable
 import numpy as np
 from dtypes import numpy_float_hi
 from scipy import ndimage
-import tensorstore as ts
-import zarr
+from vc_reader.reader import ZarrGroup, open_node
+
+try:
+	from omezarr_pyramid import stored_chunks
+except ImportError:
+	from lasagna.omezarr_pyramid import stored_chunks
 
 
 DEFAULT_CHANNELS = ("grad_mag",)
@@ -125,19 +129,15 @@ _WORKER_CHANNEL_INDEX: int | None = None
 _WORKER_STORE = None
 
 
-def _is_zarr_array(obj: object) -> bool:
-	return hasattr(obj, "shape") and hasattr(obj, "dtype")
-
-
-def _open_zarr_array(path: Path):
-	obj = zarr.open(str(path), mode="r")
-	if _is_zarr_array(obj):
+def _open_zarr_array(path: Path, **options):
+	obj = open_node(path, **options)
+	if not isinstance(obj, ZarrGroup):
 		return obj
 	keys = sorted(str(k) for k in obj.keys())
 	numeric = [k for k in keys if k.isdigit()]
 	if numeric:
 		return obj[numeric[0]]
-	if len(keys) == 1 and _is_zarr_array(obj[keys[0]]):
+	if len(keys) == 1 and not isinstance(obj[keys[0]], ZarrGroup):
 		return obj[keys[0]]
 	raise ValueError(f"{path} is a zarr group; pass a concrete array or numeric OME-Zarr level")
 
@@ -191,7 +191,7 @@ def discover_targets(path: Path, *, channels: Iterable[str] | None = None) -> li
 		name = path.parent.name if path.name.isdigit() else path.name
 		return [ScanTarget(name=name, path=path.resolve())]
 	if len(shape) == 4:
-		attrs = dict(getattr(arr, "attrs", {}) or {})
+		attrs = dict(arr.attrs)
 		params = attrs.get("preprocess_params", {}) if isinstance(attrs.get("preprocess_params", {}), dict) else {}
 		names = [str(v) for v in params.get("channels", [])]
 		if len(names) != shape[0]:
@@ -222,35 +222,17 @@ def _target_array(target: ScanTarget):
 	raise ValueError(f"expected 3D or channel-first 4D zarr at {target.path}, got shape={shape}")
 
 
-def _target_spatial_chunks(arr, channel_index: int | None) -> tuple[int, int, int] | None:
-	chunks = tuple(int(v) for v in getattr(arr, "chunks", ()) or ())
-	if channel_index is None:
-		return chunks[:3] if len(chunks) >= 3 else None
-	return chunks[1:4] if len(chunks) >= 4 else None
+def _target_spatial_chunks(arr, channel_index: int | None) -> tuple[int, int, int]:
+	chunks = tuple(int(v) for v in arr.chunks)
+	return chunks[:3] if channel_index is None else chunks[1:4]
 
 
-def _tensorstore_context() -> ts.Context:
-	return ts.Context({
-		"cache_pool": {"total_bytes_limit": 512 << 20},
-		"file_io_concurrency": {"limit": 4},
-		"data_copy_concurrency": {"limit": 1},
-	})
+def _open_for_scan(path: Path):
+	"""The array for one scanning process; the processes read in parallel."""
+	return _open_zarr_array(path, memory_cache=512 << 20, threads=1)
 
 
-def _open_tensorstore_array(path: Path):
-	return ts.open(
-		{
-			"driver": "zarr",
-			"kvstore": {"driver": "file", "path": str(path)},
-		},
-		context=_tensorstore_context(),
-		open=True,
-		read=True,
-		recheck_cached_data="open",
-	).result()
-
-
-def _init_tensorstore_worker(
+def _init_worker(
 	target: ScanTarget,
 	shape: tuple[int, int, int] | None,
 	chunks: tuple[int, int, int] | None,
@@ -261,16 +243,16 @@ def _init_tensorstore_worker(
 	_WORKER_SHAPE = tuple(shape) if shape is not None else target_shape
 	_WORKER_CHUNKS = tuple(chunks) if chunks is not None else None
 	_WORKER_CHANNEL_INDEX = channel_index
-	_WORKER_STORE = _open_tensorstore_array(target.path)
+	_WORKER_STORE = _open_for_scan(target.path)
 
 
 def _worker_store():
 	if _WORKER_STORE is None:
-		raise RuntimeError("TensorStore worker was not initialized")
+		raise RuntimeError("scan worker was not initialized")
 	return _WORKER_STORE
 
 
-def _read_ts_region(
+def _read_region(
 	store,
 	channel_index: int | None,
 	z0: int,
@@ -281,8 +263,8 @@ def _read_ts_region(
 	x1: int,
 ) -> np.ndarray:
 	if channel_index is None:
-		return np.asarray(store[z0:z1, y0:y1, x0:x1].read().result())
-	return np.asarray(store[channel_index, z0:z1, y0:y1, x0:x1].read().result())
+		return store[z0:z1, y0:y1, x0:x1]
+	return store[channel_index, z0:z1, y0:y1, x0:x1]
 
 
 def _count_nonzero_by_z(
@@ -295,7 +277,7 @@ def _count_nonzero_by_z(
 	x0: int,
 	x1: int,
 ) -> np.ndarray:
-	data = _read_ts_region(store, channel_index, z0, z1, y0, y1, x0, x1)
+	data = _read_region(store, channel_index, z0, z1, y0, y1, x0, x1)
 	if data.size == 0:
 		return np.zeros((max(0, z1 - z0),), dtype=np.int64)
 	return np.count_nonzero(data.reshape((data.shape[0], -1)), axis=1).astype(np.int64)
@@ -398,7 +380,7 @@ def _scan_block_job(
 	max_low_density: float,
 ) -> list[HoleFinding]:
 	_arr, _shape, channel_index = _target_array(target)
-	store = _open_tensorstore_array(target.path)
+	store = _open_for_scan(target.path)
 	counts = np.zeros((z_size,), dtype=np.int64)
 	for z0 in range(0, z_size, slab_z):
 		z1 = min(z_size, z0 + slab_z)
@@ -419,7 +401,7 @@ def _scan_block_job(
 
 def _scan_block_worker(args: tuple[int, int, int, int, int, int, int, float, float, float]) -> list[HoleFinding]:
 	if _WORKER_TARGET is None:
-		raise RuntimeError("TensorStore worker was not initialized")
+		raise RuntimeError("scan worker was not initialized")
 	(
 		z_size,
 		y0,
@@ -457,13 +439,10 @@ def _target_blocks(target: ScanTarget, block_yx: int | None, slab_z: int | None)
 	spatial_chunks = _target_spatial_chunks(arr, channel_index)
 	eff_block_yx = block_yx
 	if eff_block_yx is None:
-		if spatial_chunks is not None:
-			eff_block_yx = max(1, max(int(spatial_chunks[1]), int(spatial_chunks[2])))
-		else:
-			eff_block_yx = 128
+		eff_block_yx = max(1, max(int(spatial_chunks[1]), int(spatial_chunks[2])))
 	eff_slab_z = slab_z
 	if eff_slab_z is None:
-		eff_slab_z = max(1, int(spatial_chunks[0]) if spatial_chunks is not None else 32)
+		eff_slab_z = max(1, int(spatial_chunks[0]))
 
 	blocks: list[tuple[int, int, int, int]] = []
 	for y0 in range(0, Y, eff_block_yx):
@@ -501,30 +480,6 @@ def _chunk_bounds(
 	)
 
 
-def _read_zarray_metadata(path: Path) -> dict:
-	with (path / ".zarray").open("r", encoding="utf-8") as handle:
-		return json.load(handle)
-
-
-def _dimension_separator(path: Path) -> str:
-	return str(_read_zarray_metadata(path).get("dimension_separator", "."))
-
-
-def _chunk_key_parts(target: ScanTarget, arr, coord: ChunkCoord) -> tuple[int, ...]:
-	if target.channel_index is None:
-		return coord
-	chunks = tuple(int(v) for v in getattr(arr, "chunks", ()) or ())
-	channel_chunk = max(1, int(chunks[0])) if chunks else 1
-	return (int(target.channel_index) // channel_chunk, *coord)
-
-
-def _chunk_path(target: ScanTarget, arr, coord: ChunkCoord, dimension_separator: str) -> Path:
-	parts = [str(v) for v in _chunk_key_parts(target, arr, coord)]
-	if dimension_separator == "/":
-		return target.path.joinpath(*parts)
-	return target.path / ".".join(parts)
-
-
 def _iter_chunk_coords(grid_shape: tuple[int, int, int]) -> Iterable[ChunkCoord]:
 	for cz in range(grid_shape[0]):
 		for cy in range(grid_shape[1]):
@@ -532,14 +487,12 @@ def _iter_chunk_coords(grid_shape: tuple[int, int, int]) -> Iterable[ChunkCoord]
 				yield (cz, cy, cx)
 
 
-def _stored_chunk_coords(target: ScanTarget, arr, shape: tuple[int, int, int], chunks: tuple[int, int, int]) -> set[ChunkCoord]:
-	sep = _dimension_separator(target.path)
-	grid_shape = _chunk_grid(shape, chunks)
-	return {
-		coord
-		for coord in _iter_chunk_coords(grid_shape)
-		if _chunk_path(target, arr, coord, sep).exists()
-	}
+def _stored_chunk_coords(target: ScanTarget, arr) -> set[ChunkCoord]:
+	"""The spatial chunks stored for the target's channel."""
+	if target.channel_index is None:
+		return stored_chunks(arr.location)
+	channel = int(target.channel_index) // int(arr.chunks[0])
+	return {index[1:] for index in stored_chunks(arr.location) if index[0] == channel}
 
 
 def _read_chunk_data(
@@ -550,7 +503,7 @@ def _read_chunk_data(
 	chunks: tuple[int, int, int],
 ) -> np.ndarray:
 	z0, z1, y0, y1, x0, x1 = _chunk_bounds(coord, shape, chunks)
-	return _read_ts_region(store, channel_index, z0, z1, y0, y1, x0, x1)
+	return _read_region(store, channel_index, z0, z1, y0, y1, x0, x1)
 
 
 def _edge_zero(zero: np.ndarray) -> bool:
@@ -593,7 +546,7 @@ def _analyze_chunk_job(
 	coord: ChunkCoord,
 ) -> ChunkAnalysis:
 	arr, _shape, channel_index = _target_array(target)
-	store = _open_tensorstore_array(target.path)
+	store = _open_for_scan(target.path)
 	data = _read_chunk_data(store, channel_index, coord, shape, chunks)
 	zero = data == 0
 	if not bool(np.any(zero)):
@@ -623,7 +576,7 @@ def _analyze_chunk_job(
 
 def _analyze_chunk_worker(coord: ChunkCoord) -> ChunkAnalysis:
 	if _WORKER_TARGET is None or _WORKER_SHAPE is None or _WORKER_CHUNKS is None:
-		raise RuntimeError("TensorStore worker was not initialized")
+		raise RuntimeError("scan worker was not initialized")
 	data = _read_chunk_data(_worker_store(), _WORKER_CHANNEL_INDEX, coord, _WORKER_SHAPE, _WORKER_CHUNKS)
 	zero = data == 0
 	if not bool(np.any(zero)):
@@ -665,12 +618,9 @@ def _build_flood_filter(
 	progress: ProgressCallback | None = None,
 ) -> FloodFilter:
 	arr, shape, channel_index = _target_array(target)
-	spatial_chunks = _target_spatial_chunks(arr, channel_index)
-	if spatial_chunks is None:
-		spatial_chunks = shape
-	chunks = tuple(max(1, int(v)) for v in spatial_chunks)
+	chunks = _target_spatial_chunks(arr, channel_index)
 	grid_shape = _chunk_grid(shape, chunks)
-	stored = _stored_chunk_coords(target, arr, shape, chunks)
+	stored = _stored_chunk_coords(target, arr)
 	total = len(stored)
 	analyses: dict[ChunkCoord, ChunkAnalysis] = {
 		coord: ChunkAnalysis(coord=coord, status=CHUNK_MISSING)
@@ -688,7 +638,7 @@ def _build_flood_filter(
 		ctx = _process_pool_context()
 		if ctx is not None:
 			kwargs["mp_context"] = ctx
-		kwargs["initializer"] = _init_tensorstore_worker
+		kwargs["initializer"] = _init_worker
 		kwargs["initargs"] = (target, shape, chunks)
 		with ProcessPoolExecutor(max_workers=max(1, int(workers)), **kwargs) as pool:
 			futures = {
@@ -895,7 +845,7 @@ def _build_suspicious_masks(
 	progress: ProgressCallback | None = None,
 ) -> dict[ChunkCoord, np.ndarray]:
 	_arr, _shape, channel_index = _target_array(target)
-	store = _open_tensorstore_array(target.path)
+	store = _open_for_scan(target.path)
 	masks: dict[ChunkCoord, np.ndarray] = {}
 	candidates = [
 		analysis
@@ -1120,7 +1070,7 @@ def scan_target(
 		ctx = _process_pool_context()
 		if ctx is not None:
 			kwargs["mp_context"] = ctx
-		kwargs["initializer"] = _init_tensorstore_worker
+		kwargs["initializer"] = _init_worker
 		kwargs["initargs"] = (target, None, None)
 		with ProcessPoolExecutor(max_workers=max_workers, **kwargs) as pool:
 			futures = {

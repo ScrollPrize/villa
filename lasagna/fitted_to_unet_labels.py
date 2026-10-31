@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 from vc_reader import images
-import zarr
+from vc_reader.reader import open_group
 
 
 def _encode_dir(gx: np.ndarray, gy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -43,7 +43,7 @@ def convert(input_path: str, output_dir: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"[fitted_to_unet_labels] reading {input_path}", flush=True)
-    root = zarr.open(input_path, mode="r")
+    root = open_group(input_path)
     normal = np.array(root["normal"])      # (3, Z, Y, X) float32
     winding = np.array(root["winding"])    # (Z, Y, X) float32
     validity = np.array(root["validity"])  # (Z, Y, X) float32

@@ -17,21 +17,17 @@ import queue
 import shutil
 import sys
 import tempfile
-import threading
 import time
 from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
-import uuid
 
 import numpy as np
-import numcodecs
 import torch
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import ZarrWriteGroup, ZarrWriter, create_group, open_group, open_node, open_zarr
 from lasagna.cooperative_inference import cooperative_signals
 
 try:
 	from omezarr_pyramid import (
-		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -39,7 +35,6 @@ try:
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
-		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -57,11 +52,9 @@ RegionZYX = tuple[int, int, int, int, int, int]
 TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
 DEFAULT_FLUSH_WORKERS = min(64, max(1, os.cpu_count() or 1))
-DEFAULT_INPUT_READER = "tensorstore"
 DEFAULT_PREFETCH_TILES_PER_GPU = 4
 DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
-DEFAULT_INPUT_COPY_THREADS = 4
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
 DEFAULT_OME_COMPRESSOR = "blosc-zstd"
 OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
@@ -442,14 +435,6 @@ class _TileReadSpec:
 	slices_zyx: tuple[slice, slice, slice] | None
 	pad_width_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
 	tile_size: int
-
-
-@dataclass
-class _TensorStoreReadTask:
-	future: Any | None
-	spec: _TileReadSpec
-	submitted_at: float
-	completed_at: float | None = None
 
 
 def resolve_inference_devices(
@@ -837,33 +822,20 @@ def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
 	return t
 
 
-_input_meta_cache: dict[str, tuple[tuple[int, ...], str]] = {}
-
-
-def _get_input_meta(zarr_path: str) -> tuple[tuple[int, ...], str]:
-	"""Read chunk sizes and dimension_separator from a zarr array's .zarray."""
-	if zarr_path in _input_meta_cache:
-		return _input_meta_cache[zarr_path]
-	import json as _json
-	zarray_file = os.path.join(zarr_path, ".zarray")
-	with open(zarray_file) as f:
-		meta = _json.load(f)
-	chunks = tuple(meta["chunks"])
-	sep = meta.get("dimension_separator", ".")
-	_input_meta_cache[zarr_path] = (chunks, sep)
-	return chunks, sep
+_input_writers: dict[str, ZarrWriter] = {}
 
 
 def _input_has_chunks(zarr_path: str, z0: int, z1: int, y0: int, y1: int,
 					  x0: int, x1: int) -> bool:
-	"""Check if any chunk files exist in the zarr array for the given region."""
-	chunks, sep = _get_input_meta(zarr_path)
-	cz, cy, cx = chunks[0], chunks[min(1, len(chunks)-1)], chunks[min(2, len(chunks)-1)]
+	"""Check if any chunks are stored in the zarr array for the given region."""
+	array = _input_writers.get(zarr_path)
+	if array is None:
+		array = _input_writers[zarr_path] = ZarrWriter.open(zarr_path)
+	cz, cy, cx = array.chunks
 	for iz in range(max(0, z0 // cz), (z1 + cz - 1) // cz):
 		for iy in range(max(0, y0 // cy), (y1 + cy - 1) // cy):
 			for ix in range(max(0, x0 // cx), (x1 + cx - 1) // cx):
-				path = _zarr_chunk_path(zarr_path, sep, iz, iy, ix)
-				if os.path.isfile(path):
+				if array.chunk_exists((iz, iy, ix)):
 					return True
 	return False
 
@@ -957,7 +929,7 @@ def _resolve_base_shape(
 ) -> tuple[int, int, int] | None:
 	"""Resolve base_shape_zyx from --base-ref/--base-scale or OME-Zarr level 0."""
 	if base_ref is not None:
-		ref = zarr.open(str(base_ref), mode="r")
+		ref = open_node(str(base_ref))
 		if hasattr(ref, "shape"):
 			sh = tuple(int(v) for v in ref.shape)
 			if len(sh) == 4:
@@ -976,35 +948,19 @@ def _resolve_base_shape(
 		inp = Path(str(input_path).rstrip("/"))
 		group_path = inp.parent if inp.name.isdigit() else inp
 
-		level0_zarray = group_path / "0" / ".zarray"
-		if level0_zarray.is_file():
-			with level0_zarray.open("r", encoding="utf-8") as handle:
-				meta = json.load(handle)
-			sh = tuple(int(v) for v in meta["shape"])
+		try:
+			sh = open_zarr(group_path, level=0).shape
 			if len(sh) == 3:
-				print(f"[predict3d] base shape from level 0 .zarray: {sh}", flush=True)
+				print(f"[predict3d] base shape from level 0 array: {sh}", flush=True)
 				return sh
+		except FileNotFoundError:
+			pass
 
-		zattrs_path = group_path / ".zattrs"
-		if zattrs_path.is_file():
-			with zattrs_path.open("r", encoding="utf-8") as handle:
-				zattrs = json.load(handle)
-			ms = zattrs.get("multiscales", [])
-			if ms:
-				grp = zarr.open_group(str(group_path), mode="r")
-				if "0" in [str(k) for k in grp.keys()]:
-					arr = grp["0"]
-					sh = tuple(int(v) for v in arr.shape)
-					if len(sh) == 3:
-						print(f"[predict3d] base shape from level 0 array: {sh}", flush=True)
-						return sh
-
-		grp = zarr.open_group(str(group_path), mode="r")
-		level_keys = sorted(int(k) for k in grp.keys() if k.isdigit())
+		grp = open_group(group_path)
+		level_keys = sorted(int(k) for k in grp.array_keys() if k.isdigit())
 		if level_keys:
 			finest_lv = level_keys[0]
-			arr = grp[str(finest_lv)]
-			sh = tuple(int(v) for v in arr.shape)
+			sh = grp.array(str(finest_lv)).shape
 			if len(sh) == 3:
 				factor = 2 ** finest_lv
 				base = (sh[0] * factor, sh[1] * factor, sh[2] * factor)
@@ -1018,19 +974,12 @@ def _resolve_base_shape(
 		pass
 	return None
 
-
 def _invalidate_pyramid_chunks(omezarr_path: str, data_level: int, n_levels: int,
 							   iz: int, iy: int, ix: int) -> None:
 	"""Delete coarser pyramid chunks that depend on data chunk (iz, iy, ix)."""
-	sep = _omezarr_dim_sep(omezarr_path, data_level)
 	for lv in range(data_level + 1, n_levels):
 		iz, iy, ix = iz // 2, iy // 2, ix // 2
-		level_path = os.path.join(omezarr_path, str(lv))
-		path = _zarr_chunk_path(level_path, sep, iz, iy, ix)
-		try:
-			os.unlink(path)
-		except FileNotFoundError:
-			pass
+		ZarrWriter.open(os.path.join(omezarr_path, str(lv))).remove_chunk((iz, iy, ix))
 
 
 def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> str:
@@ -1127,120 +1076,53 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 					   z1: int, y1: int, x1: int,
 					   data: np.ndarray, chunk_size: int,
 					   n_levels: int = 0) -> None:
-	"""Write data to a temp zarr level, then atomically rename chunks into the real output.
-	If n_levels > 0, also invalidates coarser pyramid chunks that depend on the written data."""
-	sep = _omezarr_dim_sep(omezarr_path, level)
-	level_path = os.path.join(omezarr_path, str(level))
-	# Fast path for the inference publisher: it always hands us one complete,
-	# aligned logical Zarr chunk.  Encoding that chunk directly preserves the
-	# Zarr-v2 bytes while avoiding a temporary array, metadata copy/open, slice
-	# machinery and recursive cleanup for every channel.
-	zarray_path = os.path.join(level_path, ".zarray")
-	try:
-		with open(zarray_path, encoding="utf-8") as handle:
-			metadata = json.load(handle)
-		chunks = tuple(int(value) for value in metadata["chunks"])
-		dtype = np.dtype(metadata["dtype"])
-		shape = tuple(int(value) for value in metadata["shape"])
-		region_shape = (int(z1-z0), int(y1-y0), int(x1-x0))
-		direct = (
-			metadata.get("zarr_format") == 2
-			and metadata.get("order", "C") == "C"
-			and metadata.get("filters") in (None, [])
-			and len(chunks) == 3
-			and (z0 % chunks[0], y0 % chunks[1], x0 % chunks[2]) == (0, 0, 0)
-			and all(0 < extent <= chunk for extent, chunk in zip(region_shape, chunks))
-			and (z1, y1, x1) == tuple(min(start + chunk, size)
-				for start, chunk, size in zip((z0, y0, x0), chunks, shape))
-			and tuple(np.asarray(data).shape) == region_shape
-		)
-	except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-		direct = False
-	if direct:
-		fill_value = metadata.get("fill_value", 0)
-		if fill_value is None:
-			fill_value = 0
-		chunk = np.full(chunks, fill_value, dtype=dtype)
-		chunk[tuple(slice(0, extent) for extent in region_shape)] = np.asarray(data, dtype=dtype)
-		compressor = metadata.get("compressor")
-		payload = chunk.tobytes(order="C") if compressor is None else numcodecs.get_codec(compressor).encode(chunk)
-		iz, iy, ix = z0 // chunks[0], y0 // chunks[1], x0 // chunks[2]
-		destination = Path(_zarr_chunk_path(level_path, sep, iz, iy, ix))
-		destination.parent.mkdir(parents=True, exist_ok=True)
-		temporary = destination.with_name(
-			f".tmp.{destination.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-		)
-		try:
-			with temporary.open("xb") as handle:
-				handle.write(payload)
-			if n_levels > 0:
-				_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
-			os.replace(temporary, destination)
-		finally:
-			temporary.unlink(missing_ok=True)
-		return
+	"""Replace the chunks the region touches, holding `data` and fill elsewhere.
 
-	out_dir = os.path.dirname(omezarr_path)
-	zarr_name = os.path.basename(omezarr_path)
-	tmp_path = os.path.join(
-		out_dir,
-		f".tmp.{zarr_name}.{level}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}",
-	)
-
-	try:
-		os.makedirs(tmp_path, exist_ok=True)
-		zarray_src = os.path.join(level_path, ".zarray")
-		zarray_dst = os.path.join(tmp_path, ".zarray")
-		if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
-			shutil.copy2(zarray_src, zarray_dst)
-
-		# Persist computed fill chunks too: absence is not durable completion.
-		write_options = ({"config": {"write_empty_chunks": True}}
-			if int(zarr.__version__.split(".")[0]) >= 3 else {"write_empty_chunks": True})
-		tmp_arr = zarr.open(tmp_path, mode="r+", **write_options)
-		tmp_arr[z0:z1, y0:y1, x0:x1] = data
-
-		for cz in range(z0, z1, chunk_size):
-			for cy in range(y0, y1, chunk_size):
-				for cx in range(x0, x1, chunk_size):
-					iz, iy, ix = cz // chunk_size, cy // chunk_size, cx // chunk_size
-					src = _zarr_chunk_path(tmp_path, sep, iz, iy, ix)
-					dst = _zarr_chunk_path(level_path, sep, iz, iy, ix)
-					if os.path.isfile(src):
-						os.makedirs(os.path.dirname(dst), exist_ok=True)
-						if n_levels > 0:
-							_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
-						os.replace(src, dst)
-	finally:
-		_remove_path_quiet(tmp_path)
+	Fill chunks are stored too: absence is not durable completion. If n_levels > 0,
+	also invalidates coarser pyramid chunks that depend on the written data, first."""
+	array = ZarrWriter.open(os.path.join(omezarr_path, str(level)))
+	cz, cy, cx = array.chunks
+	data = np.asarray(data, dtype=array.dtype)
+	for iz in range(z0 // cz, (z1 + cz - 1) // cz):
+		for iy in range(y0 // cy, (y1 + cy - 1) // cy):
+			for ix in range(x0 // cx, (x1 + cx - 1) // cx):
+				chunk = np.full(array.chunks, array.fill_value, dtype=array.dtype)
+				lo = (max(z0, iz * cz), max(y0, iy * cy), max(x0, ix * cx))
+				hi = (min(z1, (iz + 1) * cz), min(y1, (iy + 1) * cy), min(x1, (ix + 1) * cx))
+				origin = (iz * cz, iy * cy, ix * cx)
+				start = (z0, y0, x0)
+				chunk[tuple(slice(a - o, b - o) for a, b, o in zip(lo, hi, origin))] = \
+					data[tuple(slice(a - t, b - t) for a, b, t in zip(lo, hi, start))]
+				if n_levels > 0:
+					_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
+				array.write_chunk((iz, iy, ix), chunk)
 
 
 def _omezarr_dim_sep(omezarr_path: str, level: int) -> str:
-	"""Read dimension_separator from .zarray metadata. Defaults to '.'."""
-	import json as _json
-	zarray_path = os.path.join(omezarr_path, str(level), ".zarray")
+	"""The level's dimension separator. Defaults to '.'."""
 	try:
-		with open(zarray_path) as f:
-			return _json.load(f).get("dimension_separator", ".")
+		return open_zarr(omezarr_path, level=level).meta.separator
 	except Exception:
 		return "."
 
 
-_dim_sep_cache: dict[tuple[str, int], str] = {}
+_chunk_stores: dict[tuple[str, int], ZarrWriter] = {}
 
 
 def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int, chunk_size: int) -> bool:
-	"""Check if an OME-Zarr chunk file exists on disk."""
+	"""Check if an OME-Zarr chunk is stored."""
 	key = (omezarr_path, level)
-	if key not in _dim_sep_cache:
-		_dim_sep_cache[key] = _omezarr_dim_sep(omezarr_path, level)
-	sep = _dim_sep_cache[key]
-	iz, iy, ix = z // chunk_size, y // chunk_size, x // chunk_size
-	if sep == "/":
-		chunk_path = os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix))
-	else:
-		chunk_path = os.path.join(omezarr_path, str(level), f"{iz}{sep}{iy}{sep}{ix}")
-	return os.path.isfile(chunk_path)
+	array = _chunk_stores.get(key)
+	if array is None:
+		try:
+			array = ZarrWriter.open(os.path.join(omezarr_path, str(level)))
+		except RuntimeError:
+			return False
+		_chunk_stores[key] = array
+	try:
+		return array.chunk_exists((z // chunk_size, y // chunk_size, x // chunk_size))
+	except IndexError:
+		return False
 
 
 def _omezarr_chunk_group_complete(
@@ -1570,15 +1452,11 @@ def omezarr_compressor_config(name: str) -> dict[str, Any] | None:
 	)
 
 
-def _omezarr_compressor(name: str) -> numcodecs.abc.Codec | None:
-	config = omezarr_compressor_config(name)
-	return numcodecs.get_codec(config) if config is not None else None
-
-
-def _read_level_compressor_config(path: str | Path, level: int) -> dict[str, Any] | None:
-	with (Path(path) / str(level) / ".zarray").open(encoding="utf-8") as handle:
-		metadata = json.load(handle)
-	return metadata.get("compressor")
+def _writer_codec(config: dict[str, Any] | None) -> dict[str, Any]:
+	"""ZarrWriter.create arguments for a compressor config of omezarr_compressor_config."""
+	if config is None:
+		return {"compressor": None}
+	return {"compressor": config["id"], "cname": config["cname"], "shuffle": config["shuffle"], "level": config["clevel"]}
 
 
 def _create_omezarr(
@@ -1590,41 +1468,19 @@ def _create_omezarr(
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
 	dtype: Any = np.uint8,
-) -> zarr.Group:
+) -> ZarrWriteGroup:
 	"""Create an OME-Zarr group with pyramid level arrays."""
-	codec = _omezarr_compressor(compressor)
-	try:
-		g = zarr.open_group(str(path), mode="w", zarr_format=2)
-	except TypeError:
-		g = zarr.open_group(str(path), mode="w")
+	codec = _writer_codec(omezarr_compressor_config(compressor))
+	g = create_group(path, version=2, overwrite=True)
 	datasets = []
 	for lv in range(first_level, n_levels):
+		_chunk_stores.pop((path, lv), None)
 		sh = _omezarr_level_shape(base_shape_zyx, lv)
-		chunks = (min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk))
-		try:
-			g.create_array(
-				str(lv), shape=sh,
-				chunks=chunks,
-				dtype=dtype, fill_value=0, overwrite=True,
-				compressor=codec,
-				chunk_key_encoding={"name": "v2", "separator": "/"},
-			)
-		except (AttributeError, TypeError):
-			try:
-				g.create_dataset(
-					str(lv), shape=sh,
-					chunks=chunks,
-					dtype=dtype, fill_value=0, overwrite=True,
-					compressor=codec,
-					dimension_separator="/",
-				)
-			except TypeError:
-				g.create_dataset(
-					str(lv), shape=sh,
-					chunks=chunks,
-					dtype=dtype, fill_value=0, overwrite=True,
-					compressor=codec,
-				)
+		g.create_array(
+			str(lv), shape=sh,
+			chunks=(min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk)),
+			dtype=dtype, fill_value=0, overwrite=True, separator="/", **codec,
+		)
 		datasets.append({
 			"path": str(lv),
 			"coordinateTransformations": [{"type": "scale", "scale": [float(2 ** lv)] * 3}],
@@ -1652,32 +1508,27 @@ def _open_or_create_omezarr(
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
 	dtype: Any = np.uint8,
-) -> zarr.Group:
+) -> ZarrWriteGroup:
 	"""Open existing OME-Zarr group or create a new one."""
 	if os.path.exists(path):
 		try:
-			g = zarr.open_group(str(path), mode="r+")
+			existing = open_group(path)
 			expected = _omezarr_level_shape(base_shape_zyx, first_level)
-			arr = g[str(first_level)]
+			arr = existing[str(first_level)]
 			if np.dtype(arr.dtype) != np.dtype(dtype):
 				raise ValueError(f"{path} dtype {arr.dtype} does not match requested {np.dtype(dtype)}")
 			if tuple(int(v) for v in arr.shape) == expected:
-				import json as _json
-				zarray_path = os.path.join(path, str(first_level), ".zarray")
-				if os.path.isfile(zarray_path):
-					with open(zarray_path) as f:
-						meta = _json.load(f)
-					zfmt = meta.get("zarr_format", None)
-					if zfmt != 2:
-						raise ValueError(
-							f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
-							"Delete and re-create the output."
-						)
+				zfmt = arr.meta.raw.get("zarr_format", None)
+				if zfmt != 2:
+					raise ValueError(
+						f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
+						"Delete and re-create the output."
+					)
 				requested = omezarr_compressor_config(compressor)
 				actual_by_level = {
-					int(level): _read_level_compressor_config(path, int(level))
+					int(level): existing.array(str(level)).compressor
 					for level in range(int(first_level), int(n_levels))
-					if (Path(path) / str(level) / ".zarray").is_file()
+					if str(level) in existing
 				}
 				mismatched = {
 					level: actual for level, actual in actual_by_level.items()
@@ -1692,7 +1543,7 @@ def _open_or_create_omezarr(
 					)
 				print(f"[predict3d] reusing existing {os.path.basename(path)} "
 					  f"(level {first_level} shape={expected})", flush=True)
-				return g
+				return create_group(path, version=2)
 		except (KeyError, ValueError):
 			raise
 		except Exception:
@@ -1712,9 +1563,9 @@ def create_product_omezarr_groups(
 	n_levels: int,
 	ome_chunk: int,
 	ome_compressor: str = DEFAULT_OME_COMPRESSOR,
-) -> dict[str, zarr.Group]:
+) -> dict[str, ZarrWriteGroup]:
 	"""Create or open per-channel OME-Zarr groups for product specs."""
-	groups: dict[str, zarr.Group] = {}
+	groups: dict[str, ZarrWriteGroup] = {}
 	for product in products:
 		for channel in product.channels:
 			path = OmeZarrOutputAdapter.channel_path(channel)
@@ -1882,8 +1733,7 @@ def _find_resume_z(omezarr_path: str, level: int) -> int:
 	if not os.path.exists(omezarr_path):
 		return 0
 	try:
-		g = zarr.open_group(str(omezarr_path), mode="r")
-		arr = g[str(level)]
+		arr = open_zarr(omezarr_path, level=level)
 		z_total = int(arr.shape[0])
 		if z_total == 0:
 			return 0
@@ -2267,65 +2117,6 @@ def _input_tile_to_device(tile_np: np.ndarray, device: torch.device) -> torch.Te
 	return compact.to(torch.float32).div_(255.0)
 
 
-class _TensorStoreTileReader:
-	"""Bounded asynchronous local Zarr-v2 bounding-box reader."""
-
-	def __init__(
-		self, path: str, *, cache_bytes: int, file_io_threads: int,
-		data_copy_threads: int,
-	) -> None:
-		level_path = Path(str(path).rstrip("/"))
-		if not (level_path / ".zarray").is_file():
-			raise ValueError(
-				"TensorStore inference input must be a local Zarr-v2 array path "
-				f"containing .zarray, got: {path}"
-			)
-		try:
-			from tensorstore_omezarr import TensorStoreConfig, open_tensorstore, tensorstore_context
-		except ImportError:
-			from lasagna.tensorstore_omezarr import TensorStoreConfig, open_tensorstore, tensorstore_context
-		cfg = TensorStoreConfig(
-			cache_pool_bytes=int(cache_bytes), file_io_threads=int(file_io_threads),
-			data_copy_threads=int(data_copy_threads),
-		)
-		self.context = tensorstore_context(cfg)
-		self.store = open_tensorstore(level_path, self.context, read=True, write=False)
-
-	def submit(
-		self, *, volume_shape: tuple[int, int, int], crop_offset: tuple[int, int, int],
-		coord: TileOriginZYX, tile_size: int, border: int, profile: bool = False,
-	) -> _TensorStoreReadTask:
-		spec = _tile_read_spec(volume_shape, crop_offset, *coord, tile_size, border)
-		future = None if spec.slices_zyx is None else self.store[spec.slices_zyx].read()
-		task = _TensorStoreReadTask(future=future, spec=spec, submitted_at=time.perf_counter())
-		if profile:
-			if future is None:
-				task.completed_at = task.submitted_at
-			else:
-				future.add_done_callback(lambda _future: setattr(task, "completed_at", time.perf_counter()))
-		return task
-
-	@staticmethod
-	def done(task: _TensorStoreReadTask) -> bool:
-		return task.future is None or bool(task.future.done())
-
-	@staticmethod
-	def result(task: _TensorStoreReadTask) -> tuple[np.ndarray, float]:
-		raw = None if task.future is None else task.future.result()
-		return _finalize_tile_read(raw, task.spec), time.perf_counter() - task.submitted_at
-
-	@staticmethod
-	def cancel(tasks: Iterable[_TensorStoreReadTask]) -> None:
-		pending = tuple(task for task in tasks if task.future is not None)
-		for task in pending:
-			task.future.cancel()
-		for task in pending:
-			try:
-				task.future.result()
-			except BaseException:
-				pass
-
-
 @dataclass(frozen=True)
 class _SharedArrayLayout:
 	name: str
@@ -2468,7 +2259,6 @@ def _limit_native_worker_threads():
 		"NUMEXPR_NUM_THREADS", "BLOSC_NTHREADS",
 	):
 		os.environ[name] = "1"
-	_limit_zarr_codec_threads()
 	try:
 		torch.set_num_threads(1)
 		torch.set_num_interop_threads(1)
@@ -3240,11 +3030,7 @@ def run_tiled_inference_3d(
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
 	flush_workers: int = 0,
-	input_reader: str = "python-zarr",
 	prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
-	input_cache_bytes: int = DEFAULT_INPUT_CACHE_BYTES,
-	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
-	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str | np.dtype = "float16",
 	accumulator_workers: int = 0,
@@ -3276,25 +3062,14 @@ def run_tiled_inference_3d(
 		raise ValueError("flush_workers must be >= 0")
 	if int(accumulator_workers) < 0:
 		raise ValueError("accumulator_workers must be >= 0")
-	input_reader = str(input_reader).strip().lower()
-	if input_reader not in {"tensorstore", "python-zarr"}:
-		raise ValueError("input_reader must be 'tensorstore' or 'python-zarr'")
 	if int(prefetch_tiles_per_gpu) <= 0:
 		raise ValueError("prefetch_tiles_per_gpu must be > 0")
-	if int(input_cache_bytes) < 0:
-		raise ValueError("input_cache_bytes must be >= 0")
-	if int(input_io_threads) <= 0:
-		raise ValueError("input_io_threads must be > 0")
-	if int(input_copy_threads) <= 0:
-		raise ValueError("input_copy_threads must be > 0")
 	product_accumulator_dtype = np.dtype(product_accumulator_dtype)
 	if product_accumulator_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
 		raise ValueError(
 			"product_accumulator_dtype must be float16 or float32, "
 			f"got {product_accumulator_dtype}"
 		)
-	if input_reader == "tensorstore" and input_zarr_path is None:
-		raise ValueError("TensorStore input requires input_zarr_path")
 	if live_cache is not None:
 		if input_zarr_path is None:
 			raise ValueError("live cache requires input_zarr_path")
@@ -3431,8 +3206,7 @@ def run_tiled_inference_3d(
 	if input_zarr_path is not None:
 		input_dir = str(Path(str(input_zarr_path).rstrip("/")).resolve())
 	else:
-		store_path = getattr(getattr(zarr_arr, "store", None), "path", None)
-		input_dir = str(Path(str(store_path or ".")).resolve())
+		input_dir = str(Path(str(getattr(zarr_arr, "location", "."))).resolve())
 
 	def _chunk_supported(sd: int, g: dict[str, Any], origin: ChunkOriginZYX) -> bool:
 		"""Whether the output chunk's own selected-input footprint has storage.
@@ -4039,26 +3813,26 @@ def run_tiled_inference_3d(
 					if progress is not None:
 						progress["live_cache"] = live_cache.snapshot()
 
+		def _read_coord(coord: TileOriginZYX) -> tuple[np.ndarray, float]:
+			started = time.perf_counter()
+			arr = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), *coord, tile_size, pad)
+			return arr, time.perf_counter() - started
+
 		if not parallel:
 			_start_flush_workers()
 			assert w_full is not None and w_native is not None and w_by_scale is not None
-			serial_reader = None
 			serial_pending: deque[dict[str, Any]] = deque()
 			serial_source = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
 			serial_source_done = False
 			serial_read_sum = 0.0
 			serial_read_bytes = 0
 			serial_ready_highwater = 0
-			if input_reader == "tensorstore":
-				serial_reader = _TensorStoreTileReader(
-					str(input_zarr_path), cache_bytes=int(input_cache_bytes),
-					file_io_threads=int(input_io_threads), data_copy_threads=int(input_copy_threads),
-				)
-				print(
-					f"[predict3d] input reader=tensorstore prefetch_window={int(prefetch_tiles_per_gpu)} "
-					f"cache={int(input_cache_bytes)/1024**3:.2f}GiB io_threads={int(input_io_threads)} "
-					f"copy_threads={int(input_copy_threads)}", flush=True,
-				)
+			serial_executor = ThreadPoolExecutor(
+				max_workers=int(prefetch_tiles_per_gpu), thread_name_prefix="predict3d-read",
+			)
+
+			def _submit_serial_read(coord: TileOriginZYX) -> Future:
+				return serial_executor.submit(_read_coord, coord)
 
 			def _next_serial_event() -> dict[str, Any] | None:
 				nonlocal serial_source_done, serial_ready_highwater
@@ -4103,14 +3877,7 @@ def run_tiled_inference_3d(
 							break
 						if pending_event.get("status") != "awaiting_read":
 							continue
-						if serial_reader is None:
-							pending_event["status"] = "ready"
-							continue
-						tz, ty, tx = pending_event["coord"]
-						pending_event["read_task"] = serial_reader.submit(
-							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
-							tile_size=tile_size, border=pad,
-						)
+						pending_event["read_task"] = _submit_serial_read(pending_event["coord"])
 						pending_event["status"] = "reading"
 						active_reads += 1
 					if not serial_pending:
@@ -4119,38 +3886,17 @@ def run_tiled_inference_3d(
 					if head["status"] == "fetching":
 						finish_materialization(head, block=True)
 					if head["status"] == "awaiting_read":
-						if serial_reader is None:
-							head["status"] = "ready"
-						else:
-							tz, ty, tx = head["coord"]
-							head["read_task"] = serial_reader.submit(
-								volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
-								tile_size=tile_size, border=pad,
-							)
-							head["status"] = "reading"
+						head["read_task"] = _submit_serial_read(head["coord"])
+						head["status"] = "reading"
 					serial_ready_highwater = max(
 						serial_ready_highwater,
 						sum(
 							1 for pending_event in serial_pending
 							if pending_event.get("status") == "reading"
-							and serial_reader is not None
-							and serial_reader.done(pending_event["read_task"])
+							and pending_event["read_task"].done()
 						),
 					)
 					return serial_pending.popleft()
-				if serial_reader is None:
-					try:
-						tz, ty, tx, row_end, next_tz = next(serial_source)
-					except StopIteration:
-						return None
-					needed, skip_reason = _tile_work(tz, ty, tx)
-					tile_np = None if not needed else _read_tile_zarr(
-						zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
-					)
-					return dict(
-						coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
-						needed=needed, skip_reason=skip_reason, tile=tile_np,
-					)
 				while not serial_source_done and len(serial_pending) < int(prefetch_tiles_per_gpu):
 					try:
 						tz, ty, tx, row_end, next_tz = next(serial_source)
@@ -4163,14 +3909,11 @@ def run_tiled_inference_3d(
 						needed=needed, skip_reason=skip_reason,
 					)
 					if needed:
-						event["read_task"] = serial_reader.submit(
-							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
-							tile_size=tile_size, border=pad,
-						)
+						event["read_task"] = _submit_serial_read((tz, ty, tx))
 					serial_pending.append(event)
 				serial_ready_highwater = max(
 					serial_ready_highwater,
-					sum(1 for event in serial_pending if event.get("read_task") is not None and serial_reader.done(event["read_task"])),
+					sum(1 for event in serial_pending if event.get("read_task") is not None and event["read_task"].done()),
 				)
 				return serial_pending.popleft() if serial_pending else None
 
@@ -4189,17 +3932,9 @@ def run_tiled_inference_3d(
 						)
 						continue
 					tile_t0 = time.time()
-					if serial_reader is None:
-						if live_cache is not None:
-							tile_np = _read_tile_zarr(
-								zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
-							)
-						else:
-							tile_np = event["tile"]
-					else:
-						tile_np, read_elapsed = serial_reader.result(event["read_task"])
-						serial_read_sum += float(read_elapsed)
-						serial_read_bytes += int(tile_np.nbytes)
+					tile_np, read_elapsed = event["read_task"].result()
+					serial_read_sum += float(read_elapsed)
+					serial_read_bytes += int(tile_np.nbytes)
 					tile = _input_tile_to_device(tile_np, device)
 					preprocess = getattr(model_adapter, "preprocess_tile", None)
 					if preprocess is not None:
@@ -4237,20 +3972,16 @@ def run_tiled_inference_3d(
 						_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
 					_record_commit(was_processed=True, elapsed=time.time() - tile_t0, row_end=row_end, next_tz=next_tz)
 			finally:
-				if serial_reader is not None:
-					serial_reader.cancel(
-						event["read_task"] for event in serial_pending if event.get("read_task") is not None
-					)
+				serial_executor.shutdown(wait=True, cancel_futures=True)
 				for pending_event in serial_pending:
 					cache_task = pending_event.get("cache_task")
 					if cache_task is not None:
 						cache_task.cancel()
-			if serial_reader is not None:
-				print(
-					f"[predict3d] input stats backend=tensorstore reads={processed} "
-					f"bytes={serial_read_bytes} read_sum={serial_read_sum:.2f}s "
-					f"ready_highwater={serial_ready_highwater}", flush=True,
-				)
+			print(
+				f"[predict3d] input stats reads={processed} "
+				f"bytes={serial_read_bytes} read_sum={serial_read_sum:.2f}s "
+				f"ready_highwater={serial_ready_highwater}", flush=True,
+			)
 		else:
 			_slot_count = len(resolved_devices) * int(slots_per_gpu)
 			_prefetch_window = len(resolved_devices) * int(prefetch_tiles_per_gpu)
@@ -4366,49 +4097,10 @@ def run_tiled_inference_3d(
 					f"[predict3d] accumulator processes={len(accum_processes)} "
 					f"queue_depth=2 native_threads_per_worker=1 backend={backend}", flush=True,
 				)
-			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else min(_slot_count, max(1, len(resolved_devices) * 2))
-			executor = None
-			tensorstore_reader = None
-			try:
-				if input_reader == "tensorstore":
-					tensorstore_reader = _TensorStoreTileReader(
-						str(input_zarr_path), cache_bytes=int(input_cache_bytes),
-						file_io_threads=int(input_io_threads), data_copy_threads=int(input_copy_threads),
-					)
-				else:
-					executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
-			except BaseException:
-				for task_queue in accum_queues:
-					try:
-						task_queue.put_nowait(None)
-					except queue.Full:
-						pass
-				for process in accum_processes:
-					process.join(timeout=5.0)
-					if process.is_alive():
-						process.terminate()
-						process.join(timeout=5.0)
-				for work_queue in work_queues:
-					try:
-						work_queue.put_nowait(None)
-					except queue.Full:
-						pass
-				for worker in workers:
-					if worker is None:
-						continue
-					worker.join(timeout=5.0)
-					if worker.is_alive():
-						worker.terminate()
-						worker.join(timeout=5.0)
-				for shm in input_shms + result_shms:
-					shm.close()
-					shm.unlink()
-				raise
+			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else _prefetch_window
+			executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
 			print(
-				f"[predict3d] input reader={input_reader} prefetch_window={_prefetch_window} "
-				f"cache={int(input_cache_bytes)/1024**3:.2f}GiB io_threads={int(input_io_threads)} "
-				f"copy_threads={int(input_copy_threads)}"
-				+ (f" fallback_threads={reader_count}" if input_reader == "python-zarr" else ""), flush=True,
+				f"[predict3d] input prefetch_window={_prefetch_window} read_threads={reader_count}", flush=True,
 			)
 			free_inputs = list(range(_slot_count - 1, -1, -1))
 			free_results = list(range(_slot_count - 1, -1, -1))
@@ -4461,35 +4153,21 @@ def run_tiled_inference_3d(
 					"worker_stage_max": [dict() for _ in workers],
 				}
 
-			def _read_coord(coord: TileOriginZYX) -> tuple[np.ndarray, float]:
-				started = time.perf_counter()
-				arr = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), *coord, tile_size, pad)
-				return arr, time.perf_counter() - started
-
 			def _submit_read(seq: int, event: dict[str, Any]) -> None:
 				"""Submit one materialized tile to the unchanged bounded reader stage."""
 				nonlocal read_submitted
 				tz, ty, tx = event["coord"]
 				event["status"] = "reading"
-				if tensorstore_reader is not None:
-					task = tensorstore_reader.submit(
-						volume_shape=volume_shape, crop_offset=(z0, y0, x0),
-						coord=(tz, ty, tx), tile_size=tile_size, border=pad,
-						profile=bool(profile_pipeline),
-					)
-					event["read_task"] = task
-					futures[id(task)] = int(seq)
-				else:
-					event["read_submitted_at"] = time.perf_counter()
-					future = executor.submit(_read_coord, (tz, ty, tx))
-					if profile_pipeline:
-						future.add_done_callback(
-							lambda _future, current=event: current.__setitem__(
-								"read_completed_at", time.perf_counter(),
-							)
+				event["read_submitted_at"] = time.perf_counter()
+				future = executor.submit(_read_coord, (tz, ty, tx))
+				if profile_pipeline:
+					future.add_done_callback(
+						lambda _future, current=event: current.__setitem__(
+							"read_completed_at", time.perf_counter(),
 						)
-					event["read_task"] = future
-					futures[future] = int(seq)
+					)
+				event["read_task"] = future
+				futures[future] = int(seq)
 				read_submitted += 1
 
 			def _handle_gpu_message(message: tuple[Any, ...]) -> None:
@@ -4858,18 +4536,12 @@ def run_tiled_inference_3d(
 					for future_key, seq in list(futures.items()):
 						event = events[seq]
 						task = event["read_task"]
-						is_done = tensorstore_reader.done(task) if tensorstore_reader is not None else task.done()
-						if not is_done:
+						if not task.done():
 							continue
 						del futures[future_key]
-						if tensorstore_reader is not None:
-							arr, elapsed = tensorstore_reader.result(task)
-							submitted_at = task.submitted_at
-							completed_at = task.completed_at
-						else:
-							arr, elapsed = task.result()
-							submitted_at = event.get("read_submitted_at")
-							completed_at = event.get("read_completed_at")
+						arr, elapsed = task.result()
+						submitted_at = event.get("read_submitted_at")
+						completed_at = event.get("read_completed_at")
 						collected_at = time.perf_counter()
 						if pipeline_profile is not None and submitted_at is not None:
 							completed_at = collected_at if completed_at is None else float(completed_at)
@@ -5100,7 +4772,7 @@ def run_tiled_inference_3d(
 					flush=True,
 				)
 				print(
-					f"[predict3d] multi-device stats input_backend={input_reader} "
+					f"[predict3d] multi-device stats "
 					f"reads={read_completed}/{read_submitted} read_bytes={read_bytes} read_sum={read_time:.1f}s "
 					f"ready_highwater={read_ready_highwater} live_highwater={read_live_highwater} "
 					f"copy_sum={input_copy_time:.1f}s input_starve={input_starve_time:.1f}s "
@@ -5154,13 +4826,7 @@ def run_tiled_inference_3d(
 					cache_task = event.get("cache_task")
 					if cache_task is not None:
 						cache_task.cancel()
-				if tensorstore_reader is not None:
-					tensorstore_reader.cancel(
-						event["read_task"] for event in events.values()
-						if event.get("status") == "reading" and event.get("read_task") is not None
-					)
-				if executor is not None:
-					executor.shutdown(wait=True, cancel_futures=True)
+				executor.shutdown(wait=True, cancel_futures=True)
 				for task_queue in accum_queues:
 					try:
 						task_queue.put_nowait(None)

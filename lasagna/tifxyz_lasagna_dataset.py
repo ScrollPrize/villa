@@ -19,10 +19,10 @@ import torch
 from torch.utils.data import Dataset
 
 from vc_reader import tifxyz
+from vc_reader.errors import CacheMissError
 from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
-    OfflineCacheMiss,
     open_zarr,
     open_zarr_group,
     _compute_wrap_order_stats,
@@ -462,7 +462,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
     target_size = tuple(int(v) for v in patch_size_zyx)
 
     patches = []
-    volume_groups = {}  # {dataset_idx: zarr.Group} for multi-scale CT reads
+    volume_groups = {}  # {dataset_idx: ZarrGroup} for multi-scale CT reads
     for dataset_idx, dataset in enumerate(config["datasets"]):
         volume_path = dataset.get("volume_path")
         if volume_path is None:
@@ -715,7 +715,7 @@ class TifxyzLasagnaDataset(Dataset):
         # and dev runs where we want to train against pre-cached data without
         # any network access. open_zarr() has already configured the store in
         # offline mode (volume_cache_offline=True), so any cache miss raises
-        # OfflineCacheMiss instead of fetching.
+        # CacheMissError instead of fetching.
         if bool(config.get("volume_cache_offline", False)):
             self.patches = self._filter_to_cached_patches(self.patches)
             print(f"{TAG} offline filter: {len(self.patches)} patches with full local cache")
@@ -765,7 +765,7 @@ class TifxyzLasagnaDataset(Dataset):
                     min_corner=min_corner, max_corner=max_corner,
                     image_normalization="unit",
                 )
-            except OfflineCacheMiss:
+            except CacheMissError:
                 dropped += 1
                 continue
             kept.append(patch)
@@ -976,7 +976,7 @@ class TifxyzLasagnaDataset(Dataset):
         try:
             return self._getitem_impl(idx)
         except (PermissionError, OSError, ConnectionError,
-                TimeoutError, OfflineCacheMiss) as e:
+                TimeoutError, CacheMissError) as e:
             # Transient zarr/S3 read errors (expired token, network
             # hiccup, stale credential, missing cache chunk). Return
             # None → collate_variable_surfaces filters it, and the

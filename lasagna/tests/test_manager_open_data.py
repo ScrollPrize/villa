@@ -39,11 +39,6 @@ class FakeStore:
         self.objects.pop(key, None)
 
 
-class FakeS3Client:
-    def upload_file(self, *_args) -> None:
-        raise AssertionError("bulk upload must use rclone")
-
-
 def test_s3_bulk_upload_uses_configured_rclone_params(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,7 +55,7 @@ def test_s3_bulk_upload_uses_configured_rclone_params(
 
     monkeypatch.setattr("lasagna.manager.open_data.subprocess.run", fake_run)
     store = S3ObjectStore(
-        "stage", client=FakeS3Client(),
+        "stage",
         rclone_params=("--transfers", "512", "--buffer-size", "2M"),
     )
     store.put_files(

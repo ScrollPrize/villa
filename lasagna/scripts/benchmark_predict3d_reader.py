@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare predict3d Python-Zarr and TensorStore bbox read windows."""
+"""Measure predict3d bbox read windows through a vc_reader array."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ import sys
 import time
 
 import numpy as np
-import zarr
+from vc_reader.reader import open_zarr
 
 LASAGNA_ROOT = Path(__file__).resolve().parents[1]
 if str(LASAGNA_ROOT) not in sys.path:
 	sys.path.insert(0, str(LASAGNA_ROOT))
 
-from tiled_predict3d import _TensorStoreTileReader, _read_tile_zarr
+from tiled_predict3d import _read_tile_zarr
 
 
 def _coords(origin: tuple[int, int, int], count: int, stride: int):
@@ -47,54 +47,37 @@ def main(argv: list[str] | None = None) -> int:
 	p.add_argument("--tiles", type=int, default=32)
 	p.add_argument("--warmups", type=int, default=1)
 	p.add_argument("--iterations", type=int, default=3)
-	p.add_argument("--zarr-threads", type=int, default=16)
+	p.add_argument("--window", type=int, default=8, help="Tile reads at once")
 	p.add_argument("--cache-gib", type=float, default=4.0)
-	p.add_argument("--io-threads", type=int, default=16)
-	p.add_argument("--copy-threads", type=int, default=4)
+	p.add_argument("--threads", type=int, default=16)
 	args = p.parse_args(argv)
-	arr = zarr.open(args.input, mode="r")
+	arr = open_zarr(args.input, memory_cache=int(args.cache_gib * (1 << 30)), threads=args.threads)
 	shape = tuple(int(v) for v in arr.shape)
 	coords = _coords(tuple(args.origin_zyx), int(args.tiles), int(args.stride))
-	ts_reader = _TensorStoreTileReader(
-		args.input, cache_bytes=int(args.cache_gib * (1 << 30)),
-		file_io_threads=args.io_threads, data_copy_threads=args.copy_threads,
-	)
 
-	def run_zarr() -> int:
-		with ThreadPoolExecutor(max_workers=args.zarr_threads) as pool:
+	def run() -> int:
+		with ThreadPoolExecutor(max_workers=args.window) as pool:
 			arrays = tuple(pool.map(
 				lambda coord: _read_tile_zarr(arr, shape, (0, 0, 0), *coord, args.tile_size, 0),
 				coords,
 			))
 		return sum(value.nbytes for value in arrays)
 
-	def run_tensorstore() -> int:
-		tasks = tuple(ts_reader.submit(
-			volume_shape=shape, crop_offset=(0, 0, 0), coord=coord,
-			tile_size=args.tile_size, border=0,
-		) for coord in coords)
-		arrays = tuple(ts_reader.result(task)[0] for task in tasks)
-		return sum(value.nbytes for value in arrays)
-
 	print(
-		f"input={args.input} shape={shape} chunks={tuple(int(v) for v in arr.chunks)} "
+		f"input={args.input} shape={shape} chunks={arr.chunks} "
 		f"dtype={arr.dtype} tile={args.tile_size} stride={args.stride} tiles={args.tiles} "
 		f"warmups={args.warmups} iterations={args.iterations}", flush=True,
 	)
-	for name, runner in (("python-zarr", run_zarr), ("tensorstore", run_tensorstore)):
-		timings = []
-		byte_count = 0
-		for iteration in range(args.warmups + args.iterations):
-			started = time.perf_counter()
-			byte_count = runner()
-			elapsed = time.perf_counter() - started
-			if iteration >= args.warmups:
-				timings.append(elapsed)
-		gib = byte_count / float(1 << 30)
-		print(
-			f"{name}: {_summary(timings)} throughput_mean={gib/statistics.mean(timings):.2f}GiB/s",
-			flush=True,
-		)
+	timings = []
+	byte_count = 0
+	for iteration in range(args.warmups + args.iterations):
+		started = time.perf_counter()
+		byte_count = run()
+		elapsed = time.perf_counter() - started
+		if iteration >= args.warmups:
+			timings.append(elapsed)
+	gib = byte_count / float(1 << 30)
+	print(f"{_summary(timings)} throughput_mean={gib/statistics.mean(timings):.2f}GiB/s", flush=True)
 	return 0
 
 

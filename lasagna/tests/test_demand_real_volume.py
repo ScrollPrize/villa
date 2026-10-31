@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import open_zarr
 
 from lasagna import tiled_predict3d as tiled
 from lasagna.demand_predict3d import DemandGeometry, DemandStore, DemandWorkerPool
@@ -23,7 +23,7 @@ def test_local_volume_serial_worker_and_resume(tmp_path):
         pytest.skip("set LASAGNA_TEST_VOLUME and LASAGNA_TEST_ORIGIN_ZYX")
     origin = tuple(map(int, os.environ["LASAGNA_TEST_ORIGIN_ZYX"].split(",")))
     assert len(origin) == 3
-    source = zarr.open_array(path, mode="r")
+    source = open_zarr(path)
     data = np.asarray(source[tuple(slice(v, v + 32) for v in origin)])
     assert data.shape == (32, 32, 32) and data.dtype == np.uint8
     assert np.ptp(data) > 0, "test crop must contain actual varied CT data"
@@ -57,7 +57,7 @@ def test_local_volume_serial_worker_and_resume(tmp_path):
                     assert not pool.busy
                     assert pool.stats["tiles"] == 8
             assert all(store.ready(geometry.origin(index)) for index in indices)
-        results.append(zarr.open_array(str(root / "value.zarr/0"), mode="r")[:])
+        results.append(open_zarr(str(root / "value.zarr/0"))[:])
         with DemandStore(root, identity, geometry, adapter, output,
                          accumulator_dtype="float32") as resumed:
             for index in indices:

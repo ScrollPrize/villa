@@ -1,7 +1,7 @@
 """Pipeline: binary label TIFF → binary zarr → vc_gen_normalgrids →
 vc_ngrids --fit-normals → Python lasagna zarr assembly → fit.py.
 
-The lasagna-format zarr is a flat zarr.Array (C, Z, Y, X) uint8 with channels
+The lasagna-format zarr is a flat Zarr array (C, Z, Y, X) uint8 with channels
 [cos, grad_mag, nx, ny, pred_dt] and preprocess_params metadata,
 ready to be consumed by fit_data.load_3d().
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 from vc_reader import images
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group
 from scipy.ndimage import distance_transform_edt
 
 
@@ -41,14 +41,8 @@ def _run(cmd: list[str], label: str) -> None:
 
 def _write_binary_zarr(vol: np.ndarray, out_path: Path, chunk_size: int) -> None:
     """Write binary uint8 volume as zarr group with dataset '0'."""
-    root = zarr.open_group(str(out_path), mode="w", zarr_format=2)
-    ds = root.create_array(
-        "0",
-        shape=vol.shape,
-        chunks=(chunk_size, chunk_size, chunk_size),
-        dtype=np.uint8,
-        overwrite=True,
-    )
+    root = create_group(out_path, overwrite=True)
+    ds = root.create_array("0", shape=vol.shape, chunks=(chunk_size, chunk_size, chunk_size), dtype=np.uint8)
     ds[:] = vol
     print(f"{TAG} binary zarr written: {out_path}  shape={vol.shape}", flush=True)
 
@@ -123,9 +117,9 @@ def _write_lasagna_zarr(
     chunk_size: int,
     pred_dt_u8: np.ndarray | None = None,
 ) -> None:
-    """Read ngrids x/0, y/0, z/0 + binary pred + ignore mask → write flat lasagna zarr.Array."""
+    """Read ngrids x/0, y/0, z/0 + binary pred + ignore mask → write flat lasagna Zarr array."""
     # Read normals from ngrids output (raw, NOT hemisphere-encoded)
-    ng = zarr.open(str(ngrids_zarr), mode="r")
+    ng = open_group(ngrids_zarr)
     nx_vol = np.array(ng["x/0"])  # (Z_ds, Y_ds, X_ds) uint8
     ny_vol = np.array(ng["y/0"])
     nz_vol = np.array(ng["z/0"])
@@ -174,17 +168,8 @@ def _write_lasagna_zarr(
 
     out_vol = np.stack(channels, axis=0)  # (C, Z, Y, X)
 
-    if output.exists():
-        shutil.rmtree(output)
-
-    arr = zarr.open(
-        str(output),
-        mode="w",
-        shape=out_vol.shape,
-        chunks=(1, chunk_size, chunk_size, chunk_size),
-        dtype=np.uint8,
-        zarr_format=2,
-    )
+    arr = ZarrWriter.create(output, shape=out_vol.shape, chunks=(1, chunk_size, chunk_size, chunk_size),
+                            dtype=np.uint8, overwrite=True)
     arr[:] = out_vol
     arr.attrs["preprocess_params"] = {
         "scaledown": step,

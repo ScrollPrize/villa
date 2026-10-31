@@ -16,7 +16,7 @@ from vc_reader import images
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import create_group
 
 import fit_data
 import model as fit_model
@@ -1059,7 +1059,7 @@ def fit_data_to_model(
 	if output_path is not None:
 		print(f"[fit_data] writing zarr output to {output_path}", flush=True)
 		out_path = Path(output_path)
-		root = zarr.open_group(str(out_path), mode="w", zarr_format=2)
+		root = create_group(out_path, version=2, overwrite=True)
 		ds_n = root.create_array(
 			"normal", shape=final_normal.shape,
 			chunks=(3, min(64, Z), min(64, Y), min(64, X)),

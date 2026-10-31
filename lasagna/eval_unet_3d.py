@@ -25,8 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from vc_reader import images
-import zarr
-from zarr.codecs import BloscCodec
+from vc_reader.reader import create_group, open_group
 
 from train_unet_3d import (
     FittedZarrDataset,
@@ -226,7 +225,7 @@ def evaluate_sample(
     """Run inference on one full sample and compute metrics."""
 
     # Load zarr labels (same logic as FittedZarrDataset.__getitem__, no crop)
-    root = zarr.open(str(zarr_path), mode="r")
+    root = open_group(zarr_path)
     origin = root.attrs["origin_fullres"]
     normal = np.array(root["normal"])       # (3, Z, Y, X)
     winding = np.array(root["winding"])     # (Z, Y, X)
@@ -336,11 +335,11 @@ def evaluate_sample(
 
     # pred.zarr at step resolution
     pred_np = pred_step[0].cpu().numpy().astype(np.float32)  # (8, Z, Y, X)
-    zout = zarr.open_group(str(sample_dir / "pred.zarr"), mode="w")
+    zout = create_group(sample_dir / "pred.zarr", version=3, overwrite=True)
     zout.create_array(
-        "prediction", data=pred_np, chunks=(8, 32, 32, 32),
-        compressors=BloscCodec(cname="zstd", clevel=3),
-    )
+        "prediction", shape=pred_np.shape, chunks=(8, 32, 32, 32), dtype=np.float32,
+        cname="zstd", level=3, shuffle=1,
+    )[...] = pred_np
     zout.attrs["channel_names"] = _CHANNEL_NAMES
     zout.attrs["step"] = step
 

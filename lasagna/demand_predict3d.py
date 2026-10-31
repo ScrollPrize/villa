@@ -29,6 +29,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from vc_reader.reader import decompress_bytes, open_zarr
 
 from lasagna import tiled_predict3d as tiled
 from lasagna.inference_provenance import atomic_write
@@ -329,23 +330,21 @@ class DemandStore:
         if not all(self.output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
                    for product in self.products):
             return False
-        import zarr
         read_arrays = self._read_arrays if read_arrays is None else read_arrays
-        region = tuple(slice(o, min(o + self.geometry.chunk, n)) for o, n in zip(origin, self.geometry.output_shape))
+        index = tuple(v // self.geometry.chunk for v in origin)
         try:
-            for channel, product, _ in self._channel_metadata:
+            for channel, product, sep in self._channel_metadata:
                 path = str(Path(channel.relative_path) / str(product.level))
                 if path not in read_arrays:
-                    read_arrays[path] = zarr.open_array(path, mode="r")
+                    read_arrays[path] = open_zarr(path)
                 array = read_arrays[path]
                 if (tuple(array.shape) != self.geometry.output_shape or array.dtype != np.dtype(product.dtype)
                         or tuple(array.chunks) != (self.geometry.chunk,) * 3):
                     return False
-                # Decodes only the requested chunk (including its padded edge
-                # storage). No array scan or persistent checksum database.
-                values = np.asarray(array[region])
-                if values.shape != tuple(s.stop - s.start for s in region):
-                    return False
+                # Decodes only this chunk's stored bytes: a read would return a
+                # corrupt chunk as fill. No array scan or persistent checksum database.
+                payload = Path(tiled._zarr_chunk_path(path, sep, *index)).read_bytes()
+                decompress_bytes(payload, array.compressor, array.meta.chunk_nbytes)
         except MemoryError:
             raise
         except Exception:

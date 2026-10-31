@@ -140,8 +140,8 @@ serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
 For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
-lattice and never creates its Cartesian job list. By default one shared
-TensorStore Zarr driver asynchronously reads bounding boxes into an independent
+lattice and never creates its Cartesian job list. One shared opened
+`vc_reader` array reads bounding boxes in the background into an independent
 bounded prefetch window. A ready tile is copied into reusable shared memory only
 when an input slot, result slot, and GPU queue are available. One persistent
 spawned process per GPU performs normalization, model inference, weighting, and
@@ -152,15 +152,15 @@ of that row's inference and skip events commit. Consequently the coordinator
 remains the sole owner of the circular rings, resume checks, progress, and Zarr
 write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
 `--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
-TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
-fallback uses `--prefetch-workers`. Single-device inference submits the same
-bounded canonical TensorStore future window before synchronous model forwards.
+The reader's memory cache and threads are explicit. Single-device inference
+keeps the same bounded canonical window of background reads before synchronous
+model forwards.
 
 For volumes too large to retain locally, both entry points can pass
 `--live-fetch`. `lasagna.live_omezarr_cache` validates the selected local
 numeric level against its S3 source, lazily materializes at most 10,000 cheap
 canonical tile descriptors ahead, and admits only completed materializations
-to the independently bounded TensorStore tile-array window. It inventories and
+to the independently bounded tile-array window. It inventories and
 accounts only the selected scale. After a complete canonical Z row commits,
 the runner may delete whole cached Z-chunk planes strictly behind the safe
 input frontier until actual resident bytes fall below the default 10 TiB

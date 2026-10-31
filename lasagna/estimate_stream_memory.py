@@ -195,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.lasagna_json is not None:
         from lasagna_volume import LasagnaVolume
-        import zarr
+        from vc_reader.reader import open_zarr
 
         lasagna_path = Path(args.lasagna_json)
         if not lasagna_path.exists():
@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             for g in vol.groups.values():
                 if g.sd_fac == min_sd:
                     zpath = str(vol.path.parent / g.zarr_path)
-                    zsrc = zarr.open(zpath, mode="r")
+                    zsrc = open_zarr(zpath)
                     shape = tuple(int(v) for v in zsrc.shape)
                     sZ = shape[0] if len(shape) == 3 else shape[1]
                     scroll_z_from_json = int(sZ * min_sd * s2b)

@@ -93,7 +93,7 @@ def _run(tmp_path: Path, *, complete: bool):
         full_output_shapes_zyx={product.name: (8, 4, 4)},
         input_zarr_path=str(input_path), output_scaledown_base={product.name: 1},
         tile_size=4, overlap=0, border=0, tmp_dir=str(tmp_path),
-        input_reader="python-zarr", flush_workers=0, accumulator_workers=0,
+        flush_workers=0, accumulator_workers=0,
         live_cache=live_cache,
     )
     return live_cache, adapter, output

@@ -1,155 +1,40 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
-import os
 from pathlib import Path
-import threading
 import time
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
 try:
 	from omezarr_pyramid import (
 		build_normal_omezarr_pyramid,
-		downsample_scalar_chunk_worker,
-		set_pyramid_metadata,
+		build_scalar_omezarr_pyramid,
+		print_progress,
+		shape_div2,
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
 		build_normal_omezarr_pyramid,
-		downsample_scalar_chunk_worker,
-		set_pyramid_metadata,
+		build_scalar_omezarr_pyramid,
+		print_progress,
+		shape_div2,
 	)
-
-
-def _down2(a: np.ndarray) -> np.ndarray:
-	return a[::2, ::2, ::2]
-
-
-def _shape_div2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
-	z, y, x = (int(v) for v in shape)
-	for _ in range(max(0, int(n))):
-		z = max(1, (z + 1) // 2)
-		y = max(1, (y + 1) // 2)
-		x = max(1, (x + 1) // 2)
-	return z, y, x
-
-
-def _shape_mul2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
-	z, y, x = (int(v) for v in shape)
-	f = 2 ** max(0, int(n))
-	return max(1, z * f), max(1, y * f), max(1, x * f)
 
 
 def _ceil_div(a: int, b: int) -> int:
 	return (int(a) + int(b) - 1) // int(b)
 
 
-def _print_progress(*, prefix: str, done: int, total: int, t0: float) -> None:
-	d = max(0, int(done))
-	t = max(1, int(total))
-	elapsed = max(1e-6, float(time.time() - t0))
-	per = elapsed / float(max(1, d)) if d > 0 else 0.0
-	eta = max(0.0, per * float(max(0, t - d))) if d > 0 else 0.0
-	eta_m = int(eta // 60.0)
-	eta_s = int(eta % 60.0)
-	bar_w = 30
-	fill = int(round((float(d) / float(t)) * float(bar_w)))
-	bar = "#" * max(0, min(bar_w, fill)) + "-" * max(0, bar_w - max(0, min(bar_w, fill)))
-	print(
-		f"\r{prefix} [{bar}] {d}/{t} ({(100.0 * d / float(t)):.1f}%) eta {eta_m:02d}:{eta_s:02d}",
-		end="",
-		flush=True,
-	)
-
-
-def _load_channel_chunked(*, src: zarr.Array, ci: int,
-                          zs0: int, zs1: int, ys0: int, ys1: int, xs0: int, xs1: int,
-                          chunk: int, label: str, workers: int = 16) -> np.ndarray:
-	z = zs1 - zs0
-	y = ys1 - ys0
-	x = xs1 - xs0
-	if z <= 0:
-		return np.zeros((0, y, x), dtype=np.uint8)
-	cz = max(1, min(int(chunk), z))
-	n_chunks = (z + cz - 1) // cz
-	sz_gb = z * y * x / 1e9
-	print(f"{label}: {z}×{y}×{x} uint8 ({sz_gb:.1f} Gvox, {n_chunks} chunks, {workers} workers)", flush=True)
-
-	# Pre-allocate output and fill in parallel
-	out = np.zeros((z, y, x), dtype=np.uint8)
-	done = [0]
-	lock = threading.Lock()
+def _run_with_progress(work, worker, *, workers: int, prefix: str) -> None:
 	t0 = time.time()
-	_print_progress(prefix=label, done=0, total=z, t0=t0)
-
-	def _read_chunk(zoff):
-		z_a = zs0 + zoff
-		z_b = min(zs0 + zoff + cz, zs1)
-		data = np.asarray(src[ci, z_a:z_b, ys0:ys1, xs0:xs1]).astype(np.uint8, copy=False)
-		out[zoff:zoff + (z_b - z_a)] = data
-		with lock:
-			done[0] += (z_b - z_a)
-			_print_progress(prefix=label, done=done[0], total=z, t0=t0)
-
-	from concurrent.futures import ThreadPoolExecutor, as_completed
+	print_progress(prefix=prefix, done=0, total=len(work), t0=t0)
 	with ThreadPoolExecutor(max_workers=workers) as pool:
-		futs = [pool.submit(_read_chunk, zoff) for zoff in range(0, z, cz)]
-		for f in as_completed(futs):
-			f.result()
-
-	_print_progress(prefix=label, done=z, total=z, t0=t0)
-	print("", flush=True)
-	return out
-
-
-def _write_z_chunks(*, dst: zarr.Array, data: np.ndarray, chunk: int, label: str, workers: int = 16) -> None:
-	z = int(data.shape[0])
-	cz = max(1, int(chunk))
-	done = [0]
-	lock = threading.Lock()
-	t0 = time.time()
-	_print_progress(prefix=label, done=0, total=z, t0=t0)
-
-	def _write(z0):
-		z1 = min(z, z0 + cz)
-		dst[z0:z1, :, :] = data[z0:z1, :, :]
-		with lock:
-			done[0] += (z1 - z0)
-			_print_progress(prefix=label, done=done[0], total=z, t0=t0)
-
-	from concurrent.futures import ThreadPoolExecutor, as_completed
-	with ThreadPoolExecutor(max_workers=workers) as pool:
-		futs = [pool.submit(_write, z0) for z0 in range(0, z, cz)]
-		for f in as_completed(futs):
-			f.result()
-	print("", flush=True)
-
-
-def _write_z_chunks_at(*, dst: zarr.Array, data: np.ndarray, z0: int, y0: int, x0: int, chunk: int, label: str, workers: int = 16) -> None:
-	z = int(data.shape[0])
-	y = int(data.shape[1])
-	x = int(data.shape[2])
-	cz = max(1, int(chunk))
-	done = [0]
-	lock = threading.Lock()
-	t0 = time.time()
-	_print_progress(prefix=label, done=0, total=z, t0=t0)
-
-	def _write(za):
-		zb = min(z, za + cz)
-		dst[int(z0) + za : int(z0) + zb, int(y0) : int(y0) + y, int(x0) : int(x0) + x] = data[za:zb, :, :]
-		with lock:
-			done[0] += (zb - za)
-			_print_progress(prefix=label, done=done[0], total=z, t0=t0)
-
-	from concurrent.futures import ThreadPoolExecutor, as_completed
-	with ThreadPoolExecutor(max_workers=workers) as pool:
-		futs = [pool.submit(_write, za) for za in range(0, z, cz)]
-		for f in as_completed(futs):
-			f.result()
+		for done, _ in enumerate(pool.map(worker, work), 1):
+			print_progress(prefix=prefix, done=done, total=len(work), t0=t0)
 	print("", flush=True)
 
 
@@ -169,46 +54,27 @@ def _first_filled_level_from_downscale(scaledown: int) -> int:
 	return lv
 
 
-def _process_slab_worker(args_tuple):
-	"""Multiprocessing worker: read one Z-slab from source, write base level only."""
-	(input_path_str, out_path_str, ci,
-	 src_z0, src_z1, ys0, ys1, xs0, xs1,
-	 out_oz, out_oy, out_ox,
-	 first_filled_level) = args_tuple
+def _upsample_level(*, src: ZarrWriter, dst: ZarrWriter, chunk: int, workers: int, prefix: str) -> None:
+	"""Fill a level from the one above by nearest-neighbor 2x upsampling (one source chunk at a time)."""
+	starts = [
+		(z0, y0, x0)
+		for z0 in range(0, src.shape[0], chunk)
+		for y0 in range(0, src.shape[1], chunk)
+		for x0 in range(0, src.shape[2], chunk)
+	]
 
-	src = zarr.open(input_path_str, mode="r")
-	slab = np.asarray(src[ci, src_z0:src_z1, ys0:ys1, xs0:xs1]).astype(np.uint8, copy=False)
+	def upsample(start):
+		z0, y0, x0 = start
+		slab = src[z0:z0 + chunk, y0:y0 + chunk, x0:x0 + chunk]
+		up = slab.repeat(2, axis=0).repeat(2, axis=1).repeat(2, axis=2)
+		dz0, dy0, dx0 = z0 * 2, y0 * 2, x0 * 2
+		# Clip to dest shape (in case source wasn't evenly divisible)
+		uz = min(up.shape[0], dst.shape[0] - dz0)
+		uy = min(up.shape[1], dst.shape[1] - dy0)
+		ux = min(up.shape[2], dst.shape[2] - dx0)
+		dst[dz0:dz0 + uz, dy0:dy0 + uy, dx0:dx0 + ux] = up[:uz, :uy, :ux]
 
-	dst_g = zarr.open_group(out_path_str, mode="r+")
-	dst_g[str(first_filled_level)][out_oz:out_oz + slab.shape[0],
-								   out_oy:out_oy + slab.shape[1],
-								   out_ox:out_ox + slab.shape[2]] = slab
-
-
-def _downsample_chunk_worker(args_tuple):
-	"""Multiprocessing worker: read one chunk-aligned region from level N,
-	downsample 2x with mean pooling, write to level N+1."""
-	return downsample_scalar_chunk_worker(args_tuple)
-
-
-def _upsample_chunk_worker(args_tuple):
-	"""Multiprocessing worker: read one chunk-aligned region from level N,
-	upsample 2x (nearest-neighbor), write to level N-1."""
-	(out_path_str, src_level, dst_level,
-	 z0, z1, y0, y1, x0, x1) = args_tuple
-
-	g = zarr.open_group(out_path_str, mode="r+")
-	slab = np.asarray(g[str(src_level)][z0:z1, y0:y1, x0:x1])
-	if slab.size == 0:
-		return
-	up = slab.repeat(2, axis=0).repeat(2, axis=1).repeat(2, axis=2)
-	dz0, dy0, dx0 = z0 * 2, y0 * 2, x0 * 2
-	dst = g[str(dst_level)]
-	# Clip to dest shape (in case source wasn't evenly divisible)
-	uz = min(up.shape[0], dst.shape[0] - dz0)
-	uy = min(up.shape[1], dst.shape[1] - dy0)
-	ux = min(up.shape[2], dst.shape[2] - dx0)
-	dst[dz0:dz0 + uz, dy0:dy0 + uy, dx0:dx0 + ux] = up[:uz, :uy, :ux]
+	_run_with_progress(starts, upsample, workers=workers, prefix=prefix)
 
 
 def run(
@@ -223,13 +89,13 @@ def run(
 	if workers <= 0:
 		workers = max(1, multiprocessing.cpu_count())
 
-	a = zarr.open(str(input_path), mode="r")
+	a = open_zarr(input_path, threads=1)
 	if len(tuple(int(v) for v in a.shape)) != 4:
 		raise ValueError(f"input must be (C,Z,Y,X), got shape={tuple(a.shape)}")
 	if str(a.dtype) != "uint8":
 		raise ValueError(f"input dtype must be uint8, got {a.dtype}")
 
-	params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}) or {})
+	params = dict(a.attrs.get("preprocess_params", {}) or {})
 	scaledown = int(params.get("scaledown", 1) or 1)
 	first_filled_level = _first_filled_level_from_downscale(scaledown)
 
@@ -274,72 +140,34 @@ def run(
 		out_path = Path(f"{output_prefix}_{ch}.ome.zarr")
 		if normal_pair_channels and ch in {"nx", "ny"}:
 			normal_pair_paths[ch] = out_path
-		g = zarr.open_group(str(out_path), mode="w", zarr_format=2)
+		g = create_group(out_path, overwrite=True)
 
 		# Create all pyramid level arrays upfront.
 		# base_full_shape is level 0 (full res). Each level halves.
-		arrs_shapes: dict[int, tuple] = {}
+		level_arrays: dict[int, ZarrWriter] = {}
 		for lv in range(levels):
-			sh = _shape_div2(base_full_shape, lv)
-			arrs_shapes[lv] = sh
-			g.create_array(
+			sh = shape_div2(base_full_shape, lv)
+			level_arrays[lv] = g.create_array(
 				str(lv),
 				shape=sh,
-				chunks=(
-					min(sh[0], chunk),
-					min(sh[1], chunk),
-					min(sh[2], chunk),
-				),
+				chunks=(min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk)),
 				dtype=np.uint8,
-				overwrite=True,
-				fill_value=0,
+				skip_empty=True,
 			)
 
-		# --- Phase 1: Write base level in parallel (chunk-aligned, no contention) ---
-		cz = chunk
-		slab_ranges = []
-		for z_off in range(0, crop_z, cz):
-			z_end = min(crop_z, z_off + cz)
-			slab_ranges.append((z_off, z_end))
-
-		n_slabs = len(slab_ranges)
+		# --- Phase 1: Write base level in parallel (one Z-slab per chunk depth) ---
+		slab_ranges = [(z_off, min(crop_z, z_off + chunk)) for z_off in range(0, crop_z, chunk)]
 		sz_gb = crop_z * (ys1 - ys0) * (xs1 - xs0) / 1e9
 		print(f"{TAG} {ch}: {crop_z}×{ys1-ys0}×{xs1-xs0} ({sz_gb:.1f} Gvox), "
-			  f"{n_slabs} slabs, {workers} workers, {levels} levels", flush=True)
-
-		work_items = []
-		for z_off, z_end in slab_ranges:
-			work_items.append((
-				str(input_path), str(out_path), ci,
-				zs0 + z_off, zs0 + z_end, ys0, ys1, xs0, xs1,
-				zs0 + z_off, ys0, xs0,
-				first_filled_level,
-			))
-
+			  f"{len(slab_ranges)} slabs, {workers} workers, {levels} levels", flush=True)
 		t0 = time.time()
-		done_count = [0]
-		lock = threading.Lock()
+		base = level_arrays[first_filled_level]
 
-		def _progress_thread():
-			while not _stop.is_set():
-				with lock:
-					d = done_count[0]
-				_print_progress(prefix=f"{TAG} {ch} L{first_filled_level}", done=d, total=n_slabs, t0=t0)
-				_stop.wait(0.5)
+		def _write_slab(slab_range, ci=ci, base=base):
+			z_off, z_end = slab_range
+			base[zs0 + z_off:zs0 + z_end, ys0:ys1, xs0:xs1] = a[ci, zs0 + z_off:zs0 + z_end, ys0:ys1, xs0:xs1]
 
-		_stop = threading.Event()
-		prog = threading.Thread(target=_progress_thread, daemon=True)
-		prog.start()
-
-		with multiprocessing.Pool(processes=workers) as pool:
-			for _ in pool.imap_unordered(_process_slab_worker, work_items):
-				with lock:
-					done_count[0] += 1
-
-		_stop.set()
-		prog.join(timeout=2)
-		_print_progress(prefix=f"{TAG} {ch} L{first_filled_level}", done=n_slabs, total=n_slabs, t0=t0)
-		print("", flush=True)
+		_run_with_progress(slab_ranges, _write_slab, workers=workers, prefix=f"{TAG} {ch} L{first_filled_level}")
 
 		# --- Phase 2: Build coarser pyramid levels, one level at a time ---
 		# nx/ny are delayed until both base channels exist so their pyramid can
@@ -347,92 +175,13 @@ def run(
 		if normal_pair_channels and ch in {"nx", "ny"}:
 			print(f"{TAG} {ch}: delaying coarser levels for paired normal pyramid", flush=True)
 		else:
-			zero_overrides = ch == "grad_mag"
-			# Each level reads from the previous level and writes chunk-aligned
-			# regions. No contention: each worker writes to a unique chunk.
-			for lv in range(first_filled_level + 1, levels):
-				src_lv = lv - 1
-				src_shape = arrs_shapes[src_lv]
-				dst_shape = arrs_shapes[lv]
-				# Chunk-aligned work items at the SOURCE level (2× chunk so
-				# each worker produces exactly one chunk at the dest level).
-				cz2 = chunk * 2
-				ds_work = []
-				for z0 in range(0, src_shape[0], cz2):
-					z1 = min(src_shape[0], z0 + cz2)
-					for y0 in range(0, src_shape[1], cz2):
-						y1 = min(src_shape[1], y0 + cz2)
-						for x0 in range(0, src_shape[2], cz2):
-							x1 = min(src_shape[2], x0 + cz2)
-							ds_work.append((
-								str(out_path), src_lv, lv,
-								z0, z1, y0, y1, x0, x1,
-								zero_overrides,
-							))
-				n_ds = len(ds_work)
-				t_lv = time.time()
-				done_count[0] = 0
-
-				_stop2 = threading.Event()
-				def _prog2():
-					while not _stop2.is_set():
-						with lock:
-							d = done_count[0]
-						_print_progress(prefix=f"{TAG} {ch} L{lv}", done=d, total=n_ds, t0=t_lv)
-						_stop2.wait(0.5)
-				prog2 = threading.Thread(target=_prog2, daemon=True)
-				prog2.start()
-
-				with multiprocessing.Pool(processes=workers) as pool:
-					for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
-						with lock:
-							done_count[0] += 1
-
-				_stop2.set()
-				prog2.join(timeout=2)
-				_print_progress(prefix=f"{TAG} {ch} L{lv}", done=n_ds, total=n_ds, t0=t_lv)
-				print("", flush=True)
+			build_scalar_omezarr_pyramid(out_path, first_filled_level, levels, workers=workers, label=ch,
+										 zero_overrides=ch == "grad_mag")
 
 		# --- Phase 3: Upsample to fill levels below first_filled_level ---
 		for lv in range(first_filled_level - 1, -1, -1):
-			src_lv = lv + 1
-			src_shape = arrs_shapes[src_lv]
-			cz2 = chunk  # one source chunk → one dest 2×chunk region
-			us_work = []
-			for z0 in range(0, src_shape[0], cz2):
-				z1 = min(src_shape[0], z0 + cz2)
-				for y0 in range(0, src_shape[1], cz2):
-					y1 = min(src_shape[1], y0 + cz2)
-					for x0 in range(0, src_shape[2], cz2):
-						x1 = min(src_shape[2], x0 + cz2)
-						us_work.append((
-							str(out_path), src_lv, lv,
-							z0, z1, y0, y1, x0, x1,
-						))
-			if us_work:
-				n_us = len(us_work)
-				t_lv = time.time()
-				done_count[0] = 0
-
-				_stop3 = threading.Event()
-				def _prog3():
-					while not _stop3.is_set():
-						with lock:
-							d = done_count[0]
-						_print_progress(prefix=f"{TAG} {ch} L{lv} (upsample)", done=d, total=n_us, t0=t_lv)
-						_stop3.wait(0.5)
-				prog3 = threading.Thread(target=_prog3, daemon=True)
-				prog3.start()
-
-				with multiprocessing.Pool(processes=workers) as pool:
-					for _ in pool.imap_unordered(_upsample_chunk_worker, us_work):
-						with lock:
-							done_count[0] += 1
-
-				_stop3.set()
-				prog3.join(timeout=2)
-				_print_progress(prefix=f"{TAG} {ch} L{lv} (upsample)", done=n_us, total=n_us, t0=t_lv)
-				print("", flush=True)
+			_upsample_level(src=level_arrays[lv + 1], dst=level_arrays[lv], chunk=chunk, workers=workers,
+							prefix=f"{TAG} {ch} L{lv} (upsample)")
 
 		# Write metadata
 		datasets = []
@@ -455,7 +204,6 @@ def run(
 			],
 			"datasets": datasets,
 		}]
-		set_pyramid_metadata(g, method="mean_pool2x_zero_overrides" if ch == "grad_mag" else "mean_pool2x")
 		g.attrs["source_preprocess_params"] = params
 		g.attrs["vc3d_convert"] = {
 			"channel": str(ch),
@@ -496,7 +244,6 @@ def run(
 			normal_pair_paths["ny"],
 			first_filled_level,
 			levels,
-			chunk,
 			workers=workers,
 			label="normal",
 		)
@@ -531,7 +278,7 @@ def run_from_manifest(
 		for g in vol.groups.values():
 			if g.sd_fac == min_sd:
 				zarr_path = str(vol.path.parent / g.zarr_path)
-				a = zarr.open(zarr_path, mode="r")
+				a = open_zarr(zarr_path)
 				sh = tuple(int(v) for v in a.shape)
 				if len(sh) == 4:
 					sh = sh[1:]
@@ -563,8 +310,8 @@ def run_from_manifest(
 		out_prefix = f"{output_prefix}_{ch_name}"
 
 		# Build per-channel preprocess_params so run() can read scaledown + crop
-		a = zarr.open(zarr_path, mode="r")
-		params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}))
+		a = open_zarr(zarr_path)
+		params = dict(a.attrs.get("preprocess_params", {}))
 		params.setdefault("scaledown", group.sd_fac)
 		if vol.crops:
 			# Use the first crop for legacy converter compat
@@ -574,10 +321,9 @@ def run_from_manifest(
 
 		# Temporarily set attrs so run() can read them
 		# (run() reads from zarr attrs — if missing, write them)
-		if "preprocess_params" not in dict(getattr(a, "attrs", {})):
+		if "preprocess_params" not in a.attrs:
 			try:
-				aw = zarr.open(zarr_path, mode="r+")
-				aw.attrs["preprocess_params"] = params
+				ZarrWriter.open(zarr_path).attrs["preprocess_params"] = params
 			except Exception:
 				pass  # read-only zarr, run() will use defaults
 

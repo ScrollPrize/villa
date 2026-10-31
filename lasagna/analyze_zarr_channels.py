@@ -17,7 +17,7 @@ import time
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrGroup, open_node
 
 
 def hist_sparkline(hist, bins=16):
@@ -31,12 +31,9 @@ def hist_sparkline(hist, bins=16):
     return "".join(bars[v] for v in scaled)
 
 
-def _process_slab(zarr_path, n_ch, z0, z1, y0, y1, x0, x1):
+def _process_slab(arr, n_ch, z0, z1, y0, y1, x0, x1):
     """Read one Z-slab (cropped in Y/X) and return partial stats per channel."""
-    arr = zarr.open(str(zarr_path), mode="r")
-    if not hasattr(arr, "shape"):
-        arr = arr[list(arr.keys())[0]]
-    data = np.asarray(arr[:, z0:z1, y0:y1, x0:x1])
+    data = arr[:, z0:z1, y0:y1, x0:x1]
     nvox = data.shape[1] * data.shape[2] * data.shape[3]
     hists = np.zeros((n_ch, 256), dtype=np.int64)
     vmins = np.empty(n_ch, dtype=np.int32)
@@ -59,9 +56,9 @@ def main():
     path = sys.argv[1].rstrip("/")
     n_workers = os.cpu_count()
 
-    a = zarr.open(str(path), mode="r")
+    a = open_node(str(path), threads=1)  # the workers below read in parallel
 
-    if hasattr(a, "shape"):
+    if not isinstance(a, ZarrGroup):
         arr = a
     else:
         keys = list(a.keys())
@@ -73,12 +70,9 @@ def main():
 
     shape = tuple(int(v) for v in arr.shape)
     dtype = arr.dtype
-    chunks = tuple(int(v) for v in arr.chunks) if hasattr(arr, "chunks") else "?"
+    chunks = tuple(int(v) for v in arr.chunks)
 
-    params = {}
-    attrs_src = a if hasattr(a, "attrs") else arr
-    if hasattr(attrs_src, "attrs"):
-        params = dict(attrs_src.attrs.get("preprocess_params", {}))
+    params = dict(a.attrs.get("preprocess_params", {}))
 
     channel_names = params.get("channels", None)
     print(f"Path:     {path}")
@@ -117,7 +111,7 @@ def main():
         sx0, sx1 = 0, X
 
     # Align chunk_z to zarr's Z chunk size for efficient reads
-    zarr_chunk_z = chunks[1] if isinstance(chunks, tuple) and len(chunks) > 1 else 64
+    zarr_chunk_z = chunks[1] if len(chunks) > 1 else 64
     chunk_z = max(1, zarr_chunk_z)
 
     # Build slab ranges over the crop Z range
@@ -137,7 +131,7 @@ def main():
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {
-            pool.submit(_process_slab, path, n_ch, z0, z1, sy0, sy1, sx0, sx1): i
+            pool.submit(_process_slab, arr, n_ch, z0, z1, sy0, sy1, sx0, sx1): i
             for i, (z0, z1) in enumerate(slabs)
         }
         for fut in as_completed(futures):

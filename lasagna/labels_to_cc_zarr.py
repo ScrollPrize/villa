@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from vc_reader import images
-import zarr
+from vc_reader.reader import ZarrWriter, create_group
 
 
 # ---------------------------------------------------------------------------
@@ -216,15 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- write zarr ---------------------------------------------------------
     print(f"[labels_to_cc] writing zarr to {output_path}", flush=True)
     cs = args.chunk_size
-    arr = zarr.open(
-        str(output_path),
-        mode="w",
-        shape=labels_u8.shape,
-        chunks=(cs, cs, cs),
-        dtype=np.uint8,
-        fill_value=0,
-        zarr_format=2,
-    )
+    arr = ZarrWriter.create(output_path, shape=labels_u8.shape, chunks=(cs, cs, cs), dtype=np.uint8, overwrite=True)
     arr[:] = labels_u8
     arr.attrs["n_components"] = n_final
     arr.attrs["source"] = str(input_path)
@@ -237,14 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         bin_path = Path(args.binary_zarr)
         print(f"[labels_to_cc] writing binary zarr to {bin_path}", flush=True)
         # vc_gen_normalgrids expects zarr Group with dataset "0" inside
-        root = zarr.open_group(str(bin_path), mode="w", zarr_format=2)
-        ds = root.create_array(
-            "0",
-            shape=binary.shape,
-            chunks=(cs, cs, cs),
-            dtype=np.uint8,
-            overwrite=True,
-        )
+        root = create_group(bin_path, overwrite=True)
+        ds = root.create_array("0", shape=binary.shape, chunks=(cs, cs, cs), dtype=np.uint8)
         ds[:] = binary
         print(f"[labels_to_cc] binary zarr written  shape={ds.shape}  chunks={ds.chunks}", flush=True)
 

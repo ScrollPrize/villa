@@ -56,7 +56,6 @@ import volume_scale
 _data_dir: str | None = None  # Set via --data-dir CLI flag
 _object_store_dir: Path | None = None  # Set via --object-store-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
-_sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 _capture_jobs: bool = False  # Set via --capture-jobs
 _capture_dir: Path | None = None  # Set via --capture-dir
 _store: stored_surfaces.StoreSession | None = None  # Set via --store
@@ -1982,7 +1981,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         args_section = dict(cfg.get("args", {}))
         if model_init != "flatten":
             args_section["input"] = str(data_input)
-            args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         if store_volume is not None:
@@ -2570,7 +2568,7 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _data_dir, _object_store_dir, _gpu_pause_enabled, _sparse_prefetch_backend
+    global _data_dir, _object_store_dir, _gpu_pause_enabled
     global _capture_jobs, _capture_dir, _store
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
@@ -2584,10 +2582,6 @@ def main() -> None:
                    help="Directory for content-addressed VC3D artifacts")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
-    p.add_argument("--sparse-prefetch-backend",
-                   choices=("tensorstore", "python-zarr"),
-                   default="tensorstore",
-                   help="Sparse streaming prefetch backend for fit jobs")
     p.add_argument("--capture-jobs", action="store_true", default=False,
                    help="Capture queued job requests, events, and final results")
     p.add_argument("--capture-dir", default=None,
@@ -2607,7 +2601,6 @@ def main() -> None:
         _object_store_dir = Path(args.object_store_dir).resolve()
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
-    _sparse_prefetch_backend = str(args.sparse_prefetch_backend)
     _capture_jobs = bool(args.capture_jobs)
     if args.capture_dir:
         _capture_dir = Path(args.capture_dir).resolve()

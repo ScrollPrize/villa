@@ -4,22 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import json
+from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
-import os
-import shutil
 import sys
 import time
-import zlib
 from pathlib import Path
-from typing import Iterable
 
 import cv2
-import numcodecs
 import numpy as np
 from vc_reader import images
+from vc_reader.reader import ZarrGroup, ZarrReader, ZarrWriter, open_group, open_node, open_zarr
 import torch
-import zarr
 
 _LASAGNA_DIR = Path(__file__).resolve().parents[1]
 if str(_LASAGNA_DIR) not in sys.path:
@@ -31,13 +26,8 @@ from omezarr_pyramid import (
     build_scalar_omezarr_pyramid,
     clear_coarser_levels,
     print_progress as _print_progress,
+    stored_chunks,
 )
-
-zarr.config.set({"async.concurrency": 1, "threading.max_workers": 1})
-
-_MASKOUT_GRAD_META: dict | None = None
-_MASKOUT_MASK_META: dict | None = None
-_MASKOUT_CFG: dict | None = None
 
 
 def _parse_z_range(value: str) -> tuple[int, int]:
@@ -54,8 +44,8 @@ def _parse_z_range(value: str) -> tuple[int, int]:
 
 
 def _open_zarr_array(path: Path, array: str | None):
-    root = zarr.open(str(path), mode="r")
-    if hasattr(root, "shape"):
+    root = open_node(path)
+    if not isinstance(root, ZarrGroup):
         return root, path
 
     keys = sorted(str(k) for k in root.keys())
@@ -69,7 +59,7 @@ def _open_zarr_array(path: Path, array: str | None):
         raise ValueError(f"zarr group {path} has no entry {key!r}; entries={keys}")
 
     arr = root[key]
-    if not hasattr(arr, "shape"):
+    if isinstance(arr, ZarrGroup):
         raise ValueError(f"zarr entry {key!r} is not an array")
     return arr, path / key
 
@@ -98,7 +88,7 @@ def _scale_from_ome_parent(array_path: Path) -> tuple[float, float, float] | Non
 
     parent = array_path.parent
     try:
-        group = zarr.open_group(str(parent), mode="r")
+        group = open_group(parent)
     except Exception:
         return None
 
@@ -162,44 +152,6 @@ def _default_full_z_range(*, array_z: int, scale_z: float) -> tuple[int, int]:
     return 0, int(np.ceil(float(array_z) * scale_z))
 
 
-def _read_metadata(array_path: Path) -> dict:
-    zarray = array_path / ".zarray"
-    if zarray.exists():
-        return json.loads(zarray.read_text())
-    zarr_json = array_path / "zarr.json"
-    if zarr_json.exists():
-        return json.loads(zarr_json.read_text())
-    return {}
-
-
-def _chunk_key_candidates(
-    array_path: Path,
-    chunk_coord: tuple[int, ...],
-    metadata: dict,
-) -> Iterable[Path]:
-    # zarr v2 defaults to "." unless dimension_separator="/" is set.
-    sep_v2 = str(metadata.get("dimension_separator", "."))
-    if sep_v2 not in {".", "/"}:
-        sep_v2 = "."
-    yield array_path / sep_v2.join(str(v) for v in chunk_coord)
-    yield array_path / ".".join(str(v) for v in chunk_coord)
-    yield array_path.joinpath(*(str(v) for v in chunk_coord))
-
-    # zarr v3 stores chunks below c/ by default.
-    enc = metadata.get("chunk_key_encoding", {})
-    cfg = enc.get("configuration", {}) if isinstance(enc, dict) else {}
-    sep_v3 = str(cfg.get("separator", "/"))
-    if sep_v3 not in {".", "/"}:
-        sep_v3 = "/"
-    yield array_path / "c" / sep_v3.join(str(v) for v in chunk_coord)
-    yield array_path / "c" / ".".join(str(v) for v in chunk_coord)
-    yield array_path / "c" / Path(*[str(v) for v in chunk_coord])
-
-
-def _chunk_exists(array_path: Path, chunk_coord: tuple[int, ...], metadata: dict) -> bool:
-    return any(p.exists() for p in _chunk_key_candidates(array_path, chunk_coord, metadata))
-
-
 def _missing_chunk_mask_for_slab(
     *,
     array_path: Path,
@@ -210,15 +162,13 @@ def _missing_chunk_mask_for_slab(
 ) -> np.ndarray:
     """Return a ZYX bool mask for chunks absent from a local zarr store.
 
-    If the chunk layout cannot be inspected, this returns an all-false mask.
+    If the array is not on disk, this returns an all-false mask.
     """
 
     if not array_path.exists():
         return np.zeros((z_range[1] - z_range[0], shape[-2], shape[-1]), dtype=bool)
 
-    metadata = _read_metadata(array_path)
-    if not metadata:
-        return np.zeros((z_range[1] - z_range[0], shape[-2], shape[-1]), dtype=bool)
+    stored = stored_chunks(array_path)
 
     z0, z1 = z_range
     if len(shape) == 3:
@@ -257,7 +207,7 @@ def _missing_chunk_mask_for_slab(
             gy1 = min(Y, gy0 + cy)
             for cxi in range(cxi1 + 1):
                 chunk_coord = chunk_prefix + (czi, cyi, cxi)
-                if _chunk_exists(array_path, chunk_coord, metadata):
+                if chunk_coord in stored:
                     continue
                 gx0 = cxi * cx
                 gx1 = min(X, gx0 + cx)
@@ -283,10 +233,10 @@ def _read_slab(
         raise ValueError(f"empty clipped z-range: requested={z_range} volume_z={Z}")
 
     if len(arr.shape) == 3:
-        data = np.asarray(arr[z0:z1, :, :])
+        data = arr[z0:z1, :, :]
     elif len(arr.shape) == 4:
         ch = 0 if channel is None else int(channel)
-        data = np.asarray(arr[ch, z0:z1, :, :])
+        data = arr[ch, z0:z1, :, :]
     else:
         raise ValueError(f"expected 3D ZYX or 4D CZYX zarr array, got shape={arr.shape}")
     if data.dtype != np.uint8:
@@ -635,56 +585,20 @@ def _write_mask_zarr(
         raise ValueError(f"expected 3D mask, got shape={keep_mask.shape}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        if out_path.is_dir():
-            shutil.rmtree(out_path)
-        else:
-            out_path.unlink()
-    out_path.mkdir(parents=True)
-
     shape = tuple(int(v) for v in keep_mask.shape)
-    chunks = tuple(min(32, int(v)) for v in shape)
-    zarray = {
-        "zarr_format": 2,
-        "shape": list(shape),
-        "chunks": list(chunks),
-        "dtype": "|u1",
-        "compressor": {"id": "zlib", "level": 1},
-        "fill_value": 0,
-        "order": "C",
-        "filters": None,
-        "dimension_separator": "/",
-    }
-    zattrs = {
+    out = ZarrWriter.create(
+        out_path, shape=shape, chunks=tuple(min(32, v) for v in shape), dtype=np.uint8,
+        compressor="zlib", level=1, separator="/", overwrite=True, skip_empty=True,
+    )
+    out.attrs.put({
         "source_zarr": str(source_path),
         "scale_zyx": [float(v) for v in scale_zyx],
         "z_range_full": [int(v) for v in z_range_full],
         "z_range_array": [int(v) for v in z_range_array],
         "mask_values": {"masked_out": 0, "keep": 255},
         "lasagna_mask_semantics": "uint8 mask: 255=keep, 0=mask_out",
-    }
-    (out_path / ".zarray").write_text(json.dumps(zarray, indent=2) + "\n")
-    (out_path / ".zattrs").write_text(json.dumps(zattrs, indent=2) + "\n")
-
-    Z, Y, X = shape
-    cZ, cY, cX = chunks
-    for z0 in range(0, Z, cZ):
-        z1 = min(Z, z0 + cZ)
-        iz = z0 // cZ
-        for y0 in range(0, Y, cY):
-            y1 = min(Y, y0 + cY)
-            iy = y0 // cY
-            for x0 in range(0, X, cX):
-                x1 = min(X, x0 + cX)
-                ix = x0 // cX
-                src = keep_mask[z0:z1, y0:y1, x0:x1]
-                if not np.any(src):
-                    continue
-                chunk = np.zeros(chunks, dtype=np.uint8)
-                chunk[: z1 - z0, : y1 - y0, : x1 - x0] = src.astype(np.uint8) * 255
-                chunk_path = out_path / str(iz) / str(iy) / str(ix)
-                chunk_path.parent.mkdir(parents=True, exist_ok=True)
-                chunk_path.write_bytes(zlib.compress(chunk.tobytes(order="C"), level=1))
+    })
+    out[:] = keep_mask.astype(np.uint8) * 255
 
 
 def _axis_power2_mapping(src_dim: int, dst_dim: int) -> tuple[str, int]:
@@ -746,161 +660,16 @@ def _numeric_omezarr_levels(root_path: Path) -> list[int]:
 
 
 def _level_chunks_zyx(level_path: Path) -> tuple[int, int, int]:
-    arr = zarr.open(str(level_path), mode="r")
+    arr = open_zarr(level_path)
     chunks = tuple(int(v) for v in arr.chunks[-3:])
     if not chunks:
         raise ValueError(f"cannot read chunk size from {level_path}: chunks={arr.chunks}")
     return chunks
 
 
-def _array_info_from_metadata(array_path: Path) -> tuple[tuple[int, ...], tuple[int, ...], str, dict]:
-    metadata = _read_metadata(array_path)
-    if not metadata:
-        raise ValueError(f"missing zarr metadata at {array_path}")
-    try:
-        shape = tuple(int(v) for v in metadata["shape"])
-        chunks = tuple(int(v) for v in metadata["chunks"])
-        dtype = str(metadata["dtype"])
-    except KeyError as exc:
-        raise ValueError(f"zarr metadata at {array_path} missing {exc.args[0]!r}") from exc
-    return shape, chunks, dtype, metadata
-
-
-def _direct_zarr_meta(array_path: Path, metadata: dict | None = None) -> dict:
-    metadata = _read_metadata(array_path) if metadata is None else metadata
-    if int(metadata.get("zarr_format", 2)) != 2:
-        raise ValueError(f"maskout direct chunk IO only supports zarr v2 arrays: {array_path}")
-    comp_cfg = metadata.get("compressor")
-    filters_cfg = metadata.get("filters") or []
-    return {
-        "path": str(array_path),
-        "shape": tuple(int(v) for v in metadata["shape"]),
-        "chunks": tuple(int(v) for v in metadata["chunks"]),
-        "dtype": np.dtype(metadata["dtype"]),
-        "fill_value": metadata.get("fill_value", 0),
-        "order": str(metadata.get("order", "C")),
-        "dim_sep": str(metadata.get("dimension_separator", ".")),
-        "compressor": numcodecs.get_codec(comp_cfg) if comp_cfg else None,
-        "filters": [numcodecs.get_codec(f) for f in filters_cfg],
-    }
-
-
-def _direct_chunk_path(meta: dict, chunk_coord: tuple[int, ...]) -> Path:
-    key = str(meta["dim_sep"]).join(str(int(v)) for v in chunk_coord)
-    return Path(str(meta["path"])) / key.replace("/", os.sep)
-
-
-def _direct_fill_chunk(meta: dict) -> np.ndarray:
-    return np.full(tuple(int(v) for v in meta["chunks"]), meta["fill_value"], dtype=meta["dtype"])
-
-
-def _direct_read_chunk(meta: dict, chunk_coord: tuple[int, ...]) -> np.ndarray:
-    path = _direct_chunk_path(meta, chunk_coord)
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return _direct_fill_chunk(meta)
-    comp = meta["compressor"]
-    if comp is not None:
-        raw = comp.decode(raw)
-    for filt in reversed(meta["filters"]):
-        raw = filt.decode(raw)
-    return np.frombuffer(raw, dtype=meta["dtype"]).reshape(meta["chunks"], order=meta["order"]).copy()
-
-
-def _direct_write_chunk(meta: dict, chunk_coord: tuple[int, ...], data: np.ndarray) -> None:
-    arr = np.asarray(data, dtype=meta["dtype"])
-    if tuple(int(v) for v in arr.shape) != tuple(int(v) for v in meta["chunks"]):
-        raise ValueError(f"direct chunk write shape mismatch: got={arr.shape} expected={meta['chunks']}")
-    raw = (np.ascontiguousarray(arr) if meta["order"] == "C" else np.asfortranarray(arr)).tobytes()
-    for filt in meta["filters"]:
-        raw = filt.encode(raw)
-    comp = meta["compressor"]
-    if comp is not None:
-        raw = comp.encode(raw)
-    path = _direct_chunk_path(meta, chunk_coord)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(raw)
-
-
-def _read_mask_region_direct(
+def _read_mask_block_resampled(
     *,
-    meta: dict,
-    mask_channel: int | None,
-    rz0: int,
-    rz1: int,
-    ry0: int,
-    ry1: int,
-    rx0: int,
-    rx1: int,
-) -> np.ndarray:
-    out = np.zeros((rz1 - rz0, ry1 - ry0, rx1 - rx0), dtype=np.uint8)
-    shape = tuple(int(v) for v in meta["shape"])
-    chunks = tuple(int(v) for v in meta["chunks"])
-    if len(shape) == 3:
-        cZ, cY, cX = chunks
-        for zc0 in range((rz0 // cZ) * cZ, rz1, cZ):
-            zc1 = min(shape[0], zc0 + cZ)
-            oz0, oz1 = max(rz0, zc0), min(rz1, zc1)
-            if oz1 <= oz0:
-                continue
-            iz = zc0 // cZ
-            for yc0 in range((ry0 // cY) * cY, ry1, cY):
-                yc1 = min(shape[1], yc0 + cY)
-                oy0, oy1 = max(ry0, yc0), min(ry1, yc1)
-                if oy1 <= oy0:
-                    continue
-                iy = yc0 // cY
-                for xc0 in range((rx0 // cX) * cX, rx1, cX):
-                    xc1 = min(shape[2], xc0 + cX)
-                    ox0, ox1 = max(rx0, xc0), min(rx1, xc1)
-                    if ox1 <= ox0:
-                        continue
-                    ix = xc0 // cX
-                    chunk = _direct_read_chunk(meta, (iz, iy, ix))
-                    out[oz0 - rz0:oz1 - rz0, oy0 - ry0:oy1 - ry0, ox0 - rx0:ox1 - rx0] = chunk[
-                        oz0 - zc0:oz1 - zc0,
-                        oy0 - yc0:oy1 - yc0,
-                        ox0 - xc0:ox1 - xc0,
-                    ]
-    elif len(shape) == 4:
-        ch = 0 if mask_channel is None else int(mask_channel)
-        cC, cZ, cY, cX = chunks
-        ic = ch // cC
-        oc = ch - ic * cC
-        for zc0 in range((rz0 // cZ) * cZ, rz1, cZ):
-            zc1 = min(shape[1], zc0 + cZ)
-            oz0, oz1 = max(rz0, zc0), min(rz1, zc1)
-            if oz1 <= oz0:
-                continue
-            iz = zc0 // cZ
-            for yc0 in range((ry0 // cY) * cY, ry1, cY):
-                yc1 = min(shape[2], yc0 + cY)
-                oy0, oy1 = max(ry0, yc0), min(ry1, yc1)
-                if oy1 <= oy0:
-                    continue
-                iy = yc0 // cY
-                for xc0 in range((rx0 // cX) * cX, rx1, cX):
-                    xc1 = min(shape[3], xc0 + cX)
-                    ox0, ox1 = max(rx0, xc0), min(rx1, xc1)
-                    if ox1 <= ox0:
-                        continue
-                    ix = xc0 // cX
-                    chunk = _direct_read_chunk(meta, (ic, iz, iy, ix))
-                    out[oz0 - rz0:oz1 - rz0, oy0 - ry0:oy1 - ry0, ox0 - rx0:ox1 - rx0] = chunk[
-                        oc,
-                        oz0 - zc0:oz1 - zc0,
-                        oy0 - yc0:oy1 - yc0,
-                        ox0 - xc0:ox1 - xc0,
-                    ]
-    else:
-        raise ValueError(f"mask zarr must be 3D ZYX or 4D CZYX, got shape={shape}")
-    return out
-
-
-def _read_mask_block_resampled_direct(
-    *,
-    mask_meta: dict,
+    mask: ZarrReader,
     mask_channel: int | None,
     target_shape: tuple[int, int, int],
     z0: int,
@@ -910,7 +679,7 @@ def _read_mask_block_resampled_direct(
     x0: int,
     x1: int,
 ) -> np.ndarray:
-    src_shape = tuple(int(v) for v in mask_meta["shape"][-3:])
+    src_shape = tuple(int(v) for v in mask.shape[-3:])
     zi, zv = _mapped_axis_indices(src_shape[0], target_shape[0], z0, z1)
     yi, yv = _mapped_axis_indices(src_shape[1], target_shape[1], y0, y1)
     xi, xv = _mapped_axis_indices(src_shape[2], target_shape[2], x0, x1)
@@ -924,79 +693,22 @@ def _read_mask_block_resampled_direct(
     rz0, rz1 = int(z_valid.min()), int(z_valid.max()) + 1
     ry0, ry1 = int(y_valid.min()), int(y_valid.max()) + 1
     rx0, rx1 = int(x_valid.min()), int(x_valid.max()) + 1
-    slab = _read_mask_region_direct(
-        meta=mask_meta,
-        mask_channel=mask_channel,
-        rz0=rz0,
-        rz1=rz1,
-        ry0=ry0,
-        ry1=ry1,
-        rx0=rx0,
-        rx1=rx1,
-    )
+    region = (slice(rz0, rz1), slice(ry0, ry1), slice(rx0, rx1))
+    if mask.ndim == 4:
+        region = (0 if mask_channel is None else int(mask_channel), *region)
+    slab = mask[region]
     values = slab[np.ix_(z_valid - rz0, y_valid - ry0, x_valid - rx0)] != 0
     out[np.ix_(zv, yv, xv)] = values
     return out
-
-
-def _init_maskout_worker(
-    grad_level_path: str,
-    mask_array_path: str,
-    grad_metadata: dict,
-    mask_metadata: dict,
-    mask_shape: tuple[int, ...],
-    mask_channel: int | None,
-    target_shape: tuple[int, int, int],
-) -> None:
-    global _MASKOUT_GRAD_META, _MASKOUT_MASK_META, _MASKOUT_CFG
-    _MASKOUT_GRAD_META = _direct_zarr_meta(Path(grad_level_path), grad_metadata)
-    _MASKOUT_MASK_META = _direct_zarr_meta(Path(mask_array_path), mask_metadata)
-    _MASKOUT_CFG = {
-        "mask_shape": tuple(int(v) for v in mask_shape),
-        "mask_channel": mask_channel,
-        "target_shape": tuple(int(v) for v in target_shape),
-    }
-
-
-def _maskout_chunk_worker(item: tuple[int, int, int, int, int, int]) -> tuple[tuple[int, int, int, int, int, int], int]:
-    if _MASKOUT_GRAD_META is None or _MASKOUT_MASK_META is None or _MASKOUT_CFG is None:
-        raise RuntimeError("maskout worker was not initialized")
-    z0, z1, y0, y1, x0, x1 = item
-    cZ, cY, cX = tuple(int(v) for v in _MASKOUT_GRAD_META["chunks"])
-    chunk_coord = (z0 // cZ, y0 // cY, x0 // cX)
-    grad_chunk = _direct_read_chunk(_MASKOUT_GRAD_META, chunk_coord)
-    dz, dy, dx = z1 - z0, y1 - y0, x1 - x0
-    gm = grad_chunk[:dz, :dy, :dx]
-    keep = _read_mask_block_resampled_direct(
-        mask_meta=_MASKOUT_MASK_META,
-        mask_channel=_MASKOUT_CFG["mask_channel"],
-        target_shape=_MASKOUT_CFG["target_shape"],
-        z0=z0,
-        z1=z1,
-        y0=y0,
-        y1=y1,
-        x0=x0,
-        x1=x1,
-    )
-    out = np.where((gm != 0) & keep, gm, 0).astype(np.uint8, copy=False)
-    if np.array_equal(out, gm):
-        return item, 0
-    grad_chunk[:dz, :dy, :dx] = out
-    _direct_write_chunk(_MASKOUT_GRAD_META, chunk_coord, grad_chunk)
-    return item, 1
 
 
 def _run_maskout_workers(
     work: list[tuple[int, int, int, int, int, int]],
     *,
     workers: int,
-    grad_level_path: Path,
-    mask_array_path: Path,
-    grad_metadata: dict,
-    mask_metadata: dict,
-    mask_shape: tuple[int, ...],
+    grad: ZarrWriter,
+    mask: ZarrReader,
     mask_channel: int | None,
-    target_shape: tuple[int, int, int],
 ) -> int:
     if not work:
         return 0
@@ -1004,29 +716,26 @@ def _run_maskout_workers(
         workers = max(1, multiprocessing.cpu_count())
     workers = min(max(1, int(workers)), len(work))
 
+    def mask_chunk(item: tuple[int, int, int, int, int, int]) -> int:
+        z0, z1, y0, y1, x0, x1 = item
+        gm = grad[z0:z1, y0:y1, x0:x1]
+        keep = _read_mask_block_resampled(
+            mask=mask, mask_channel=mask_channel, target_shape=grad.shape,
+            z0=z0, z1=z1, y0=y0, y1=y1, x0=x0, x1=x1,
+        )
+        out = np.where((gm != 0) & keep, gm, 0).astype(np.uint8, copy=False)
+        if np.array_equal(out, gm):
+            return 0
+        grad[z0:z1, y0:y1, x0:x1] = out
+        return 1
+
     changed = 0
-    done_count = 0
     progress_t0 = time.time()
     _print_progress(prefix="[maskout apply]", done=0, total=len(work), t0=progress_t0)
-    mp_ctx = multiprocessing.get_context("fork") if sys.platform != "win32" else multiprocessing.get_context("spawn")
-    with mp_ctx.Pool(
-        processes=workers,
-        initializer=_init_maskout_worker,
-        initargs=(
-            str(grad_level_path),
-            str(mask_array_path),
-            grad_metadata,
-            mask_metadata,
-            tuple(int(v) for v in mask_shape),
-            mask_channel,
-            tuple(int(v) for v in target_shape),
-        ),
-    ) as pool:
-        for _done_item, changed_one in pool.imap_unordered(_maskout_chunk_worker, work, chunksize=1):
-            changed += int(changed_one)
-            done_count += 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for done_count, changed_one in enumerate(pool.map(mask_chunk, work), 1):
+            changed += changed_one
             _print_progress(prefix="[maskout apply]", done=done_count, total=len(work), t0=progress_t0)
-    _print_progress(prefix="[maskout apply]", done=len(work), total=len(work), t0=progress_t0)
     print("", flush=True)
     return changed
 
@@ -1047,16 +756,17 @@ def _mark_manifest_v2(vol: LasagnaVolume, *, label: str) -> None:
 def _apply_external_keep_mask(
     *,
     grad_level_path: Path,
-    mask_array_path: Path,
-    mask_shape: tuple[int, ...],
+    mask: ZarrReader,
     mask_channel: int | None,
     workers: int,
 ) -> tuple[int, int, int]:
-    grad_shape_all, grad_chunks_all, grad_dtype, metadata = _array_info_from_metadata(grad_level_path)
+    mask_shape = mask.shape
+    grad = ZarrWriter.open(grad_level_path)
+    grad_shape_all, grad_chunks_all = grad.shape, grad.chunks
     if len(grad_shape_all) != 3:
         raise ValueError(f"grad_mag level must be 3D ZYX, got shape={grad_shape_all}")
-    if np.dtype(grad_dtype) != np.dtype(np.uint8):
-        raise ValueError(f"grad_mag dtype must be uint8, got {grad_dtype}")
+    if grad.dtype != np.dtype(np.uint8):
+        raise ValueError(f"grad_mag dtype must be uint8, got {grad.dtype}")
     if len(mask_shape) not in {3, 4}:
         raise ValueError(f"mask zarr must be 3D ZYX or 4D CZYX, got shape={mask_shape}")
     if len(mask_shape) == 4 and mask_channel is not None:
@@ -1073,6 +783,7 @@ def _apply_external_keep_mask(
     )
 
     chunks = tuple(int(v) for v in grad_chunks_all)
+    stored = stored_chunks(grad_level_path)
     skipped_missing = 0
     total = 0
     work: list[tuple[int, int, int, int, int, int]] = []
@@ -1088,26 +799,16 @@ def _apply_external_keep_mask(
                 x1 = min(X, x0 + cX)
                 ix = x0 // cX
                 total += 1
-                if not _chunk_exists(grad_level_path, (iz, iy, ix), metadata):
+                if (iz, iy, ix) not in stored:
                     skipped_missing += 1
                     continue
                 work.append((z0, z1, y0, y1, x0, x1))
     print(
-        f"[maskout] applying mask with direct chunk IO workers={workers or multiprocessing.cpu_count()} "
+        f"[maskout] applying mask workers={workers or multiprocessing.cpu_count()} "
         f"chunks={len(work)} skipped_missing={skipped_missing} total_chunks={total}",
         flush=True,
     )
-    changed = _run_maskout_workers(
-        work,
-        workers=workers,
-        grad_level_path=grad_level_path,
-        mask_array_path=mask_array_path,
-        grad_metadata=metadata,
-        mask_metadata=_read_metadata(mask_array_path),
-        mask_shape=mask_shape,
-        mask_channel=mask_channel,
-        target_shape=target_shape,
-    )
+    changed = _run_maskout_workers(work, workers=workers, grad=grad, mask=mask, mask_channel=mask_channel)
     return total, skipped_missing, changed
 
 
@@ -1116,11 +817,11 @@ def run_maskout(args: argparse.Namespace) -> None:
     mask_array_path = Path(args.mask_zarr)
     if args.mask_array is not None:
         mask_array_path = mask_array_path / str(args.mask_array)
-    mask_shape, _mask_chunks, mask_dtype, _mask_metadata = _array_info_from_metadata(mask_array_path)
-    if np.dtype(mask_dtype) != np.dtype(np.uint8):
-        raise ValueError(f"mask dtype must be uint8, got {mask_dtype}")
+    mask = open_zarr(mask_array_path, threads=1)
+    if mask.dtype != np.dtype(np.uint8):
+        raise ValueError(f"mask dtype must be uint8, got {mask.dtype}")
     mask_channel = None
-    if len(mask_shape) == 4:
+    if mask.ndim == 4:
         mask_channel = int(args.mask_channel)
     _vol, grad_root, grad_level, data_level = _grad_mag_omezarr_paths(lasagna_json)
     levels = _numeric_omezarr_levels(grad_root)
@@ -1135,8 +836,7 @@ def run_maskout(args: argparse.Namespace) -> None:
     t0 = time.perf_counter()
     total, skipped, changed = _apply_external_keep_mask(
         grad_level_path=grad_level,
-        mask_array_path=mask_array_path,
-        mask_shape=mask_shape,
+        mask=mask,
         mask_channel=mask_channel,
         workers=int(args.workers),
     )

@@ -42,8 +42,6 @@ def _build_parser() -> argparse.ArgumentParser:
 				   help="Output directory for shell_XXXX.tifxyz and interm_shell_XXXX.tifxyz exports")
 	p.add_argument("--device", default=None,
 				   help="Torch device; overrides config args.device, default cuda")
-	p.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python-zarr"), default=None,
-				   help="Streaming prefetch backend; overrides config args.sparse-prefetch-backend")
 	p.add_argument("--z-range", type=float, nargs=2, default=None,
 				   metavar=("Z0", "Z1"), help="Fullres z extent for the cylinder shell")
 	p.add_argument("--start-shell", default=None,
@@ -473,18 +471,6 @@ def main(argv: list[str] | None = None) -> int:
 	if input_path in (None, ""):
 		raise ValueError("missing --input (lasagna volume manifest .lasagna.json)")
 	device_name = args.device if args.device not in (None, "") else _cfg_arg(cfg, "device", "cuda")
-	prefetch_backend = (
-		args.sparse_prefetch_backend
-		if args.sparse_prefetch_backend not in (None, "")
-		else _cfg_arg(cfg, "sparse-prefetch-backend", "tensorstore")
-	)
-	prefetch_backend = str(prefetch_backend)
-	if prefetch_backend not in {"tensorstore", "python-zarr"}:
-		raise ValueError(
-			f"invalid sparse prefetch backend {prefetch_backend!r}; "
-			"expected 'tensorstore' or 'python-zarr'"
-		)
-
 	device = torch.device(str(device_name))
 	out_dir = Path(args.out_dir)
 	out_dir.mkdir(parents=True, exist_ok=True)
@@ -516,7 +502,6 @@ def main(argv: list[str] | None = None) -> int:
 		d = fit_data.load_3d_streaming(
 			path=str(input_path),
 			device=device,
-			sparse_prefetch_backend=prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
 			require_umbilicus=True,
 		)
@@ -535,7 +520,6 @@ def main(argv: list[str] | None = None) -> int:
 	initial_data = fit_data.load_3d_streaming(
 		path=str(input_path),
 		device=device,
-		sparse_prefetch_backend=prefetch_backend,
 		skip_channels=_streaming_skip_channels(set()),
 		require_umbilicus=True,
 	)

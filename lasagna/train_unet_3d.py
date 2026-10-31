@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import open_group
 from vc_reader import images
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -119,14 +119,14 @@ class FittedZarrDataset(Dataset):
             raise ValueError("All samples were filtered out")
 
         # Read step from first sample, verify all are consistent & isotropic
-        root = zarr.open(str(self.samples[0][1]), mode="r")
+        root = open_group(self.samples[0][1])
         sp = root.attrs["spacing"]
         self.step = int(round(sp[0]))
         assert int(round(sp[1])) == self.step and int(round(sp[2])) == self.step, \
             f"Non-isotropic spacing not supported: {sp}"
 
         for _, zp, name in self.samples[1:]:
-            r = zarr.open(str(zp), mode="r")
+            r = open_group(zp)
             s = int(round(r.attrs["spacing"][0]))
             if s != self.step:
                 raise ValueError(f"Inconsistent step: {name} has step={s}, expected {self.step}")
@@ -144,7 +144,7 @@ class FittedZarrDataset(Dataset):
         img_path, zarr_path, name = self.samples[idx]
 
         # Load zarr arrays
-        root = zarr.open(str(zarr_path), mode="r")
+        root = open_group(zarr_path)
         origin = root.attrs["origin_fullres"]  # [x0, y0, z0] in fullres voxels
         normal = np.array(root["normal"])       # (3, Z, Y, X)
         winding = np.array(root["winding"])     # (Z, Y, X)

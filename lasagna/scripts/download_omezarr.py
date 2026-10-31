@@ -2,10 +2,10 @@
 """Download regions of S3 OME-Zarr volumes to local disk.
 
 Produces a local mirror of the remote zarr directory structure that can
-be opened directly with ``zarr.open()``.  Only copies raw compressed
+be opened directly as a local Zarr.  Only copies raw compressed
 chunk bytes — no decoding.
 
-Uses boto3 with per-thread sessions and connection pooling for maximum
+Each thread has its own object store and connection pool, for maximum
 parallel throughput on high-latency links (e.g. Starlink).
 
 Usage examples::
@@ -38,10 +38,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-import boto3
-import botocore.config
-import botocore.exceptions
-from botocore import UNSIGNED
+from vc_reader.reader import ObjectStore
 
 try:
     from lasagna.live_omezarr_cache import SelectedLevelLock
@@ -51,35 +48,30 @@ except ImportError:  # pragma: no cover - direct scripts/ execution.
 
 
 # ---------------------------------------------------------------------------
-# Per-thread boto3 client — each thread gets its own TCP connection pool
+# Per-thread object stores — each thread gets its own TCP connection pool
 # ---------------------------------------------------------------------------
 
 _thread_local = threading.local()
 
 
-def _get_s3_client(anon: bool, region: str | None = None):
-    """Return a boto3 S3 client local to the calling thread.
+def _s3_location(location: str, anon: bool, region: str | None) -> str:
+    """Anonymous requests name the bucket's region in the URL; signed ones find it themselves."""
+    if anon and region:
+        return location.replace("s3://", f"s3+{region}://", 1)
+    return location
 
-    Caches per (anon, region) — a change in either creates a new client.
-    """
-    cache_key = (anon, region)
-    cached = getattr(_thread_local, "s3_client_cache", None)
-    if cached is not None:
-        key, client = cached
-        if key == cache_key:
-            return client
-    cfg = botocore.config.Config(
-        max_pool_connections=4,
-        retries={"mode": "standard", "total_max_attempts": 5},
-        connect_timeout=10,
-        read_timeout=30,
-    )
-    if anon:
-        cfg = cfg.merge(botocore.config.Config(signature_version=UNSIGNED))
-    session = boto3.Session()
-    client = session.client("s3", config=cfg, region_name=region)
-    _thread_local.s3_client_cache = (cache_key, client)
-    return client
+
+def _get_store(bucket: str, anon: bool, region: str | None = None) -> ObjectStore:
+    """Return the bucket's object store local to the calling thread."""
+    cache_key = (bucket, anon, region)
+    stores = getattr(_thread_local, "stores", None)
+    if stores is None:
+        stores = _thread_local.stores = {}
+    store = stores.get(cache_key)
+    if store is None:
+        store = ObjectStore(_s3_location(f"s3://{bucket}", anon, region), auth=None if anon else "aws", connections=4)
+        stores[cache_key] = store
+    return store
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -282,15 +274,16 @@ def _save_noremote(local_root: str, noremote: dict[int, set[str]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# S3 helpers using boto3 directly
+# S3 helpers
 # ---------------------------------------------------------------------------
 
 def _s3_read_bytes(
     bucket: str, key: str, anon: bool, *, region: str | None = None,
 ) -> bytes:
-    client = _get_s3_client(anon, region)
-    resp = client.get_object(Bucket=bucket, Key=key)
-    return resp["Body"].read()
+    data = _get_store(bucket, anon, region).read(key)
+    if data is None:
+        raise FileNotFoundError(f"s3://{bucket}/{key}")
+    return data
 
 
 def _s3_read_json(
@@ -300,47 +293,38 @@ def _s3_read_json(
 
 
 def _s3_exists(bucket: str, key: str, anon: bool) -> bool:
-    client = _get_s3_client(anon)
-    try:
-        client.head_object(Bucket=bucket, Key=key)
-        return True
-    except botocore.exceptions.ClientError:
-        return False
+    return _get_store(bucket, anon).exists(key)
 
 
-def _s3_list_prefix(
+def _s3_children(
     bucket: str, prefix: str, anon: bool, *, region: str | None = None,
 ) -> list[str]:
-    """List immediate children (CommonPrefixes + Contents) under prefix."""
-    client = _get_s3_client(anon, region)
-    if not prefix.endswith("/"):
-        prefix += "/"
-    result: list[str] = []
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-        for cp in page.get("CommonPrefixes", []):
-            result.append(cp["Prefix"].rstrip("/"))
-        for obj in page.get("Contents", []):
-            result.append(obj["Key"])
-    return result
+    """The immediate "subdirectories" of prefix."""
+    return ObjectStore(
+        _s3_location(f"s3://{bucket}/{prefix.strip('/')}", anon, region), auth=None if anon else "aws",
+    ).children()
 
 
 def list_s3_prefix(
     bucket: str, prefix: str, *, anon: bool = True, region: str | None = None,
 ) -> list[str]:
-    """List immediate S3 children with the downloader's paginated client."""
-    return _s3_list_prefix(bucket, prefix, anon, region=region)
+    """Keys of the immediate S3 children of prefix, subdirectories and objects.
+
+    Finding the objects lists everything below prefix: the store has no listing of one level's objects.
+    """
+    prefix = prefix.rstrip("/") + "/"
+    children = {f"{prefix}{name}" for name in _s3_children(bucket, prefix, anon, region=region)}
+    for key in _s3_iter_objects(bucket, prefix, anon, region=region):
+        if "/" not in key[len(prefix):]:
+            children.add(key)
+    return sorted(children)
 
 
 def _s3_iter_objects(
     bucket: str, prefix: str, anon: bool, *, region: str | None = None,
 ):
-    """Yield all object keys under prefix as S3 listing pages arrive."""
-    client = _get_s3_client(anon, region)
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            yield obj["Key"]
+    """All object keys under prefix."""
+    return iter(_get_store(bucket, anon, region).keys(prefix))
 
 
 def _s3_list_objects(bucket: str, prefix: str, anon: bool) -> list[str]:
@@ -432,10 +416,8 @@ def _remaining_download_estimate(s: dict) -> tuple[int, bool]:
 # ---------------------------------------------------------------------------
 
 def _discover_levels(bucket: str, prefix: str, anon: bool) -> list[int]:
-    entries = _s3_list_prefix(bucket, prefix, anon)
     levels: list[int] = []
-    for e in entries:
-        name = e.rstrip("/").rsplit("/", 1)[-1]
+    for name in _s3_children(bucket, prefix, anon):
         try:
             lvl = int(name)
         except ValueError:
@@ -842,9 +824,7 @@ def _download_chunk_atomic(
     region: str | None = None,
 ) -> int:
     """Download one raw chunk with a unique temporary file or raise."""
-    client = _get_s3_client(anon, region)
-    resp = client.get_object(Bucket=bucket, Key=s3_key)
-    data = resp["Body"].read()
+    data = _s3_read_bytes(bucket, s3_key, anon, region=region)
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
     tmp_path = f"{local_path}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
     try:
@@ -873,17 +853,10 @@ def _download_one(
             size = _download_chunk_atomic(bucket, s3_key, local_path, anon)
             stats.inc(downloaded=1, bytes_downloaded=size)
             return True
-        except botocore.exceptions.ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if code in ("NoSuchKey", "404"):
-                stats.add_noremote(level, chunk_key)
-                stats.inc(download_missing=1, missing_remote=1)
-                return True
-            if attempt == max_retries - 1:
-                print(f"\n  WARN: failed {s3_key}: {e}", file=sys.stderr)
-                stats.inc(failed=1)
-                return False
-            time.sleep(0.5 * (attempt + 1))
+        except FileNotFoundError:
+            stats.add_noremote(level, chunk_key)
+            stats.inc(download_missing=1, missing_remote=1)
+            return True
         except Exception as e:
             if attempt == max_retries - 1:
                 print(f"\n  WARN: failed {s3_key}: {e}", file=sys.stderr)
@@ -1156,9 +1129,6 @@ def main(argv: list[str] | None = None) -> int:
     bucket, prefix = _parse_s3_uri(remote_root)
     anon = args.anon
 
-    # Warm up the main-thread client (also validates credentials/connectivity)
-    _get_s3_client(anon, region=args.region)
-
     print(f"Source: s3://{bucket}/{prefix}", file=sys.stderr)
     print(f"Dest:   {local_root}", file=sys.stderr)
 
@@ -1173,12 +1143,12 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 data = _s3_read_json(bucket, s3key, anon)
                 _write_local_json(lpath, data)
-            except (botocore.exceptions.ClientError, FileNotFoundError):
+            except FileNotFoundError:
                 pass
 
     try:
         zattrs = _s3_read_json(bucket, f"{prefix}/.zattrs", anon)
-    except (botocore.exceptions.ClientError, FileNotFoundError):
+    except FileNotFoundError:
         zattrs = {}
 
     multiscales = _parse_multiscales(zattrs)
@@ -1220,7 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
             la = os.path.join(lvl_dir, ".zattrs")
             if not os.path.exists(la):
                 _write_local_json(la, lvl_zattrs)
-        except (botocore.exceptions.ClientError, FileNotFoundError):
+        except FileNotFoundError:
             pass
         print(f"  Level {lvl}: shape={meta['shape']} chunks={meta['chunks']} sep='{meta['dim_sep']}'",
               file=sys.stderr)
@@ -1371,9 +1341,6 @@ def download(
     if not remote_inventory:
         argv.append("--no-remote-inventory")
     argv += ["--workers", str(workers)]
-    # Clear cached S3 client so each download() call gets a fresh session
-    # (avoids mixing anon/authenticated credentials between volumes)
-    _thread_local.s3_client_cache = None
     return main(argv)
 
 
