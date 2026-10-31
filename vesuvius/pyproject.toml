@@ -48,8 +48,10 @@ volume-only = [
     "s3fs>=2025.9.0",
     "vc-delta3d>=0.2.0,<0.3",
 ]
-# Machine-learning & training stack
-models = [
+# Machine-learning & training stack without the monorepo C++ packages
+# (volume-cartographer, vc-object-store). Enough for ink detection, inference
+# and training; use it where those cannot be built (e.g. macOS without Ceres/Qt6).
+models-core = [
     "torch>=2.12,<3",
     "accelerate>=1.13.0",
     "diffusers>=0.37.0",
@@ -60,13 +62,6 @@ models = [
     "timm>=1.0.20",
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
-    # Monorepo-only C++ package (resolved via [tool.uv.sources]); provides the vc /
-    # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
-    # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
-    "volume-cartographer",
-    # Monorepo-only C++ package like volume-cartographer; the fiber tracers and
-    # fiber_trace_3d read and write fibers through its object store.
-    "vc-object-store",
     "villa-gpu-manager",
     "numba>=0.60.0",
     "batchgenerators>=0.25.1",
@@ -97,6 +92,17 @@ models = [
     # cuCIM ships manylinux wheels only; both import sites already fall back
     # gracefully when it is absent, so keep non-Linux platforms resolvable.
     "cucim-cu13>=26.6; sys_platform == 'linux'",
+]
+# Full machine-learning stack, as before models-core was split out.
+models = [
+    "vesuvius[models-core]",
+    # Monorepo-only C++ package (resolved via [tool.uv.sources]); provides the vc /
+    # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
+    # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
+    "volume-cartographer",
+    # Monorepo-only C++ package like volume-cartographer; the fiber tracers and
+    # fiber_trace_3d read and write fibers through its object store.
+    "vc-object-store",
 ]
 # Rendering and geometry utilities
 render = [

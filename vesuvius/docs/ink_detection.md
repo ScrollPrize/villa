@@ -24,6 +24,14 @@ OpenCV, TIFF/Zarr codecs, and the CUDA cuCIM package used by positive native-3D
 label dilation. The volume-only installation does not include the training
 stack.
 
+Ink detection does not use the C++ `volume-cartographer` bindings that the
+`models` extra builds. Where those cannot be built, for example on macOS
+without Ceres and Qt6, install `models-core` instead:
+
+```bash
+uv sync --extra models-core --extra tests
+```
+
 ## Data layout
 
 The published `ink_9um` label tree holds one folder per source family, with
