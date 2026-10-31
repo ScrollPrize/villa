@@ -1909,7 +1909,7 @@ void MenuActionController::attachCatalogRepresentation(const vcr::catalog::OpenD
             _window->refreshCurrentVolumePackageUi();
             return;
         }
-        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection);
+        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection, vc3d::remoteCachePathFs());
         _window->refreshCurrentVolumePackageUi();
         if (result.failedVolumes)
             reportMessages(tr("Attach incomplete"), result.messages);

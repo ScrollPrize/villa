@@ -32,23 +32,29 @@ bool isRemoteZarr(const vcr::catalog::OpenDataArtifact& artifact)
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
                                   const std::string& sourceUrl,
-                                  int sourceLevel)
+                                  int sourceLevel,
+                                  const std::filesystem::path& remoteCacheRoot)
 {
-    const auto levelMeta = [](const std::string& url, int level) {
-        for (const auto& info : vcr::zarr::pyramidLevels(url, {}))
-            if (info.level == level)
-                return info.meta;
-        throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + url);
+    // Through the caches: what a volume's pyramid looks like is kept with them.
+    vcr::zarr::OpenOptions options;
+    if (!remoteCacheRoot.empty())
+        options.cacheDirs = {remoteCacheRoot.string()};
+    auto predictionGroup = vcr::zarr::Group::open(predictionUrl, options);
+    const auto levelMeta = [](vcr::zarr::Group&& group, int level) {
+        const auto node = group.node(std::to_string(level));
+        if (!node || node->first != vcr::zarr::Group::NodeKind::Array)
+            throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + group.location());
+        return vcr::zarr::parseArrayMeta(node->second);
     };
-    const auto prediction = levelMeta(predictionUrl, 0);
-    const auto source = levelMeta(sourceUrl, sourceLevel);
+    const auto multiscales = predictionGroup.multiscales();
+    const auto prediction = levelMeta(std::move(predictionGroup), 0);
+    const auto source = levelMeta(vcr::zarr::Group::open(sourceUrl, options), sourceLevel);
     if (prediction.shape != source.shape)
         throw std::runtime_error("prediction /0 shape does not match source physical /" +
                                  std::to_string(sourceLevel));
     if (prediction.dtype != source.dtype)
         throw std::runtime_error("prediction/source dtype mismatch");
     // Level 0's own OME transform: placements are only relative to it.
-    const auto multiscales = vcr::zarr::Group::open(predictionUrl, {}).multiscales();
     if (!multiscales.empty()) {
         for (const auto& transform : multiscales.at(0).at("datasets").at(0).value("coordinateTransformations", vcr::zarr::Json::array())) {
             const bool identity = transform.value("type", "") == "scale"
@@ -178,7 +184,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                                                         selection ? selection->segmentIds : std::nullopt);
     if (surfaces.added > 0)
         result.messages.push_back("Added " + std::to_string(surfaces.added) + " catalog surface(s).");
-    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
+    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection, remoteCacheRoot);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
     result.skippedVolumes = attachResult.skippedVolumes;
@@ -231,7 +237,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
     const vcr::catalog::OpenDataSample& sample,
-    const OpenDataResourceSelection* selection)
+    const OpenDataResourceSelection* selection,
+    const std::filesystem::path& remoteCacheRoot)
 {
     OpenDataSampleProjectResult result;
     std::vector<std::string> supportedVolumeIds;
@@ -408,7 +415,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
         try {
             preflightPredictionAndSource(
-                candidate.predictionUrl, candidate.sourceUrl, level);
+                candidate.predictionUrl, candidate.sourceUrl, level,
+                remoteCacheRoot);
         } catch (const std::exception& e) {
             ++result.failedVolumes;
             result.messages.push_back(
