@@ -348,9 +348,9 @@ def read_tifxyz(
     )
 
     if volume_path is not None:
-        import zarr
+        from vc_reader.reader import open_node
 
-        tifxyz.volume = zarr.open(volume_path, mode="r")
+        tifxyz.volume = open_node(volume_path)
 
     return tifxyz
 

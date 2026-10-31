@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import tifffile
 
+from vc_reader.reader import ZarrWriter, create_group
 from vesuvius import surface_preflight
 from vesuvius.tifxyz_label_transfer.io import load_surface
 
@@ -447,70 +448,37 @@ def test_resolve_volume_array_prefers_multiscale_level_zero() -> None:
     assert key == "level0"
 
 
-def test_open_volume_accepts_direct_base_array_path(monkeypatch) -> None:
-    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+def _write_pyramid_group(path) -> None:
+    group = create_group(path, attrs={"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}]}]})
+    for key in ("0", "1"):
+        group.create_array(key, shape=(2, 2, 2), chunks=(2, 2, 2), dtype="u1")
 
-    class FakeGroup(dict):
-        attrs = {"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}]}]}
 
-        def array_keys(self):
-            return self.keys()
+def test_open_volume_accepts_direct_base_array_path(tmp_path) -> None:
+    _write_pyramid_group(tmp_path / "volume.zarr")
 
-    class FakeZarr:
-        @staticmethod
-        def open(store, mode):
-            assert store == "/volume.zarr"
-            assert mode == "r"
-            return FakeGroup({"0": expected, "1": expected})
+    array, key = surface_preflight._open_volume(f"{tmp_path}/volume.zarr/0", None)
 
-    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
-
-    array, key = surface_preflight._open_volume("/volume.zarr/0", None)
-
-    assert array is expected
+    assert array.shape == (2, 2, 2)
     assert key == "0"
 
 
-def test_open_volume_rejects_direct_non_base_array_path(monkeypatch) -> None:
-    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
-
-    class FakeGroup(dict):
-        attrs = {"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}]}]}
-
-        def array_keys(self):
-            return self.keys()
-
-    class FakeZarr:
-        @staticmethod
-        def open(store, mode):
-            assert store == "/volume.zarr"
-            assert mode == "r"
-            return FakeGroup({"0": expected, "1": expected})
-
-    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
+def test_open_volume_rejects_direct_non_base_array_path(tmp_path) -> None:
+    _write_pyramid_group(tmp_path / "volume.zarr")
 
     with np.testing.assert_raises_regex(
         ValueError,
         "must select the base-resolution array.*expected '0', got '1'",
     ):
-        surface_preflight._open_volume("/volume.zarr/1", None)
+        surface_preflight._open_volume(f"{tmp_path}/volume.zarr/1", None)
 
 
-def test_open_volume_preserves_standalone_array_store(monkeypatch) -> None:
-    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+def test_open_volume_preserves_standalone_array_store(tmp_path) -> None:
+    ZarrWriter.create(tmp_path / "standalone.zarr", shape=(2, 2, 2), chunks=(2, 2, 2), dtype="u1")
 
-    class FakeZarr:
-        @staticmethod
-        def open(store, mode):
-            assert store == "/standalone.zarr"
-            assert mode == "r"
-            return expected
+    array, key = surface_preflight._open_volume(f"file://{tmp_path}/standalone.zarr", None)
 
-    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
-
-    array, key = surface_preflight._open_volume("/standalone.zarr", None)
-
-    assert array is expected
+    assert array.shape == (2, 2, 2)
     assert key == ""
 
 

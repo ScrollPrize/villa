@@ -15,8 +15,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import zarr
-from vc_reader.reader import create_group
+from vc_reader.reader import ZarrGroup, create_group
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.common import (
@@ -37,7 +36,6 @@ TIFXYZ_PATH = None
 VOLUME_PATH = "auto"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/home/sean/Documents/tmp_infer/vesuvius-volume-cache"
-VOLUME_CACHE_RETRY_SECONDS = 0.0
 CHECKPOINT_PATH = None
 
 # Keep None unless intentionally debugging shape mismatches. The default reads
@@ -741,12 +739,9 @@ def _crop_size_from_config(config):
 def _open_volume_array(volume_path, volume_scale):
     root = open_zarr_group(
         volume_path,
-        config={
-            "volume_cache_dir": VOLUME_CACHE_DIR,
-            "volume_cache_retry_seconds": VOLUME_CACHE_RETRY_SECONDS,
-        },
+        config={"volume_cache_dir": VOLUME_CACHE_DIR},
     )
-    if isinstance(root, zarr.Group):
+    if isinstance(root, ZarrGroup):
         scale_key = str(int(volume_scale))
         if scale_key not in root:
             raise KeyError(f"volume scale {scale_key!r} not found in {volume_path}")
@@ -2780,7 +2775,6 @@ def _parse_args(argv=None):
         help="Volume pyramid scale. Defaults to the matched checkpoint dataset scale when --volume-path=auto.",
     )
     parser.add_argument("--volume-cache-dir", default="/tmp/vesuvius-volume-cache")
-    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
     parser.add_argument("--output-dir", required=True, help="Run output directory.")
     parser.add_argument("--grow-direction", default="left", choices=sorted(_DIRECTION_SPECS))
     parser.add_argument("--num-iterations", type=int, default=10)
@@ -2816,7 +2810,7 @@ def _parse_args(argv=None):
 
 
 def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tifxyz_voxel_step, runtime_device=None):
-    global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR, VOLUME_CACHE_RETRY_SECONDS
+    global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR
     global CHECKPOINT_PATH, BATCH_SIZE, DEVICE, COMPILE_MODEL, OUTPUT_TIFXYZ_DIR
     global OUTPUT_TIFXYZ_VOXEL_SIZE_UM, RUN_OUTPUT_DIR, RUN_TIMESTAMP, USE_TTA
     global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS
@@ -2827,7 +2821,6 @@ def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tif
     VOLUME_PATH = str(resolved_volume_path)
     VOLUME_SCALE = int(resolved_volume_scale)
     VOLUME_CACHE_DIR = str(args.volume_cache_dir)
-    VOLUME_CACHE_RETRY_SECONDS = float(args.volume_cache_retry_seconds)
     BATCH_SIZE = int(args.batch_size)
     DEVICE = str(args.device if runtime_device is None else runtime_device)
     COMPILE_MODEL = bool(args.compile_model)

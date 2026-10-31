@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 if TYPE_CHECKING:
-    import zarr
+    from vc_reader.reader import ZarrGroup, ZarrReader
     import torch
 
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str((1 << 63) - 1))
@@ -64,7 +64,7 @@ class Tifxyz:
     path: Optional[Path] = None
     interp_method: InterpolationMethod = "catmull_rom"
     resolution: Literal["stored", "full"] = "stored"
-    volume: Optional["zarr.Array"] = field(default=None, repr=False)
+    volume: Optional["ZarrReader | ZarrGroup"] = field(default=None, repr=False)
     # Cache fields for quad properties
     _valid_quad_mask_cache: Optional[NDArray[np.bool_]] = field(default=None, repr=False)
     _quad_centers_cache: Optional[NDArray[np.float32]] = field(default=None, repr=False)
@@ -971,7 +971,7 @@ class Tifxyz:
             volume=new_volume,
         )
 
-    def _get_volume_level(self, factor: float) -> Optional["zarr.Array"]:
+    def _get_volume_level(self, factor: float) -> Optional["ZarrReader"]:
         """Get the appropriate OME-zarr resolution level for the given factor.
 
         For OME-zarr groups with multiple resolution levels (0, 1, 2, ...),
@@ -984,17 +984,17 @@ class Tifxyz:
 
         Returns
         -------
-        zarr.Array or None
+        ZarrReader or None
             The appropriate resolution level array.
         """
-        import zarr
+        from vc_reader.reader import ZarrGroup
 
         vol = self.volume
         if vol is None:
             return None
 
         # If it's a zarr Group (OME-zarr), find the right level
-        if isinstance(vol, zarr.Group):
+        if isinstance(vol, ZarrGroup):
             # OME-zarr levels are typically named "0", "1", "2", etc.
             # Level 0 is full resolution, higher levels are downsampled by 2x each
             level = int(np.log2(factor)) if factor >= 1 else 0

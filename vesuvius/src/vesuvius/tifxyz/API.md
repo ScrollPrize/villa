@@ -330,7 +330,7 @@ surface = read_tifxyz("/path/to/segment", volume_path="/path/to/volume.zarr")
 
 # Option 2: Set volume after loading
 import zarr
-surface.volume = zarr.open("/path/to/volume.zarr", mode="r")
+surface.volume = vc_reader.reader.open_node("/path/to/volume.zarr")
 ```
 
 ### retarget
@@ -391,7 +391,7 @@ surface = read_tifxyz(
 
 # Example with volume association
 surface = read_tifxyz("/path/to/segment", volume_path="/path/to/volume.zarr")
-print(surface.volume)  # zarr.Group or zarr.Array
+print(surface.volume)  # ZarrGroup or ZarrReader
 ```
 
 ### write_tifxyz

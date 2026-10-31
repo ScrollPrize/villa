@@ -1664,20 +1664,6 @@ def _evaluate_trace2cp_metric_fixed_set(
     )
 
 
-def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
-    if cache_stats is None:
-        return {}
-    return {
-        "cache/hits": float(getattr(cache_stats, "cache_hits", 0)),
-        "cache/downloads": float(getattr(cache_stats, "downloads", 0)),
-        "cache/misses": float(getattr(cache_stats, "missing", 0)) + float(getattr(cache_stats, "negative_hits", 0)),
-        "cache/hit_mib": float(getattr(cache_stats, "cache_hit_bytes", 0)) / (1024.0 * 1024.0),
-        "cache/download_mib": float(getattr(cache_stats, "download_bytes", 0)) / (1024.0 * 1024.0),
-        "cache/hit_ms": float(getattr(cache_stats, "cache_hit_ms", 0.0)),
-        "cache/download_ms": float(getattr(cache_stats, "download_ms", 0.0)),
-    }
-
-
 _SUMMED_PREFETCH_KEYS = (
     "samples",
     "skipped_samples",
@@ -2308,8 +2294,6 @@ def run_training(
                 writer.add_scalar("timing/prep_wait_ms", prep_wait_ms, step)
                 writer.add_scalar("timing/prep_submit_ms", prep_submit_ms, step)
                 writer.add_scalar("timing/train_ms", train_ms, step)
-                for key, value in _cache_scalars(batch.cache_stats).items():
-                    writer.add_scalar(key, value, step)
                 wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
@@ -2330,8 +2314,6 @@ def run_training(
                     )
                     writer.add_scalar("test/trace2cp_segments", test_trace2cp_metric.segments, step)
                     writer.add_scalar("test/trace2cp_skipped_segments", test_trace2cp_metric.skipped_segments, step)
-                for key, value in _cache_scalars(test_result.batch.cache_stats).items():
-                    writer.add_scalar(f"test_{key}", value, step)
                 wrote_tensorboard = True
             if writer is not None and (
                 is_first_run_step or step == 1 or step % training.tensorboard_image_interval == 0

@@ -6,7 +6,7 @@ relates the two (``p_fixed = M @ p_moving`` in XYZ order). We enumerate
 foreground patches natively in label-voxel coords, then resample the
 matching image region through ``M^{-1}`` with trilinear interpolation.
 
-All S3/HTTPS/local zarr I/O goes through :func:`vesuvius.data.utils.open_zarr`.
+All S3/HTTPS/local zarr I/O goes through ``vc_reader``.
 The patch index is built once per unique (labels URL, patch size, thresholds,
 transform checksum) tuple and cached on disk.
 """
@@ -23,11 +23,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import zarr
 from torch.utils.data import Dataset
+from vc_reader.reader import ZarrReader, open_node
 
 from vesuvius.data import affine
-from vesuvius.data.utils import open_zarr
 from vesuvius.utils.utils import pad_or_crop_3d
 
 from ..augmentation.pipelines import create_training_transforms, sample_seed
@@ -48,19 +47,17 @@ def _stage(msg: str) -> None:
 
 
 def _open_zarr_any(url: str, storage_options: Optional[dict]):
-    """Open a zarr at ``url``. Uses ``open_zarr`` for http(s)/s3 URLs and
-    ``zarr.open`` for local paths, because zarr rejects ``storage_options``
-    on non-fsspec paths even when the mapping is empty.
+    """Group or array at ``url``, read in DataLoader workers. ``storage_options``
+    may say ``anon``: true to send no credentials.
     """
-    if url.startswith(("http://", "https://", "s3://")):
-        return open_zarr(url, mode="r", storage_options=storage_options or {})
-    return zarr.open(url, mode="r")
+    auth = None if (storage_options or {}).get("anon") else "auto"
+    return open_node(url, auth=auth, threads=1)
 
 
-def _resolve_zarr_array(obj) -> zarr.Array:
-    """Return the underlying ``zarr.Array`` for a group-or-array object.
+def _resolve_zarr_array(obj) -> ZarrReader:
+    """Return the array for a group-or-array object.
 
-    ``open_zarr`` may return a Group when the URL points at an OME-Zarr
+    ``open_node`` returns a group when the URL points at an OME-Zarr
     container. Prefer the ``"0"`` subpath, then a handful of common fallbacks.
     """
     if hasattr(obj, "shape") and hasattr(obj, "dtype") and not hasattr(obj, "keys"):
@@ -144,12 +141,10 @@ class CrossFrameZarrDataset(Dataset):
         )
 
         # Zarr handles are opened lazily per-process (see
-        # ``_ensure_process_local_handles``). An fsspec/s3fs session pickled
-        # into a DataLoader worker does not survive fork/spawn cleanly, which
-        # is why dinovol uses the same per-PID reopen pattern.
-        self._image_array: Optional[zarr.Array] = None
-        self._labels_array: Optional[zarr.Array] = None
-        self._scan_array: Optional[zarr.Array] = None
+        # ``_ensure_process_local_handles``).
+        self._image_array: Optional[ZarrReader] = None
+        self._labels_array: Optional[ZarrReader] = None
+        self._scan_array: Optional[ZarrReader] = None
         self._handle_pid: Optional[int] = None
         self._atexit_pid: Optional[int] = None
         self._debug_calls_remaining: int = self._DEBUG_CALLS_PER_PID

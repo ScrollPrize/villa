@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
-import zarr
 from numpy.lib.stride_tricks import as_strided
 
 logger = logging.getLogger(__name__)

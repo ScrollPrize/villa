@@ -12,7 +12,8 @@ import time
 from typing import Any
 
 import torch
-import zarr
+import vc_reader
+from vc_reader.reader import open_node
 
 try:
     from lasagna.live_omezarr_cache import (
@@ -482,7 +483,7 @@ def run_fiber_trace_3d_inference(
     if not no_download and not live_fetch:
         _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
-    a_in = zarr.open(str(input_path), mode="r")
+    a_in = open_node(str(input_path))
     if not hasattr(a_in, "shape"):
         raise ValueError(f"input must point to a zarr array, got: {input_path}")
     input_shape = tuple(int(v) for v in a_in.shape)
@@ -669,7 +670,7 @@ def run_fiber_trace_3d_inference(
         "runtime": {
             "python": platform.python_version(),
             "torch": torch.__version__,
-            "zarr": getattr(zarr, "__version__", None),
+            "vc_reader": vc_reader.__version__,
             "cuda": torch.version.cuda,
         },
         "manifest": output_manifest.name,

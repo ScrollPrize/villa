@@ -163,10 +163,7 @@ def _resolve_volume_array(opened: Any, array_key: str | None) -> tuple[Any, str]
 
 
 def _open_volume(volume: str, array_key: str | None) -> tuple[Any, str]:
-    try:
-        import zarr
-    except ImportError as exc:  # pragma: no cover - package dependency invariant
-        raise RuntimeError("surface preflight requires zarr") from exc
+    from vc_reader.reader import open_node
 
     store_volume = volume.rstrip("/")
     direct_key = None
@@ -179,14 +176,7 @@ def _open_volume(volume: str, array_key: str | None) -> tuple[Any, str]:
             "selects a Zarr array"
         )
 
-    store: Any = store_volume
-    if "://" in store_volume and not store_volume.startswith("file://"):
-        import fsspec
-
-        store = fsspec.get_mapper(store_volume)
-    elif store_volume.startswith("file://"):
-        store = store_volume.removeprefix("file://")
-    opened = zarr.open(store, mode="r")
+    opened = open_node(store_volume.removeprefix("file://"))
     return _resolve_volume_array(opened, direct_key or array_key)
 
 

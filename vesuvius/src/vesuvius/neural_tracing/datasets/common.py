@@ -1,535 +1,24 @@
 import torch
 import numpy as np
-import fsspec
 import json
 import os
-import threading
-import asyncio
-import time
 from numba import njit
 from dataclasses import dataclass
 from pathlib import Path
 from vesuvius.tifxyz import Tifxyz
 from vesuvius.tifxyz.upsampling import interpolate_at_points
-import zarr
-import zarr.storage
+from vc_reader.reader import ZarrGroup, ZarrReader, load_basic_auth, open_node
 from typing import Any, Dict, List, Tuple
 import re
 from functools import lru_cache
 from scipy import ndimage
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
-from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 import tifffile
 import warnings
-from collections.abc import MutableMapping
 
 
 _HTTP_PREFIXES = ('http://', 'https://')
-_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
-
-if _ZARR_V3:
-    from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
-else:
-    # These names are only used by the Zarr 3 store implementation below.
-    OffsetByteRequest = RangeByteRequest = SuffixByteRequest = ()
-
-
-@dataclass
-class ZarrCacheTraceStats:
-    cache_hits: int = 0
-    downloads: int = 0
-    negative_hits: int = 0
-    missing: int = 0
-    cache_hit_bytes: int = 0
-    download_bytes: int = 0
-    cache_hit_ms: float = 0.0
-    download_ms: float = 0.0
-    missing_ms: float = 0.0
-
-
-_CACHE_TRACE_LOCAL = threading.local()
-
-
-def begin_zarr_cache_trace() -> None:
-    _CACHE_TRACE_LOCAL.stats = ZarrCacheTraceStats()
-
-
-def end_zarr_cache_trace() -> ZarrCacheTraceStats:
-    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
-    _CACHE_TRACE_LOCAL.stats = None
-    return stats if isinstance(stats, ZarrCacheTraceStats) else ZarrCacheTraceStats()
-
-
-def _record_zarr_cache_event(kind: str, *, byte_count: int = 0, elapsed_ms: float = 0.0) -> None:
-    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
-    if not isinstance(stats, ZarrCacheTraceStats):
-        return
-    if kind == "cache_hit":
-        stats.cache_hits += 1
-        stats.cache_hit_bytes += int(byte_count)
-        stats.cache_hit_ms += float(elapsed_ms)
-    elif kind == "download":
-        stats.downloads += 1
-        stats.download_bytes += int(byte_count)
-        stats.download_ms += float(elapsed_ms)
-    elif kind == "negative_hit":
-        stats.negative_hits += 1
-        stats.missing_ms += float(elapsed_ms)
-    elif kind == "missing":
-        stats.missing += 1
-        stats.missing_ms += float(elapsed_ms)
-
-
-class OfflineCacheMiss(Exception):
-    """Raised when a zarr chunk fetch is attempted in offline mode but the
-    chunk is not present in the local _DiskCacheStore cache (neither as data
-    nor as a negative marker).
-
-    Used by testing/dev flows that want to train on whatever happens to be
-    cached already, without issuing any network requests."""
-
-
-# Exceptions that are NEVER retried — they won't resolve by waiting.
-# OfflineCacheMiss must be here because it's our own marker and would
-# otherwise be caught by the broad OSError check.
-_NEVER_RETRY_EXCEPTIONS: tuple = (
-    OfflineCacheMiss,
-    PermissionError,        # OSError subclass; permanent denial
-    IsADirectoryError,      # OSError subclass; structural problem
-    NotADirectoryError,     # OSError subclass; structural problem
-)
-
-# Exceptions that ARE retried with backoff. OSError covers ConnectionError,
-# TimeoutError, asyncio.TimeoutError (Python 3.11+), aiohttp.ClientConnectionError
-# (which inherits OSError), most fsspec wrapped errors, etc. Anything in
-# _NEVER_RETRY_EXCEPTIONS is excluded earlier in the except chain.
-#
-# Note: zarr's FsspecStore.get already converts FileNotFoundError/KeyError
-# (the genuine "missing chunk" cases) into a None return via its
-# allowed_exceptions filter, so they never reach this retry layer.
-_RETRYABLE_EXCEPTIONS: tuple = (OSError,)
-
-# Add botocore exceptions when available so S3 endpoint/credential failures
-# get retried too. botocore.BotoCoreError is the base for connection/timeout
-# errors; ClientError covers HTTP 4xx/5xx returned by the service. We retry
-# both — permanent ClientErrors (NoSuchKey, AccessDenied) will burn the budget
-# and then propagate.
-try:
-    import botocore.exceptions as _botocore_exceptions
-    _RETRYABLE_EXCEPTIONS = _RETRYABLE_EXCEPTIONS + (
-        _botocore_exceptions.BotoCoreError,
-        _botocore_exceptions.ClientError,
-    )
-    del _botocore_exceptions
-except ImportError:
-    pass
-
-
-class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
-    """Read-only Zarr v2 store wrapper that lazily caches remote bytes to disk."""
-
-    def __init__(
-        self,
-        remote: Any,
-        cache_dir: str,
-        url: str,
-        offline: bool = False,
-        retry_budget_seconds: float = 0.0,
-    ) -> None:
-        super().__init__(remote)
-        self._remote = remote
-        self._cache_root = cache_dir
-        self._url = url
-        self._offline = offline
-        self._retry_budget_seconds = float(retry_budget_seconds)
-        self._url = str(url)
-        # Namespace cache by the normalized remote URL to prevent cross-dataset
-        # chunk-key collisions. Zarr chunk keys are relative paths inside one
-        # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
-        # would write to the same paths under cache_dir.
-        normalized = url.rstrip('/')
-        scheme, sep, rest = normalized.partition('://')
-        subdir = os.path.join(scheme, rest) if sep else normalized
-        self._cache_dir = os.path.join(cache_dir, subdir)
-
-    # Suffix appended to the cached path to mark a "known-missing" chunk.
-    # Zarr chunk keys don't contain this pattern, so there's no collision
-    # with a real cached chunk filename.
-    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
-
-    @property
-    def supports_writes(self) -> bool:
-        return False
-
-    @property
-    def supports_deletes(self) -> bool:
-        return False
-
-    def with_read_only(self, read_only: bool = False):
-        if not read_only:
-            raise NotImplementedError("_DiskCacheStore is always read-only")
-        return type(self)(
-            self._remote.with_read_only(True),
-            self._cache_root,
-            self._url,
-            offline=self._offline,
-            retry_budget_seconds=self._retry_budget_seconds,
-        )
-
-    async def _remote_get_with_retry(self, key, prototype, byte_range=None):
-        """Read one key from the wrapped remote store with backoff retries."""
-        if self._retry_budget_seconds <= 0.0:
-            return await self._remote.get(key, prototype, byte_range)
-
-        deadline = time.monotonic() + self._retry_budget_seconds
-        delay = 1.0
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await self._remote.get(key, prototype, byte_range)
-            except _NEVER_RETRY_EXCEPTIONS:
-                raise
-            except _RETRYABLE_EXCEPTIONS as exc:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    print(
-                        f"[_DiskCacheStore] giving up on {key!r} after "
-                        f"{attempt} attempts, "
-                        f"{self._retry_budget_seconds:.0f}s budget exhausted: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-                    raise
-                wait = min(delay, remaining, 60.0)
-                print(
-                    f"[_DiskCacheStore] transient error fetching {key!r} "
-                    f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
-                    f"retrying in {wait:.1f}s "
-                    f"(remaining budget {remaining:.0f}s)",
-                    flush=True,
-                )
-                await asyncio.sleep(wait)
-                delay = min(delay * 2.0, 60.0)
-
-    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
-        """Write `data` to `target` atomically.
-
-        Uses a per-process/thread temp file in the same directory + os.replace,
-        which is atomic on POSIX. Concurrent readers always see either the
-        old content or the new — never a partially written file.
-        """
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
-        try:
-            with open(tmp, 'wb') as f:
-                f.write(data)
-            os.replace(tmp, target)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
-    @staticmethod
-    def _buffer_from_cached_bytes(data, prototype, byte_range=None):
-        if isinstance(byte_range, RangeByteRequest):
-            data = data[byte_range.start:byte_range.end]
-        elif isinstance(byte_range, OffsetByteRequest):
-            data = data[byte_range.offset:]
-        elif isinstance(byte_range, SuffixByteRequest):
-            data = data[-byte_range.suffix:]
-        elif byte_range is not None:
-            raise ValueError(f"unexpected byte range request: {byte_range!r}")
-        return prototype.buffer.from_bytes(data)
-
-    async def get(self, key, prototype, byte_range=None):
-        start = time.perf_counter()
-        cached = os.path.join(self._cache_dir, key)
-        marker = cached + self._NEGATIVE_MARKER_SUFFIX
-
-        # Positive cache hit.
-        if os.path.isfile(cached):
-            try:
-                with open(cached, 'rb') as f:
-                    data = f.read()
-                _record_zarr_cache_event(
-                    "cache_hit",
-                    byte_count=len(data),
-                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
-                )
-                return self._buffer_from_cached_bytes(data, prototype, byte_range)
-            except FileNotFoundError:
-                # Raced with a concurrent replace; fall through to re-fetch.
-                pass
-        # Negative cache hit → known-missing, skip the remote round-trip.
-        if os.path.isfile(marker):
-            _record_zarr_cache_event(
-                "negative_hit",
-                elapsed_ms=(time.perf_counter() - start) * 1000.0,
-            )
-            return None
-
-        if self._offline:
-            raise OfflineCacheMiss(
-                f"offline mode: chunk {key!r} not in local cache "
-                f"({self._cache_dir})"
-            )
-
-        # A partial response cannot populate the full-object disk cache. Range
-        # reads are uncommon for Zarr chunks, so delegate cache misses to the
-        # remote store and preserve its exact ByteRequest semantics.
-        result = await self._remote_get_with_retry(key, prototype, byte_range)
-        if result is None:
-            try:
-                self._atomic_write_bytes(marker, b"")
-            except OSError:
-                pass
-            _record_zarr_cache_event(
-                "missing",
-                elapsed_ms=(time.perf_counter() - start) * 1000.0,
-            )
-            return None
-
-        if byte_range is None:
-            data = result.to_bytes()
-            self._atomic_write_bytes(cached, data)
-            byte_count = len(data)
-        else:
-            byte_count = len(result.to_bytes())
-        _record_zarr_cache_event(
-            "download",
-            byte_count=byte_count,
-            elapsed_ms=(time.perf_counter() - start) * 1000.0,
-        )
-        return result
-
-    async def exists(self, key):
-        cached = os.path.join(self._cache_dir, key)
-        if os.path.isfile(cached):
-            return True
-        if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
-            return False
-        if self._offline:
-            return False
-        return await self._remote.exists(key)
-
-    async def get_partial_values(self, prototype, key_ranges):
-        return await asyncio.gather(*(
-            self.get(key, prototype, byte_range)
-            for key, byte_range in key_ranges
-        ))
-
-    async def set(self, key, value):
-        raise PermissionError("read-only cache store")
-
-    async def delete(self, key):
-        raise PermissionError("read-only cache store")
-
-    def close(self) -> None:
-        close_fn = getattr(self._remote, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, _DiskCacheStoreV3)
-            and self._remote == other._remote
-            and self._cache_dir == other._cache_dir
-        )
-
-
-class _DiskCacheStoreV2(MutableMapping):
-    """Read-only Zarr v2 mapping that lazily caches remote bytes to disk."""
-
-    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
-
-    def __init__(
-        self,
-        remote: MutableMapping,
-        cache_dir: str,
-        url: str,
-        offline: bool = False,
-        retry_budget_seconds: float = 0.0,
-    ) -> None:
-        self._remote = remote
-        self._cache_root = cache_dir
-        self._url = url
-        self._offline = offline
-        self._retry_budget_seconds = float(retry_budget_seconds)
-        normalized = url.rstrip('/')
-        scheme, sep, rest = normalized.partition('://')
-        subdir = os.path.join(scheme, rest) if sep else normalized
-        self._cache_dir = os.path.join(cache_dir, subdir)
-
-    def with_read_only(self, read_only: bool = False):
-        if not read_only:
-            raise NotImplementedError("_DiskCacheStore is always read-only")
-        return type(self)(
-            self._remote,
-            self._cache_root,
-            self._url,
-            offline=self._offline,
-            retry_budget_seconds=self._retry_budget_seconds,
-        )
-
-    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
-        try:
-            with open(tmp, 'wb') as f:
-                f.write(data)
-            os.replace(tmp, target)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
-    def _remote_get_with_retry(self, key):
-        if self._retry_budget_seconds <= 0.0:
-            return self._remote[key]
-
-        deadline = time.monotonic() + self._retry_budget_seconds
-        delay = 1.0
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return self._remote[key]
-            except _NEVER_RETRY_EXCEPTIONS:
-                raise
-            except _RETRYABLE_EXCEPTIONS as exc:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    print(
-                        f"[_DiskCacheStore] giving up on {key!r} after "
-                        f"{attempt} attempts, "
-                        f"{self._retry_budget_seconds:.0f}s budget exhausted: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-                    raise
-                wait = min(delay, remaining, 60.0)
-                print(
-                    f"[_DiskCacheStore] transient error fetching {key!r} "
-                    f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
-                    f"retrying in {wait:.1f}s "
-                    f"(remaining budget {remaining:.0f}s)",
-                    flush=True,
-                )
-                time.sleep(wait)
-                delay = min(delay * 2.0, 60.0)
-
-    def __getitem__(self, key):
-        start = time.perf_counter()
-        cached = os.path.join(self._cache_dir, key)
-        marker = cached + self._NEGATIVE_MARKER_SUFFIX
-
-        # Positive cache hit.
-        if os.path.isfile(cached):
-            try:
-                with open(cached, 'rb') as f:
-                    data = f.read()
-                _record_zarr_cache_event(
-                    "cache_hit",
-                    byte_count=len(data),
-                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
-                )
-                return data
-            except FileNotFoundError:
-                # Raced with a concurrent replace; fall through to re-fetch.
-                pass
-        # Negative cache hit → known-missing, skip the remote round-trip.
-        if os.path.isfile(marker):
-            _record_zarr_cache_event(
-                "negative_hit",
-                elapsed_ms=(time.perf_counter() - start) * 1000.0,
-            )
-            raise KeyError(key)
-        if self._offline:
-            raise OfflineCacheMiss(
-                f"offline mode: chunk {key!r} not in local cache "
-                f"({self._cache_dir})"
-            )
-
-        try:
-            result = self._remote_get_with_retry(key)
-        except KeyError:
-            try:
-                self._atomic_write_bytes(marker, b"")
-            except OSError:
-                pass
-            _record_zarr_cache_event(
-                "missing",
-                elapsed_ms=(time.perf_counter() - start) * 1000.0,
-            )
-            raise
-
-        result = bytes(result)
-        self._atomic_write_bytes(cached, result)
-        _record_zarr_cache_event(
-            "download",
-            byte_count=len(result),
-            elapsed_ms=(time.perf_counter() - start) * 1000.0,
-        )
-        return result
-
-    def get(self, key, default=None):
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def __contains__(self, key):
-        cached = os.path.join(self._cache_dir, key)
-        if os.path.isfile(cached):
-            return True
-        if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
-            return False
-        if self._offline:
-            return False
-        return key in self._remote
-
-    def __iter__(self):
-        return iter(self._remote)
-
-    def __len__(self):
-        return len(self._remote)
-
-    def __setitem__(self, key, value):
-        raise PermissionError("read-only cache store")
-
-    def __delitem__(self, key):
-        raise PermissionError("read-only cache store")
-
-    def close(self) -> None:
-        close_fn = getattr(self._remote, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, _DiskCacheStoreV2)
-            and self._remote == other._remote
-            and self._cache_dir == other._cache_dir
-        )
-
-
-_DiskCacheStore = _DiskCacheStoreV3 if _ZARR_V3 else _DiskCacheStoreV2
-
-
-def _make_remote_store(path: str, storage_opts: dict, *, missing_exceptions: tuple[type[Exception], ...]):
-    if _ZARR_V3:
-        return zarr.storage.FsspecStore.from_url(
-            path.rstrip('/'),
-            storage_options=storage_opts,
-            read_only=True,
-            allowed_exceptions=missing_exceptions,
-        )
-    return zarr.storage.FSStore(path.rstrip('/'), mode='r', **storage_opts)
+_REMOTE_PREFIXES = (*_HTTP_PREFIXES, 's3://')
 
 
 def _resolve_config_relative_path(path_value, config):
@@ -547,58 +36,14 @@ def _resolve_config_relative_path(path_value, config):
     return Path.cwd() / path_obj
 
 
-def _load_http_basic_auth(auth_json_path, config):
-    """Load HTTP basic auth credentials from a JSON file."""
-    resolved_path = _resolve_config_relative_path(auth_json_path, config)
-    if resolved_path is None:
-        return None
-
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"volume_auth_json file not found: {resolved_path}")
-
-    with open(resolved_path, 'r', encoding='utf-8') as f:
-        auth_data = json.load(f)
-
-    if not isinstance(auth_data, dict):
-        raise ValueError(
-            f"volume_auth_json must contain a JSON object, got {type(auth_data).__name__}"
-        )
-
-    auth_root = auth_data.get('auth') if isinstance(auth_data.get('auth'), dict) else auth_data
-    username = auth_root.get('username', auth_root.get('user'))
-    password = auth_root.get('password')
-
-    if not username or password is None:
-        raise ValueError(
-            f"volume_auth_json ({resolved_path}) must contain 'username' (or 'user') and 'password' fields"
-        )
-
-    return str(username), str(password)
-
-
-def open_zarr(path, scale=None, auth_json_path=None, config=None):
-    """Open a zarr volume from a local path, HTTP URL, or S3 URI.
-
-    Remote paths (HTTP/S3) require ``volume_cache_dir`` in *config* to enable
-    fsspec ``filecache`` so that zarr chunks are cached locally across epochs
-    and training runs.
-
-    Args:
-        path: Local path, ``http(s)://`` URL, or ``s3://`` URI to a zarr store.
-        scale: Resolution level inside the zarr group (default ``0``).
-        auth_json_path: Path to a JSON file with HTTP basic-auth credentials.
-        config: Dict with optional keys ``volume_cache_dir``, ``_config_dir``.
-    """
-    import aiohttp
-
+def _volume_open_options(path, auth_json_path, config, threads):
+    """vc_reader's open arguments from a dataset config: ``volume_cache_dir``
+    (required for a remote volume), ``volume_cache_offline``, and HTTP basic
+    auth from ``auth_json_path``."""
     path = str(path)
     config = {} if config is None else config
-    scale = 0 if scale is None else int(scale)
-
-    is_http = path.startswith(_HTTP_PREFIXES)
-    is_s3 = path.startswith('s3://')
-
-    if is_http or is_s3:
+    options = {"threads": threads}
+    if path.startswith(_REMOTE_PREFIXES):
         cache_dir = config.get('volume_cache_dir')
         if not cache_dir:
             raise ValueError(
@@ -606,109 +51,23 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
                 f"Set it to a local directory for caching, e.g. "
                 f'{{"volume_cache_dir": "/data/zarr_cache"}}'
             )
-        cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
-        offline = bool(config.get('volume_cache_offline', False))
-        retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
-
-    if is_http:
-        storage_opts = {}
-        # Only truly "chunk missing" errors belong here. Zarr converts anything
-        # in this tuple to a None return from store.get, which _DiskCacheStore
-        # then negative-caches. A broad catch like OSError/ClientResponseError
-        # would silently treat transient network failures (connection reset,
-        # 503) as permanent "missing" and poison the cache.
-        store_exceptions = (KeyError, FileNotFoundError)
-
-        if auth_json_path:
-            username, password = _load_http_basic_auth(auth_json_path, config)
-            storage_opts['client_kwargs'] = {'auth': aiohttp.BasicAuth(username, password)}
-
-        remote = _make_remote_store(
-            path,
-            storage_opts,
-            missing_exceptions=store_exceptions,
-        )
-        store = _DiskCacheStore(
-            remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
-        )
-        return zarr.open(store, path=str(scale), mode='r')
-
-    if is_s3:
-        remote = _make_remote_store(
-            path,
-            s3_storage_options_for_path(path),
-            missing_exceptions=(KeyError, FileNotFoundError),
-        )
-        store = _DiskCacheStore(
-            remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
-        )
-        return zarr.open(store, path=str(scale), mode='r')
-
-    # Local path — no caching needed.
-    return zarr.open(path, path=str(scale), mode='r')
+        options["cache_dir"] = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
+        options["offline"] = bool(config.get('volume_cache_offline', False))
+    if auth_json_path and path.startswith(_HTTP_PREFIXES):
+        options["auth"] = load_basic_auth(_resolve_config_relative_path(auth_json_path, config))
+    return options
 
 
-def open_zarr_group(path, auth_json_path=None, config=None):
-    """Open a zarr volume as a root Group (all pyramid levels accessible).
+def open_zarr(path, scale=None, auth_json_path=None, config=None, threads=None):
+    """One level of a volume: a local path, HTTP URL, or S3 URI."""
+    return ZarrReader.open(
+        str(path), level=0 if scale is None else int(scale),
+        **_volume_open_options(path, auth_json_path, config, threads))
 
-    Same store setup as :func:`open_zarr` but returns the root
-    ``zarr.Group`` instead of a specific scale level.  Use
-    ``group[str(level)]`` to access individual pyramid arrays.
 
-    This is used for scale augmentation where we need to read from
-    multiple pyramid levels per sample.
-    """
-    import aiohttp
-
-    path = str(path)
-    config = {} if config is None else config
-
-    is_http = path.startswith(_HTTP_PREFIXES)
-    is_s3 = path.startswith('s3://')
-
-    if is_http or is_s3:
-        cache_dir = config.get('volume_cache_dir')
-        if not cache_dir:
-            raise ValueError(
-                f"Remote volume path {path!r} requires 'volume_cache_dir' in config."
-            )
-        cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
-        offline = bool(config.get('volume_cache_offline', False))
-        retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
-
-    if is_http:
-        storage_opts = {}
-        store_exceptions = (KeyError, FileNotFoundError)
-        if auth_json_path:
-            username, password = _load_http_basic_auth(auth_json_path, config)
-            storage_opts['client_kwargs'] = {'auth': aiohttp.BasicAuth(username, password)}
-        remote = _make_remote_store(
-            path,
-            storage_opts,
-            missing_exceptions=store_exceptions,
-        )
-        store = _DiskCacheStore(
-            remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
-        )
-        return zarr.open(store, mode='r')
-
-    if is_s3:
-        remote = _make_remote_store(
-            path,
-            s3_storage_options_for_path(path),
-            missing_exceptions=(KeyError, FileNotFoundError),
-        )
-        store = _DiskCacheStore(
-            remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
-        )
-        return zarr.open(store, mode='r')
-
-    # Local path.
-    return zarr.open(path, mode='r')
+def open_zarr_group(path, auth_json_path=None, config=None, threads=None):
+    """A volume's root group (all pyramid levels), or the array at ``path``."""
+    return open_node(str(path), **_volume_open_options(path, auth_json_path, config, threads))
 
 
 def _parse_z_range(z_range):
@@ -941,7 +300,7 @@ def _read_volume_crop(volume_arr, crop_size, min_corner, max_corner,
     """Read a CT crop from a zarr Array and normalize it.
 
     Args:
-        volume_arr: zarr.Array to read from (a specific pyramid level).
+        volume_arr: ZarrReader to read from (a specific pyramid level).
         crop_size: (Z, Y, X) shape of the output crop.
         min_corner: (3,) int64 array — ZYX origin in volume coordinates.
         max_corner: (3,) int64 array — ZYX end (exclusive) in volume coordinates.
@@ -979,11 +338,11 @@ def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
                                  image_normalization: str = "zscore"):
     """Read a CT crop from a patch's volume and normalize it.
 
-    Thin wrapper around :func:`_read_volume_crop` that resolves the zarr
-    Array from ``patch.volume`` / ``patch.scale``.
+    Thin wrapper around :func:`_read_volume_crop` that resolves the
+    level from ``patch.volume`` / ``patch.scale``.
     """
     volume = patch.volume
-    if isinstance(volume, zarr.Group):
+    if isinstance(volume, ZarrGroup):
         volume = volume[str(patch.scale)]
     return _read_volume_crop(volume, crop_size, min_corner, max_corner,
                              image_normalization)
@@ -1505,7 +864,7 @@ def voxelize_surface_grid_masked(
 class Patch:
     """A single patch from the hierarchical tiling method."""
     seg: Tifxyz                           # Reference to the segment
-    volume: zarr.Array                    # zarr volume
+    volume: ZarrReader                    # zarr volume
     scale: float                          # volume_scale from config
     grid_bbox: Tuple[int, int, int, int]  # (row_min, row_max, col_min, col_max) in the tifxyz grid
     world_bbox: Tuple[float, ...]         # (z_min, z_max, y_min, y_max, x_min, x_max) in world coordinates (volume coordinates)
@@ -1519,7 +878,7 @@ class ChunkPatch:
     multiple wraps from potentially multiple segments.
     """
     chunk_id: Tuple[int, int, int]         # (cz, cy, cx) index in chunk grid
-    volume: Any                            # zarr.Array or zarr.Group
+    volume: Any                            # ZarrReader or ZarrGroup
     scale: int                             # volume_scale from config
     world_bbox: Tuple[float, ...]          # (z_min, z_max, y_min, y_max, x_min, x_max)
     wraps: List[Dict]                      # [{"segment": Tifxyz, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
@@ -1527,7 +886,7 @@ class ChunkPatch:
     dataset_idx: int = -1                  # index into config["datasets"] (-1 = unknown)
     dataset_name: str = ""                 # human-readable dataset name
     dataset_local_idx: int = -1            # per-dataset patch index (stable within a cache)
-    volume_group: Any = None               # zarr.Group for multi-level access (scale augmentation)
+    volume_group: Any = None               # ZarrGroup for multi-level access (scale augmentation)
     cache_to_volume: Any = None            # (3,4) ndarray affine: cache-scale ZYX → volume reading-level ZYX (cross-volume transform)
 
     @property

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from scipy import ndimage
 
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore
 
 
 SCHEMA_VERSION = "1.0.0"
@@ -41,13 +41,11 @@ def _read_bytes(path_or_url: str) -> bytes:
     """Read bytes from a local path, ``http(s)://`` URL, or ``s3://`` URI."""
     text = str(path_or_url)
     if text.startswith(("http://", "https://", "s3://")):
-        import fsspec
-
-        storage_options: Dict[str, Any] = {}
-        if text.startswith("s3://"):
-            storage_options["anon"] = True
-        with fsspec.open(text, mode="rb", **storage_options) as f:
-            return f.read()
+        parent, name = text.rsplit("/", 1)
+        data = ObjectStore(parent, auth=None).read(name)
+        if data is None:
+            raise FileNotFoundError(text)
+        return data
     return Path(text).read_bytes()
 
 
@@ -359,6 +357,3 @@ __all__ = [
     "matrix_checksum",
 ]
 
-
-# Keep ``open_zarr`` reachable for callers that want a consistent I/O path.
-_open_zarr = open_zarr

@@ -19,8 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import zarr
 from torch.utils.data import Dataset
+from vc_reader.reader import ZarrGroup, ZarrReader, open_node
 
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from .intensity_properties import initialize_intensity_properties
@@ -36,9 +36,9 @@ class VolumeInfo:
     """Metadata for a loaded OME-Zarr volume."""
     volume_id: str
     image_path: Path
-    image_array: zarr.Array
+    image_array: ZarrReader
     label_paths: Dict[str, Optional[Path]]
-    label_arrays: Dict[str, Optional[zarr.Array]]
+    label_arrays: Dict[str, Optional[ZarrReader]]
     spatial_shape: Tuple[int, ...]
     has_labels: bool = True
 
@@ -188,7 +188,7 @@ class ZarrDataset(Dataset):
         # Build volume list
         for volume_id, image_path in sorted(image_zarrs.items()):
             label_paths: Dict[str, Optional[Path]] = {}
-            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            label_arrays: Dict[str, Optional[ZarrReader]] = {}
             has_any_label = False
 
             for target in self.target_names:
@@ -252,7 +252,7 @@ class ZarrDataset(Dataset):
 
             label_mapping = self._resolve_explicit_label_mapping(spec)
             label_paths: Dict[str, Optional[Path]] = {}
-            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            label_arrays: Dict[str, Optional[ZarrReader]] = {}
             has_any_label = False
             for target in self.target_names:
                 label_path = self._resolve_explicit_volume_path(label_mapping.get(target))
@@ -346,12 +346,13 @@ class ZarrDataset(Dataset):
             return base_id
         return f"{base_id}_{duplicate_idx}"
 
-    def _open_zarr(self, path: Path) -> zarr.Array:
+    def _open_zarr(self, path: Path) -> ZarrReader:
         """Open a zarr array at the configured resolution level."""
-        store = zarr.open(path, mode="r")
+        # Read in DataLoader workers, which are the parallelism.
+        store = open_node(path, threads=1)
 
         # Handle zarr Group (OME-Zarr format)
-        if isinstance(store, zarr.Group):
+        if isinstance(store, ZarrGroup):
             # Try to get the requested resolution level
             level_key = str(self.ome_zarr_resolution)
             if level_key in store:
@@ -364,7 +365,7 @@ class ZarrDataset(Dataset):
 
         return store
 
-    def _get_spatial_shape(self, arr: zarr.Array) -> Tuple[int, ...]:
+    def _get_spatial_shape(self, arr: ZarrReader) -> Tuple[int, ...]:
         """Extract spatial shape (Z, Y, X) or (Y, X) from array."""
         shape = arr.shape
         if self.is_2d:
@@ -847,7 +848,7 @@ class ZarrDataset(Dataset):
             return data
 
         def load_array(
-            arr: Optional[zarr.Array], *, normalize: bool = False, return_original_shape: bool = False
+            arr: Optional[ZarrReader], *, normalize: bool = False, return_original_shape: bool = False
         ) -> np.ndarray | Tuple[np.ndarray, Tuple[int, ...]]:
             if arr is None:
                 data = np.zeros(size, dtype=np.float32)

@@ -1113,7 +1113,7 @@ def multipass_hierarchical_tiling(
 
 if __name__ == "__main__":
     import argparse
-    import zarr
+    from vc_reader.reader import open_group
     from tqdm.auto import tqdm
 
     # Import tifxyz utilities - adjust path as needed
@@ -1164,7 +1164,7 @@ if __name__ == "__main__":
 
     # Load volume and segments
     print(f"Loading volume from {args.volume}")
-    ome_zarr = zarr.open(args.volume, mode='r')
+    ome_zarr = open_group(args.volume)
 
     print(f"Loading segments from {args.segments}")
     segments = load_tifxyz_segments(args.segments, None, ome_zarr)

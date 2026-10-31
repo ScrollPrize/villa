@@ -108,6 +108,7 @@ class EdtSegDataset(Dataset):
                     volume_path,
                     auth_json_path=dataset.get('volume_auth_json'),
                     config=config,
+                    threads=1,  # read in DataLoader workers
                 )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))

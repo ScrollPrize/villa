@@ -13,19 +13,17 @@ def test_relative_keys_and_digest(tmp_path):
 
 @pytest.fixture
 def fake_s3(monkeypatch):
-    from datetime import datetime,timezone
     from types import SimpleNamespace
-    boto3=pytest.importorskip('boto3')
+    import vc_reader.reader
     remote=SimpleNamespace(objects={'prefix/x.tif':b'x','prefix/y.tif':b'y'},downloads=[])
-    class Client:
-        def get_paginator(self,name):return self
-        def paginate(self,**kwargs):
-            return [{'Contents':[dict(Key=k,Size=len(v),ETag=v.hex(),
-                LastModified=datetime(2026,1,1,tzinfo=timezone.utc)) for k,v in remote.objects.items()]}]
-        def download_file(self,bucket,key,path,Config):
-            from pathlib import Path
-            remote.downloads.append(key);Path(path).write_bytes(remote.objects[key])
-    monkeypatch.setattr(boto3,'client',lambda *a,**kw:Client())
+    class Store:
+        def __init__(self,location):self.prefix=location.split('/',3)[3]
+        def objects(self):
+            return [dict(key=k[len(self.prefix):],size=len(v),etag=v.hex(),last_modified='2026-01-01T00:00:00.000Z')
+                    for k,v in remote.objects.items() if k.startswith(self.prefix)]
+        def read(self,name):
+            remote.downloads.append(self.prefix+name);return remote.objects[self.prefix+name]
+    monkeypatch.setattr(vc_reader.reader,'ObjectStore',Store)
     return remote
 
 

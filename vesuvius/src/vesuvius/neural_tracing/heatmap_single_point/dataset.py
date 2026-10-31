@@ -1,6 +1,5 @@
 import os
 import cv2
-import zarr
 import json
 import warnings
 import glob
@@ -14,6 +13,8 @@ from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+from vc_reader.reader import ZarrReader, open_group
+
 import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
 from vesuvius.models.augmentation.pipelines import sample_seed
 
@@ -24,7 +25,7 @@ from vesuvius.models.augmentation.pipelines import sample_seed
 class Patch:
     zyxs: torch.Tensor
     scale: torch.Tensor
-    volume: zarr.Array
+    volume: ZarrReader
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
@@ -1032,7 +1033,8 @@ def load_datasets(config, shard_idx=None, total_shards=None):
                 "(LRUStoreCache was removed). Ignoring the option.",
                 stacklevel=2,
             )
-        ome_zarr = zarr.open(volume_path, mode='r')
+        # Read in DataLoader workers, which are the parallelism.
+        ome_zarr = open_group(volume_path, threads=1)
 
         volume_scale = dataset['volume_scale']
         volume = ome_zarr[str(volume_scale)]

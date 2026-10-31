@@ -14,7 +14,8 @@ from typing import Iterable, Iterator, Sequence
 import numpy as np
 import tifffile
 from tqdm.auto import tqdm
-import zarr
+
+from vc_reader.reader import ZarrReader, open_node
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -296,30 +297,19 @@ def validate_label_tiff(
     return tuple(issues)
 
 
-def _resolve_zarr_array(zarr_path: Path) -> zarr.Array:
-    root = zarr.open(str(zarr_path), mode="r")
-
-    if isinstance(root, zarr.Array):
+def _resolve_zarr_array(zarr_path: Path) -> ZarrReader:
+    root = open_node(str(zarr_path))
+    if isinstance(root, ZarrReader):
         return root
-
-    if isinstance(root, zarr.Group):
-        if "0" in root:
-            array = root["0"]
-            if isinstance(array, zarr.Array):
-                return array
-
-        array_keys = sorted(str(key) for key in root.array_keys())
-        if len(array_keys) == 1:
-            array = root[array_keys[0]]
-            if isinstance(array, zarr.Array):
-                return array
-
-        raise ValueError(
-            f"Could not determine which array to validate in {zarr_path}. "
-            f"Available array keys: {array_keys}"
-        )
-
-    raise ValueError(f"Unsupported Zarr object at {zarr_path}: {type(root)!r}")
+    if "0" in root and isinstance(root["0"], ZarrReader):
+        return root["0"]
+    array_keys = sorted(str(key) for key in root.array_keys())
+    if len(array_keys) == 1:
+        return root[array_keys[0]]
+    raise ValueError(
+        f"Could not determine which array to validate in {zarr_path}. "
+        f"Available array keys: {array_keys}"
+    )
 
 
 def read_zarr_shape(path: Path) -> tuple[int, int]:

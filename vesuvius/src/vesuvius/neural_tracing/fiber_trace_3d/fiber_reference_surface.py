@@ -49,23 +49,20 @@ def validate_refresh(root, source, prefix, objects):
 
 
 def run(cfg):
-    import boto3
-    from boto3.s3.transfer import TransferConfig
-    from botocore.config import Config
+    from vc_reader.reader import ObjectStore
     source=urlparse(cfg['source'])
     if source.scheme!='s3' or not source.netloc:raise ValueError('Expected S3 source')
     prefix=source.path.lstrip('/').rstrip('/')+'/'
     root=Path(cfg['output_root']);root.mkdir(parents=True,exist_ok=True)
-    client=boto3.client('s3',config=Config(max_pool_connections=16))
+    store=ObjectStore(f's3://{source.netloc}/{prefix}')
+    listed=[dict(obj,Key=prefix+obj['key']) for obj in store.objects() if not obj['key'].endswith('/')]
     if cfg.get('list_only',False):
-        pages=list(client.get_paginator('list_objects_v2').paginate(Bucket=source.netloc,Prefix=prefix,Delimiter='/'))
-        report=dict(source=cfg['source'],objects=[dict(key=o['Key'],bytes=o['Size']) for p in pages for o in p.get('Contents',[])],
-            prefixes=[o['Prefix'] for p in pages for o in p.get('CommonPrefixes',[])])
+        report=dict(source=cfg['source'],objects=[dict(key=o['Key'],bytes=o['size']) for o in listed if '/' not in o['key']],
+            prefixes=[prefix+name+'/' for name in store.children()])
         (root/'listing.json').write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report),flush=True)
         return report
-    objects=[obj for page in client.get_paginator('list_objects_v2').paginate(Bucket=source.netloc,Prefix=prefix)
-             for obj in page.get('Contents',[]) if not obj['Key'].endswith('/')]
+    objects=[dict(Key=o['Key'],Size=o['size'],ETag=o['etag'],LastModified=o['last_modified']) for o in listed]
     if not objects:raise ValueError('Empty reference prefix')
     for obj in objects:relative_key(obj['Key'],prefix)
     manifest=root/'download_manifest.json'
@@ -81,13 +78,12 @@ def run(cfg):
         if sha is None:
             temporary=path.with_name(path.name+'.download-part')
             if temporary.is_symlink():raise ValueError('Unsafe partial destination')
-            client.download_file(source.netloc,obj['Key'],str(temporary),
-                Config=TransferConfig(max_concurrency=2))
+            temporary.write_bytes(store.read(relative.as_posix()))
             if temporary.stat().st_size!=obj['Size']:raise ValueError('Downloaded size mismatch')
             sha=digest(temporary);temporary.replace(path)
         print(f'Reference downloaded {relative}: {obj["Size"]:,} bytes',flush=True)
         return dict(key=obj['Key'],relative=str(relative),bytes=obj['Size'],etag=obj['ETag'],
-                    last_modified=obj['LastModified'].isoformat(),sha256=sha)
+                    last_modified=obj['LastModified'],sha256=sha)
     with ThreadPoolExecutor(max_workers=cfg.get('workers',4)) as pool:entries=list(pool.map(fetch,objects))
     report=dict(source=cfg['source'],downloaded_utc=datetime.now(timezone.utc).isoformat(),
                 object_count=len(entries),bytes=sum(e['bytes'] for e in entries),objects=entries)

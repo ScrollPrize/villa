@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -21,9 +20,7 @@ from vesuvius.neural_tracing.fiber_trace.dataset import (
     FiberTraceBatch,
     FiberTraceBatchBuilder,
     FiberTraceDebugTableState,
-    ZarrChunkRequest,
 )
-from vesuvius.neural_tracing.zarr_support import read_zarr_store_bytes
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_ID,
     IGNORE_INDEX,
@@ -447,40 +444,6 @@ def _compute_losses(
         outputs, batch, contrastive_samples=contrastive_samples, **loss_kwargs
     )
     timings = {"data_ms": data_ms}
-    cache_stats = getattr(batch_builder, "last_cache_stats", None)
-    if cache_stats is not None:
-        cache_mib = float(getattr(cache_stats, "cache_hit_bytes", 0)) / (
-            1024.0 * 1024.0
-        )
-        download_mib = float(getattr(cache_stats, "download_bytes", 0)) / (
-            1024.0 * 1024.0
-        )
-        cache_ms = float(getattr(cache_stats, "cache_hit_ms", 0.0))
-        download_ms = float(getattr(cache_stats, "download_ms", 0.0))
-        timings.update(
-            {
-                "cache_hits": float(getattr(cache_stats, "cache_hits", 0)),
-                "cache_downloads": float(getattr(cache_stats, "downloads", 0)),
-                "cache_missing": float(
-                    int(getattr(cache_stats, "missing", 0))
-                    + int(getattr(cache_stats, "negative_hits", 0))
-                ),
-                "cache_hit_ms": cache_ms,
-                "cache_download_ms": download_ms,
-                "cache_hit_mib": cache_mib,
-                "cache_download_mib": download_mib,
-                "cache_mib_s": (
-                    cache_mib / max(cache_ms / 1000.0, 1e-9)
-                    if cache_mib > 0.0
-                    else 0.0
-                ),
-                "download_mib_s": (
-                    download_mib / max(download_ms / 1000.0, 1e-9)
-                    if download_mib > 0.0
-                    else 0.0
-                ),
-            }
-        )
     return losses, batch, outputs, timings
 
 
@@ -529,45 +492,16 @@ def _distributed_reduce_step_timings(
         return timings
 
     reduced = dict(timings)
-    sum_keys = (
-        "cache_hits",
-        "cache_downloads",
-        "cache_missing",
-        "cache_hit_ms",
-        "cache_download_ms",
-        "cache_hit_mib",
-        "cache_download_mib",
-    )
     max_keys = ("data_ms", "train_ms")
-    sum_values = torch.tensor(
-        [float(timings.get(key, 0.0)) for key in sum_keys],
-        device=device,
-        dtype=torch.float64,
-    )
     max_values = torch.tensor(
         [float(timings.get(key, 0.0)) for key in max_keys],
         device=device,
         dtype=torch.float64,
     )
-    dist.all_reduce(sum_values, op=dist.ReduceOp.SUM)
     dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
-    for key, value in zip(sum_keys, sum_values):
-        reduced[key] = float(value.detach().cpu())
     for key, value in zip(max_keys, max_values):
         reduced[key] = float(value.detach().cpu())
 
-    cache_mib = float(reduced.get("cache_hit_mib", 0.0))
-    cache_ms = float(reduced.get("cache_hit_ms", 0.0))
-    download_mib = float(reduced.get("cache_download_mib", 0.0))
-    download_ms = float(reduced.get("cache_download_ms", 0.0))
-    reduced["cache_mib_s"] = (
-        cache_mib / max(cache_ms / 1000.0, 1e-9) if cache_mib > 0.0 else 0.0
-    )
-    reduced["download_mib_s"] = (
-        download_mib / max(download_ms / 1000.0, 1e-9)
-        if download_mib > 0.0
-        else 0.0
-    )
     return reduced
 
 
@@ -642,28 +576,19 @@ def _print_step_timing(
         print(
             "fiber_trace step columns: it=iteration data=batch sample/load ms "
             "train=device transfer + labels + forward/loss + backward + optimizer ms "
-            "hit/dl/mis=cache events hms/dms=cache-hit/download ms "
-            "hMiB/s/dMiB/s=cache-hit/download throughput "
             "trn/tst losses=total/contrastive",
             flush=True,
         )
     if row_index % max(1, int(header_every)) == 0:
         print(
             "   it      data     train "
-            " hit  dl mis      hms      dms   hMiB/s   dMiB/s   trn_tot   trn_con   tst_tot   tst_con",
+            "  trn_tot   trn_con   tst_tot   tst_con",
             flush=True,
         )
     print(
         f"{int(step):5d} "
         f"{float(timings.get('data_ms', 0.0)):9.1f} "
         f"{float(timings.get('train_ms', 0.0)):9.1f} "
-        f"{int(timings.get('cache_hits', 0.0)):4d} "
-        f"{int(timings.get('cache_downloads', 0.0)):3d} "
-        f"{int(timings.get('cache_missing', 0.0)):3d} "
-        f"{float(timings.get('cache_hit_ms', 0.0)):8.1f} "
-        f"{float(timings.get('cache_download_ms', 0.0)):8.1f} "
-        f"{float(timings.get('cache_mib_s', 0.0)):8.1f} "
-        f"{float(timings.get('download_mib_s', 0.0)):8.1f} "
         f"{_loss_value(train_scalars, 'total')} "
         f"{_loss_value(train_scalars, 'contrastive')} "
         f"{_loss_value(test_scalars, 'total')} "
@@ -1145,219 +1070,6 @@ def _save_snapshot(
     )
 
 
-def _dedupe_chunk_requests(
-    requests: list[ZarrChunkRequest],
-) -> list[ZarrChunkRequest]:
-    seen: set[tuple[str, str]] = set()
-    unique: list[ZarrChunkRequest] = []
-    for request in requests:
-        key = (request.store_identity, request.key)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(request)
-    return unique
-
-
-def _fetch_prefetch_chunk(request: ZarrChunkRequest) -> tuple[str, int, float]:
-    start = time.perf_counter()
-    try:
-        data = read_zarr_store_bytes(request.store, request.key)
-    except KeyError:
-        return "missing", 0, (time.perf_counter() - start) * 1000.0
-    return "ok", len(data), (time.perf_counter() - start) * 1000.0
-
-
-def _prefetch_chunk_is_cached(request: ZarrChunkRequest) -> bool:
-    cache_dir = getattr(request.store, "_cache_dir", None)
-    if cache_dir is None:
-        return False
-    cached = os.path.join(str(cache_dir), request.key)
-    if os.path.isfile(cached):
-        return True
-    marker_suffix = getattr(request.store, "_NEGATIVE_MARKER_SUFFIX", ".__notfound__")
-    return os.path.isfile(cached + str(marker_suffix))
-
-
-def _format_eta(seconds: float | None) -> str:
-    if seconds is None or not bool(seconds >= 0.0) or seconds == float("inf"):
-        return "--:--"
-    total_seconds = int(round(seconds))
-    hours, rem = divmod(total_seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours:d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def _prefetch_progress_line(
-    *,
-    done: int,
-    total: int,
-    bytes_read: int,
-    started_at: float,
-    missing: int,
-    errors: int,
-) -> str:
-    elapsed = max(time.perf_counter() - started_at, 1e-9)
-    mib = float(bytes_read) / (1024.0 * 1024.0)
-    mib_s = mib / elapsed
-    eta_seconds = None
-    if done > 0:
-        eta_seconds = elapsed * float(max(total - done, 0)) / float(done)
-    width = 24
-    filled = int(width * done / max(total, 1))
-    bar = "#" * filled + "-" * (width - filled)
-    return (
-        f"prefetch [{bar}] {done}/{total} chunks "
-        f"{mib:.1f} MiB {mib_s:.1f} MiB/s "
-        f"eta={_format_eta(eta_seconds)} missing={missing} errors={errors}"
-    )
-
-
-def run_prefetch(
-    config: dict[str, Any],
-    *,
-    max_workers: int | None = None,
-) -> dict[str, Any]:
-    _reject_legacy_checkpoint_path(config)
-    steps = int(config.get("num_steps", config.get("steps", 1)))
-    if steps <= 0:
-        raise ValueError(f"num_steps/steps must be positive, got {steps}")
-    configured_workers = (
-        max_workers
-        if max_workers is not None
-        else config.get("prefetch_workers", 16)
-    )
-    if configured_workers is None:
-        configured_workers = 16
-    worker_count = int(configured_workers)
-    worker_count = max(1, min(16, worker_count))
-
-    debug_table_state = FiberTraceDebugTableState()
-    batch_builder = FiberTraceBatchBuilder(
-        config, debug_table_state=debug_table_state
-    )
-    test_config = _make_test_config(config)
-    test_batch_builder = (
-        FiberTraceBatchBuilder(test_config, debug_table_state=debug_table_state)
-        if test_config is not None
-        else None
-    )
-
-    requests: list[ZarrChunkRequest] = []
-    sample_limit = getattr(batch_builder, "sample_limit", None)
-    train_prefetch_steps = (
-        min(steps, int(sample_limit)) if sample_limit is not None else steps
-    )
-    for step in range(1, train_prefetch_steps + 1):
-        requests.extend(
-            batch_builder.prefetch_chunk_requests_for_iteration(iteration=step)
-        )
-    if test_batch_builder is not None:
-        test_sample_count = max(1, int(config.get("test_sample_count", 1)))
-        test_start_iteration = int(config.get("test_start_iteration", 1))
-        for offset in range(test_sample_count):
-            requests.extend(
-                test_batch_builder.prefetch_chunk_requests_for_iteration(
-                    iteration=test_start_iteration + offset
-                )
-            )
-
-    unique_requests = _dedupe_chunk_requests(requests)
-    cached_requests = [
-        request for request in unique_requests if _prefetch_chunk_is_cached(request)
-    ]
-    pending_requests = [
-        request for request in unique_requests if not _prefetch_chunk_is_cached(request)
-    ]
-    total = len(pending_requests)
-    print(
-        f"prefetch chunks: generated={len(requests)} unique={len(unique_requests)} "
-        f"cached={len(cached_requests)} pending={total} "
-        f"steps={steps} sample_steps={train_prefetch_steps} workers={worker_count}",
-        flush=True,
-    )
-    if total == 0:
-        return {
-            "generated_chunks": len(requests),
-            "unique_chunks": len(unique_requests),
-            "cached_chunks": len(cached_requests),
-            "pending_chunks": 0,
-            "bytes": 0,
-            "missing": 0,
-            "errors": 0,
-            "elapsed_seconds": 0.0,
-            "mib_s": 0.0,
-        }
-
-    started_at = time.perf_counter()
-    done = 0
-    bytes_read = 0
-    missing = 0
-    error_count = 0
-    errors: list[str] = []
-    next_print_at = 0.0
-    pool_workers = min(worker_count, total)
-    with ThreadPoolExecutor(max_workers=pool_workers) as executor:
-        futures = [
-            executor.submit(_fetch_prefetch_chunk, request)
-            for request in pending_requests
-        ]
-        for future in as_completed(futures):
-            done += 1
-            try:
-                status, byte_count, _elapsed_ms = future.result()
-            except Exception as exc:
-                status = "error"
-                byte_count = 0
-                error_count += 1
-                if len(errors) < 5:
-                    errors.append(f"{type(exc).__name__}: {exc}")
-            if status == "missing":
-                missing += 1
-            elif status == "error":
-                pass
-            else:
-                bytes_read += int(byte_count)
-
-            now = time.perf_counter()
-            if now >= next_print_at or done == total:
-                print(
-                    "\r"
-                    + _prefetch_progress_line(
-                        done=done,
-                        total=total,
-                        bytes_read=bytes_read,
-                        started_at=started_at,
-                        missing=missing,
-                        errors=error_count,
-                    ),
-                    end="",
-                    flush=True,
-                )
-                next_print_at = now + 0.25
-    print("", flush=True)
-
-    elapsed_seconds = max(time.perf_counter() - started_at, 1e-9)
-    mib = float(bytes_read) / (1024.0 * 1024.0)
-    if error_count:
-        preview = "; ".join(errors)
-        raise RuntimeError(f"prefetch failed for {error_count} chunks: {preview}")
-
-    return {
-        "generated_chunks": len(requests),
-        "unique_chunks": len(unique_requests),
-        "cached_chunks": len(cached_requests),
-        "pending_chunks": total,
-        "bytes": bytes_read,
-        "missing": missing,
-        "errors": error_count,
-        "elapsed_seconds": elapsed_seconds,
-        "mib_s": mib / elapsed_seconds,
-    }
-
-
 def _run_training_worker(
     config: dict[str, Any],
     *,
@@ -1689,27 +1401,9 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train the fiber tracing MVP model.")
-    parser.add_argument(
-        "--prefetch",
-        action="store_true",
-        help=(
-            "Generate the zarr chunk list for this training config and download "
-            "those chunks into the configured cache instead of training."
-        ),
-    )
-    parser.add_argument(
-        "--prefetch-workers",
-        type=int,
-        default=None,
-        help="Maximum parallel chunk downloads for --prefetch, capped at 16.",
-    )
     parser.add_argument("config", help="Path to a fiber trace training config JSON.")
     args = parser.parse_args(argv)
-    config = _load_config(args.config)
-    if args.prefetch:
-        run_prefetch(config, max_workers=args.prefetch_workers)
-    else:
-        run_training(config)
+    run_training(_load_config(args.config))
 
 
 if __name__ == "__main__":

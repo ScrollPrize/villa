@@ -107,7 +107,6 @@ class FiberTrace3DConfig:
     volume_cache_memory_mib: float | None = DEFAULT_VOLUME_CACHE_MEMORY_MIB
     volume_io_threads: int | None = None
     volume_cache_offline: bool = False
-    volume_cache_retry_seconds: float = 0.0
     config_dir: Path | None = None
     sampling_strategy: str = "control_points"
 
@@ -920,7 +919,6 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
             None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
         ),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
-        volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
         config_dir=config_path.parent,
     )
 
@@ -931,7 +929,6 @@ def _common_zarr_config(config: FiberTrace3DConfig) -> dict[str, Any]:
         "volume_cache_memory_mib": config.volume_cache_memory_mib,
         "volume_io_threads": config.volume_io_threads,
         "volume_cache_offline": config.volume_cache_offline,
-        "volume_cache_retry_seconds": config.volume_cache_retry_seconds,
         "_config_dir": str(config.config_dir) if config.config_dir is not None else None,
     }
 

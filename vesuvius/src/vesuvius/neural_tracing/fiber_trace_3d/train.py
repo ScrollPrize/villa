@@ -2298,7 +2298,6 @@ def _make_trace2cp_geometry_loader(raw_config: dict[str, Any], cfg: _Trace2Cp3DC
                 else int(raw_config.get("volume_io_threads"))
             ),
             volume_cache_offline=bool(raw_config.get("volume_cache_offline", False)),
-            volume_cache_retry_seconds=float(raw_config.get("volume_cache_retry_seconds", 0.0)),
             config_dir=(
                 None
                 if raw_config.get("_config_dir") is None

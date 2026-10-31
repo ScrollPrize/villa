@@ -26,16 +26,12 @@ from typing import Tuple
 from vesuvius.data.zarr_chunk_index import (
     ENV_OVERRIDE_URL,
     build_chunk_occupancy,
-    _url_to_fs,
-    _zarray_signature,
+    _read_url,
 )
 
 
 def read_zarray(volume_path: str, *, anon: bool) -> dict:
-    zarray_url = volume_path.rstrip("/") + "/.zarray"
-    fs, fs_path = _url_to_fs(zarray_url, anon=anon)
-    with fs.open(fs_path, "rb") as f:
-        return json.loads(f.read())
+    return json.loads(_read_url(volume_path.rstrip("/") + "/.zarray", anon=anon))
 
 
 def extract_chunks_shape(zarray: dict) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
@@ -86,8 +82,7 @@ def main(argv=None) -> int:
     # Verify the cache is actually present at `output`. build_chunk_occupancy may have
     # fallen back to sidecar/local if the override write failed, which defeats the point.
     try:
-        fs, fs_path = _url_to_fs(output)
-        if not fs.exists(fs_path):
+        if _read_url(output) is None:
             print(
                 f"ERROR: expected chunk occupancy cache at {output} after build, "
                 f"but it does not exist (write likely failed).",

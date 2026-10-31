@@ -12706,14 +12706,6 @@ def main() -> None:
             f"cp_xyz=({cp_xyz[0]:.3f}, {cp_xyz[1]:.3f}, {cp_xyz[2]:.3f}) "
             f"cp_zyx=({cp_zyx[0]:.3f}, {cp_zyx[1]:.3f}, {cp_zyx[2]:.3f})"
         )
-    stats = batch.cache_stats
-    if stats is not None:
-        print(
-            "cache: "
-            f"hits={getattr(stats, 'cache_hits', 0)} "
-            f"downloads={getattr(stats, 'downloads', 0)} "
-            f"missing={getattr(stats, 'missing', 0)}"
-        )
     if args.export_dir:
         _export_batch(batch, args.export_dir)
 

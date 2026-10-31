@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import ZarrGroup
 
 import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
@@ -641,7 +641,7 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
 
 def _resolve_segment_volume(segment, volume_scale=None):
     volume = segment.volume
-    if isinstance(volume, zarr.Group):
+    if isinstance(volume, ZarrGroup):
         target_level = None
         if volume_scale is not None:
             target_level = int(volume_scale)

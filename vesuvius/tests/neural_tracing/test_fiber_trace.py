@@ -325,15 +325,11 @@ def test_debug_cache_logs_one_table_row_per_batch(tmp_path: Path, capsys):
     lines = output.splitlines()
     assert lines[0].startswith("fiber_trace batch columns:")
     assert "data=batch data-loading ms" in lines[0]
-    assert "throughput" in lines[0]
     assert "it" in lines[1]
     assert "data" in lines[1]
     assert "rec" not in lines[1]
     assert "k" not in lines[1]
     assert "ctl" not in lines[1]
-    assert "hMiB/s" in lines[1]
-    assert "dMiB/s" in lines[1]
-    assert {"hit", "dl", "mis", "hms", "dms"} <= set(lines[1].split())
     data_lines = [line for line in lines if line.split()[:1] == ["7"]]
     assert len(data_lines) == 1
     assert data_lines[0].split()[0] == "7"
@@ -342,7 +338,6 @@ def test_debug_cache_logs_one_table_row_per_batch(tmp_path: Path, capsys):
     assert "bz" not in lines[1]
     assert "[fiber_trace:patch]" not in output
     assert "[fiber_trace:sample]" not in output
-    assert "_DiskCacheStore" not in output
 
 
 def test_iteration_sampling_is_deterministic_and_stateless(tmp_path: Path):
@@ -1505,264 +1500,6 @@ def test_test_fiber_glob_builds_separate_test_config():
     assert "test_fiber_glob" in test_config["datasets"][0]
 
 
-def _prefetch_zarr_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
-    fiber_path = tmp_path / "fiber.json"
-    _write_fiber(fiber_path)
-    manifest_path = tmp_path / "pred.lasagna.json"
-    manifest_path.write_text("{}", encoding="utf-8")
-
-    base_root = tmp_path / "base.ome.zarr"
-    grad_root = tmp_path / "grad_mag.ome.zarr"
-    normal_root = tmp_path / "normal.ome.zarr"
-    base = create_v2_group_array(
-        base_root,
-        "0",
-        shape=(16, 16, 16),
-        chunks=(8, 8, 8),
-        dtype="u1",
-    )
-    base[:] = np.arange(16 * 16 * 16, dtype=np.uint16).reshape(16, 16, 16) % 255
-    setattr(base.store, "_url", "s3://example/base.ome.zarr")
-    setattr(base.store, "_cache_dir", str(tmp_path / "cache" / "base"))
-    grad = create_v2_group_array(
-        grad_root,
-        "0",
-        shape=(16, 16, 16),
-        chunks=(8, 8, 8),
-        dtype="u1",
-    )
-    grad[:] = 1
-    normals = create_v2_group_array(
-        normal_root,
-        "0",
-        shape=(2, 16, 16, 16),
-        chunks=(1, 8, 8, 8),
-        dtype="u1",
-    )
-    normals[:] = 128
-
-    class FakeLasagnaVolume:
-        path = manifest_path
-        base_shape_zyx = (16, 16, 16)
-        source_to_base = 1.0
-
-        def channel_group(self, channel_name: str):
-            if channel_name == "grad_mag":
-                return (
-                    SimpleNamespace(
-                        zarr_path="grad_mag.ome.zarr/0",
-                        scaledown=0,
-                        sd_fac=1.0,
-                    ),
-                    0,
-                )
-            if channel_name == "nx":
-                return (
-                    SimpleNamespace(
-                        zarr_path="normal.ome.zarr/0",
-                        scaledown=0,
-                        sd_fac=1.0,
-                    ),
-                    0,
-                )
-            if channel_name == "ny":
-                return (
-                    SimpleNamespace(
-                        zarr_path="normal.ome.zarr/0",
-                        scaledown=0,
-                        sd_fac=1.0,
-                    ),
-                    1,
-                )
-            raise KeyError(channel_name)
-
-    monkeypatch.setattr(
-        fiber_dataset,
-        "_load_lasagna_volume",
-        lambda path, config: FakeLasagnaVolume(),
-    )
-
-    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
-        if str(path) == "s3://example/base.ome.zarr" and int(scale) == 0:
-            return base
-        if str(path) == str(grad_root.resolve()) and int(scale) == 0:
-            return grad
-        if str(path) == str(normal_root.resolve()) and int(scale) == 0:
-            return normals
-        raise AssertionError((path, scale))
-
-    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
-    return {
-        "crop_size": [8, 8, 8],
-        "batch_size": 2,
-        "seed": 3,
-        "image_normalization": "unit",
-        "positive_direction_jitter_degrees": 0.0,
-        "control_point_margin_voxels": 3,
-        "random_negative_pool_size": 2,
-        "random_valid_max_attempts": 64,
-        "num_steps": 1,
-        "log_every": 1,
-        "tensorboard_enabled": False,
-        "datasets": [
-            {
-                "base_volume_path": "s3://example/base.ome.zarr",
-                "lasagna_manifest_path": str(manifest_path),
-                "fiber_paths": [str(fiber_path)],
-            }
-        ],
-    }
-
-
-def test_prefetch_chunk_requests_use_zarr_chunk_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    config = _prefetch_zarr_config(tmp_path, monkeypatch)
-    builder = FiberTraceBatchBuilder(config)
-
-    requests = builder.prefetch_chunk_requests_for_iteration(iteration=1)
-    labels = {request.label for request in requests}
-
-    assert labels == {"base"}
-    assert requests
-    assert all(request.key.startswith("0/") for request in requests)
-    assert any(request.key.count("/") == 3 for request in requests)
-
-
-def test_prefetch_mode_fetches_chunks_with_progress(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-):
-    config = _prefetch_zarr_config(tmp_path, monkeypatch)
-
-    result = fiber_train.run_prefetch(config, max_workers=2)
-    output = capsys.readouterr().out
-
-    assert result["unique_chunks"] > 0
-    assert result["pending_chunks"] > 0
-    assert result["cached_chunks"] == 0
-    assert result["bytes"] > 0
-    assert result["errors"] == 0
-    assert "prefetch chunks:" in output
-    assert "pending=" in output
-    assert "eta=" in output
-    assert "MiB/s" in output
-
-
-def test_prefetch_mode_skips_already_cached_chunks(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-):
-    config = _prefetch_zarr_config(tmp_path, monkeypatch)
-    builder = FiberTraceBatchBuilder(config)
-    requests = fiber_train._dedupe_chunk_requests(
-        builder.prefetch_chunk_requests_for_iteration(iteration=1)
-    )
-    assert requests
-    for request in requests:
-        cache_dir = Path(getattr(request.store, "_cache_dir"))
-        cache_path = cache_dir / request.key
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(b"cached")
-
-    result = fiber_train.run_prefetch(config, max_workers=2)
-    output = capsys.readouterr().out
-
-    assert result["unique_chunks"] == len(requests)
-    assert result["cached_chunks"] == len(requests)
-    assert result["pending_chunks"] == 0
-    assert result["bytes"] == 0
-    assert "pending=0" in output
-
-
-def test_prefetch_mode_adds_test_batch_once(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[tuple[str, int]] = []
-
-    class FakeStore:
-        def __getitem__(self, key: str) -> bytes:
-            return b"x"
-
-    class FakeBuilder:
-        def __init__(self, config: dict, **kwargs) -> None:
-            self.name = "test" if config.get("is_test") else "train"
-
-        def prefetch_chunk_requests_for_iteration(self, *, iteration: int):
-            calls.append((self.name, int(iteration)))
-            return [
-                fiber_dataset.ZarrChunkRequest(
-                    store=FakeStore(),
-                    store_identity=self.name,
-                    key=f"{self.name}/{iteration}",
-                    label="base",
-                )
-            ]
-
-    monkeypatch.setattr(fiber_train, "FiberTraceBatchBuilder", FakeBuilder)
-    monkeypatch.setattr(
-        fiber_train,
-        "_make_test_config",
-        lambda config: {"is_test": True},
-    )
-
-    result = fiber_train.run_prefetch({"num_steps": 5}, max_workers=1)
-
-    assert calls == [
-        ("train", 1),
-        ("train", 2),
-        ("train", 3),
-        ("train", 4),
-        ("train", 5),
-        ("test", 1),
-    ]
-    assert result["unique_chunks"] == 6
-
-
-def test_prefetch_mode_respects_sample_limit(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[tuple[str, int]] = []
-
-    class FakeStore:
-        def __getitem__(self, key: str) -> bytes:
-            return b"x"
-
-    class FakeBuilder:
-        def __init__(self, config: dict, **kwargs) -> None:
-            self.name = "test" if config.get("is_test") else "train"
-            self.sample_limit = config.get("sample_limit")
-
-        def prefetch_chunk_requests_for_iteration(self, *, iteration: int):
-            calls.append((self.name, int(iteration)))
-            return [
-                fiber_dataset.ZarrChunkRequest(
-                    store=FakeStore(),
-                    store_identity=self.name,
-                    key=f"{self.name}/{iteration}",
-                    label="base",
-                )
-            ]
-
-    monkeypatch.setattr(fiber_train, "FiberTraceBatchBuilder", FakeBuilder)
-    monkeypatch.setattr(
-        fiber_train,
-        "_make_test_config",
-        lambda config: {"is_test": True, "sample_limit": config.get("sample_limit")},
-    )
-
-    result = fiber_train.run_prefetch({"num_steps": 5, "sample_limit": 2}, max_workers=1)
-
-    assert calls == [
-        ("train", 1),
-        ("train", 2),
-        ("test", 1),
-    ]
-    assert result["unique_chunks"] == 3
-
-
 def test_training_writes_tensorboard_text_and_snapshots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -1849,7 +1586,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
     step_rows = [
         line
         for line in output.splitlines()
-        if line.split()[:1] == ["1"] and len(line.split()) == 14
+        if line.split()[:1] == ["1"] and len(line.split()) == 7
     ]
     assert len(step_rows) == 1
     assert {"test/total", "test/contrastive"} <= scalar_tags

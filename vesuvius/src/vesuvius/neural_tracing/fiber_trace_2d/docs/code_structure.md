@@ -1819,7 +1819,6 @@ Top-level keys used by `load_config`:
 - `volume_io_threads`: optional positive VC3D I/O thread count, forwarded to
   the VC3D volume binding when available.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
-- `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
 - `strip_coord_cache_dir`: removed. CP-local dense source-coordinate files are
   no longer read or written; compact fiber-line geometry is built in RAM during
   loader construction.

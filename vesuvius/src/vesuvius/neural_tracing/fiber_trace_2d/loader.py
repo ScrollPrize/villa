@@ -25,8 +25,6 @@ import torch.nn.functional as F
 from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
 
 from vesuvius.neural_tracing.datasets.common import (
-    begin_zarr_cache_trace,
-    end_zarr_cache_trace,
     open_zarr,
 )
 from vesuvius.data.affine import read_transform_json
@@ -96,7 +94,6 @@ class FiberStrip2DConfig:
     volume_cache_memory_mib: float | None = None
     volume_io_threads: int | None = None
     volume_cache_offline: bool = False
-    volume_cache_retry_seconds: float = 0.0
     augment: FiberStripAugmentConfig = FiberStripAugmentConfig()
     config_dir: Path | None = None
     suppress_record_warnings: bool = False
@@ -163,7 +160,6 @@ class FiberStrip2DBatch:
     record_indices: np.ndarray
     fiber_paths: tuple[str, ...]
     samples: tuple[FiberStripSample, ...]
-    cache_stats: Any | None = None
     augmentation_params: tuple[FiberStripAugmentParams | None, ...] = ()
 
 
@@ -507,7 +503,6 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         volume_cache_memory_mib=cache_memory_mib,
         volume_io_threads=volume_io_threads,
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
-        volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
         augment=augment_config_from_mapping(raw),
         config_dir=config_path.parent,
     )
@@ -666,7 +661,6 @@ def _open_dataset_volume(dataset_config: dict[str, Any], config: FiberStrip2DCon
         "volume_cache_memory_mib": config.volume_cache_memory_mib,
         "volume_io_threads": config.volume_io_threads,
         "volume_cache_offline": config.volume_cache_offline,
-        "volume_cache_retry_seconds": config.volume_cache_retry_seconds,
         "_config_dir": str(config.config_dir) if config.config_dir is not None else None,
     }
     return open_zarr(
@@ -689,7 +683,6 @@ def _open_manifest_channels(
         "volume_cache_memory_mib": config.volume_cache_memory_mib,
         "volume_io_threads": config.volume_io_threads,
         "volume_cache_offline": config.volume_cache_offline,
-        "volume_cache_retry_seconds": config.volume_cache_retry_seconds,
         "_config_dir": str(config.config_dir) if config.config_dir is not None else None,
     }
     lasagna_volume = _load_lasagna_volume(manifest_path, common_config)
@@ -3424,7 +3417,6 @@ class FiberStrip2DLoader:
                 local_profile["load_batch_worker"] = (time.perf_counter() - worker_start) * 1000.0
             return item_index, local_profile, prepared
 
-        begin_zarr_cache_trace()
         top_wall_start = time.perf_counter()
         try:
             prepared_items: list[tuple[_PreparedTopStripSample, dict[str, float]]] = []
@@ -3501,7 +3493,6 @@ class FiberStrip2DLoader:
                 cp_indices.append(sample.control_point_index)
                 fiber_paths.append(sample.fiber_path)
         finally:
-            cache_stats = end_zarr_cache_trace()
             if profile is not None:
                 profile["load_batch_wall"] = profile.get("load_batch_wall", 0.0) + (
                     time.perf_counter() - top_wall_start
@@ -3515,7 +3506,6 @@ class FiberStrip2DLoader:
             record_indices=np.asarray(record_indices, dtype=np.int32),
             fiber_paths=tuple(fiber_paths),
             samples=tuple(samples),
-            cache_stats=cache_stats,
             augmentation_params=tuple(selected_params),
         )
 
@@ -4875,7 +4865,6 @@ class FiberStrip2DLoader:
             if value_augmentation_sync_group_size is None
             else max(1, int(value_augmentation_sync_group_size))
         )
-        begin_zarr_cache_trace()
         all_samples: list[FiberStripSample] = []
         images: list[np.ndarray] = []
         coords: list[np.ndarray] = []
@@ -5094,7 +5083,6 @@ class FiberStrip2DLoader:
             ):
                 consume_finished(local_profile, result)
         finally:
-            cache_stats = end_zarr_cache_trace()
             if profile is not None:
                 profile["load_batch_wall"] = profile.get("load_batch_wall", 0.0) + (
                     time.perf_counter() - batch_wall_start
@@ -5108,7 +5096,6 @@ class FiberStrip2DLoader:
             record_indices=np.asarray(record_indices, dtype=np.int32),
             fiber_paths=tuple(fiber_paths),
             samples=tuple(all_samples),
-            cache_stats=cache_stats,
             augmentation_params=tuple(augmentation_params),
         )
 
