@@ -28,5 +28,13 @@ dependencies = [
     "numcodecs>=0.16.5",
 ]
 
+[project.optional-dependencies]
+# Parting, the layer-contact classifier in dinovol_2/eval/parting/
+parting = [
+    "huggingface-hub",
+    "joblib",
+    "scikit-learn>=1.9.1,<1.10",
+]
+
 [tool.setuptools.packages.find]
 include = ["dinovol_2*"]
