@@ -316,6 +316,19 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
     REQUIRE(out[0].size()==1); CHECK(out[0][0]==doctest::Approx(40));
     CHECK(out[1].empty()); REQUIRE(out[2].size()==1); CHECK(out[2][0]==doctest::Approx(40));
     CHECK(*sampleLasagnaChannel(m,cv::Vec3d(.5,.5,.5))==doctest::Approx(255./8));
+    // The scalar form is Array::sample_linear; the cube form stays for tensors and masks.
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> at(0.,1.);
+    double largest=0;
+    for(int i=0;i<2000;++i) {
+        const cv::Vec3d p(at(rng),at(rng),at(rng));
+        LasagnaCubes cubes;
+        readLasagnaCubes(m,std::span(&p,1),cubes);
+        largest=std::max(largest,std::abs(*sampleLasagnaChannel(m,p)-interpolateLasagnaCube(cubes.values[0],cubes.fractionsXYZ[0])));
+    }
+    MESSAGE("largest scalar difference from the cube form: " << largest);
+    CHECK(largest<1e-12);
+    CHECK_FALSE(sampleLasagnaChannel(m,cv::Vec3d(1.5,.5,.5)).has_value());
     LasagnaNormalSampler sampler(dataset);
     auto n=sampler.sampleNormal({.5,.5,.5});
     REQUIRE(n.valid); CHECK(std::abs(n.normal[0])==doctest::Approx(1));

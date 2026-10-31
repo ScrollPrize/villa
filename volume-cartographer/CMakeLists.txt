@@ -523,7 +523,6 @@ if(APPLE)
     unset(_vc_opencv_library)
 endif()
 find_package(nlohmann_json REQUIRED)
-find_package(TIFF REQUIRED)
 if(MSVC)
     # On MSVC, zstd/lz4 come from vcpkg CMake configs (below), and the
     # pkg-config-only consumers (vendored libbacktrace, avahi) are Linux-only,

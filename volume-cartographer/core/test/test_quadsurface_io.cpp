@@ -6,6 +6,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -102,4 +103,50 @@ TEST_CASE("saveSnapshot: copies prior on-disk state into backups/<id>/0")
 
     auto backupsRoot = t.segDir.parent_path() / "backups" / t.segId;
     CHECK(fs::exists(backupsRoot / "0"));
+}
+
+TEST_CASE("channel files round trip at their stored depth and colour order")
+{
+    TmpSegDir t;
+    auto pts = grid();
+    QuadSurface writer(pts, cv::Vec2f(1.f, 1.f));
+    cv::Mat uv(16, 16, CV_32FC2, cv::Scalar(1.5f, -2.5f));
+    cv::Mat colour(16, 16, CV_8UC3, cv::Scalar(10, 20, 30));
+    cv::Mat generations(16, 16, CV_16UC1, cv::Scalar(4000));
+    writer.setChannel("uv", uv);
+    writer.setChannel("colour", colour);
+    writer.setChannel("generations", generations);
+    writer.save(t.segDir.string());
+
+    // Other tools see colour.tif as OpenCV wrote it.
+    const cv::Mat external = cv::imread((t.segDir / "colour.tif").string(), cv::IMREAD_UNCHANGED);
+    REQUIRE(external.type() == CV_8UC3);
+    CHECK(external.at<cv::Vec3b>(0, 0) == cv::Vec3b(10, 20, 30));
+
+    QuadSurface reader(t.segDir);
+    const cv::Mat readUv = reader.channel("uv", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readUv.type() == CV_32FC2);
+    CHECK(readUv.at<cv::Vec2f>(3, 3) == cv::Vec2f(1.5f, -2.5f));
+    const cv::Mat readColour = reader.channel("colour", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readColour.type() == CV_8UC3);
+    CHECK(readColour.at<cv::Vec3b>(3, 3) == cv::Vec3b(10, 20, 30));
+    const cv::Mat readGenerations = reader.channel("generations", SURF_CHANNEL_NORESIZE);
+    REQUIRE(readGenerations.type() == CV_16UC1);
+    CHECK(readGenerations.at<uint16_t>(3, 3) == 4000);
+}
+
+TEST_CASE("a mask with an image page reads its first page")
+{
+    TmpSegDir t;
+    auto pts = grid();
+    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
+    qs.save(t.segDir.string());
+    QuadSurface loaded(t.segDir);
+    cv::Mat image(16, 16, CV_8UC1, cv::Scalar(77));
+    loaded.writeValidMask(image);
+    QuadSurface reader(t.segDir);
+    const cv::Mat mask = reader.channel("mask", SURF_CHANNEL_NORESIZE);
+    REQUIRE(mask.type() == CV_8UC1);
+    REQUIRE(mask.rows == 16);
+    CHECK(mask.at<uint8_t>(3, 3) == 255);
 }

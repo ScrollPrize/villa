@@ -8,6 +8,8 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <vc_reader/image_write.hpp>
+
 #include <opencv2/core.hpp>
 
 #include <filesystem>
@@ -72,6 +74,43 @@ TEST_CASE("rebuild against a path-backed (tifxyz) fixture exercises the mapped-c
     // updateSurface re-scans the mapped cache.
     CHECK(idx.updateSurface(qs));
     (void)idx.updateSurfaceRegion(qs, 0, 8, 0, 8);
+}
+
+TEST_CASE("mapped and compressed coordinate files index the same, and stay as they were")
+{
+    const fs::path root = fs::temp_directory_path() / ("vc_patch_index_" + std::to_string(std::random_device{}()));
+    const auto plain = root / "plain";
+    const auto compressed = root / "compressed";
+    fs::create_directories(root);
+    auto source = makeSurface(32, 32);
+    source->save(plain.string());
+    source->save(compressed.string());
+
+    vcr::sources::TiffOptions lzw;
+    lzw.compression = "lzw";
+    std::vector<cv::Mat> xyz;
+    cv::split(*source->rawPointsPtr(), xyz);
+    const char* names[] = {"x.tif", "y.tif", "z.tif"};
+    for (int i = 0; i < 3; ++i) {
+        const cv::Mat band = xyz[i].isContinuous() ? xyz[i] : xyz[i].clone();
+        vcr::sources::writeTiff(compressed / names[i], band.data, "<f4", band.rows, band.cols, 1, lzw);
+    }
+    const auto sizeBefore = fs::file_size(compressed / "x.tif");
+
+    const auto entries = [](const fs::path& dir) {
+        auto surface = std::make_shared<QuadSurface>(dir);
+        surface->ensureLoaded();
+        SurfacePatchIndex idx;
+        idx.rebuild({surface}, 0.5f, /*useMappedSurfaces=*/true);
+        return idx.patchCount();
+    };
+    const auto plainPatches = entries(plain);
+    CHECK(plainPatches > 0);
+    CHECK(entries(compressed) == plainPatches);
+    // Indexing does not rewrite a surface's files.
+    CHECK(fs::file_size(compressed / "x.tif") == sizeBefore);
+    std::error_code ec;
+    fs::remove_all(root, ec);
 }
 
 TEST_CASE("removeSurface drops all of a surface's cells/entries")

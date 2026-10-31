@@ -53,7 +53,6 @@ target_link_libraries(vc_core
         ${VC_OPENCV_CALIB_TARGETS}
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
-        TIFF::TIFF
 )
 
 target_link_libraries(vc_core PUBLIC
@@ -123,8 +122,7 @@ if(VC_USE_PCH)
         opencv_imgproc
         opencv_imgcodecs
         nlohmann_json::nlohmann_json
-        OpenMP::OpenMP_CXX
-        TIFF::TIFF)
+        OpenMP::OpenMP_CXX)
     target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
     target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
 endif()

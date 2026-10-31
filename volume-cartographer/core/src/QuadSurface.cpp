@@ -4,7 +4,6 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include <vc_object_store/Tiff.hpp>
 #include <vc_reader/image_write.hpp>
 #include <vc_reader/source_reader.hpp>
 #include <vc_reader/tifxyz.hpp>
@@ -53,9 +52,6 @@
 #endif
 
 #include "vc/core/util/MemMap.hpp"
-
-// Use libtiff for BigTIFF
-#include <tiffio.h>
 
 // GCC/Clang spell the restrict qualifier __restrict__; MSVC only has __restrict.
 #if defined(_MSC_VER)
@@ -243,15 +239,6 @@ void replaceDirectoryContents(const std::filesystem::path& source,
 }
 #endif
 
-// Channel files with a sample count OpenCV's TIFF codec does not handle.
-bool readSamplesTiffFirst(const std::filesystem::path& path)
-{
-    std::unique_ptr<TIFF, decltype(&TIFFClose)> tif(TIFFOpen(path.string().c_str(), "r"), TIFFClose);
-    uint16_t samples = 1;
-    if (tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &samples);
-    return samples == 2 || samples > 4;
-}
-
 vcr::sources::TiffOptions tiffOptions(float dpi)
 {
     vcr::sources::TiffOptions options;
@@ -259,47 +246,39 @@ vcr::sources::TiffOptions tiffOptions(float dpi)
     return options;
 }
 
-// OpenCV depths as TIFF samples (TiffSamples::bits, sampleFormat).
-bool tiffSampleFormat(int depth, uint16_t& bits, uint16_t& format)
+const char* tiffDtype(int depth)
 {
     switch (depth) {
-    case CV_8U: bits = 8; format = SAMPLEFORMAT_UINT; return true;
-    case CV_16U: bits = 16; format = SAMPLEFORMAT_UINT; return true;
-    case CV_32S: bits = 32; format = SAMPLEFORMAT_INT; return true;
-    case CV_32F: bits = 32; format = SAMPLEFORMAT_IEEEFP; return true;
-    case CV_64F: bits = 64; format = SAMPLEFORMAT_IEEEFP; return true;
+    case CV_8U: return "|u1";
+    case CV_8S: return "|i1";
+    case CV_16U: return "<u2";
+    case CV_16S: return "<i2";
+    case CV_32S: return "<i4";
+    case CV_32F: return "<f4";
+    case CV_64F: return "<f8";
     }
-    return false;
+    return nullptr;
 }
 
-// A channel image with any number of components through the store's TIFF
-// sample codec; empty when its samples have no OpenCV depth.
-cv::Mat readChannelSamples(const std::filesystem::path& path)
+// A channel file's first page with OpenCV's colour order: TIFFs store RGB(A),
+// channel Mats hold BGR(A). Empty when its samples have no OpenCV depth.
+cv::Mat readChannelFile(const std::filesystem::path& path)
 {
-    const auto samples = readTiffSamples(path, false);
-    for (const int depth : {CV_8U, CV_16U, CV_32S, CV_32F, CV_64F}) {
-        uint16_t bits = 0, format = 0;
-        if (!tiffSampleFormat(depth, bits, format) || bits != samples.bits || format != samples.sampleFormat ||
-            samples.components > CV_CN_MAX)
+    const auto block = vcr::sources::readImagePage(path.string(), 0);
+    if (block.shape.size() < 2 || block.shape.size() > 3)
+        return {};
+    const int channels = block.shape.size() == 3 ? int(block.shape[2]) : 1;
+    for (const int depth : {CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F}) {
+        if (block.dtype != tiffDtype(depth) || channels > CV_CN_MAX)
             continue;
-        cv::Mat image(int(samples.height), int(samples.width), CV_MAKETYPE(depth, samples.components));
-        std::memcpy(image.data, samples.bytes.data(), samples.bytes.size());
+        const cv::Mat stored(int(block.shape[0]), int(block.shape[1]), CV_MAKETYPE(depth, channels), block.data.get());
+        cv::Mat image;
+        if (channels == 3) cv::cvtColor(stored, image, cv::COLOR_RGB2BGR);
+        else if (channels == 4) cv::cvtColor(stored, image, cv::COLOR_RGBA2BGRA);
+        else image = stored.clone();
         return image;
     }
     return {};
-}
-
-void writeChannelSamples(const std::filesystem::path& path, const cv::Mat& image)
-{
-    TiffSamples samples;
-    if (image.empty() || !tiffSampleFormat(image.depth(), samples.bits, samples.sampleFormat))
-        throw std::runtime_error("unsupported image for " + path.string());
-    const cv::Mat contiguous = image.isContinuous() ? image : image.clone();
-    samples.width = uint32_t(contiguous.cols);
-    samples.height = uint32_t(contiguous.rows);
-    samples.components = uint16_t(contiguous.channels());
-    samples.bytes.assign(contiguous.datastart, contiguous.dataend);
-    writeTiffSamples(path, samples);
 }
 
 void normalizeMaskChannel(cv::Mat& mask)
@@ -855,15 +834,10 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
             // On-demand loading
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
-                std::vector<cv::Mat> layers;
-                // OpenCV rejects some sample layouts (e.g. two float components).
-                if (readSamplesTiffFirst(channel_path)) {
-                    channel = readChannelSamples(channel_path);
-                } else {
-                    cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
-                    if (!layers.empty()) {
-                        channel = layers[0];
-                    }
+                try {
+                    channel = readChannelFile(channel_path);
+                } catch (const std::exception& error) {
+                    Logger()->warn("cannot read channel {}: {}", channel_path.string(), error.what());
                 }
             }
         }
@@ -1349,32 +1323,21 @@ void QuadSurface::invalidateMask()
     }
 }
 
-// Single-channel 8U/16U/32F -> untiled uncompressed TIFF; else cv::imwrite.
+// Any depth and channel count; uncompressed, except samples image tools do not
+// show (e.g. the two-component uv), which are LZW.
 void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat)
 {
-    bool wrote = false;
-    if (mat.channels() == 1 &&
-        (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
-    {
-        try {
-            const cv::Mat stored = mat.isContinuous() ? mat : mat.clone();
-            const char* dtype = mat.type() == CV_8UC1 ? "|u1" : mat.type() == CV_16UC1 ? "<u2" : "<f4";
-            vcr::sources::writeTiff(dir / (name + ".tif"), stored.data, dtype, stored.rows, stored.cols, 1, tiffOptions(dpi_));
-            wrote = true;
-        } catch (...) {
-            wrote = false; // Fall back to OpenCV
-        }
-    }
-
-    // OpenCV writes 1, 3 or 4 channels; others (e.g. the two-component uv) keep their samples.
-    if (!wrote && (mat.channels() == 2 || mat.channels() > 4)) {
-        writeChannelSamples(dir / (name + ".tif"), mat);
-        wrote = true;
-    }
-    if (!wrote) {
-        std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
-        cv::imwrite((dir / (name + ".tif")).string(), mat, compression_params);
-    }
+    const char* dtype = tiffDtype(mat.depth());
+    if (mat.empty() || !dtype)
+        throw std::runtime_error("unsupported image for channel " + name);
+    cv::Mat stored;
+    if (mat.channels() == 3) cv::cvtColor(mat, stored, cv::COLOR_BGR2RGB);
+    else if (mat.channels() == 4) cv::cvtColor(mat, stored, cv::COLOR_BGRA2RGBA);
+    else stored = mat.isContinuous() ? mat : mat.clone();
+    auto options = tiffOptions(dpi_);
+    if (mat.channels() == 2 || mat.channels() > 4)
+        options.compression = "lzw";
+    vcr::sources::writeTiff(dir / (name + ".tif"), stored.data, dtype, stored.rows, stored.cols, stored.channels(), options);
 }
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)

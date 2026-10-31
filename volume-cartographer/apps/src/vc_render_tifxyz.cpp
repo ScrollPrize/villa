@@ -35,7 +35,6 @@
 #include <exception>
 #include <thread>
 #include <optional>
-#include <tiffio.h>
 #include <omp.h>
 #ifndef _WIN32
 #include <unistd.h>

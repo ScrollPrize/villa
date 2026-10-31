@@ -54,7 +54,7 @@ add_subdirectory(VC3D)
 #################
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
+target_link_libraries(vc_render_tifxyz vc_core Boost::program_options)
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)

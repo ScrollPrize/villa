@@ -578,11 +578,19 @@ std::optional<double> sampleLasagnaChannel(
     const LasagnaChannelBinding& binding,
     const cv::Vec3d& volumePoint)
 {
-    LasagnaCubes cubes;
-    readLasagnaCubes(binding, std::span(&volumePoint, 1), cubes);
-    if (!cubes.valid[0])
+    const cv::Vec3d point = volumePoint / binding.spacing;
+    if (!insideGrid(binding, point[0], point[1], point[2]))
         return std::nullopt;
-    return interpolateLasagnaCube(cubes.values[0], cubes.fractionsXYZ[0]);
+    double coordinates[4];
+    double* zyx = coordinates;
+    if (binding.packed) *zyx++ = double(binding.channelIndex);
+    zyx[0] = point[2];
+    zyx[1] = point[1];
+    zyx[2] = point[0];
+    double value = 0.0;
+    binding.array->sample_linear(coordinates, 1,
+        binding.float32 ? vcr::ElementType{'f', 4, false} : vcr::ElementType{'u', 1, false}, true, &value);
+    return value;
 }
 
 std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(

@@ -4044,9 +4044,8 @@ void CChunkedVolumeViewer::updateStatusLabel()
     if (showStats && !statsTopRight) {
         items << statsItems;
     }
-    // Cache/scheduler statistics are informational; refresh them at most
-    // every 250 ms (see _sharedCacheStatsThrottle) instead of taking the
-    // shared cache and scheduler mutexes on every mouse move.
+    // Cache statistics are informational; refresh them at most every 250 ms
+    // (see _sharedCacheStatsThrottle), not on every mouse move.
     constexpr qint64 kSharedCacheStatsRefreshMs = 250;
     if (!_sharedCacheStatsThrottle.isValid() ||
         _sharedCacheStatsThrottle.elapsed() >= kSharedCacheStatsRefreshMs) {
