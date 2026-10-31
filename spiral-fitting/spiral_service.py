@@ -1876,7 +1876,7 @@ class ServiceState:
                                          request_from_config)
         lasagna = lasagna_normal_inputs(
             load_lasagna_source(paths.lasagna) if paths.lasagna else None,
-            config, int(scroll.lasagna_scale), paths.cache_directory)
+            config, scroll.lasagna_scale, paths.cache_directory)
         cache = (os.path.join(paths.cache_directory, "object_store_strips")
                  if paths.cache_directory else None)
 

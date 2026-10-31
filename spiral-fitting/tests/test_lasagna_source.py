@@ -4,8 +4,9 @@ import json
 
 import pytest
 
-from lasagna_source import (LasagnaSource, LasagnaSourceError, dataset_url,
-                            find_dataset_manifest, load_lasagna_source,
+from lasagna_source import (LasagnaSource, LasagnaSourceError, array_shape_matches,
+                            dataset_url, dyadic_coordinate_scale,
+                            find_dataset_manifest, lasagna_scale_for, load_lasagna_source,
                             manifest_identity, read_lasagna_manifest, url_identity,
                             write_lasagna_source)
 
@@ -133,3 +134,77 @@ def test_the_link_refresh_reads_the_normals_pack_when_the_cache_has_it(tmp_path)
     assert lasagna_normal_inputs(source, config, 4, tmp_path) == {'pool': str(pack), 'scale': 4}
     assert lasagna_normal_inputs(source, {'input_use_normals': False}, 4, tmp_path) is None
     assert lasagna_normal_inputs(None, config, 4, tmp_path) is None
+
+
+def test_shape_pairing_matches_vc3d_s_dyadic_rule():
+    # The cases of core/test/test_lasagna_manifest.cpp.
+    l0, l2 = (75784, 32694, 32694), (18946, 8174, 8174)
+    assert dyadic_coordinate_scale(l2, l0, 5) == 4.0
+    assert dyadic_coordinate_scale(l0, l2, 5) == 0.25
+    inclusive = (75784, 32693, 32693)
+    assert dyadic_coordinate_scale(inclusive, l0, 5) == 1.0
+    assert dyadic_coordinate_scale(l0, inclusive, 5) == 1.0
+    with pytest.raises(ValueError):
+        dyadic_coordinate_scale((75784, 32692, 32694), l0, 5)
+    assert dyadic_coordinate_scale((13, 25, 38), (100, 200, 300), 5) == 8.0
+    with pytest.raises(ValueError):
+        dyadic_coordinate_scale((18946, 8175, 8174), l0, 5)
+    with pytest.raises(ValueError):
+        dyadic_coordinate_scale(l2, l2, -1)
+    assert array_shape_matches(l0, l2, 4) and not array_shape_matches(l0, l2, 2)
+
+
+def test_a_manifest_s_frame_gives_the_arrays_downsampling(tmp_path):
+    path = write_manifest(tmp_path, base_shape_zyx=[400, 800, 1200])
+    source = read_lasagna_manifest(path)
+    # scaledown 4 of the fixture: 16 base voxels per array voxel.
+    assert (source.base_shape_zyx, source.base_voxels_per_array_voxel) == ((400, 800, 1200), 16.0)
+    assert lasagna_scale_for(source, (400, 800, 1200))[0] == 16
+    assert lasagna_scale_for(source, (399, 800, 1199))[0] == 16   # inclusive convention
+    assert lasagna_scale_for(source, (800, 1600, 2400))[0] == 32  # a 2x finer fit volume
+    # The scale survives a local copy of a remote dataset and its source document.
+    copy = read_lasagna_manifest(path, url='https://data.example/s.lasagna.json')
+    assert load_lasagna_source(write_lasagna_source(tmp_path / 'c', copy)) == copy
+    assert lasagna_scale_for(copy, (400, 800, 1200))[0] == 16
+
+    scaled = read_lasagna_manifest(write_manifest(
+        tmp_path, name='t.lasagna.json', base_shape_zyx=[400, 800, 1200], source_to_base=0.5))
+    assert lasagna_scale_for(scaled, (400, 800, 1200))[0] == 8
+
+
+def test_the_downsampling_is_not_derived_without_a_frame_or_a_matching_shape(tmp_path):
+    bare = read_lasagna_manifest(write_manifest(tmp_path))
+    assert bare.base_shape_zyx is None
+    assert lasagna_scale_for(bare, (400, 800, 1200)) == (
+        None, f'{bare.location} does not state its base_shape_zyx')
+    framed = read_lasagna_manifest(write_manifest(
+        tmp_path, name='t.lasagna.json', base_shape_zyx=[400, 800, 1200]))
+    assert lasagna_scale_for(framed, None)[0] is None
+    scale, why = lasagna_scale_for(framed, (300, 800, 1200))
+    assert scale is None and 'not levels of one grid' in why
+    # A fit volume coarser than the arrays.
+    scale, why = lasagna_scale_for(framed, (13, 25, 38))
+    assert scale is None and 'not a whole downsampling' in why
+    for bad in ({'base_shape_zyx': [1, 2]}, {'source_to_base': 0}):
+        with pytest.raises(LasagnaSourceError):
+            read_lasagna_manifest(write_manifest(tmp_path, name='u.lasagna.json', **bad))
+
+
+def test_a_stated_scale_is_derived_cross_checked_or_required(tmp_path):
+    from dataclasses import replace
+
+    from fit_session import ScrollSpec, ScrollSpecError, resolve_lasagna_scale
+    framed = read_lasagna_manifest(write_manifest(tmp_path, base_shape_zyx=[400, 800, 1200]))
+    bare = read_lasagna_manifest(write_manifest(tmp_path, name='t.lasagna.json'))
+    spec = ScrollSpec(name='s', voxel_size_um=8.0, spiral_outward_sense='CW',
+                      base_shape_zyx=(400, 800, 1200))
+    assert resolve_lasagna_scale(spec, framed).lasagna_scale == 16
+    assert resolve_lasagna_scale(replace(spec, lasagna_scale=16), framed).lasagna_scale == 16
+    with pytest.raises(ScrollSpecError, match='lasagna_scale 4 contradicts'):
+        resolve_lasagna_scale(replace(spec, lasagna_scale=4), framed)
+    # Underivable: the stated scale stands, and without one the fit is refused.
+    assert resolve_lasagna_scale(replace(spec, lasagna_scale=4), bare).lasagna_scale == 4
+    with pytest.raises(ScrollSpecError, match='state lasagna_scale'):
+        resolve_lasagna_scale(spec, bare)
+    with pytest.raises(ScrollSpecError, match='base_shape_zyx'):
+        resolve_lasagna_scale(replace(spec, base_shape_zyx=None), framed)

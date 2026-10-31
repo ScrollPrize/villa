@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from devices import fit_device
+from lasagna_source import array_shape_matches
 from pack_resident_pools import pack_arrays
 
 
@@ -178,13 +179,14 @@ def prepare_lasagna_volume(
                 f'grad_mag sidecar shape {grad_meta["array_shape"]} differs '
                 f'from dense normal shape {reference_shape}')
 
-    if scroll_zarr is not None:
-        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / lasagna_scale).astype(np.int64))
-        if tuple(reference_shape) != expected_shape:
-            print(
-                f'WARNING: lasagna store shape {reference_shape} does not match '
-                f'ceil(scroll_zarr.shape / lasagna_scale) {expected_shape}'
-            )
+    # The fit volume itself shows whether the arrays are its downsampling:
+    # a wrong lasagna_scale would read normals at the wrong positions.
+    if scroll_zarr is not None and not array_shape_matches(
+            scroll_zarr.shape, reference_shape, lasagna_scale):
+        raise ValueError(
+            f'lasagna arrays of shape {list(reference_shape)} are not the fit volume '
+            f'(shape {list(scroll_zarr.shape)}) downsampled lasagna_scale={lasagna_scale} '
+            f'times; check lasagna_scale and that both cover one aligned extent')
 
     z_size = int(reference_shape[0])
     z_lo = max(0, int(np.floor(z_begin / lasagna_scale)))

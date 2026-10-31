@@ -99,7 +99,8 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(spec.spiral_outward_sense, "CW")
             self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
-            self.assertEqual(spec.lasagna_scale, 4)
+            # No default: resolve_lasagna_scale derives or requires it.
+            self.assertIsNone(spec.lasagna_scale)
             self.assertEqual(spec.path_overrides, ())
 
     def test_base_shape_is_validated_and_preserved(self):

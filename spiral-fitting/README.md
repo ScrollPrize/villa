@@ -139,17 +139,32 @@ don't match the catalog's conventional defaults (e.g. `fiber_directions`).
 Overrides of inputs that now come from the object store (`verified_patches`,
 `fibers`, `outer_shell`, `tracks_dbm`) are ignored.
 
-Also optional, and easy to get wrong silently: `lasagna_scale` (default `4`),
-the Lasagna arrays' downsampling relative to the fit volume. The arrays
-themselves are the ones the dataset's Lasagna manifest names (see "Lasagna
-inputs must be packed first"); `normal_zarr_group` is retired and refused.
-**`lasagna_scale` must equal the actual downsample factor of those arrays
-for this specific scroll** — read it from the store's own `.zattrs`
-multiscales metadata, do not assume it from another scroll's example or from
-a generic recommendation. A mismatched value either silently reads the
-wrong-resolution normal maps (no error) or throws `RuntimeError: lasagna
-z-ROI [...] is empty` if the mismatch is large enough to push the requested
-z-range outside the (wrongly-scaled) store bounds.
+Optional `base_shape_zyx`: the fit volume's shape in its own voxels, a ZYX
+list of three positive integers (the catalog `metadata.json` shape of a
+full-resolution volume). Exports record it, and the fit derives the Lasagna
+scale from it.
+
+The Lasagna arrays' downsampling relative to the fit volume (`lasagna_scale`)
+is derived, as VC3D derives it for a service fit, when a fit reads the
+Lasagna dataset (see "Lasagna inputs must be packed first";
+`normal_zarr_group` is retired and refused) and both shapes are known: this
+file's `base_shape_zyx` and the manifest's `base_shape_zyx`. The two shapes
+must be power-of-two levels of one grid (ceil or floor halving; at one level
+they may differ by one voxel, the voxel-count and inclusive conventions), and
+the scale is then the manifest's base voxels per array voxel
+(`source_to_base` × 2^`scaledown`) over its base voxels per fit-volume voxel,
+which must be a whole number. **The derivation assumes the two grids cover
+the same aligned volume extent** (one origin, one extent): shapes cannot show
+a cropped or offset Lasagna dataset, or another volume of the same shape.
+
+An explicit `lasagna_scale` (a positive integer) is then a cross-check, and a
+fit whose value disagrees with the derived one is refused. Where the scale
+cannot be derived (either shape missing, shapes that are not levels of one
+grid, a fractional result) `lasagna_scale` is required: there is no default.
+Read it from the arrays' own `.zattrs` multiscales metadata, not from another
+scroll's example. Whatever its source, a fit that opens the scroll zarr
+refuses Lasagna packs whose shape is not that volume's downsampling by the
+scale.
 
 Optional `num_windings`: the scroll's winding count, where someone has
 estimated it (an integer of at least 2). It replaces the generic default of
@@ -161,7 +176,9 @@ than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
 still override it, and `model_gap_expander_capacity_windings` is raised to
 `num_windings + 3` only when the count would not otherwise fit.
 
-Example (PHerc0826, whose Lasagna arrays are a 4x downsample of its fit volume):
+Example (PHerc0826, whose Lasagna arrays are a 4x downsample of its fit
+volume; with `base_shape_zyx` here and in its manifest `lasagna_scale` only
+cross-checks the derived scale):
 
 ```json
 {
@@ -390,7 +407,10 @@ you name the URL it was copied from: `pack_resident_pools.py --as <URL>` packs
 it, and `fit_spiral.py --lasagna-url <URL>` fits it, under that URL's
 identity, so a service fitting the URL finds its packs. Either way a host
 needs only the packs, not the arrays; the packer writes the dataset's source
-document (`lasagna-<identity>.json`, recording its location) beside them.
+document (`lasagna-<identity>.json`, recording its location and, where the
+manifest states it, its frame: `base_shape_zyx` and base voxels per array
+voxel) beside them. The command-line fit derives `lasagna_scale` from that
+frame (see "Scroll specification").
 
 The command-line fit builds a missing pool from the arrays (reporting chunk
 progress; in DDP only rank 0 builds). A service never builds one: it fits the

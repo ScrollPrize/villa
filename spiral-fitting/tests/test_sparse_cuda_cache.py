@@ -319,3 +319,19 @@ def test_packer_writes_a_manifest_s_packs_into_the_cache(tmp_path):
     assert built == [str(tmp_path / 'cache' / 'lasagna' / identity / 'normals_g4'),
                      str(tmp_path / 'cache' / 'lasagna' / identity / 'grad_mag_g4')]
     assert json.loads((Path(built[0]) / 'meta.json').read_text())['lasagna_identity'] == identity
+
+
+def test_arrays_that_are_not_the_fit_volume_s_downsampling_are_refused(tmp_path):
+    """The fit volume's shape cross-checks lasagna_scale before any pool
+    loads."""
+    source = LasagnaSource(identity='run-1', location='/data/s.lasagna.json', group='4',
+                           stores={'normal_x': '/data/nx', 'normal_y': '/data/ny'})
+    pack = Path(source.pack_directory(tmp_path, 'normals'))
+    pack.mkdir(parents=True)
+    (pack / 'meta.json').write_text(json.dumps({'array_shape': [25, 50, 75]}))
+    volume = SimpleNamespace(shape=(100, 200, 300))
+    with pytest.raises(ValueError, match='not the fit volume'):
+        lasagna_data.prepare_lasagna_volume(
+            volume, use_normals=True, use_spacing=False, source=source,
+            cache_directory=str(tmp_path), z_begin=0, z_end=100, lasagna_scale=2,
+            device='cpu')

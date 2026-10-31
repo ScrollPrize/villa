@@ -47,7 +47,8 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS,
                          input_source_enabled, lasagna_enabled,
-                         lasagna_normal_inputs, outer_shell_required, shell_losses_enabled,
+                         lasagna_normal_inputs, outer_shell_required,
+                         resolve_lasagna_scale, shell_losses_enabled,
                          winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
@@ -1044,7 +1045,6 @@ class FitContext:
         self.spiral_outward_sense = scroll.spiral_outward_sense
         # Decides whether exports are flipped so the scroll top is row 0.
         self.z_direction_is_top_to_bottom = scroll.z_direction_is_top_to_bottom
-        self.lasagna_scale = int(scroll.lasagna_scale)
         umbilicus_path = paths.umbilicus
         umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
         self.umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(
@@ -1058,6 +1058,12 @@ class FitContext:
         self.lasagna_source = (
             load_lasagna_source(paths.lasagna)
             if paths.lasagna and lasagna_enabled(config) else None)
+        # The arrays' downsampling relative to the fit volume, None when the
+        # fit reads no Lasagna dataset.
+        if self.lasagna_source is not None:
+            self.scroll = scroll = resolve_lasagna_scale(scroll, self.lasagna_source)
+        self.lasagna_scale = (
+            int(scroll.lasagna_scale) if self.lasagna_source is not None else None)
         self.build_lasagna_packs = bool(build_lasagna_packs)
         self.winding_inference_path = (
             (paths.winding_inference or None)
@@ -2719,7 +2725,9 @@ class FitContext:
                 reasons.append(f'checkpoint has no {key!r} entry')
 
         # --- scroll / dataset identity ------------------------------------
-        if checkpoint.get('lasagna_scale') != self.lasagna_scale:
+        # A fit that reads no Lasagna dataset has no downsampling to compare.
+        if (self.lasagna_scale is not None
+                and checkpoint.get('lasagna_scale') != self.lasagna_scale):
             reasons.append(
                 f'checkpoint lasagna_scale={checkpoint.get("lasagna_scale")!r} '
                 f'does not match this fit ({self.lasagna_scale!r})')

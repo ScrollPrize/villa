@@ -7,7 +7,7 @@ stack in the service worker.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import datetime
 from enum import Enum
 import hashlib
@@ -22,7 +22,7 @@ from config import Config
 from lasagna_source import (LASAGNA_CHANNELS, LasagnaSource, LasagnaSourceError,
                             check_identity, fiber_directions_path,
                             find_dataset_manifest, is_remote_location,
-                            load_lasagna_source, url_identity)
+                            lasagna_scale_for, load_lasagna_source, url_identity)
 from surface_orientation import spiral_outward_sense_for
 
 
@@ -589,8 +589,10 @@ class ScrollSpec:
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     # The Lasagna arrays' downsampling relative to the fit volume; the arrays
-    # themselves are the Lasagna dataset's (lasagna_source).
-    lasagna_scale: int = 4
+    # themselves are the Lasagna dataset's (lasagna_source). None when the
+    # spec does not state it: resolve_lasagna_scale derives it from the
+    # dataset's frame where it can, and requires it where it cannot.
+    lasagna_scale: int | None = None
     # The scroll's winding count, when someone has estimated it. A default for
     # the fit, not a fact the scroll owns: see scroll_spec_config_defaults.
     num_windings: int | None = None
@@ -758,7 +760,7 @@ def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str, *,
         left_handed_coordinates=catalog["left_handed_coordinates"],
         base_shape_zyx=fields.get("base_shape_zyx"),
         umbilicus_coordinate_scale=fields.get("umbilicus_coordinate_scale", 1.0),
-        lasagna_scale=fields.get("lasagna_scale", 4),
+        lasagna_scale=fields.get("lasagna_scale"),
         num_windings=fields.get("num_windings"),
         path_overrides=fields.get("path_overrides", ()),
     )
@@ -773,6 +775,28 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     return _scroll_spec_from_fields(
         _scroll_spec_fields(document, dataset_root, source), source,
         outward_sense=outward_sense)
+
+
+def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec:
+    """``spec`` with the downsampling of the Lasagna dataset ``source``
+    relative to the fit volume: derived from the volume's ``base_shape_zyx``
+    and the dataset's frame where both are known (lasagna_scale_for), a
+    stated ``lasagna_scale`` then only a cross-check that must agree; else
+    the stated one, which is then required. The derivation takes the two
+    grids to cover one aligned extent."""
+    derived, how = lasagna_scale_for(source, spec.base_shape_zyx)
+    if derived is None:
+        if spec.lasagna_scale is None:
+            raise ScrollSpecError(
+                f"cannot derive the Lasagna arrays' downsampling relative to the fit "
+                f"volume: {how}; state lasagna_scale in {SCROLL_SPEC_FILENAME}, or "
+                "the volume's base_shape_zyx there and the dataset's in its manifest")
+        return spec
+    if spec.lasagna_scale is not None and spec.lasagna_scale != derived:
+        raise ScrollSpecError(
+            f"lasagna_scale {spec.lasagna_scale} contradicts the downsampling of "
+            f"{source.location} relative to the fit volume, {derived} ({how})")
+    return replace(spec, lasagna_scale=derived)
 
 
 def _read_scroll_spec_document(path: Path) -> Any:

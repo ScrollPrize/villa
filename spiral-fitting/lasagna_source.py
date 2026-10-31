@@ -25,6 +25,13 @@ A fit names its dataset with a ``*.lasagna.json`` manifest (the command-line
 fit) or with a source document a service writes from the project VC3D sends
 (``write_lasagna_source``); ``load_lasagna_source`` reads either.
 
+A manifest that states its ``base_shape_zyx`` gives the dataset's frame: the
+arrays' downsampling relative to that base grid (``source_to_base`` times
+2^scaledown). With the fit volume's own shape that fixes the arrays'
+downsampling relative to the fit volume (``lasagna_scale_for``), as VC3D's
+SpiralProjectInputs computes it; it assumes the two grids cover one aligned
+extent, which shapes alone cannot show.
+
 Fiber-direction samples (fiber_direction_samples.py) extracted from a
 fiber-inference dataset are kept the same way, by that dataset's identity and
 the fit-volume scale their positions are in:
@@ -36,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -65,12 +73,16 @@ class LasagnaSource:
     location, the array name its channels share and, by input
     (LASAGNA_CHANNELS), the OME-Zarr store holding that channel; a store is
     ``<store>/<group>``. The stores are where the dataset was found and need
-    not be readable here: only building a pack reads them."""
+    not be readable here: only building a pack reads them.
+    ``base_shape_zyx`` and ``base_voxels_per_array_voxel`` are the dataset's
+    frame, None where its manifest does not state it."""
 
     identity: str
     location: str
     group: str
     stores: Mapping[str, str] = field(default_factory=dict)
+    base_shape_zyx: tuple[int, int, int] | None = None
+    base_voxels_per_array_voxel: float | None = None
 
     def __post_init__(self):
         check_identity(self.identity)
@@ -78,8 +90,13 @@ class LasagnaSource:
             raise LasagnaSourceError(f"{self.location}: invalid array name {self.group!r}")
 
     def manifest(self) -> dict[str, Any]:
-        return {"identity": self.identity, "location": self.location,
-                "group": self.group, "stores": dict(sorted(self.stores.items()))}
+        document = {"identity": self.identity, "location": self.location,
+                    "group": self.group, "stores": dict(sorted(self.stores.items()))}
+        if self.base_shape_zyx is not None:
+            document["base_shape_zyx"] = list(self.base_shape_zyx)
+        if self.base_voxels_per_array_voxel is not None:
+            document["base_voxels_per_array_voxel"] = self.base_voxels_per_array_voxel
+        return document
 
     def dataset_directory(self, cache_directory: str | os.PathLike[str]) -> str:
         """Where a cache keeps this dataset's packs (and, written by the
@@ -197,11 +214,94 @@ def read_lasagna_manifest(path: str | os.PathLike[str],
         group, scaledown = array.name, entry.get("scaledown")
     if not stores:
         raise LasagnaSourceError(f"{path} has no nx, ny or grad_mag channel")
+
+    # The frame, read as vc::lasagna's manifest reader reads it.
+    source_to_base = document.get("source_to_base", 1.0)
+    if (type(source_to_base) not in (int, float) or not math.isfinite(source_to_base)
+            or source_to_base <= 0):
+        raise LasagnaSourceError(f"{path}: source_to_base must be a positive number")
+    scaledown = 0 if scaledown is None else scaledown
+    if type(scaledown) is not int or not 0 <= scaledown <= 30:
+        raise LasagnaSourceError(f"{path}: invalid scaledown {scaledown!r}")
+    base_shape = document.get("base_shape_zyx")
+    if base_shape is not None:
+        base_shape = _checked_shape(base_shape, f"{path}: base_shape_zyx")
+    frame = {"base_shape_zyx": base_shape,
+             "base_voxels_per_array_voxel": float(source_to_base) * 2 ** scaledown}
+
     if url is not None:
         return LasagnaSource(identity=url_identity(url), location=dataset_url(url),
-                             group=group, stores=stores)
+                             group=group, stores=stores, **frame)
     return LasagnaSource(identity=manifest_identity(data, path.name, provenance),
-                         location=str(path), group=group, stores=stores)
+                         location=str(path), group=group, stores=stores, **frame)
+
+
+def _checked_shape(value: Any, what: str) -> tuple[int, int, int]:
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(type(extent) is not int or extent <= 0 for extent in value)):
+        raise LasagnaSourceError(f"{what} must be a ZYX list of three positive integers")
+    return tuple(value)
+
+
+def _same_level(fine: int, coarse: int, factor: int) -> bool:
+    """Whether ``coarse`` is ``fine`` downsampled ``factor`` times: either
+    ceil or floor halving; at one level, the voxel-count and inclusive
+    maximum-coordinate conventions (one apart)."""
+    if factor == 1:
+        return abs(fine - coarse) <= 1
+    return coarse in (-(-fine // factor), max(1, fine // factor))
+
+
+def dyadic_coordinate_scale(from_shape_zyx, to_shape_zyx, maximum_level: int = 30) -> float:
+    """``to_shape_zyx`` voxels per ``from_shape_zyx`` voxel: the one power of
+    two (within 2^±``maximum_level``) at which the shapes are levels of one
+    grid (vc::lasagna::dyadicCoordinateScaleBetweenShapes). ValueError when
+    no single level matches."""
+    if not 0 <= maximum_level <= 30:
+        raise ValueError("maximum dyadic coordinate level must be between 0 and 30")
+    if any(int(extent) <= 0 for extent in (*from_shape_zyx, *to_shape_zyx)):
+        raise ValueError("coordinate-domain shapes must be positive")
+    matches = [
+        level for level in range(-maximum_level, maximum_level + 1)
+        if all(_same_level(*((to, frm) if level >= 0 else (frm, to)), 1 << abs(level))
+               for frm, to in zip(from_shape_zyx, to_shape_zyx))]
+    if len(matches) != 1:
+        raise ValueError(
+            f"shapes {list(from_shape_zyx)} and {list(to_shape_zyx)} do not identify "
+            "exactly one power-of-two scale")
+    return math.ldexp(1.0, matches[0])
+
+
+def array_shape_matches(volume_shape_zyx, array_shape_zyx, downsampling: int) -> bool:
+    """Whether arrays of ``array_shape_zyx`` are ``volume_shape_zyx``
+    downsampled ``downsampling`` times, by the rule of
+    ``dyadic_coordinate_scale``."""
+    return all(_same_level(int(fine), int(coarse), int(downsampling))
+               for fine, coarse in zip(volume_shape_zyx, array_shape_zyx))
+
+
+def lasagna_scale_for(source: LasagnaSource, volume_shape_zyx) -> tuple[int | None, str]:
+    """The downsampling of ``source``'s arrays relative to a fit volume of
+    shape ``volume_shape_zyx`` (its full-resolution shape), as VC3D's
+    SpiralProjectInputs derives it, and how it was found; ``(None, why)``
+    when it cannot be derived. Valid only where the volume and the dataset's
+    base grid cover the same aligned extent."""
+    if volume_shape_zyx is None:
+        return None, "the fit volume's shape (base_shape_zyx) is not known"
+    if source.base_shape_zyx is None or source.base_voxels_per_array_voxel is None:
+        return None, f"{source.location} does not state its base_shape_zyx"
+    try:
+        base_per_volume_voxel = dyadic_coordinate_scale(volume_shape_zyx, source.base_shape_zyx)
+    except ValueError as exc:
+        return None, (f"the fit volume's shape {list(volume_shape_zyx)} and the "
+                      f"dataset's base shape {list(source.base_shape_zyx)} are not "
+                      f"levels of one grid ({exc})")
+    scale = source.base_voxels_per_array_voxel / base_per_volume_voxel
+    how = (f"{source.base_voxels_per_array_voxel:g} base voxels per array voxel, "
+           f"{base_per_volume_voxel:g} per fit-volume voxel")
+    if scale < 1 or scale != round(scale):
+        return None, f"{how} is not a whole downsampling ({scale:g})"
+    return int(scale), how
 
 
 def write_lasagna_source(directory: str | os.PathLike[str], source: LasagnaSource) -> str:
@@ -231,10 +331,19 @@ def load_lasagna_source(path: str | os.PathLike[str]) -> LasagnaSource:
     stores = document.get("stores") or {}
     if not isinstance(stores, Mapping) or set(stores) - set(LASAGNA_CHANNELS):
         raise LasagnaSourceError(f"{path}: stores must be keyed by {sorted(LASAGNA_CHANNELS)}")
+    base_shape = document.get("base_shape_zyx")
+    per_array_voxel = document.get("base_voxels_per_array_voxel")
+    if per_array_voxel is not None and (
+            type(per_array_voxel) not in (int, float) or not per_array_voxel > 0):
+        raise LasagnaSourceError(f"{path}: invalid base_voxels_per_array_voxel")
     return LasagnaSource(identity=str(document.get("identity") or ""),
                          location=str(document.get("location") or ""),
                          group=str(document.get("group") or ""),
-                         stores={key: str(value) for key, value in stores.items() if value})
+                         stores={key: str(value) for key, value in stores.items() if value},
+                         base_shape_zyx=(None if base_shape is None else
+                                         _checked_shape(base_shape, f"{path}: base_shape_zyx")),
+                         base_voxels_per_array_voxel=(
+                             None if per_array_voxel is None else float(per_array_voxel)))
 
 
 def fiber_directions_path(cache_directory: str | os.PathLike[str], identity: str,
