@@ -174,6 +174,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.train" = "vesuvius.models.training.train:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 "vesuvius.fiber_spline_generator" = "vesuvius.fiber_spline_generator.cli:main"
+"vesuvius.gp_submission" = "vesuvius.gp_submission:main"
 
 [tool.setuptools]
 include-package-data = true
