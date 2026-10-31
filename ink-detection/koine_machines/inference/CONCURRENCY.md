@@ -5,16 +5,18 @@ idle between batches. Running 2–4 processes on the same card, each on its own 
 surface list, raises throughput.
 
 Measured on six Reader v3 windings (PHerc0800, 0125, 0211 and 0268 surface volumes) with
-`--stride 192 --amp-dtype fp16 --no-compile`, MIOpen off. The windings are split round-robin
+`--stride 192 --amp-dtype fp16 --no-compile` (MIOpen off on the AMD cards). The windings are split round-robin
 over the processes, and the time runs until every process is done. Each value is the median
 of 3 interleaved rounds after a warm-up, with nothing else running on the machine:
 
 | GPU | 1 process | 2 processes | 4 processes | Output vs 1 process |
 |---|---|---|---|---|
+| RTX 3080 10 GB | 40.8 s | 33.1 s (1.23×) | 34.4 s (1.19×) | byte-identical |
 | Radeon AI PRO R9700 32 GB | 74.7 s | 64.4 s (1.16×) | 51.9 s (1.44×) | byte-identical |
 | Instinct MI50 32 GB | 102.2 s | 81.0 s (1.26×) | 77.7 s (1.32×) | byte-identical |
 
-With `--gpu-normalize` the same runs were within 3% of these times on both cards.
+With `--gpu-normalize` the same runs were within 3% of these times on the R9700 and MI50,
+and 1–4% slower on the RTX 3080. On the RTX 3080, 2 processes is the best setting.
 
 Notes:
 
