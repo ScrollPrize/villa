@@ -5447,7 +5447,8 @@ class FitContext:
     def _auto_steps_stage_starts(self):
         """First iteration of each later stage of a staged fit: a directional
         DT loss that acts (non-zero weight, inputs loaded) switching on at its
-        loss_start, or the start of a high-resolution flow LR ramp."""
+        loss_start, the start of a high-resolution flow LR ramp, or the
+        one-time fiber relink at pcl_fiber_link_model_direction_step."""
         cfg = self.config
         acting = {
             'verified_patch': (cfg['loss_weight_patch_dt'] > 0
@@ -5462,6 +5463,8 @@ class FitContext:
         if (cfg['model_flow_field_high_res_lr_scale_initial']
                 != cfg['model_flow_field_high_res_lr_scale_final']):
             starts.append(cfg['model_flow_field_high_res_lr_ramp_start_step'])
+        if cfg['pcl_fiber_link_side_filter'] and getattr(self, 'fiber_catalog', True):
+            starts.append(cfg['pcl_fiber_link_model_direction_step'])
         return auto_steps_stage_starts(
             starts, start_iteration=self.start_iteration,
             horizon=self.num_training_steps)
@@ -5477,7 +5480,7 @@ class FitContext:
         monitor = AutoStepsMonitor(
             window=window_blocks, block=_AUTO_STEPS_BLOCK,
             min_iterations=min_iterations, rel_threshold=threshold,
-            stage_starts=stage_starts)
+            stage_starts=stage_starts, start_iteration=self.start_iteration)
         if stage_starts:
             print(f'auto steps: staged fit, stages start at iterations '
                   f'{", ".join(map(str, stage_starts))}; no stop before '

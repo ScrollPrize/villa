@@ -50,18 +50,21 @@ class AutoStepsMonitor:
     that block, and ``window`` counts blocks. A staged fit's loss is not
     comparable across a stage start (a term switching on raises it), so the
     history restarts there, dropping a block that straddles the start, and
-    the fit never stops before two windows after the last stage start.
+    the fit never stops before two windows after the last stage start. A fit
+    resumed from a checkpoint (``start_iteration`` > 0) likewise runs two
+    windows of its own before it can stop.
     """
 
-    def __init__(self, *, window, block, min_iterations, rel_threshold, stage_starts=()):
+    def __init__(self, *, window, block, min_iterations, rel_threshold, stage_starts=(),
+                 start_iteration=0):
         self.window = int(window)
         self.block = int(block)
         self.rel_threshold = float(rel_threshold)
         self.stage_starts = sorted(stage_starts)
         self.earliest_stop = int(min_iterations)
-        if self.stage_starts:
-            self.earliest_stop = max(self.earliest_stop,
-                                     self.stage_starts[-1] + 2 * self.window * self.block)
+        restart = max([*self.stage_starts, int(start_iteration)])
+        if restart > 0:
+            self.earliest_stop = max(self.earliest_stop, restart + 2 * self.window * self.block)
         self.history = []
 
     def observe(self, completed, block_min) -> bool:

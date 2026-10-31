@@ -111,3 +111,14 @@ def test_block_that_straddles_a_stage_start_is_dropped():
     for end in (200, 400, 600, 800, 1000, 1200):
         monitor.observe(end, 1.0 if end <= 1000 else 3.0)
     assert monitor.history == [3.0]
+
+
+def test_resumed_fit_runs_two_windows_before_it_can_stop():
+    monitor = AutoStepsMonitor(window=5, block=BLOCK, min_iterations=2000, rel_threshold=1e-4,
+                               start_iteration=20_000)
+    assert monitor.earliest_stop == 22_000
+    stop = next(end for end in range(20_200, 30_001, BLOCK) if monitor.observe(end, 1.0))
+    assert stop == 22_000
+    # A fresh fit keeps the configured minimum, even below two windows.
+    assert AutoStepsMonitor(window=5, block=BLOCK, min_iterations=600,
+                            rel_threshold=1e-4).earliest_stop == 600

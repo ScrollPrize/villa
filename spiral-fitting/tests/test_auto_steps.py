@@ -123,3 +123,18 @@ def test_stage_starts_include_a_later_high_res_lr_ramp():
     context = _context({"optimizer_num_training_steps": 10_000,
                         "model_flow_field_high_res_lr_ramp_start_step": 8000})
     assert context._auto_steps_stage_starts() == []
+
+
+def test_stage_starts_include_the_fiber_relink_when_the_side_filter_is_on():
+    cfg = {"optimizer_num_training_steps": 30_000, "pcl_fiber_link_side_filter": True}
+    assert _context(cfg)._auto_steps_stage_starts() == [10_000, 25_001]
+    context = _context(cfg)
+    context.fiber_catalog = {}
+    assert context._auto_steps_stage_starts() == [25_001]
+    assert _context({"optimizer_num_training_steps": 30_000})._auto_steps_stage_starts() == [25_001]
+
+
+def test_resumed_fit_waits_two_windows_after_the_resume():
+    context = _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 10_000},
+                       start_iteration=6000)
+    assert context._auto_steps_monitor().earliest_stop == 8000
