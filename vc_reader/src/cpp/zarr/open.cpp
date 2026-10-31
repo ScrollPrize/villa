@@ -683,6 +683,11 @@ bool isLocalZarrArray(const std::filesystem::path& directory)
     return node.is_object() && node.value("node_type", "") == "array";
 }
 
+bool isArrayNode(const std::string& location, const OpenOptions& options)
+{
+    return rootArrayMetadata(stripSlashes(location), options).has_value();
+}
+
 // Keeps a pyramid's group state with its caches, every level looked up.
 static void keepPyramid(Group& group, const std::vector<std::pair<int, std::string>>& levels)
 {
@@ -767,6 +772,15 @@ std::optional<Json> Group::consolidated()
         consolidated_ = metadata;
     }
     return *consolidated_;
+}
+
+std::vector<std::string> Group::arrayKeys()
+{
+    std::vector<std::string> out;
+    for (auto& key : keys())
+        if (const auto found = node(key); found && found->first == NodeKind::Array)
+            out.push_back(std::move(key));
+    return out;
 }
 
 std::optional<std::pair<Group::NodeKind, Json>> Group::node(const std::string& input)

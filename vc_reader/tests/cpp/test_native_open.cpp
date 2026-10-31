@@ -137,6 +137,8 @@ void groups(const fs::path& root)
     OpenOptions options;
     auto group = Group::open(store.string(), options);
     require(group.keys() == std::vector<std::string>{"0", "1", "labels"}, "local keys skip non-nodes");
+    require(group.arrayKeys() == std::vector<std::string>{"0", "1"}, "array keys leave out groups");
+    require(!isArrayNode(group.location(), options) && isArrayNode(group.location() + "/0", options), "array or group");
     require(group.levels() == std::vector<std::string>{"0", "1"}, "levels");
     require(group.placement("1").scale == std::array<double, 3>{2, 4, 4}, "group placement");
     require(levelPlacement(group.attributes(), "1").scale == std::array<double, 3>{2, 4, 4}, "placement from attributes");

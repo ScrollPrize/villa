@@ -357,6 +357,7 @@ NB_MODULE(_reader, m)
         .def_prop_ro("multiscales", [](const Group& g) { return py_json(g.multiscales()); })
         .def("levels", &Group::levels, "probe_levels"_a = 0, nb::call_guard<nb::gil_scoped_release>())
         .def("keys", &Group::keys, nb::call_guard<nb::gil_scoped_release>())
+        .def("array_keys", &Group::arrayKeys, nb::call_guard<nb::gil_scoped_release>())
         .def("node", [](Group& g, const std::string& key) -> nb::object {
             std::optional<std::pair<Group::NodeKind, Json>> node;
             {
@@ -383,6 +384,7 @@ NB_MODULE(_reader, m)
     }, "location"_a, "options"_a, "refresh"_a = false,
        "What is known about the volume at a location, as JSON (see vcr::zarr::volumeMetadata).");
     m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
+    m.def("is_array_node", &vcr::zarr::isArrayNode, "location"_a, "options"_a, nb::call_guard<nb::gil_scoped_release>());
     m.def("forget_kept_metadata", &vcr::zarr::forgetKeptMetadata, "location"_a, "options"_a);
     m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
         vcr::zarr::StoreMetadata metadata;

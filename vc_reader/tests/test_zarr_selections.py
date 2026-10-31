@@ -111,3 +111,15 @@ class ZarrSelectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_open_node_returns_what_is_at_the_location(tmp_path):
+    import zarr
+    from vc_reader.reader import ZarrGroup, ZarrReader, open_node
+
+    root = zarr.open_group(tmp_path / "g.zarr", mode="w", zarr_format=2)
+    root.create_array("0", shape=(2, 2), chunks=(2, 2), dtype="u1")
+    root.create_group("child")
+    assert isinstance(open_node(tmp_path / "g.zarr"), ZarrGroup)
+    assert isinstance(open_node(tmp_path / "g.zarr" / "0"), ZarrReader)
+    assert open_node(tmp_path / "g.zarr").array_keys() == ["0"]

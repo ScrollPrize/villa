@@ -201,6 +201,10 @@ class ZarrGroup:
         """
         return self._group.keys()
 
+    def array_keys(self) -> list[str]:
+        """Those of :meth:`keys` that are arrays."""
+        return self._group.array_keys()
+
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
 
@@ -220,6 +224,15 @@ class ZarrGroup:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def open_node(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader | ZarrGroup:
+    """The array or group at ``location``, whichever it is; the arguments of :meth:`ZarrGroup.open`."""
+    settings, _ = _make_settings(location, auth=kwargs.get("auth", "auto"), cache_dir=kwargs.get("cache_dir"),
+                                 offline=kwargs.get("offline", False))
+    if _reader.is_array_node(settings["location"], _open_options(settings, None)):
+        return ZarrReader.open(location, **kwargs)
+    return ZarrGroup.open(location, **kwargs)
 
 
 def open_group(location: str | os.PathLike[str], **kwargs: Any) -> ZarrGroup:

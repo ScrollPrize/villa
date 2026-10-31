@@ -236,6 +236,8 @@ struct ArrayHints {
     std::optional<Json> attributes;              // already-read array attributes
 };
 OpenedArray openArray(const std::string& location, const OpenOptions& options, ArrayHints hints = {});
+// Whether the node at a location is an array (otherwise open it as a Group).
+bool isArrayNode(const std::string& location, const OpenOptions& options);
 
 // Select one physical pyramid level without opening the other arrays. A root
 // array is level 0. Numeric dataset paths retain their numbers (including gaps);
@@ -294,6 +296,8 @@ public:
     // consolidated metadata or the caches when offline, else by listing the S3 prefix.
     // Throws std::invalid_argument for plain HTTP, which has no listing.
     std::vector<std::string> keys();
+    // Those of keys() that are arrays.
+    std::vector<std::string> arrayKeys();
     // The volume's metadata (see volumeMetadata), memoized with the group.
     const StoreMetadata& metadata(bool refresh = false);
 
