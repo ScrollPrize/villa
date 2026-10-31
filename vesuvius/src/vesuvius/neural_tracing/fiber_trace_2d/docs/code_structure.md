@@ -158,16 +158,12 @@ model forwards.
 
 For volumes too large to retain locally, both entry points can pass
 `--live-fetch`. `lasagna.live_omezarr_cache` validates the selected local
-numeric level against its S3 source, lazily materializes at most 10,000 cheap
-canonical tile descriptors ahead, and admits only completed materializations
-to the independently bounded tile-array window. It inventories and
-accounts only the selected scale. After a complete canonical Z row commits,
-the runner may delete whole cached Z-chunk planes strictly behind the safe
-input frontier until actual resident bytes fall below the default 10 TiB
-target. Protected/current/future planes are never deleted, and lack of a safe
-plane produces a conservative temporary overshoot rather than a stall.
-Selected-level advisory locks prevent cooperating bulk download, live mutation,
-and ordinary inference readers from colliding. Remote listings are authoritative;
+numeric level against its S3 source and reads it through a `vc_reader` reader
+whose disk cache (`<ome root>/.live_cache`, default target 10 TiB) removes its
+least recently used chunks. At most 10,000 cheap canonical tile descriptors are
+read ahead, and only completed reads are admitted to the independently bounded
+tile-array window.
+Remote listings are authoritative;
 `.noremote` remains advisory and eviction never records remote absence.
 
 The shared multi-device runner's opt-in `--profile-pipeline` diagnostics use

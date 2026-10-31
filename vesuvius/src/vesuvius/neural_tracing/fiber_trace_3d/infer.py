@@ -477,9 +477,11 @@ def run_fiber_trace_3d_inference(
     if not no_download and not live_fetch:
         _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
-    a_in = open_node(
-        str(input_path), memory_cache=int(float(input_cache_gib) * (1 << 30)), threads=int(input_io_threads),
-    )
+    input_memory = int(float(input_cache_gib) * (1 << 30))
+    if _live_cache is not None:
+        a_in = _live_cache.open_reader(memory_cache=input_memory, threads=int(input_io_threads))
+    else:
+        a_in = open_node(str(input_path), memory_cache=input_memory, threads=int(input_io_threads))
     if not hasattr(a_in, "shape"):
         raise ValueError(f"input must point to a zarr array, got: {input_path}")
     input_shape = tuple(int(v) for v in a_in.shape)
