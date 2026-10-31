@@ -141,8 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Number of steps to accumulate gradients before optimizer.step()")
     grp_optim.add_argument("--grad-clip", type=float, default=12.0,
                            help="Gradient clipping value")
-    grp_optim.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default="float16",
-                           help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
+    grp_optim.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default=None,
+                           help="Autocast dtype (config or float16 when unset; float16 uses GradScaler, bfloat16 skips scaling)")
     grp_optim.add_argument("--no-amp", action="store_true",
                            help="Disable Automatic Mixed Precision (AMP)")
 
