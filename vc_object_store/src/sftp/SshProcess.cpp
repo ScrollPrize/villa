@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
@@ -31,6 +32,49 @@ namespace detail {
 namespace {
 constexpr size_t kDiagnosticBytes = 8192;
 
+#ifndef _WIN32
+std::string controlPath()
+{
+    // Keep the socket path short enough for macOS too. mkdtemp creates mode
+    // 0700, so only this user can connect to the authenticated transport.
+    struct Directory {
+        std::string path = "/tmp/vc-ssh-XXXXXX";
+        Directory() {
+            if (!mkdtemp(path.data())) throw std::runtime_error("SFTP: cannot create SSH control directory");
+        }
+        ~Directory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    };
+    static Directory directory;
+    return directory.path + "/%C";
+}
+#endif
+
+std::string shellQuote(const std::string& text)
+{
+    std::string quoted = "'";
+    for (const char c : text) quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return quoted + "'";
+}
+
+std::string lockedServerCommand(const Options& options)
+{
+    if (options.processLifetime.count() <= 0)
+        throw std::invalid_argument("SFTP process lifetime must be positive");
+    // No user-supplied text is interpreted as shell syntax. All descriptors
+    // for the database and its journal belong to this one locked process.
+    return "lock=" + shellQuote(options.processLock) + "; "
+        "test -f \"$lock\" && test ! -L \"$lock\" || { "
+        "echo 'hub: enable SSH process locking with vc_object_hub enable-ssh-locking HUB first' >&2; exit 1; }; "
+        "command -v flock >/dev/null && command -v timeout >/dev/null || { "
+        "echo 'hub: server needs flock and timeout (Linux util-linux/coreutils)' >&2; exit 1; }; "
+        "server=; for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server "
+        "/usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do "
+        "if test -x \"$p\"; then server=$p; break; fi; done; "
+        "test -n \"$server\" || { echo 'hub: external OpenSSH sftp-server not found' >&2; exit 1; }; "
+        "exec timeout --kill-after=5s " + std::to_string(options.processLifetime.count()) +
+        "s flock --exclusive --timeout 60 --no-fork \"$lock\" \"$server\"";
+}
+
 std::vector<std::string> sshArguments(const Url& url, const Options& options, bool interactive)
 {
     std::vector<std::string> args{"ssh", "-T", interactive ? "-oBatchMode=no" : "-oBatchMode=yes",
@@ -38,7 +82,12 @@ std::vector<std::string> sshArguments(const Url& url, const Options& options, bo
         "-oConnectTimeout=" + std::to_string(options.connectTimeout.count())};
     if (!url.user.empty()) args.insert(args.end(), {"-l", url.user});
     if (url.port) args.insert(args.end(), {"-p", std::to_string(*url.port)});
-    args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+#ifndef _WIN32
+    if (options.shareConnection)
+        args.insert(args.end(), {"-oControlMaster=auto", "-oControlPersist=no", "-oControlPath=" + controlPath()});
+#endif
+    if (options.processLock.empty()) args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+    else args.insert(args.end(), {"--", url.host, lockedServerCommand(options)});
     return args;
 }
 
@@ -53,13 +102,6 @@ void keepTail(std::string& tail, const char* data, size_t size)
 // asks the same question so reconnecting does not ask the user again.
 std::mutex answersMutex;
 std::map<std::pair<std::string, std::string>, std::string> rememberedAnswers;
-
-std::string shellQuote(const std::string& text)
-{
-    std::string quoted = "'";
-    for (const char c : text) quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
-    return quoted + "'";
-}
 
 // ssh runs a generated helper as SSH_ASKPASS. The helper writes the prompt kind
 // and text to one FIFO and prints the answer it reads from another; both live in
@@ -290,6 +332,11 @@ size_t SshProcess::read(std::span<std::byte> out, std::chrono::milliseconds wait
 }
 
 bool SshProcess::prompting() const { return false; }
+bool SshProcess::closed() const
+{
+    DWORD status = 0;
+    return !GetExitCodeProcess(impl_->process, &status) || status != STILL_ACTIVE;
+}
 void SshProcess::authenticated() {}
 std::string SshProcess::diagnostics()
 {
@@ -441,6 +488,14 @@ size_t SshProcess::read(std::span<std::byte> out, std::chrono::milliseconds wait
 }
 
 bool SshProcess::prompting() const { return impl_->askpass && impl_->askpass->active(); }
+bool SshProcess::closed() const
+{
+    pollfd ready{impl_->stream, POLLIN, 0};
+    if (poll(&ready, 1, 0) <= 0) return false;
+    if (ready.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+    char byte;
+    return (ready.revents & POLLIN) && ::recv(impl_->stream, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
 void SshProcess::authenticated() { impl_->askpass.reset(); }
 std::string SshProcess::diagnostics()
 {

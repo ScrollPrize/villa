@@ -31,20 +31,26 @@ Upstream upstream(sqlite3* db)
     return {row.text(0), row.text(1), {row.i64(2), row.i64(3)}};
 }
 
-// Hub handles stay open for the life of the process. A new connection rereads
+// Hub handles stay open between operations. A new connection rereads
 // the header and schema page by page, a network round trip each; an open one
 // keeps its page cache while the hub's change counter is unchanged.
 struct OpenHub {
     std::shared_ptr<ObjectStore> store;
     std::string uuid, replica;
+    std::shared_ptr<const void> remoteIdentity;
 };
 
 std::shared_ptr<ObjectStore> openHub(const ObjectStore& replica, const Txn& txn, const Upstream& up)
 {
     static std::mutex mutex;
     static std::map<std::pair<std::string, std::string>, OpenHub> handles;
-    std::lock_guard lock(mutex);
-    auto& hub = handles[{up.hub.string(), replica.author()}];
+    static thread_local std::map<std::pair<std::string, std::string>, OpenHub> remoteHandles;
+    const bool remote = isRemotePath(up.hub);
+    std::unique_lock lock(mutex, std::defer_lock);
+    if (!remote) lock.lock();
+    auto& hub = (remote ? remoteHandles : handles)[{up.hub.string(), replica.author()}];
+    const auto identity = remote ? remoteHubCacheIdentity() : nullptr;
+    if (remote && hub.remoteIdentity != identity) hub = {};
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!hub.store) {
             OpenOptions options;
@@ -54,6 +60,7 @@ std::shared_ptr<ObjectStore> openHub(const ObjectStore& replica, const Txn& txn,
             options.sharedFile = true;
             options.busyTimeoutMs = kHubBusyTimeoutMs;
             hub.store = std::make_shared<ObjectStore>(ObjectStore::open(up.hub, options));
+            hub.remoteIdentity = identity;
             auto check = hub.store->read();
             hub.uuid = hub.store->uuid(check);
             hub.replica = hub.store->replicaUuid(check);
@@ -155,6 +162,7 @@ std::vector<HubLease> grantLeases(ObjectStore& replica, const std::vector<std::s
     self = replicaIdentity(conn(local)); up = upstream(conn(local));
     for (const auto& object : objects) known[formatUuid(parseUuid(object))] = knownHubVersion(conn(local), object);
     pending = uuidColumn(conn(local), "SELECT record_uuid FROM hub_pending");
+    RemoteHubScope remoteScope(up.hub);
     const auto handle = openHub(replica, local, up);
     auto& hub = *handle;
     std::vector<HubLease> granted;
@@ -287,6 +295,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
 {
     if (std::filesystem::exists(replicaPath)) throw std::runtime_error("hub: clone refuses existing " + replicaPath.string());
     const auto hub = hubAddress(hubPath);
+    RemoteHubScope remoteScope(hubPath);
     auto partial = replicaPath; partial += ".partial";
     // A leftover journal would be replayed into the new copy.
     auto removePartial = [&] {
@@ -295,7 +304,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
     };
     removePartial();
     auto shared = options; shared.sharedFile = true; shared.busyTimeoutMs = kHubBusyTimeoutMs;
-    auto* source = openConnection(hub, SQLITE_OPEN_READONLY, shared, false);
+    auto* source = openConnection(hub, isRemotePath(hubPath) ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY, shared, false);
     sqlite3* target = nullptr;
     auto close = [&] { if (target) sqlite3_close(target); sqlite3_close(source); target = nullptr; };
     try {
@@ -330,11 +339,20 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
     std::filesystem::rename(partial, replicaPath);
 }
 
-// SQLite's unix-dotfile VFS and the SFTP VFS both lock with this directory.
+void enableHubProcessLocking(const std::filesystem::path& hub)
+{
+    if (!isRemotePath(hub))
+        throw std::invalid_argument("hub: enable-ssh-locking requires an sftp:// or ssh:// address");
+    remoteEnableProcessLock(canonicalRemotePath(hub));
+}
+
+// Legacy dot-file locks are removable; process-lock guard directories are not.
 std::optional<int64_t> hubLockAge(const std::filesystem::path& hub)
 {
     const auto now = std::chrono::system_clock::now();
     if (isRemotePath(hub)) {
+        if (remoteStat(canonicalRemotePath(hub) + ".lock/" + kProcessLockName).exists)
+            throw std::runtime_error("hub: process locks release automatically; the permanent .lock directory must not be removed");
         const auto lock = remoteStat(canonicalRemotePath(hub) + ".lock");
         if (!lock.exists) return std::nullopt;
         if (!lock.modified) return 0;
@@ -343,6 +361,8 @@ std::optional<int64_t> hubLockAge(const std::filesystem::path& hub)
     auto lock = hub;
     lock += ".lock";
     std::error_code missing;
+    if (std::filesystem::exists(lock / kProcessLockName))
+        throw std::runtime_error("hub: process locks release automatically; the permanent .lock directory must not be removed");
     const auto modified = std::filesystem::last_write_time(lock, missing);
     if (missing) return std::nullopt;
     return std::chrono::duration_cast<std::chrono::seconds>(std::filesystem::file_time_type::clock::now() - modified).count();
@@ -350,7 +370,10 @@ std::optional<int64_t> hubLockAge(const std::filesystem::path& hub)
 
 void removeHubLock(const std::filesystem::path& hub)
 {
-    if (isRemotePath(hub)) return remoteRmdir(canonicalRemotePath(hub) + ".lock");
+    (void)hubLockAge(hub); // Refuses process-lock hubs before attempting removal.
+    if (isRemotePath(hub)) {
+        return remoteRmdir(canonicalRemotePath(hub) + ".lock");
+    }
     auto lock = hub;
     lock += ".lock";
     std::filesystem::remove(lock);
@@ -389,10 +412,12 @@ HubSyncReport pullDiscarding(ObjectStore& replica, const std::set<std::string>& 
     DependencyScope dependencyScope;
     HubSyncReport report;
     Upstream up;
+    std::unique_ptr<RemoteHubScope> remoteScope;
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
         up = upstream(conn(local));
+        remoteScope = std::make_unique<RemoteHubScope>(up.hub);
         hub = openHub(replica, local, up);
     }
     // The hub read lock is held until the replica commits, so the installed
@@ -414,6 +439,18 @@ HubSyncReport pullDiscarding(ObjectStore& replica, const std::set<std::string>& 
     auto txn = replica.write();
     pool(txn).hubApply = true;
     auto* db = conn(txn);
+    // An idle poll must not turn replication bookkeeping into a database
+    // change: data_version would discard warm geometry and spatial caches.
+    // Check under the local writer lock, including leases (which have no
+    // journal entry), before deciding that there is nothing to persist.
+    const auto current = upstream(db).cursor;
+    if (hubRecords.empty() && current.journal == cursor.journal &&
+        current.geometry == cursor.geometry && readLeases(db) == leases) {
+        // Let the unchanged transaction roll back: commit runs publication
+        // cleanup, whose DELETE statements can themselves dirty SQLite pages.
+        report.pulledPosition = cursor.journal;
+        return report;
+    }
     const auto pending = uuidColumn(db, "SELECT record_uuid FROM hub_pending UNION SELECT record_uuid FROM hub_conflicts");
     std::map<std::string, Json> install;
     Statement conflict(db, "INSERT INTO hub_conflicts VALUES(?,?,?) ON CONFLICT(record_uuid) DO UPDATE SET "
@@ -477,6 +514,7 @@ HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead)
     if (changes.empty()) {
         if (!expectedHead) return report;
         // Nothing to publish: the position is the expected head, if it still is one.
+        RemoteHubScope remoteScope(up.hub);
         const auto handle = openHub(replica, local, up);
         auto hubTxn = handle->read();
         const auto head = hubHead(conn(hubTxn));
@@ -496,6 +534,7 @@ HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead)
         for (const auto& [id, change] : changes) put.run(id, hash(change.record));
         mark.commit();
     }
+    RemoteHubScope remoteScope(up.hub);
     const auto handle = openHub(replica, local, up);
     auto& hub = *handle;
     std::map<std::string, int64_t> published;
@@ -674,6 +713,7 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
         ids.push_back(formatUuid(parseUuid(object)));
         if (pending.contains(ids.back())) throw std::runtime_error("hub: push " + ids.back() + " before releasing its lease");
     }
+    RemoteHubScope remoteScope(up.hub);
     const auto handle = openHub(replica, local, up);
     auto& hub = *handle;
     {
@@ -693,6 +733,7 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
 void readHubPosition(ObjectStore& replica, int64_t position,
                      const std::function<void(ObjectStore&, const ReadTxn&, const RevisionSelection&)>& read)
 {
+    std::unique_ptr<RemoteHubScope> remoteScope;
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
@@ -704,7 +745,9 @@ void readHubPosition(ObjectStore& replica, int64_t position,
             read(replica, local, replica.revisionSelectionAt(local, publication.publishedAtUs, true));
             return;
         }
-        hub = openHub(replica, local, upstream(conn(local)));
+        const auto up = upstream(conn(local));
+        remoteScope = std::make_unique<RemoteHubScope>(up.hub);
+        hub = openHub(replica, local, up);
     }
     auto txn = hub->read();
     const auto publication = hubPublicationAt(conn(txn), position);
@@ -731,6 +774,7 @@ void requireHubGeometry(ObjectStore& replica, const ReadTxn& hubTxn, int64_t pos
 
 std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_t upTo)
 {
+    std::unique_ptr<RemoteHubScope> remoteScope;
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
@@ -739,7 +783,9 @@ std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_
             std::erase_if(entries, [&](const JournalEntry& entry) { return entry.seq > upTo; });
             return entries;
         }
-        hub = openHub(replica, local, upstream(conn(local)));
+        const auto up = upstream(conn(local));
+        remoteScope = std::make_unique<RemoteHubScope>(up.hub);
+        hub = openHub(replica, local, up);
     }
     auto txn = hub->read();
     auto entries = hub->journalSince(txn, after);
@@ -798,6 +844,7 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     const auto id = formatUuid(parseUuid(uuid));
     if (keep != "hub" && keep != "local") throw std::invalid_argument("hub: keep must be \"hub\" or \"local\"");
     Upstream up;
+    std::unique_ptr<RemoteHubScope> remoteScope;
     std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
@@ -810,6 +857,7 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
             if (!lease.row() && isObjectRecord(syncRecord(replica, local, id)))
                 throw std::runtime_error("hub: lease " + id + " before keeping the local record");
         }
+        remoteScope = std::make_unique<RemoteHubScope>(up.hub);
         hub = openHub(replica, local, up);
     }
     auto hubTxn = hub->read();
@@ -830,6 +878,7 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     txn.commit();
     hubTxn.commit();
     hub.reset();
+    remoteScope.reset();
     HubSyncReport report;
     if (keep == "hub") report.pulled = 1;
     else report = hubPush(replica);

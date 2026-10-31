@@ -12,6 +12,7 @@ struct HubLeaseCounts {
     std::mutex mutex;
     std::map<std::string, int> counts;
     std::set<std::string> held();
+    bool retain(const std::vector<std::string>& objects, const HubStatus& status, int64_t validThroughUs);
 };
 
 // Live PushHolds. The worker reads the count; a hold's release wakes the

@@ -159,6 +159,27 @@ if(VC_MACDEPLOYQT)
                 endif()
             endif()
 
+            # Homebrew dylibs can retain absolute LC_RPATH entries even after
+            # their dependency names have been rewritten. Those search paths
+            # take precedence over the app's Frameworks directory and can load
+            # a second OpenCV/OpenMP runtime on machines with Homebrew installed.
+            execute_process(COMMAND otool -l "${_f}"
+                RESULT_VARIABLE _rpath_rc OUTPUT_VARIABLE _load_commands
+                ERROR_VARIABLE _rpath_err)
+            if(NOT _rpath_rc EQUAL 0)
+                message(FATAL_ERROR "otool failed for ${_f}: ${_rpath_err}")
+            endif()
+            string(REGEX MATCHALL "cmd LC_RPATH\n[^\n]*\n[^\n]*"
+                _rpath_commands "${_load_commands}")
+            foreach(_command IN LISTS _rpath_commands)
+                if(_command MATCHES "\n[ \t]+path (/.*) \\(offset [0-9]+\\)$")
+                    set(_rpath "${CMAKE_MATCH_1}")
+                    if(NOT _rpath MATCHES "^(/usr/lib(/|$)|/System/)")
+                        list(APPEND _install_name_args -delete_rpath "${_rpath}")
+                    endif()
+                endif()
+            endforeach()
+
             # install_name_tool rewrites the Mach-O for every invocation.
             # Apply all dependency and ID changes in one pass per file.
             if(_install_name_args)

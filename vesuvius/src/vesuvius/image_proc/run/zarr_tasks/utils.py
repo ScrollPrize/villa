@@ -160,7 +160,17 @@ def write_multiscales_metadata(
         axes.append(
             {"name": a, "type": "space" if a in ("x", "y", "z") else "unknown"}
         )
-    datasets = [{"path": str(i)} for i in range(num_levels)]
+    # OME-NGFF 0.4 requires one scale transform per dataset. build_pyramid
+    # halves every axis per level, so level i is 2**i times coarser than level 0.
+    datasets = [
+        {
+            "path": str(i),
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [float(2**i)] * len(axes_names)}
+            ],
+        }
+        for i in range(num_levels)
+    ]
     root.attrs["multiscales"] = [
         {
             "version": "0.4",

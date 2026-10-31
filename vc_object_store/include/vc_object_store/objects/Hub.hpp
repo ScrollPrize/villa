@@ -20,6 +20,7 @@ struct HubLease {
     std::string holder;  // replica UUID
     std::string author, host;
     int64_t acquiredUs = 0, expiresUs = 0;  // UTC Unix microseconds
+    bool operator==(const HubLease&) const = default;
 };
 
 // A record changed both here and on the hub. Resolve with resolveHubConflict.
@@ -68,13 +69,19 @@ struct HubLeaseRefused : std::runtime_error {
 
 // Convert a local store (no other connections) into a hub, then place it on the share.
 void initHub(const std::filesystem::path& store, const std::string& author);
+// One-time opt-in for an SSH-addressed hub, with all clients stopped. Creates
+// a permanent guard against old dot-file clients; subsequent access must use
+// SSH process locks. Needs remote flock, timeout and external sftp-server.
+void enableHubProcessLocking(const std::filesystem::path& hub);
 // Copy the hub into a new local replica (refuses an existing file). The hub
-// stays usable during the copy; progress counts copied database pages.
+// is locked for the SSH copy; mounted copies verify an optimistic snapshot.
+// Progress counts copied bytes.
 void cloneHub(const std::filesystem::path& hub, const std::filesystem::path& replica, const OpenOptions& options,
               const util::ProgressCallback& progress = {});
 // Drop the replica's hub tables, leaving an ordinary standalone store.
 void detachHub(const std::filesystem::path& replica, const std::string& author);
-// Seconds since a hub's lock was taken, or nullopt when it is unlocked.
+// Legacy locks only: seconds since acquisition, or nullopt when unlocked.
+// Process-lock hubs refuse age/removal: their permanent guard must remain.
 std::optional<int64_t> hubLockAge(const std::filesystem::path& hub);
 // Remove a stale lock left by a crashed client; only once no client is syncing.
 // The next open rolls back any interrupted write from its journal.
@@ -128,7 +135,8 @@ std::vector<std::string> hubWriters(ObjectStore& replica);
 // and relationship membership/approval come from the hub; geometry revisions
 // are shared and read from this replica, so a reader checks the objects whose
 // geometry it reads with requireHubGeometry. Throws for a position that is
-// not a hub state.
+// not a hub state. A remote hub stays locked while `read` runs; it must not
+// start another hub operation.
 void readHubPosition(ObjectStore& replica, int64_t position,
                      const std::function<void(ObjectStore& hub, const ReadTxn&, const RevisionSelection&)>& read);
 // Inside readHubPosition's `read`: throws unless this replica holds the

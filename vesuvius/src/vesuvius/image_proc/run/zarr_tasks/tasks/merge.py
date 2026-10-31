@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from multiprocessing import Pool
@@ -20,7 +21,7 @@ from tqdm import tqdm
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
-from ..utils import get_chunk_slices
+from ..utils import create_level_dataset, get_chunk_slices
 
 
 @dataclass
@@ -292,15 +293,19 @@ class MergeTask(ZarrTask):
         output_path = Path(self.config.output_zarr)
         print(f"\nCreating output zarr at {output_path}")
 
-        root = zarr.open(str(output_path), mode="w")
-        root.create_dataset(
+        # zarr 3 removed Group.create_dataset. create_level_dataset is the package's
+        # one place that creates a level on both zarr 2 and zarr 3 (the other pyramid
+        # tasks use it too); it writes the .zgroup itself, so the output directory
+        # only has to be emptied first, as mode="w" used to do.
+        if output_path.exists():
+            shutil.rmtree(output_path)
+        create_level_dataset(
+            str(output_path),
             "0",
-            shape=self._shape,
-            chunks=self._chunks,
-            dtype=self._dtype,
-            compressor=self._compressor,
-            fill_value=0,
-            write_empty_chunks=False,
+            self._shape,
+            self._chunks,
+            self._dtype,
+            self._compressor,
         )
 
     def generate_work_items(self) -> Iterable[Any]:
@@ -324,11 +329,10 @@ class MergeTask(ZarrTask):
     def _generate_pyramid_levels(self) -> None:
         """Generate downsampled pyramid levels from level 0."""
         zarr_path = self.config.output_zarr
-        root = zarr.open(zarr_path, mode="r+")
 
         for level in range(1, self.config.num_levels):
             prev_level = level - 1
-            prev_arr = root[str(prev_level)]
+            prev_arr = zarr.open(f"{zarr_path}/{prev_level}", mode="r")
             prev_shape = prev_arr.shape
 
             # Output shape is halved
@@ -340,14 +344,14 @@ class MergeTask(ZarrTask):
 
             print(f"Level {level}: {prev_shape} -> {out_shape}")
 
-            # Create output array
-            root.create_dataset(
+            # Create output array (same helper as level 0; overwrite is its default)
+            create_level_dataset(
+                zarr_path,
                 str(level),
-                shape=out_shape,
-                chunks=self._chunks,
-                dtype=self._dtype,
-                compressor=self._compressor,
-                overwrite=True,
+                out_shape,
+                self._chunks,
+                self._dtype,
+                self._compressor,
             )
 
             # Generate chunk tasks
@@ -445,8 +449,6 @@ class MergeTask(ZarrTask):
         # Copy metadata.json if it exists in input1
         metadata_src = Path(self.config.input_zarr) / "metadata.json"
         if metadata_src.exists():
-            import shutil
-
             metadata_dst = output_path / "metadata.json"
             shutil.copy2(metadata_src, metadata_dst)
             print("Copied metadata.json from input1")

@@ -102,11 +102,11 @@ nanobind_add_module(vc_fiber_trace
 set_target_properties(vc_fiber_trace PROPERTIES
     OUTPUT_NAME fiber_trace
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_SELF_AND_PARENT}"
 )
 target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
-set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
+set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "${VC_PY_RPATH_SELF}")
 
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .

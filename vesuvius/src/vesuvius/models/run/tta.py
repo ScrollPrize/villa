@@ -236,8 +236,11 @@ def infer_with_tta(model,
     if spatial_dims not in (2, 3):
         raise ValueError(f"infer_with_tta expects 2D or 3D spatial dims, got {spatial_dims}")
 
-    # Use batched TTA for mirroring if enabled and not previously failed
-    if tta_type == 'mirroring' and use_batched and not _batched_tta_disabled:
+    # Use batched TTA for mirroring if enabled and not previously failed.
+    # It needs ~8x the activation memory and its out-of-memory fallback only
+    # exists on CUDA, so other devices (CPU, MPS) run the flips one at a time.
+    if (tta_type == 'mirroring' and use_batched and not _batched_tta_disabled
+            and inputs.device.type == 'cuda'):
         try:
             if spatial_dims == 3:
                 return infer_with_tta_batched_3d(

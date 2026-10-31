@@ -83,6 +83,39 @@ int main() try
     }
     require(meta(alice, a) == meta(bob, a), "clones start from the hub");
 
+    // Idle publication must not invalidate local readers through data_version.
+    // Lease-only changes still need to reach the mirror (no journal entries).
+    {
+        hubPull(alice);
+        sqlite3* observer = nullptr;
+        require(sqlite3_open_v2(alicePath.c_str(), &observer, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK, "open observer");
+        const auto close = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>(observer, sqlite3_close);
+        const auto version = [&] {
+            sqlite3_stmt* stmt = nullptr;
+            require(sqlite3_prepare_v2(observer, "PRAGMA data_version", -1, &stmt, nullptr) == SQLITE_OK, "data version query");
+            require(sqlite3_step(stmt) == SQLITE_ROW, "data version row");
+            const auto value = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+            return value;
+        };
+        const auto before = version();
+        require(hubPull(alice).pulled == 0 && version() == before, "idle pull preserves local data version");
+        acquireLeases(bob, {b});
+        require(hubPull(alice).pulled == 0 && version() != before, "lease-only pull changes local data version");
+        require(hubStatus(alice)->leases == hubStatus(bob)->leases, "lease-only pull mirrors acquisition");
+        const auto leased = version();
+        hubPull(alice);
+        require(version() == leased, "unchanged leases do not cause a write");
+        renewLeases(bob, {b}, 1200);
+        hubPull(alice);
+        require(hubStatus(alice)->leases == hubStatus(bob)->leases && version() != leased,
+                "lease-only pull mirrors renewal of the same object");
+        const auto renewed = version();
+        releaseLeases(bob, {b});
+        hubPull(alice);
+        require(hubStatus(alice)->leases.empty() && version() != renewed, "lease-only pull mirrors release");
+    }
+
     // Editing an object on the hub requires its lease.
     mustFail([&] { setNote(alice, a, "1"); });
     require(hubStatus(alice)->pending.empty(), "rejected edit leaves nothing pending");

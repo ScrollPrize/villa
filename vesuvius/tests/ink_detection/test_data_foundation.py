@@ -365,6 +365,31 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
     assert held_out == []
 
 
+def _patch_search_counting_mask_reads(tmp_path):
+    config = _config(tmp_path, patch_size=[3, 8, 8], patch_overlap=0.25)
+    segment = replace(
+        _segment(config, tmp_path, image_volume="image"), inklabels=Path("labels"), supervision_mask=Path("supervision")
+    )
+    mask = (np.random.default_rng(0).random((3, 61, 47)) < 0.02).astype(np.uint8)
+    reads = []
+    class Counted(np.ndarray):
+        def __getitem__(self, key):
+            reads.append(key)
+            return np.asarray(self)[key]
+    training, _ = find_segment_patches(segment, lambda path, _: mask.view(Counted))
+    expected = np.unique(np.stack(np.nonzero(mask[1]), axis=1) // 2 * 2, axis=0).tolist()
+    return [list(p.bbox[1:3]) for p in training], expected, reads
+
+
+def test_default_patch_origins_are_every_supported_stride_cell(tmp_path):
+    origins, expected, _ = _patch_search_counting_mask_reads(tmp_path)
+    assert origins == expected
+
+
+def test_default_patch_finding_reads_each_mask_surface_once(tmp_path):
+    assert len(_patch_search_counting_mask_reads(tmp_path)[2]) == 2
+
+
 def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     config = _config(tmp_path)
     segment = replace(
