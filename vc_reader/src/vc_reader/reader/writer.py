@@ -62,6 +62,14 @@ class ObjectStore:
     def write(self, name: str, data: bytes | str) -> None:
         self._native.write(name, data.encode() if isinstance(data, str) else bytes(data))
 
+    def write_file(self, name: str, file: str | os.PathLike[str]) -> None:
+        """A file as an object, without holding it in memory; large files go to S3 in parts."""
+        self._native.write_file(name, os.fspath(file))
+
+    def read_file(self, name: str, file: str | os.PathLike[str]) -> bool:
+        """An object to a file, atomically, without holding it in memory; False when it does not exist."""
+        return self._native.read_file(name, os.fspath(file))
+
     def exists(self, name: str) -> bool:
         return self._native.exists(name)
 

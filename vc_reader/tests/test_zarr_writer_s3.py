@@ -63,7 +63,32 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
     def _key(self):
         return urllib.parse.unquote(self.path.partition("?")[0]).removeprefix("/bucket/")
 
+    def _query(self):
+        return dict(urllib.parse.parse_qsl(self.path.partition("?")[2], keep_blank_values=True))
+
+    def do_POST(self):
+        if not self._authorized():
+            return self._respond(403)
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        query = self._query()
+        if "uploads" in query:
+            return self._respond(200, b"<InitiateMultipartUploadResult><UploadId>the-id</UploadId></InitiateMultipartUploadResult>")
+        numbers = [int(n) for n in re.findall(r"<PartNumber>(\d+)</PartNumber>", body.decode())]
+        self.objects[self._key()] = b"".join(self.parts[n] for n in numbers)
+        type(self).completed_uploads = getattr(type(self), "completed_uploads", 0) + 1
+        self._respond(200, b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>")
+
     def do_PUT(self):
+        if "partNumber" in self._query():
+            if not self._authorized():
+                return self._respond(403)
+            part = self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).parts = {**getattr(type(self), "parts", {}), int(self._query()["partNumber"]): part}
+            self.send_response(200)
+            self.send_header("ETag", f'"{hashlib.md5(part).hexdigest()}"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.methods.append("PUT")
         if not self._authorized():
@@ -235,6 +260,28 @@ def test_object_store(s3, tmp_path):
         assert pickle.loads(pickle.dumps(store)).read("c") == b"\x00\x01"
         assert store.remove("c") and not store.remove("c")
         assert store.remove_all() and store.keys() == []
+
+
+def test_object_store_files(s3, tmp_path):
+    store = ObjectStore("s3://bucket/files", auth=s3.auth)
+    small = tmp_path / "small.bin"
+    small.write_bytes(b"small")
+    store.write_file("small.bin", small)
+    assert store.read("small.bin") == b"small"
+    # Past one part: a multipart upload, read back whole and by streaming.
+    large = tmp_path / "large.bin"
+    payload = np.random.default_rng(0).integers(0, 255, (65 << 20) + 17, dtype=np.uint8).tobytes()
+    large.write_bytes(payload)
+    store.write_file("large.bin", large)
+    assert store.read_file("large.bin", tmp_path / "back.bin") is True
+    assert (tmp_path / "back.bin").read_bytes() == payload
+    assert s3.completed_uploads == 1
+    assert store.read_file("absent.bin", tmp_path / "absent.bin") is False
+    assert not list(tmp_path.glob("absent*"))
+    local = ObjectStore(tmp_path / "local", auth=None)
+    local.write_file("a/b.bin", small)
+    assert local.read("a/b.bin") == b"small"
+    assert local.read_file("a/b.bin", tmp_path / "c.bin") and (tmp_path / "c.bin").read_bytes() == b"small"
 
 
 def test_transient_failures_are_retried_and_denials_raise(s3):

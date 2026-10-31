@@ -1,4 +1,6 @@
 // Objects below a local directory or an s3:// prefix, for writing.
+#include <fstream>
+#include <unistd.h>
 #include "vc_reader/s3_listing.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/http.hpp"
@@ -96,6 +98,96 @@ void Store::write(const std::string& name, std::string_view data) const
     }
     impl_->needWritable();
     impl_->signedRequest([&] { impl_->http->put(impl_->url(name), data.data(), data.size()); });
+}
+
+void Store::writeFile(const std::string& name, const fs::path& file) const
+{
+    const auto bytes = fs::file_size(file);
+    if (!impl_->remote) {
+        const auto target = fs::path(impl_->location) / name;
+        fs::create_directories(target.parent_path());
+        auto temporary = target;
+        temporary += "." + std::to_string(::getpid()) + ".tmp";
+        fs::copy_file(file, temporary, fs::copy_options::overwrite_existing);
+        fs::rename(temporary, target);
+        return;
+    }
+    impl_->needWritable();
+    constexpr std::uint64_t kPartBytes = 64ULL << 20;
+    std::ifstream in(file, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + file.string());
+    std::vector<char> buffer(std::size_t(std::min<std::uint64_t>(std::max(kPartBytes, bytes / 9000 + 1), std::max<std::uint64_t>(bytes, 1))));
+    if (bytes <= kPartBytes) {
+        in.read(buffer.data(), std::streamsize(bytes));
+        impl_->signedRequest([&] { impl_->http->put(impl_->url(name), buffer.data(), std::size_t(bytes)); });
+        return;
+    }
+    const auto url = impl_->url(name);
+    const auto started = impl_->signedRequest([&] { return impl_->http->post(url + "?uploads=", "", 0); });
+    const auto open = started.find("<UploadId>"), close = started.find("</UploadId>");
+    if (open == std::string::npos || close == std::string::npos) throw std::runtime_error("starting an upload of " + url + ": no UploadId");
+    const auto id = started.substr(open + 10, close - open - 10);
+    try {
+        std::string done = "<CompleteMultipartUpload>";
+        std::uint64_t sent = 0;
+        for (int part = 1; sent < bytes; ++part) {
+            const auto size = std::size_t(std::min<std::uint64_t>(buffer.size(), bytes - sent));
+            if (!in.read(buffer.data(), std::streamsize(size))) throw std::runtime_error("cannot read " + file.string());
+            const auto partUrl = url + "?partNumber=" + std::to_string(part) + "&uploadId=" + id;
+            const auto etag = impl_->signedRequest([&] { return impl_->http->put_part(partUrl, buffer.data(), size); });
+            done += "<Part><PartNumber>" + std::to_string(part) + "</PartNumber><ETag>" + etag + "</ETag></Part>";
+            sent += size;
+        }
+        done += "</CompleteMultipartUpload>";
+        const auto answer = impl_->signedRequest([&] { return impl_->http->post(url + "?uploadId=" + id, done.data(), done.size()); });
+        // S3 may answer 200 and still report a failure in the body.
+        if (answer.find("<Error>") != std::string::npos) throw std::runtime_error("completing an upload of " + url + ": " + answer);
+    } catch (...) {
+        try {
+            impl_->http->remove(url + "?uploadId=" + id);
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+bool Store::readFile(const std::string& name, const fs::path& file) const
+{
+    if (file.has_parent_path()) fs::create_directories(file.parent_path());
+    auto temporary = file;
+    temporary += "." + std::to_string(::getpid()) + ".tmp";
+    const auto finish = [&](bool found) {
+        if (found) fs::rename(temporary, file);
+        else fs::remove(temporary);
+        return found;
+    };
+    if (!impl_->remote) {
+        const auto source = fs::path(impl_->location) / name;
+        if (!fs::exists(source)) return false;
+        fs::copy_file(source, temporary, fs::copy_options::overwrite_existing);
+        return finish(true);
+    }
+    if (!impl_->http) {
+        const auto data = read(name);
+        if (!data) return false;
+        atomicWrite(file, *data);
+        return true;
+    }
+    std::ofstream out;
+    const auto response = impl_->signedRequest([&] {
+        return impl_->http->get_stream(impl_->url(name), [&] {
+            out.close();
+            out.open(temporary, std::ios::binary | std::ios::trunc);
+            if (!out) throw std::runtime_error("cannot write " + temporary.string());
+        }, [&](const char* data, std::size_t n) { out.write(data, std::streamsize(n)); });
+    });
+    out.close();
+    if (!out) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        throw std::runtime_error("cannot write " + temporary.string());
+    }
+    return finish(response.status == 200);
 }
 
 bool Store::exists(const std::string& name) const

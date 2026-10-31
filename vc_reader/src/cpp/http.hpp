@@ -133,6 +133,25 @@ public:
             throw std::runtime_error("PUT " + url + ": HTTP " + std::to_string(response.status));
     }
 
+    // PUT one part of a multipart upload: its ETag, for completing the upload.
+    std::string put_part(const std::string& url, const void* data, std::size_t size)
+    {
+        const auto response = perform("PUT", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, data, size);
+        if (response.status / 100 != 2 || response.etag.empty())
+            throw std::runtime_error("PUT " + url + ": HTTP " + std::to_string(response.status));
+        return response.etag;
+    }
+
+    // POST `size` bytes to `url`: the answer's body. Retried like a read, so only for requests safe to repeat.
+    std::string post(const std::string& url, const void* data, std::size_t size)
+    {
+        std::string answer;
+        const auto response = perform("POST", url, [&] { answer.clear(); }, [&](const char* p, std::size_t n) { answer.append(p, n); }, {}, 200, {}, data, size);
+        if (response.status / 100 != 2)
+            throw std::runtime_error("POST " + url + ": HTTP " + std::to_string(response.status));
+        return answer;
+    }
+
     // Whether `url` exists (HEAD): false for 404.
     bool head(const std::string& url)
     {
@@ -157,7 +176,7 @@ private:
         { std::lock_guard lock(mutex_); auth = auth_; }
         float delay = 0.25f;
         std::string last_error;
-        const bool get = std::strcmp(method, "GET") == 0, put = std::strcmp(method, "PUT") == 0;
+        const bool get = std::strcmp(method, "GET") == 0, post = std::strcmp(method, "POST") == 0, put = std::strcmp(method, "PUT") == 0 || post;
         const std::string payload = put && auth->kind == "s3" ? payload_hash(upload, upload_size) : sigv4_empty_payload();
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
@@ -181,6 +200,7 @@ private:
             HeaderList headers;
             if (put) {
                 curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+                if (post) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
                 curl_easy_setopt(h, CURLOPT_READFUNCTION, &HttpClient::send);
                 curl_easy_setopt(h, CURLOPT_READDATA, &body);
                 curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(upload_size));

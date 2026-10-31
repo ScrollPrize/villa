@@ -28,6 +28,11 @@ public:
 
     std::optional<std::string> read(const std::string& name) const;
     void write(const std::string& name, std::string_view data) const;
+    // A file as an object, without holding it in memory: on S3 in parts above 64 MiB, so past
+    // S3's 5 GiB limit on one request.
+    void writeFile(const std::string& name, const std::filesystem::path& file) const;
+    // An object to a file through a temporary beside it, without holding it in memory; whether it existed.
+    bool readFile(const std::string& name, const std::filesystem::path& file) const;
     bool exists(const std::string& name) const;
     // Whether the object was there. On S3 that costs a request `discard` does not make.
     bool remove(const std::string& name) const;

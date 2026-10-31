@@ -511,6 +511,8 @@ NB_MODULE(_reader, m)
             nb::gil_scoped_release release;
             s.write(name, view);
         }, "name"_a, "data"_a)
+        .def("write_file", &Store::writeFile, "name"_a, "file"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("read_file", &Store::readFile, "name"_a, "file"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("exists", &Store::exists, "name"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("remove", &Store::remove, "name"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_all", &Store::removeAll, nb::call_guard<nb::gil_scoped_release>())
@@ -797,6 +799,8 @@ NB_MODULE(_reader, m)
             d["remote_bytes"] = s.remote_bytes.load();
             d["write_errors"] = s.write_errors.load();
             d["last_write_error"] = a.last_write_error();
+            d["corrupt"] = s.corrupt.load();
+            d["last_corrupt_chunk"] = a.last_corrupt_chunk();
             return d;
         });
 }
