@@ -1388,6 +1388,9 @@ class BaseTrainer:
             def update(self):
                 pass
 
+            def get_scale(self):
+                return 1.0
+
 
         if device_type == 'cuda' and use_amp and amp_dtype == torch.float16:
             # Use standard GradScaler when AMP is enabled on CUDA with float16
@@ -1978,10 +1981,14 @@ class BaseTrainer:
             scaler.unscale_(optimizer)
             grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            optimizer_stepped = True
-            self._update_ema_model(model)
+            # This trainer has one optimizer. A scale backoff means its update
+            # was skipped;constant and growing scales retain successful steps.
+            optimizer_stepped = 0.0 < scale_before < float("inf") and scaler.get_scale() >= scale_before
+            if optimizer_stepped:
+                self._update_ema_model(model)
             if should_time_optimizer:
                 self._record_startup_timing("first_optimizer_step", perf_counter() - step_stage_start)
                 self._first_optimizer_timing_recorded = True
