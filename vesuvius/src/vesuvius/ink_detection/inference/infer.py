@@ -1705,4 +1705,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # torch MPS segfaults in MetalShaderLibrary's static destructor at interpreter exit
+    # (rc -11 and a macOS crash dialog per run); os._exit skips C++ static destructors.
+    import os
+    import sys
+
+    try:
+        rc = main()
+    except SystemExit as e:
+        rc = e.code
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        rc = 1
+    if not isinstance(rc, int):
+        if rc is not None:
+            print(rc, file=sys.stderr)
+        rc = 0 if rc is None else 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
