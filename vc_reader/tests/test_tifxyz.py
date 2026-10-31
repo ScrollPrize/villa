@@ -53,6 +53,14 @@ def test_reads_other_writers_and_mask(tmp_path):
     assert (surface.xyz[3, 4] == -1).all()
     assert surface.bbox[0] == grid[..., 0].min()
     assert tifxyz.read(path, mask=False).valid.all()
+    pages = np.ones((2, 40, 40), np.uint8)
+    pages[0, 7, 8] = 0
+    tifffile.imwrite(path / 'mask.tif', pages)
+    assert tifxyz.read(path).valid.sum() == 1599 and not tifxyz.read(path).valid[7, 8]
+    finer = np.full((80, 80), 255, np.uint8)
+    finer[3, 5] = 0
+    tifffile.imwrite(path / 'mask.tif', finer)
+    assert tifxyz.read(path).valid.sum() == 1599 and not tifxyz.read(path).valid[1, 2]
     tifffile.imwrite(path / 'mask.tif', np.ones((5, 5), np.uint8))
     with pytest.raises(ValueError, match='mask shape'):
         tifxyz.read(path)
@@ -93,6 +101,7 @@ def test_resample_matches_points_and_marks_missing():
     assert np.array_equal(valid, valid2) and np.array_equal(xyz[valid], other[valid2])
     assert not valid[2, 2] and np.isnan(xyz[2, 2]).all()
     _, _, normals = surface.resample((0, 0), (1, 1), (3, 3), normals=True)
+    assert tifxyz.Surface(grid, mask=np.ones(grid.shape[:2], bool)).valid[0, 0]
     assert np.allclose(np.linalg.norm(normals, axis=-1), 1)
 
 
@@ -116,3 +125,11 @@ def test_write_tiff_dtypes(tmp_path):
     assert np.array_equal(tifffile.imread(tmp_path / 'c.tif'), rgb)
     with pytest.raises(ValueError, match='compression'):
         tifxyz.write_tiff(tmp_path / 'b.tif', rgb, '|u1', compression='jpeg')
+
+
+def test_resample_full_is_scaled_stored_positions():
+    surface = tifxyz.Surface(_grid(), scale=(.5, .25))
+    assert surface.full_shape == (40, 120)
+    xyz, valid = surface.resample_full((2, 8), (3, 4))
+    other, _ = surface.resample((1, 2), (.5, .25), (3, 4))
+    assert valid.all() and np.array_equal(xyz, other)

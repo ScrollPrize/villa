@@ -56,6 +56,19 @@ inline nb::tuple pointsOut(const Surface& s, const float* xy, std::size_t n, std
     return normals ? nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols), valid) : nb::make_tuple(xyz, finiteOf(xyz.data(), rows, cols));
 }
 
+inline nb::tuple rasterOut(const Surface& s, const grid::Raster& raster, grid::Interpolation mode, bool normals)
+{
+    const std::size_t r = std::size_t(raster.height), c = std::size_t(raster.width);
+    auto xyz = floats<3>({r, c, 3});
+    auto nrm = nb::ndarray<nb::numpy, float, nb::ndim<3>>();
+    if (normals) nrm = floats<3>({r, c, 3});
+    {
+        nb::gil_scoped_release release;
+        s.resample(raster, mode, xyz.data(), normals ? nrm.data() : nullptr);
+    }
+    return normals ? nb::make_tuple(xyz, finiteOf(xyz.data(), r, c), nrm) : nb::make_tuple(xyz, finiteOf(xyz.data(), r, c));
+}
+
 inline void bind(nb::module_& m)
 {
     m.def("write_tiff", [](const std::filesystem::path& path, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, const std::string& dtype, const std::string& compression, std::optional<std::array<int, 2>> tile) {
@@ -135,25 +148,33 @@ inline void bind(nb::module_& m)
         }, "rows"_a, "cols"_a, "interpolation"_a = "linear", "normals"_a = false)
         .def("resample", [](const Surface& s, std::array<double, 2> origin, std::array<double, 2> step, std::array<int, 2> size, const std::string& interpolation, bool normals) {
             if (size[0] <= 0 || size[1] <= 0) throw nb::value_error("resample size must be positive");
-            const std::size_t r = std::size_t(size[0]), c = std::size_t(size[1]);
-            auto xyz = floats<3>({r, c, 3});
-            auto nrm = nb::ndarray<nb::numpy, float, nb::ndim<3>>();
-            if (normals) nrm = floats<3>({r, c, 3});
-            const grid::Raster raster{origin[1], origin[0], step[1], step[0], size[1], size[0]};
-            const auto mode = interpolationOf(interpolation);
-            {
-                nb::gil_scoped_release release;
-                s.resample(raster, mode, xyz.data(), normals ? nrm.data() : nullptr);
-            }
-            return normals ? nb::make_tuple(xyz, finiteOf(xyz.data(), r, c), nrm) : nb::make_tuple(xyz, finiteOf(xyz.data(), r, c));
+            return rasterOut(s, grid::Raster{origin[1], origin[0], step[1], step[0], size[1], size[0]}, interpolationOf(interpolation), normals);
         }, "origin"_a, "step"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
-           "Positions at grid positions origin + (j, i) * step, in stored cells (row, column); NaN where no patch covers one.");
+           "Positions at grid positions origin + (j, i) * step, in stored cells (row, column); NaN where no patch covers one.")
+        .def("resample_full", [](const Surface& s, std::array<std::int64_t, 2> start, std::array<std::int64_t, 2> size, const std::string& interpolation, bool normals) {
+            return rasterOut(s, s.fullRaster(start, size), interpolationOf(interpolation), normals);
+        }, "start"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
+           "Positions of a window at full resolution: start and size in rows and columns of full_shape.");
 
     m.def("_tifxyz_read", [](const std::string& location, bool mask, nb::object options) {
         auto optionsFor = sources::python::optionsFrom(std::move(options));
         nb::gil_scoped_release release;
         return std::make_shared<Surface>(read(location, mask, optionsFor));
     }, "location"_a, "mask"_a, "options"_a);
+    m.def("_tifxyz_read_mask", [](const std::string& location, std::int64_t rows, std::int64_t cols, nb::object options) -> nb::object {
+        auto optionsFor = sources::python::optionsFrom(std::move(options));
+        std::vector<std::uint8_t> mask;
+        {
+            nb::gil_scoped_release release;
+            mask = readMask(location, rows, cols, optionsFor);
+        }
+        if (mask.empty()) return nb::none();
+        auto* data = new bool[mask.size()];
+        std::copy(mask.begin(), mask.end(), data);
+        nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<bool*>(p); });
+        const std::size_t shape[2]{std::size_t(rows), std::size_t(cols)};
+        return nb::cast(nb::ndarray<nb::numpy, bool, nb::ndim<2>>(data, 2, shape, owner));
+    }, "location"_a, "rows"_a, "cols"_a, "options"_a);
     m.def("_tifxyz_read_metadata", [](const std::string& location, nb::object options) {
         auto optionsFor = sources::python::optionsFrom(std::move(options));
         Metadata metadata;

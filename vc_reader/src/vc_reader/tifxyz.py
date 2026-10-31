@@ -29,6 +29,11 @@ def read(location, *, mask=True, **reader_options):
     return _reader._tifxyz_read(os.fspath(location), mask, _options_for(reader_options))
 
 
+def read_mask(location, shape, **reader_options):
+    """``mask.tif`` as a bool array over a grid of ``shape``, or None without one."""
+    return _reader._tifxyz_read_mask(os.fspath(location), shape[0], shape[1], _options_for(reader_options))
+
+
 @dataclass(frozen=True)
 class Metadata:
     uuid: str
@@ -70,4 +75,4 @@ def full_extent(stored, scale):
     return _reader._tifxyz_full_extent(stored, scale)
 
 
-__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_metadata', 'write', 'write_tiff']
+__all__ = ['Entry', 'Metadata', 'Surface', 'full_extent', 'list_surfaces', 'read', 'read_mask', 'read_metadata', 'write', 'write_tiff']

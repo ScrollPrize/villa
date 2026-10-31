@@ -60,6 +60,8 @@ public:
     void pointsAt(const float* xy, std::size_t n, grid::Interpolation interpolation, float* xyz, float* normals = nullptr) const;
     // The same at every pixel of a raster.
     void resample(const grid::Raster& raster, grid::Interpolation interpolation, float* xyz, float* normals = nullptr) const;
+    // The raster of a full-resolution window: rows and columns, one pixel a full-resolution pixel.
+    [[nodiscard]] grid::Raster fullRaster(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size) const;
 
 private:
     struct Interpolators;
@@ -76,8 +78,12 @@ private:
 [[nodiscard]] Metadata parseMetadata(const nlohmann::json& document, const std::string& location);
 [[nodiscard]] Metadata readMetadata(const std::string& location, const sources::OptionsFor& options = {});
 
-// A whole surface. Without `useMask`, mask.tif is ignored. A mask of another shape than the
-// coordinates raises. A stored bounding box with a missing-point marker becomes the real extent.
+// mask.tif at `location` for a grid of rows x cols: nonzero where allowed, empty when there is none.
+// Its first page counts; at an integer multiple of the grid a vertex needs its whole block, any
+// other shape raises.
+[[nodiscard]] std::vector<std::uint8_t> readMask(const std::string& location, std::int64_t rows, std::int64_t cols, const sources::OptionsFor& options = {});
+
+// A whole surface. Without `useMask`, mask.tif is ignored. A stored bounding box with a missing-point marker becomes the real extent.
 [[nodiscard]] Surface read(const std::string& location, bool useMask = true, const sources::OptionsFor& options = {});
 
 struct Entry {

@@ -4,6 +4,7 @@
 #include "vc_reader/sources.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
+#include "../rounding.hpp"
 
 #include <unistd.h>
 
@@ -43,20 +44,24 @@ std::string readText(const std::string& location, const sources::OptionsFor& opt
     files.close();
     return text;
 }
+sources::SourceReader::Settings settingsOf(const sources::OptionsFor& options)
+{
+    sources::SourceReader::Settings settings;
+    settings.options = resolved(options);
+    settings.decodedCacheBytes = 0;
+    settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
+    return settings;
+}
 // One image, whole, as stored values.
-sources::Block readImage(const std::string& location, const char* role, const sources::OptionsFor& options)
+sources::Block readImage(const std::string& location, const sources::OptionsFor& options)
 {
     sources::Source source;
     source.id = location;
     source.storage.location = location;
     source.storage.format = "tiff";
-    source.role = role;
+    source.role = "scalar";
     source.axes = std::vector<std::string>{"y", "x"};
-    sources::SourceReader::Settings settings;
-    settings.options = resolved(options);
-    settings.decodedCacheBytes = 0;
-    settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
-    sources::SourceReader reader(sources::finished(std::move(source)), std::move(settings));
+    sources::SourceReader reader(sources::finished(std::move(source)), settingsOf(options));
     return reader.read({0, 0}, reader.shape());
 }
 template <class T>
@@ -99,7 +104,7 @@ std::int64_t fullExtent(std::int64_t stored, double scale)
 {
     const float scale32 = float(scale);
     if (!std::isfinite(scale32) || scale32 <= 0) return std::max<std::int64_t>(1, stored);
-    return std::max<std::int64_t>(1, std::int64_t(std::floor(double(stored) * (1.0 / double(scale32)) + 0.5)));
+    return std::max<std::int64_t>(1, nearest_index(double(stored) * (1.0 / double(scale32))));
 }
 
 bool hasMissingMarker(const Bounds& bbox)
@@ -187,6 +192,56 @@ void Surface::resample(const grid::Raster& raster, grid::Interpolation interpola
     interpolator(interpolation).resample(raster, xyz, normals);
 }
 
+grid::Raster Surface::fullRaster(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size) const
+{
+    if (size[0] <= 0 || size[1] <= 0 || size[0] >= (1LL << 31) || size[1] >= (1LL << 31)) bad("full-resolution window must have a positive size");
+    const auto [sy, sx] = metadata_.scale;
+    return grid::Raster{double(start[1]) * sx, double(start[0]) * sy, sx, sy, int(size[1]), int(size[0])};
+}
+
+std::vector<std::uint8_t> readMask(const std::string& location, std::int64_t rows, std::int64_t cols, const sources::OptionsFor& options)
+{
+    const auto path = child(location, "mask.tif");
+    const auto open = [&](std::vector<std::string> axes) {
+        sources::Source source;
+        source.id = path;
+        source.storage.location = path;
+        source.storage.format = "tiff";
+        source.role = "label";
+        source.axes = std::move(axes);
+        auto reader = std::make_unique<sources::SourceReader>(sources::finished(std::move(source)), settingsOf(options));
+        (void)reader->shape();  // opens it: the declared axes are checked against the file
+        return reader;
+    };
+    std::unique_ptr<sources::SourceReader> reader;
+    try {
+        try {
+            reader = open({"y", "x"});
+        } catch (const std::invalid_argument&) {
+            reader = open({"z", "y", "x"});
+        }
+    } catch (const zarr::NotFound&) {
+        return {};
+    }
+    const auto& shape = reader->shape();
+    const auto height = shape[shape.size() - 2], width = shape[shape.size() - 1];
+    std::vector<std::int64_t> start(shape.size(), 0), size(shape.size(), 1);
+    size[shape.size() - 2] = height;
+    size[shape.size() - 1] = width;
+    if (height % rows || width % cols)
+        bad(path + ": tifxyz mask shape (" + std::to_string(height) + ", " + std::to_string(width) + ") does not match the coordinate grid");
+    const auto stored = reader->read(start, size);
+    const auto item = stored.itemsize();
+    const auto factorY = height / rows, factorX = width / cols;
+    std::vector<std::uint8_t> mask(std::size_t(rows) * std::size_t(cols), 1);
+    for (std::int64_t y = 0; y < height; ++y)
+        for (std::int64_t x = 0; x < width; ++x) {
+            const auto* p = stored.data.get() + (std::size_t(y) * std::size_t(width) + std::size_t(x)) * item;
+            if (std::all_of(p, p + item, [](std::uint8_t b) { return b == 0; })) mask[std::size_t(y / factorY) * std::size_t(cols) + std::size_t(x / factorX)] = 0;
+        }
+    return mask;
+}
+
 Metadata parseMetadata(const json& document, const std::string& location)
 {
     Metadata out;
@@ -219,9 +274,9 @@ Metadata readMetadata(const std::string& location, const sources::OptionsFor& op
 Surface read(const std::string& location, bool useMask, const sources::OptionsFor& options)
 {
     auto metadata = readMetadata(location, options);
-    const auto x = readImage(child(location, "x.tif"), "scalar", options);
-    const auto y = readImage(child(location, "y.tif"), "scalar", options);
-    const auto z = readImage(child(location, "z.tif"), "scalar", options);
+    const auto x = readImage(child(location, "x.tif"), options);
+    const auto y = readImage(child(location, "y.tif"), options);
+    const auto z = readImage(child(location, "z.tif"), options);
     if (x.shape.size() != 2 || x.shape != y.shape || x.shape != z.shape) bad(location + ": tifxyz coordinates require matching YX grids");
     const auto cells = std::size_t(x.shape[0]) * std::size_t(x.shape[1]);
     std::vector<float> xyz(cells * 3);
@@ -229,19 +284,7 @@ Surface read(const std::string& location, bool useMask, const sources::OptionsFo
     copyComponent(y, xyz.data() + 1);
     copyComponent(z, xyz.data() + 2);
     std::vector<std::uint8_t> mask;
-    if (useMask) {
-        try {
-            const auto stored = readImage(child(location, "mask.tif"), "label", options);
-            if (stored.shape != x.shape) bad(location + ": tifxyz mask shape does not match the coordinate grid");
-            mask.resize(cells);
-            const auto item = stored.itemsize();
-            for (std::size_t i = 0; i < cells; ++i) {
-                const auto* p = stored.data.get() + i * item;
-                mask[i] = std::any_of(p, p + item, [](std::uint8_t b) { return b != 0; });
-            }
-        } catch (const zarr::NotFound&) {
-        }
-    }
+    if (useMask) mask = readMask(location, x.shape[0], x.shape[1], options);
     Surface out(x.shape[0], x.shape[1], std::move(xyz), std::move(mask), std::move(metadata), location);
     if (out.metadata().bbox && hasMissingMarker(*out.metadata().bbox)) out.metadata().bbox = out.bounds();
     return out;
