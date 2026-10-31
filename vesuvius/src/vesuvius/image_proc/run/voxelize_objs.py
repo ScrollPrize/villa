@@ -4,21 +4,17 @@ import numpy as np
 import os
 import trimesh
 import shutil
-import zarr
 from pathlib import Path
 import logging
 from glob import glob
 from itertools import repeat, product
-from numcodecs import Blosc
-from vesuvius.data.utils import open_zarr_group, create_zarr_array
-from concurrent.futures import ProcessPoolExecutor
+from vc_reader.reader import ZarrWriter, create_group, open_zarr
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing
 from numba import jit, set_num_threads
 import sys
 import argparse
 from tqdm import tqdm  # Progress bar
-import dask.array as da
-from dask.diagnostics import ProgressBar
 
 from vesuvius.image_proc.mesh.affine import (
     axis_perm,
@@ -96,24 +92,21 @@ def _get_worker_datasets():
 
     labels_ds = _SLICE_DATASETS.get("labels")
     if labels_ds is None:
-        label_root = zarr.open(state["label_store_path"], mode="r+")
-        labels_ds = label_root[state["label_dataset_name"]]
+        labels_ds = ZarrWriter.open(state["label_dataset_name"], auth=None)
         _SLICE_DATASETS["labels"] = labels_ds
 
     normals_ds = None
     if state.get("write_normals", False):
         normals_ds = _SLICE_DATASETS.get("normals")
         if normals_ds is None:
-            normals_root = zarr.open(state["normals_store_path"], mode="r+")
-            normals_ds = normals_root[state["normals_dataset_name"]]
+            normals_ds = ZarrWriter.open(state["normals_dataset_name"], auth=None)
             _SLICE_DATASETS["normals"] = normals_ds
 
     frame_ds = None
     if state.get("include_surface_frame", False):
         frame_ds = _SLICE_DATASETS.get("surface_frame")
         if frame_ds is None:
-            frame_root = zarr.open(state["surface_frame_store_path"], mode="r+")
-            frame_ds = frame_root[state["surface_frame_dataset_name"]]
+            frame_ds = ZarrWriter.open(state["surface_frame_dataset_name"], auth=None)
             _SLICE_DATASETS["surface_frame"] = frame_ds
 
     return labels_ds, normals_ds, frame_ds
@@ -257,9 +250,9 @@ def _get_downsample_datasets():
 
     datasets = _DOWNSAMPLE_DATASETS.get("datasets")
     if datasets is None:
-        root = zarr.open_group(state["store_path"], mode="r+")
-        parent_ds = root[state["parent_dataset_path"]]
-        target_ds = root[state["target_dataset_path"]]
+        # The process pool already reads chunks in parallel.
+        parent_ds = open_zarr(state["parent_dataset_path"], threads=1)
+        target_ds = ZarrWriter.open(state["target_dataset_path"], auth=None)
         datasets = (parent_ds, target_ds)
         _DOWNSAMPLE_DATASETS["datasets"] = datasets
     return datasets
@@ -344,7 +337,7 @@ def _downsample_chunk_worker(chunk_start):
     return chunk_start
 
 
-def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
+def _rechunk(zarr_array, chunk_size, desc, num_workers):
     if zarr_array is None or chunk_size <= 0:
         return zarr_array
 
@@ -365,97 +358,25 @@ def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
         return zarr_array
 
     target_chunks = tuple(target_chunks)
-    print(f"Rechunking {desc} to chunks {target_chunks} using Dask", flush=True)
+    print(f"Rechunking {desc} to chunks {target_chunks}", flush=True)
 
-    dask_array = da.from_zarr(zarr_array, chunks=target_chunks)
-    tmp_component = _build_tmp_component_name(zarr_array.path)
-    tmp_component_full = _join_parent_path(zarr_array.path, tmp_component)
+    path = zarr_array.path
+    tmp_path = f"{path}__rechunk_tmp"
+    tmp_array = ZarrWriter.create_like(tmp_path, zarr_array, chunks=target_chunks, overwrite=True, auth=None)
+    tmp_array.attrs.put(dict(zarr_array.attrs))
 
-    # Preserve existing attributes before recreating the dataset.
-    attrs = zarr_array.attrs.asdict()
+    def copy_chunk(start):
+        region = tuple(slice(s, min(s + c, n)) for s, c, n in zip(start, target_chunks, zarr_array.shape))
+        tmp_array[region] = zarr_array[region]
 
-    root = zarr.open_group(store=zarr_array.store, mode="r+")
-    parent_group = _get_parent_group(root, zarr_array.path)
+    starts = list(product(*(range(0, n, c) for n, c in zip(zarr_array.shape, target_chunks))))
+    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
+        for _ in tqdm(executor.map(copy_chunk, starts), total=len(starts), desc=f"Rechunk {desc}", leave=False):
+            pass
 
-    if tmp_component in parent_group:
-        del parent_group[tmp_component]
-
-    # Create the temporary target ourselves (Zarr v2 under either major) and
-    # hand dask the array object: letting dask create it by path writes a
-    # Zarr v3 array plus a root zarr.json under zarr 3, after which the
-    # existing v2 level arrays are no longer visible in the store.
-    compressors = getattr(zarr_array, 'compressors', None)  # zarr 3
-    if compressors is not None:
-        compressor = compressors[0] if compressors else None
-    else:
-        compressor = zarr_array.compressor  # zarr 2
-    tmp_array = create_zarr_array(
-        parent_group,
-        tmp_component,
-        shape=zarr_array.shape,
-        chunks=target_chunks,
-        dtype=zarr_array.dtype,
-        compressor=compressor,
-        fill_value=zarr_array.fill_value,
-        overwrite=True,
-    )
-    delayed = da.to_zarr(dask_array, tmp_array, compute=False)
-
-    with ProgressBar():
-        delayed.compute(scheduler="threads", num_workers=max(1, num_workers))
-
-    new_array = parent_group[tmp_component]
-    if attrs:
-        new_array.attrs.update(attrs)
-
-    dataset_name = zarr_array.path.rpartition("/")[2] or zarr_array.path
-    if dataset_name in parent_group:
-        del parent_group[dataset_name]
-    _rename_child(parent_group, tmp_component, dataset_name)
-
-    refreshed = parent_group[dataset_name]
-    return refreshed
-
-
-def _rename_child(group, old_name, new_name):
-    """Rename a child array of ``group`` under either zarr major.
-
-    zarr 3's ``Group.move`` raises NotImplementedError; a Zarr v2 array in a
-    local store is a directory, so rename it on disk and let the group
-    re-read it. Remote stores fall back to ``move`` where it is implemented.
-    """
-    store = group.store
-    root = getattr(store, "root", None) or getattr(store, "path", None)
-    if root is not None:
-        base = Path(str(root))
-        if group.path:
-            base = base / group.path
-        source, destination = base / old_name, base / new_name
-        if source.is_dir():
-            if destination.exists():
-                shutil.rmtree(destination)
-            os.rename(source, destination)
-            return
-    group.move(old_name, new_name)
-
-
-def _build_tmp_component_name(path):
-    basename = path.rpartition("/")[2] or path
-    return f"{basename}__rechunk_tmp"
-
-
-def _join_parent_path(path, child):
-    parent, sep, _ = path.rpartition("/")
-    if sep:
-        return f"{parent}/{child}"
-    return child
-
-
-def _get_parent_group(root, path):
-    parent_path, sep, _ = path.rpartition("/")
-    if sep:
-        return root[parent_path]
-    return root
+    shutil.rmtree(path)
+    os.rename(tmp_path, path)
+    return ZarrWriter.open(path, auth=None)
 
 
 @jit(nopython=True)
@@ -1536,7 +1457,7 @@ def main():
     print(f"Total number of slices: {len(z_slices)}")
 
     num_levels = PYRAMID_LEVELS
-    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    codec = {"cname": "zstd", "level": 3, "shuffle": 2}
 
     def compute_level_shape(base_shape, level, downsample_axes):
         shape = list(base_shape)
@@ -1571,7 +1492,7 @@ def main():
     label_datasets = []
     label_dataset_name = None
     if args.format == "zarr":
-        label_root = open_zarr_group(out_path, mode='w')
+        label_root = create_group(out_path, overwrite=True, auth=None)
         label_base_shape = (z_dim, h, w)
         label_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1585,14 +1506,13 @@ def main():
             level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = create_zarr_array(
-                label_root,
+            ds = label_root.create_array(
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
                 dtype=label_dtype,
-                compressor=compressor,
                 overwrite=True,
+                **codec,
             )
             label_datasets.append(ds)
             scale_vector = [float(2 ** level), float(2 ** level), float(2 ** level)]
@@ -1623,7 +1543,7 @@ def main():
 
     normals_datasets = []
     if args.output_normals:
-        normals_root = open_zarr_group(normals_out_path, mode='w')
+        normals_root = create_group(normals_out_path, overwrite=True, auth=None)
         normals_base_shape = (z_dim, h, w, 3)
         normals_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1638,14 +1558,13 @@ def main():
             level_shape = compute_level_shape(normals_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = create_zarr_array(
-                normals_root,
+            ds = normals_root.create_array(
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
                 dtype=normals_dtype,
-                compressor=compressor,
                 overwrite=True,
+                **codec,
             )
             normals_datasets.append(ds)
             scale_vector = [float(2 ** level), float(2 ** level), float(2 ** level), 1.0]
@@ -1674,7 +1593,7 @@ def main():
     surface_frame_dataset_name = None
 
     if args.output_surface_frame:
-        surface_frame_root = open_zarr_group(surface_frame_out_path, mode='w')
+        surface_frame_root = create_group(surface_frame_out_path, overwrite=True, auth=None)
         surface_frame_base_shape = (z_dim, h, w, 3, 3)
         surface_frame_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1690,14 +1609,13 @@ def main():
             level_shape = compute_level_shape(surface_frame_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = create_zarr_array(
-                surface_frame_root,
+            ds = surface_frame_root.create_array(
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
                 dtype=surface_frame_dtype,
-                compressor=compressor,
                 overwrite=True,
+                **codec,
             )
             surface_frame_datasets.append(ds)
             scale_vector = [float(2 ** level), float(2 ** level), float(2 ** level), 1.0, 1.0]
@@ -1891,15 +1809,15 @@ def main():
                 _write_slice_output(z, zero_label, zero_normals, zero_frame)
 
     if args.format == "zarr" and args.chunk_size > 0:
-        label_datasets[0] = _rechunk_with_dask(
+        label_datasets[0] = _rechunk(
             label_datasets[0], args.chunk_size, "Labels level 0", N_PROCESSES
         )
         if args.output_normals:
-            normals_datasets[0] = _rechunk_with_dask(
+            normals_datasets[0] = _rechunk(
                 normals_datasets[0], args.chunk_size, "Normals level 0", N_PROCESSES
             )
         if args.output_surface_frame:
-            surface_frame_datasets[0] = _rechunk_with_dask(
+            surface_frame_datasets[0] = _rechunk(
                 surface_frame_datasets[0], args.chunk_size, "Surface frame level 0", N_PROCESSES
             )
 

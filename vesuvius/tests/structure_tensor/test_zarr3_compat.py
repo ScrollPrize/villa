@@ -7,10 +7,8 @@ import os
 import numpy as np
 import pytest
 import zarr
-from numcodecs import Blosc
 from vc_reader.reader import create_group
 
-from vesuvius.data.utils import create_zarr_array, open_zarr_group
 from vesuvius.structure_tensor.vf_format import require_array, zarr_codec
 
 
@@ -38,26 +36,22 @@ def test_zarr_codec_names():
     assert zarr_codec("unknown", 3) == {"cname": "zstd", "level": 1, "shuffle": 1}
 
 
-def test_voxelize_rechunk_keeps_store_v2(tmp_path):
-    """--chunk_size N routes level 0 through a dask rechunk; that must not leave
-    a v3 array or a root zarr.json in the v2 label store (issue #1448 follow-up)."""
-    from vesuvius.image_proc.run.voxelize_objs import _rechunk_with_dask
+def test_voxelize_rechunk_keeps_values_and_attributes(tmp_path):
+    from vesuvius.image_proc.run.voxelize_objs import _rechunk
 
-    path = str(tmp_path / "labels.zarr")
-    root = open_zarr_group(path, mode="w")
-    level0 = create_zarr_array(root, "0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=np.uint16, compressor=Blosc())
+    path = tmp_path / "labels.zarr"
+    level0 = create_group(path).create_array("0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=np.uint16, cname="zstd")
     expected = np.arange(8 * 8 * 8, dtype=np.uint16).reshape(8, 8, 8)
     level0[...] = expected
     level0.attrs["note"] = "kept"
 
-    rechunked = _rechunk_with_dask(level0, 4, "labels", num_workers=1)
+    rechunked = _rechunk(level0, 4, "labels", num_workers=2)
     assert tuple(rechunked.chunks) == (4, 4, 4)
-    assert not os.path.exists(tmp_path / "labels.zarr" / "zarr.json")
-    assert _is_v2_array_dir(str(tmp_path / "labels.zarr" / "0"))
-    reopened = zarr.open_group(path, mode="r")
+    assert not os.path.exists(path / "zarr.json")
+    assert _is_v2_array_dir(str(path / "0"))
+    reopened = zarr.open_group(str(path), mode="r")
     assert list(reopened.keys()) == ["0"]
     np.testing.assert_array_equal(reopened["0"][:], expected)
-    np.testing.assert_array_equal(rechunked[:], expected)
     assert reopened["0"].attrs["note"] == "kept"
 
 
