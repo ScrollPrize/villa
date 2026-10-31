@@ -18,7 +18,13 @@ void checkExtension(const std::filesystem::path& path) {
 }
 bool hasWritePermission(const std::filesystem::path& path) {
     std::error_code error;
-    const auto permissions = std::filesystem::status(path, error).permissions();
+    const auto status = std::filesystem::status(path, error);
+#if defined(_WIN32)
+    // Windows ignores the read-only attribute on folders but sets it on
+    // customized ones such as Downloads, so it does not mean unwritable.
+    if (!error && std::filesystem::is_directory(status)) return true;
+#endif
+    const auto permissions = status.permissions();
     using P = std::filesystem::perms;
     return !error && (permissions & (P::owner_write | P::group_write | P::others_write)) != P::none;
 }
