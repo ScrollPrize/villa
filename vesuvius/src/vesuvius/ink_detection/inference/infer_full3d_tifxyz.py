@@ -151,8 +151,18 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max-target-chunks", type=int, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--cache-max-gb", type=float, default=None)
-    parser.add_argument("--reader", choices=("zarr", "vc_reader"), default="zarr")
-    parser.add_argument("--reader-connections", type=int, default=32)
+    parser.add_argument(
+        "--reader",
+        choices=("zarr", "vc_reader"),
+        default="zarr",
+        help="patch reader; vc_reader reads each DataLoader batch in one call",
+    )
+    parser.add_argument(
+        "--reader-connections",
+        type=int,
+        default=32,
+        help="vc_reader HTTP connections per DataLoader worker",
+    )
     parser.add_argument(
         "--reader-memory-cache-mb",
         type=int,
@@ -992,7 +1002,10 @@ class NativePatchDataset(Dataset):
         return self.__getitems__([index])[0]
 
     def __getitems__(self, indices):
-        """DataLoader batch fetch; a vc_reader volume reads the batch in one call."""
+        """Read a DataLoader batch.
+
+        A vc_reader volume reads the whole batch in one call; zarr reads each patch.
+        """
         bboxes = []
         for index in indices:
             patch = self.patches[int(index)]
