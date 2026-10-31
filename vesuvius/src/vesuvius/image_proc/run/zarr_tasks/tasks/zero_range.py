@@ -65,6 +65,8 @@ class ZeroRangeTask(ZarrTask):
     """Zero out chunks within a specified z-range."""
 
     def __init__(self, config: ZeroRangeConfig):
+        if config.output_zarr is not None:
+            raise ValueError("zero-range operates in place; output_zarr is not supported")
         super().__init__(config)
         self.config: ZeroRangeConfig = config
 
@@ -109,6 +111,10 @@ class ZeroRangeTask(ZarrTask):
     @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate z-range arguments."""
+        if args.output_zarr is not None:
+            raise SystemExit(
+                "Error: zero-range operates in place; omit output_zarr and use --inplace"
+            )
         if args.z_start > args.z_end:
             raise SystemExit(
                 f"Error: --z-start ({args.z_start}) must be <= --z-end ({args.z_end})"
