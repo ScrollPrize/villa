@@ -124,7 +124,7 @@ A quicker visual check is PHerc1667 `w018`: it should show rows of letters in th
 
 ## 6. Spiral fitting
 
-`spiral-fitting` runs track-based fits on MPS with `FIT_SPIRAL_DEVICE=mps`. On a 1000-slice PHerc0846A band with 144k tracks, an M5 Pro reaches about 1.1 it/s (0.6 it/s while sharing the machine with other jobs). The same fit on CPU does 0.47 it/s. This needs the MPS fixes in ScrollPrize/villa PR "spiral-fitting: make weighted track sampling work on MPS". The fit holds about 4.5 GB between steps and peaks around 10 GB.
+`spiral-fitting` runs track-based fits on MPS with `FIT_SPIRAL_DEVICE=mps`. On a 1000-slice PHerc0846A band with 144k tracks, an M5 Pro reaches about 1.1 it/s (0.6 it/s while sharing the machine with other jobs). The same fit on CPU does 0.47 it/s. This needs the MPS fixes in [ScrollPrize/villa#2393](https://github.com/ScrollPrize/villa/pull/2393). The fit holds about 4.5 GB between steps and peaks around 10 GB.
 
 You can build a band dataset from public data alone:
 - umbilicus: `vc_gen_umbilicus` on the normal grids;
