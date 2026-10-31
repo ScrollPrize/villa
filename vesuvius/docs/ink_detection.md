@@ -534,6 +534,46 @@ it, producing a six-level OME-Zarr pyramid with ceil-halved shapes.
 Keep supervision explicit: ink labels mark positive pixels, while the
 supervision mask defines which pixels participate in loss and metrics.
 
+## Check a prediction against a reference (inkcheck)
+
+`vesuvius.inkcheck` asks whether an ink prediction actually agrees with an
+independent reference for the same segment (a published read, a photo
+transcription, or another model), and whether that agreement beats chance.
+It works on any 2D prediction and reference image, is CPU-only, and finishes in
+seconds to minutes.
+
+```bash
+vesuvius.inkcheck pred.png ref.jpg --pred-um 9.6 --ref-um 19.2 \
+  --ref-origin 512,1536 --mask segment_mask.png --out out/paris4_check
+# or: python -m vesuvius.ink_detection.eval.inkcheck ...
+```
+
+It resamples both maps to a shared analysis grid (`--analysis-um`, default
+the coarser of the two), registers them with a bounded masked-NCC shift search,
+and reports band-pass Pearson r, AUC, breakeven F1, and stroke-level recall and precision.
+Each metric is compared with circular-shift null distributions (`--nulls`,
+`--metric-nulls`). Verdicts: `PASS` needs p(r_bp) <= 0.01, p(stroke) <= 0.05,
+r_bp >= 0.20, and stroke recall >= 0.50. `WEAK` is significant band-pass
+correlation only. Anything else is `FAIL`. The exit code is 0, 1, or 2, so it
+can gate scripts. Outputs are `PREFIX.json` (all numbers, config, and warnings)
+and `PREFIX.png` (prediction, registered reference, and overlay panels).
+
+Use `--pred-scale ink9um` for raw uint8 predictions written by
+`ink_detection.inference`. The default, `raw`, maps 0..255 linearly to 0..1.
+
+Use it as a diagnostic, to tell "no ink" apart from "ink not recovered yet".
+`FAIL` means nothing beats the shift nulls: check the placement, the surface and
+the checkpoint. `WEAK` means the signal is there but not at letter level, which
+is not the same as no ink. On a PHerc0343P segment a naive whole-image Pearson r
+was about 0.40, which looks convincing, but inkcheck rated it `WEAK` with 12 to
+19 % stroke recall. The same checkpoints rated `PASS` on held-out Paris 4
+(letter level; Paris 4 scores are not published while the PHercParis4
+publication reservation applies, until 2027-06-25).
+
+inkcheck complements `ink_detection evaluate` (#2210), which scores held-out vs
+training regions, and `face_check` (#2318), which asks "ink or texture?" without
+a reference. inkcheck needs a reference map but can compare across resolutions.
+
 ## Tests
 
 Run the self-contained ink-detection coverage:
@@ -541,6 +581,9 @@ Run the self-contained ink-detection coverage:
 ```bash
 uv run --no-sync pytest tests/ink_detection -q
 ```
+
+`tests/ink_detection/test_inkcheck.py` covers inkcheck. It needs only numpy,
+scipy, and Pillow.
 
 Run the package suite without slow or network tests:
 
