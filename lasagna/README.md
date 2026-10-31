@@ -403,13 +403,13 @@ python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
 
 The local OME root must contain `_download` S3 metadata. The defaults are a
 10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
-descriptors (`--live-fetch-ahead-tiles 10000`); this disk window is separate
-from the much smaller `--prefetch-tiles-per-gpu` array window. Only
-whole input Z-chunk planes safely behind a fully committed model row are
-removed. Cache pressure may temporarily exceed the target when no obsolete
-plane is safe. Live mode is intentionally full-volume only, conflicts with
+descriptors (`--live-fetch-ahead-tiles 10000`); this read-ahead is separate
+from the much smaller `--prefetch-tiles-per-gpu` array window. Chunks are read
+through `vc_reader` into `<ome root>/.live_cache`, decoded; past the target its
+least recently used chunks are removed. Chunks a plain download left in the
+level are not used. Live mode is intentionally full-volume only, conflicts with
 `--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
-Interrupted runs retain atomically completed chunks and can be rerun directly.
+Interrupted runs keep the cache and can be rerun directly.
 
 ### Multi-axis processing
 

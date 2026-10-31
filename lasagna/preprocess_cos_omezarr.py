@@ -1410,7 +1410,11 @@ def run_preprocess_3d(
 	output_location, output_format = resolve_output(output_path, output_format)
 	output_path = str(output_location)
 
-	a_in = open_zarr(input_path, memory_cache=int(float(input_cache_gib) * (1 << 30)), threads=int(input_io_threads))
+	input_memory = int(float(input_cache_gib) * (1 << 30))
+	if live_cache is not None:
+		a_in = live_cache.open_reader(memory_cache=input_memory, threads=int(input_io_threads))
+	else:
+		a_in = open_zarr(input_path, memory_cache=input_memory, threads=int(input_io_threads))
 	sh = tuple(int(v) for v in a_in.shape)
 	if len(sh) != 3:
 		raise ValueError(f"input array must be (Z,Y,X), got shape {sh}")

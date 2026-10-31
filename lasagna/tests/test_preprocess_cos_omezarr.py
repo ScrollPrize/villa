@@ -537,7 +537,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			def __init__(self, level_path):
 				self.requests = []
-				self.safe_boundaries = []
 				self.source = type("Source", (), {"level_path": Path(level_path)})()
 
 			def request_region(self, bounds):
@@ -546,9 +545,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			def region_has_remote_chunks(self, bounds):
 				return True
-
-			def advance_safe_boundary(self, z):
-				self.safe_boundaries.append(int(z))
 
 			def snapshot(self):
 				return {}
@@ -589,7 +585,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						path = parallel_root / ("chunk_" + "_".join(str(v) for v in origin) + ".npy")
 						np.testing.assert_array_equal(expected, np.load(path))
 		self.assertEqual(len(live_cache.requests), 16)
-		self.assertEqual(live_cache.safe_boundaries, [4, 8, 12, 16])
 
 	def test_shared_runner_composes_native_and_requested_output_stride(self):
 		product = OutputProductSpec(

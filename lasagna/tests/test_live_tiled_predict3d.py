@@ -15,7 +15,6 @@ class _LiveCacheSpy:
         self.source = SimpleNamespace(level_path=level_path.resolve())
         self.lookahead_tiles = lookahead_tiles
         self.requests: list[tuple[int, ...]] = []
-        self.safe_boundaries: list[int] = []
 
     def request_region(self, bounds):
         self.requests.append(tuple(bounds))
@@ -23,17 +22,11 @@ class _LiveCacheSpy:
         future.set_result(True)
         return future
 
-    def advance_safe_boundary(self, value: int) -> None:
-        self.safe_boundaries.append(int(value))
-
     def region_has_remote_chunks(self, _bounds) -> bool:
         return True
 
     def snapshot(self):
-        return {
-            "resident_bytes": 0, "target_bytes": 1 << 30,
-            "safe_plane_exclusive": len(self.safe_boundaries),
-        }
+        return {"target_bytes": 1 << 30}
 
 
 class _IdentityAdapter:
@@ -104,7 +97,6 @@ def test_live_scheduler_materializes_lookahead_before_serial_gpu_work(tmp_path, 
     cache, adapter, output = _run(tmp_path, complete=False)
     assert len(cache.requests) == 2
     assert adapter.request_counts_at_inference[0] == 2
-    assert cache.safe_boundaries == [4, 8]
     assert output.writes > 0
 
 

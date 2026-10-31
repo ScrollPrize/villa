@@ -1337,19 +1337,14 @@ def _predict3d_progress_line(progress: dict) -> str:
 	live_cache = progress.get("live_cache")
 	cache_status = ""
 	if isinstance(live_cache, Mapping):
-		resident = int(live_cache.get("resident_bytes", 0)) / float(1 << 40)
 		target = int(live_cache.get("target_bytes", 0)) / float(1 << 40)
-		safe_plane = int(live_cache.get("safe_plane_exclusive", 0))
 		downloaded = int(live_cache.get("downloaded_chunks", 0))
-		missing = int(live_cache.get("missing_chunks", live_cache.get("missing_requests", 0)))
-		inflight = int(live_cache.get("inflight_downloads", 0))
-		evicted = int(live_cache.get("evicted_planes", 0))
+		missing = int(live_cache.get("missing_chunks", 0))
+		inflight = int(live_cache.get("inflight_regions", 0))
 		rate = float(live_cache.get("download_rate_bytes_s", 0.0)) / float(1 << 20)
-		over = "+" if live_cache.get("over_target") else ""
 		cache_status = (
-			f" cache={resident:.2f}/{target:.2f}TiB{over} dl={downloaded} "
-			f"miss={missing} inflight={inflight} rate={rate:.1f}MiB/s "
-			f"safe_zchunk={safe_plane} evicted={evicted}"
+			f" cache_target={target:.2f}TiB dl={downloaded} "
+			f"miss={missing} inflight={inflight} rate={rate:.1f}MiB/s"
 		)
 	return (
 		f"[predict3d] [{bar}] {done}/{total} tiles "
@@ -3805,13 +3800,6 @@ def run_tiled_inference_3d(
 			if row_end:
 				progress_emitter.finish_line()
 				_advance_flushes(next_tz)
-				if live_cache is not None:
-					safe_input_z = min(
-						volume_shape[0], max(0, int(next_tz) + int(z0) - int(pad)),
-					)
-					live_cache.advance_safe_boundary(safe_input_z)
-					if progress is not None:
-						progress["live_cache"] = live_cache.snapshot()
 
 		def _read_coord(coord: TileOriginZYX) -> tuple[np.ndarray, float]:
 			started = time.perf_counter()
