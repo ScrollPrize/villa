@@ -3,7 +3,7 @@ import json
 import time
 import queue
 import threading
-import zarr
+from vc_reader.reader import open_group
 import cupy as cp
 from cucim.skimage.measure import label as cucim_label, regionprops_table
 import torch
@@ -272,10 +272,9 @@ class Inference:
         self.model.eval()
 
         print(f"loading volume zarr {volume_zarr}...")
-        ome_zarr = zarr.open_group(volume_zarr, mode='r')
+        ome_zarr = open_group(volume_zarr)
         self.volume = ome_zarr[str(volume_scale)]
-        with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
-            self.voxel_size_um = json.load(meta_fp)['voxelsize']
+        self.voxel_size_um = ome_zarr.voxel_size
         print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
 
         # cache for prefetching

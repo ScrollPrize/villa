@@ -16,7 +16,7 @@ from os import cpu_count
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
-import zarr
+from vc_reader.reader import ZarrGroup, ZarrReader, open_node
 from tqdm import tqdm
 
 
@@ -57,8 +57,8 @@ class ZarrTask(ABC):
             config: Task configuration dataclass
         """
         self.config = config
-        self.input_zarr: Optional[zarr.Array] = None
-        self.output_zarr: Optional[zarr.Array] = None
+        self.input_zarr: Optional[ZarrReader] = None
+        self.output_zarr = None
         self._is_ome_zarr: bool = False
         self._levels_to_process: List[str] = []
 
@@ -212,9 +212,9 @@ class ZarrTask(ABC):
         Returns:
             Tuple of (is_ome_zarr, list_of_levels)
         """
-        opened = zarr.open(path, mode="r")
+        opened = open_node(path)
 
-        if isinstance(opened, zarr.Group):
+        if isinstance(opened, ZarrGroup):
             all_levels = sorted(
                 [k for k in opened.keys() if k.isdigit()], key=int
             )
@@ -223,7 +223,7 @@ class ZarrTask(ABC):
 
         return False, []
 
-    def _get_input_array(self, level: Optional[str] = None) -> zarr.Array:
+    def _get_input_array(self, level: Optional[str] = None) -> ZarrReader:
         """Get input zarr array, handling OME-Zarr levels.
 
         Args:
@@ -232,9 +232,9 @@ class ZarrTask(ABC):
         Returns:
             Zarr array
         """
-        opened = zarr.open(self.config.input_zarr, mode="r")
+        opened = open_node(self.config.input_zarr)
 
-        if isinstance(opened, zarr.Group):
+        if isinstance(opened, ZarrGroup):
             if level is not None:
                 return opened[level]
             return opened["0"]

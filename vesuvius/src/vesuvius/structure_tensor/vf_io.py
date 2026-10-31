@@ -2,8 +2,7 @@
 
 import numpy as np
 import torch
-import zarr
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ZarrGroup, open_node, open_zarr
 from typing import Tuple
 
 def load_density_mask(
@@ -16,11 +15,7 @@ def load_density_mask(
     and return it as a float32 mask of shape (Dz, Dy, Dx).
     """
     z0, z1, y0, y1, x0, x1 = bounds
-    arr = open_zarr(
-        input_zarr,
-        mode='r',
-        storage_options={'anon': False} if input_zarr.startswith('s3://') else None
-    )
+    arr = open_zarr(input_zarr)
     # if there's a channel axis, we assume it's the first one; drop it
     if arr.ndim == 4:
         sub = arr[0, z0:z1, y0:y1, x0:x1]
@@ -43,19 +38,14 @@ def load_eigenvector_field(
     returning a tensor of shape (3, Dz, Dy, Dx).
     """
     z0, z1, y0, y1, x0, x1 = bounds
-    root = open_zarr(
-        eigen_zarr,
-        mode='r',
-        storage_options={'anon': False} if eigen_zarr.startswith('s3://') else None
-    )
-    
-    if isinstance(root, zarr.Group):
+    root = open_node(eigen_zarr)
+
+    if isinstance(root, ZarrGroup):
         try:
             arr = root['eigenvectors']
         except KeyError:
            raise KeyError(f"Zarr group at {eigen_zarr!r} has no 'eigenvectors' dataset")
     else:
-        # assume open_zarr returned a single Array
         arr = root
 
     # eigenvectors is a 9×Z×Y×X array; slice out channels [start:start+3]

@@ -137,20 +137,20 @@ _EXPORT_WORKER_GROUP = None
 
 
 def _init_export_worker(source_path: str) -> None:
-    import zarr
+    from vc_reader.reader import open_group
 
     global _EXPORT_WORKER_SOURCE, _EXPORT_WORKER_GROUP
     _EXPORT_WORKER_SOURCE = source_path
-    _EXPORT_WORKER_GROUP = zarr.open_group(source_path, mode="r")
+    _EXPORT_WORKER_GROUP = open_group(source_path)
 
 
 def _get_export_group(source_path: str):
-    import zarr
+    from vc_reader.reader import open_group
 
     if (_EXPORT_WORKER_GROUP is not None
             and _EXPORT_WORKER_SOURCE == source_path):
         return _EXPORT_WORKER_GROUP
-    return zarr.open_group(source_path, mode="r")
+    return open_group(source_path)
 
 
 def _source_signature(
@@ -408,11 +408,11 @@ def export_spiral_supervision(
     show_progress: bool = True,
 ) -> dict:
     """Export ``source`` and return the completed root manifest."""
-    import zarr
+    from vc_reader.reader import open_group
 
     source = Path(source).resolve()
     output = Path(output).resolve()
-    group = zarr.open_group(str(source), mode="r")
+    group = open_group(source)
     if group.attrs.get("artifact_type") != "winding_native_phase_cache":
         raise ValueError(f"not a native winding phase cache: {source}")
     if not bool(group.attrs.get("complete", False)):

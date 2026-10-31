@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import zarr
+from vc_reader.reader import open_node
 
 from vesuvius.models.configuration.config_manager import ConfigManager
 from vesuvius.models.datasets.find_valid_patches import find_valid_patches
@@ -130,9 +130,9 @@ def generate_patch_caches(
             )
 
     # Prepare arrays for find_valid_patches
-    label_arrays: List[Optional[zarr.Array]] = []
+    label_arrays: List[Optional[object]] = []
     label_names: List[str] = []
-    image_arrays: List[Optional[zarr.Array]] = []
+    image_arrays: List[Optional[object]] = []
 
     first_target = target_names[0]
     unlabeled_fg_enabled = bool(getattr(mgr, "unlabeled_foreground_enabled", False))
@@ -143,7 +143,7 @@ def generate_patch_caches(
         label_path = vol.label_paths.get(first_target)
         if label_path and label_path.exists():
             try:
-                label_arrays.append(zarr.open(label_path, mode="r"))
+                label_arrays.append(open_node(label_path))
             except Exception as e:
                 logger.warning("Failed to open label %s: %s", label_path, e)
                 label_arrays.append(None)
@@ -157,7 +157,7 @@ def generate_patch_caches(
             should_use = not unlabeled_fg_volume_ids or vol.volume_id in unlabeled_fg_volume_ids
             if should_use:
                 try:
-                    image_arrays.append(zarr.open(vol.image_path, mode="r"))
+                    image_arrays.append(open_node(vol.image_path))
                 except Exception as e:
                     logger.warning("Failed to open image %s: %s", vol.image_path, e)
                     image_arrays.append(None)

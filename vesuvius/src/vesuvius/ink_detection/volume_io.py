@@ -1,85 +1,16 @@
-"""Local/remote Zarr opening, resolution selection, padding, and disk caching."""
+"""Zarr opening through vc_reader, resolution selection, and padded crops."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 import numpy as np
-import zarr
 
-from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
+from vc_reader.reader import load_basic_auth, open_node
 
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
-ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-
-
-def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
-    snapshot = []
-    for directory, _, filenames in os.walk(cache_dir):
-        for filename in filenames:
-            if filename.endswith(".partial"):
-                continue
-            path = Path(directory) / filename
-            try:
-                stat = path.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if not path.is_file():
-                continue
-            snapshot.append((stat.st_mtime_ns, stat.st_size, path))
-    snapshot.sort()
-    return snapshot
-
-
-def _evict_to_watermark(
-    snapshot: list[tuple[int, int, Path]], max_bytes: int
-) -> int:
-    total = sum(size for _, size, _ in snapshot)
-    target_bytes = 0.9 * max_bytes
-    for _, size, path in snapshot:
-        if total <= target_bytes:
-            break
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        total -= size
-    return total
-
-
-def load_volume_auth(auth_json_path: str | Path | None) -> tuple[str, str] | None:
-    """Read the exact username/password JSON boundary used for HTTPS volumes."""
-    if auth_json_path is None:
-        return None
-    with Path(auth_json_path).open("r", encoding="utf-8") as stream:
-        authored = json.load(stream)
-    if not isinstance(authored, dict) or "username" not in authored or "password" not in authored:
-        raise ValueError("volume auth JSON requires username and password")
-    return str(authored["username"]), str(authored["password"])
-
-
-def disk_cache_subdir(source_path: str, cache_dir: Path) -> Path:
-    digest = hashlib.sha1(str(source_path).encode()).hexdigest()[:12]
-    return Path(cache_dir) / digest
-
-
-def _available_top_level_keys(root: Any) -> tuple[str, ...]:
-    if not hasattr(root, "keys"):
-        return ()
-    return tuple(sorted(str(key) for key in root.keys()))
-
-
-def _missing_node_error(message: str) -> Exception:
-    error_type = getattr(zarr.errors, "NodeNotFoundError", None)
-    if error_type is None:
-        error_type = getattr(zarr.errors, "PathNotFoundError", KeyError)
-    return error_type(message)
 
 
 def open_volume_root(
@@ -89,70 +20,18 @@ def open_volume_root(
     cache_dir: str | Path | None = None,
     cache_max_gb: float | None = None,
 ):
-    """Open a Zarr root with process-owned remote transport and optional cache."""
+    """Open a Zarr root with vc_reader's remote transport and optional disk cache."""
     path_text = str(path)
-    storage_options: dict[str, Any] = {}
-    is_public_s3 = (
-        path_text.startswith("s3://")
-        and _PUBLIC_S3_VOLUME_SUBSTRING in path_text
-    )
-    if is_public_s3:
-        storage_options["anon"] = True
-    auth = load_volume_auth(auth_json_path)
-    if not is_public_s3 and path_text.startswith("https://") and auth is not None:
-        storage_options["client_kwargs"] = {
-            "auth": aiohttp.BasicAuth(auth[0], auth[1])
-        }
-    is_remote = path_text.startswith(("s3://", "http://", "https://"))
-
-    if cache_dir is not None:
-        if not ZARR_V3:
-            raise NotImplementedError(
-                "volume disk cache requires zarr 3; "
-                f"installed zarr is {zarr.__version__}"
-            )
-        from zarr.experimental.cache_store import CacheStore
-        from zarr.storage import LocalStore
-
-        maximum_bytes = (
-            None if cache_max_gb is None else int(float(cache_max_gb) * 1e9)
-        )
-        if maximum_bytes is not None and maximum_bytes < 0:
-            raise ValueError("cache_max_gb must be nonnegative or None")
-        cache_path = disk_cache_subdir(path_text, Path(cache_dir))
-        cache_path.mkdir(parents=True, exist_ok=True)
-        if maximum_bytes is not None:
-            snapshot = _cache_snapshot(cache_path)
-            if sum(size for _, size, _ in snapshot) > maximum_bytes:
-                _evict_to_watermark(snapshot, maximum_bytes)
-        if is_remote:
-            remote_options = dict(storage_options)
-            remote_options["skip_instance_cache"] = True
-            source_store = zarr.storage.FsspecStore.from_url(
-                path_text,
-                storage_options=remote_options,
-                read_only=True,
-            )
-        else:
-            source_store = LocalStore(path_text, read_only=True)
-        store = CacheStore(
-            store=source_store,
-            cache_store=LocalStore(cache_path),
-            max_size=maximum_bytes,
-        )
-        return zarr.open(store=store, mode="r")
-
-    if is_remote and ZARR_V3:
-        storage_options["skip_instance_cache"] = True
-        store = zarr.storage.FsspecStore.from_url(
-            path_text,
-            storage_options=storage_options,
-            read_only=True,
-        )
-        return zarr.open(store=store, mode="r")
-
-    return open_vesuvius_zarr(
-        path_text, mode="r", storage_options=storage_options
+    auth: Any = "auto"
+    if auth_json_path is not None and path_text.startswith("https://") and _PUBLIC_S3_VOLUME_SUBSTRING not in path_text:
+        auth = load_basic_auth(auth_json_path)
+    if cache_max_gb is not None and cache_max_gb < 0:
+        raise ValueError("cache_max_gb must be nonnegative or None")
+    return open_node(
+        path_text,
+        auth=auth,
+        cache_dir=None if cache_dir is None else str(cache_dir),
+        cache_max_bytes=None if cache_max_gb is None else int(float(cache_max_gb) * 1e9),
     )
 
 
@@ -167,7 +46,7 @@ def select_volume_level(
 
     if hasattr(root, "shape"):
         if not root_array_is_requested_level and str(resolution) not in {"0", ""}:
-            raise _missing_node_error(
+            raise FileNotFoundError(
                 f"{source.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
                 f"in zarr array {source!r})"
             )
@@ -180,12 +59,12 @@ def select_volume_level(
             f"in zarr store {source!r})"
         )
         try:
-            available = _available_top_level_keys(root)
+            available = sorted(root.keys())
         except Exception:
             available = ()
         if available:
             message += "; available top-level keys: " + ", ".join(available[:20])
-        raise _missing_node_error(message) from exc
+        raise FileNotFoundError(message) from exc
 
 
 def open_volume(

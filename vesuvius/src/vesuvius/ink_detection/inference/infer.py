@@ -37,12 +37,13 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 )
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
-    ZARR_V3,
     open_volume,
     open_volume_root,
     select_volume_level,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
+ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 LOGGER = logging.getLogger(__name__)

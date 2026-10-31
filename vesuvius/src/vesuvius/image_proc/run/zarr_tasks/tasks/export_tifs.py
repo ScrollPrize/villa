@@ -13,7 +13,7 @@ from typing import Any, Iterable, Optional, Tuple
 
 import numpy as np
 import tifffile
-import zarr
+from vc_reader.reader import open_node
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
@@ -89,10 +89,10 @@ def _get_zarr_stores():
     """Get or initialize zarr stores for the current thread."""
     global _zarr_path, _zarr2_path, _resolution
     if not hasattr(_thread_local, "zarr_data1"):
-        store1 = zarr.open(_zarr_path, mode="r")
+        store1 = open_node(_zarr_path)
         _thread_local.zarr_data1 = store1[_resolution]
         if _zarr2_path is not None:
-            store2 = zarr.open(_zarr2_path, mode="r")
+            store2 = open_node(_zarr2_path)
             _thread_local.zarr_data2 = store2[_resolution]
         else:
             _thread_local.zarr_data2 = None
@@ -297,7 +297,7 @@ class ExportTifsTask(ZarrTask):
             bg_dir.mkdir(parents=True, exist_ok=True)
 
         # Open zarr to get dimensions
-        store = zarr.open(self.config.input_zarr, mode="r")
+        store = open_node(self.config.input_zarr)
         data = store[self.config.resolution]
 
         self._shape = data.shape[:3]

@@ -12,9 +12,11 @@ from numcodecs import Blosc
 import zarr
 
 from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
-from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume_root
+from vesuvius.ink_detection.volume_io import open_volume_root
 from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
+ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 OUTPUT_Z = 21

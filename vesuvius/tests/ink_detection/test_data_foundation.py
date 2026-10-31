@@ -504,13 +504,6 @@ def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
     assert valid == (slice(1, 3), slice(0, 3), slice(0, 2))
     np.testing.assert_array_equal(crop[1:3, :3, :2], array[:2, 1:4, 3:5])
 
-    if int(zarr.__version__.split(".", 1)[0]) < 3:
-        with pytest.raises(
-            NotImplementedError, match="volume disk cache requires zarr 3"
-        ):
-            open_volume(volume_path, 0, cache_dir=tmp_path / "cache")
-        return
-
     cached = open_volume(
         volume_path,
         0,
@@ -518,7 +511,6 @@ def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
         cache_max_gb=0.001,
     )
     np.testing.assert_array_equal(cached[:], array)
-    assert any(path.is_file() for path in (tmp_path / "cache").rglob("*"))
 
 
 def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch):

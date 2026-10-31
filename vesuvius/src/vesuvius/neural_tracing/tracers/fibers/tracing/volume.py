@@ -61,7 +61,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import zarr
 from scipy import ndimage
 from scipy.spatial import cKDTree
 from vc_reader.reader import open_zarr
@@ -486,7 +485,7 @@ _TILE_PRESENCE = None
 
 def _tile_worker_init(presence_path):
     global _TILE_PRESENCE
-    _TILE_PRESENCE = zarr.open(presence_path, mode='r')
+    _TILE_PRESENCE = open_zarr(presence_path)
 
 
 def _tile_dots(task):
@@ -800,7 +799,7 @@ def tile_weights(presence_path, threshold, tiles, shape):
     coarse = Path(presence_path).parent/str(int(Path(presence_path).name)+1)
     if not coarse.exists():
         return None
-    a = zarr.open(str(coarse), mode='r')
+    a = open_zarr(coarse)
     weights = []
     for t in tiles:
         z0, y0, x0 = (t['lo'][::-1]//2).astype(int)
@@ -875,7 +874,7 @@ def main(argv=None):
     (out/'tiles').mkdir(parents=True, exist_ok=True)
     tracer, ct, spec, policy = build_tracer(args)
     shape = tuple(int(n) for n in np.ceil(np.asarray(ct.shape)/spec.input_scale))  # the trace grid, zyx
-    presence = zarr.open(args.presence, mode='r')
+    presence = open_zarr(args.presence)
     if tuple(presence.shape) != shape:
         raise SystemExit(f'presence shape {presence.shape} is not the trace grid {shape} (zyx)')
     if args.box:

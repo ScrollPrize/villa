@@ -23,9 +23,11 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
-from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume, open_volume_root
+from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
 from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
+ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)

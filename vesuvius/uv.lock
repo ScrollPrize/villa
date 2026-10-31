@@ -4419,6 +4419,36 @@ dependencies = [
 requires-dist = [{ name = "numpy" }]
 
 [[package]]
+name = "vc-reader"
+version = "0.1.0"
+source = { editable = "../vc_reader" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp", marker = "extra == 'all'" },
+    { name = "aiohttp", marker = "extra == 'bench'" },
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "pillow", marker = "extra == 'all'", specifier = ">=10.1" },
+    { name = "pillow", marker = "extra == 'previews'", specifier = ">=10.1" },
+    { name = "s3fs", marker = "extra == 'all'" },
+    { name = "s3fs", marker = "extra == 'bench'" },
+    { name = "scipy", marker = "extra == 'all'", specifier = ">=1.11" },
+    { name = "scipy", marker = "extra == 'bench'", specifier = ">=1.11" },
+    { name = "tensorstore", marker = "extra == 'all'", specifier = ">=0.1.60" },
+    { name = "tensorstore", marker = "extra == 'bench'", specifier = ">=0.1.60" },
+    { name = "tifffile", marker = "extra == 'all'" },
+    { name = "tifffile", marker = "extra == 'bench'" },
+    { name = "torch", marker = "extra == 'all'", specifier = ">=2.0" },
+    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.0" },
+    { name = "zarr", marker = "extra == 'all'", specifier = ">=3" },
+    { name = "zarr", marker = "extra == 'bench'", specifier = ">=3" },
+]
+provides-extras = ["reader", "transforms", "torch", "previews", "bench", "all"]
+
+[[package]]
 name = "vesuvius"
 source = { editable = "." }
 dependencies = [
@@ -4545,6 +4575,7 @@ models = [
     { name = "tqdm" },
     { name = "typed-argument-parser" },
     { name = "vc-object-store" },
+    { name = "vc-reader" },
     { name = "villa-gpu-manager" },
     { name = "volume-cartographer" },
     { name = "wandb", extra = ["media"] },
@@ -4711,6 +4742,7 @@ requires-dist = [
     { name = "vc-delta3d", marker = "extra == 'volume-only'", specifier = ">=0.2.0,<0.3" },
     { name = "vc-object-store", marker = "extra == 'all'", editable = "../vc_object_store" },
     { name = "vc-object-store", marker = "extra == 'models'", editable = "../vc_object_store" },
+    { name = "vc-reader", marker = "extra == 'models'", editable = "../vc_reader" },
     { name = "villa-gpu-manager", marker = "extra == 'all'", editable = "../gpu_manager" },
     { name = "villa-gpu-manager", marker = "extra == 'models'", editable = "../gpu_manager" },
     { name = "volume-cartographer", marker = "extra == 'all'", editable = "../volume-cartographer" },
@@ -4769,17 +4801,11 @@ name = "volume-cartographer"
 version = "3.0.3"
 source = { editable = "../volume-cartographer" }
 dependencies = [
-    { name = "numcodecs" },
     { name = "numpy" },
-    { name = "vc-delta3d" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
-    { name = "numpy" },
-    { name = "vc-delta3d", specifier = ">=0.2.0,<0.3" },
-]
+requires-dist = [{ name = "numpy" }]
 
 [[package]]
 name = "wandb"

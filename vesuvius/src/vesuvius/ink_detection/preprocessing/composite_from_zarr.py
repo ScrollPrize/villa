@@ -21,7 +21,7 @@ from typing import Iterator, Sequence
 
 import numpy as np
 import tifffile
-import zarr
+from vc_reader.reader import ZarrReader, open_node
 from tqdm import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -172,21 +172,19 @@ def _discover_zarr_dirs(root: Path) -> list[Path]:
 
 
 def _resolve_array_spec(zarr_path: Path, resolution: str) -> ArraySpec:
-    root = zarr.open(str(zarr_path), mode="r")
+    root = open_node(zarr_path)
 
-    if isinstance(root, zarr.Array):
+    if isinstance(root, ZarrReader):
         array = root
         array_key: str | None = None
-    elif isinstance(root, zarr.Group):
+    else:
         if resolution not in root:
-            available = sorted(str(key) for key in root.array_keys())
+            available = root.keys()
             raise ValueError(
                 f"Resolution '{resolution}' not found in {zarr_path}. Available arrays: {available}"
             )
         array = root[resolution]
         array_key = resolution
-    else:
-        raise ValueError(f"Unsupported Zarr root type at {zarr_path}: {type(root)!r}")
 
     if array.ndim == 3:
         shape = tuple(int(v) for v in array.shape)
@@ -340,8 +338,8 @@ def _get_worker_array():
         _WORKER_CONFIG.array_key,
     )
     if getattr(_THREAD_LOCAL, "key", None) != cache_key:
-        root = zarr.open(_WORKER_CONFIG.zarr_path, mode="r")
-        array = root if isinstance(root, zarr.Array) else root[_WORKER_CONFIG.array_key]
+        root = open_node(_WORKER_CONFIG.zarr_path)
+        array = root if isinstance(root, ZarrReader) else root[_WORKER_CONFIG.array_key]
         _THREAD_LOCAL.array = array
         _THREAD_LOCAL.key = cache_key
 

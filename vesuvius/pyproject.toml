@@ -67,6 +67,8 @@ models = [
     # Monorepo-only C++ package like volume-cartographer; the fiber tracers and
     # fiber_trace_3d read and write fibers through its object store.
     "vc-object-store",
+    # Monorepo-only C++ package: Zarr, TIFF and catalog reading, sampling, transforms.
+    "vc-reader",
     "villa-gpu-manager",
     "numba>=0.60.0",
     "batchgenerators>=0.25.1",
@@ -262,6 +264,7 @@ url = "https://pypi.nvidia.com"
 [tool.uv.sources]
 volume-cartographer = { path = "../volume-cartographer", editable = true }
 vc-object-store = { path = "../vc_object_store", editable = true }
+vc-reader = { path = "../vc_reader", editable = true }
 villa-gpu-manager = { path = "../gpu_manager", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
