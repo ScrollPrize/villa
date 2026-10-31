@@ -17,36 +17,26 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Scientific/Engineering",
 ]
-# Minimal core dependencies required by the Volume class.
+# Minimal core dependencies.
 dependencies = [
     "numpy>=2.0.2",
     "pillow>=11.3.0",
     "pynrrd>=1.1.3",
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
-    "fsspec>=2025.9.0",
-    "numcodecs>=0.15.1,<0.17",
-    "zarr>=2.18.7,<4",
-    "s3fs>=2025.9.0",
     "cachetools>=6.2.4",
     "edt>=3.1.2",
-    # numcodecs codec for vc-delta3d compressed zarrs (VC3D and vc_reader caches).
-    "vc-delta3d>=0.2.0,<0.3",
 ]
 
 [project.optional-dependencies]
 # Minimal install explicitly named
 volume-only = [
+    "vc-reader",
     "numpy>=2.0.2",
     "pillow>=11.3.0",
     "pynrrd>=1.1.3",
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
-    "fsspec>=2025.9.0",
-    "numcodecs>=0.15.1,<0.17",
-    "zarr>=2.18.7,<4",
-    "s3fs>=2025.9.0",
-    "vc-delta3d>=0.2.0,<0.3",
 ]
 # Machine-learning & training stack
 models = [
@@ -77,7 +67,6 @@ models = [
     "scipy>=1.13.1",
     "connected-components-3d>=3.24.0",
     "pandas>=2.3.2",
-    "tensorstore>=0.1.69",
     "tqdm>=4.67.1",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
@@ -87,18 +76,15 @@ models = [
     # Data pipeline / I/O and compression
     "aiohttp>=3.12.15",
     "blosc2>=2.5.1",
-    "dask>=2024.8.0",
-    "dask-image>=2024.5.3",
     "lxml>=6.0.2",
     "opencv-python-headless>=4.11.0.86",
-    "tifffile>=2024.8.30",
-    "imagecodecs>=2026.3.6",
     # cuCIM ships manylinux wheels only; both import sites already fall back
     # gracefully when it is absent, so keep non-Linux platforms resolvable.
     "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]
 # Rendering and geometry utilities
 render = [
+    "vc-reader",
     "trimesh>=4.8.2",
     "opencv-python-headless>=4.11.0.86",
     "opencv-contrib-python>=4.11.0.86",
@@ -106,7 +92,6 @@ render = [
     "alphashape>=1.3.1",
     "connected-components-3d>=3.24.0",
     "simpleitk>=2.5.2",
-    "tifffile>=2024.8.30",
 ]
 # Graphical user interface and visualisation
 gui = [
@@ -126,18 +111,18 @@ notebooks = [
 
 # Blending and finalization (minimal dependencies for vesuvius.blend_logits and vesuvius.finalize_outputs)
 blending = [
+    "vc-reader",
     "scipy>=1.13.1",       # For scipy.ndimage.gaussian_filter in blending.py
     "tqdm>=4.67.1",        # Progress bars
-    "nest-asyncio>=1.6.0", # Required by vesuvius.utils.catalog (imported via __init__)
 ]
 
-tests = ["pytest>=8.4.2"]
+# tifffile checks written TIFFs independently of vc_reader.
+tests = ["pytest>=8.4.2", "tifffile>=2024.8.30"]
 
 # Geometry-driven TIFXYZ label production (no torch/GUI dependency)
 label-transfer = [
+    "vc-reader",
     "scipy>=1.13.1",
-    "tifffile>=2024.8.30",
-    "imagecodecs>=2024.6.1",
     # Required by vesuvius.utils.cli's package import boundary.
     "aiohttp>=3.12.15",
     "nest-asyncio>=1.6.0",
@@ -159,13 +144,13 @@ all = [
     "nnunetv2",
     "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "vc-object-store",  # monorepo-only, see the note in [project.optional-dependencies.models]
+    "vc-reader",  # monorepo-only until published
     "villa-gpu-manager",
     "einops>=0.8.1",
     "fvcore>=0.1.5.post20221221",
     "scikit-image>=0.24.0",
     "scipy>=1.13.1",
     "pandas>=2.3.2",
-    "tensorstore>=0.1.69",
     "tqdm>=4.67.1",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
@@ -179,8 +164,6 @@ all = [
     "alphashape>=1.3.1",
     "connected-components-3d>=3.24.0",
     "simpleitk>=2.5.2",
-    "tifffile>=2024.8.30",
-    "imagecodecs>=2026.3.6",
 
     # GUI and visualisation
     "napari>=0.5.6",
@@ -198,12 +181,11 @@ all = [
 
     # Tests
     "pytest>=8.4.2",
+    "tifffile>=2024.8.30",
 
     # Data pipeline / I/O and compression
     "aiohttp>=3.12.15",
     "blosc2>=2.5.1",
-    "dask>=2024.8.0",
-    "dask-image>=2024.5.3",
     "lxml>=6.0.2",
     "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]

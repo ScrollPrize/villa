@@ -53,8 +53,7 @@ def upload_files_to_s3(
 
     def _upload_one(path: str) -> str:
         key = _to_s3_key(path)
-        with open(path, "rb") as handle:
-            store.write(key, handle.read())
+        store.write_file(key, path)
         return key
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:

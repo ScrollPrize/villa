@@ -12,9 +12,7 @@ _INK_RUNTIME_DISTRIBUTIONS = {
     "connected-components-3d",
     "cucim-cu13",
     "diffusers",
-    "imagecodecs",
     "opencv-python-headless",
-    "tifffile",
 }
 
 

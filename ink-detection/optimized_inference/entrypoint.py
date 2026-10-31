@@ -279,15 +279,12 @@ def profiled_s3_download_file(
     bytes_metric: str = "s3_download_bytes",
 ) -> None:
     start = time.monotonic()
-    data = s3_bucket(bucket).read(key)
-    if data is None:
+    if not s3_bucket(bucket).read_file(key, output_path):
         raise FileNotFoundError(f"s3://{bucket}/{key}")
-    with open(output_path, "wb") as handle:
-        handle.write(data)
     elapsed = time.monotonic() - start
     if profiler is not None:
         profiler.add_duration(metric_name, elapsed)
-        profiler.increment_counter(bytes_metric, len(data))
+        profiler.increment_counter(bytes_metric, os.path.getsize(output_path))
 
 
 def profiled_s3_upload_file(
@@ -299,12 +296,11 @@ def profiled_s3_upload_file(
     bytes_metric: str = "s3_upload_bytes",
 ) -> None:
     start = time.monotonic()
-    data = Path(local_path).read_bytes()
-    s3_bucket(bucket).write(key, data)
+    s3_bucket(bucket).write_file(key, local_path)
     elapsed = time.monotonic() - start
     if profiler is not None:
         profiler.add_duration(metric_name, elapsed)
-        profiler.increment_counter(bytes_metric, len(data))
+        profiler.increment_counter(bytes_metric, os.path.getsize(local_path))
 
 
 def write_aggregate_output_parameters(results: Dict[str, str]) -> None:
@@ -596,7 +592,7 @@ def save_and_upload_prediction(
 
         # Upload to S3
         logger.info(f"Uploading prediction to S3: {final_output_path}")
-        s3_bucket(bucket).write(key, Path(local_path).read_bytes())
+        s3_bucket(bucket).write_file(key, local_path)
     else:
         # Local file path
         os.makedirs(os.path.dirname(final_output_path), exist_ok=True)

@@ -265,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "the Lasagna bootstrap requires the sibling vc_object_store checkout"
         )
+    vc_reader = project.parent / "vc_reader"
+    if not (vc_reader / "pyproject.toml").is_file():
+        raise SystemExit(
+            "the Lasagna bootstrap requires the sibling vc_reader checkout"
+        )
     print(f"PyTorch backend: {backend} ({reason})", flush=True)
 
     if not venv_python.exists():
@@ -302,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
             "-e",
             str(volume_cartographer),
         ],
+        dry_run=args.dry_run,
+        environment=volume_cartographer_build_environment(),
+    )
+    run(
+        [uv, "pip", "install", "--python", str(venv_python), "-e", str(vc_reader)],
         dry_run=args.dry_run,
         environment=volume_cartographer_build_environment(),
     )

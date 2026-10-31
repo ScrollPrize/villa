@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from vc_reader.reader import ZarrWriter
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -4011,18 +4012,18 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
         n_levels=0,
     )
 
+    def write_chunk(channel) -> None:
+        array = ZarrWriter.create(Path(str(channel.relative_path)) / "0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype=np.uint8, auth=None)
+        array.write_chunk((0, 0, 0), np.ones((16, 16, 16), np.uint8))
+
     for channel in product.channels[:-1]:
-        chunk_path = Path(str(channel.relative_path)) / "0" / "0.0.0"
-        chunk_path.parent.mkdir(parents=True, exist_ok=True)
-        chunk_path.write_bytes(b"x")
+        write_chunk(channel)
     assert not output_adapter.product_chunk_complete(
         product,
         chunk_origin_zyx=(0, 0, 0),
     )
 
-    presence_path = Path(str(product.channels[-1].relative_path)) / "0" / "0.0.0"
-    presence_path.parent.mkdir(parents=True, exist_ok=True)
-    presence_path.write_bytes(b"x")
+    write_chunk(product.channels[-1])
     assert output_adapter.product_chunk_complete(
         product,
         chunk_origin_zyx=(0, 0, 0),
