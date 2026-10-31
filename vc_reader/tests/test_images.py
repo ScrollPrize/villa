@@ -97,6 +97,24 @@ def test_open_reads_windows(tmp_path):
         images.open(tmp_path / 'four.tif')
 
 
+def test_named_pages(tmp_path):
+    stack = np.arange(2 * 20 * 30, dtype=np.float32).reshape(2, 20, 30)
+    with images.TiffWriter(tmp_path / 'n.tif', (20, 30), np.float32, pages=2) as writer:
+        writer.write_page(stack[0], name='first')
+        writer.write_page(stack[1], name='second')
+    with tifffile.TiffFile(tmp_path / 'n.tif') as tif:
+        assert [page.tags['PageName'].value for page in tif.pages] == ['first', 'second']
+    assert np.array_equal(images.read(tmp_path / 'n.tif'), stack)
+
+
+def test_pixel_size(tmp_path):
+    with images.TiffWriter(tmp_path / 'r.tif', (32, 32), np.uint8, tile=(16, 16), pixel_um=2.5) as writer:
+        writer.write_tile(0, 0, np.ones((16, 16), np.uint8))
+    with images.open(tmp_path / 'r.tif') as reader:
+        rows = reader.resolved.storage_from_array.matrix
+        assert reader.resolved.storage_units == 'micrometer' and abs(rows[0][0] - 2.5) < 1e-5
+
+
 def test_first_page(tmp_path):
     stack = np.arange(3 * 20 * 30, dtype=np.uint8).reshape(3, 20, 30)
     images.write_tiff(tmp_path / 's.tif', stack)

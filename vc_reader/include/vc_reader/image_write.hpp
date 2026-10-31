@@ -15,6 +15,7 @@ struct TiffOptions {
     // None: strips of about 256 KiB.
     std::optional<std::array<int, 2>> tile;
     std::int64_t pages = 1;
+    std::optional<double> pixelUm;  // written as the resolution tags
 };
 
 // `dtype` is a typestr: |u1, |i1, <u2, <i2, <u4, <i4, <u8, <i8, <f4, <f8. Samples are row-major with
@@ -32,7 +33,8 @@ public:
     [[nodiscard]] const std::string& dtype() const;
     [[nodiscard]] std::array<std::int64_t, 3> shape() const;  // rows, columns, channels
     // The next page, whole: tiled when the options ask for it and the image reaches 16 pixels on both sides.
-    void writePage(const void* data);
+    // `name` is its PageName tag, the layer name image editors show.
+    void writePage(const void* data, const std::string& name = {});
     // The next page, all zeros, in strips even if the options ask for tiles.
     void writeBlankPage();
     // One tile of a single-page image, at a tile-aligned position, in any order. A tile at the

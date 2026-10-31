@@ -66,10 +66,16 @@ struct TiffWriter::State {
         TIFFSetField(t, TIFFTAG_SAMPLEFORMAT, sample.format);
         TIFFSetField(t, TIFFTAG_COMPRESSION, compression);
         TIFFSetField(t, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-        TIFFSetField(t, TIFFTAG_PHOTOMETRIC, channels >= 3 && sample.format == SAMPLEFORMAT_UINT ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(t, TIFFTAG_PHOTOMETRIC, channels >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
         if (channels == 2 || channels == 4) {
             const std::uint16_t extra[1]{EXTRASAMPLE_UNSPECIFIED};
             TIFFSetField(t, TIFFTAG_EXTRASAMPLES, std::uint16_t(1), extra);
+        }
+        if (options.pixelUm) {
+            const float perCentimeter = float(10000. / *options.pixelUm);
+            TIFFSetField(t, TIFFTAG_RESOLUTIONUNIT, RESUNIT_CENTIMETER);
+            TIFFSetField(t, TIFFTAG_XRESOLUTION, perCentimeter);
+            TIFFSetField(t, TIFFTAG_YRESOLUTION, perCentimeter);
         }
     }
     void tileTags() const
@@ -162,10 +168,11 @@ std::array<std::int64_t, 3> TiffWriter::shape() const
     return {state_->rows, state_->cols, state_->channels};
 }
 
-void TiffWriter::writePage(const void* data)
+void TiffWriter::writePage(const void* data, const std::string& name)
 {
     auto& s = *state_;
     s.nextPage();
+    if (!name.empty()) TIFFSetField(s.tif.get(), TIFFTAG_PAGENAME, name.c_str());
     const auto* bytes = static_cast<const std::uint8_t*>(data);
     const std::size_t line = std::size_t(s.cols) * s.pixel;
     if (s.options.tile && s.rows >= 16 && s.cols >= 16) {

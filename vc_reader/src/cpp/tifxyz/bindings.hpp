@@ -103,20 +103,21 @@ inline void bind(nb::module_& m)
 
     using Writer = sources::TiffWriter;
     nb::class_<Writer>(m, "TiffWriter", "One TIFF written by tile or by page through a temporary; as a context manager it finishes, or on an exception abandons.")
-        .def("__init__", [](Writer* self, const std::filesystem::path& path, const std::string& dtype, std::int64_t rows, std::int64_t cols, std::int64_t channels, const std::string& compression, std::optional<std::array<int, 2>> tile, std::int64_t pages) {
+        .def("__init__", [](Writer* self, const std::filesystem::path& path, const std::string& dtype, std::int64_t rows, std::int64_t cols, std::int64_t channels, const std::string& compression, std::optional<std::array<int, 2>> tile, std::int64_t pages, std::optional<double> pixelUm) {
             sources::TiffOptions options;
             options.compression = compression;
             options.tile = tile;
             options.pages = pages;
+            options.pixelUm = pixelUm;
             new (self) Writer(path, dtype, rows, cols, channels, std::move(options));
-        }, "path"_a, "dtype"_a, "rows"_a, "cols"_a, "channels"_a = 1, "compression"_a = "none", "tile"_a = nb::none(), "pages"_a = 1)
+        }, "path"_a, "dtype"_a, "rows"_a, "cols"_a, "channels"_a = 1, "compression"_a = "none", "tile"_a = nb::none(), "pages"_a = 1, "pixel_um"_a = nb::none())
         .def_prop_ro("tile", &Writer::tile)
-        .def("write_page", [](Writer& w, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image) {
+        .def("write_page", [](Writer& w, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, const std::string& name) {
             const auto [rows, cols] = checkedTile(w, image);
             if (rows != w.shape()[0] || cols != w.shape()[1]) throw nb::value_error("write_page takes a whole page");
             nb::gil_scoped_release release;
-            w.writePage(image.data());
-        }, "image"_a)
+            w.writePage(image.data(), name);
+        }, "image"_a, "name"_a = "")
         .def("write_blank_page", &Writer::writeBlankPage, nb::call_guard<nb::gil_scoped_release>())
         .def("write_tile", [](Writer& w, std::int64_t row, std::int64_t col, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> tile) {
             const auto [rows, cols] = checkedTile(w, tile);

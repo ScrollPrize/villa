@@ -57,17 +57,17 @@ def write_tiff(path, image, *, compression='none', tile=None, pages=None):
     Unless ``pages`` says, a third axis of up to 4 is channels, of more is pages, and a fourth means both.
 
     ``compression``: none, lzw, deflate, packbits, zstd. ``tile``: rows and columns, rounded down to
-    a multiple of 16 and capped to the image; without it, strips of about 256 KiB. Uint data of 3 or 4 channels is RGB(A), else min-is-black.
+    a multiple of 16 and capped to the image; without it, strips of about 256 KiB. 3 or 4 channels are RGB(A), else min-is-black.
     """
     _reader._write_tiff(path, image, compression, tile, pages)
 
 
-def TiffWriter(path, shape, dtype, *, compression='none', tile=None, pages=1):
+def TiffWriter(path, shape, dtype, *, compression='none', tile=None, pages=1, pixel_um=None):
     """A TIFF too large to hold, written by ``write_tiles(iterable)`` row by row, ``write_tile(row, col, tile)`` at ``writer.tile`` steps, or ``write_page``.
 
-    ``shape`` is ``(rows, cols)`` or ``(rows, cols, channels)``. Use as a context manager.
+    ``shape`` is ``(rows, cols)`` or ``(rows, cols, channels)``. ``pixel_um`` is written as the resolution tags. Use as a context manager.
     """
-    return _NativeWriter(path, np.dtype(dtype).str, *shape[:2], *(shape[2:] or (1,)), compression=compression, tile=tile, pages=pages)
+    return _NativeWriter(path, np.dtype(dtype).str, *shape[:2], *(shape[2:] or (1,)), compression=compression, tile=tile, pages=pages, pixel_um=pixel_um)
 
 
 __all__ = ['TiffWriter', 'memmap', 'open', 'read', 'write_tiff']
