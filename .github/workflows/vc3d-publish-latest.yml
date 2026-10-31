@@ -102,8 +102,22 @@ jobs:
             current_latest="$(git rev-parse 'refs/tags/latest^{commit}')"
 
             if [[ "$current_latest" == "$PACKAGE_SHA" ]]; then
-              echo "latest already points to $PACKAGE_SHA"
-              echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+              # Even six *new* assets are insufficient proof that the previous
+              # release survived. Require the signed-up archive receipt on the
+              # moving annotated tag and verify all six archived IDs first.
+              replay="$(python3 .github/scripts/vc3d_archive_zero_copy.py latest "$PACKAGE_SHA")"
+              printf '%s\n' "$replay"
+              replay_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$replay")"
+              case "$replay_status" in
+                ALREADY_PUBLISHED|BOOTSTRAPPED_UNCHANGED)
+                  echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV" ;;
+                REPAIR_RELEASE_ONLY)
+                  echo "SKIP_PUBLISH=false" >> "$GITHUB_ENV"
+                  echo "REPAIR_PUBLISH=true" >> "$GITHUB_ENV" ;;
+                *)
+                  echo "::error::unrecognized latest replay status: $replay_status"
+                  exit 1 ;;
+              esac
               exit 0
             fi
 
@@ -152,25 +166,60 @@ jobs:
             exit 1
           fi
 
+      - name: Archive previous latest release (preserves six asset IDs)
+        if: env.PACKAGES_READY == 'true' && env.SKIP_PUBLISH != 'true' && env.REPAIR_PUBLISH != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="$(python3 .github/scripts/vc3d_archive_zero_copy.py latest "$PACKAGE_SHA")"
+          printf '%s\n' "$receipt"
+          echo "ARCHIVE_REF=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["archive"])' <<< "$receipt")" >> "$GITHUB_ENV"
+          echo "EXPECTED_OLD_TAG_OID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["old_tag_object"])' <<< "$receipt")" >> "$GITHUB_ENV"
+          echo "ARCHIVED_RELEASE_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_id"])' <<< "$receipt")" >> "$GITHUB_ENV"
+          echo "ARCHIVED_ASSET_IDS=$(python3 -c 'import json,sys; print(",".join(map(str,json.load(sys.stdin)["asset_ids"])))' <<< "$receipt")" >> "$GITHUB_ENV"
+
       - name: Move latest tag and publish release
         if: env.PACKAGES_READY == 'true' && env.SKIP_PUBLISH != 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git tag --force --annotate latest "$PACKAGE_SHA" \
-            --message "VC3D latest release at $PACKAGE_SHA"
-          git push --force origin refs/tags/latest
-
-          # Replace the old rolling release after its tag advances. Mark this
-          # main-branch snapshot as a pre-release so the manually promoted
-          # stable channel remains GitHub's designated latest release.
-          if gh release view latest >/dev/null 2>&1; then
-            gh release delete latest --yes
+          if [[ "${REPAIR_PUBLISH:-false}" == 'true' ]]; then
+            # Crash recovery: latest already moved, so pushing the tag again is
+            # both unnecessary and unsafe. Recheck the complete archive receipt
+            # immediately before recreating the missing GitHub release.
+            replay="$(python3 .github/scripts/vc3d_archive_zero_copy.py latest "$PACKAGE_SHA")"
+            replay_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$replay")"
+            case "$replay_status" in
+              REPAIR_RELEASE_ONLY) ;;
+              ALREADY_PUBLISHED)
+                echo "Latest release was restored concurrently; no change needed."
+                exit 0 ;;
+              *)
+                echo "::error::latest replay receipt no longer authorizes repair: $replay_status"
+                exit 1 ;;
+            esac
+          else
+            bash .github/scripts/vc3d_atomic_prestage.sh \
+              latest "$PACKAGE_SHA" "$EXPECTED_OLD_TAG_OID" \
+              "$ARCHIVE_REF" "$ARCHIVED_RELEASE_ID" "$ARCHIVED_ASSET_IDS"
           fi
 
+          # Even after atomic prestage, another actor can move latest before
+          # gh release create; --verify-tag checks existence, not source SHA.
+          # Only the exact staged/archived receipt permits this upload.
+          replay="$(python3 .github/scripts/vc3d_archive_zero_copy.py latest "$PACKAGE_SHA" --probe-only)"
+          replay_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$replay")"
+          case "$replay_status" in
+            REPAIR_RELEASE_ONLY) ;;
+            ALREADY_PUBLISHED)
+              echo "Latest release was published concurrently; skip duplicate."
+              exit 0 ;;
+            *) echo "::error::latest publication receipt changed: $replay_status" >&2; exit 1 ;;
+          esac
+
+          # Archive step preserves old assets and their release ID without reupload.
+          # The stable channel remains GitHub's designated latest release.
           gh release create latest release-assets/* \
             --verify-tag \
             --title "VC3D Latest" \
