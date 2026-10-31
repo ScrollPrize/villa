@@ -218,9 +218,9 @@ public data, add
 ```
 
 and pack `grad_mag` as above. The fitter prints a `WARNING` at start-up when no
-dense spacing loss is active. (The retired `phase` mode, used by some published
-recipes pinned to commits before September 2026, is now rejected as an invalid
-value.)
+dense spacing loss is active. (The `phase` mode, retired in #1871 (23 Sep 2026)
+and used by some published recipes pinned to earlier commits, is now rejected as
+an invalid value.)
 
 ## Sweep runner output
 
