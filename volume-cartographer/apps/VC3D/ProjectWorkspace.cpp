@@ -779,26 +779,28 @@ void ProjectWorkspace::updateCaches()
     _revealCache->setToolTip(rootText);
     _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit; "
                              "when the disk runs low, caching stops and nothing is removed.").arg(rootText));
+    const auto limit = vc::settings::remoteCacheMaxBytes();
+    const auto minimumFree = static_cast<std::uint64_t>(vc::settings::remoteCacheMinFreeBytes());
     std::error_code rootError;
-    if (std::filesystem::is_regular_file(root / ".vc_reader_cache.sqlite3", rootError)) {
-        const auto budget = vcr::zarr::diskBudget(root.string(), std::nullopt);
-        const auto limit = vc::settings::remoteCacheMaxBytes();
-        const auto minimumFree = static_cast<std::uint64_t>(vc::settings::remoteCacheMinFreeBytes());
-        const auto space = std::filesystem::space(root, rootError);
-        const std::uint64_t freeBytes = rootError ? 0 : space.available;
-        const bool lowSpace = !rootError && freeBytes < minimumFree;
-        QStringList extra;
-        if (!rootError) extra << tr("%1 free").arg(bytes(freeBytes));
-        if (minimumFree) extra << tr("stops caching under %1 free").arg(bytes(minimumFree));
-        setBar(_diskBar, _diskText, static_cast<quint64>(budget->total_bytes()),
-               limit ? std::optional<quint64>(static_cast<quint64>(*limit)) : std::nullopt,
-               extra.join(QStringLiteral(" · ")));
-        // Overrides the dimmed palette while space is low.
-        _diskText->setStyleSheet(lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    const auto space = std::filesystem::space(root, rootError);
+    const std::uint64_t freeBytes = rootError ? 0 : space.available;
+    QStringList extra;
+    if (!rootError) extra << tr("%1 free").arg(bytes(freeBytes));
+    if (minimumFree) extra << tr("stops caching under %1 free").arg(bytes(minimumFree));
+    if (limit) {
+        // A limit keeps the budget's index, built when the volumes opened.
+        setBar(_diskBar, _diskText, static_cast<quint64>(vcr::zarr::diskBudget(root.string(), std::nullopt)->total_bytes()),
+               static_cast<quint64>(*limit), extra.join(QStringLiteral(" · ")));
     } else {
+        // Without one there is no index: a total would walk every chunk of the root.
+        // Measure caches sizes the project's volumes on request.
         _diskBar->setEnabled(false);
-        _diskText->setText(tr("not in use"));
+        extra.prepend(tr("no limit"));
+        _diskText->setText(extra.join(QStringLiteral(" · ")));
     }
+    // Overrides the dimmed palette while space is low.
+    _diskText->setStyleSheet(!rootError && freeBytes < minimumFree ? QStringLiteral("color: #d28b00; font-weight: 600;")
+                                                                   : QString());
     const auto surfaces = CState::surfaceGeometryCache();
     setBar(_surfaceBar, _surfaceText, surfaces->size(), surfaces->capacity());
 }
