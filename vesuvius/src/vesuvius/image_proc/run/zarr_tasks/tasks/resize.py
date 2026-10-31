@@ -6,18 +6,16 @@ Resizes an OME-Zarr to match the shape of a reference OME-Zarr using cv2 resize.
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrWriter, create_group, open_group
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
+from ..utils import open_input, open_output
 
 
 @dataclass
@@ -79,11 +77,8 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
     ) = args
 
     # Open zarr in each worker
-    input_store = zarr.open(input_path, mode="r")
-    output_store = zarr.open(output_path, mode="r+")
-
-    input_data = input_store[resolution]
-    output_data = output_store[resolution]
+    input_data = open_input(f"{input_path}/{resolution}")
+    output_data = open_output(f"{output_path}/{resolution}", skip_empty=False)
 
     # Calculate output chunk bounds
     oz_end = min(oz_start + out_chunk_size[0], output_shape[0])
@@ -195,26 +190,6 @@ class ResizeTask(ZarrTask):
         )
         return cls(config)
 
-    def _get_resolutions(self, zarr_path: str) -> List[str]:
-        """Get list of resolution levels from OME-Zarr."""
-        store = zarr.open(zarr_path, mode="r")
-
-        # Try to read from .zattrs
-        zattrs_path = Path(zarr_path) / ".zattrs"
-        if zattrs_path.exists():
-            with open(zattrs_path) as f:
-                attrs = json.load(f)
-            if "multiscales" in attrs:
-                datasets = attrs["multiscales"][0]["datasets"]
-                return [d["path"] for d in datasets]
-
-        # Fallback: find numeric directories
-        resolutions = []
-        for item in sorted(Path(zarr_path).iterdir()):
-            if item.is_dir() and item.name.isdigit():
-                resolutions.append(item.name)
-        return resolutions
-
     def prepare(self) -> None:
         """Get resolutions and set up interpolation."""
         # Map interpolation names to cv2 constants
@@ -228,20 +203,12 @@ class ResizeTask(ZarrTask):
         self._interpolation = interpolation_map[self.config.interpolation]
 
         # Get resolutions from input
-        self._resolutions = self._get_resolutions(self.config.input_zarr)
+        input_store = open_group(self.config.input_zarr)
+        self._resolutions = list(input_store.levels)
         print(f"Found {len(self._resolutions)} resolution levels: {self._resolutions}")
 
-        # Create output directory
-        output_path = Path(self.config.output_zarr)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        # Copy metadata files from input
-        input_path = Path(self.config.input_zarr)
-        for meta_file in [".zattrs", ".zgroup"]:
-            src = input_path / meta_file
-            if src.exists():
-                shutil.copy(src, output_path / meta_file)
-                print(f"Copied {meta_file}")
+        # Create the output group with the input's metadata
+        create_group(self.config.output_zarr, attrs=input_store.attrs, auth=None)
 
     def run(self) -> None:
         """Execute resize for all resolution levels."""
@@ -251,8 +218,6 @@ class ResizeTask(ZarrTask):
 
         from tqdm import tqdm
 
-        output_path = Path(self.config.output_zarr)
-
         for resolution in self._resolutions:
             print(f"\n{'='*60}")
             print(f"Processing resolution level: {resolution}")
@@ -261,11 +226,8 @@ class ResizeTask(ZarrTask):
             self._current_resolution = resolution
 
             # Open input and reference
-            input_store = zarr.open(self.config.input_zarr, mode="r")
-            ref_store = zarr.open(self.config.reference_zarr, mode="r")
-
-            input_data = input_store[resolution]
-            ref_data = ref_store[resolution]
+            input_data = open_input(f"{self.config.input_zarr}/{resolution}")
+            ref_data = open_input(f"{self.config.reference_zarr}/{resolution}")
 
             self._input_shape = input_data.shape
             self._target_shape = ref_data.shape
@@ -278,7 +240,6 @@ class ResizeTask(ZarrTask):
             )
 
             # Get compression and chunks from input
-            compressor = input_data.compressor
             input_chunks = input_data.chunks
 
             # Use input chunks, but cap at target shape
@@ -286,21 +247,19 @@ class ResizeTask(ZarrTask):
                 min(c, s) for c, s in zip(input_chunks, self._target_shape)
             )
 
-            print(f"Compressor: {compressor}")
+            print(f"Compressor: {input_data.compressor}")
             print(f"Output chunks: {self._out_chunks}")
 
             # Create output array for this resolution
-            output_store = zarr.open(str(output_path), mode="a")
-            output_store.create_dataset(
-                resolution,
+            ZarrWriter.create_like(
+                f"{self.config.output_zarr}/{resolution}",
+                input_data,
                 shape=self._target_shape,
                 chunks=self._out_chunks,
-                dtype=self.config.output_dtype
-                if self.config.output_dtype
-                else input_data.dtype,
-                compressor=compressor,
-                dimension_separator="/",
+                dtype=self.config.output_dtype,
+                separator="/",
                 overwrite=True,
+                auth=None,
             )
 
             # Generate chunk tasks

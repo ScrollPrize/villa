@@ -10,15 +10,15 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
 import numpy as np
-import zarr
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import (
-    build_pyramid,
-    create_level_dataset,
+    create_level,
+    finish_pyramid,
     get_chunk_coords,
-    write_multiscales_metadata,
+    open_input,
+    open_output,
 )
 
 
@@ -34,8 +34,8 @@ class ThresholdConfig(TaskConfig):
 def _threshold_worker(args: Tuple) -> Tuple[Tuple[int, int], ...]:
     """Multiprocessing worker for thresholding chunks."""
     input_path, output_path, threshold, erase_blank, chunk_coords = args
-    input_z = zarr.open(input_path, mode="r")
-    output_z = zarr.open(output_path, mode="r+")
+    input_z = open_input(input_path)
+    output_z = open_output(output_path)
 
     slices = tuple(slice(start, stop) for start, stop in chunk_coords)
     chunk_data = input_z[slices]
@@ -114,15 +114,9 @@ class ThresholdTask(ZarrTask):
         root_group_path = self.config.output_zarr
         self._lvl0_path = f"{root_group_path}/0"
 
-        create_level_dataset(
-            root_group_path,
-            "0",
-            input_z.shape,
-            input_z.chunks,
-            np.uint8,
-            input_z.compressor,
-        )
+        create_level(root_group_path, "0", input_z, dtype=np.uint8)
 
+        self._input_path = input_z.location
         self._input_shape = input_z.shape
         self._input_chunks = input_z.chunks
 
@@ -132,7 +126,7 @@ class ThresholdTask(ZarrTask):
 
         for coords in chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self.config.threshold,
                 self.config.erase_blank,
@@ -148,14 +142,11 @@ class ThresholdTask(ZarrTask):
         """Build pyramid levels and write metadata."""
         root_group_path = self.config.output_zarr
 
-        build_pyramid(
+        finish_pyramid(
             root_group_path,
             self._axes_names,
             num_levels=self.config.num_levels,
             num_workers=self.config.num_workers,
-        )
-        write_multiscales_metadata(
-            root_group_path, self._axes_names, num_levels=self.config.num_levels
         )
 
         print(

@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, create_group, open_group
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
-from ..utils import get_chunk_slices
+from ..utils import get_chunk_slices, open_input, open_output
 
 # Try to import fastremap for efficient remapping
 try:
@@ -49,11 +49,8 @@ def _remap_chunk_worker(args: Tuple) -> int:
     ) = args
 
     # Open stores (each worker opens its own handle)
-    input_store = zarr.open(input_path, mode="r")
-    output_store = zarr.open(output_path, mode="r+")
-
-    input_arr = input_store[str(resolution_level)]
-    output_arr = output_store[str(resolution_level)]
+    input_arr = open_input(f"{input_path}/{resolution_level}")
+    output_arr = open_output(f"{output_path}/{resolution_level}", skip_empty=False)
 
     # Read chunk data
     data = input_arr[chunk_slice]
@@ -163,7 +160,7 @@ class RemapTask(ZarrTask):
             print("Warning: fastremap not installed, using numpy (slower)")
 
         # Open input to get metadata
-        input_store = zarr.open(self.config.input_zarr, mode="r")
+        input_store = open_group(self.config.input_zarr)
 
         # Determine which levels to process
         if self.config.level is not None:
@@ -183,14 +180,14 @@ class RemapTask(ZarrTask):
             print("Output already exists, opening in r+ mode")
         else:
             print("Creating output zarr")
-            zarr.open(self.config.output_zarr, mode="w")
+            create_group(self.config.output_zarr, auth=None)
 
     def run(self) -> None:
         """Execute remap for all levels."""
         self.prepare()
 
-        input_store = zarr.open(self.config.input_zarr, mode="r")
-        output_store = zarr.open(self.config.output_zarr, mode="a")
+        input_store = open_group(self.config.input_zarr)
+        output_store = create_group(self.config.output_zarr, auth=None)
 
         for level in self._levels_to_process:
             print(f"\n{'='*60}")
@@ -206,13 +203,7 @@ class RemapTask(ZarrTask):
 
             # Create output array with same properties
             if str(level) not in output_store:
-                output_store.create_dataset(
-                    str(level),
-                    shape=input_arr.shape,
-                    chunks=input_arr.chunks,
-                    dtype=input_arr.dtype,
-                    compressor=input_arr.compressor,
-                )
+                ZarrWriter.create_like(f"{self.config.output_zarr}/{level}", input_arr, auth=None)
 
             # Generate and process work items for this level
             work_items = list(self._generate_level_work_items(level, input_arr))
@@ -236,7 +227,7 @@ class RemapTask(ZarrTask):
         self.finalize()
 
     def _generate_level_work_items(
-        self, level: int, input_arr: zarr.Array
+        self, level: int, input_arr: ZarrReader
     ) -> Iterable[Any]:
         """Generate work items for a specific level."""
         chunk_slices = get_chunk_slices(input_arr.shape, input_arr.chunks)
@@ -263,12 +254,10 @@ class RemapTask(ZarrTask):
 
     def finalize(self) -> None:
         """Copy metadata to output."""
-        input_store = zarr.open(self.config.input_zarr, mode="r")
-        output_store = zarr.open(self.config.output_zarr, mode="a")
-
         # Copy metadata if present
-        if ".zattrs" in input_store:
-            output_store.attrs.update(input_store.attrs)
+        attributes = open_group(self.config.input_zarr).attrs
+        if attributes:
+            create_group(self.config.output_zarr, auth=None).attrs.update(attributes)
 
         # Copy metadata.json if it exists
         metadata_src = Path(self.config.input_zarr) / "metadata.json"

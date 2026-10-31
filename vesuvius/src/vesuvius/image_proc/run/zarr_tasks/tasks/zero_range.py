@@ -12,12 +12,11 @@ from multiprocessing import Pool
 from typing import Any, Iterable, List, Tuple
 
 import numpy as np
-import zarr
 from tqdm import tqdm
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
-from ..utils import get_chunk_coords
+from ..utils import get_chunk_coords, open_input, open_output
 
 
 @dataclass
@@ -39,7 +38,7 @@ def _zero_range_worker(args: Tuple) -> Tuple[Tuple[int, int], ...]:
         The chunk coordinates that were processed
     """
     zarr_path, chunk_coords, z_start, z_end, replace_value = args
-    arr = zarr.open(zarr_path, mode="r+")
+    arr = open_output(zarr_path, skip_empty=False)
 
     # chunk_coords is ((z_start, z_stop), (y_start, y_stop), (x_start, x_stop))
     cz_start, cz_stop = chunk_coords[0]
@@ -174,7 +173,7 @@ class ZeroRangeTask(ZarrTask):
             scaled_z_start = self.config.z_start // scale_factor
             scaled_z_end = self.config.z_end // scale_factor
 
-            arr = zarr.open(level_path, mode="r")
+            arr = open_input(level_path)
             print(f"  Shape: {arr.shape}, Chunks: {arr.chunks}")
             print(f"  Z-range: [{scaled_z_start}, {scaled_z_end}]")
 

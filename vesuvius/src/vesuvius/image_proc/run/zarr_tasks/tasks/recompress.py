@@ -11,22 +11,20 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Tuple
 
 import numpy as np
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import ZarrReader, ZarrWriter
 from tqdm import tqdm
 from multiprocessing import Pool
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import (
-    build_pyramid,
-    create_level_dataset,
-    delete_chunk_file,
+    finish_pyramid,
     get_chunk_coords,
-    write_multiscales_metadata,
+    open_input,
+    open_output,
 )
 
 
@@ -44,8 +42,8 @@ def _recompress_worker(args: Tuple) -> Tuple[Tuple[Tuple[int, int], ...], bool]:
     input_path, output_path, chunk_coords, delete_source_path, chunks, skip_corrupt = (
         args
     )
-    input_z = zarr.open(input_path, mode="r")
-    output_z = zarr.open(output_path, mode="r+")
+    input_z = open_input(input_path)
+    output_z = open_output(output_path)
 
     slices = tuple(slice(start, stop) for start, stop in chunk_coords)
     corrupted = False
@@ -63,7 +61,9 @@ def _recompress_worker(args: Tuple) -> Tuple[Tuple[Tuple[int, int], ...], bool]:
             raise
 
     if delete_source_path is not None and chunks is not None:
-        delete_chunk_file(delete_source_path, chunk_coords, chunks)
+        ZarrWriter.open(delete_source_path, auth=None).remove_chunk(
+            [start // size for (start, _), size in zip(chunk_coords, chunks)]
+        )
 
     return (chunk_coords, corrupted)
 
@@ -77,7 +77,6 @@ class RecompressTask(ZarrTask):
         self.config: RecompressConfig = config
         self._lvl0_path: str = ""
         self._axes_names = ["z", "y", "x"]
-        self._compressor: Optional[Blosc] = None
         self._is_ome_zarr: bool = False
         self._levels_to_process: List[str] = []
         self._all_corrupted_chunks: List[Tuple[str, Tuple]] = []
@@ -122,12 +121,6 @@ class RecompressTask(ZarrTask):
 
     def prepare(self) -> None:
         """Detect OME-Zarr structure and prepare compressor."""
-        self._compressor = Blosc(
-            cname="zstd",
-            clevel=self.config.compression_level,
-            shuffle=Blosc.BITSHUFFLE,
-        )
-
         # Detect OME-Zarr structure
         self._is_ome_zarr, all_levels = self._detect_ome_zarr(self.config.input_zarr)
 
@@ -160,6 +153,21 @@ class RecompressTask(ZarrTask):
         print(f"Task: recompress | zstd level {self.config.compression_level}")
         if self.config.skip_corrupt:
             print("  --skip-corrupt enabled: corrupted chunks will be filled with zeros")
+
+    def _create_recompressed(self, path: str, like: ZarrReader) -> ZarrWriter:
+        return ZarrWriter.create(
+            path,
+            shape=like.shape,
+            chunks=like.chunks,
+            dtype=like.dtype,
+            cname="zstd",
+            level=self.config.compression_level,
+            shuffle=2,
+            separator=like.meta.separator,
+            fill_value=like.fill_value,
+            overwrite=True,
+            auth=None,
+        )
 
     def generate_work_items(self) -> Iterable[Any]:
         """Generate work items - handled in custom run() for recompress."""
@@ -194,23 +202,12 @@ class RecompressTask(ZarrTask):
             temp_path = f"{level_path}_tmp"
 
             # Read original zarr
-            read_z = zarr.open(level_path, mode="r")
+            read_z = open_input(level_path)
             print(f"  Shape: {read_z.shape}, Chunks: {read_z.chunks}")
 
             # Create temp zarr with new compressor
-            temp_z = zarr.open(
-                temp_path,
-                mode="w",
-                shape=read_z.shape,
-                chunks=read_z.chunks,
-                dtype=read_z.dtype,
-                compressor=self._compressor,
-            )
-
-            # Copy .zattrs if it exists
-            zattrs_path = Path(level_path) / ".zattrs"
-            if zattrs_path.exists():
-                shutil.copy2(zattrs_path, Path(temp_path) / ".zattrs")
+            temp_z = self._create_recompressed(temp_path, read_z)
+            temp_z.attrs.put(read_z.attrs)
 
             chunk_coords = get_chunk_coords(read_z.shape, read_z.chunks)
             chunks = read_z.chunks
@@ -270,14 +267,7 @@ class RecompressTask(ZarrTask):
         root_group_path = self.config.output_zarr
         self._lvl0_path = f"{root_group_path}/0"
 
-        create_level_dataset(
-            root_group_path,
-            "0",
-            input_z.shape,
-            input_z.chunks,
-            input_z.dtype,
-            self._compressor,
-        )
+        self._create_recompressed(self._lvl0_path, input_z)
 
         # Process chunks
         chunk_coords = get_chunk_coords(input_z.shape, input_z.chunks)
@@ -285,7 +275,7 @@ class RecompressTask(ZarrTask):
 
         work_items = [
             (
-                self.config.input_zarr,
+                input_z.location,
                 self._lvl0_path,
                 coords,
                 None,
@@ -310,14 +300,11 @@ class RecompressTask(ZarrTask):
             self._all_corrupted_chunks = [(None, c) for c in corrupted_chunks]
 
         # Build pyramid and write metadata
-        build_pyramid(
+        finish_pyramid(
             root_group_path,
             self._axes_names,
             num_levels=self.config.num_levels,
             num_workers=self.config.num_workers,
-        )
-        write_multiscales_metadata(
-            root_group_path, self._axes_names, num_levels=self.config.num_levels
         )
 
     def finalize(self) -> None:

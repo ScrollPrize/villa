@@ -10,16 +10,16 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Tuple
 
 import numpy as np
-import zarr
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import (
-    build_pyramid,
-    create_level_dataset,
+    create_level,
+    finish_pyramid,
     get_chunk_coords,
     inverse_permutation,
-    write_multiscales_metadata,
+    open_input,
+    open_output,
 )
 
 
@@ -34,8 +34,8 @@ class TransposeConfig(TaskConfig):
 def _transpose_worker(args: Tuple) -> Tuple[Tuple[int, int], ...]:
     """Multiprocessing worker for transposing chunks."""
     input_path, output_path, perm, out_chunk_coords = args
-    in_z = zarr.open(input_path, mode="r")
-    out_z = zarr.open(output_path, mode="r+")
+    in_z = open_input(input_path)
+    out_z = open_output(output_path)
 
     out_slices = tuple(slice(start, stop) for start, stop in out_chunk_coords)
 
@@ -139,14 +139,8 @@ class TransposeTask(ZarrTask):
         root_group_path = self.config.output_zarr
         self._lvl0_path = f"{root_group_path}/0"
 
-        create_level_dataset(
-            root_group_path,
-            "0",
-            self._out_shape,
-            self._out_chunks,
-            input_z.dtype,
-            input_z.compressor,
-        )
+        create_level(root_group_path, "0", input_z, shape=self._out_shape, chunks=self._out_chunks)
+        self._input_path = input_z.location
 
     def generate_work_items(self) -> Iterable[Any]:
         """Generate work items for parallel processing."""
@@ -154,7 +148,7 @@ class TransposeTask(ZarrTask):
 
         for coords in out_chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self._perm,
                 coords,
@@ -169,14 +163,11 @@ class TransposeTask(ZarrTask):
         """Build pyramid levels and write metadata."""
         root_group_path = self.config.output_zarr
 
-        build_pyramid(
+        finish_pyramid(
             root_group_path,
             self._axes_names,
             num_levels=self.config.num_levels,
             num_workers=self.config.num_workers,
-        )
-        write_multiscales_metadata(
-            root_group_path, self._axes_names, num_levels=self.config.num_levels
         )
 
         print(

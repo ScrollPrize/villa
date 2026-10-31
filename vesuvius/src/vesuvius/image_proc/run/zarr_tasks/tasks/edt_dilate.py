@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
 
 import numpy as np
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import create_group
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
+from ..utils import open_input, open_output
 
 # Try to import edt package for fast EDT
 try:
@@ -68,7 +68,7 @@ def _edt_dilate_worker(
     z_start, z_end, y_start, y_end, x_start, x_end = chunk_bounds
 
     # Read input chunk
-    input_arr = zarr.open(input_path, mode="r")[resolution]
+    input_arr = open_input(f"{input_path}/{resolution}")
     chunk_data = input_arr[z_start:z_end, y_start:y_end, x_start:x_end]
 
     # Create binary mask of nonzero values
@@ -95,7 +95,7 @@ def _edt_dilate_worker(
     dilated = (distances <= distance).astype(np.uint8)
 
     # Write to output
-    output_arr = zarr.open(output_path, mode="r+")[resolution]
+    output_arr = open_output(f"{output_path}/{resolution}")
     output_arr[z_start:z_end, y_start:y_end, x_start:x_end] = dilated
 
     return (chunk_idx, True)
@@ -184,8 +184,7 @@ class EdtDilateTask(ZarrTask):
             )
 
         # Open input zarr
-        input_store = zarr.open(self.config.input_zarr, mode="r")
-        input_arr = input_store[self.config.resolution]
+        input_arr = open_input(f"{self.config.input_zarr}/{self.config.resolution}")
         self._shape = input_arr.shape
 
         print(f"Input shape: {self._shape}, dtype: {input_arr.dtype}")
@@ -195,17 +194,16 @@ class EdtDilateTask(ZarrTask):
         print(f"Black border: {self.config.black_border}")
 
         # Create output zarr
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-
-        output_store = zarr.open_group(self.config.output_zarr, mode="w")
-        output_arr = output_store.create_dataset(
+        output_store = create_group(self.config.output_zarr, overwrite=True, auth=None)
+        output_arr = output_store.create_array(
             self.config.resolution,
             shape=self._shape,
             chunks=self.config.chunk_size,
             dtype=np.uint8,
-            compressor=compressor,
+            cname="zstd",
+            level=3,
+            shuffle=2,
             fill_value=0,
-            write_empty_chunks=False,
         )
 
         print(f"Created output zarr: {self.config.output_zarr}")

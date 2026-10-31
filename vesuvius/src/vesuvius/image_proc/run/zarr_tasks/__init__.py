@@ -21,10 +21,8 @@ from .registry import register_task, get_task, list_tasks, get_all_tasks
 from .utils import (
     get_chunk_coords,
     get_chunk_slices,
-    create_level_dataset,
-    build_pyramid,
-    write_multiscales_metadata,
-    get_default_compressor,
+    create_level,
+    finish_pyramid,
 )
 
 # Import tasks to trigger registration
@@ -42,10 +40,8 @@ __all__ = [
     # Utility functions
     "get_chunk_coords",
     "get_chunk_slices",
-    "create_level_dataset",
-    "build_pyramid",
-    "write_multiscales_metadata",
-    "get_default_compressor",
+    "create_level",
+    "finish_pyramid",
     # CLI helpers
     "get_base_parser",
     "make_task_config",

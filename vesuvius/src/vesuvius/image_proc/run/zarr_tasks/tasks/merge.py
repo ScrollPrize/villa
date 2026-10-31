@@ -6,21 +6,18 @@ Merges two OME-Zarr files by taking the maximum value at overlapping positions.
 from __future__ import annotations
 
 import argparse
-import json
+import shutil
 from collections import Counter
 from dataclasses import dataclass
-from multiprocessing import Pool
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, Tuple
 
 import numpy as np
-import zarr
-from numcodecs import Blosc
-from tqdm import tqdm
+from vc_reader.reader import create_group, ome_multiscales, write_pyramid
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
-from ..utils import get_chunk_slices
+from ..utils import get_chunk_slices, open_input, open_output
 
 
 @dataclass
@@ -45,13 +42,9 @@ def _merge_chunk_worker(args: Tuple) -> str:
     chunk_idx, chunk_slice, input1_path, input2_path, output_path = args
 
     # Open stores (each worker opens its own handle)
-    store1 = zarr.open(input1_path, mode="r")
-    store2 = zarr.open(input2_path, mode="r")
-    out_store = zarr.open(output_path, mode="r+")
-
-    arr1 = store1["0"]
-    arr2 = store2["0"]
-    out_arr = out_store["0"]
+    arr1 = open_input(f"{input1_path}/0")
+    arr2 = open_input(f"{input2_path}/0")
+    out_arr = open_output(f"{output_path}/0")
 
     # Read both chunks
     data1 = arr1[chunk_slice]
@@ -74,108 +67,6 @@ def _merge_chunk_worker(args: Tuple) -> str:
         return "merge"
 
 
-def _downsample_chunk_worker(args: Tuple) -> str:
-    """Downsample a single chunk from the previous level."""
-    (
-        out_chunk_idx,
-        zarr_path,
-        prev_level,
-        out_level,
-        prev_shape,
-        out_shape,
-        out_chunks,
-        interpolation,
-    ) = args
-    cz, cy, cx = out_chunk_idx
-
-    # Calculate output chunk bounds
-    z_out_start = cz * out_chunks[0]
-    y_out_start = cy * out_chunks[1]
-    x_out_start = cx * out_chunks[2]
-    z_out_end = min(z_out_start + out_chunks[0], out_shape[0])
-    y_out_end = min(y_out_start + out_chunks[1], out_shape[1])
-    x_out_end = min(x_out_start + out_chunks[2], out_shape[2])
-
-    # Calculate corresponding input bounds (2x)
-    z_in_start = z_out_start * 2
-    y_in_start = y_out_start * 2
-    x_in_start = x_out_start * 2
-    z_in_end = min(z_out_end * 2, prev_shape[0])
-    y_in_end = min(y_out_end * 2, prev_shape[1])
-    x_in_end = min(x_out_end * 2, prev_shape[2])
-
-    # Read only the required input region
-    root = zarr.open(zarr_path, mode="r+")
-    prev_arr = root[str(prev_level)]
-    input_chunk = prev_arr[z_in_start:z_in_end, y_in_start:y_in_end, x_in_start:x_in_end]
-
-    # Skip empty chunks
-    if input_chunk.max() == 0:
-        return "empty"
-
-    # Output dimensions for this chunk
-    out_z = z_out_end - z_out_start
-    out_y = y_out_end - y_out_start
-    out_x = x_out_end - x_out_start
-
-    # Downsample using configured method
-    if interpolation == "nearest":
-        # Mode-based: most common non-zero value in each 2x2x2 block
-        sz, sy, sx = input_chunk.shape
-        pad_z = sz % 2
-        pad_y = sy % 2
-        pad_x = sx % 2
-        if pad_z or pad_y or pad_x:
-            input_chunk = np.pad(input_chunk, ((0, pad_z), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0)
-            sz, sy, sx = input_chunk.shape
-
-        # Reshape to (n_blocks, 8)
-        blocks = input_chunk.reshape(sz // 2, 2, sy // 2, 2, sx // 2, 2)
-        blocks = blocks.transpose(0, 2, 4, 1, 3, 5).reshape(-1, 8)
-
-        # Compute mode of non-zero values for each block
-        result = np.zeros(blocks.shape[0], dtype=input_chunk.dtype)
-        for i, vals in enumerate(blocks):
-            nonzero = vals[vals != 0]
-            if len(nonzero) > 0:
-                unique, counts = np.unique(nonzero, return_counts=True)
-                result[i] = unique[np.argmax(counts)]
-
-        downsampled = result.reshape(sz // 2, sy // 2, sx // 2)
-    else:  # average
-        # Pad to even dimensions if needed
-        sz, sy, sx = input_chunk.shape
-        pad_z = sz % 2
-        pad_y = sy % 2
-        pad_x = sx % 2
-        if pad_z or pad_y or pad_x:
-            input_chunk = np.pad(input_chunk, ((0, pad_z), (0, pad_y), (0, pad_x)), mode='edge')
-            sz, sy, sx = input_chunk.shape
-
-        mean = input_chunk.reshape(sz // 2, 2, sy // 2, 2, sx // 2, 2).mean(axis=(1, 3, 5))
-        if np.issubdtype(input_chunk.dtype, np.integer):
-            # Round, don't truncate: a plain cast drops ~0.44 levels per pyramid level.
-            np.rint(mean, out=mean)
-        downsampled = mean.astype(input_chunk.dtype)
-
-    # Ensure correct output size (handle edge cases)
-    if downsampled.shape != (out_z, out_y, out_x):
-        result = np.zeros((out_z, out_y, out_x), dtype=input_chunk.dtype)
-        sz = min(downsampled.shape[0], out_z)
-        sy = min(downsampled.shape[1], out_y)
-        sx = min(downsampled.shape[2], out_x)
-        result[:sz, :sy, :sx] = downsampled[:sz, :sy, :sx]
-        downsampled = result
-
-    # Write directly to output
-    out_arr = root[str(out_level)]
-    out_arr[
-        z_out_start:z_out_end, y_out_start:y_out_end, x_out_start:x_out_end
-    ] = downsampled
-
-    return "written"
-
-
 @register_task("merge")
 class MergeTask(ZarrTask):
     """Merge two OME-Zarr files by taking the maximum at overlapping positions."""
@@ -186,7 +77,6 @@ class MergeTask(ZarrTask):
         self._shape: Tuple[int, ...] = ()
         self._chunks: Tuple[int, ...] = ()
         self._dtype: np.dtype = np.dtype("uint8")
-        self._compressor: Optional[Blosc] = None
         self._merge_stats: Counter = Counter()
 
     @classmethod
@@ -245,11 +135,8 @@ class MergeTask(ZarrTask):
 
     def _validate_compatibility(self) -> None:
         """Verify shapes match between inputs."""
-        store1 = zarr.open(self.config.input_zarr, mode="r")
-        store2 = zarr.open(self.config.input2_zarr, mode="r")
-
-        arr1 = store1["0"]
-        arr2 = store2["0"]
+        arr1 = open_input(f"{self.config.input_zarr}/0")
+        arr2 = open_input(f"{self.config.input2_zarr}/0")
 
         if arr1.shape != arr2.shape:
             raise ValueError(
@@ -281,26 +168,20 @@ class MergeTask(ZarrTask):
         print(f"Chunks: {self._chunks}")
         print(f"Dtype: {self._dtype}")
 
-        # Create compressor
-        self._compressor = Blosc(
-            cname="zstd",
-            clevel=self.config.compression_level,
-            shuffle=Blosc.BITSHUFFLE,
-        )
-
         # Create output zarr with level 0
         output_path = Path(self.config.output_zarr)
         print(f"\nCreating output zarr at {output_path}")
 
-        root = zarr.open(str(output_path), mode="w")
-        root.create_dataset(
+        root = create_group(str(output_path), overwrite=True, auth=None)
+        root.create_array(
             "0",
             shape=self._shape,
             chunks=self._chunks,
             dtype=self._dtype,
-            compressor=self._compressor,
+            cname="zstd",
+            level=self.config.compression_level,
+            shuffle=2,
             fill_value=0,
-            write_empty_chunks=False,
         )
 
     def generate_work_items(self) -> Iterable[Any]:
@@ -321,101 +202,10 @@ class MergeTask(ZarrTask):
         """Process a single chunk."""
         return _merge_chunk_worker(args)
 
-    def _generate_pyramid_levels(self) -> None:
-        """Generate downsampled pyramid levels from level 0."""
-        zarr_path = self.config.output_zarr
-        root = zarr.open(zarr_path, mode="r+")
-
-        for level in range(1, self.config.num_levels):
-            prev_level = level - 1
-            prev_arr = root[str(prev_level)]
-            prev_shape = prev_arr.shape
-
-            # Output shape is halved
-            out_shape = (
-                (prev_shape[0] + 1) // 2,
-                (prev_shape[1] + 1) // 2,
-                (prev_shape[2] + 1) // 2,
-            )
-
-            print(f"Level {level}: {prev_shape} -> {out_shape}")
-
-            # Create output array
-            root.create_dataset(
-                str(level),
-                shape=out_shape,
-                chunks=self._chunks,
-                dtype=self._dtype,
-                compressor=self._compressor,
-                overwrite=True,
-            )
-
-            # Generate chunk tasks
-            tasks = []
-            for cz in range((out_shape[0] + self._chunks[0] - 1) // self._chunks[0]):
-                for cy in range(
-                    (out_shape[1] + self._chunks[1] - 1) // self._chunks[1]
-                ):
-                    for cx in range(
-                        (out_shape[2] + self._chunks[2] - 1) // self._chunks[2]
-                    ):
-                        tasks.append(
-                            (
-                                (cz, cy, cx),
-                                zarr_path,
-                                prev_level,
-                                level,
-                                prev_shape,
-                                out_shape,
-                                self._chunks,
-                                self.config.interpolation,
-                            )
-                        )
-
-            # Process chunks in parallel
-            with Pool(processes=self.config.num_workers) as pool:
-                for _ in tqdm(
-                    pool.imap_unordered(_downsample_chunk_worker, tasks),
-                    total=len(tasks),
-                    desc=f"Level {level}",
-                ):
-                    pass
-
-    def _create_ome_zarr_metadata(self) -> dict:
-        """Create OME-Zarr multiscales metadata."""
-        datasets = []
-        for level in range(self.config.num_levels):
-            scale = 2**level
-            datasets.append(
-                {
-                    "path": str(level),
-                    "coordinateTransformations": [
-                        {
-                            "type": "scale",
-                            "scale": [float(scale), float(scale), float(scale)],
-                        }
-                    ],
-                }
-            )
-
-        return {
-            "multiscales": [
-                {
-                    "version": "0.4",
-                    "name": "merged",
-                    "axes": [
-                        {"name": "z", "type": "space", "unit": "micrometer"},
-                        {"name": "y", "type": "space", "unit": "micrometer"},
-                        {"name": "x", "type": "space", "unit": "micrometer"},
-                    ],
-                    "datasets": datasets,
-                    "type": self.config.interpolation,
-                    "metadata": {
-                        "method": f"{self.config.interpolation} 2x downsampling",
-                    },
-                }
-            ]
-        }
+    @property
+    def _reduction(self) -> str:
+        # "nearest" here has always meant the mode of each block's nonzero values, for labels.
+        return "mode" if self.config.interpolation == "nearest" else "mean"
 
     def finalize(self) -> None:
         """Build pyramid and write metadata."""
@@ -430,23 +220,27 @@ class MergeTask(ZarrTask):
         print(f"  Merged (maximum): {self._merge_stats['merge']}")
 
         # Generate pyramid levels
-        if self.config.num_levels > 1:
-            print(f"\nGenerating {self.config.num_levels - 1} pyramid levels...")
-            self._generate_pyramid_levels()
+        levels = self.config.num_levels - 1
+        if levels > 0:
+            print(f"\nGenerating {levels} pyramid levels...")
+            write_pyramid(
+                self.config.output_zarr,
+                levels,
+                reduction=self._reduction,
+                threads=self.config.num_workers,
+                overwrite=True,
+            )
 
         # Write OME-Zarr metadata
         print("\nWriting OME-Zarr metadata...")
         output_path = Path(self.config.output_zarr)
-        metadata = self._create_ome_zarr_metadata()
-        attrs_path = output_path / ".zattrs"
-        with open(attrs_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        create_group(str(output_path), auth=None).attrs["multiscales"] = [
+            ome_multiscales(name="merged", levels=levels, unit="micrometer", reduction=self._reduction)
+        ]
 
         # Copy metadata.json if it exists in input1
         metadata_src = Path(self.config.input_zarr) / "metadata.json"
         if metadata_src.exists():
-            import shutil
-
             metadata_dst = output_path / "metadata.json"
             shutil.copy2(metadata_src, metadata_dst)
             print("Copied metadata.json from input1")
