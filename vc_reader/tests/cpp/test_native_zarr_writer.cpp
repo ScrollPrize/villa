@@ -5,6 +5,7 @@
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/rounding.hpp"
 #include "vc_reader/native/sigv4.hpp"
+#include "vc_reader/native/reader_types.hpp"
 
 #include <algorithm>
 #include <barrier>
@@ -655,6 +656,15 @@ static void generalOptions(const fs::path& root)
 }
 
 // AWS's published example of signing a PUT ("Example: PUT Object", S3 API reference).
+static void joinsLocations()
+{
+    require(vcr::joinLocation("https://example.test/source.zarr/?token=a%2Fb&order=1+2", "/2/.zarray") ==
+                "https://example.test/source.zarr/2/.zarray?token=a%2Fb&order=1+2", "a query stays last, untouched");
+    require(vcr::joinLocation("https://example.test/source.zarr", "metadata.json") ==
+                "https://example.test/source.zarr/metadata.json", "plain join");
+    require(vcr::joinLocation("/data/a?b#c", "0") == "/data/a?b#c/0", "a path keeps its ? and #");
+}
+
 static void storedChunks(const fs::path& root)
 {
     using namespace vcr::zarr;
@@ -710,6 +720,7 @@ int main()
     try {
         fs::create_directories(root);
         generalOptions(root);
+        joinsLocations();
         storedChunks(root);
         pyramidReductions(root);
         packbitsFilter(root);
