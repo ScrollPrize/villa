@@ -14,6 +14,9 @@ struct CreateOptions {
     // blosc clevel, zstd/zlib/gzip level, lz4 acceleration; volcomp's quantiser step q
     // (0 lossless). Values <= 0 choose the codec default (blosc 3, zstd 3, volcomp q 8).
     int level = -1;
+    std::string cname = "lz4";  // blosc inner codec: lz4, zstd, zlib, ...
+    int shuffle = 1;            // blosc: 0 none, 1 byte, 2 bit
+    bool overwrite = false;     // replace whatever is at the path, stored chunks included
     std::string separator = ".";
     Json fillValue = 0;
     int version = 2;               // Zarr format 2 or 3
@@ -57,14 +60,24 @@ public:
     bool writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size);
     bool removeChunk(const Index& chunk);
     // Writes a C-order region; chunks it covers partially are read, patched and
-    // rewritten. The region must lie inside the array.
-    void writeRegion(const Index& start, const Index& shape, const std::uint8_t* data);
+    // rewritten. The region must lie inside the array. `skipEmpty`: a chunk that comes
+    // out entirely fill is not stored, and any stored one is removed.
+    void writeRegion(const Index& start, const Index& shape, const std::uint8_t* data, bool skipEmpty = false);
 
 private:
     struct Impl;
     explicit Writer(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
+
+// A local group (marker and attributes), kept when it already exists; `attributes` replace
+// its attributes when given. Parent directories are created.
+void createGroup(const std::filesystem::path& path, const std::optional<Json>& attributes = std::nullopt, int version = 2);
+
+// Removes a local array or group with everything in it; whether anything was there.
+bool removeNode(const std::filesystem::path& path);
+// Names of the arrays and groups directly in a local directory, sorted.
+std::vector<std::string> nodeChildren(const std::filesystem::path& path);
 
 // Attributes of a local v2/v3 group or array (an empty object when absent).
 Json readAttributes(const std::filesystem::path& node);

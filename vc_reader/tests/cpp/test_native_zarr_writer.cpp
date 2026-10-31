@@ -483,6 +483,36 @@ void pyramids(const fs::path& root)
 
 }  // namespace
 
+static void generalOptions(const fs::path& root)
+{
+    using namespace vcr::zarr;
+    CreateOptions options;
+    options.shape = {4, 4};
+    options.chunks = {2, 2};
+    options.cname = "zstd";
+    options.shuffle = 2;
+    auto writer = Writer::create(root / "general" / "a", options);
+    if (writer.meta().compressor.value("cname", "") != "zstd" || writer.meta().compressor.value("shuffle", 0) != 2)
+        throw std::runtime_error("blosc options are kept");
+    const std::vector<std::uint8_t> zeros(4, 0), ones(4, 1);
+    writer.writeRegion({0, 0}, {2, 2}, ones.data());
+    writer.writeRegion({2, 2}, {2, 2}, zeros.data(), true);
+    if (!writer.chunkExists({0, 0}) || writer.chunkExists({1, 1}))
+        throw std::runtime_error("skipEmpty does not store an all-fill chunk");
+    options.overwrite = true;
+    auto replaced = Writer::create(root / "general" / "a", options);
+    if (replaced.chunkExists({0, 0}))
+        throw std::runtime_error("overwrite removes stored chunks");
+    createGroup(root / "general" / "g", Json{{"k", 1}});
+    createGroup(root / "general" / "g");
+    if (readAttributes(root / "general" / "g").value("k", 0) != 1)
+        throw std::runtime_error("an existing group keeps its attributes");
+    if (nodeChildren(root / "general") != std::vector<std::string>{"a", "g"})
+        throw std::runtime_error("node children");
+    if (!removeNode(root / "general" / "g") || removeNode(root / "general" / "g"))
+        throw std::runtime_error("remove a node once");
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() /
@@ -497,6 +527,7 @@ int main()
     } cleanup{root};
     try {
         fs::create_directories(root);
+        generalOptions(root);
         for (int version : {2, 3}) {
             const auto dir = root / std::to_string(version);
             codecs(dir, version);

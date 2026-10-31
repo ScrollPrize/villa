@@ -45,7 +45,7 @@ Json compressorConfig(const CreateOptions& options)
         return nullptr;
     const int level = options.level;
     if (id == "blosc")
-        return {{"id", "blosc"}, {"cname", "lz4"}, {"clevel", level > 0 ? level : 3}, {"shuffle", 1}, {"blocksize", 0}};
+        return {{"id", "blosc"}, {"cname", options.cname}, {"clevel", level > 0 ? level : 3}, {"shuffle", options.shuffle}, {"blocksize", 0}};
     if (id == "zstd" || id == "zlib" || id == "gzip")
         return {{"id", id}, {"level", level > 0 ? level : (id == "zstd" ? 3 : 6)}};
     if (id == "lz4")
@@ -192,6 +192,8 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options)
         throw std::invalid_argument("Zarr version must be 2 or 3");
     if (options.version != 3 && !options.shardShape.empty())
         throw std::invalid_argument("indexed shards require Zarr v3");
+    if (options.overwrite)
+        fs::remove_all(path);
     if (fs::exists(path / ".zgroup") ||
         (options.version == 3 && fs::exists(path / ".zarray")) ||
         (options.version == 2 && fs::exists(path / "zarr.json")))
@@ -353,7 +355,7 @@ bool Writer::removeChunk(const Index& chunk)
     return removed;
 }
 
-void Writer::writeRegion(const Index& start, const Index& shape, const std::uint8_t* data)
+void Writer::writeRegion(const Index& start, const Index& shape, const std::uint8_t* data, bool skipEmpty)
 {
     const auto& meta = impl_->meta;
     const std::size_t nd = meta.shape.size();
@@ -400,8 +402,42 @@ void Writer::writeRegion(const Index& start, const Index& shape, const std::uint
         }
         copy_box(data + offset_of(src, regionStrides), regionStrides, buffer.data() + offset_of(dst, chunkStrides),
                  chunkStrides, extent, itemsize);
-        writeChunk(idx, buffer.data(), buffer.size());
+        if (skipEmpty)
+            writeChunkSkipEmpty(idx, buffer.data(), buffer.size());
+        else
+            writeChunk(idx, buffer.data(), buffer.size());
     } while (nextIndex(idx, c0, c1));
+}
+
+bool removeNode(const fs::path& path)
+{
+    return fs::remove_all(path) > 0;
+}
+
+std::vector<std::string> nodeChildren(const fs::path& path)
+{
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& child : fs::directory_iterator(path, ec))
+        if (child.is_directory() && isLocalZarrNode(child.path()))
+            out.push_back(child.path().filename().string());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+void createGroup(const fs::path& path, const std::optional<Json>& attributes, int version)
+{
+    if (version != 2 && version != 3)
+        throw std::invalid_argument("Zarr version must be 2 or 3");
+    fs::create_directories(path);
+    if (fs::exists(path / ".zarray"))
+        throw std::invalid_argument("an array is at " + path.string());
+    if (!fs::exists(path / ".zgroup") && !fs::exists(path / "zarr.json"))
+        atomicWrite(path / (version == 3 ? "zarr.json" : ".zgroup"),
+                    version == 3 ? "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {}}\n"
+                                 : "{\"zarr_format\": 2}\n");
+    if (attributes)
+        writeAttributes(path, *attributes);
 }
 
 Json readAttributes(const fs::path& node)
