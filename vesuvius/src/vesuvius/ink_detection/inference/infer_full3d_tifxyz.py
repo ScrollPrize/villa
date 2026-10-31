@@ -15,7 +15,7 @@ from typing import Any, Iterable, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
-from numcodecs import Blosc
+from vc_reader.reader import create_group, ome_multiscales, write_pyramid_level
 import tifffile
 import torch
 import torch.nn.functional as F
@@ -49,7 +49,6 @@ from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
 )
-from vesuvius.label_zarr import create_v2_array, open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -58,11 +57,6 @@ DEFAULT_LEVELS = 6
 DEFAULT_OVERLAP = 0.5
 DEFAULT_PREFETCH_FACTOR = 2
 ARRAY_DIMENSIONS = ["z", "y", "x"]
-AXES = [
-    {"name": "z", "type": "space"},
-    {"name": "y", "type": "space"},
-    {"name": "x", "type": "space"},
-]
 
 
 @dataclass(frozen=True, order=True)
@@ -661,32 +655,6 @@ class ChunkAccumulator3D:
             self._flush(chunk)
 
 
-def multiscales_metadata(name: str, levels: int) -> dict[str, Any]:
-    """Build OME-NGFF metadata for ZYX arrays downsampled by powers of two."""
-
-    return {
-        "multiscales": [
-            {
-                "name": name,
-                "version": "0.4",
-                "axes": AXES,
-                "datasets": [
-                    {
-                        "path": str(level),
-                        "coordinateTransformations": [
-                            {
-                                "type": "scale",
-                                "scale": [float(2**level)] * 3,
-                            }
-                        ],
-                    }
-                    for level in range(levels)
-                ],
-            }
-        ]
-    }
-
-
 def pyramid_shapes(
     shape_zyx: tuple[int, int, int], levels: int = DEFAULT_LEVELS
 ) -> list[tuple[int, int, int]]:
@@ -718,121 +686,59 @@ def create_output_zarr(
             shutil.rmtree(output_path)
         else:
             output_path.unlink()
-    group = open_v2_group(output_path)
-    group.attrs.update(multiscales_metadata(output_path.stem, levels))
-    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    group = create_group(
+        output_path,
+        attrs={"multiscales": [ome_multiscales(name=output_path.stem, levels=levels - 1)]},
+        overwrite=True,
+        auth=None,
+    )
     arrays = []
     for level, shape in enumerate(pyramid_shapes(shape_zyx, levels)):
         chunks = tuple(min(chunks_zyx[axis], shape[axis]) for axis in range(3))
-        array = create_v2_array(
-            group,
+        array = group.create_array(
             str(level),
             shape=shape,
             chunks=chunks,
             dtype=np.uint8,
-            compressor=compressor,
+            cname="zstd",
+            level=3,
+            shuffle=2,
+            separator="/",
             fill_value=0,
+            skip_empty=True,
         )
         array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
         arrays.append(array)
     return arrays
 
 
-def downsample_mean_3d(block: np.ndarray) -> np.ndarray:
-    """Mean-pool a ZYX block by two and round to its input dtype."""
-
-    block = np.asarray(block)
-    output_shape = tuple((value + 1) // 2 for value in block.shape)
-    total = np.zeros(output_shape, dtype=np.float64)
-    count = np.zeros(output_shape, dtype=np.float64)
-    for offsets in itertools.product((0, 1), repeat=3):
-        sample = block[
-            offsets[0] :: 2, offsets[1] :: 2, offsets[2] :: 2
-        ]
-        if sample.size:
-            slices = tuple(slice(0, value) for value in sample.shape)
-            total[slices] += sample
-            count[slices] += 1.0
-    return np.ascontiguousarray(np.rint(total / count).astype(block.dtype))
-
-
-def scale_chunks_to_next_level(chunks, *, source_array, target_array) -> set[ChunkId]:
-    """Map written source chunks to overlapping chunks at the next level."""
-
-    result = set()
-    source_shape = tuple(source_array.shape)
-    source_chunks = tuple(source_array.chunks)
-    target_shape = tuple(target_array.shape)
-    target_chunks = tuple(target_array.chunks)
-    for chunk in chunks:
-        starts, stops = chunk_bounds(
-            chunk,
-            chunk_shape_zyx=source_chunks,
-            array_shape_zyx=source_shape,
-        )
-        result.update(
-            chunks_overlapping_box(
-                tuple(value // 2 for value in starts),
-                tuple((value + 1) // 2 for value in stops),
-                chunk_shape_zyx=target_chunks,
-                array_shape_zyx=target_shape,
-            )
-        )
-    return result
-
-
-def downsample_level_chunk(source, target, chunk: ChunkId) -> None:
-    """Populate one target ZYX chunk from its corresponding source extent."""
-
-    target_starts, target_stops = chunk_bounds(
-        chunk,
-        chunk_shape_zyx=tuple(target.chunks),
-        array_shape_zyx=tuple(target.shape),
-    )
-    source_starts = tuple(value * 2 for value in target_starts)
-    source_stops = tuple(
-        min(source.shape[axis], target_stops[axis] * 2) for axis in range(3)
-    )
-    source_block = np.asarray(
-        source[
-            source_starts[0] : source_stops[0],
-            source_starts[1] : source_stops[1],
-            source_starts[2] : source_stops[2],
-        ]
-    )
-    output = downsample_mean_3d(source_block)
-    target[
-        target_starts[0] : target_starts[0] + output.shape[0],
-        target_starts[1] : target_starts[1] + output.shape[1],
-        target_starts[2] : target_starts[2] + output.shape[2],
-    ] = output
-
-
 def build_downsample_levels(
     arrays, *, level0_written_chunks: set[ChunkId], workers: int = 1
 ) -> None:
-    """Populate all lower pyramid levels reachable from written level-0 chunks."""
+    """Write the lower pyramid levels over the box of the written level-0 chunks."""
 
-    current_chunks = set(level0_written_chunks)
+    if not level0_written_chunks:
+        return
+    bounds = [
+        chunk_bounds(chunk, chunk_shape_zyx=tuple(arrays[0].chunks), array_shape_zyx=tuple(arrays[0].shape))
+        for chunk in level0_written_chunks
+    ]
+    starts = [min(start[axis] for start, _ in bounds) for axis in range(3)]
+    stops = [max(stop[axis] for _, stop in bounds) for axis in range(3)]
+    root = Path(arrays[0].path).parent
     for level in range(1, len(arrays)):
-        source, target = arrays[level - 1], arrays[level]
-        target_chunks = sorted(
-            scale_chunks_to_next_level(
-                current_chunks, source_array=source, target_array=target
-            )
+        starts = [value // 2 for value in starts]
+        stops = [(value + 1) // 2 for value in stops]
+        chunks = arrays[level].chunks
+        write_pyramid_level(
+            root,
+            level,
+            threads=max(1, workers),
+            chunk_range=(
+                [start // size for start, size in zip(starts, chunks)],
+                [-(-stop // size) for stop, size in zip(stops, chunks)],
+            ),
         )
-        if workers <= 1 or len(target_chunks) <= 1:
-            for chunk in target_chunks:
-                downsample_level_chunk(source, target, chunk)
-        else:
-            with ThreadPoolExecutor(max_workers=min(workers, len(target_chunks))) as executor:
-                list(
-                    executor.map(
-                        lambda chunk: downsample_level_chunk(source, target, chunk),
-                        target_chunks,
-                    )
-                )
-        current_chunks = set(target_chunks)
 
 
 class NativePatchDataset(Dataset):

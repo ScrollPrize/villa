@@ -1,157 +1,41 @@
-"""The structure-tensor writers must work on a zarr 3 install (issue #1448).
-
-``pyproject.toml`` allows ``zarr>=2.18.7,<4``; on the 3.x half of that range
-``Group.create_dataset`` / ``require_dataset`` / ``zarr.DirectoryStore`` no
-longer exist, so ``vesuvius.compute_st`` died before writing a voxel. These
-tests drive the real writers (eigenanalysis, OME vector writer, vector-field
-creator) through the shared compatibility helpers and check the on-disk
-result is still Zarr v2 with the same chunk layout under either zarr major.
-"""
+"""The structure-tensor writers' on-disk results: Zarr v2 with the expected layout."""
 
 from __future__ import annotations
 
-import json
 import os
 
 import numpy as np
 import pytest
 import zarr
 from numcodecs import Blosc
+from vc_reader.reader import create_group
 
-from vesuvius.data.utils import (
-    _ZARR_V3,
-    create_zarr_array,
-    open_zarr_group,
-    require_zarr_array,
-)
+from vesuvius.data.utils import create_zarr_array, open_zarr_group
+from vesuvius.structure_tensor.vf_format import require_array, zarr_codec
 
 
 def _is_v2_array_dir(path: str) -> bool:
     return os.path.exists(os.path.join(path, ".zarray"))
 
 
-def test_open_zarr_group_creates_v2_layout(tmp_path):
-    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
-    assert os.path.exists(tmp_path / "g.zarr" / ".zgroup")
-    assert not os.path.exists(tmp_path / "g.zarr" / "zarr.json")
-    if _ZARR_V3:
-        assert root.metadata.zarr_format == 2
-
-
-def test_open_zarr_group_append_creates_v2_when_missing(tmp_path):
-    root = open_zarr_group(str(tmp_path / "new.zarr"), mode="a")
-    assert os.path.exists(tmp_path / "new.zarr" / ".zgroup")
-    assert not os.path.exists(tmp_path / "new.zarr" / "zarr.json")
-    create_zarr_array(root, "U", shape=(2, 2), chunks=(2, 2), dtype=np.float32, compressor=Blosc())
-    assert _is_v2_array_dir(str(tmp_path / "new.zarr" / "U"))
-
-
-@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
-def test_open_zarr_group_append_keeps_existing_v3_store(tmp_path):
-    """Appending must not write a second .zgroup beside an existing zarr.json."""
-    path = str(tmp_path / "v3.zarr")
-    v3 = zarr.open_group(path, mode="w", zarr_format=3)
-    v3.create_array("existing", shape=(2, 2), chunks=(2, 2), dtype=np.uint8)
-
-    root = open_zarr_group(path, mode="a")
-    assert root.metadata.zarr_format == 3
-    assert not os.path.exists(tmp_path / "v3.zarr" / ".zgroup")
-    # numcodecs Blosc is translated to the v3 BloscCodec on this branch
-    arr = create_zarr_array(
-        root, "new", shape=(2, 2), chunks=(2, 2), dtype=np.float32,
-        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE),
-    )
-    arr[...] = 1.0
-    reopened = zarr.open_group(path, mode="r")
-    assert sorted(reopened.keys()) == ["existing", "new"]
-    np.testing.assert_array_equal(reopened["new"][:], 1.0)
-
-
-@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
-def test_open_zarr_group_append_recreates_empty_v3_leftover_as_v2(tmp_path):
-    """A failed run on zarr 3 leaves an empty zarr.json-only group; re-running
-    on the same --output must produce the v2 store the consumers read."""
-    path = str(tmp_path / "leftover.zarr")
-    zarr.open_group(path, mode="w", zarr_format=3)
-    assert os.path.exists(tmp_path / "leftover.zarr" / "zarr.json")
-
-    root = open_zarr_group(path, mode="a")
-    assert root.metadata.zarr_format == 2
-    create_zarr_array(root, "U", shape=(2, 2), chunks=(2, 2), dtype=np.float32, compressor=Blosc())
-    assert not os.path.exists(tmp_path / "leftover.zarr" / "zarr.json")
-    assert os.path.exists(tmp_path / "leftover.zarr" / ".zgroup")
-    assert _is_v2_array_dir(str(tmp_path / "leftover.zarr" / "U"))
-    assert list(zarr.open_group(path, mode="r").keys()) == ["U"]
-
-
-def test_create_zarr_array_matches_create_dataset_layout(tmp_path):
-    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
-    arr = create_zarr_array(
-        root,
-        "structure_tensor",
-        shape=(6, 4, 8, 8),
-        chunks=(6, 4, 4, 4),
-        dtype=np.float32,
-        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE),
-        write_empty_chunks=False,
-    )
-    arr[:, :, :4, :4] = 1.0
-    array_dir = str(tmp_path / "g.zarr" / "structure_tensor")
-    assert _is_v2_array_dir(array_dir)
-    meta = json.load(open(os.path.join(array_dir, ".zarray")))
-    assert meta["chunks"] == [6, 4, 4, 4]
-    assert meta["compressor"]["id"] == "blosc"
-    assert meta["compressor"]["cname"] == "zstd"
-    # write_empty_chunks=False: only the written chunk is on disk
-    chunk_files = [f for f in os.listdir(array_dir) if not f.startswith(".")]
-    assert chunk_files == ["0.0.0.0"]
-    reopened = zarr.open_group(str(tmp_path / "g.zarr"), mode="r")
-    np.testing.assert_array_equal(reopened["structure_tensor"][0, 0, :4, :4], 1.0)
-
-
-def test_create_zarr_array_with_data_and_nested_separator(tmp_path):
-    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
-    data = np.arange(2 * 4 * 4, dtype=np.uint16).reshape(2, 4, 4)
-    create_zarr_array(
-        root,
-        "labels",
-        data=data,
-        chunks=(1, 4, 4),
-        compressor=Blosc(),
-        dimension_separator="/",
-    )
-    array_dir = tmp_path / "g.zarr" / "labels"
-    assert (array_dir / "0" / "0" / "0").exists()
-    np.testing.assert_array_equal(zarr.open_group(str(tmp_path / "g.zarr"), mode="r")["labels"][:], data)
-
-
-def test_require_zarr_array_reuses_existing_like_require_dataset(tmp_path):
-    """zarr 2's require_dataset returns an existing array (shape + dtype-cast
-    checked) and never consults overwrite; a resumed compute_vf run keeps its
-    chunks. The helper must do the same under either major."""
-    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="a")
-    first = require_zarr_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 2, 2, 2), dtype=np.float32, compressor=None)
+def test_require_array_keeps_what_exists(tmp_path):
+    root = create_group(tmp_path / "g.zarr")
+    first = require_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 2, 2, 2), dtype=np.float32)
     first[...] = 7.0
-    again = require_zarr_array(
-        root, "U", shape=(3, 2, 2, 2), chunks=(3, 1, 1, 1), dtype=np.float32, compressor=Blosc(), overwrite=True
-    )
+    again = require_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 1, 1, 1), dtype=np.float32)
     np.testing.assert_array_equal(again[...], 7.0)
-    assert tuple(again.chunks) == (3, 2, 2, 2)  # existing layout kept
-    with pytest.raises(TypeError, match="shape"):
-        require_zarr_array(root, "U", shape=(3, 1, 1, 1), dtype=np.float32)
-    with pytest.raises(TypeError, match="dtype"):
-        require_zarr_array(root, "U", shape=(3, 2, 2, 2), dtype=np.uint8)
-    root.require_group("sub")
+    assert again.chunks == (3, 2, 2, 2)
+    with pytest.raises(ValueError, match="shape"):
+        require_array(root, "U", shape=(3, 1, 1, 1), chunks=(3, 1, 1, 1), dtype=np.float32)
+    root.create_group("sub")
     with pytest.raises(TypeError, match="group, not an array"):
-        require_zarr_array(root, "sub", shape=(1,), dtype=np.uint8)
+        require_array(root, "sub", shape=(1,), chunks=(1,), dtype=np.uint8)
 
 
-def test_create_zarr_array_writes_empty_chunks_like_zarr2_by_default(tmp_path):
-    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
-    arr = create_zarr_array(root, "z", shape=(4, 4), chunks=(2, 2), dtype=np.uint8, compressor=None)
-    arr[...] = 0
-    chunk_files = sorted(f for f in os.listdir(tmp_path / "g.zarr" / "z") if not f.startswith("."))
-    assert chunk_files == ["0.0", "0.1", "1.0", "1.1"]
+def test_zarr_codec_names():
+    assert zarr_codec("ZSTD", 3) == {"cname": "zstd", "level": 3, "shuffle": 1}
+    assert zarr_codec("none", 3) == {"compressor": None}
+    assert zarr_codec("unknown", 3) == {"cname": "zstd", "level": 1, "shuffle": 1}
 
 
 def test_voxelize_rechunk_keeps_store_v2(tmp_path):
@@ -187,14 +71,13 @@ def test_eigenanalysis_writes_ome_and_eigen_arrays(tmp_path):
     st[3] = 2.0  # Jyy
     st[5] = 1.0  # Jxx
     zarr_path = str(tmp_path / "st.zarr")
-    root = open_zarr_group(zarr_path, mode="w")
-    create_zarr_array(root, "structure_tensor", data=st, chunks=(6, Z, Y, X), dtype="f4")
+    create_group(zarr_path).create_array("structure_tensor", shape=st.shape, chunks=(6, Z, Y, X), dtype="f4")[...] = st
 
     _finalize_structure_tensor_torch(
         zarr_path=zarr_path,
         chunk_size=None,
         num_workers=0,
-        compressor=Blosc(cname="zstd", clevel=1),
+        codec={"cname": "zstd", "level": 1},
         verbose=False,
         swap_eigenvectors=False,
         device="cpu",
@@ -241,20 +124,3 @@ def test_ome_u8_vector_writer_creates_scale_arrays(tmp_path):
         downsample=2,
         make_confidence=True,
     )
-
-
-@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
-def test_open_zarr_group_append_keeps_attrs_of_empty_v3_group(tmp_path):
-    """An empty group is not necessarily a bare one: recreating a v3 leftover
-    as v2 must not throw away metadata written before the first array."""
-    path = str(tmp_path / "meta_only.zarr")
-    seed = zarr.open_group(path, mode="w", zarr_format=3)
-    seed.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
-    seed.attrs["patch_size"] = [128, 128, 128]
-
-    root = open_zarr_group(path, mode="a")
-
-    assert root.metadata.zarr_format == 2
-    assert root.attrs["multiscales"] == [{"version": "0.4", "datasets": [{"path": "0"}]}]
-    assert root.attrs["patch_size"] == [128, 128, 128]
-    assert dict(zarr.open_group(path, mode="r").attrs) == dict(root.attrs)

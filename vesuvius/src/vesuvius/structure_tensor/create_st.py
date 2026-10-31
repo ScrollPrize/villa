@@ -9,18 +9,16 @@ from pathlib import Path
 from typing import Optional, Union
 from tqdm.auto import tqdm
 from torch.utils.data import Dataset, DataLoader
-import zarr
-import numcodecs
+from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
 from vesuvius.models.run.inference import Inferer
-from vesuvius.data.utils import open_zarr, open_zarr_group, create_zarr_array
 from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     _get_gaussian_kernel_3d,
     _get_pavel_kernels_3d,
 )
-from numcodecs import Blosc
 from ._compile_utils import _maybe_compile_function
+from .vf_format import zarr_codec
 
 def _ceildiv(a: int, b: int) -> int:
     """Ceiling division for positives."""
@@ -82,12 +80,7 @@ class StructureTensorInferer(Inferer, nn.Module):
 
         # --- Auto-infer patch_size from the input Zarr's chunking if none given ---
         if self.patch_size is None:
-            store = open_zarr(
-                path=self.input,
-                mode='r',
-                storage_options={'anon': False}
-                    if str(self.input).startswith('s3://') else None
-            )
+            store = open_zarr(self.input)
             chunks = store.chunks  # e.g. (1, pZ, pY, pX) or (pZ, pY, pX)
             if len(chunks) == 4:
                 # drop the channel‐chunk
@@ -165,15 +158,8 @@ class StructureTensorInferer(Inferer, nn.Module):
             main_store_path = self.output_dir
             print(f"Opening existing shared store at: {main_store_path}")
             
-            # Open the root group
-            root_store = zarr.open_group(
-                main_store_path,
-                mode='r+',
-                storage_options={'anon': False} if main_store_path.startswith('s3://') else None
-            )
-            
-            # Access the structure_tensor subgroup
-            self.output_store = root_store['structure_tensor']
+            # Access the structure_tensor array
+            self.output_store = ZarrWriter.open(f"{main_store_path}/structure_tensor", skip_empty=True)
             
         else:
             # Single-GPU mode: create new store with group hierarchy
@@ -189,28 +175,21 @@ class StructureTensorInferer(Inferer, nn.Module):
             # Use the same chunking as patch size for efficient writing
             output_chunks = (self.num_classes, *self.patch_size)
             
-            compressor = self._get_zarr_compressor()
-            
             print(f"Creating output store at: {main_store_path}")
             print(f"Full volume shape: {output_shape}")
             print(f"Chunk shape: {output_chunks}")
             
             # Create the root group
-            root_store = open_zarr_group(
-                main_store_path,
-                mode='w',
-                storage_options={'anon': False} if main_store_path.startswith('s3://') else None
-            )
+            root_store = create_group(main_store_path, overwrite=True)
             
             # Create the structure_tensor array within the group
-            self.output_store = create_zarr_array(
-                root_store,
+            self.output_store = root_store.create_array(
                 'structure_tensor',
                 shape=output_shape,
                 chunks=output_chunks,
                 dtype=np.float32,
-                compressor=compressor,
-                write_empty_chunks=False
+                skip_empty=True,
+                **zarr_codec(self.compressor_name, self.compression_level),
             )
             
             # Store metadata in the root group
@@ -298,18 +277,12 @@ class StructureTensorInferer(Inferer, nn.Module):
         Iterate over patches using DataLoader, compute J over a padded region,
         trim to the original patch, and write into the full-volume zarr.
         """
-        numcodecs.blosc.use_threads = True
-
         total = self.num_total_patches
         store = self.output_store
         processed_count = 0
 
         # Open the raw input volume once so we can read arbitrary slabs
-        input_src = open_zarr(
-            path=self.input,
-            mode='r',
-            storage_options={'anon': False} if str(self.input).startswith('s3://') else None
-        )
+        input_src = open_zarr(self.input)
         # Full volume dims (Z, Y, X)
         if input_src.ndim == 4:
             _, vol_Z, vol_Y, vol_X = input_src.shape
@@ -419,10 +392,7 @@ class ChunkDataset(Dataset):
     def __getitem__(self, idx):
         # read block
         z0, z1, y0, y1, x0, x1 = self.chunks[idx]
-        src = open_zarr(
-            path=self.input_path, mode='r',
-            storage_options={'anon': False} if self.input_path.startswith('s3://') else None
-        )
+        src = open_zarr(self.input_path)
         block_np = src[:, z0:z1, y0:y1, x0:x1].astype('float32')
         block = torch.from_numpy(block_np).to(self.device)  # [6, dz, dy, dx]
         if not torch.isfinite(block).all():
@@ -529,7 +499,7 @@ def _finalize_structure_tensor_torch(
     zarr_path,
     chunk_size,
     num_workers,
-    compressor,
+    codec,
     verbose,
     swap_eigenvectors: bool = False,
     device: Optional[Union[str, torch.device]] = None,
@@ -553,20 +523,16 @@ def _finalize_structure_tensor_torch(
         zarr_path: Path to the zarr file containing structure_tensor group
         chunk_size: Chunk size for processing
         num_workers: Number of workers for data loading
-        compressor: Zarr compressor to use
+        codec: ``ZarrWriter.create`` codec arguments (see ``zarr_codec``)
         verbose: Enable verbose output
         swap_eigenvectors: Whether to swap eigenvectors 0 and 1
         device: torch device to use ('cpu', 'cuda:0', etc.)
     """
     # Open the root group
-    root_store = zarr.open_group(
-        zarr_path,
-        mode='r+',
-        storage_options={'anon': False} if zarr_path.startswith('s3://') else None
-    )
+    root_store = create_group(zarr_path)
     
     # Access the structure tensor array
-    src = root_store['structure_tensor']
+    src = open_zarr(f"{zarr_path}/structure_tensor")
     C, Z, Y, X = src.shape
     assert C == 6, f"Expect 6 channels, got {C}"
 
@@ -585,55 +551,43 @@ def _finalize_structure_tensor_torch(
     out_chunks_ds = (max(1, cz // ds_factor), max(1, cy // ds_factor), max(1, cx // ds_factor))
 
     def _ensure_vec_target(root, name: str):
-        g = root.require_group(name)
-        gz = g.require_group("z")
-        gy = g.require_group("y")
-        gx = g.require_group("x")
+        g = root.create_group(name)
         # (Re)create datasets per axis at this scale
-        for axg in (gz, gy, gx):
-            if ome_scale in axg:
-                del axg[ome_scale]
-            create_zarr_array(
-                axg, ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
-                dtype=np.uint8, compressor=compressor, write_empty_chunks=False
-            )
-        return gz[ome_scale], gy[ome_scale], gx[ome_scale]
+        return tuple(_create_scale(g.create_group(axis)) for axis in ("z", "y", "x"))
+
+    def _create_scale(group):
+        return group.create_array(
+            ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds, dtype=np.uint8,
+            overwrite=True, skip_empty=True, **codec
+        )
 
     if ome_out:
         fz, fy, fx = _ensure_vec_target(root_store, "first_component")
         sz_, sy_, sx_ = _ensure_vec_target(root_store, "second_component")
         nz, ny, nx = _ensure_vec_target(root_store, "normal")
         # confidence dataset
-        conf_group = root_store.require_group("confidence")
-        if ome_scale in conf_group:
-            del conf_group[ome_scale]
-        conf_ds = create_zarr_array(
-            conf_group, ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
-            dtype=np.uint8, compressor=compressor, write_empty_chunks=False
-        )
+        conf_ds = _create_scale(root_store.create_group("confidence"))
 
     # ---- Optional: keep full-precision eigen* arrays (float32) ----
     if keep_eigen:
         out_chunks = (1, cz, cy, cx)
-        eigenvectors_arr = create_zarr_array(
-            root_store,
+        eigenvectors_arr = root_store.create_array(
             'eigenvectors',
             shape=(9, Z, Y, X),
             chunks=out_chunks,
-            compressor=compressor,
             dtype=np.float32,
-            write_empty_chunks=False,
-            overwrite=True
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
-        eigenvalues_arr = create_zarr_array(
-            root_store,
+        eigenvalues_arr = root_store.create_array(
             'eigenvalues',
             shape=(3, Z, Y, X),
             chunks=out_chunks,
-            compressor=compressor,
             dtype=np.float32,
-            write_empty_chunks=False,
-            overwrite=True
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
     
     # build chunk list
@@ -922,17 +876,7 @@ def main():
         except Exception as e:
             print(f"Error parsing chunk_size: {e}")
     
-    # Get compressor
-    if args.zarr_compressor.lower() == 'zstd':
-        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'lz4':
-        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'zlib':
-        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'none':
-        compressor = None
-    else:
-        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
+    codec = zarr_codec(args.zarr_compressor, args.zarr_compression_level)
     
     if args.mode == 'structure-tensor':
         # Run structure tensor computation
@@ -994,7 +938,7 @@ def main():
                     zarr_path=logits_path,
                     chunk_size=chunk_size,
                     num_workers=args.num_workers,
-                    compressor=compressor,
+                    codec=codec,
                     verbose=args.verbose,
                     swap_eigenvectors=args.swap_eigenvectors,
                     device=args.device
@@ -1028,7 +972,7 @@ def main():
                 zarr_path=args.eigen_input,
                 chunk_size=chunk_size,
                 num_workers=args.num_workers,
-                compressor=compressor,
+                codec=codec,
                 verbose=args.verbose,
                 swap_eigenvectors=args.swap_eigenvectors,
                 device=args.device,

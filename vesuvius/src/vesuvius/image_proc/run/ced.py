@@ -18,7 +18,7 @@ from typing import Dict, List
 import numpy as np
 import tifffile
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 from tqdm import tqdm
 
 from vesuvius.image_proc.geometry.diffusion import coherence_enhancing_diffusion as run_coherence_diffusion
@@ -148,8 +148,8 @@ def process_zarr_chunk(
         print(f"GPU {gpu_id}: CUDA device name: {torch.cuda.get_device_name(gpu_id)}")
     
     # Open zarr arrays
-    zarr_in = zarr.open(input_path, mode='r')
-    zarr_out = zarr.open(output_path, mode='r+')  # r+ for read/write
+    zarr_in = open_zarr(input_path)
+    zarr_out = ZarrWriter.open(output_path, skip_empty=True, auth=None)
     
     shape = zarr_in.shape
     dtype = zarr_in.dtype
@@ -237,7 +237,7 @@ def launch_multi_gpu_processing(
     ctx = mp.get_context('spawn')
     
     # Open input zarr to get shape
-    zarr_in = zarr.open(input_path, mode='r')
+    zarr_in = open_zarr(input_path)
     shape = zarr_in.shape
     dtype = zarr_in.dtype
     num_slices = shape[0]
@@ -247,14 +247,12 @@ def launch_multi_gpu_processing(
     
     # Create output zarr with chunks=(1, height, width)
     print(f"Creating output zarr array: {output_path}")
-    zarr_out = zarr.open(
-        output_path, 
-        mode='w', 
-        shape=shape, 
+    ZarrWriter.create_like(
+        output_path,
+        zarr_in,
         chunks=(1, shape[1], shape[2]),  # One chunk per z-slice
-        dtype=dtype,
-        compressor=zarr_in.compressor if hasattr(zarr_in, 'compressor') else None,
-        write_empty_chunks=False
+        overwrite=True,
+        auth=None,
     )
     
     # Calculate chunk boundaries for each GPU
@@ -299,7 +297,7 @@ def process_zarr_array(input_path, output_path, config, batch_size=1):
     
     # Open input zarr array
     print(f"Opening zarr array: {input_path}")
-    zarr_in = zarr.open(input_path, mode='r')
+    zarr_in = open_zarr(input_path)
     
     # Get array shape and dtype
     shape = zarr_in.shape
@@ -323,17 +321,9 @@ def process_zarr_array(input_path, output_path, config, batch_size=1):
     if len(shape) == 3:
         chunks = (1, shape[1], shape[2])
     else:
-        chunks = zarr_in.chunks if hasattr(zarr_in, 'chunks') else None
+        chunks = zarr_in.chunks
     
-    zarr_out = zarr.open(
-        output_path, 
-        mode='w', 
-        shape=shape, 
-        chunks=chunks,
-        dtype=dtype,
-        compressor=zarr_in.compressor if hasattr(zarr_in, 'compressor') else None,
-        write_empty_chunks=False
-    )
+    zarr_out = ZarrWriter.create_like(output_path, zarr_in, chunks=chunks, overwrite=True, skip_empty=True, auth=None)
     
     # Process each slice in batches
     print(f"Processing {num_slices} slices with batch size {batch_size}...")

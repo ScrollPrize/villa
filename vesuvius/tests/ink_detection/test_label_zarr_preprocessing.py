@@ -15,7 +15,7 @@ from vesuvius.ink_detection.preprocessing import (
 from vesuvius.ink_detection.preprocessing.create_label_zarrs import (
     DEFAULT_LABEL_SLICE,
     _STREAMABLE_COMPRESSIONS,
-    build_pyramid_with_mode,
+    write_label_pyramid,
     convert_image,
     find_target_images,
     main,
@@ -78,22 +78,24 @@ def test_discovery_is_stable_skips_zarr_trees_and_adds_one_composite(tmp_path):
     ]
 
 
-def test_label_and_composite_pyramids_keep_nearest_and_mean_rounding():
+def test_label_and_composite_pyramids_keep_nearest_and_mean_rounding(tmp_path):
     image_YX = np.array(
         [[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=np.uint8
     )
-    nearest = build_pyramid_with_mode(image_YX, levels=2)
-    mean = build_pyramid_with_mode(image_YX, levels=2, downsample_mode="mean")
+    write_label_pyramid(image_YX, tmp_path / "nearest.zarr", levels=2)
+    write_label_pyramid(image_YX, tmp_path / "mean.zarr", levels=2, downsample_mode="mean")
+    nearest = zarr.open_group(tmp_path / "nearest.zarr", mode="r")
+    mean = zarr.open_group(tmp_path / "mean.zarr", mode="r")
 
-    assert nearest[0].shape == (65, 3, 3)
-    np.testing.assert_array_equal(nearest[0][DEFAULT_LABEL_SLICE], image_YX)
+    assert nearest["0"].shape == (65, 3, 3)
+    np.testing.assert_array_equal(nearest["0"][DEFAULT_LABEL_SLICE], image_YX)
     np.testing.assert_array_equal(
-        nearest[1][DEFAULT_LABEL_SLICE], np.array([[0, 2], [6, 8]])
+        nearest["1"][DEFAULT_LABEL_SLICE], np.array([[0, 2], [6, 8]])
     )
     np.testing.assert_array_equal(
-        mean[1][DEFAULT_LABEL_SLICE], np.array([[2, 4], [6, 8]])
+        mean["1"][DEFAULT_LABEL_SLICE], np.array([[2, 4], [6, 8]])
     )
-    assert np.count_nonzero(nearest[1][:DEFAULT_LABEL_SLICE]) == 0
+    assert np.count_nonzero(nearest["1"][:DEFAULT_LABEL_SLICE]) == 0
 
 
 def test_conversion_writes_v2_ome_metadata_and_preserves_skip_overwrite(tmp_path):

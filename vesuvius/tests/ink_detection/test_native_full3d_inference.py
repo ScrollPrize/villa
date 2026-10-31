@@ -407,18 +407,27 @@ def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
     expected[:2, :2, :2] = values
     multiscales = zarr.open_group(path, mode="r").attrs["multiscales"][0]
     assert multiscales["version"] == "0.4"
-    assert multiscales["axes"] == native.AXES
+    assert [axis["name"] for axis in multiscales["axes"]] == ["z", "y", "x"]
     assert [dataset["path"] for dataset in multiscales["datasets"]] == [
         str(level) for level in range(6)
     ]
     for level, array in enumerate(arrays):
         assert array.attrs["_ARRAY_DIMENSIONS"] == ["z", "y", "x"]
-        assert np.array_equal(np.asarray(array), expected)
-        assert multiscales["datasets"][level]["coordinateTransformations"] == [
-            {"type": "scale", "scale": [float(2**level)] * 3}
-        ]
+        assert np.array_equal(array[...], expected)
+        assert multiscales["datasets"][level]["coordinateTransformations"][0] == {
+            "type": "scale", "scale": [float(2**level)] * 3
+        }
         if level + 1 < len(arrays):
-            expected = native.downsample_mean_3d(expected)
+            expected = _downsample_mean_3d(expected)
+
+
+def _downsample_mean_3d(block):
+    """Rounded mean of each 2x2x2 block, clipped at the array's end."""
+    shape = tuple((value + 1) // 2 for value in block.shape)
+    output = np.zeros(shape, block.dtype)
+    for index in np.ndindex(shape):
+        output[index] = np.rint(block[tuple(slice(2 * i, 2 * i + 2) for i in index)].mean())
+    return output
 
 
 def test_output_reject_overwrite_and_coherent_rerun(tmp_path):

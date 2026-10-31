@@ -8,15 +8,11 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-from numcodecs import Blosc
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriteGroup, ZarrWriter, create_group
 
 from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
 from vesuvius.ink_detection.volume_io import open_volume_root
-from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
-
-ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 OUTPUT_Z = 21
@@ -35,7 +31,7 @@ def centered_slice(length: int, requested: int) -> tuple[int, int]:
     return start, start + requested
 
 
-def open_source_array(path: str, level: str) -> zarr.Array:
+def open_source_array(path: str, level: str) -> ZarrReader:
     """Open a bare ZYX array or one named level from a local or remote group."""
     node = open_volume_root(path)
     if hasattr(node, "shape"):
@@ -52,25 +48,16 @@ def _create_target_array(
     partial_path: Path,
     *,
     shape_zyx: tuple[int, int, int],
-) -> tuple[zarr.Group, zarr.Array]:
-    group = open_v2_group(partial_path)
+) -> tuple[ZarrWriteGroup, ZarrWriter]:
+    group = create_group(partial_path, overwrite=True, auth=None)
     chunks = (
         OUTPUT_Z,
         min(CHUNK_XY, shape_zyx[1]),
         min(CHUNK_XY, shape_zyx[2]),
     )
-    compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
-    create_kwargs = {
-        "shape": shape_zyx,
-        "chunks": chunks,
-        "dtype": np.uint8,
-        "compressor": compressor,
-        "fill_value": 0,
-    }
-    if ZARR_V3:
-        target = group.create_array("0", **create_kwargs)
-    else:
-        target = group.create_dataset("0", **create_kwargs)
+    target = group.create_array(
+        "0", shape=shape_zyx, chunks=chunks, dtype=np.uint8, cname="zstd", level=5, shuffle=2, fill_value=0
+    )
     return group, target
 
 

@@ -9,8 +9,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Iterable
 
 import numpy as np
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import ZarrWriter, create_group, open_group
 from tqdm.auto import tqdm
 import vesuvius.tifxyz as tifxyz
 
@@ -24,10 +23,8 @@ from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_inde
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
-from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
-ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
@@ -78,12 +75,12 @@ class DatasetChunkPlan:
         return int(len(self.chunk_ids_by_scale[self.volume_scale]))
 
 
-def compressor_from_recompress_preset(preset: str):
+def codec_from_recompress_preset(preset: str) -> dict[str, object]:
     preset_key = str(preset).strip().lower()
     if preset_key == "fast":
-        return Blosc(cname="lz4", clevel=5, shuffle=Blosc.BITSHUFFLE)
+        return {"cname": "lz4", "level": 5, "shuffle": 2}
     if preset_key == "balanced":
-        return Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE)
+        return {"cname": "zstd", "level": 3, "shuffle": 1}
     raise ValueError(f"Unsupported recompress preset: {preset!r}")
 
 
@@ -382,15 +379,15 @@ def _write_progress(
     output_path: Path,
     completed_chunk_ids_by_scale: dict[int, set[tuple[int, int, int]]],
 ) -> None:
-    root = zarr.open_group(str(output_path), mode="r+")
+    root = create_group(output_path, auth=None)
     root.attrs[DOWNLOAD_PROGRESS_ATTR] = _progress_payload(
         completed_chunk_ids_by_scale
     )
 
 
 def _create_output_arrays(source_group, output_path: Path, recompress: str):
-    root = open_v2_group(output_path)
-    compressor = compressor_from_recompress_preset(recompress)
+    root = create_group(output_path, overwrite=True, auth=None)
+    codec = codec_from_recompress_preset(recompress)
     root.attrs.update(dict(source_group.attrs))
     array_keys = sorted(
         (str(key) for key in source_group.array_keys()),
@@ -398,19 +395,14 @@ def _create_output_arrays(source_group, output_path: Path, recompress: str):
     )
     for key in array_keys:
         source_array = source_group[key]
-        create_kwargs = {
-            "shape": tuple(int(value) for value in source_array.shape),
-            "chunks": tuple(int(value) for value in source_array.chunks),
-            "dtype": source_array.dtype,
-            "compressor": compressor,
-            "fill_value": source_array.fill_value,
-            "filters": source_array.filters,
-            "order": getattr(source_array, "order", "C"),
-        }
-        if ZARR_V3:
-            output_array = root.create_array(key, **create_kwargs)
-        else:
-            output_array = root.create_dataset(key, **create_kwargs)
+        output_array = root.create_array(
+            key,
+            shape=tuple(int(value) for value in source_array.shape),
+            chunks=tuple(int(value) for value in source_array.chunks),
+            dtype=source_array.dtype,
+            fill_value=source_array.fill_value,
+            **codec,
+        )
         output_array.attrs.update(dict(source_array.attrs))
     return root
 
@@ -419,7 +411,7 @@ def _validate_output_schema(output_path: Path, plan: dict[str, object]) -> None:
     root_metadata = output_path / ".zgroup"
     if not root_metadata.is_file() or json.loads(root_metadata.read_text())["zarr_format"] != 2:
         raise ValueError(f"Existing sparse output is not an explicit Zarr-v2 group: {output_path}")
-    root = zarr.open_group(str(output_path), mode="r")
+    root = open_group(output_path)
     expected_arrays = plan["arrays"]
     assert isinstance(expected_arrays, dict)
     actual_keys = set(str(key) for key in root.array_keys())
@@ -441,7 +433,7 @@ def _load_resume_progress(
     output_path: Path,
     plan: dict[str, object],
 ) -> dict[int, set[tuple[int, int, int]]]:
-    root = zarr.open_group(str(output_path), mode="r")
+    root = open_group(output_path)
     if DOWNLOAD_PLAN_ATTR not in root.attrs or DOWNLOAD_PROGRESS_ATTR not in root.attrs:
         raise ValueError(
             "Existing sparse output lacks its source/plan or progress manifest; "
@@ -491,7 +483,7 @@ def _init_chunk_copy_worker(volume_path: str, volume_scale: int, volume_auth_jso
     _WORKER_SOURCE = open_volume(
         volume_path, volume_scale, auth_json_path=volume_auth_json
     )
-    _WORKER_DEST = zarr.open_group(str(output_path), mode="r+")[str(int(volume_scale))]
+    _WORKER_DEST = ZarrWriter.open(f"{output_path}/{int(volume_scale)}", auth=None)
     _WORKER_CHUNK_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.chunks)
     _WORKER_ARRAY_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.shape)
 

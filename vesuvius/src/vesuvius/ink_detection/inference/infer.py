@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
@@ -43,7 +43,6 @@ from vesuvius.ink_detection.volume_io import (
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
-ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 LOGGER = logging.getLogger(__name__)
@@ -848,19 +847,7 @@ def open_temp_zarr_array(
 ):
     """Create one explicit-v2 float32 accumulation array."""
 
-    format_keyword = (
-        {"zarr_format": 2}
-        if ZARR_V3
-        else {"zarr_version": 2}
-    )
-    return zarr.open(
-        str(path),
-        mode="w",
-        shape=shape,
-        chunks=chunks,
-        dtype=np.float32,
-        **format_keyword,
-    )
+    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=np.float32, overwrite=True, auth=None)
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:

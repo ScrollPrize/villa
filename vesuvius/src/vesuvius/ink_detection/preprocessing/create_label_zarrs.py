@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import tifffile
 from tqdm.auto import tqdm
-import zarr
+from vc_reader.reader import ZarrWriter, write_pyramid_level
 
 from vesuvius.ink_detection.data.segment import parse_label_asset_path
 from vesuvius.label_zarr import (
@@ -200,66 +200,15 @@ def _embed_label_volume(
     return volume_ZYX
 
 
-def _downsample_mean(current_ZYX: np.ndarray) -> np.ndarray:
-    out_y = (current_ZYX.shape[1] + 1) // 2
-    out_x = (current_ZYX.shape[2] + 1) // 2
-    accum = np.zeros((current_ZYX.shape[0], out_y, out_x), dtype=np.float64)
-    counts = np.zeros((out_y, out_x), dtype=np.float64)
-    for y_offset in (0, 1):
-        for x_offset in (0, 1):
-            block_ZYX = current_ZYX[:, y_offset::2, x_offset::2]
-            if block_ZYX.size == 0:
-                continue
-            accum[:, : block_ZYX.shape[1], : block_ZYX.shape[2]] += block_ZYX
-            counts[: block_ZYX.shape[1], : block_ZYX.shape[2]] += 1.0
-    mean_ZYX = accum / counts[np.newaxis, :, :]
-    if np.issubdtype(current_ZYX.dtype, np.integer):
-        mean_ZYX = np.rint(mean_ZYX).astype(current_ZYX.dtype, copy=False)
-    else:
-        mean_ZYX = mean_ZYX.astype(current_ZYX.dtype, copy=False)
-    return np.ascontiguousarray(mean_ZYX)
-
-
-def build_pyramid_with_mode(
-    image_2d: np.ndarray,
-    *,
-    levels: int = DEFAULT_LEVELS,
-    downsample_mode: Literal["nearest", "mean"] = "nearest",
-) -> list[np.ndarray]:
-    """Embed a label at Z=32 and derive XY pyramid levels without Z pooling."""
-    if levels < 1:
-        raise ValueError("levels must be at least 1")
-    if downsample_mode not in {"nearest", "mean"}:
-        raise ValueError(f"Unsupported downsample_mode: {downsample_mode}")
-    current_ZYX = np.ascontiguousarray(_embed_label_volume(image_2d))
-    pyramid = [current_ZYX]
-    for _ in range(1, levels):
-        if downsample_mode == "mean":
-            current_ZYX = _downsample_mean(current_ZYX)
-        else:
-            current_ZYX = np.ascontiguousarray(current_ZYX[:, ::2, ::2])
-        pyramid.append(current_ZYX)
-    return pyramid
-
-
-def _iter_block_slices(
-    height: int, width: int, *, block_size: int = STREAM_BLOCK_SIZE
-) -> Iterable[tuple[int, int, int, int]]:
-    for y_start in range(0, height, block_size):
-        block_height = min(block_size, height - y_start)
-        for x_start in range(0, width, block_size):
-            block_width = min(block_size, width - x_start)
-            yield y_start, x_start, block_height, block_width
-
-
 def _create_ome_zarr_datasets(
     output_path: Path,
     *,
     image_shape: tuple[int, int],
     dtype: np.dtype,
     levels: int,
+    reduction: str,
     overwrite: bool = False,
-) -> list[zarr.Array]:
+) -> list[ZarrWriter]:
     if output_path.exists():
         if not overwrite:
             raise FileExistsError(f"Output already exists: {output_path}")
@@ -268,37 +217,45 @@ def _create_ome_zarr_datasets(
         else:
             output_path.unlink()
     shapes = pyramid_shapes(image_shape, levels)
-    group = create_label_group(output_path, levels=len(shapes))
-    datasets = []
-    for level, shape in enumerate(shapes):
-        dataset = create_label_array(
-            group,
-            str(level),
-            shape=shape,
-            dtype=np.dtype(dtype),
-        )
-        datasets.append(dataset)
-    return datasets
+    group = create_label_group(output_path, levels=len(shapes), reduction=reduction)
+    return [
+        create_label_array(group, str(level), shape=shape, dtype=np.dtype(dtype))
+        for level, shape in enumerate(shapes)
+    ]
 
 
-def write_ome_zarr(
-    pyramid: Sequence[np.ndarray],
+def write_label_pyramid(
+    image_2d: np.ndarray,
     output_path: Path,
     *,
+    levels: int = DEFAULT_LEVELS,
+    downsample_mode: Literal["nearest", "mean"] = "nearest",
     overwrite: bool = False,
+    chunk_workers: int = 1,
 ) -> None:
-    """Write an in-memory ZYX pyramid as an explicit Zarr-v2 OME group."""
-    if not pyramid:
-        raise ValueError("pyramid must contain at least one level")
+    """Embed a label at Z=32 and write it with XY pyramid levels, without Z pooling."""
+    if levels < 1:
+        raise ValueError("levels must be at least 1")
+    level_zero = _embed_label_volume(image_2d)
     datasets = _create_ome_zarr_datasets(
         output_path,
-        image_shape=tuple(int(value) for value in pyramid[0].shape[1:]),
-        dtype=pyramid[0].dtype,
-        levels=len(pyramid),
+        image_shape=tuple(int(value) for value in level_zero.shape[1:]),
+        dtype=level_zero.dtype,
+        levels=levels,
+        reduction=downsample_mode,
         overwrite=overwrite,
     )
-    for dataset, array_ZYX in zip(datasets, pyramid):
-        dataset[:] = array_ZYX
+    datasets[0][...] = level_zero
+    _write_levels_above_zero(output_path, levels, downsample_mode, chunk_workers)
+
+
+def _write_levels_above_zero(
+    output_path: Path, levels: int, downsample_mode: str, chunk_workers: int
+) -> None:
+    for level in range(1, levels):
+        write_pyramid_level(
+            output_path, level, factors=(1, 2, 2), reduction=downsample_mode, threads=chunk_workers
+        )
 
 
 def _get_streamable_tiff_metadata(
@@ -320,7 +277,7 @@ def _get_streamable_tiff_metadata(
     the only published label images that stream are the ones that happen to
     be tiled; every other TIFF -- including any written with a default
     ``tifffile.imwrite``, which produces strips -- silently falls through to
-    ``build_pyramid_with_mode``, which loads the entire volume into memory.
+    ``write_label_pyramid``, which loads the entire volume into memory.
     That is invisible until someone converts a large enough image (a full
     z-stack label volume, not a single flattened image) and hits an OOM with
     no indication that a streamed path exists or why it wasn't used.
@@ -361,7 +318,7 @@ def _get_streamable_tiff_metadata(
 _STREAMABLE_COMPRESSIONS = frozenset({1, 5, 8, 32773, 32946})
 
 
-def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> None:
+def _write_streamed_tiff_level_zero(input_path: Path, dataset: ZarrWriter) -> None:
     """Stream a tiled OR striped TIFF's level-0 data into ``dataset``.
 
     Reads ``page.chunks``/``page.chunked`` generically -- for a tiled page
@@ -474,73 +431,6 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
             _flush(key)
 
 
-def _write_downsample_block(
-    source: zarr.Array,
-    target: zarr.Array,
-    *,
-    block_y: int,
-    block_x: int,
-    block_height: int,
-    block_width: int,
-    downsample_mode: Literal["nearest", "mean"],
-) -> None:
-    source_y1 = min(source.shape[1], (block_y + block_height) * 2)
-    source_x1 = min(source.shape[2], (block_x + block_width) * 2)
-    source_ZYX = np.asarray(
-        source[:, block_y * 2 : source_y1, block_x * 2 : source_x1]
-    )
-    if downsample_mode == "mean":
-        downsampled_ZYX = _downsample_mean(source_ZYX)
-    else:
-        downsampled_ZYX = np.ascontiguousarray(source_ZYX[:, ::2, ::2])
-    target[
-        :,
-        block_y : block_y + downsampled_ZYX.shape[1],
-        block_x : block_x + downsampled_ZYX.shape[2],
-    ] = downsampled_ZYX
-
-
-def _build_downsample_levels_from_zarr(
-    datasets: Sequence[zarr.Array],
-    *,
-    downsample_mode: Literal["nearest", "mean"],
-    chunk_workers: int,
-) -> None:
-    for level in range(1, len(datasets)):
-        source, target = datasets[level - 1], datasets[level]
-        blocks = list(_iter_block_slices(target.shape[1], target.shape[2]))
-        if chunk_workers <= 1 or len(blocks) <= 1:
-            for block_y, block_x, block_height, block_width in blocks:
-                _write_downsample_block(
-                    source,
-                    target,
-                    block_y=block_y,
-                    block_x=block_x,
-                    block_height=block_height,
-                    block_width=block_width,
-                    downsample_mode=downsample_mode,
-                )
-            continue
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(chunk_workers, len(blocks))
-        ) as executor:
-            futures = [
-                executor.submit(
-                    _write_downsample_block,
-                    source,
-                    target,
-                    block_y=block_y,
-                    block_x=block_x,
-                    block_height=block_height,
-                    block_width=block_width,
-                    downsample_mode=downsample_mode,
-                )
-                for block_y, block_x, block_height, block_width in blocks
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-
 def convert_image(
     input_path: Path,
     *,
@@ -567,20 +457,20 @@ def convert_image(
             image_shape=image_shape,
             dtype=dtype,
             levels=levels,
+            reduction=downsample_mode,
             overwrite=overwrite,
         )
         _write_streamed_tiff_level_zero(input_path, datasets[0])
-        _build_downsample_levels_from_zarr(
-            datasets,
+        _write_levels_above_zero(output_path, levels, downsample_mode, chunk_workers)
+    else:
+        write_label_pyramid(
+            load_image(input_path),
+            output_path,
+            levels=levels,
             downsample_mode=downsample_mode,
+            overwrite=overwrite,
             chunk_workers=chunk_workers,
         )
-    else:
-        image_YX = load_image(input_path)
-        pyramid = build_pyramid_with_mode(
-            image_YX, levels=levels, downsample_mode=downsample_mode
-        )
-        write_ome_zarr(pyramid, output_path, overwrite=overwrite)
     return {
         "status": "written",
         "input": str(input_path),

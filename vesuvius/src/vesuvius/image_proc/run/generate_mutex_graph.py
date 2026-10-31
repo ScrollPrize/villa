@@ -12,9 +12,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import tifffile
-import zarr
-from numcodecs import Blosc
-from vesuvius.data.utils import open_zarr_group, create_zarr_array
+from vc_reader.reader import create_group
 from scipy import ndimage
 from tqdm import tqdm
 
@@ -242,7 +240,6 @@ def process_volume(
 
     # Conservative chunk shape with channel-leading layout
     chunk_shape = (1,) + tuple(min(64, s) for s in labels.shape)
-    compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
 
     output_path = output_dir / f"{path.stem}.zarr"
     if output_path.exists():
@@ -253,7 +250,12 @@ def process_volume(
         else:
             output_path.unlink()
 
-    root = open_zarr_group(str(output_path), mode="w")
+    root = create_group(str(output_path), overwrite=True, auth=None)
+
+    def write_array(name, data, chunks):
+        root.create_array(
+            name, shape=data.shape, chunks=chunks, dtype=data.dtype, cname="zstd", level=5, shuffle=2
+        )[...] = data
 
     # Determine minimal lossless dtypes
     attr_dtype = _select_min_lossless_dtype(attractive)
@@ -263,45 +265,15 @@ def process_volume(
     mask_rep_dtype = np.uint8 if _is_binary_array(repulsive_mask) else _select_min_lossless_dtype(repulsive_mask)
 
     # Cast on write to avoid holding two copies if possible
-    create_zarr_array(
-        root,
-        "affinities/attractive",
-        data=attractive.astype(attr_dtype, copy=False),
-        compressor=compressor,
-        chunks=chunk_shape,
-    )
-    create_zarr_array(
-        root,
-        "affinities/repulsive",
-        data=repulsive.astype(rep_dtype, copy=False),
-        compressor=compressor,
-        chunks=chunk_shape,
-    )
-    create_zarr_array(
-        root,
-        "mask/attractive",
-        data=attractive_mask.astype(mask_attr_dtype, copy=False),
-        compressor=compressor,
-        chunks=chunk_shape,
-    )
-    create_zarr_array(
-        root,
-        "mask/repulsive",
-        data=repulsive_mask.astype(mask_rep_dtype, copy=False),
-        compressor=compressor,
-        chunks=chunk_shape,
-    )
+    write_array("affinities/attractive", attractive.astype(attr_dtype, copy=False), chunk_shape)
+    write_array("affinities/repulsive", repulsive.astype(rep_dtype, copy=False), chunk_shape)
+    write_array("mask/attractive", attractive_mask.astype(mask_attr_dtype, copy=False), chunk_shape)
+    write_array("mask/repulsive", repulsive_mask.astype(mask_rep_dtype, copy=False), chunk_shape)
 
     if cfg.store_labels:
         max_label = int(labels.max(initial=0)) if labels.size else 0
         label_dtype = _min_uint_dtype(max_label)
-        create_zarr_array(
-            root,
-            "labels",
-            data=labels.astype(label_dtype, copy=False),
-            compressor=compressor,
-            chunks=tuple(min(64, s) for s in labels.shape),
-        )
+        write_array("labels", labels.astype(label_dtype, copy=False), tuple(min(64, s) for s in labels.shape))
 
     root.attrs.update(
         {
