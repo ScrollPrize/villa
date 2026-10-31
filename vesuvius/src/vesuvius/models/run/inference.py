@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import zarr
 import os
 import errno
 try:
@@ -12,8 +11,6 @@ import hashlib
 import multiprocessing
 import subprocess
 import threading
-import fsspec
-import numcodecs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
@@ -21,7 +18,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.data.vc_dataset import VCDataset
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
@@ -427,13 +424,8 @@ class Inferer():
         if output_dir:
             self.output_dir = output_dir
             
-            # For S3 paths, use fsspec.filesystem.makedirs
-            if self.output_dir.startswith('s3://'):
-                fs = fsspec.filesystem('s3', anon=False)
-                fs.makedirs(self.output_dir, exist_ok=True)
-                print(f"Created S3 output directory: {self.output_dir}")
-            else:
-                # For local paths, use os.makedirs
+            # S3 has no directories to make
+            if not self.output_dir.startswith('s3://'):
                 os.makedirs(self.output_dir, exist_ok=True)
         else:
             raise ValueError("Output directory must be provided.")
@@ -934,21 +926,13 @@ class Inferer():
         
         return concatenated
         
-    def _get_zarr_compressor(self):
-        # numcodecs.Blosc, not zarr.Blosc: zarr 3 dropped that re-export, and the rest
-        # of the package (blending, finalize_outputs) already builds compressors here.
-        shuffle = numcodecs.blosc.SHUFFLE
+    def _zarr_codec(self):
         name = self.compressor_name.lower()
-        if name == 'zstd':
-            return numcodecs.Blosc(cname='zstd', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'lz4':
-            return numcodecs.Blosc(cname='lz4', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'zlib':
-            return numcodecs.Blosc(cname='zlib', clevel=self.compression_level, shuffle=shuffle)
-        elif name == 'none':
-            return None
-        else:
-            return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
+        if name == 'none':
+            return {'compressor': None}
+        if name in ('zstd', 'lz4', 'zlib'):
+            return {'cname': name, 'level': self.compression_level, 'shuffle': 1}
+        return {'cname': 'zstd', 'level': 1, 'shuffle': 1}
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
@@ -956,24 +940,23 @@ class Inferer():
         # An empty patch list is valid: we still write zarrs with shape[0]=0 so
         # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
-        compressor = self._get_zarr_compressor()
+        codec = self._zarr_codec()
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
         output_chunks = (1, self.num_classes, *self.patch_size)  # we align chunks to patch size for better write performance
         main_store_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
         
         print(f"Creating output store at: {main_store_path}")
         
-        self.output_store = open_zarr(
-            path=main_store_path, 
-            mode='w',  
-            storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        # We skip empty chunks here so we don't write all zero patches to the array but keep
+        # the proper indices for later re-zarring.
+        self.output_store = ZarrWriter.create(
+            main_store_path,
             shape=output_shape,
             chunks=output_chunks,
-            dtype=np.float16,  
-            compressor=compressor,
-            write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
-                                      # the proper indices for later re-zarring 
+            dtype=np.float16,
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
@@ -985,16 +968,14 @@ class Inferer():
         
         print(f"Creating coordinates store at: {self.coords_store_path}")
         
-        coords_store = open_zarr(
-            path=self.coords_store_path,
-            mode='w',
-            storage_options={'anon': False} if self.coords_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        coords_store = ZarrWriter.create(
+            self.coords_store_path,
             shape=coord_shape,
             chunks=coord_chunks,
             dtype=np.int32,
-            compressor=compressor,
-            write_empty_chunks=False  
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created coordinates zarr array at {self.coords_store_path} with shape {coords_store.shape}")
@@ -1069,8 +1050,6 @@ class Inferer():
         return self.output_store
 
     def _process_batches(self):
-        numcodecs.blosc.use_threads = False
-
         self.current_patch_write_index = 0
         max_workers = self.writer_workers if self.writer_workers is not None else min(16, os.cpu_count() or 4)
 
@@ -1416,21 +1395,18 @@ def main():
         logits_path, coords_path = result
 
         if logits_path and coords_path:
-            # Check if paths exist, using fsspec for S3 paths
+            # Check if paths exist
             logits_exists = False
             coords_exists = False
             
             try:
                 if logits_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    # Check if .zarray file exists within the zarr directory
-                    logits_exists = fs.exists(os.path.join(logits_path, '.zarray'))
+                    logits_exists = ObjectStore(logits_path).exists('.zarray')
                 else:
                     logits_exists = os.path.exists(logits_path)
                     
                 if coords_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
+                    coords_exists = ObjectStore(coords_path).exists('.zarray')
                 else:
                     coords_exists = os.path.exists(coords_path)
             except Exception as e:
@@ -1445,11 +1421,7 @@ def main():
 
                 print("\n--- Inspecting Output Store ---")
                 try:
-                    output_store = open_zarr(
-                        path=logits_path,
-                        mode='r',
-                        storage_options={'anon': False} if logits_path.startswith('s3://') else None
-                    )
+                    output_store = open_zarr(logits_path)
                     print(f"Output shape: {output_store.shape}")
                     print(f"Output dtype: {output_store.dtype}")
                     print(f"Output chunks: {output_store.chunks}")
@@ -1468,11 +1440,7 @@ def main():
 
                 print("\n--- Inspecting Coordinate Store ---")
                 try:
-                    coords_store = open_zarr(
-                        path=coords_path,
-                        mode='r',
-                        storage_options={'anon': False} if coords_path.startswith('s3://') else None
-                    )
+                    coords_store = open_zarr(coords_path)
                     print(f"Coords shape: {coords_store.shape}")
                     print(f"Coords dtype: {coords_store.dtype}")
                     first_few_coords = coords_store[0:5]

@@ -8,13 +8,11 @@ import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import fsspec
-import numcodecs
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -53,13 +51,7 @@ class SpatialPatchGrid:
 
         Raises ValueError if the format doesn't match expectations.
         """
-        zarray_path = os.path.join(logits_path, '.zarray')
-        if logits_path.startswith('s3://'):
-            with fsspec.open(zarray_path, 'r', anon=False) as f:
-                zarray = json.load(f)
-        else:
-            with open(zarray_path, 'r') as f:
-                zarray = json.load(f)
+        zarray = json.loads(ObjectStore(logits_path).read('.zarray'))
 
         zarr_format = zarray.get('zarr_format')
         if zarr_format != 2:
@@ -91,13 +83,7 @@ class SpatialPatchGrid:
                 except ValueError:
                     warnings.warn(f"Non-integer patch index in chunk filename '{filename}' in {logits_path}")
 
-        if logits_path.startswith('s3://'):
-            fs = fsspec.filesystem('s3', anon=False)
-            zarr_path = logits_path.replace('s3://', '')
-            files = fs.ls(zarr_path, detail=False)
-            _parse_chunk_files(f.split('/')[-1] for f in files)
-        else:
-            _parse_chunk_files(os.listdir(logits_path))
+        _parse_chunk_files(ObjectStore(logits_path).keys())
 
         non_empty_mask = np.zeros(total_patches, dtype=bool)
         if non_empty_indices:
@@ -107,30 +93,22 @@ class SpatialPatchGrid:
 
     def _load_or_compute_non_empty(self, logits_path):
         """Load or compute non-empty patch mask."""
-        cache_path = os.path.join(logits_path, '.non_empty_patch_idxs.json')
+        cache_name = '.non_empty_patch_idxs.json'
+        store = ObjectStore(logits_path)
 
         # Try to load from cache
         try:
-            if logits_path.startswith('s3://'):
-                with fsspec.open(cache_path, 'r', anon=False) as f:
-                    data = json.load(f)
-            else:
-                if os.path.exists(cache_path):
-                    with open(cache_path, 'r') as f:
-                        data = json.load(f)
-                else:
-                    data = None
-
+            data = store.read(cache_name)
             if data:
+                data = json.loads(data)
                 non_empty_mask = np.zeros(data['num_patches'], dtype=bool)
                 non_empty_mask[data['non_empty_indices']] = True
                 return non_empty_mask
         except Exception as e:
-            warnings.warn(f"Failed to load non-empty cache from {cache_path}: {e}")
+            warnings.warn(f"Failed to load non-empty cache from {logits_path}/{cache_name}: {e}")
 
         # Compute it
-        logits_store = open_zarr(logits_path, mode='r',
-                                storage_options={'anon': False} if logits_path.startswith('s3://') else None)
+        logits_store = open_zarr(logits_path)
         total_patches = logits_store.shape[0]
 
         non_empty_mask = self._compute_non_empty_from_chunks(logits_path, total_patches)
@@ -141,14 +119,9 @@ class SpatialPatchGrid:
                 'num_patches': int(total_patches),
                 'non_empty_indices': np.where(non_empty_mask)[0].tolist()
             }
-            if logits_path.startswith('s3://'):
-                with fsspec.open(cache_path, 'w', anon=False) as f:
-                    json.dump(data, f)
-            else:
-                with open(cache_path, 'w') as f:
-                    json.dump(data, f)
+            store.write(cache_name, json.dumps(data))
         except Exception as e:
-            warnings.warn(f"Failed to save non-empty cache to {cache_path}: {e}")
+            warnings.warn(f"Failed to save non-empty cache to {logits_path}/{cache_name}: {e}")
 
         return non_empty_mask
 
@@ -177,14 +150,10 @@ class SpatialPatchGrid:
         """Load aggregate bbox cache from parent directory."""
         cache_path = os.path.join(parent_dir, '.bbox_cache.json')
         try:
-            if parent_dir.startswith('s3://'):
-                with fsspec.open(cache_path, 'r', anon=False) as f:
-                    cache_data = json.load(f)
-            else:
-                if not os.path.exists(cache_path):
-                    return None
-                with open(cache_path, 'r') as f:
-                    cache_data = json.load(f)
+            cache_data = ObjectStore(parent_dir).read('.bbox_cache.json')
+            if cache_data is None:
+                return None
+            cache_data = json.loads(cache_data)
             return {int(k): v for k, v in cache_data.items()}
         except Exception as e:
             warnings.warn(f"Failed to load bbox cache from {cache_path}: {e}")
@@ -195,12 +164,7 @@ class SpatialPatchGrid:
         cache_path = os.path.join(parent_dir, '.bbox_cache.json')
         try:
             cache_data = {str(k): v for k, v in self.bbox_cache.items()}
-            if parent_dir.startswith('s3://'):
-                with fsspec.open(cache_path, 'w', anon=False) as f:
-                    json.dump(cache_data, f, indent=2)
-            else:
-                with open(cache_path, 'w') as f:
-                    json.dump(cache_data, f, indent=2)
+            ObjectStore(parent_dir).write('.bbox_cache.json', json.dumps(cache_data, indent=2))
         except Exception as e:
             warnings.warn(f"Failed to save bbox cache to {cache_path}: {e}")
 
@@ -231,10 +195,9 @@ class SpatialPatchGrid:
             print(f"  Loading/computing bounding boxes for {len(part_ids)} parts...")
             for part_id in tqdm(part_ids, desc="Loading bboxes", **tqdm_kwargs):
                 coords_path = part_files[part_id]['coordinates']
-                coords_store = open_zarr(coords_path, mode='r',
-                                        storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+                coords_store = open_zarr(coords_path)
 
-                if hasattr(coords_store, 'attrs') and 'bbox' in coords_store.attrs:
+                if 'bbox' in coords_store.attrs:
                     self.bbox_cache[part_id] = dict(coords_store.attrs['bbox'])
                 else:
                     coords_np = coords_store[:]
@@ -263,8 +226,7 @@ class SpatialPatchGrid:
         for part_id in tqdm(relevant_parts, desc="Loading metadata", **tqdm_kwargs):
             if part_id not in self.coords_cache:
                 coords_path = part_files[part_id]['coordinates']
-                coords_store = open_zarr(coords_path, mode='r',
-                                        storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+                coords_store = open_zarr(coords_path)
                 self.coords_cache[part_id] = coords_store[:]
 
             logits_path = part_files[part_id]['logits']
@@ -394,8 +356,6 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         finalize_config: Optional FinalizeConfig. When set, chunks are finalized
             (softmax + uint8) inline instead of writing float16 blended logits.
     """
-    numcodecs.blosc.use_threads = False
-    storage_opts = {'anon': False} if is_s3 else None
     _worker_state.update({
         'part_files': part_files,
         'gaussian_map': gaussian_map,
@@ -403,7 +363,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'num_classes': num_classes,
         'is_s3': is_s3,
         'logits_stores': {},
-        'output_store': open_zarr(output_path, mode='r+', storage_options=storage_opts),
+        'output_store': ZarrWriter.open(output_path, skip_empty=True),
         'finalize_config': finalize_config,
     })
 
@@ -451,7 +411,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         if part_id not in logits_stores:
             logits_path = part_files[part_id]['logits']
             storage_opts = {'anon': False} if is_s3 else None
-            logits_stores[part_id] = open_zarr(logits_path, mode='r', storage_options=storage_opts)
+            # The worker pool already reads patches in parallel.
+            logits_stores[part_id] = open_zarr(logits_path, threads=1)
         logits_store = logits_stores[part_id]
 
         for patch_idx, z, y, x in patches:
@@ -619,7 +580,6 @@ def merge_inference_outputs(
         tqdm_kwargs['disable'] = True
 
     # blosc has an issuse with threading , so we disable it
-    numcodecs.blosc.use_threads = False
     if num_workers is None:
         # just use half the cpu count 
         num_workers = max(1, mp.cpu_count() // 2)
@@ -635,25 +595,8 @@ def merge_inference_outputs(
     part_pattern = re.compile(r"(logits|coordinates)_part_(\d+)\.zarr")
     print(f"Scanning for parts in: {parent_dir}")
     
-    # we need to use fsspec to work w/ s3 paths , as os.listdir doesn't work with s3
-    if parent_dir.startswith('s3://'):
-        fs = fsspec.filesystem('s3', anon=False)
-        # Remove 's3://' prefix for fs.ls()
-        parent_dir_no_prefix = parent_dir.replace('s3://', '')
-        # List directory to get all entries
-        full_paths = fs.ls(parent_dir_no_prefix)
-        
-        # For S3, strip the bucket name and path prefix to get just the directory name
-        # Each entry looks like: 'bucket/path/to/parent_dir/logits_part_0.zarr'
-        file_list = []
-        for path in full_paths:
-            path_parts = path.split('/')
-            filename = path_parts[-1]
-            file_list.append(filename)
-            
-    else:
-        file_list = os.listdir(parent_dir)
-        
+    file_list = ObjectStore(parent_dir).children()
+
     for filename in file_list:
         match = part_pattern.match(filename)
         if match:
@@ -677,26 +620,15 @@ def merge_inference_outputs(
     print(f"Reading metadata from part {first_part_id}...")
     part0_logits_path = part_files[first_part_id]['logits']
     try:
-        part0_logits_store = open_zarr(part0_logits_path, mode='r', storage_options={'anon': False} if part0_logits_path.startswith('s3://') else None)
+        part0_logits_store = open_zarr(part0_logits_path)
 
         input_chunks = part0_logits_store.chunks
         print(f"Input zarr chunk size: {input_chunks}")
 
-        try:
-            # Use the part0_logits_store's .attrs directly if available
-            meta_attrs = part0_logits_store.attrs
-            patch_size = tuple(meta_attrs['patch_size']) 
-            original_volume_shape = tuple(meta_attrs['original_volume_shape'])  # MUST exist
-            num_classes = part0_logits_store.shape[1]  # (N, C, pZ, pY, pX) -> C
-        except (KeyError, AttributeError):
-            # Fallback: try to read .zattrs file directly
-            zattrs_path = os.path.join(part0_logits_path, '.zattrs')
-            with fsspec.open(zattrs_path, 'r') as f:
-                meta_attrs = json.load(f)
-                
-            patch_size = tuple(meta_attrs['patch_size'])  
-            original_volume_shape = tuple(meta_attrs['original_volume_shape'])
-            num_classes = part0_logits_store.shape[1]
+        meta_attrs = part0_logits_store.attrs
+        patch_size = tuple(meta_attrs['patch_size'])
+        original_volume_shape = tuple(meta_attrs['original_volume_shape'])  # MUST exist
+        num_classes = part0_logits_store.shape[1]  # (N, C, pZ, pY, pX) -> C
 
     except Exception as e:
         traceback.print_exc()
@@ -743,13 +675,9 @@ def merge_inference_outputs(
 
 
     if compression_level > 0:
-        compressor = numcodecs.Blosc(
-            cname='zstd',
-            clevel=compression_level,
-            shuffle=numcodecs.blosc.SHUFFLE
-        )
+        codec = {'cname': 'zstd', 'level': compression_level, 'shuffle': 1}
     else:
-        compressor = None
+        codec = {'compressor': None}
 
     # --- 3. Create or Open Output Arrays ---
     if global_part_id == 0:
@@ -757,17 +685,14 @@ def merge_inference_outputs(
         print(f"Creating final output store: {output_path}")
         print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
 
-        open_zarr(
-            path=output_path,
-            mode='w',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose,
+        ZarrWriter.create(
+            output_path,
             shape=output_shape,
             chunks=output_chunks,
-            compressor=compressor,
             dtype=output_dtype,
             fill_value=0,
-            write_empty_chunks=False
+            overwrite=True,
+            **codec,
         )
     else:
         # Other parts wait for part 0 to create the arrays, then open them in r+ mode
@@ -928,27 +853,18 @@ def merge_inference_outputs(
     print(f"{'='*60}")
 
     # --- 10. Save Metadata ---
-    output_zarr = open_zarr(
-        path=output_path,
-        mode='r+',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None,
-        verbose=verbose
-    )
-    if hasattr(output_zarr, 'attrs'):
-        # Copy all attributes from the input part
-        if hasattr(part0_logits_store, 'attrs'):
-            for key, value in part0_logits_store.attrs.items():
-                output_zarr.attrs[key] = value
-        # Update/add specific attributes
-        output_zarr.attrs['patch_size'] = patch_size
-        output_zarr.attrs['original_volume_shape'] = original_volume_shape
-        output_zarr.attrs['sigma_scale'] = sigma_scale
+    output_zarr = ZarrWriter.open(output_path)
+    # Copy all attributes from the input part, then update/add specific ones
+    output_zarr.attrs.update(part0_logits_store.attrs)
+    output_zarr.attrs['patch_size'] = patch_size
+    output_zarr.attrs['original_volume_shape'] = original_volume_shape
+    output_zarr.attrs['sigma_scale'] = sigma_scale
 
-        # Add finalization metadata when in fused mode
-        if finalize_config is not None:
-            output_zarr.attrs['processing_mode'] = finalize_config.mode
-            output_zarr.attrs['threshold_applied'] = finalize_config.threshold
-            output_zarr.attrs['fused_blend_finalize'] = True
+    # Add finalization metadata when in fused mode
+    if finalize_config is not None:
+        output_zarr.attrs['processing_mode'] = finalize_config.mode
+        output_zarr.attrs['threshold_applied'] = finalize_config.threshold
+        output_zarr.attrs['fused_blend_finalize'] = True
 
     print(f"\n--- Merging Finished ---")
     print(f"Final merged output saved to: {output_path}")

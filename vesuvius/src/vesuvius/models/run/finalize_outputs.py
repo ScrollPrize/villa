@@ -4,14 +4,11 @@ from dataclasses import dataclass
 from typing import Optional
 from tqdm.auto import tqdm
 import argparse
-import zarr
-import fsspec
-import numcodecs
 import shutil
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -188,17 +185,10 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
     )
     
-    input_store = open_zarr(
-        path=input_path,
-        mode='r',
-        storage_options={'anon': False} if input_path.startswith('s3://') else None
-    )
+    # The worker pool already reads chunks in parallel.
+    input_store = open_zarr(input_path, threads=1)
     
-    output_store = open_zarr(
-        path=output_path,
-        mode='r+',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None
-    )
+    output_store = ZarrWriter.open(output_path, skip_empty=True)
     
     input_slice = (slice(None),) + spatial_slices
     logits_np = input_store[input_slice]
@@ -250,7 +240,6 @@ def finalize_logits(
     if not verbose:
         tqdm_kwargs['disable'] = True
 
-    numcodecs.blosc.use_threads = False
     
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() // 2)
@@ -261,22 +250,11 @@ def finalize_logits(
     if num_parts > 1:
         print(f"Partitioned finalization: Processing part {part_id}/{num_parts}")
 
-    compressor = numcodecs.Blosc(
-        cname='zstd',
-        clevel=1,  # compression level is 1 because we're only using this for mostly empty chunks
-        shuffle=numcodecs.blosc.SHUFFLE
-    )
-    
     threshold_enabled = threshold is not None
 
     print(f"Opening input logits: {input_path}")
     print(f"Mode: {mode}, Threshold: {threshold if threshold_enabled else 'off'}")
-    input_store = open_zarr(
-        path=input_path,
-        mode='r',
-        storage_options={'anon': False} if input_path.startswith('s3://') else None,
-        verbose=verbose
-    )
+    input_store = open_zarr(input_path)
     
     input_shape = input_store.shape
     num_classes = input_shape[0]
@@ -362,17 +340,17 @@ def finalize_logits(
         print(f"Creating output store: {output_path}")
         print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
 
-        output_store = open_zarr(
-            path=output_path,
-            mode='w',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose,
+        # Compression level is 1 because we're only using this for mostly empty chunks
+        output_store = ZarrWriter.create(
+            output_path,
             shape=output_shape,
             chunks=output_chunks,
             dtype=np.uint8,
-            compressor=compressor,
-            write_empty_chunks=False,
-            overwrite=True
+            cname='zstd',
+            level=1,
+            shuffle=1,
+            overwrite=True,
+            skip_empty=True,
         )
     else:
         # Other parts wait for part 0 to create the array, then open it in r+ mode
@@ -383,12 +361,7 @@ def finalize_logits(
         print(f"Array found! Opening in r+ mode for part {part_id}")
 
         # Open existing array in r+ mode (no need to specify shape/chunks)
-        output_store = open_zarr(
-            path=output_path,
-            mode='r+',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose
-        )
+        output_store = ZarrWriter.open(output_path, skip_empty=True)
 
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
@@ -482,15 +455,13 @@ def finalize_logits(
     # Only part 0 updates metadata to avoid conflicts
     if part_id == 0:
         try:
-            if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
-                for key in input_store.attrs:
-                    output_store.attrs[key] = input_store.attrs[key]
+            output_store.attrs.update(input_store.attrs)
 
-                output_store.attrs['processing_mode'] = mode
-                output_store.attrs['threshold_applied'] = threshold
-                output_store.attrs['empty_chunks_skipped'] = empty_chunks
-                output_store.attrs['total_chunks'] = total_chunks
-                output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+            output_store.attrs['processing_mode'] = mode
+            output_store.attrs['threshold_applied'] = threshold
+            output_store.attrs['empty_chunks_skipped'] = empty_chunks
+            output_store.attrs['total_chunks'] = total_chunks
+            output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
         except Exception as e:
             print(f"Warning: Failed to copy metadata: {e}")
     elif verbose:
@@ -500,17 +471,8 @@ def finalize_logits(
         # Only delete intermediates when not using partitioning
         print(f"Deleting intermediate logits: {input_path}")
         try:
-            # we have to use fsspec for s3/gs/azure paths 
-            # os module does not work well with them
-            if input_path.startswith(('s3://', 'gs://', 'azure://')):
-                fs_protocol = input_path.split('://', 1)[0]
-                fs = fsspec.filesystem(fs_protocol, anon=False if fs_protocol == 's3' else None)
-                
-                # Remove protocol prefix for fs operations
-                path_no_prefix = input_path.split('://', 1)[1]
-                
-                if fs.exists(path_no_prefix):
-                    fs.rm(path_no_prefix, recursive=True)
+            if input_path.startswith('s3://'):
+                if ObjectStore(input_path).remove_all():
                     print(f"Successfully deleted intermediate logits (remote path)")
             elif os.path.exists(input_path):
                 shutil.rmtree(input_path)
