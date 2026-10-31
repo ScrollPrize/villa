@@ -254,6 +254,31 @@ struct Writer::Impl {
     }
 };
 
+CreateOptions createOptionsLike(const ArrayMeta& meta)
+{
+    CreateOptions options;
+    options.shape = meta.shape;
+    options.chunks = meta.chunks;
+    options.dtype = meta.dtype;
+    options.separator = meta.separator;
+    options.fillValue = meta.raw.value("fill_value", Json(0));
+    options.compressor = meta.compressor.is_null() ? "none" : meta.compressor.at("id").get<std::string>();
+    if (!meta.compressor.is_null()) {
+        const auto encode = encodeOptions(meta.compressor);
+        options.level = options.compressor == "volcomp" ? int(encode.q) : encode.level;
+        options.cname = encode.cname;
+        options.shuffle = encode.shuffle;
+    }
+    if (meta.v3) {
+        options.version = 3;
+        options.shardIndexEnd = meta.v3->indexEnd;
+        options.shardIndexCrc = meta.v3->indexCrc;
+        for (std::size_t axis = 0; axis < meta.v3->shards.size(); ++axis)
+            options.shardShape.push_back(meta.v3->shards[axis] * meta.chunks[axis]);
+    }
+    return options;
+}
+
 Writer::Writer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Writer::Writer(Writer&&) noexcept = default;
 Writer& Writer::operator=(Writer&&) noexcept = default;

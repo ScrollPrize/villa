@@ -64,6 +64,10 @@ struct CreateOptions {
     bool shardIndexEnd = true, shardIndexCrc = true;
 };
 
+// What creates an array like `meta`: its shape, chunks, dtype, codec, separator, fill,
+// format and shards. Filters are not kept: Writer stores none.
+CreateOptions createOptionsLike(const ArrayMeta& meta);
+
 // A Zarr v2/v3 array, in a local directory or at an s3:// location, opened for writing.
 // Chunks are replaced atomically, so readers never see a partial chunk. Thread-safe for
 // distinct chunks in one process, including chunks sharing a shard. Separate processes
@@ -128,26 +132,38 @@ void writeAttributes(const std::filesystem::path& node, const Json& attributes, 
 
 // ---- writing pyramids -----------------------------------------------------------------
 
-// Numbered levels <root>/0, /1, ...: each level is the block mean of the level below,
-// reduced by `factors` (ZYX) per level.
+// How a block of the level below becomes one voxel. Mean: uint8, uint16, float32. Nearest:
+// the block's first voxel, any dtype. Mode: the most common nonzero value, the smallest on
+// a tie, zero when the block holds nothing else; any integer dtype.
+enum class Reduction { Mean, Nearest, Mode };
+// "mean", "nearest" or "mode".
+Reduction parseReduction(const std::string& name);
+
+// Numbered levels <root>/0, /1, ...: each level reduces the level below by `factors` (ZYX).
 struct PyramidOptions {
     int levels = 5;  // levels above level 0
     std::array<int, 3> factors{2, 2, 2};
     std::size_t threads = 0;  // output-chunk workers; 0: all cores
+    Reduction reduction = Reduction::Mean;
 };
 // Creates the arrays of levels 1..levels (metadata only) to go with a level 0 created
 // from `level0`: the same dtype, codec and chunks, chunks capped to each level's shape.
 void createPyramidLevels(const std::filesystem::path& root, const CreateOptions& level0, const PyramidOptions& options);
+// The same for the level 0 already stored at <root>/0. `overwrite` replaces existing levels.
+void createPyramidLevels(const std::filesystem::path& root, const PyramidOptions& options, bool overwrite = false);
 // Output chunks [begin, end), clamped to the level's chunk grid.
 struct ChunkRange {
     Index begin, end;
 };
-// Writes `level` from level - 1 on disk (uint8, uint16, float32). Chunks that come out
-// entirely fill are not stored. Separate processes may write disjoint ranges. Integer
-// means round to nearest, ties to even. `progress(done, total)` may run on any worker.
+// Writes `level` from level - 1 on disk. Chunks that come out entirely fill are not
+// stored. Separate processes may write disjoint ranges. Integer means round to nearest,
+// ties to even. `progress(done, total)` may run on any worker.
 void writePyramidLevel(const std::filesystem::path& root, int level, const PyramidOptions& options,
                        const std::optional<ChunkRange>& range = std::nullopt,
                        const std::function<void(std::size_t, std::size_t)>& progress = {});
+
+// Creates and writes every level above the level 0 stored at <root>/0.
+void writePyramid(const std::filesystem::path& root, const PyramidOptions& options, bool overwrite = false);
 
 struct MultiscalesOptions {
     std::string name = "image";
@@ -155,9 +171,12 @@ struct MultiscalesOptions {
     std::array<int, 3> factors{2, 2, 2};
     std::array<double, 3> scale{1, 1, 1};  // level 0's voxel size per axis (ZYX); level factors without a unit
     std::string unit;                      // axis unit of a physical scale; empty declares none
+    Reduction reduction = Reduction::Mean;
+    std::array<std::string, 3> axes{"z", "y", "x"};
 };
 // One OME-NGFF 0.4 "multiscales" entry for such a pyramid, with each level's scale and
-// the translation that centres its voxels on the blocks they reduce.
+// the translation that centres its voxels on the blocks they reduce. A Nearest voxel is
+// its block's first voxel, so it has no translation.
 Json omeMultiscales(const MultiscalesOptions& options);
 
 }  // namespace vcr::zarr

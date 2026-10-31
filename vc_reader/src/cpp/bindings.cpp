@@ -418,6 +418,21 @@ NB_MODULE(_reader, m)
             return Writer::create(path, options, access);
         }, "path"_a, "shape"_a, "chunks"_a, "dtype"_a, "compressor"_a, "level"_a, "cname"_a, "shuffle"_a, "overwrite"_a,
            "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "access"_a)
+        .def_static("create_like", [](const std::string& path, const ArrayMeta& like, const std::optional<vcr::Index>& shape,
+                                      const std::optional<vcr::Index>& chunks, const std::optional<std::string>& dtype,
+                                      const nb::object& fill, const std::optional<std::string>& separator, bool overwrite,
+                                      const vcr::zarr::Access& access) {
+            auto options = vcr::zarr::createOptionsLike(like);
+            if (shape) options.shape = *shape;
+            if (chunks) options.chunks = *chunks;
+            if (dtype) options.dtype = *dtype;
+            if (!fill.is_none()) options.fillValue = to_json(fill);
+            if (separator) options.separator = *separator;
+            options.overwrite = overwrite;
+            nb::gil_scoped_release release;
+            return Writer::create(path, options, access);
+        }, "path"_a, "like"_a, "shape"_a.none(), "chunks"_a.none(), "dtype"_a.none(), "fill_value"_a.none(), "separator"_a.none(),
+           "overwrite"_a, "access"_a)
         .def_static("open", [](const std::string& path, const vcr::zarr::Access& access) {
             nb::gil_scoped_release release;
             return Writer::open(path, access);
@@ -509,6 +524,48 @@ NB_MODULE(_reader, m)
     }, "path"_a, "access"_a);
     m.def("node_children", [](const std::string& path, const Access& access) { return vcr::zarr::nodeChildren(path, access); },
           "path"_a, "access"_a, nb::call_guard<nb::gil_scoped_release>());
+
+    const auto pyramidOptions = [](int levels, const std::array<int, 3>& factors, const std::string& reduction, std::size_t threads) {
+        vcr::zarr::PyramidOptions options;
+        options.levels = levels;
+        options.factors = factors;
+        options.reduction = vcr::zarr::parseReduction(reduction);
+        options.threads = threads;
+        return options;
+    };
+    m.def("create_pyramid_levels", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors, bool overwrite) {
+        const auto options = pyramidOptions(levels, factors, "mean", 0);
+        nb::gil_scoped_release release;
+        vcr::zarr::createPyramidLevels(root, options, overwrite);
+    }, "root"_a, "levels"_a, "factors"_a, "overwrite"_a);
+    m.def("write_pyramid_level", [pyramidOptions](const std::string& root, int level, const std::array<int, 3>& factors,
+                                                  const std::string& reduction, std::size_t threads,
+                                                  const std::optional<vcr::Index>& begin, const std::optional<vcr::Index>& end) {
+        const auto options = pyramidOptions(level, factors, reduction, threads);
+        std::optional<vcr::zarr::ChunkRange> range;
+        if (begin && end)
+            range = vcr::zarr::ChunkRange{*begin, *end};
+        nb::gil_scoped_release release;
+        vcr::zarr::writePyramidLevel(root, level, options, range);
+    }, "root"_a, "level"_a, "factors"_a, "reduction"_a, "threads"_a, "begin"_a.none(), "end"_a.none());
+    m.def("write_pyramid", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors,
+                                            const std::string& reduction, std::size_t threads, bool overwrite) {
+        const auto options = pyramidOptions(levels, factors, reduction, threads);
+        nb::gil_scoped_release release;
+        vcr::zarr::writePyramid(root, options, overwrite);
+    }, "root"_a, "levels"_a, "factors"_a, "reduction"_a, "threads"_a, "overwrite"_a);
+    m.def("ome_multiscales", [](const std::string& name, int levels, const std::array<int, 3>& factors, const std::array<double, 3>& scale,
+                                const std::string& unit, const std::string& reduction, const std::array<std::string, 3>& axes) {
+        vcr::zarr::MultiscalesOptions options;
+        options.name = name;
+        options.levels = levels;
+        options.factors = factors;
+        options.scale = scale;
+        options.unit = unit;
+        options.reduction = vcr::zarr::parseReduction(reduction);
+        options.axes = axes;
+        return py_json(vcr::zarr::omeMultiscales(options));
+    }, "name"_a, "levels"_a, "factors"_a, "scale"_a, "unit"_a, "reduction"_a, "axes"_a);
 
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,

@@ -484,6 +484,65 @@ void pyramids(const fs::path& root)
 
 }  // namespace
 
+static void pyramidReductions(const fs::path& root)
+{
+    using namespace vcr::zarr;
+    const auto dir = root / "reductions";
+    CreateOptions create;
+    create.shape = {2, 2, 3};
+    create.chunks = {2, 2, 2};
+    create.dtype = "<u4";
+    create.cname = "zstd";
+    create.shuffle = 2;
+    create.separator = "/";
+    auto level0 = Writer::create(dir / "0", create);
+    const std::vector<std::uint32_t> voxels{7, 7, 9,  0, 5, 9,  5, 5, 0,  0, 0, 0};
+    level0.writeRegion({0, 0, 0}, {2, 2, 3}, reinterpret_cast<const std::uint8_t*>(voxels.data()));
+
+    const auto like = createOptionsLike(level0.meta());
+    if (like.cname != "zstd" || like.shuffle != 2 || like.separator != "/" || like.dtype != "<u4" || like.shape != create.shape)
+        throw std::runtime_error("createOptionsLike keeps the array's layout and codec");
+
+    PyramidOptions options;
+    options.levels = 1;
+    const auto level1 = [&](Reduction reduction) {
+        options.reduction = reduction;
+        writePyramid(dir, options, true);
+        auto written = Writer::open(dir / "1");
+        if (written.meta().shape != vcr::Index({1, 1, 2}) || written.meta().compressor.value("cname", "") != "zstd")
+            throw std::runtime_error("levels follow level 0");
+        return read(written.reader(), {0, 0, 0}, {1, 1, 2}, 4);
+    };
+    const auto values = [](const std::vector<std::uint8_t>& bytes) {
+        std::vector<std::uint32_t> out(bytes.size() / 4);
+        std::memcpy(out.data(), bytes.data(), bytes.size());
+        return out;
+    };
+    // First block {7,7,0,5, 5,5,0,0}: 5 three times beats 7 twice, zeros do not count.
+    if (values(level1(Reduction::Mode)) != std::vector<std::uint32_t>{5, 9})
+        throw std::runtime_error("mode is the most common nonzero value");
+    if (values(level1(Reduction::Nearest)) != std::vector<std::uint32_t>{7, 9})
+        throw std::runtime_error("nearest is the block's first voxel");
+    bool refused = false;
+    try {
+        level1(Reduction::Mean);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    if (!refused)
+        throw std::runtime_error("mean refuses uint32");
+
+    MultiscalesOptions ome;
+    ome.levels = 1;
+    ome.reduction = Reduction::Nearest;
+    ome.axes = {"x", "z", "y"};
+    const auto entry = omeMultiscales(ome);
+    if (entry.at("axes").at(0).at("name") != "x" ||
+        entry.at("datasets").at(1).at("coordinateTransformations").at(1).at("translation").at(0) != 0.0 ||
+        entry.at("metadata").at("downsampling_method") != "nearest")
+        throw std::runtime_error("nearest multiscales declare no translation");
+}
+
 static void generalOptions(const fs::path& root)
 {
     using namespace vcr::zarr;
@@ -542,6 +601,7 @@ int main()
     try {
         fs::create_directories(root);
         generalOptions(root);
+        pyramidReductions(root);
         for (int version : {2, 3}) {
             const auto dir = root / std::to_string(version);
             codecs(dir, version);

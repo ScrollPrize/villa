@@ -163,6 +163,33 @@ class ZarrWriter:
         return cls(native, skip_empty, access)
 
     @classmethod
+    def create_like(
+        cls,
+        path: str | os.PathLike[str],
+        source: ZarrReader | ZarrWriter,
+        *,
+        shape: Sequence[int] | None = None,
+        chunks: Sequence[int] | None = None,
+        dtype: Any = None,
+        fill_value: Any = None,
+        separator: str | None = None,
+        overwrite: bool = False,
+        skip_empty: bool = False,
+        auth: Any = "aws",
+    ) -> ZarrWriter:
+        """An array like ``source``: its shape, chunks, dtype, codec, separator, fill, format and
+        shards, except for what is given here. Filters and attributes are not kept.
+        """
+        path = os.fspath(path)
+        access = _write_access(path, auth)
+        like = source._native.meta if isinstance(source, ZarrWriter) else source.meta._native
+        native = _reader.Writer.create_like(
+            path, like, None if shape is None else [int(n) for n in shape],
+            None if chunks is None else [int(n) for n in chunks], None if dtype is None else np.dtype(dtype).str,
+            _plain(fill_value), separator, bool(overwrite), access)
+        return cls(native, skip_empty, access)
+
+    @classmethod
     def open(cls, path: str | os.PathLike[str], *, skip_empty: bool = False, auth: Any = "aws") -> ZarrWriter:
         """An existing array."""
         path = os.fspath(path)
@@ -282,4 +309,41 @@ def create_group(path: str | os.PathLike[str], *, attrs: dict[str, Any] | None =
     return ZarrWriteGroup(path, version, access)
 
 
-__all__ = ["ObjectStore", "ZarrWriter", "ZarrWriteGroup", "create_group"]
+def create_pyramid_levels(root: str | os.PathLike[str], levels: int, *, factors: Sequence[int] = (2, 2, 2),
+                          overwrite: bool = False) -> None:
+    """Create local arrays ``root/1 .. root/levels`` (metadata only) to go with ``root/0``: its dtype and
+    codec, its chunks capped to each level's shape, each shape the level below divided by ``factors``, rounded up.
+    """
+    _reader.create_pyramid_levels(os.fspath(root), int(levels), [int(f) for f in factors], bool(overwrite))
+
+
+def write_pyramid_level(root: str | os.PathLike[str], level: int, *, factors: Sequence[int] = (2, 2, 2),
+                        reduction: str = "mean", threads: int = 0,
+                        chunk_range: tuple[Sequence[int], Sequence[int]] | None = None) -> None:
+    """Write local ``root/level`` from the level below. ``reduction``: ``mean`` (uint8, uint16, float32;
+    integers round to nearest, ties to even), ``nearest`` (a block's first voxel, any dtype) or ``mode``
+    (most common nonzero value, smallest on a tie; integers). Chunks entirely fill are not stored. ``chunk_range`` is
+    ``(begin, end)`` in output chunks, so separate processes can write disjoint ranges.
+    """
+    begin, end = (None, None) if chunk_range is None else ([int(n) for n in chunk_range[0]], [int(n) for n in chunk_range[1]])
+    _reader.write_pyramid_level(os.fspath(root), int(level), [int(f) for f in factors], reduction, int(threads), begin, end)
+
+
+def write_pyramid(root: str | os.PathLike[str], levels: int, *, factors: Sequence[int] = (2, 2, 2),
+                  reduction: str = "mean", threads: int = 0, overwrite: bool = False) -> None:
+    """Create and write ``root/1 .. root/levels`` from the local level 0 at ``root/0``.
+    See :func:`create_pyramid_levels` and :func:`write_pyramid_level`.
+    """
+    _reader.write_pyramid(os.fspath(root), int(levels), [int(f) for f in factors], reduction, int(threads), bool(overwrite))
+
+
+def ome_multiscales(*, name: str = "image", levels: int = 5, factors: Sequence[int] = (2, 2, 2),
+                    scale: Sequence[float] = (1.0, 1.0, 1.0), unit: str = "", reduction: str = "mean",
+                    axes: Sequence[str] = ("z", "y", "x")) -> dict[str, Any]:
+    """One OME-NGFF 0.4 ``multiscales`` entry for a pyramid with ``levels`` levels above level 0."""
+    return _reader.ome_multiscales(name, int(levels), [int(f) for f in factors], [float(s) for s in scale], unit, reduction,
+                                   [str(a) for a in axes])
+
+
+__all__ = ["ObjectStore", "ZarrWriter", "ZarrWriteGroup", "create_group", "create_pyramid_levels", "ome_multiscales",
+           "write_pyramid", "write_pyramid_level"]

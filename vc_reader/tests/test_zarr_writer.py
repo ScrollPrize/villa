@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 import zarr
 
-from vc_reader.reader import ZarrWriter, create_group, open_node, open_zarr
+from vc_reader.reader import (ZarrReader, ZarrWriter, create_group, create_pyramid_levels, ome_multiscales, open_node, open_zarr,
+                              write_pyramid, write_pyramid_level)
 
 
 def test_writes_read_back_through_zarr_and_vc_reader(tmp_path):
@@ -77,3 +78,36 @@ def test_v3_sharded(tmp_path):
     w[:] = 5
     assert zarr.open_array(tmp_path / "a", mode="r").shards == (4, 4)
     np.testing.assert_array_equal(open_zarr(tmp_path / "a")[:], np.full((8, 8), 5))
+
+
+def test_create_like_keeps_layout_and_codec(tmp_path):
+    source = ZarrWriter.create(tmp_path / "a", shape=(8, 8), chunks=(4, 4), dtype="u2", cname="zstd", shuffle=2, level=5,
+                               separator="/", fill_value=3)
+    copy = ZarrWriter.create_like(tmp_path / "b", ZarrReader.open(source.path))
+    assert copy.shape == (8, 8) and copy.chunks == (4, 4) and copy.dtype == np.uint16 and copy.fill_value == 3
+    assert ZarrReader.open(copy.path).compressor == ZarrReader.open(source.path).compressor
+    assert ZarrReader.open(copy.path).meta.separator == "/"
+    changed = ZarrWriter.create_like(tmp_path / "c", source, shape=(2, 2), chunks=(1, 1), dtype="u1", fill_value=0, separator=".")
+    assert changed.shape == (2, 2) and changed.dtype == np.uint8 and changed.fill_value == 0
+    assert ZarrReader.open(changed.path).meta.separator == "."
+
+
+@pytest.mark.parametrize(("reduction", "expected"), [("mean", 6), ("nearest", 7), ("mode", 5)])
+def test_write_pyramid_reductions(tmp_path, reduction, expected):
+    level0 = ZarrWriter.create(tmp_path / "0", shape=(2, 2, 2), chunks=(2, 2, 2), dtype="u1")
+    level0[...] = np.array([7, 7, 0, 5, 5, 5, 8, 8], np.uint8).reshape(2, 2, 2)
+    write_pyramid(tmp_path, 1, reduction=reduction, overwrite=True)
+    assert ZarrReader.open(tmp_path / "1")[0, 0, 0] == expected
+
+
+def test_write_pyramid_level_ranges_and_multiscales(tmp_path):
+    level0 = ZarrWriter.create(tmp_path / "0", shape=(1, 5, 5), chunks=(1, 2, 2), dtype="u1")
+    level0[...] = 9
+    create_pyramid_levels(tmp_path, 1, factors=(1, 2, 2))
+    assert ZarrReader.open(tmp_path / "1").shape == (1, 3, 3)
+    write_pyramid_level(tmp_path, 1, factors=(1, 2, 2), chunk_range=((0, 0, 0), (1, 1, 99)))
+    level1 = ZarrReader.open(tmp_path / "1")
+    assert level1[0, 0, 0] == 9 and level1[0, 2, 0] == 0
+    entry = ome_multiscales(levels=1, factors=(1, 2, 2), reduction="nearest", axes=("x", "z", "y"))
+    assert [axis["name"] for axis in entry["axes"]] == ["x", "z", "y"]
+    assert entry["datasets"][1]["coordinateTransformations"][1]["translation"] == [0.0, 0.0, 0.0]
