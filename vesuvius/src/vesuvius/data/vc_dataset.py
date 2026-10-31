@@ -10,20 +10,42 @@ from pathlib import Path
 
 # Assuming these are in the correct relative paths
 from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
-from vesuvius.data.volume import Volume
-# Import utility functions directly from vesuvius package
-from vesuvius.utils import list_files, is_aws_ec2_instance
-# Import get_max_value from data.utils to avoid import errors
-from vesuvius.data.utils import get_max_value, open_zarr
+import vc_reader.transforms as A
+from vc_reader.reader import ZarrGroup, open_node
 from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
+
+def _normalization_pipeline(scheme, global_mean, global_std, intensity_props):
+    """The transform of a normalization scheme; None for ``none``."""
+    if scheme == 'none':
+        return None
+    if scheme == 'instance_zscore':
+        transform = A.Normalize('zscore', nonzero=False, eps=1e-8)
+    elif scheme == 'global_zscore':
+        if global_mean is None or global_std is None:
+            raise ValueError("global_mean and global_std must be provided when normalization_scheme is 'global_zscore'")
+        transform = A.Normalize('fixed', center=float(global_mean), scale=max(float(global_std), 1e-8))
+    elif scheme == 'instance_minmax':
+        transform = A.Normalize('minmax')
+    elif scheme == 'percentile_minmax':
+        transform = A.Normalize('percentile', lower=1.0, upper=99.0)
+    elif scheme == 'ct':
+        required = ['mean', 'std', 'percentile_00_5', 'percentile_99_5']
+        if not intensity_props or not all(key in intensity_props for key in required):
+            raise ValueError(f"CT normalization requires intensity_props with keys: {required}")
+        transform = A.Normalize(
+            'fixed', center=float(intensity_props['mean']), scale=max(float(intensity_props['std']), 1e-8),
+            bounds=(float(intensity_props['percentile_00_5']), float(intensity_props['percentile_99_5'])))
+    else:
+        raise ValueError(f"Invalid normalization_scheme: {scheme!r}")
+    return A.Pipeline([transform], backend='cpu')
+
 
 class VCDataset(Dataset):
     def __init__(
             self,
             input_path: str,
             patch_size: Tuple[int, int, int],
-            num_input_channels: Optional[int] = None, # Can often be inferred from Volume
-            input_format: str = 'zarr', # Less critical now, type inferred from input_path/params
+            num_input_channels: Optional[int] = None, # Can often be inferred from the array
             step_size: float = 0.5,
             verbose: bool = False,
             mode: str = 'infer', # Currently only 'infer' logic is fully implemented
@@ -31,37 +53,26 @@ class VCDataset(Dataset):
             part_id: int = 0,
             bbox: Optional[Tuple[int, int, int, int, int, int]] = None,
             targets = None,  # Added targets parameter with None default
-            # --- Volume Class Pass-through Parameters ---
-            scroll_id: Optional[Union[int, str]] = None,
-            energy: Optional[int] = None,
-            resolution: Optional[float] = None,
-            segment_id: Optional[int] = None,
             normalization_scheme: str = 'instance_zscore', # Default to instance z-score
             global_mean: Optional[float] = None,
             global_std: Optional[float] = None,
             intensity_props: Optional[dict] = None,
             return_as_type: str = 'np.float16', # Default float type for model input
-            # return_as_tensor: bool = True, # Forcing True below
-            domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
-            read_retries: int = 4,  # Attempts per read, forwarded to Volume
             cache: bool = False,
             cache_size_mb: int = 256,
+            io_threads: Optional[int] = None,  # Reader threads; 1 inside DataLoader workers
             ):
         """
-        Dataset for nnUNet inference using the Volume class for data access and preprocessing.
-
-        Handles local/remote Zarr, scrolls, and segments uniformly via Volume.
+        Dataset for nnUNet inference over a local or remote Zarr array or OME-Zarr group (level 0).
 
         Args:
-            input_path: Path to input data (local/remote Zarr, scroll ID, segment ID).
+            input_path: Path or URL of the input Zarr. ``vc_reader.catalog`` finds those of published volumes.
             targets: Output targets configuration (currently unused in inference).
             patch_size: Patch size for extraction (tuple of 3 ints - Z, Y, X).
             num_input_channels: Expected number of input channels (optional, can be inferred).
-            input_format: Format hint ('zarr', 'volume'). Type is mainly inferred now.
             step_size: Step size for sliding window as a fraction of patch size (0.5 = 50% overlap).
-            load_all: Ignored. Volume class handles data loading.
             verbose: Enable detailed output messages.
             mode: 'infer' (default). 'train' mode logic is not implemented here.
             num_parts: Number of parts to split the dataset into along Z-axis.
@@ -74,28 +85,19 @@ class VCDataset(Dataset):
                   size along an axis is grown to the patch size (shifted back inside the
                   volume when possible).
 
-            scroll_id: Scroll ID for Volume (if input_path isn't a specific scroll/segment).
-            energy: Energy value for Volume.
-            resolution: Resolution value for Volume.
-            segment_id: Segment ID for Volume (if input_path isn't a specific scroll/segment).
-            normalization_scheme: Normalization method for Volume ('none', 'instance_zscore',
+            normalization_scheme: Normalization method ('none', 'instance_zscore',
                                   'global_zscore', 'instance_minmax').
             global_mean: Global mean for 'global_zscore' scheme.
             global_std: Global standard deviation for 'global_zscore' scheme.
-            return_as_type: Target NumPy dtype string for Volume output *before* tensor conversion
+            return_as_type: Target NumPy dtype string *before* tensor conversion
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
-            domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
             anon: Use anonymous requests for input S3 reads.
-            read_retries: Attempts per read, forwarded to Volume (default 4). Transient
-                remote failures are retried with exponential backoff so one dropped
-                connection does not abort a long streaming run. Pass 1 to disable.
-            cache: Keep an in-memory LRU cache of fetched chunks, forwarded to Volume.
+            cache: Keep an in-memory LRU cache of fetched chunks.
                 Overlapping patches then reuse chunks instead of fetching them again.
                 Requires zarr 3.
             cache_size_mb: Size bound of that cache in megabytes (default 256).
         """
         self.input_path = input_path
-        self.input_format = input_format # Keep for informational purposes
         self.targets = targets
         self.patch_size = patch_size
         self.step_size = step_size
@@ -134,150 +136,39 @@ class VCDataset(Dataset):
         if self.mode != 'infer':
             print(f"Warning: VCDataset mode is '{self.mode}'. Only 'infer' mode logic (sliding window) is fully implemented.")
 
-        # --- Determine Volume Type and Path ---
-        type_value: Union[str, int]
-        use_path: Optional[str] = None
+        use_path = str(input_path)
+        if not use_path.startswith(('http://', 'https://', 's3://')):
+            use_path = str(Path(use_path).resolve())
+            if not os.path.exists(use_path):
+                raise FileNotFoundError(f"Zarr path does not exist: {use_path}")
+        self._normalize = _normalization_pipeline(normalization_scheme, global_mean, global_std, intensity_props)
 
-        if isinstance(input_path, str):
-            input_lower = input_path.lower()
-            # Check for Scroll ID format (e.g., "scroll1", "scroll1b")
-            if re.match(r'scroll[0-9]+[a-z]*$', input_lower):
-                 type_value = input_path # Pass original case potentially
-                 if scroll_id is None: scroll_id = type_value # Set scroll_id if not provided
-                 if self.verbose: print(f"Interpreting input_path '{input_path}' as Volume type 'scroll'.")
-            # Check for Segment ID format (numeric string)
-            elif input_path.isdigit():
-                 type_value = input_path # Keep as string for Volume constructor flexibility
-                 if segment_id is None: segment_id = int(input_path) # Set segment_id if not provided
-                 if self.verbose: print(f"Interpreting input_path '{input_path}' as Volume type 'segment'.")
-            # Check for explicit 'volume' format hint (less common now)
-            elif input_format == 'volume':
-                 # This case requires scroll_id or segment_id to be provided explicitly
-                 if segment_id is not None:
-                      type_value = str(segment_id)
-                      if self.verbose: print(f"Using explicit segment_id {segment_id} as Volume type.")
-                 elif scroll_id is not None:
-                      type_value = f"scroll{scroll_id}" # Construct type
-                      if self.verbose: print(f"Using explicit scroll_id {scroll_id} to set Volume type.")
-                 else:
-                      raise ValueError("input_format='volume' requires scroll_id or segment_id to be provided.")
-            # Otherwise, assume it's a path (Zarr or potentially other formats Volume might support)
-            else:
-                 type_value = "zarr" # Default type when it looks like a path
-                 use_path = input_path
-                 if self.verbose: print(f"Interpreting input_path '{input_path}' as a path for Volume type 'zarr'.")
-                 # Automatically set domain to local for file paths unless overridden
-                 if domain is None and not use_path.startswith(('http://', 'https://', 's3://')):
-                     domain = "local"
-                     if self.verbose: print("Auto-setting domain to 'local' for non-HTTP/S3 path.")
+        node = open_node(
+            use_path, auth=None if self.anon else "auto", threads=io_threads,
+            memory_cache=int(cache_size_mb) << 20 if cache else None)
+        self._array_url = use_path.rstrip('/')
+        if isinstance(node, ZarrGroup):
+            node = node["0"]
+            self._array_url += '/0'
+        self.reader = node
 
-        elif isinstance(input_path, int): # Handle integer scroll_id passed as input_path
-             type_value = f"scroll{input_path}"
-             if scroll_id is None: scroll_id = input_path
-             if self.verbose: print(f"Interpreting integer input_path {input_path} as scroll ID.")
+        self.input_shape = tuple(int(n) for n in self.reader.shape)  # Z, Y, X or C, Z, Y, X
+        self.input_dtype = self.reader.dtype
+        target_dtype = return_as_type.replace('np.', '')
+        self._output_np_dtype = np.dtype(target_dtype)
+        self.output_dtype = getattr(torch, target_dtype) if self.return_as_tensor else getattr(np, target_dtype)
+
+        # Infer num_input_channels if not provided
+        if num_input_channels is None:
+            self.num_input_channels = self.input_shape[0] if len(self.input_shape) == 4 else 1
         else:
-             raise TypeError(f"Unsupported input_path type: {type(input_path)}")
-
-
-        # --- Initialize Volume Class ---
-        try:
-            if self.verbose:
-                print("\n--- Initializing Volume ---")
-                print(f"  Type: {type_value}")
-                print(f"  Path: {use_path}")
-                print(f"  Scroll ID: {scroll_id}")
-                print(f"  Segment ID: {segment_id}")
-                print(f"  Energy: {energy}")
-                print(f"  Resolution: {resolution}")
-                print(f"  Domain: {domain}")
-                print(f"  Normalization: {normalization_scheme}")
-                if normalization_scheme == 'global_zscore':
-                     print(f"    Global Mean: {global_mean}, Global Std: {global_std}")
-                if normalization_scheme == 'ct':
-                     print(f"    Intensity props keys: {list((intensity_props or {}).keys())}")
-                print(f"  Return Type (NumPy): {return_as_type}")
-                print(f"  Return As Tensor: {self.return_as_tensor}") # Use internal dataset flag
-                print(f"  Input Channels: {num_input_channels}")
-                print(f"  Targets: {targets}")
-                print(f"  Anonymous S3 Input: {anon}")
-                print("---------------------------\n")
-
-            # Validate Zarr path if provided - skip validation for remote paths
-            if type_value == "zarr" and use_path is not None and not use_path.startswith(('http://', 'https://', 's3://')):
-                p = Path(use_path)
-                if not p.is_absolute():
-                     abs_p = p.resolve()
-                     if self.verbose: print(f"  Converting relative Zarr path '{use_path}' to absolute '{abs_p}'")
-                     use_path = str(abs_p)
-
-                if not os.path.exists(use_path):
-                    raise FileNotFoundError(f"Zarr path does not exist: {use_path}")
-                if not os.path.isdir(use_path):
-                     if not use_path.endswith('.zip'): # Basic check
-                         print(f"  Warning: Zarr path '{use_path}' exists but is not a directory.")
-                # Check for key Zarr files (optional, Volume handles errors)
-                # if not os.path.exists(os.path.join(use_path, '.zarray')) and not os.path.exists(os.path.join(use_path, '.zgroup')):
-                #     print(f"  Warning: Path {use_path} might not be a Zarr store (missing .zarray/.zgroup).")
-            elif type_value == "zarr" and use_path is not None and use_path.startswith('s3://'):
-                if self.verbose: print(f"  Using S3 path: {use_path}")
-
-            self.volume = Volume(
-                type=type_value,
-                scroll_id=scroll_id,
-                energy=energy,
-                resolution=resolution,
-                segment_id=segment_id,
-                # normalize=False, # Removed, use scheme
-                normalization_scheme=normalization_scheme,
-                global_mean=global_mean,
-                global_std=global_std,
-                intensity_props=intensity_props,
-                return_as_type=return_as_type,
-                return_as_tensor=self.return_as_tensor, # Ensure Volume returns tensors directly
-                verbose=verbose,
-                domain=domain,
-                path=use_path,
-                anon=self.anon,
-                read_retries=read_retries,
-                cache=cache,
-                cache_size_mb=cache_size_mb,
-            )
-
-            # Get shape and dtype from the primary resolution level (0)
-            self.input_shape = self.volume.shape(0) # Z, Y, X or C, Z, Y, X
-            self.input_dtype = self.volume.dtype # Original dtype before Volume's processing
-            self.output_dtype = getattr(torch, return_as_type.replace('np.', '')) if self.return_as_tensor else getattr(np, return_as_type.replace('np.', ''))
-
-            if self.verbose:
-                print(f"Volume initialized successfully.")
-                print(f"  Input Shape (from Volume level 0): {self.input_shape}")
-                print(f"  Original Dtype (from Volume): {self.input_dtype}")
-                print(f"  Output Dtype (expected from Volume): {self.output_dtype}")
-
-            # Infer num_input_channels if not provided
-            if num_input_channels is None:
-                if len(self.input_shape) == 4: # Assume C, Z, Y, X
-                    self.num_input_channels = self.input_shape[0]
-                    if self.verbose: print(f"  Inferred num_input_channels: {self.num_input_channels}")
-                else: # Assume Z, Y, X
-                    self.num_input_channels = 1
-                    if self.verbose: print(f"  Assuming single channel input (num_input_channels=1).")
-            else:
-                self.num_input_channels = num_input_channels
-                 # Add a check
-                if len(self.input_shape) == 4 and self.input_shape[0] != self.num_input_channels:
-                     print(f"Warning: Provided num_input_channels ({self.num_input_channels}) does not match "
-                           f"first dimension of Volume shape ({self.input_shape[0]}). Using provided value.")
-                elif len(self.input_shape) == 3 and self.num_input_channels != 1:
-                     print(f"Warning: Provided num_input_channels ({self.num_input_channels}) != 1 for 3D Volume shape. "
-                           f"Will add channel dimension in getitem. Using provided value.")
-
-        except Exception as e:
-            print(f"ERROR: Failed to initialize Volume within VCDataset.")
-            # Log details that might be helpful
-            print(f"  Attempted Volume params: type={type_value}, path={use_path}, scroll={scroll_id}, seg={segment_id}, ...")
-            raise ValueError(f"Error initializing Volume: {e}") from e
-
+            self.num_input_channels = num_input_channels
+            if len(self.input_shape) == 4 and self.input_shape[0] != self.num_input_channels:
+                print(f"Warning: Provided num_input_channels ({self.num_input_channels}) does not match "
+                      f"first dimension of the array shape ({self.input_shape[0]}). Using provided value.")
+            elif len(self.input_shape) == 3 and self.num_input_channels != 1:
+                print(f"Warning: Provided num_input_channels ({self.num_input_channels}) != 1 for a 3D array. "
+                      f"Will add channel dimension in getitem. Using provided value.")
 
         # --- Position Calculation (for infer mode) ---
         self.all_positions = []
@@ -292,7 +183,7 @@ class VCDataset(Dataset):
             elif len(self.input_shape) == 4: # C, Z, Y, X
                 image_size = self.input_shape[1:]
             else:
-                raise ValueError(f"Unsupported input shape dimension from Volume: {self.input_shape}")
+                raise ValueError(f"Unsupported input shape dimension: {self.input_shape}")
 
             roi = None
             if self.bbox is not None:
@@ -432,36 +323,26 @@ class VCDataset(Dataset):
             roi.append((lo_c, hi_c))
         return tuple(roi)
 
+    def _read_patch(self, *region):
+        """A normalized region as a tensor of the output dtype. Statistics are those of the patch
+        before padding, per channel."""
+        data = self.reader[region]
+        if self._normalize is not None:
+            has_channels = data.ndim > 3
+            image = data.astype(np.float32, copy=False)
+            image = self._normalize({'image': image if has_channels else image[np.newaxis]}, seed=0)['image']
+            data = image if has_channels else image[0]
+        return torch.from_numpy(np.ascontiguousarray(data.astype(self._output_np_dtype)))
+
     def _build_non_empty_mask_from_chunks(self, use_path):
         if not self.skip_empty_patches or not self.all_positions:
             return None
         if use_path is None:
             return None
 
-        try:
-            import zarr as _zarr
-        except ImportError:
-            return None
-
-        array_obj = getattr(self.volume, 'data', None)
-        if array_obj is None:
-            return None
-
-        if isinstance(array_obj, _zarr.Array):
-            array_url = use_path.rstrip('/')
-            array_chunks = tuple(array_obj.chunks)
-            array_shape = tuple(array_obj.shape)
-        elif isinstance(array_obj, _zarr.Group):
-            # Use level "0" to match what Volume.__getitem__ reads by default.
-            if "0" not in array_obj or not isinstance(array_obj["0"], _zarr.Array):
-                return None
-            sub = array_obj["0"]
-            first_key = "0"
-            array_url = use_path.rstrip('/') + '/' + first_key
-            array_chunks = tuple(sub.chunks)
-            array_shape = tuple(sub.shape)
-        else:
-            return None
+        array_url = self._array_url
+        array_chunks = tuple(self.reader.chunks)
+        array_shape = tuple(self.reader.shape)
 
         occupancy = build_chunk_occupancy(
             array_url,
@@ -569,7 +450,7 @@ class VCDataset(Dataset):
         z, y, x = self.all_positions[idx]
         pZ, pY, pX = self.patch_size
 
-        # Define the slices for fetching data from Volume
+        # Define the slices for fetching data
         # Use spatial dimensions (Z, Y, X) correctly based on input_shape length
         spatial_dims_indices = slice(1, None) if len(self.input_shape) == 4 else slice(None)
         image_shape_zyx = self.input_shape[spatial_dims_indices]
@@ -579,14 +460,13 @@ class VCDataset(Dataset):
         x_slice = slice(x, min(x + pX, image_shape_zyx[2]))
 
         try:
-            # Fetch the (potentially smaller) patch from Volume
-            # Volume's __getitem__ handles normalization, type conversion, and tensor conversion
+            # Fetch the (potentially smaller) patch, normalized and converted
             if len(self.input_shape) == 3: # Input is Z, Y, X
                 # For 3D input (Z, Y, X), we always create a single-channel tensor
                 # The model expects a single channel regardless of how many output classes it produces
                 
-                # Volume returns (Z, Y, X) tensor
-                extracted_tensor = self.volume[z_slice, y_slice, x_slice]
+                # (Z, Y, X) tensor
+                extracted_tensor = self._read_patch(z_slice, y_slice, x_slice)
                 
                 # Fast check for empty patch - skip if all zeros or all values are the same
                 # This avoids processing empty patches which won't contain any information
@@ -607,7 +487,7 @@ class VCDataset(Dataset):
                 fetched_z, fetched_y, fetched_x = extracted_tensor.shape
                 
                 # Initialize the full-size patch tensor with zeros (for padding)
-                # Use the dtype returned by Volume
+                # Use the dtype of the patch
                 # ALWAYS use a single channel (1) here since we're coming from Z,Y,X data
                 patch_tensor = torch.zeros((1, pZ, pY, pX), dtype=extracted_tensor.dtype)
                 
@@ -615,7 +495,7 @@ class VCDataset(Dataset):
                 patch_tensor[0, :fetched_z, :fetched_y, :fetched_x] = extracted_tensor
 
             elif len(self.input_shape) == 4: # Input is C, Z, Y, X
-                # Volume returns (C, Z, Y, X) tensor
+                # (C, Z, Y, X) tensor
                 
                 # For multiclass models, we need to ensure we're using exactly the right number of input channels
                 available_channels = self.input_shape[0]
@@ -629,7 +509,7 @@ class VCDataset(Dataset):
                     print(f"4D input: Extracting {self.num_input_channels} channels from data with {available_channels} channels")
                 
                 # Take exactly what the model expects
-                extracted_tensor = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
+                extracted_tensor = self._read_patch(slice(0, self.num_input_channels), z_slice, y_slice, x_slice)
                 
                 # Check for empty patch - flag if all values are the same
                 is_empty = False
@@ -670,13 +550,12 @@ class VCDataset(Dataset):
         except Exception as e:
              print(f"ERROR fetching/padding patch at ZYX=({z},{y},{x}), index={idx}")
              print(f"  Slices: Z={z_slice}, Y={y_slice}, X={x_slice}")
-             print(f"  Volume shape: {self.input_shape}")
+             print(f"  Array shape: {self.input_shape}")
              # Re-raise the error with more context
              raise RuntimeError(f"Failed to get item {idx} (pos {z},{y},{x}): {e}") from e
 
 
-        # Data should already be a tensor of the correct type due to Volume settings
-        # assert isinstance(patch_tensor, torch.Tensor), "Volume did not return a tensor as expected"
+        # Data is already a tensor of the correct type
         # assert patch_tensor.dtype == self.output_dtype, f"Expected dtype {self.output_dtype} but got {patch_tensor.dtype}"
 
 

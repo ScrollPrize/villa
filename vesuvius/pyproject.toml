@@ -236,7 +236,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 vesuvius = [
-    "install/configs/*.yaml",
     "ink_detection/configs/*.json",
     "tifxyz_label_transfer/*.cpp",
     "tifxyz_label_transfer/*.md",

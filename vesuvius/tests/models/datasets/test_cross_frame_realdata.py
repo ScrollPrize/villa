@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from vesuvius.data import affine
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import open_node
 from vesuvius.models.datasets.cross_frame_dataset import (
     CrossFrameZarrDataset,
     _resolve_zarr_array,
@@ -59,8 +59,8 @@ def _make_mgr(cache_dir: Path, *, patch_size=(128, 128, 128)) -> SimpleNamespace
 
 
 def test_remote_zarrs_and_transform_are_reachable():
-    image = _resolve_zarr_array(open_zarr(IMAGE_URL, mode="r", storage_options={"anon": True}))
-    labels = _resolve_zarr_array(open_zarr(LABELS_URL, mode="r"))
+    image = _resolve_zarr_array(open_node(IMAGE_URL, auth=None))
+    labels = _resolve_zarr_array(open_node(LABELS_URL))
     doc = affine.read_transform_json(TRANSFORM_URL)
 
     assert image.shape == (75784, 32693, 32693), f"unexpected image shape {image.shape}"
@@ -101,9 +101,9 @@ def test_foreground_scan_over_small_region(tmp_path: Path):
     ds.storage_options_labels = {}
 
     ds._image_array = _resolve_zarr_array(
-        open_zarr(IMAGE_URL, mode="r", storage_options={"anon": True})
+        open_node(IMAGE_URL, auth=None)
     )
-    ds._labels_array = _resolve_zarr_array(open_zarr(LABELS_URL, mode="r"))
+    ds._labels_array = _resolve_zarr_array(open_node(LABELS_URL))
     ds._image_shape = tuple(int(v) for v in ds._image_array.shape[-3:])
     ds._labels_shape = tuple(int(v) for v in ds._labels_array.shape[-3:])
 
@@ -131,8 +131,8 @@ def test_single_patch_fetch_end_to_end(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     mgr = _make_mgr(cache_dir=tmp_path)
 
-    labels = _resolve_zarr_array(open_zarr(LABELS_URL, mode="r"))
-    image = _resolve_zarr_array(open_zarr(IMAGE_URL, mode="r", storage_options={"anon": True}))
+    labels = _resolve_zarr_array(open_node(LABELS_URL))
+    image = _resolve_zarr_array(open_node(IMAGE_URL, auth=None))
     matrix = affine.label_to_image_zyx_matrix(
         affine.read_transform_json(TRANSFORM_URL).matrix_xyz
     )

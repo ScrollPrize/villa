@@ -7,14 +7,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.models.run import inference
 from vesuvius.models.run.inference import Inferer, build_parser
-
-_ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-requires_zarr_v3 = pytest.mark.skipif(not _ZARR_V3, reason="the chunk cache needs zarr>=3")
 
 
 def _required_args(tmp_path: Path) -> list[str]:
@@ -103,13 +100,10 @@ def test_inferer_rejects_negative_chunk_cache_mb(tmp_path: Path) -> None:
         )
 
 
-@requires_zarr_v3
 def test_vcdataset_chunk_cache_survives_pickling_and_reads_identically(tmp_path: Path) -> None:
-    from zarr.experimental.cache_store import CacheStore
-
     path = str(tmp_path / "volume.zarr")
-    array = zarr.create_array(store=path, shape=(32, 32, 32), chunks=(16, 16, 16), dtype="uint8", zarr_format=2)
-    array[:] = np.random.default_rng(0).integers(0, 255, (32, 32, 32), dtype="uint8")
+    ZarrWriter.create(path, shape=(32, 32, 32), chunks=(16, 16, 16), dtype="uint8")[:] = (
+        np.random.default_rng(0).integers(0, 255, (32, 32, 32), dtype="uint8"))
 
     common = dict(
         input_path=path,
@@ -121,14 +115,10 @@ def test_vcdataset_chunk_cache_survives_pickling_and_reads_identically(tmp_path:
     plain = VCDataset(**common)
     cached = VCDataset(**common, cache=True, cache_size_mb=1)
 
-    assert not isinstance(plain.volume.data.store, CacheStore)
-    assert isinstance(cached.volume.data.store, CacheStore)
+    assert plain.reader.memory_cache is None
+    assert cached.reader.memory_cache is not None
 
     worker_copy = pickle.loads(pickle.dumps(cached))
     assert len(worker_copy) == len(plain) > 1
     for index in range(len(plain)):
         assert torch.equal(worker_copy[index]["data"], plain[index]["data"])
-
-    store = worker_copy.volume.data.store
-    assert store.cache_stats()["hits"] > 0
-    assert store.cache_info()["current_size"] <= 2**20

@@ -316,7 +316,6 @@ class Inferer():
                  model_path: str = None,
                  input_dir: str = None,
                  output_dir: str = None,
-                 input_format: str = 'zarr',
                  tta_type: str = 'mirroring', # 'mirroring' or 'rotation'
                  # tta_combinations: int = 3,
                  # tta_rotation_weights: [list, tuple] = (1, 1, 1),
@@ -333,17 +332,11 @@ class Inferer():
                  writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
-                 # params to get passed to Volume 
-                 scroll_id: [str, int] = None,
-                 segment_id: [str, int] = None,
-                 energy: int = None,
-                 resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
-                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
@@ -367,21 +360,15 @@ class Inferer():
         self.save_softmax = save_softmax
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
-        self.input_format = input_format
         self.device = torch.device(device)
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
-        self.scroll_id = scroll_id
-        self.segment_id = segment_id
-        self.energy = energy
-        self.resolution = resolution
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
-        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
@@ -825,19 +812,14 @@ class Inferer():
             global_mean=global_mean,
             global_std=global_std,
             intensity_props=self.model_intensity_properties,
-            input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
             skip_empty_patches=self.skip_empty_patches,
-            scroll_id=self.scroll_id,
-            segment_id=self.segment_id,
-            energy=self.energy,
-            resolution=self.resolution,
             anon=self.input_anon,
             bbox=self.bbox,
-            read_retries=self.read_retries,
             cache=self.chunk_cache_mb > 0,
             cache_size_mb=self.chunk_cache_mb,
+            io_threads=1 if self.num_dataloader_workers > 0 else None,
             # The float16 default suits the CUDA autocast path. CPU convolutions
             # have no float16 kernels, so half patches meet float32 weights and
             # raise "Input type (c10::Half) and bias type (float) should be the
@@ -1238,7 +1220,6 @@ def build_parser():
                            'Required when reading from a public bucket while AWS credentials '
                            'are configured for writes to a different bucket.')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
-    parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
                       help='TTA type (mirroring or rotation). Default: rotation')
     parser.add_argument('--disable_tta', action='store_true', help='Disable test time augmentation')
@@ -1271,12 +1252,6 @@ def build_parser():
     parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
-    # Add arguments for the updated Volume class
-    parser.add_argument('--scroll_id', type=str, default=None, help='Scroll ID to use (if input_format is volume)')
-    parser.add_argument('--segment_id', type=str, default=None, help='Segment ID to use (if input_format is volume)')
-    parser.add_argument('--energy', type=int, default=None, help='Energy level to use (if input_format is volume)')
-    parser.add_argument('--resolution', type=float, default=None, help='Resolution to use (if input_format is volume)')
-
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
     parser.add_argument('--model_type', type=str, default='auto',
@@ -1286,11 +1261,6 @@ def build_parser():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read_retries', type=int, default=4,
-                      help='Attempts per patch read (default 4). Transient remote failures '
-                           '(dropped connections, truncated payloads, 429/5xx) are retried '
-                           'with exponential backoff so one hiccup does not abort a long '
-                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--chunk_cache_mb', type=int, default=0,
                       help='Keep up to this many MB of fetched input chunks in an in-memory LRU '
                            'cache, so overlapping patches reuse chunks instead of downloading '
@@ -1334,22 +1304,11 @@ def main():
             parser.error(str(e))
         print(f"Restricting inference to bbox (z0,z1,y0,y1,x0,x1): {bbox}")
 
-    # Convert scroll_id and segment_id if needed
-    scroll_id = args.scroll_id
-    segment_id = args.segment_id
-    
-    if scroll_id is not None and scroll_id.isdigit():
-        scroll_id = int(scroll_id)
-    
-    if segment_id is not None and segment_id.isdigit():
-        segment_id = int(segment_id)
-    
     print("\n--- Initializing Inferer ---")
     inferer = Inferer(
         model_path=args.model_path,
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        input_format=args.input_format,
         tta_type=args.tta_type,
         do_tta=not args.disable_tta,
         num_parts=args.num_parts,
@@ -1365,10 +1324,6 @@ def main():
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
         # Pass Volume-specific parameters to VCDataset
-        scroll_id=scroll_id,
-        segment_id=segment_id,
-        energy=args.energy,
-        resolution=args.resolution,
         # Pass Zarr compression settings
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
@@ -1376,7 +1331,6 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
-        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,

@@ -158,7 +158,6 @@ def test_declarations_are_underscored(name):
     [
         ("--zarr-compressor", "zarr_compressor", "lz4"),
         ("--zarr-compression-level", "zarr_compression_level", 5),
-        ("--read-retries", "read_retries", 9),
     ],
 )
 def test_predict_still_accepts_the_old_hyphenated_spellings(flag, dest, value):

@@ -7,10 +7,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
 
+from vc_reader.reader import ZarrWriter
 from vesuvius.data.vc_dataset import VCDataset
-from vesuvius.data.volume import Volume
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run import inference
 from vesuvius.models.run.inference import (
@@ -189,67 +188,48 @@ def test_load_train_py_model_supports_legacy_checkpoint_with_ema(tmp_path: Path)
     torch.testing.assert_close(loaded_state[floating_key], torch.full_like(loaded_state[floating_key], 2.0))
 
 
-def test_volume_percentile_minmax_normalization(tmp_path: Path) -> None:
+def _normalized(path: Path, scheme: str) -> np.ndarray:
+    dataset = VCDataset(input_path=str(path), patch_size=(1, 1, 1), normalization_scheme=scheme,
+                        return_as_type="np.float32", skip_empty_patches=False)
+    return dataset._read_patch(*(slice(None),) * 3).numpy()
+
+
+def test_percentile_minmax_normalization(tmp_path: Path) -> None:
     path = tmp_path / "input.zarr"
-    arr = zarr.open(str(path), mode="w", shape=(1, 1, 5), chunks=(1, 1, 5), dtype="uint8")
-    arr[:] = np.array([[[0, 10, 20, 30, 255]]], dtype=np.uint8)
+    source = np.array([[[0, 10, 20, 30, 255]]], dtype=np.uint8)
+    ZarrWriter.create(path, shape=(1, 1, 5), chunks=(1, 1, 5), dtype="uint8")[:] = source
 
-    volume = Volume(
-        type="zarr",
-        path=str(path),
-        normalization_scheme="percentile_minmax",
-        return_as_type="np.float32",
-        return_as_tensor=False,
-    )
-
-    normalized = volume[:, :, :]
-    lower, upper = np.percentile(arr[:].astype(np.float32), (1.0, 99.0))
-    expected = (np.clip(arr[:].astype(np.float32), lower, upper) - lower) / (upper - lower)
+    normalized = _normalized(path, "percentile_minmax")
+    lower, upper = np.percentile(source.astype(np.float32), (1.0, 99.0))
+    expected = (np.clip(source.astype(np.float32), lower, upper) - lower) / (upper - lower)
 
     np.testing.assert_allclose(normalized, expected.astype(np.float32), rtol=1e-6, atol=1e-6)
     assert normalized.min() >= 0.0
     assert normalized.max() <= 1.0
 
 
-def test_volume_percentile_minmax_constant_input_returns_zero(tmp_path: Path) -> None:
+def test_percentile_minmax_constant_input_returns_zero(tmp_path: Path) -> None:
     path = tmp_path / "constant.zarr"
-    arr = zarr.open(str(path), mode="w", shape=(2, 2, 2), chunks=(2, 2, 2), dtype="uint8")
-    arr[:] = 7
+    ZarrWriter.create(path, shape=(2, 2, 2), chunks=(2, 2, 2), dtype="uint8")[:] = 7
 
-    volume = Volume(
-        type="zarr",
-        path=str(path),
-        normalization_scheme="percentile_minmax",
-        return_as_type="np.float32",
-        return_as_tensor=False,
-    )
-
-    np.testing.assert_array_equal(volume[:, :, :], np.zeros((2, 2, 2), dtype=np.float32))
+    np.testing.assert_array_equal(_normalized(path, "percentile_minmax"), np.zeros((2, 2, 2), dtype=np.float32))
 
 
-def test_vcdataset_passes_anon_to_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vcdataset_passes_anon_to_reader(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = {}
+    path = tmp_path / "input.zarr"
+    ZarrWriter.create(path, shape=(8, 8, 8), chunks=(8, 8, 8), dtype="uint8")
+    from vc_reader.reader import open_node as real_open_node
 
-    class FakeVolume:
-        dtype = np.dtype("uint8")
-        data = None
+    def open_node(location, **kwargs):
+        captured["auth"] = kwargs["auth"]
+        return real_open_node(location)
 
-        def __init__(self, **kwargs):
-            captured["anon"] = kwargs["anon"]
+    monkeypatch.setattr("vesuvius.data.vc_dataset.open_node", open_node)
 
-        def shape(self, level):
-            return (8, 8, 8)
+    dataset = VCDataset(input_path=str(path), patch_size=(8, 8, 8), anon=True, skip_empty_patches=False)
 
-    monkeypatch.setattr("vesuvius.data.vc_dataset.Volume", FakeVolume)
-
-    dataset = VCDataset(
-        input_path="s3://example-bucket/input.zarr",
-        patch_size=(8, 8, 8),
-        anon=True,
-        skip_empty_patches=False,
-    )
-
-    assert captured["anon"] is True
+    assert captured["auth"] is None
     assert len(dataset) == 1
 
 
