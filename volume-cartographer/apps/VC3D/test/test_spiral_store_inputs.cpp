@@ -51,7 +51,12 @@ const std::string kVolume = "20260411134726";
 // Expected values from object_store_inputs.adapter_metadata.
 void adapterMetadataMatchesThePythonAdapter()
 {
-    struct Case { const char* kind; const char* meta; std::optional<FiberDetail> fiber; const char* expected; };
+    struct Case {
+        const char* kind; const char* meta; std::optional<FiberDetail> fiber; const char* expected;
+        std::optional<TrackDetail> track = std::nullopt;
+    };
+    TrackDetail track;
+    track.datasetRef = "tracks.vctracks"; track.externalKey = "4294967296"; track.family = "vertical";
     const FiberDetail h{"H", false};
     const FiberDetail manual{"", true};
     const Case cases[] = {
@@ -64,9 +69,13 @@ void adapterMetadataMatchesThePythonAdapter()
          h, R"({"coordinates": {"scale_factor": 4.0, "volume_uuid": "s1-reference"}, "family": "H", "hv_classification": {"certainty": 0.873, "family": "H"}, "manual_family": false})"},
         {"fiber", R"({"coordinates":{"volume_uuid":"s1-reference","scale_factor":1e-05}})",
          manual, R"({"coordinates": {"scale_factor": 1e-05, "volume_uuid": "s1-reference"}, "family": "", "hv_classification": null, "manual_family": true})"},
+        {"track", R"({"coordinates":{"volume_uuid":"s1-reference","scale_factor":2.0},"source":{"version":1}})",
+         std::nullopt, R"({"coordinates": {"scale_factor": 2.0, "volume_uuid": "s1-reference"}, "dataset_ref": "tracks.vctracks", "external_key": "4294967296", "family": "vertical"})",
+         track},
     };
     for (const auto& item : cases)
-        require(vc3d::spiral::adapterMetadata(item.kind, Json::parse(item.meta), item.fiber) == Json::parse(item.expected),
+        require(vc3d::spiral::adapterMetadata(item.kind, Json::parse(item.meta), item.fiber, item.track)
+                    == Json::parse(item.expected),
                 std::string("adapter metadata differs from the Python adapter's for ") + item.kind + " " + item.meta);
 }
 

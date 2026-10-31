@@ -1807,18 +1807,20 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
 void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& event)
 {
     if (!_fitDocument || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
-        || !event.touches({"surface", "point_collection", "fiber", "point-surface",
-                           "same-surface", "fiber_branch"}))
+        || !event.touches({"surface", "point_collection", "fiber", "track", "point-surface",
+                           "same-surface", "fiber_branch", "crossing"}))
         return;
     const auto before = _changedOtherInputs.size();
     for (const auto& change : event.changes) {
         const QString uuid = QString::fromStdString(change.recordUuid);
-        const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber";
+        const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber"
+            || change.kind == "track";
         // A fitted input, or a link that may involve one, is read again by
         // itself. Other inputs only matter to a rebuild.
         if (object && _fitRecords.contains(uuid))
             _pendingObjectChanges.insert(change.recordUuid);
-        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch")
+        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch"
+                 || change.kind == "crossing")
             _pendingLinkChanges.insert(change.recordUuid);
         else if (object)
             _changedOtherInputs.insert(uuid);

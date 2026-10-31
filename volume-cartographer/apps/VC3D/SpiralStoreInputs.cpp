@@ -77,10 +77,10 @@ bool truthy(const Json& value)
 // fitter consumes, by edge kind and endpoint kinds in KINDS order.
 int kindIndex(const std::string& kind)
 {
-    constexpr const char* kinds[] = {"surface", "point_collection", "fiber"};
-    for (int i = 0; i < 3; ++i)
+    constexpr const char* kinds[] = {"surface", "point_collection", "fiber", "track"};
+    for (int i = 0; i < 4; ++i)
         if (kind == kinds[i]) return i;
-    return 3;
+    return 4;
 }
 
 std::string relationshipFamily(const std::string& edgeKind, const std::string& first,
@@ -90,6 +90,7 @@ std::string relationshipFamily(const std::string& edgeKind, const std::string& f
     if (edgeKind == "same-surface" && first == "surface" && second == "fiber") return "fiber_patch";
     if (edgeKind == "same-surface" && first == "surface" && second == "surface") return "patch_overlap";
     if (edgeKind == "fiber_branch" && first == "fiber" && second == "fiber") return "fiber_branch";
+    if (edgeKind == "crossing" && first == "track" && second == "track") return "track_crossing";
     return {};
 }
 
@@ -196,7 +197,8 @@ void readObject(const ObjectStore& db, const Txn& txn, const StoreInputPin& pin,
         meta = Json::parse(current->record.meta);
         // Compared as values: JSON numbers compare numerically.
         state = *current->geometryRevision != pin.geometryRevision ? InputState::Edited
-            : !pin.metadata.is_null() && adapterMetadata(pin.kind, meta, current->record.fiber) != pin.metadata
+            : !pin.metadata.is_null()
+                    && adapterMetadata(pin.kind, meta, current->record.fiber, current->record.track) != pin.metadata
                 ? InputState::MetadataChanged
                 : InputState::Fitted;
     } else {
@@ -208,6 +210,11 @@ void readObject(const ObjectStore& db, const Txn& txn, const StoreInputPin& pin,
     collection.state = state;
     if (present) collection.revision = current->uuid;
     FitFiber fiber{pin, state, {}, {}, {}, {}};
+    if (pin.kind == "track") {
+        // Its state is all a track contributes; its geometry is not shown.
+        result.tracks.push_back({pin, state, problem});
+        return;
+    }
     try {
         std::optional<vc::objects::GeometryRevision> geometry;
         std::optional<double> scale;
@@ -329,6 +336,7 @@ std::size_t FitInputs::count(InputState state) const
     for (const auto& entry : surfaces) total += entry.state == state;
     for (const auto& entry : pointCollections) total += entry.state == state;
     for (const auto& entry : fibers) total += entry.state == state;
+    for (const auto& entry : tracks) total += entry.state == state;
     return total;
 }
 
@@ -360,7 +368,8 @@ std::vector<StoreInputPin> manifestPins(const Json& document)
 }
 
 Json adapterMetadata(const std::string& kind, const Json& meta,
-                     const std::optional<vc::objects::FiberDetail>& fiber)
+                     const std::optional<vc::objects::FiberDetail>& fiber,
+                     const std::optional<vc::objects::TrackDetail>& track)
 {
     const Json source = valueOrNull(meta, "source");
     Json read = Json::object();
@@ -374,6 +383,10 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
         read["hv_classification"] = valueOrNull(source, "hv_classification");
         read["family"] = fiber ? Json(fiber->family) : Json(nullptr);
         read["manual_family"] = fiber ? Json(fiber->manualFamily) : Json(nullptr);
+    } else if (kind == "track") {
+        read["family"] = track ? Json(track->family) : Json(nullptr);
+        read["dataset_ref"] = track ? Json(track->datasetRef) : Json(nullptr);
+        read["external_key"] = track ? Json(track->externalKey) : Json(nullptr);
     }
     return read;
 }
@@ -424,9 +437,11 @@ void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes)
     for (const auto& entry : changes.inputs.surfaces) reread.insert(entry.pin.uuid);
     for (const auto& entry : changes.inputs.pointCollections) reread.insert(entry.pin.uuid);
     for (const auto& entry : changes.inputs.fibers) reread.insert(entry.pin.uuid);
+    for (const auto& entry : changes.inputs.tracks) reread.insert(entry.pin.uuid);
     replaceByUuid(inputs.surfaces, changes.inputs.surfaces);
     replaceByUuid(inputs.pointCollections, changes.inputs.pointCollections);
     replaceByUuid(inputs.fibers, changes.inputs.fibers);
+    replaceByUuid(inputs.tracks, changes.inputs.tracks);
     for (auto& link : changes.inputs.relationships) {
         const auto found = std::find_if(inputs.relationships.begin(), inputs.relationships.end(),
                                         [&](const auto& old) { return old.uuid == link.uuid; });

@@ -735,12 +735,10 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
 {
     // The service owns its base inputs (it is launched with --dataset), so a
     // session construction request carries run
-    // parameters plus the client-selectable checkpoint/tracks values only.
+    // parameters plus the client-selectable checkpoint only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
     QJsonObject selectable;
-    const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
-    if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
     // The service's launch binding owns these (its object store and the
     // author of its link refreshes); a request never chooses them.
@@ -887,7 +885,6 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
 {
     emit inputUpdateProgress(QStringLiteral("linking"),
                              tr("Linking and pinning a position including %1…").arg(requested));
-    const QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
     QJsonObject run = request.value(QStringLiteral("run")).toObject();
     QJsonObject config = run.value(QStringLiteral("config")).toObject();
     for (const QString& key : _serviceOwnedKeys) config.remove(key);
@@ -895,8 +892,6 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
     QJsonObject body{{QStringLiteral("run"), run},
                      {QStringLiteral("inputs_position"), requested},
                      {QStringLiteral("command_id"), commandId()}};
-    const QString tracks = paths.value(QStringLiteral("tracks_dbm")).toString().trimmed();
-    if (!tracks.isEmpty()) body[QStringLiteral("paths")] = QJsonObject{{QStringLiteral("tracks_dbm"), tracks}};
     const bool initialize = !_hasActiveSession;
     // An idle fit keeps training across the update; a failed one is rebuilt.
     // Any other state (a run, a build) is the user's to stop first: a

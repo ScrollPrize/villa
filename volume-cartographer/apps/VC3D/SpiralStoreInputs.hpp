@@ -81,6 +81,13 @@ enum class LinkState {
 };
 const char* linkStateName(LinkState state);
 
+// A track is compared, never shown: a fit may read millions of them.
+struct FitTrack {
+    StoreInputPin pin;
+    InputState state = InputState::Missing;
+    std::string problem;
+};
+
 struct FitRelationship {
     std::string uuid, family;
     LinkState state = LinkState::Dropped;
@@ -95,6 +102,7 @@ struct FitInputs {
     std::optional<FitSurface> outerShell;
     std::vector<FitPointCollection> pointCollections;
     std::vector<FitFiber> fibers;
+    std::vector<FitTrack> tracks;
     std::vector<FitRelationship> relationships;
     // Relationships among the fitted objects that a rebuild would consume
     // and the fit did not (state Added), by record UUID.
@@ -110,7 +118,7 @@ struct FitInputs {
     {
         return problems.empty() && (!outerShell || outerShell->state == InputState::Fitted)
             && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
-                                                                   + fibers.size()
+                                                                   + fibers.size() + tracks.size()
             && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }
 };
@@ -121,7 +129,8 @@ std::vector<StoreInputPin> manifestPins(const nlohmann::json& document);
 // The metadata the fit's object-store adapter reads from one object, as
 // object_store_inputs.adapter_metadata builds it.
 nlohmann::json adapterMetadata(const std::string& kind, const nlohmann::json& meta,
-                               const std::optional<vc::objects::FiberDetail>& fiber);
+                               const std::optional<vc::objects::FiberDetail>& fiber,
+                               const std::optional<vc::objects::TrackDetail>& track = std::nullopt);
 
 // Read the inputs of `document` ({"digest", "manifest"}) from `db` at their
 // current heads, each with how it differs from what the fit read, and

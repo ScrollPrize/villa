@@ -316,8 +316,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("vertical_fiber_offset"), {_verticalFiberOffsetEnabled});
     describe(QStringLiteral("vertical_fiber_offset_voxels"), {_verticalFiberOffsetVoxels});
 
-    addPathRow(pathsForm, "tracks_dbm", tr("Tracks DBM"), false);
-
     _trackLengthBinSampling = new QCheckBox(tr("Sample tracks by length bins"), pathsContents);
     _trackLengthBinSampling->setObjectName(QStringLiteral("spiralTrackLengthBinSampling"));
     _trackLengthBinSampling->setChecked(false);
@@ -1595,12 +1593,10 @@ void SpiralPanel::setRemoteMode(bool remote)
     _remoteMode = remote;
     // Every service owns its base inputs (local and remote alike): the path
     // rows populate read-only from the service's advertised dataset
-    // resolution. The tracks selection stays editable because the client
-    // chooses among service-advertised values; checkpoints have their own
-    // section and are never a path the client types here.
-    const QStringList clientSelectable{QStringLiteral("tracks_dbm")};
+    // resolution. Checkpoints have their own section and are never a path
+    // the client types here.
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        it.value()->setReadOnly(!clientSelectable.contains(it.key()));
+        it.value()->setReadOnly(true);
         if (_pathBrowseButtons.contains(it.key()))
             _pathBrowseButtons[it.key()]->setVisible(false);
     }
@@ -2144,8 +2140,12 @@ void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveCo
 
 void SpiralPanel::updateTrackSamplingUi()
 {
-    const bool tracksEnabled =
-        !_paths.value(QStringLiteral("tracks_dbm"))->text().trimmed().isEmpty();
+    // Tracks come from the object store; the fit reads them when
+    // input_use_tracks is on.
+    const QJsonDocument advanced = _advanced
+        ? QJsonDocument::fromJson(_advanced->toPlainText().toUtf8()) : QJsonDocument();
+    const bool tracksEnabled = advanced.isObject()
+        && advanced.object().value(QStringLiteral("input_use_tracks")).toBool(false);
     _trackLengthBinSampling->setEnabled(tracksEnabled);
     _trackShortWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackMediumWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
