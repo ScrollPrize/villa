@@ -72,7 +72,9 @@ fi
 [ -f "$HERE/render_shim.so" ] || { echo "build render_shim.so first (README.md)" >&2; exit 1; }
 GL=$(mktemp)
 producer=
-trap '[ -n "$producer" ] && { pkill -P "$producer"; kill "$producer"; } 2>/dev/null; rm -f "$GL"' EXIT
+# stop the subshell before its renderer so it can't start the next surface in between
+stop_producer() { kill -STOP "$producer"; pkill -P "$producer"; kill "$producer"; kill -CONT "$producer"; } 2>/dev/null
+trap '[ -n "$producer" ] && stop_producer; rm -f "$GL"' EXIT
 while read -r S O || [ -n "$S" ]; do
   [ -n "$S" ] && echo "$O.rgpu_dump $O" >> "$GL"
 done < "$LIST"
@@ -93,7 +95,7 @@ producer=$!
 "$PY" "$HERE/render_gpu.py" "@$GL" "$V/0" --device "${RGPU_DEVICE:-cuda:0}" \
   ${RGPU_POOL_GB:+--pool-gb "$RGPU_POOL_GB"} --wait --producer-pid "$producer" --rm-dump
 rc=$?
-[ $rc = 0 ] || { pkill -P "$producer"; kill "$producer"; } 2>/dev/null  # the subshell and its running renderer
+[ $rc = 0 ] || stop_producer
 wait "$producer"
 producer=
 if [ $rc != 0 ]; then  # --rm-dump only removes dumps of surfaces that were written

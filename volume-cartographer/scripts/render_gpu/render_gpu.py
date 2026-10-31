@@ -243,7 +243,6 @@ def render_one(pool, kernel, dump, out_zarr, a, wpool):
 
     # Pyramid L1..L5, as renderTiles builds it: L1 = rounded 2x2 mean of L0 with partial
     # windows at the image edge; L2+ cascade from zero-padded chunk buffers (count 4).
-    # the whole cascade runs on the host so no level sits on the GPU next to the chunk pool
     prev = img
     del img
     for li, lvl in enumerate(levels):
@@ -321,6 +320,8 @@ def main():
     torch.cuda.set_device(dev)  # the kernels launch on the current device
     if a.pool_gb is None:
         a.pool_gb = torch.cuda.mem_get_info(dev)[0] / 2**30 - 2
+        if a.pool_gb < 1:
+            ap.error(f"only {a.pool_gb + 2:.1f} GB free on {a.device}; pass --pool-gb")
     pool = ChunkPool(a.vol, dev, a.pool_gb)
     kernel = rgpu_kernel.load(dev)
     t0 = time.time()

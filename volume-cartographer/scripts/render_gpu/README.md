@@ -32,11 +32,12 @@ It only needs the OpenCV headers: the `cv::Mat` symbols it uses are resolved fro
 
 ```bash
 # list.txt: one "SURFACE_DIR OUT_ZARR" per line, no spaces in paths
-RENDER_GPU=1 RGPU_POOL_GB=10 VC_RENDER_TIFXYZ=/path/to/vc_render_tifxyz \
+RENDER_GPU=1 VC_RENDER_TIFXYZ=/path/to/vc_render_tifxyz \
   ./render_band.sh list.txt /path/to/volume.zarr
 ```
 
-Other env: `RENDER_N` (31), `RENDER_FLIP` (1), `RGPU_DEVICE` (`cuda:0`), `PYTHON` (`python3`).
+Other env: `RGPU_POOL_GB` (GPU memory for the chunk pool; default free memory minus 2 GB),
+`RENDER_N` (31), `RENDER_FLIP` (1), `RGPU_DEVICE` (`cuda:0`), `PYTHON` (`python3`).
 
 Run by hand, the shim also takes `RENDER_SHIM_MODE=both`: the CPU sampler runs as well, so
 one `vc_render_tifxyz` run writes the CPU reference zarr and the dump.
@@ -47,6 +48,7 @@ one `vc_render_tifxyz` run writes the CPU reference zarr and the dump.
 - `-g 0`, u8 output, no composite, no accumulate offsets, no rotate or flip-axis options.
 - A pool smaller than the chunks one surface touches (about 7 GB for a 6,000 px wide
   surface) means re-reading chunks from disk for every surface.
+- Level 0 and the pyramid are built in host RAM (about 2-3 GB for the widest surfaces).
 - The shim matches `sampleTileSlices` and `VcDataset::writeChunkSkipEmpty` by mangled
   name, so `vc_core` must be a shared library (the default, `BUILD_SHARED_LIBS=ON`).
   It relies on each sample call being followed by one write on the same thread.
