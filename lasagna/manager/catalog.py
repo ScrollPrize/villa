@@ -15,6 +15,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
+import vc_reader
+
 from .config import ManagerConfig
 
 
@@ -118,25 +120,7 @@ class LasagnaPredictionRecord:
         value = self.source_url
         if value is None:
             return None
-        open_data = "s3://vesuvius-challenge-open-data/"
-        challenge = "s3://vesuvius-challenge/"
-        if value.startswith(open_data):
-            return (
-                "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"
-                + value[len(open_data):]
-            ).rstrip("/")
-        if value.startswith(challenge):
-            return (
-                "https://data.aws.ash2txt.org/samples/"
-                + value[len(challenge):]
-            ).rstrip("/")
-        if value.startswith("s3://") or value.startswith("s3+"):
-            bucket, key, region = parse_catalog_s3_url(value)
-            result = f"https://{bucket}.s3.{region}.amazonaws.com"
-            if key:
-                result += f"/{key}"
-            return result.rstrip("/")
-        return value.rstrip("/")
+        return (vc_reader.to_https(value) or value).rstrip("/")
 
 
 def cache_paths(config: ManagerConfig) -> tuple[Path, Path]:
