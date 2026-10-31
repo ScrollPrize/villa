@@ -18,7 +18,7 @@ from dtypes import numpy_float_hi
 import torch
 from torch.utils.data import Dataset
 
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
@@ -534,7 +534,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         # coordinates (same convention as original datasets).
         retarget_factor = 2 ** cache_scale
         z_range = _parse_z_range(dataset.get("z_range"))
-        dataset_segments = list(tifxyz.load_folder(segments_path))
+        dataset_segments = [tifxyz.read(entry.location) for entry in tifxyz.list_surfaces(segments_path)]
         scaled_segments = []
         dropped_by_z_range = 0
         for seg in dataset_segments:
@@ -542,7 +542,6 @@ def _find_patches_world_chunks(config, patch_size_zyx):
             if not _segment_overlaps_z_range(seg_scaled, z_range):
                 dropped_by_z_range += 1
                 continue
-            seg_scaled.volume = volume
             scaled_segments.append(seg_scaled)
 
         if not scaled_segments:
@@ -825,7 +824,7 @@ class TifxyzLasagnaDataset(Dataset):
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
         # Clamp to segment bounds
-        seg_h, seg_w = seg._valid_mask.shape
+        seg_h, seg_w = seg.shape
         r_min = max(0, r_min)
         r_max = min(seg_h - 1, r_max)
         c_min = max(0, c_min)
@@ -834,15 +833,12 @@ class TifxyzLasagnaDataset(Dataset):
             return _empty()
 
         # Read stored-resolution grid
-        seg.use_stored_resolution()
-        scale_y, scale_x = seg._scale
-        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
-            return _empty()
-
+        scale_y, scale_x = seg.scale
         # Skip wraps with invalid cells in stored grid (upsampling requires all-valid)
-        if valid_s is not None and not valid_s.all():
+        if not seg.valid[r_min:r_max + 1, c_min:c_max + 1].all():
             return _empty()
+        xyz_s = seg.xyz[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
 
         # Upsample to full resolution
         try:
