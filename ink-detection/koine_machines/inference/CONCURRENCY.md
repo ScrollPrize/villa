@@ -4,22 +4,22 @@ One `infer.py` process does not keep a GPU busy: tile reads and preprocessing le
 idle between batches. Running 2–4 processes on the same card, each on its own part of the
 surface list, raises throughput.
 
-Measured on one PHerc0800 wrap (2400 × 5820 output), with `--overlap 0.5`, Hann blending and
-`--batch-size 1`, one wrap per configuration. Each concurrent output was compared with the single-process output of the
-same card:
+Measured on six Reader v3 windings (PHerc0800, 0125, 0211 and 0268 surface volumes) with
+`--stride 192 --amp-dtype fp16 --no-compile`, MIOpen off. The windings are split round-robin
+over the processes, and the time runs until every process is done. Each value is the median
+of 3 interleaved rounds after a warm-up, with nothing else running on the machine:
 
-| GPU | 1 process (stock flags) | Recipe | Wraps/h | Output vs 1 process |
+| GPU | 1 process | 2 processes | 4 processes | Output vs 1 process |
 |---|---|---|---|---|
-| RTX 3080 10 GB | 125 | 2 processes × `--num-workers 1`, `--gpu-normalize` | 242 | byte-identical |
-| Radeon AI PRO R9700 32 GB | 54 | 4 processes, `--gpu-normalize` | 256 | max diff 1/255 |
-| Instinct MI50 32 GB | 48 | 3–4 processes, stock flags | 125–133 | not byte-identical; max diff not recorded |
+| Radeon AI PRO R9700 32 GB | 74.7 s | 64.4 s (1.16×) | 51.9 s (1.44×) | byte-identical |
+| Instinct MI50 32 GB | 102.2 s | 81.0 s (1.26×) | 77.7 s (1.32×) | byte-identical |
 
-On the R9700 that is 256 / 54 = 4.7× the single-process rate.
+With `--gpu-normalize` the same runs were within 3% of these times on both cards.
 
 Notes:
 
-- `--gpu-normalize` (#2189) moves the per-tile normalization to the GPU. It matters most when
-  several processes share the CPU.
+- `--gpu-normalize` (#2189) moves the per-tile normalization to the GPU. It made no measurable
+  difference in the runs above, where the CPU was not the limit.
 - `--batch-size 8` with `--amp-dtype fp16` gave no gain on any of the three cards.
 - Keep processes × `--num-workers` at or below the number of CPU cores. On Windows each worker
   loads its own copy of torch, so use 0 or 1 workers per process there.
