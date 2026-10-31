@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Prepare auditable canvas-offset CT evidence using rclone only.
+"""Prepare auditable canvas-offset CT evidence.
 
 The source annotation render is copied as one object when the ink dataset
 ships ``*_max_<first>_<last>.tif``. Exact-center images and target comparison
-slabs are extracted from surface-volume Zarrs with ``rclone cat``. Uncompressed
-chunks use byte ranges; compressed chunks are fetched whole and decoded
-locally. No HTTP or Hugging Face client is used.
+slabs are read from surface-volume Zarrs through vc_reader.
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 from dataclasses import dataclass
 import json
 import math
@@ -19,85 +16,25 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
-import subprocess
-import sys
-import tempfile
 from typing import Any, Optional, Sequence
 
 import numpy as np
 from PIL import Image
 from vc_reader import images
+from vc_reader.reader import ObjectStore, open_group, open_zarr
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 # The ink dataset is private: there is no usable default, every run must
-# name the caller's own rclone mirror explicitly.
+# name the location of the caller's own copy explicitly.
 DEFAULT_INK_ROOT: Optional[str] = None
-# The open-data bucket is public; this inline rclone remote reads it
-# anonymously without requiring any local rclone configuration.
-DEFAULT_OPEN_DATA_ROOT = (
-    ":s3,provider=AWS,env_auth=false,region=us-east-1:"
-    "vesuvius-challenge-open-data"
-)
+DEFAULT_OPEN_DATA_ROOT = "s3://vesuvius-challenge-open-data"
 DEFAULT_AWS_CREDENTIALS_FILE: Optional[Path] = None
-RCLONE_PROCESS_TIMEOUT_SECONDS = 10 * 60
-ANNOTATION_COPY_TIMEOUT_SECONDS = 30 * 60
-
-
 def _remote_join(root: str, *parts: str) -> str:
     return root.rstrip("/") + "/" + "/".join(
         part.strip("/") for part in parts if part
     )
-
-
-def _run_rclone(
-    arguments: list[str], timeout_seconds: int = RCLONE_PROCESS_TIMEOUT_SECONDS
-) -> bytes:
-    rclone_command = [
-        "rclone",
-        *arguments,
-        "--contimeout",
-        "10s",
-        "--timeout",
-        "60s",
-        "--retries",
-        "2",
-    ]
-    # A SIGKILL/OOM kill cannot execute Python cleanup.  On Linux, ask the
-    # kernel to terminate rclone when this process dies so a failed Napari
-    # extraction cannot continue downloading orphaned multi-gigabyte chunks.
-    setpriv = (
-        shutil.which("setpriv")
-        if sys.platform.startswith("linux")
-        else None
-    )
-    command = (
-        [setpriv, "--pdeathsig", "TERM", *rclone_command]
-        if setpriv is not None
-        else rclone_command
-    )
-    try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(
-            f"rclone timed out while running {arguments[0]!r}; check AWS "
-            "credentials and object-store connectivity"
-        ) from error
-    if completed.returncode:
-        message = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"rclone failed ({completed.returncode}): "
-            f"rclone {arguments[0]}: {message}"
-        )
-    return completed.stdout
 
 
 def _load_aws_credentials(path: Optional[Path]) -> Optional[Path]:
@@ -131,40 +68,6 @@ def _load_aws_credentials(path: Optional[Path]) -> Optional[Path]:
     return path
 
 
-def _cat_json(remote: str) -> dict[str, Any]:
-    return json.loads(_run_rclone(["cat", remote]))
-
-
-def _cat_range(remote: str, offset: int, count: int) -> bytes:
-    return _run_rclone(
-        [
-            "cat",
-            remote,
-            "--offset",
-            str(offset),
-            "--count",
-            str(count),
-        ]
-    )
-
-
-def _list_files(remote: str, include: str) -> list[str]:
-    output = _run_rclone(
-        [
-            "lsf",
-            remote,
-            "--max-depth",
-            "1",
-            "--files-only",
-            "--include",
-            include,
-        ]
-    )
-    return sorted(
-        line for line in output.decode("utf-8").splitlines() if line
-    )
-
-
 @dataclass(frozen=True)
 class ZarrLevel:
     remote: str
@@ -182,9 +85,17 @@ class ZarrLevel:
     def chunks(self) -> tuple[int, int, int]:
         return tuple(int(value) for value in self.metadata["chunks"])
 
+    def open(self, **reader_options):
+        return open_zarr(_remote_join(self.remote, self.level), **reader_options)
+
+
+def _array_metadata(array) -> dict[str, Any]:
+    return {"shape": list(array.shape), "chunks": list(array.chunks), "dtype": str(array.dtype)}
+
 
 def inspect_zarr(remote: str, preferred_level: int) -> ZarrLevel:
-    attrs = _cat_json(_remote_join(remote, ".zattrs"))
+    group = open_group(remote)
+    attrs = group.attrs
     datasets = [
         dataset
         for multiscale in attrs.get("multiscales") or []
@@ -212,151 +123,10 @@ def inspect_zarr(remote: str, preferred_level: int) -> ZarrLevel:
         remote=remote.rstrip("/"),
         level=level,
         attrs=attrs,
-        metadata=_cat_json(_remote_join(remote, level, ".zarray")),
-        level_zero_metadata=_cat_json(_remote_join(remote, "0", ".zarray")),
+        metadata=_array_metadata(group.array(level)),
+        level_zero_metadata=_array_metadata(group.array("0")),
         scale_zyx=scale,
     )
-
-
-def _chunk_key(
-    info: ZarrLevel, z_chunk: int, y_chunk: int, x_chunk: int
-) -> str:
-    separator = info.metadata.get("dimension_separator", ".")
-    indices = separator.join(
-        str(value) for value in (z_chunk, y_chunk, x_chunk)
-    )
-    return _remote_join(info.remote, info.level, indices)
-
-
-def _batched_range_payloads(
-    info: ZarrLevel,
-    z_chunk: int,
-    byte_offset: int,
-    byte_count: int,
-    workers: int,
-) -> list[tuple[int, int, bytes]]:
-    """Read uncompressed chunks with one rclone process per chunk row."""
-
-    separator = info.metadata.get("dimension_separator", ".")
-    if separator == "/":
-        root = _remote_join(info.remote, info.level, str(z_chunk))
-        prefix = ""
-    else:
-        root = _remote_join(info.remote, info.level)
-        prefix = f"{z_chunk}."
-    listed = _run_rclone(
-        ["lsf", root, "--recursive", "--files-only"]
-    ).decode("utf-8").splitlines()
-    rows: dict[int, list[tuple[str, int]]] = {}
-    for relative in listed:
-        if separator == "/":
-            parts = relative.split("/")
-            if len(parts) != 2:
-                continue
-            y_chunk, x_chunk = int(parts[0]), int(parts[1])
-        else:
-            if not relative.startswith(prefix):
-                continue
-            parts = relative.split(".")
-            if len(parts) != 3 or int(parts[0]) != z_chunk:
-                continue
-            y_chunk, x_chunk = int(parts[1]), int(parts[2])
-        rows.setdefault(y_chunk, []).append((relative, x_chunk))
-
-    def fetch_row(
-        item: tuple[int, list[tuple[str, int]]]
-    ) -> list[tuple[int, int, bytes]]:
-        y_chunk, files = item
-        # rclone cat concatenates matching files in remote lexical order.
-        files = sorted(files, key=lambda value: value[0])
-        arguments = ["cat", root]
-        for relative, _ in files:
-            arguments.extend(["--include", f"/{relative}"])
-        arguments.extend(
-            [
-                "--offset",
-                str(byte_offset),
-                "--count",
-                str(byte_count),
-            ]
-        )
-        combined = _run_rclone(arguments)
-        expected = len(files) * byte_count
-        if len(combined) != expected:
-            raise ValueError(
-                f"batched rclone row {y_chunk} returned "
-                f"{len(combined)} bytes, expected {expected}"
-            )
-        return [
-            (
-                y_chunk,
-                x_chunk,
-                combined[index * byte_count : (index + 1) * byte_count],
-            )
-            for index, (_, x_chunk) in enumerate(files)
-        ]
-
-    payloads: list[tuple[int, int, bytes]] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(workers, max(len(rows), 1))
-    ) as executor:
-        for row_payloads in executor.map(fetch_row, sorted(rows.items())):
-            payloads.extend(row_payloads)
-    return payloads
-
-
-def _bulk_copy_compressed_chunks(
-    info: ZarrLevel,
-    z_chunk: int,
-    positions: Sequence[tuple[int, int]],
-    destination: Path,
-    workers: int,
-) -> list[tuple[int, int, Path]]:
-    """Fetch compressed chunks with one parallel rclone copy process."""
-
-    level_remote = _remote_join(info.remote, info.level)
-    listed = set(
-        _run_rclone(
-            ["lsf", level_remote, "--recursive", "--files-only"]
-        )
-        .decode("utf-8")
-        .splitlines()
-    )
-    separator = info.metadata.get("dimension_separator", ".")
-    wanted = {
-        separator.join(str(value) for value in (z_chunk, y_chunk, x_chunk)): (
-            y_chunk,
-            x_chunk,
-        )
-        for y_chunk, x_chunk in positions
-    }
-    present = sorted(relative for relative in wanted if relative in listed)
-    if not present:
-        return []
-    destination.mkdir(parents=True, exist_ok=True)
-    files_path = destination / "files-from.txt"
-    files_path.write_text("\n".join(present) + "\n", encoding="utf-8")
-    try:
-        _run_rclone(
-            [
-                "copy",
-                level_remote,
-                str(destination),
-                "--files-from",
-                str(files_path),
-                "--no-traverse",
-                "--transfers",
-                str(workers),
-                "--checkers",
-                str(workers),
-            ],
-            timeout_seconds=1800,
-        )
-    finally:
-        files_path.unlink(missing_ok=True)
-    return [
-        (*wanted[relative], destination / relative) for relative in present
-    ]
 
 
 def extract_composite(
@@ -367,7 +137,7 @@ def extract_composite(
     workers: int,
     overwrite: bool,
 ) -> dict[str, Any]:
-    """Extract a maximum composite while transferring only required bytes."""
+    """Extract a maximum composite, reading one band of rows of the slab at a time."""
 
     audit_path = output_path.with_suffix(".json")
     if output_path.exists() and audit_path.exists() and not overwrite:
@@ -380,38 +150,10 @@ def extract_composite(
     indices = np.unique(
         np.clip(np.asarray(z_indices, dtype=np.int64), 0, shape[0] - 1)
     )
-    z_chunks = indices // chunks[0]
-    if not np.all(z_chunks == z_chunks[0]):
-        raise ValueError(
-            "selected Z layers cross chunk boundaries; split extraction "
-            "is not implemented"
-        )
-    local_z = indices % chunks[0]
-    if not np.all(np.diff(local_z) == 1):
+    if not np.all(np.diff(indices) == 1):
         raise ValueError("selected Z layers must be contiguous")
-    if (
-        len(shape) != 3
-        or len(chunks) != 3
-        or info.metadata.get("filters") is not None
-        or info.metadata.get("order") != "C"
-    ):
-        raise ValueError(
-            "requires an unfiltered, C-order 3D Zarr; "
-            f"got {info.metadata}"
-        )
-
-    compressor = info.metadata.get("compressor")
-    codec = None
-    if compressor is not None:
-        from numcodecs import get_codec
-
-        codec = get_codec(compressor)
-    slice_bytes = chunks[1] * chunks[2] * dtype.itemsize
-    byte_offset = int(local_z[0]) * slice_bytes
-    byte_count = len(indices) * slice_bytes
-    full_chunk_bytes = math.prod(chunks) * dtype.itemsize
-    y_chunks = math.ceil(shape[1] / chunks[1])
-    x_chunks = math.ceil(shape[2] / chunks[2])
+    if len(shape) != 3:
+        raise ValueError(f"expected a z/y/x array, got shape {shape}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     partial_output = output_path.with_name(
         f".{output_path.name}.{os.getpid()}.partial.tif"
@@ -426,104 +168,24 @@ def extract_composite(
         f"{indices[0]}..{indices[-1]} -> {output_path}",
         flush=True,
     )
-
-    def fetch_one(
-        position: tuple[int, int]
-    ) -> tuple[int, int, Optional[bytes]]:
-        y_chunk, x_chunk = position
-        remote = _chunk_key(
-            info, int(z_chunks[0]), y_chunk, x_chunk
-        )
-        payload = _cat_range(remote, byte_offset, byte_count)
-        # Sparse Zarrs omit all-fill chunks. rclone cat represents a missing
-        # object as an empty result for this S3 backend.
-        return y_chunk, x_chunk, payload or None
-
-    positions = [
-        (y_chunk, x_chunk)
-        for y_chunk in range(y_chunks)
-        for x_chunk in range(x_chunks)
-    ]
-    transferred = 0
-    present_chunks = 0
-    missing_chunks = 0
-    compressed_cache: Optional[tempfile.TemporaryDirectory] = None
-    if codec is not None:
-        compressed_cache = tempfile.TemporaryDirectory(
-            prefix=".tifxyz-compressed-chunks-",
-            dir=output_path.parent,
-        )
-        fetched = _bulk_copy_compressed_chunks(
-            info,
-            int(z_chunks[0]),
-            positions,
-            Path(compressed_cache.name),
-            workers,
-        )
-        missing_chunks = len(positions) - len(fetched)
-    elif workers > 1:
-        fetched = _batched_range_payloads(
-            info, int(z_chunks[0]), byte_offset, byte_count, workers
-        )
-        missing_chunks = len(positions) - len(fetched)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers
-        ) as executor:
-            fetched = list(executor.map(fetch_one, positions))
+    reader = info.open(threads=workers)
     try:
-        for y_chunk, x_chunk, payload_value in fetched:
-            payload = (
-                payload_value.read_bytes()
-                if isinstance(payload_value, Path)
-                else payload_value
-            )
-            if payload is None:
-                missing_chunks += 1
-                continue
-            present_chunks += 1
-            transferred += len(payload)
-            if codec is None:
-                expected = byte_count
-                if len(payload) != expected:
-                    raise ValueError(
-                        f"short range for chunk {y_chunk}/{x_chunk}: "
-                        f"{len(payload)} != {expected}"
-                    )
-                layers = np.frombuffer(payload, dtype=dtype).reshape(
-                    len(indices), chunks[1], chunks[2]
-                )
-            else:
-                decoded = codec.decode(payload)
-                if len(decoded) != full_chunk_bytes:
-                    raise ValueError(
-                        f"decoded chunk {y_chunk}/{x_chunk} has "
-                        f"{len(decoded)} bytes, expected {full_chunk_bytes}"
-                    )
-                layers = np.frombuffer(decoded, dtype=dtype).reshape(
-                    chunks
-                )[int(local_z[0]) : int(local_z[-1]) + 1]
-            block = layers.max(axis=0)
-            row = y_chunk * chunks[1]
-            col = x_chunk * chunks[2]
-            row_end = min(row + chunks[1], shape[1])
-            col_end = min(col + chunks[2], shape[2])
-            output[row:row_end, col:col_end] = block[
-                : row_end - row, : col_end - col
-            ]
+        for row in range(0, shape[1], chunks[1]):
+            band = reader[int(indices[0]) : int(indices[-1]) + 1, row : row + chunks[1], :]
+            output[row : row + band.shape[1]] = band.max(axis=0)
         output.flush()
+        transferred = int(reader.stats().get("remote_bytes", 0))
     except BaseException:
         del output
         partial_output.unlink(missing_ok=True)
         raise
     finally:
-        if compressed_cache is not None:
-            compressed_cache.cleanup()
+        reader.close()
 
     del output
     partial_output.replace(output_path)
     audit = {
-        "transport": "rclone",
+        "transport": "vc_reader",
         "source": info.remote,
         "pyramid_level": int(info.level),
         "scale_zyx": list(info.scale_zyx),
@@ -534,15 +196,12 @@ def extract_composite(
         "composite": "single" if len(indices) == 1 else "maximum",
         "output": str(output_path),
         "transferred_bytes": transferred,
-        "present_chunks": present_chunks,
-        "missing_chunks": missing_chunks,
-        "whole_compressed_chunks": codec is not None,
     }
     audit_path.write_text(
         json.dumps(audit, indent=2) + "\n", encoding="utf-8"
     )
     print(
-        f"Cached {output_path} ({transferred / 1024**2:.1f} MiB via rclone)",
+        f"Cached {output_path} ({transferred / 1024**2:.1f} MiB read)",
         flush=True,
     )
     return audit
@@ -562,7 +221,11 @@ def _preserves_z_planes(info: ZarrLevel) -> bool:
 def _copy_annotation_render(
     dataset_remote: str, output_dir: Path, overwrite: bool
 ) -> tuple[Optional[Path], Optional[tuple[int, int]]]:
-    candidates = _list_files(dataset_remote, "*_max_*_*.tif")
+    store = ObjectStore(dataset_remote)
+    candidates = sorted(
+        name for name in store.keys()
+        if "/" not in name and re.search(r"_max_.*_.*\.tif$", name)
+    )
     if not candidates:
         return None, None
     if len(candidates) != 1:
@@ -579,14 +242,7 @@ def _copy_annotation_render(
         output.parent.mkdir(parents=True, exist_ok=True)
         partial = output.with_name(f".{output.name}.{os.getpid()}.partial")
         try:
-            _run_rclone(
-                [
-                    "copyto",
-                    _remote_join(dataset_remote, name),
-                    str(partial),
-                ],
-                timeout_seconds=ANNOTATION_COPY_TIMEOUT_SECONDS,
-            )
+            partial.write_bytes(store.read(name))
             partial.replace(output)
         finally:
             partial.unlink(missing_ok=True)
@@ -802,19 +458,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ink-rclone-root",
+        "--ink-root",
         default=DEFAULT_INK_ROOT,
         help=(
-            "rclone remote:path of your mirror of the private ink dataset "
+            "location (s3://, a URL or a path) of your copy of the private ink dataset "
             "(required, e.g. myremote:bucket/datasets/ink/ink_YYYYMM)"
         ),
     )
     parser.add_argument(
-        "--open-data-rclone-root",
+        "--open-data-root",
         default=DEFAULT_OPEN_DATA_ROOT,
         help=(
-            "rclone remote:path of the public Vesuvius open-data bucket "
-            "(default: anonymous inline S3 remote, no rclone config needed)"
+            "location of the public Vesuvius open-data bucket"
         ),
     )
     parser.add_argument(
@@ -824,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "optional shell-format AWS exports loaded only when "
             "AWS_ACCESS_KEY_ID is absent (default: none; authenticate via "
-            "the environment or your rclone config)"
+            "the environment or ~/.aws)"
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -833,11 +488,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    if not args.ink_rclone_root:
+    if not args.ink_root:
         raise SystemExit(
-            "error: --ink-rclone-root is required; the ink dataset is "
-            "private, so point it at your own rclone mirror "
-            "(e.g. myremote:bucket/datasets/ink/ink_YYYYMM)"
+            "error: --ink-root is required; the ink dataset is "
+            "private, so point it at your own copy "
+            "(e.g. s3://bucket/datasets/ink/ink_YYYYMM)"
         )
     credentials_path = _load_aws_credentials(
         args.aws_credentials_file.expanduser()
@@ -855,14 +510,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(f"Preparing canvas-offset evidence for {case_dir}", flush=True)
     dataset_remote = _source_dataset_remote(
-        selection, args.ink_rclone_root
+        selection, args.ink_root
     )
     source_zarr_name = Path(
         selection["source_surface_zarrs"][0]["path"]
     ).name
     source_zarr_remote = _remote_join(dataset_remote, source_zarr_name)
     target_zarr_remote = _target_zarr_remote(
-        selection, case_dir, args.open_data_rclone_root
+        selection, case_dir, args.open_data_root
     )
     target_resolution = _surface_resolution_for_remote(
         selection, target_zarr_remote
@@ -975,7 +630,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     manifest = {
         "tool": "prepare_canvas_offset_evidence.py",
-        "transport": "rclone",
+        "transport": "vc_reader",
         "aws_credentials_file": (
             str(credentials_path) if credentials_path else None
         ),

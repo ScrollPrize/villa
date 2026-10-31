@@ -34,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 from vc_reader import tifxyz
+from vc_reader.reader import decompress_bytes
 from scipy import ndimage
 
 ROOT = 'https://vesuvius-challenge-open-data.s3.amazonaws.com'
@@ -127,15 +128,11 @@ class Occupancy:
         self.absent_file = level_dir/'absent.json'
         self.absent = {tuple(k) for k in json.loads(self.absent_file.read_text())} if self.absent_file.is_file() else set()
         self.lock = threading.Lock()
-        if zarray.get('compressor'):
-            import numcodecs
-            self.codec = numcodecs.get_codec(zarray['compressor'])
-        else:
-            self.codec = None
 
     def _cells(self, blob: bytes) -> np.ndarray:
-        raw = self.codec.decode(blob) if self.codec else blob
-        a = np.frombuffer(raw, np.dtype(self.zarray['dtype'])).reshape(self.chunk)
+        dtype = np.dtype(self.zarray['dtype'])
+        raw = decompress_bytes(blob, self.zarray.get('compressor'), int(np.prod(self.chunk))*dtype.itemsize)
+        a = np.frombuffer(raw, dtype).reshape(self.chunk)
         c = self.chunk//BLOCK
         return a.reshape(c[0], BLOCK, c[1], BLOCK, c[2], BLOCK).max((1, 3, 5)) > 0
 

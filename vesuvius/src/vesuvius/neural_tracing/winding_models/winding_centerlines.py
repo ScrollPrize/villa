@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -58,7 +59,7 @@ import click
 import cv2
 import numpy as np
 from vc_reader import tifxyz
-from numcodecs import Zstd, get_codec
+from vc_reader.reader import ObjectStore, ZarrWriter, create_group, open_zarr
 from scipy import ndimage
 from scipy.interpolate import interp1d
 from scipy.spatial import cKDTree
@@ -68,7 +69,6 @@ from tqdm import tqdm
 @dataclass(frozen=True)
 class ChunkEntry:
     index: tuple[int, int, int]
-    path: Path
 
 
 @dataclass(frozen=True)
@@ -122,139 +122,29 @@ def _parse_labels(text: str | None) -> set[int] | None:
     return labels
 
 
-class LocalZarrArray:
-    """Small local-filesystem Zarr v2/v3 reader optimized for stored chunks."""
-
-    def __init__(self, path: Path):
-        self.path = path.resolve()
-        v3_metadata = self.path / 'zarr.json'
-        v2_metadata = self.path / '.zarray'
-        if v3_metadata.exists():
-            self.version = 3
-            with open(v3_metadata) as stream:
-                metadata = json.load(stream)
-            if metadata.get('node_type') != 'array':
-                raise click.UsageError(f'{self.path} is a Zarr group, not an array')
-            self.shape = tuple(map(int, metadata['shape']))
-            self.chunks = tuple(map(int, metadata['chunk_grid']['configuration']['chunk_shape']))
-            self.fill_value = metadata.get('fill_value')
-            self.order = 'C'
-            self.codecs = metadata.get('codecs', [])
-            self.dtype = np.dtype(metadata['data_type'])
-            for codec in self.codecs:
-                if codec.get('name') == 'bytes':
-                    endian = codec.get('configuration', {}).get('endian')
-                    if endian == 'little':
-                        self.dtype = self.dtype.newbyteorder('<')
-                    elif endian == 'big':
-                        self.dtype = self.dtype.newbyteorder('>')
-            encoding = metadata.get('chunk_key_encoding', {
-                'name': 'default', 'configuration': {'separator': '/'},
-            })
-            self.chunk_key_name = encoding.get('name', 'default')
-            self.separator = encoding.get('configuration', {}).get('separator', '/')
-            self.chunk_root = self.path / ('c' if self.chunk_key_name == 'default' else '')
-            self.compressor = None
-            self.filters = []
-        elif v2_metadata.exists():
-            self.version = 2
-            with open(v2_metadata) as stream:
-                metadata = json.load(stream)
-            self.shape = tuple(map(int, metadata['shape']))
-            self.chunks = tuple(map(int, metadata['chunks']))
-            self.fill_value = metadata.get('fill_value')
-            self.order = metadata.get('order', 'C')
-            self.dtype = np.dtype(metadata['dtype'])
-            self.separator = metadata.get('dimension_separator', '.')
-            self.chunk_root = self.path
-            self.compressor = metadata.get('compressor')
-            self.filters = metadata.get('filters') or []
-            self.codecs = []
-            self.chunk_key_name = 'v2'
-        else:
-            raise click.UsageError(f'{self.path} is not a local Zarr v2/v3 array')
-
-        if len(self.shape) != 3 or len(self.chunks) != 3:
-            raise click.UsageError(
-                f'{self.path} has shape {self.shape}; expected a three-dimensional Z,Y,X array'
-            )
-        if not np.issubdtype(self.dtype, np.integer):
-            raise click.UsageError(f'{self.path} has dtype {self.dtype}; expected an integer array')
-
-    def stored_chunks(self) -> list[ChunkEntry]:
-        entries = []
-        if not self.chunk_root.exists():
-            return entries
-        for path in self.chunk_root.rglob('*'):
-            if not path.is_file() or path.name.startswith('.'):
-                continue
-            relative = path.relative_to(self.chunk_root)
-            try:
-                if self.separator == '/':
-                    parts = relative.parts
-                else:
-                    if len(relative.parts) != 1:
-                        continue
-                    parts = tuple(relative.name.split(self.separator))
-                if len(parts) != 3:
-                    continue
-                index = tuple(map(int, parts))
-            except ValueError:
-                continue
-            entries.append(ChunkEntry(index=index, path=path))
-        entries.sort(key=lambda entry: entry.index)
-        return entries
-
-    def actual_chunk_shape(self, index: tuple[int, int, int]) -> tuple[int, int, int]:
-        return tuple(
-            min(chunk, size - coordinate * chunk)
-            for size, chunk, coordinate in zip(self.shape, self.chunks, index)
+def _open_input(path: Path):
+    try:
+        reader = open_zarr(path.resolve(), threads=1)
+    except (OSError, ValueError) as error:
+        raise click.UsageError(f'{path} is not a Zarr array: {error}') from error
+    if len(reader.shape) != 3 or len(reader.chunks) != 3:
+        raise click.UsageError(
+            f'{path} has shape {reader.shape}; expected a three-dimensional Z,Y,X array'
         )
+    if not np.issubdtype(reader.dtype, np.integer):
+        raise click.UsageError(f'{path} has dtype {reader.dtype}; expected an integer array')
+    return reader
 
-    def _decode_v3(self, payload: bytes) -> bytes:
-        decoded = payload
-        for codec in reversed(self.codecs):
-            name = codec.get('name')
-            configuration = codec.get('configuration', {})
-            if name == 'zstd':
-                decoded = Zstd().decode(decoded)
-            elif name == 'gzip':
-                decoded = get_codec({'id': 'gzip', **configuration}).decode(decoded)
-            elif name == 'bytes':
-                pass
-            else:
-                raise click.ClickException(
-                    f'unsupported Zarr v3 codec {name!r} in {self.path}; '
-                    'bytes+zstd and bytes+gzip are supported'
-                )
-        return bytes(decoded)
 
-    def _decode_v2(self, payload: bytes) -> bytes:
-        decoded = payload
-        if self.compressor is not None:
-            decoded = get_codec(self.compressor).decode(decoded)
-        if self.filters:
-            raise click.ClickException(
-                f'filtered Zarr v2 input is not currently supported: {self.path}'
-            )
-        return bytes(decoded)
-
-    def decode_chunk(self, entry: ChunkEntry) -> tuple[ChunkEntry, bytes, tuple[int, int, int]]:
-        payload = entry.path.read_bytes()
-        decoded = self._decode_v3(payload) if self.version == 3 else self._decode_v2(payload)
-        actual_shape = self.actual_chunk_shape(entry.index)
-        actual_bytes = math.prod(actual_shape) * self.dtype.itemsize
-        full_bytes = math.prod(self.chunks) * self.dtype.itemsize
-        if len(decoded) == actual_bytes:
-            shape = actual_shape
-        elif len(decoded) == full_bytes:
-            shape = self.chunks
-        else:
-            raise click.ClickException(
-                f'{entry.path} decoded to {len(decoded)} bytes; expected '
-                f'{actual_bytes} (edge chunk) or {full_bytes} (full chunk)'
-            )
-        return entry, decoded, tuple(map(int, shape))
+def _stored_chunks(path: Path) -> list[ChunkEntry]:
+    """The chunks present in a local array, by key, in order: this tool visits only those."""
+    entries = []
+    for name in ObjectStore(path.resolve(), auth=None).keys():
+        parts = re.split(r'[/.]', name.removeprefix('c/'))
+        if len(parts) == 3 and all(part.isdigit() for part in parts):
+            entries.append(ChunkEntry(index=tuple(map(int, parts))))
+    entries.sort(key=lambda entry: entry.index)
+    return entries
 
 
 def _group_block_points(
@@ -300,25 +190,26 @@ def _group_block_points(
 
 
 def _collect_chunk_points(
-    reader: LocalZarrArray,
+    reader,
     entry: ChunkEntry,
     background: int,
     selected_labels: np.ndarray | None,
     anchor_planes: np.ndarray,
 ) -> list[tuple[int, int, np.ndarray]]:
     """Decode one stored chunk and reduce it to grouped foreground points."""
-    entry, decoded, shape = reader.decode_chunk(entry)
     z0 = entry.index[0] * reader.chunks[0]
     y0 = entry.index[1] * reader.chunks[1]
     x0 = entry.index[2] * reader.chunks[2]
-    valid_z = min(shape[0], reader.shape[0] - z0)
-    valid_y = min(shape[1], reader.shape[1] - y0)
-    valid_x = min(shape[2], reader.shape[2] - x0)
+    values = reader[
+        z0 : z0 + reader.chunks[0],
+        y0 : y0 + reader.chunks[1],
+        x0 : x0 + reader.chunks[2],
+    ]
+    valid_z, valid_y, valid_x = values.shape
     local = anchor_planes - z0
     local = local[(local >= 0) & (local < valid_z)]
     if not len(local):
         return []
-    values = np.ndarray(shape, dtype=reader.dtype, buffer=decoded, order=reader.order)
     low, high = int(local[0]), int(local[-1]) + 1
     if len(local) == high - low:
         block = values[low:high, :valid_y, :valid_x]
@@ -340,7 +231,7 @@ class PointSlab:
 
     def __init__(
         self,
-        reader: LocalZarrArray,
+        reader,
         entries: list[ChunkEntry],
         anchor_planes: np.ndarray,
         read_workers: int,
@@ -710,23 +601,16 @@ class OmeZarrWriter:
             tuple((size + (1 << level) - 1) // (1 << level) for size in shape)
             for level in range(self.pyramid_levels)
         ]
-        self.array_paths = [path / str(level) for level in range(self.pyramid_levels)]
         self.dtype = np.dtype(dtype)
         self.background = background
         self.chunk_z = chunk_z
         self.chunk_yx = chunk_yx
-        self.compressor = Zstd(level=compression_level)
-        self.compression_level = compression_level
         self._plane = np.full(shape[1:], background, dtype=self.dtype)
         self._buffers: list[dict[tuple[int, int], np.ndarray]] = [
             {} for _ in range(self.pyramid_levels)
         ]
         self._buffer_z_chunks: list[int | None] = [None] * self.pyramid_levels
         self.stored_chunk_count = 0
-        path.mkdir(parents=True)
-        for array_path in self.array_paths:
-            array_path.mkdir()
-        _write_json_atomic(path / '.zgroup', {'zarr_format': 2})
         axes = [{'name': axis, 'type': 'space'} for axis in 'zyx']
         if unit:
             for axis in axes:
@@ -759,25 +643,24 @@ class OmeZarrWriter:
                 } for level in range(self.pyramid_levels)],
             }],
         }
-        _write_json_atomic(path / '.zattrs', self.attributes)
-        for level, (array_path, level_shape) in enumerate(
-            zip(self.array_paths, self.level_shapes)
-        ):
-            _write_json_atomic(array_path / '.zarray', {
-                'zarr_format': 2,
-                'shape': list(level_shape),
-                'chunks': [chunk_z, chunk_yx, chunk_yx],
-                'dtype': self.dtype.str,
-                'compressor': {'id': 'zstd', 'level': compression_level},
-                'fill_value': background,
-                'order': 'C',
-                'filters': None,
-                'dimension_separator': '/',
-            })
-            array_attributes = {'_ARRAY_DIMENSIONS': ['z', 'y', 'x']}
+        self.group = create_group(path, attrs=self.attributes, auth=None)
+        self.writers = []
+        for level, level_shape in enumerate(self.level_shapes):
+            writer = ZarrWriter.create(
+                path / str(level),
+                shape=level_shape,
+                chunks=(chunk_z, chunk_yx, chunk_yx),
+                dtype=self.dtype,
+                compressor='zstd',
+                level=compression_level,
+                separator='/',
+                fill_value=background,
+                auth=None,
+            )
+            writer.attrs['_ARRAY_DIMENSIONS'] = ['z', 'y', 'x']
             if level:
-                array_attributes['downsampling_method'] = 'nearest'
-            _write_json_atomic(array_path / '.zattrs', array_attributes)
+                writer.attrs['downsampling_method'] = 'nearest'
+            self.writers.append(writer)
 
     def _write_chunk(
         self,
@@ -787,13 +670,7 @@ class OmeZarrWriter:
         chunk_x: int,
         values: np.ndarray,
     ) -> None:
-        destination = self.array_paths[level] / str(z_chunk) / str(chunk_y) / str(chunk_x)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = bytes(self.compressor.encode(values.tobytes(order='C')))
-        temporary = destination.with_name(f'.{destination.name}.tmp-{os.getpid()}')
-        with open(temporary, 'wb') as stream:
-            stream.write(payload)
-        os.replace(temporary, destination)
+        self.writers[level].write_chunk((z_chunk, chunk_y, chunk_x), values)
 
     def _flush_level(self, level: int) -> None:
         z_chunk = self._buffer_z_chunks[level]
@@ -877,7 +754,8 @@ class OmeZarrWriter:
             'stored_chunk_count': int(self.stored_chunk_count),
             'complete': True,
         })
-        _write_json_atomic(self.path / '.zattrs', self.attributes)
+        for key in ('labels', 'curve_count', 'stored_chunk_count', 'complete'):
+            self.group.attrs[key] = self.attributes[key]
 
 
 class TifxyzSpool:
@@ -1181,7 +1059,7 @@ def main(
 ) -> None:
     """Extract centerlines from INPUT_ARRAY into OUTPUT_OME_ZARR."""
     progress_enabled = not no_progress
-    reader = LocalZarrArray(input_array)
+    reader = _open_input(input_array)
     limits = np.iinfo(reader.dtype)
     if background < limits.min or background > limits.max:
         raise click.UsageError(f'background {background} is not representable by {reader.dtype}')
@@ -1241,7 +1119,7 @@ def main(
     )
 
     entries_by_z_chunk: dict[int, list[ChunkEntry]] = defaultdict(list)
-    for entry in reader.stored_chunks():
+    for entry in _stored_chunks(input_array):
         block_start = entry.index[0] * reader.chunks[0]
         block_stop = min(reader.shape[0], block_start + reader.chunks[0])
         if block_stop > z_min and block_start < z_max:

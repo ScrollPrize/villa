@@ -30,8 +30,8 @@ from .io import load_surface as load_full_surface
 from .prepare_canvas_offset_evidence import (
     DEFAULT_INK_ROOT,
     DEFAULT_OPEN_DATA_ROOT,
-    extract_composite as extract_rclone_composite,
-    inspect_zarr as inspect_rclone_zarr,
+    extract_composite,
+    inspect_zarr,
 )
 
 
@@ -426,8 +426,8 @@ def preferred_annotation_image(paths: list[Path]) -> Path:
 
 def discover_case(
     root: Path,
-    ink_rclone_root: str | None = DEFAULT_INK_ROOT,
-    open_data_rclone_root: str = DEFAULT_OPEN_DATA_ROOT,
+    ink_root: str | None = DEFAULT_INK_ROOT,
+    open_data_root: str = DEFAULT_OPEN_DATA_ROOT,
 ) -> Case:
     selection_path = root / "selection.json"
     if not selection_path.exists():
@@ -495,7 +495,7 @@ def discover_case(
     )
     surface_urls = {
         float(volume["resolution_um"]): _remote_join(
-            open_data_rclone_root, volume["path"]
+            open_data_root, volume["path"]
         )
         for volume in surface_volumes
         if float(volume.get("resolution_um") or -1.0) in requested
@@ -516,8 +516,8 @@ def discover_case(
     # The ink dataset is private; without an explicit mirror the viewer can
     # still run from cached/prepared renders and only fails on a remote fetch.
     source_surface_url = (
-        _remote_join(ink_rclone_root, source_path)
-        if ink_rclone_root
+        _remote_join(ink_root, source_path)
+        if ink_root
         else None
     )
 
@@ -685,32 +685,23 @@ def load_middle_three_max(
     if cache_path.is_file():
         print(f"Using cached middle-{plane_count} max: {cache_path}")
         return read_render_tiff(cache_path)
-    if "://" not in root_url:
-        info = inspect_rclone_zarr(root_url, preferred_level)
-        middle = info.shape[0] // 2
-        radius = plane_count // 2
-        extract_rclone_composite(
-            info,
-            list(
-                range(
-                    max(0, middle - radius),
-                    min(info.shape[0], middle + radius + 1),
-                )
-            ),
-            cache_path,
-            workers=workers,
-            overwrite=False,
-        )
-        print(
-            f"Using rclone-backed middle-{plane_count} max: {cache_path}"
-        )
-        return read_render_tiff(cache_path)
-
-    raise ValueError(
-        "HTTP/URL zarr access is disabled; data must be read with "
-        f"rclone. Pass an rclone remote path (remote:bucket/path) "
-        f"instead of {root_url!r}"
+    info = inspect_zarr(root_url, preferred_level)
+    middle = info.shape[0] // 2
+    radius = plane_count // 2
+    extract_composite(
+        info,
+        list(
+            range(
+                max(0, middle - radius),
+                min(info.shape[0], middle + radius + 1),
+            )
+        ),
+        cache_path,
+        workers=workers,
+        overwrite=False,
     )
+    print(f"Using middle-{plane_count} max: {cache_path}")
+    return read_render_tiff(cache_path)
 
 
 def evidence_comparison_render(
@@ -1242,7 +1233,7 @@ def prepare_case(
             if case.source_surface_volume_url is None:
                 raise ValueError(
                     f"{case.name}: no cached source render and no ink "
-                    "dataset mirror configured; pass --ink-rclone-root "
+                    "dataset mirror configured; pass --ink-root "
                     "to fetch it"
                 )
             source_render = load_middle_three_max(
@@ -2594,19 +2585,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ink-rclone-root",
+        "--ink-root",
         default=DEFAULT_INK_ROOT,
         help=(
-            "rclone remote:path of your mirror of the private ink dataset; "
+            "location of your copy of the private ink dataset; "
             "needed only when a source CT render must be fetched remotely"
         ),
     )
     parser.add_argument(
-        "--open-data-rclone-root",
+        "--open-data-root",
         default=DEFAULT_OPEN_DATA_ROOT,
         help=(
-            "rclone remote:path of the public Vesuvius open-data bucket "
-            "(default: anonymous inline S3 remote, no rclone config needed)"
+            "location of the public Vesuvius open-data bucket"
         ),
     )
     parser.add_argument(
@@ -2639,8 +2629,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for path in args.case_dir:
         case = discover_case(
             path.resolve(),
-            ink_rclone_root=args.ink_rclone_root,
-            open_data_rclone_root=args.open_data_rclone_root,
+            ink_root=args.ink_root,
+            open_data_root=args.open_data_root,
         )
         if any(existing.name == case.name for existing in cases):
             raise ValueError(f"Duplicate case name: {case.name}")

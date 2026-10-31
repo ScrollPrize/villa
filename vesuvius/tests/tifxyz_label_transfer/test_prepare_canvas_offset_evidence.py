@@ -10,20 +10,17 @@ from unittest import mock
 import numpy as np
 import tifffile
 from vc_reader import images
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.tifxyz_label_transfer.estimate_canvas_offset_evidence import (
     assess_evidence,
     main as estimate_evidence_main,
 )
 from vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence import (
-    ANNOTATION_COPY_TIMEOUT_SECONDS,
     DEFAULT_AWS_CREDENTIALS_FILE,
     DEFAULT_INK_ROOT,
     DEFAULT_OPEN_DATA_ROOT,
-    RCLONE_PROCESS_TIMEOUT_SECONDS,
     ZarrLevel,
-    _batched_range_payloads,
-    _bulk_copy_compressed_chunks,
     _copy_annotation_render,
     _load_aws_credentials,
     _preserves_z_planes,
@@ -32,12 +29,12 @@ from vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence import (
     _surface_z_step_um,
     build_parser as build_prepare_parser,
     extract_composite,
+    inspect_zarr,
     main as prepare_evidence_main,
-    _run_rclone,
 )
 
 
-class RcloneCompositeTests(unittest.TestCase):
+class CompositeTests(unittest.TestCase):
     def test_exact_center_requires_z_plane_preserving_level(self) -> None:
         preserved = SimpleNamespace(
             shape=(65, 20, 30),
@@ -51,118 +48,21 @@ class RcloneCompositeTests(unittest.TestCase):
         self.assertTrue(_preserves_z_planes(preserved))
         self.assertFalse(_preserves_z_planes(shortened))
 
-    def test_rclone_process_timeout_allows_slow_range_reads(self) -> None:
-        completed = mock.Mock(returncode=0, stdout=b"payload", stderr=b"")
-        with (
-            mock.patch("subprocess.run", return_value=completed) as run,
-            mock.patch(
-                "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                "shutil.which",
-                return_value="/usr/bin/setpriv",
-            ),
-            mock.patch(
-                "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                "sys.platform",
-                "linux",
-            ),
-        ):
-            self.assertEqual(_run_rclone(["cat", "remote:path"]), b"payload")
-        self.assertEqual(
-            run.call_args.kwargs["timeout"], RCLONE_PROCESS_TIMEOUT_SECONDS
-        )
-        self.assertEqual(
-            run.call_args.args[0][:5],
-            [
-                "/usr/bin/setpriv",
-                "--pdeathsig",
-                "TERM",
-                "rclone",
-                "cat",
-            ],
-        )
-
-    def test_large_annotation_copy_uses_extended_process_timeout(self) -> None:
+    def test_annotation_copy_takes_the_one_shipped_max(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with (
-                mock.patch(
-                    "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                    "_list_files",
-                    return_value=["segment_max_22_42.tif"],
-                ),
-                mock.patch(
-                    "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                    "_run_rclone",
-                    side_effect=lambda arguments, **_: Path(
-                        arguments[2]
-                    ).touch(),
-                ) as run_rclone,
-            ):
-                output, indices = _copy_annotation_render(
-                    "remote:dataset", Path(directory), overwrite=True
-                )
-
-            self.assertEqual(indices, (22, 42))
-            self.assertEqual(
-                output,
-                Path(directory) / "source-annotation-segment_max_22_42.tif",
-            )
-            self.assertEqual(
-                run_rclone.call_args.kwargs["timeout_seconds"],
-                ANNOTATION_COPY_TIMEOUT_SECONDS,
-            )
-            partial = Path(run_rclone.call_args.args[0][2])
-            self.assertNotEqual(partial, output)
-            self.assertTrue(partial.name.endswith(".partial"))
-            self.assertTrue(output.is_file())
-            self.assertFalse(partial.exists())
-
-    def test_compressed_chunks_use_one_parallel_rclone_copy(self) -> None:
-        info = ZarrLevel(
-            remote="remote:bucket/render.zarr",
-            level="2",
-            attrs={},
-            metadata={
-                "shape": [5, 2, 4],
-                "chunks": [5, 2, 2],
-                "dtype": "|u1",
-                "compressor": {"id": "zlib", "level": 1},
-                "filters": None,
-                "order": "C",
-                "dimension_separator": "/",
-            },
-            level_zero_metadata={"shape": [5, 2, 4]},
-            scale_zyx=(1.0, 4.0, 4.0),
-        )
-        calls: list[str] = []
-
-        def fake_rclone(arguments: list[str], **_: object) -> bytes:
-            calls.append(arguments[0])
-            if arguments[0] == "lsf":
-                return b"0/0/0\n0/0/1\n"
-            destination = Path(arguments[2])
-            files_path = Path(arguments[arguments.index("--files-from") + 1])
-            for relative in files_path.read_text().splitlines():
-                output = destination / relative
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(relative.encode())
-            return b""
-
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(
-                "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                "_run_rclone",
-                side_effect=fake_rclone,
-            ):
-                copied = _bulk_copy_compressed_chunks(
-                    info, 0, [(0, 0), (0, 1)], Path(directory), 8
-                )
-            self.assertEqual([item[:2] for item in copied], [(0, 0), (0, 1)])
-
-        self.assertEqual(calls, ["lsf", "copy"])
+            root = Path(directory)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "seg_max_10_20.tif").write_bytes(b"render")
+            (dataset / "other.tif").write_bytes(b"no")
+            output, indices = _copy_annotation_render(str(dataset), root / "out", False)
+            self.assertEqual(indices, (10, 20))
+            self.assertEqual(output.read_bytes(), b"render")
+            self.assertEqual(list((root / "out").glob("*.partial")), [])
 
     def test_source_resolution_uses_source_zarr_provenance(self) -> None:
         source = ZarrLevel(
-            remote="remote:source",
+            remote="s3://remote/source",
             level="2",
             attrs={"source_zarr": "/volumes/scan_2.403um_data.zarr"},
             metadata={"shape": [1, 1, 1], "chunks": [1, 1, 1]},
@@ -180,7 +80,7 @@ class RcloneCompositeTests(unittest.TestCase):
 
     def test_surface_z_step_distinguishes_physical_and_legacy_metadata(self) -> None:
         physical = ZarrLevel(
-            remote="remote:physical",
+            remote="s3://remote/physical",
             level="2",
             attrs={
                 "multiscales": [
@@ -236,7 +136,7 @@ class RcloneCompositeTests(unittest.TestCase):
             }
 
         physical = ZarrLevel(
-            remote="remote:physical",
+            remote="s3://remote/physical",
             level="2",
             attrs=multiscale("micrometer", 2.399, 4.798),
             metadata={"shape": [1, 1, 1], "chunks": [1, 1, 1]},
@@ -267,125 +167,31 @@ class RcloneCompositeTests(unittest.TestCase):
         )
         self.assertEqual(_surface_z_step_um(legacy, 2.0), 12.0)
 
-    def test_batched_ranges_preserve_remote_lexical_chunk_order(self) -> None:
-        info = ZarrLevel(
-            remote="remote:bucket/render.zarr",
-            level="2",
-            attrs={},
-            metadata={
-                "shape": [5, 4, 4],
-                "chunks": [5, 2, 2],
-                "dtype": "|u1",
-                "compressor": None,
-                "filters": None,
-                "order": "C",
-                "dimension_separator": "/",
-            },
-            level_zero_metadata={"shape": [5, 4, 4]},
-            scale_zyx=(1.0, 1.0, 1.0),
-        )
-
-        def fake_rclone(arguments: list[str]) -> bytes:
-            if arguments[0] == "lsf":
-                return b"1/0\n0/1\n0/0\n"
-            includes = [
-                arguments[index + 1].lstrip("/")
-                for index, value in enumerate(arguments)
-                if value == "--include"
-            ]
-            values = {
-                "0/0": b"aa",
-                "0/1": b"bb",
-                "1/0": b"cc",
-            }
-            return b"".join(values[name] for name in sorted(includes))
-
-        with mock.patch(
-            "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-            "_run_rclone",
-            side_effect=fake_rclone,
-        ):
-            payloads = _batched_range_payloads(
-                info, 0, byte_offset=3, byte_count=2, workers=2
-            )
-
-        self.assertEqual(
-            payloads,
-            [(0, 0, b"aa"), (0, 1, b"bb"), (1, 0, b"cc")],
-        )
-
-    def test_uncompressed_chunks_fetch_only_selected_z_bytes(self) -> None:
+    def test_composite_is_the_maximum_of_the_selected_layers(self) -> None:
         volume = np.arange(5 * 3 * 4, dtype=np.uint8).reshape(5, 3, 4)
-        info = ZarrLevel(
-            remote="remote:bucket/render.zarr",
-            level="2",
-            attrs={},
-            metadata={
-                "shape": [5, 3, 4],
-                "chunks": [5, 2, 2],
-                "dtype": "|u1",
-                "compressor": None,
-                "filters": None,
-                "order": "C",
-                "dimension_separator": "/",
-            },
-            level_zero_metadata={
-                "shape": [5, 3, 4],
-                "dtype": "|u1",
-            },
-            scale_zyx=(1.0, 4.0, 4.0),
-        )
-        requested: list[tuple[int, int]] = []
-
-        def fake_cat_range(
-            remote: str, offset: int, count: int
-        ) -> bytes:
-            parts = remote.split("/")
-            y_chunk, x_chunk = int(parts[-2]), int(parts[-1])
-            chunk = np.zeros((5, 2, 2), dtype=np.uint8)
-            source = volume[
-                :,
-                y_chunk * 2 : (y_chunk + 1) * 2,
-                x_chunk * 2 : (x_chunk + 1) * 2,
-            ]
-            chunk[:, : source.shape[1], : source.shape[2]] = source
-            requested.append((offset, count))
-            return chunk.tobytes()[offset : offset + count]
-
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "center-max.tif"
-            with (
-                mock.patch(
-                    "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                    "_cat_range",
-                    side_effect=fake_cat_range,
-                ),
-                mock.patch(
-                    "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                    "images.memmap",
-                    wraps=images.memmap,
-                ) as memmap,
-            ):
-                audit = extract_composite(
-                    info,
-                    [1, 2, 3],
-                    output,
-                    workers=1,
-                    overwrite=False,
-                )
-
-            np.testing.assert_array_equal(
-                tifffile.imread(output), volume[1:4].max(axis=0)
-            )
-            self.assertEqual(requested, [(4, 12)] * 4)
-            self.assertEqual(audit["transferred_bytes"], 48)
-            self.assertEqual(audit["transport"], "rclone")
+            root = Path(directory) / "render.zarr"
+            create_group(root, attrs={
+                "multiscales": [{"datasets": [{"path": "0"}]}],
+            })
+            for level in ("0",):
+                writer = ZarrWriter.create(root / level, shape=volume.shape, chunks=(5, 2, 2), dtype=np.uint8, auth=None)
+                writer[:] = volume
+            info = inspect_zarr(str(root), 0)
+            output = Path(directory) / "composite.tif"
+            with mock.patch(
+                "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
+                "images.memmap",
+                wraps=images.memmap,
+            ) as memmap:
+                audit = extract_composite(info, [1, 2, 3], output, workers=1, overwrite=False)
+            np.testing.assert_array_equal(tifffile.imread(output), volume[1:4].max(axis=0))
+            self.assertEqual(audit["transport"], "vc_reader")
             memmap.assert_called_once()
             self.assertEqual(list(Path(directory).glob("*.partial.tif")), [])
-            self.assertEqual(
-                list(Path(directory).glob(".tifxyz-compressed-chunks-*")),
-                [],
-            )
+
+            cached = extract_composite(info, [1, 2, 3], output, workers=1, overwrite=False)
+            self.assertEqual(cached, audit)
 
 
 class EvidenceAssessmentTests(unittest.TestCase):
@@ -528,12 +334,12 @@ class EvidencePreparationModeTests(unittest.TestCase):
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
                     "_source_dataset_remote",
-                    return_value="remote:dataset",
+                    return_value="s3://remote/dataset",
                 ),
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
                     "_target_zarr_remote",
-                    return_value="remote:target.zarr",
+                    return_value="s3://remote/target.zarr",
                 ),
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
@@ -559,7 +365,7 @@ class EvidencePreparationModeTests(unittest.TestCase):
                     [
                         "--case-dir",
                         str(case_dir),
-                        "--ink-rclone-root",
+                        "--ink-root",
                         "test-remote:ink-dataset",
                         "--exact-center-only",
                     ]
@@ -612,12 +418,12 @@ class EvidencePreparationModeTests(unittest.TestCase):
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
                     "_source_dataset_remote",
-                    return_value="remote:dataset",
+                    return_value="s3://remote/dataset",
                 ),
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
                     "_target_zarr_remote",
-                    return_value="remote:target.zarr",
+                    return_value="s3://remote/target.zarr",
                 ),
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
@@ -639,7 +445,7 @@ class EvidencePreparationModeTests(unittest.TestCase):
                     [
                         "--case-dir",
                         str(case_dir),
-                        "--ink-rclone-root",
+                        "--ink-root",
                         "test-remote:ink-dataset",
                         "--exact-center-only",
                     ]
@@ -666,9 +472,8 @@ class PortabilityTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(_load_aws_credentials(None))
 
-    def test_open_data_default_is_anonymous_inline_remote(self) -> None:
-        self.assertTrue(DEFAULT_OPEN_DATA_ROOT.startswith(":s3,"))
-        self.assertIn("env_auth=false", DEFAULT_OPEN_DATA_ROOT)
+    def test_open_data_default_is_the_public_bucket(self) -> None:
+        self.assertEqual(DEFAULT_OPEN_DATA_ROOT, "s3://vesuvius-challenge-open-data")
 
     def test_private_ink_root_has_no_default_and_errors_actionably(
         self,
@@ -677,9 +482,9 @@ class PortabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SystemExit) as caught:
                 prepare_evidence_main(["--case-dir", directory])
-        self.assertIn("--ink-rclone-root", str(caught.exception))
+        self.assertIn("--ink-root", str(caught.exception))
 
-    def test_source_dataset_remote_accepts_any_rclone_remote(self) -> None:
+    def test_source_dataset_remote_joins_the_root(self) -> None:
         selection = {
             "source_surface_zarrs": [
                 {"path": "ink/scroll-x/source.zarr"}
@@ -687,9 +492,9 @@ class PortabilityTests(unittest.TestCase):
         }
         self.assertEqual(
             _source_dataset_remote(
-                selection, "my-mirror:bucket/datasets/ink"
+                selection, "s3://bucket/datasets/ink"
             ),
-            "my-mirror:bucket/datasets/ink/scroll-x",
+            "s3://bucket/datasets/ink/scroll-x",
         )
 
 

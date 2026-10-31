@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing
 import os
 import socket
 import subprocess
@@ -11,17 +10,6 @@ import torch
 from vesuvius.models.configuration.config_manager import ConfigManager
 from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
 from vesuvius.models.utilities.cli_utils import update_config_from_args
-
-
-def _maybe_set_spawn_start_method(argv):
-    # s3fs/fsspec can misbehave with fork; force spawn if s3/config is present.
-    if not argv:
-        return
-    if any('s3://' in str(arg) for arg in argv) or '--config-path' in argv or '--config' in argv:
-        try:
-            multiprocessing.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -188,8 +176,6 @@ def main(argv=None):
     """Main entry point for the training script."""
     if argv is None:
         argv = sys.argv[1:]
-
-    _maybe_set_spawn_start_method(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)

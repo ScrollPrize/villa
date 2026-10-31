@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-render a source TIFXYZ from its raw CT volume through rclone.
+"""Self-render a source TIFXYZ from its raw CT volume.
 
 Only informative source and mapped-overlap tiles are rendered. XYZ coordinates
 and normals follow vc_render_tifxyz conventions; raw CT is sampled trilinearly
@@ -10,17 +10,16 @@ source-on-target versus target self-renders independently verify the 3D map.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
 import json
 import math
 from pathlib import Path
 import re
-import tempfile
 from typing import Any, Optional, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.ndimage import gaussian_filter
 from vc_reader import images
+from vc_reader.reader import ObjectStore
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -38,13 +37,12 @@ from .prepare_canvas_offset_evidence import (
     ZarrLevel,
     _load_aws_credentials,
     _remote_join,
-    _run_rclone,
     inspect_zarr,
 )
 
 
 # Raw scan volumes are not public: there is no usable default, callers
-# must name their own rclone remote when provenance remapping is needed.
+# must name their own location when provenance remapping is needed.
 DEFAULT_SOURCE_RAW_ROOT: Optional[str] = None
 
 
@@ -386,217 +384,14 @@ def select_overlap_tiles(
     )
 
 
-def _relative_chunk_key(
-    info: ZarrLevel, chunk_zyx: tuple[int, int, int]
-) -> str:
-    separator = info.metadata.get("dimension_separator", ".")
-    return separator.join(str(value) for value in chunk_zyx)
+class RawSampler:
+    """Trilinear CT values at level-0 XYZ points, clamped to the array."""
 
-
-def required_chunks(
-    xyz: np.ndarray,
-    normals: np.ndarray,
-    valid: np.ndarray,
-    offsets: Sequence[float],
-    info: ZarrLevel,
-) -> set[tuple[int, int, int]]:
-    """Conservatively bound raw chunks needed for trilinear samples."""
-
-    scale_xyz = np.asarray(info.scale_zyx[::-1], dtype=np.float64)
-    chunk_zyx = np.asarray(info.chunks, dtype=np.int64)
-    shape_zyx = np.asarray(info.shape, dtype=np.int64)
-    endpoint_indices = (int(np.argmin(offsets)), int(np.argmax(offsets)))
-    endpoints = []
-    for index in endpoint_indices:
-        offset = offsets[index]
-        points_xyz = (xyz + normals * float(offset)) / scale_xyz
-        points_zyx = points_xyz[..., ::-1][valid]
-        if not points_zyx.size:
-            continue
-        floor = np.floor(points_zyx).astype(np.int64)
-        floor = np.clip(floor, 0, shape_zyx - 2)
-        endpoints.extend((floor, floor + 1))
-    if not endpoints:
-        return set()
-    # Every normal-line sample lies coordinate-wise between the two endpoint
-    # samples. A chunk-space box around both endpoints and their +1
-    # trilinear neighbours is therefore conservative for every offset.
-    all_endpoints = np.concatenate(endpoints, axis=0)
-    minimum = np.min(all_endpoints, axis=0) // chunk_zyx
-    maximum = np.max(all_endpoints, axis=0) // chunk_zyx
-    result = {
-        (z_chunk, y_chunk, x_chunk)
-        for z_chunk in range(int(minimum[0]), int(maximum[0]) + 1)
-        for y_chunk in range(int(minimum[1]), int(maximum[1]) + 1)
-        for x_chunk in range(int(minimum[2]), int(maximum[2]) + 1)
-    }
-    return result
-
-
-def ensure_chunks(
-    info: ZarrLevel,
-    chunks: set[tuple[int, int, int]],
-    cache_dir: Path,
-    workers: int,
-) -> tuple[int, int, set[tuple[int, int, int]]]:
-    """Fetch present chunks and treat omitted sparse Zarr chunks as fill."""
-
-    missing = [
-        chunk
-        for chunk in sorted(chunks)
-        if not (cache_dir / _relative_chunk_key(info, chunk)).is_file()
-    ]
-    if not missing:
-        return 0, 0, set()
-    if info.metadata.get("dimension_separator", ".") != "/":
-        raise ValueError(
-            "raw self-render currently requires '/' Zarr chunk keys"
-        )
-
-    present: set[tuple[int, int, int]] = set()
-    by_z: dict[int, set[tuple[int, int, int]]] = {}
-    for chunk in missing:
-        by_z.setdefault(chunk[0], set()).add(chunk)
-    for z_chunk, wanted in sorted(by_z.items()):
-        listing = _run_rclone(
-            [
-                "lsf",
-                _remote_join(info.remote, info.level, str(z_chunk)),
-                "--recursive",
-                "--files-only",
-            ]
-        ).decode("utf-8").splitlines()
-        available = {
-            tuple(int(value) for value in item.strip("/").split("/"))
-            for item in listing
-            if item.strip() and len(item.strip("/").split("/")) == 2
-        }
-        present.update(
-            chunk
-            for chunk in wanted
-            if (chunk[1], chunk[2]) in available
-        )
-    sparse = set(missing) - present
-    if not present:
-        return 0, 0, sparse
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", delete=False
-    ) as handle:
-        files_path = Path(handle.name)
-        for chunk in sorted(present):
-            handle.write(_relative_chunk_key(info, chunk) + "\n")
-    try:
-        _run_rclone(
-            [
-                "copy",
-                _remote_join(info.remote, info.level),
-                str(cache_dir),
-                "--files-from",
-                str(files_path),
-                "--no-traverse",
-                "--transfers",
-                str(workers),
-                "--checkers",
-                str(workers),
-            ],
-            timeout_seconds=900,
-        )
-    finally:
-        files_path.unlink(missing_ok=True)
-    still_missing = [
-        chunk
-        for chunk in present
-        if not (cache_dir / _relative_chunk_key(info, chunk)).is_file()
-    ]
-    if still_missing:
-        raise RuntimeError(
-            f"rclone did not materialize {len(still_missing)} required raw "
-            f"chunks; first missing: {still_missing[0]}"
-        )
-    downloaded_bytes = sum(
-        (cache_dir / _relative_chunk_key(info, chunk)).stat().st_size
-        for chunk in present
-    )
-    return len(present), downloaded_bytes, sparse
-
-
-class RawChunkSampler:
-    def __init__(
-        self,
-        info: ZarrLevel,
-        cache_dir: Path,
-        sparse_chunks: Optional[set[tuple[int, int, int]]] = None,
-        max_cached_chunks: int = 96,
-    ) -> None:
+    def __init__(self, info: ZarrLevel, **reader_options) -> None:
         self.info = info
-        self.cache_dir = cache_dir
-        self.max_cached_chunks = max_cached_chunks
-        self.sparse_chunks = sparse_chunks or set()
-        self._cache: OrderedDict[
-            tuple[int, int, int], np.ndarray
-        ] = OrderedDict()
+        self.reader = info.open(**reader_options)
 
-    def _chunk(self, index: tuple[int, int, int]) -> np.ndarray:
-        cached = self._cache.pop(index, None)
-        if cached is not None:
-            self._cache[index] = cached
-            return cached
-        if index in self.sparse_chunks:
-            return np.full(
-                self.info.chunks,
-                self.info.metadata.get("fill_value") or 0,
-                dtype=np.dtype(self.info.metadata["dtype"]),
-            )
-        path = self.cache_dir / _relative_chunk_key(self.info, index)
-        payload = path.read_bytes()
-        dtype = np.dtype(self.info.metadata["dtype"])
-        expected = math.prod(self.info.chunks) * dtype.itemsize
-        if len(payload) != expected:
-            raise ValueError(
-                f"raw chunk {path} has {len(payload)} bytes; expected "
-                f"{expected}"
-            )
-        chunk = np.frombuffer(payload, dtype=dtype).reshape(self.info.chunks)
-        self._cache[index] = chunk
-        while len(self._cache) > self.max_cached_chunks:
-            self._cache.popitem(last=False)
-        return chunk
-
-    def load_block(
-        self, chunks: set[tuple[int, int, int]]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Materialize one tile's chunk box for fast C-level interpolation."""
-
-        indices = np.asarray(sorted(chunks), dtype=np.int64)
-        if indices.size == 0:
-            raise ValueError("cannot load an empty raw chunk block")
-        minimum = indices.min(axis=0)
-        maximum = indices.max(axis=0)
-        chunk_shape = np.asarray(self.info.chunks, dtype=np.int64)
-        block_shape = (maximum - minimum + 1) * chunk_shape
-        block = np.full(
-            tuple(int(value) for value in block_shape),
-            self.info.metadata.get("fill_value") or 0,
-            dtype=np.dtype(self.info.metadata["dtype"]),
-        )
-        for chunk_index in map(tuple, indices.tolist()):
-            relative = (
-                np.asarray(chunk_index, dtype=np.int64) - minimum
-            ) * chunk_shape
-            slices = tuple(
-                slice(int(start), int(start + size))
-                for start, size in zip(relative, chunk_shape)
-            )
-            block[slices] = self._chunk(chunk_index)
-        return block, minimum * chunk_shape
-
-    def sample_block(
-        self,
-        points_xyz: np.ndarray,
-        block: np.ndarray,
-        origin_zyx: np.ndarray,
-    ) -> np.ndarray:
+    def sample(self, points_xyz: np.ndarray) -> np.ndarray:
         points_zyx = points_xyz[:, ::-1] / np.asarray(
             self.info.scale_zyx, dtype=np.float64
         )
@@ -605,62 +400,7 @@ class RawChunkSampler:
             0.0,
             np.asarray(self.info.shape, dtype=np.float64) - 1.0,
         )
-        points_zyx -= origin_zyx
-        return map_coordinates(
-            block,
-            points_zyx.T,
-            output=np.float32,
-            order=1,
-            mode="nearest",
-            prefilter=False,
-        )
-
-    def _lattice_values(self, indices_zyx: np.ndarray) -> np.ndarray:
-        chunk_shape = np.asarray(self.info.chunks, dtype=np.int64)
-        chunk_indices = indices_zyx // chunk_shape
-        local = indices_zyx % chunk_shape
-        values = np.zeros(indices_zyx.shape[0], dtype=np.float32)
-        unique, inverse = np.unique(
-            chunk_indices, axis=0, return_inverse=True
-        )
-        for group, chunk_index in enumerate(unique):
-            selected = inverse == group
-            key = tuple(int(value) for value in chunk_index)
-            chunk = self._chunk(key)
-            positions = local[selected]
-            values[selected] = chunk[
-                positions[:, 0], positions[:, 1], positions[:, 2]
-            ]
-        return values
-
-    def sample(self, points_xyz: np.ndarray) -> np.ndarray:
-        scale_xyz = np.asarray(
-            self.info.scale_zyx[::-1], dtype=np.float64
-        )
-        points_zyx = points_xyz[:, ::-1] / scale_xyz[::-1]
-        shape = np.asarray(self.info.shape, dtype=np.int64)
-        floor = np.floor(points_zyx).astype(np.int64)
-        floor = np.clip(floor, 0, shape - 2)
-        fraction = np.clip(points_zyx - floor, 0.0, 1.0)
-        output = np.zeros(points_zyx.shape[0], dtype=np.float32)
-        for dz, dy, dx in (
-            (0, 0, 0),
-            (0, 0, 1),
-            (0, 1, 0),
-            (0, 1, 1),
-            (1, 0, 0),
-            (1, 0, 1),
-            (1, 1, 0),
-            (1, 1, 1),
-        ):
-            delta = np.asarray((dz, dy, dx), dtype=np.int64)
-            weight = (
-                (fraction[:, 0] if dz else 1.0 - fraction[:, 0])
-                * (fraction[:, 1] if dy else 1.0 - fraction[:, 1])
-                * (fraction[:, 2] if dx else 1.0 - fraction[:, 2])
-            )
-            output += weight * self._lattice_values(floor + delta)
-        return output
+        return self.reader.sample(points_zyx, order=1, dtype=np.float32)
 
 
 def _find_raw_volume_remote(
@@ -668,17 +408,10 @@ def _find_raw_volume_remote(
 ) -> str:
     sample = str(selection["segment"]["s3_path"]).split("/", 1)[0]
     volumes_root = _remote_join(open_data_root, sample, "volumes")
-    listing = _run_rclone(
-        [
-            "lsf",
-            volumes_root,
-            "--dirs-only",
-            "--max-depth",
-            "1",
-            "--include",
-            f"{volume_id}-*.zarr/",
-        ]
-    ).decode("utf-8").splitlines()
+    listing = [
+        name for name in ObjectStore(volumes_root, auth=None if open_data_root == DEFAULT_OPEN_DATA_ROOT else "aws").children()
+        if name.startswith(f"{volume_id}-") and name.endswith(".zarr")
+    ]
     matches = [item.rstrip("/") for item in listing if item.strip()]
     if len(matches) != 1:
         raise ValueError(
@@ -709,8 +442,8 @@ def _source_raw_volume_remote(
             if not source_raw_root:
                 raise ValueError(
                     f"source_zarr provenance {source_zarr!r} needs a raw "
-                    "CT root; pass --source-raw-rclone-root (your rclone "
-                    "remote holding the raw scan volumes) or an explicit "
+                    "CT root; pass --source-raw-root (a location "
+                    "holding the raw scan volumes) or an explicit "
                     "--source-raw-volume"
                 )
             return (
@@ -718,7 +451,7 @@ def _source_raw_volume_remote(
                 f"source surface Zarr: {source_zarr}",
             )
     raise ValueError(
-        f"cannot map source_zarr {source_zarr!r} to rclone; pass "
+        f"cannot map source_zarr {source_zarr!r} to a location; pass "
         "--source-raw-volume"
     )
 
@@ -860,24 +593,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=24)
     parser.add_argument(
         "--source-raw-volume",
-        help="explicit rclone remote for the raw CT behind the source TIFXYZ",
+        help="explicit location of the raw CT behind the source TIFXYZ",
     )
     parser.add_argument(
         "--source-surface-zarr",
         help=(
-            "explicit rclone remote for source surface-volume metadata; "
+            "explicit location of source surface-volume metadata; "
             "useful when the same metadata has a public mirror"
         ),
     )
     parser.add_argument(
         "--target-raw-volume",
-        help="explicit rclone remote for the raw CT behind the target TIFXYZ",
+        help="explicit location of the raw CT behind the target TIFXYZ",
     )
     parser.add_argument(
-        "--source-raw-rclone-root",
+        "--source-raw-root",
         default=DEFAULT_SOURCE_RAW_ROOT,
         help=(
-            "rclone remote:path holding the raw scan volumes; required "
+            "location holding the raw scan volumes; required "
             "when the source provenance must be remapped and no explicit "
             "--source-raw-volume is given"
         ),
@@ -887,14 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--raw-cache-dir",
         type=Path,
-        help="shared root for downloaded raw Zarr chunks",
+        help="disk cache root for raw Zarr chunks",
     )
     parser.add_argument(
-        "--open-data-rclone-root",
+        "--open-data-root",
         default=DEFAULT_OPEN_DATA_ROOT,
         help=(
-            "rclone remote:path of the public Vesuvius open-data bucket "
-            "(default: anonymous inline S3 remote, no rclone config needed)"
+            "location of the public Vesuvius open-data bucket"
         ),
     )
     parser.add_argument(
@@ -919,32 +651,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _raw_reader_options(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    cache = args.raw_cache_dir.resolve() if args.raw_cache_dir else output_dir / "raw-chunks"
+    return {"cache_dir": cache, "threads": args.workers}
+
+
 def _render_values(
     xyz: np.ndarray,
     normals: np.ndarray,
     valid: np.ndarray,
     offsets: Sequence[float],
-    sampler: RawChunkSampler,
-    chunks: set[tuple[int, int, int]],
+    sampler: RawSampler,
 ) -> np.ndarray:
     output = np.zeros(valid.shape, dtype=np.float32)
     selected = valid.ravel()
     if not np.any(selected):
         return output
-    block, origin = sampler.load_block(chunks)
     points = xyz.reshape(-1, 3)[selected]
     directions = normals.reshape(-1, 3)[selected]
     maximum = np.zeros(points.shape[0], dtype=np.float32)
     for offset in offsets:
-        values = sampler.sample_block(
-            points + directions * float(offset), block, origin
-        )
+        values = sampler.sample(points + directions * float(offset))
         maximum = np.maximum(maximum, values)
     output.ravel()[selected] = maximum
     return output
 
 
-def _to_uint8(values: np.ndarray, sampler: "RawChunkSampler") -> np.ndarray:
+def _to_uint8(values: np.ndarray, sampler: RawSampler) -> np.ndarray:
     """Convert rendered raw-CT values to uint8 without integer wrap-around."""
 
     array = np.asarray(values, dtype=np.float64)
@@ -1079,17 +812,11 @@ def _run_source_only(
 
     source_raw_remote, source_raw_provenance = _source_raw_volume_remote(
         source_surface_info,
-        args.source_raw_rclone_root,
+        args.source_raw_root,
         args.source_raw_volume,
     )
     print(f"Raw source volume: {source_raw_remote}", flush=True)
     source_raw_info = inspect_zarr(source_raw_remote, args.zarr_level)
-    if source_raw_info.metadata.get("compressor") is not None:
-        raise ValueError("raw self-render currently requires uncompressed Zarr")
-    if source_raw_info.metadata.get("filters") is not None:
-        raise ValueError("raw self-render currently requires no Zarr filters")
-    if source_raw_info.metadata.get("order", "C") != "C":
-        raise ValueError("raw self-render currently requires C-order Zarr")
 
     source_tiles = select_tiles(
         annotation, args.tile_size, args.max_tiles, args.min_coverage
@@ -1113,20 +840,14 @@ def _run_source_only(
     )
 
     source_plan: list[dict[str, Any]] = []
-    source_union: set[tuple[int, int, int]] = set()
     for index, bounds in enumerate(source_tiles, start=1):
-        xyz, normals, valid = surface_tile_geometry(
+        _, _, valid = surface_tile_geometry(
             source_surface, annotation.shape, bounds
         )
-        chunks = required_chunks(
-            xyz, normals, valid, [0.0, *source_offsets], source_raw_info
-        )
-        source_union.update(chunks)
         source_plan.append(
             {
                 "bounds_yxyx": list(bounds),
                 "valid_pixels": int(valid.sum()),
-                "source_chunks": len(chunks),
             }
         )
         print(f"Plan source tile {index}/{len(source_tiles)}", flush=True)
@@ -1140,7 +861,6 @@ def _run_source_only(
         "source_canvas_shape_yx": list(annotation.shape),
         "source_offsets_full_voxels": source_offsets,
         "source_tiles": source_plan,
-        "source_unique_required_chunks": len(source_union),
     }
     (output_dir / "plan.json").write_text(
         json.dumps(plan_document, indent=2) + "\n", encoding="utf-8"
@@ -1149,24 +869,7 @@ def _run_source_only(
         print(json.dumps(plan_document, indent=2))
         return 0
 
-    cache_root = (
-        args.raw_cache_dir.resolve()
-        if args.raw_cache_dir
-        else output_dir / "raw-chunks"
-    )
-    source_cache = (
-        cache_root
-        / Path(source_raw_remote).name
-        / source_raw_info.level
-    )
-    downloaded, downloaded_bytes, sparse_chunks = ensure_chunks(
-        source_raw_info, source_union, source_cache, args.workers
-    )
-    print(
-        f"Raw cache ready: {downloaded} new chunks, "
-        f"{downloaded_bytes / 1024**3:.2f} GiB",
-        flush=True,
-    )
+    raw_options = _raw_reader_options(args, output_dir)
 
     center_output = output_dir / "source-self-center.tif"
     max_output = output_dir / "source-self-annotation-max.tif"
@@ -1183,26 +886,21 @@ def _run_source_only(
     center_image = _open_output(center_output, annotation.shape, args.overwrite)
     max_image = _open_output(max_output, annotation.shape, args.overwrite)
     valid_image = _open_output(valid_output, annotation.shape, args.overwrite)
-    source_sampler = RawChunkSampler(
-        source_raw_info, source_cache, sparse_chunks
-    )
+    source_sampler = RawSampler(source_raw_info, **raw_options)
     for index, bounds in enumerate(source_tiles, start=1):
         row0, row1, col0, col1 = bounds
         xyz, normals, valid = surface_tile_geometry(
             source_surface, annotation.shape, bounds
         )
-        chunks = required_chunks(
-            xyz, normals, valid, [0.0, *source_offsets], source_raw_info
-        )
         center_image[row0:row1, col0:col1] = _to_uint8(
             _render_values(
-                xyz, normals, valid, [0.0], source_sampler, chunks
+                xyz, normals, valid, [0.0], source_sampler
             ),
             source_sampler,
         )
         max_image[row0:row1, col0:col1] = _to_uint8(
             _render_values(
-                xyz, normals, valid, source_offsets, source_sampler, chunks
+                xyz, normals, valid, source_offsets, source_sampler
             ),
             source_sampler,
         )
@@ -1226,7 +924,7 @@ def _run_source_only(
     report = {
         "tool": "self_render_tifxyz.py",
         "mode": "source-only",
-        "transport": "rclone",
+        "transport": "vc_reader",
         "aws_credentials_file": (
             str(credentials_path) if credentials_path else None
         ),
@@ -1242,8 +940,6 @@ def _run_source_only(
         "self_annotation_max_render": str(max_output),
         "source_validity": str(valid_output),
         "source_offsets_full_voxels": source_offsets,
-        "downloaded_chunks": downloaded,
-        "downloaded_bytes": downloaded_bytes,
         "canvas_shape_check": _canvas_shape_check(
             full_shape, np.asarray(annotation.shape)
         ),
@@ -1401,14 +1097,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     source_raw_remote, source_raw_provenance = _source_raw_volume_remote(
         source_surface_info,
-        args.source_raw_rclone_root,
+        args.source_raw_root,
         args.source_raw_volume,
     )
     target_raw_remote = (
         args.target_raw_volume.rstrip("/")
         if args.target_raw_volume
         else _find_raw_volume_remote(
-            selection, args.open_data_rclone_root, target_volume_id
+            selection, args.open_data_root, target_volume_id
         )
     )
     print(f"Raw source volume: {source_raw_remote}", flush=True)
@@ -1419,15 +1115,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if target_raw_remote == source_raw_remote
         else inspect_zarr(target_raw_remote, args.zarr_level)
     )
-    for raw_info in (source_raw_info, target_raw_info):
-        if raw_info.metadata.get("compressor") is not None:
-            raise ValueError(
-                "raw self-render currently requires uncompressed Zarr"
-            )
-        if raw_info.metadata.get("filters") is not None:
-            raise ValueError("raw self-render currently requires no Zarr filters")
-        if raw_info.metadata.get("order", "C") != "C":
-            raise ValueError("raw self-render currently requires C-order Zarr")
 
     source_tiles = select_tiles(
         annotation, args.tile_size, args.max_tiles, args.min_coverage
@@ -1465,21 +1152,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     source_plan: list[dict[str, Any]] = []
     target_plan: list[dict[str, Any]] = []
-    source_union: set[tuple[int, int, int]] = set()
-    target_union: set[tuple[int, int, int]] = set()
     for index, bounds in enumerate(source_tiles, start=1):
-        xyz, normals, valid = surface_tile_geometry(
+        _, _, valid = surface_tile_geometry(
             source_surface, annotation.shape, bounds
         )
-        chunks = required_chunks(
-            xyz, normals, valid, [0.0, *source_offsets], source_raw_info
-        )
-        source_union.update(chunks)
         source_plan.append(
             {
                 "bounds_yxyx": list(bounds),
                 "valid_pixels": int(valid.sum()),
-                "source_chunks": len(chunks),
             }
         )
         print(f"Plan source tile {index}/{len(source_tiles)}", flush=True)
@@ -1496,32 +1176,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             affine,
             float(stage_report["max_distance"]),
         )
-        source_xyz, source_normals, target_xyz, target_normals, valid = geometry
-        source_chunks = required_chunks(
-            source_xyz,
-            source_normals,
-            valid,
-            [0.0, *source_offsets],
-            source_raw_info,
-        )
-        target_chunks = required_chunks(
-            target_xyz,
-            target_normals,
-            valid,
-            [0.0, *target_offsets],
-            target_raw_info,
-        )
-        source_union.update(source_chunks)
-        target_union.update(target_chunks)
-        target_geometry.append(
-            (*geometry, source_chunks, target_chunks)
-        )
+        target_geometry.append(geometry)
         target_plan.append(
             {
                 "bounds_yxyx": list(bounds),
-                "overlap_pixels": int(valid.sum()),
-                "source_chunks": len(source_chunks),
-                "target_chunks": len(target_chunks),
+                "overlap_pixels": int(geometry[4].sum()),
             }
         )
         print(f"Plan overlap tile {index}/{len(target_tiles)}", flush=True)
@@ -1538,8 +1197,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "target_matched_offsets_full_voxels": target_offsets,
         "source_tiles": source_plan,
         "target_overlap_tiles": target_plan,
-        "source_unique_required_chunks": len(source_union),
-        "target_unique_required_chunks": len(target_union),
     }
     (output_dir / "plan.json").write_text(
         json.dumps(plan_document, indent=2) + "\n", encoding="utf-8"
@@ -1548,39 +1205,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(plan_document, indent=2))
         return 0
 
-    cache_root = (
-        args.raw_cache_dir.resolve()
-        if args.raw_cache_dir
-        else output_dir / "raw-chunks"
-    )
-    source_cache = (
-        cache_root / Path(source_raw_remote).name / source_raw_info.level
-    )
-    target_cache = (
-        cache_root / Path(target_raw_remote).name / target_raw_info.level
-    )
-    source_downloaded, source_bytes, source_sparse = ensure_chunks(
-        source_raw_info, source_union, source_cache, args.workers
-    )
-    if target_raw_remote == source_raw_remote:
-        combined = source_union | target_union
-        more_downloaded, more_bytes, combined_sparse = ensure_chunks(
-            source_raw_info, combined, source_cache, args.workers
-        )
-        source_downloaded += more_downloaded
-        source_bytes += more_bytes
-        source_sparse |= combined_sparse
-        target_downloaded, target_bytes = 0, 0
-        target_sparse = source_sparse
-    else:
-        target_downloaded, target_bytes, target_sparse = ensure_chunks(
-            target_raw_info, target_union, target_cache, args.workers
-        )
-    print(
-        f"Raw caches ready: {source_downloaded + target_downloaded} new "
-        f"chunks, {(source_bytes + target_bytes) / 1024**3:.2f} GiB",
-        flush=True,
-    )
+    raw_options = _raw_reader_options(args, output_dir)
 
     center_output = output_dir / "source-self-center.tif"
     max_output = output_dir / "source-self-annotation-max.tif"
@@ -1616,45 +1241,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     projected_max = _open_output(projected_max_output, target_center.shape, args.overwrite)
     target_max = _open_output(target_max_output, target_center.shape, args.overwrite)
     target_valid_image = _open_output(target_valid_output, target_center.shape, args.overwrite)
-    source_sampler = RawChunkSampler(source_raw_info, source_cache, source_sparse)
+    source_sampler = RawSampler(source_raw_info, **raw_options)
     target_sampler = (
         source_sampler
         if target_raw_remote == source_raw_remote
-        else RawChunkSampler(target_raw_info, target_cache, target_sparse)
+        else RawSampler(target_raw_info, **raw_options)
     )
     for index, bounds in enumerate(source_tiles, start=1):
         row0, row1, col0, col1 = bounds
         xyz, normals, valid = surface_tile_geometry(
             source_surface, annotation.shape, bounds
         )
-        chunks = required_chunks(xyz, normals, valid, [0.0, *source_offsets], source_raw_info)
         center_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(xyz, normals, valid, [0.0], source_sampler, chunks),
+            _render_values(xyz, normals, valid, [0.0], source_sampler),
             source_sampler,
         )
         max_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(xyz, normals, valid, source_offsets, source_sampler, chunks),
+            _render_values(xyz, normals, valid, source_offsets, source_sampler),
             source_sampler,
         )
         source_valid_image[row0:row1, col0:col1] = valid.astype(np.uint8) * 255
         print(f"Rendered source tile {index}/{len(source_tiles)}", flush=True)
     for index, (bounds, geometry) in enumerate(zip(target_tiles, target_geometry), start=1):
         row0, row1, col0, col1 = bounds
-        source_xyz, source_normals, target_xyz, target_normals, valid, source_chunks, target_chunks = geometry
+        source_xyz, source_normals, target_xyz, target_normals, valid = geometry
         projected_center[row0:row1, col0:col1] = _to_uint8(
-            _render_values(source_xyz, source_normals, valid, [0.0], source_sampler, source_chunks),
+            _render_values(source_xyz, source_normals, valid, [0.0], source_sampler),
             source_sampler,
         )
         projected_max[row0:row1, col0:col1] = _to_uint8(
-            _render_values(source_xyz, source_normals, valid, source_offsets, source_sampler, source_chunks),
+            _render_values(source_xyz, source_normals, valid, source_offsets, source_sampler),
             source_sampler,
         )
         target_center_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(target_xyz, target_normals, valid, [0.0], target_sampler, target_chunks),
+            _render_values(target_xyz, target_normals, valid, [0.0], target_sampler),
             target_sampler,
         )
         target_max[row0:row1, col0:col1] = _to_uint8(
-            _render_values(target_xyz, target_normals, valid, target_offsets, target_sampler, target_chunks),
+            _render_values(target_xyz, target_normals, valid, target_offsets, target_sampler),
             target_sampler,
         )
         target_valid_image[row0:row1, col0:col1] = valid.astype(np.uint8) * 255
@@ -1761,7 +1385,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     report = {
         "tool": "self_render_tifxyz.py",
-        "transport": "rclone",
+        "transport": "vc_reader",
         "aws_credentials_file": (
             str(credentials_path) if credentials_path else None
         ),
@@ -1785,8 +1409,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "target_overlap_validity": str(target_valid_output),
         "source_offsets_full_voxels": source_offsets,
         "target_matched_offsets_full_voxels": target_offsets,
-        "downloaded_chunks": source_downloaded + target_downloaded,
-        "downloaded_bytes": source_bytes + target_bytes,
         "canvas_shape_check": _canvas_shape_check(full_shape, render_shape),
         "center_canvas_check": {
             "canvas_offset_yx_full_resolution_px": center_offset_full,

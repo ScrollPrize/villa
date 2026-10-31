@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from numcodecs.registry import get_codec
+from vc_reader.reader import open_zarr
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
@@ -22,49 +22,8 @@ _CONN6 = ndimage.generate_binary_structure(3, 1)
 _CONN26 = ndimage.generate_binary_structure(3, 3)
 
 
-class LocalZarrV2:
-    """Small, bounded reader for the immutable local V2 arrays used here.
-
-    Reading chunks directly avoids making this diagnostic depend on Zarr's
-    asynchronous store machinery.  The accepted metadata is deliberately
-    narrow and validated rather than silently supporting a second data path.
-    """
-
-    def __init__(self, path):
-        self.path = Path(path)
-        meta = json.loads((self.path / ".zarray").read_text())
-        if (meta.get("zarr_format") != 2 or meta.get("dimension_separator") != "/"
-                or meta.get("order") != "C" or meta.get("filters") not in (None, [])):
-            raise ValueError("pair connectivity requires a C-order, slash-separated local Zarr V2 array")
-        self.shape = np.asarray(meta["shape"], dtype=np.int64)
-        self.chunks = np.asarray(meta["chunks"], dtype=np.int64)
-        self.dtype = np.dtype(meta["dtype"])
-        self.fill = np.asarray(meta.get("fill_value", 0), dtype=self.dtype).item()
-        self.codec = get_codec(meta["compressor"]) if meta.get("compressor") else None
-
-    def read(self, begin_zyx, end_zyx):
-        begin = np.asarray(begin_zyx, dtype=np.int64)
-        end = np.asarray(end_zyx, dtype=np.int64)
-        if begin.shape != (3,) or end.shape != (3,) or np.any(begin < 0) or np.any(end > self.shape) or np.any(end <= begin):
-            raise ValueError("invalid local Zarr crop")
-        result = np.full(tuple(end - begin), self.fill, dtype=self.dtype)
-        first, last = begin // self.chunks, (end - 1) // self.chunks
-        for key in itertools.product(*(range(int(a), int(b) + 1) for a, b in zip(first, last))):
-            chunk_begin = np.asarray(key) * self.chunks
-            chunk_end = np.minimum(chunk_begin + self.chunks, self.shape)
-            path = self.path.joinpath(*(str(v) for v in key))
-            if not path.is_file():
-                continue
-            payload = path.read_bytes()
-            if self.codec is not None:
-                payload = self.codec.decode(payload)
-            chunk = np.frombuffer(payload, dtype=self.dtype).reshape(tuple(chunk_end - chunk_begin))
-            source_begin = np.maximum(begin, chunk_begin)
-            source_end = np.minimum(end, chunk_end)
-            src = tuple(slice(int(a - c), int(b - c)) for a, b, c in zip(source_begin, source_end, chunk_begin))
-            dst = tuple(slice(int(a - c), int(b - c)) for a, b, c in zip(source_begin, source_end, begin))
-            result[dst] = chunk[src]
-        return result
+def _read_box(array, begin_zyx, end_zyx):
+    return array[tuple(slice(int(begin), int(end)) for begin, end in zip(begin_zyx, end_zyx))]
 
 
 def _manifest_group(manifest_path, name):
@@ -847,28 +806,28 @@ def run_pair_connectivity(workload):
         raise ValueError("connectivity diagnostic requires exactly two single-span fibers")
     source = evaluation["sources"][0]
     presence_path, presence_scale = _manifest_group(source["fiber_manifest"], "presence")
-    presence_array = LocalZarrV2(presence_path)
+    presence_array = open_zarr(presence_path)
     all_points = np.concatenate(points)
     halo = float(settings["roi_halo_base"])
     lo_xyz = np.maximum(0, np.floor((all_points.min(axis=0)-halo)/presence_scale).astype(int))
     hi_xyz = np.minimum(presence_array.shape[::-1],
                         np.ceil((all_points.max(axis=0)+halo)/presence_scale).astype(int)+1)
     origin_zyx = lo_xyz[::-1]
-    presence_u8 = presence_array.read(origin_zyx, hi_xyz[::-1])
+    presence_u8 = _read_box(presence_array, origin_zyx, hi_xyz[::-1])
     presence = presence_u8.astype(np.float32)/255.0
 
     nx_path, normal_scale = _manifest_group(source["normal_manifest"], "nx")
     ny_path, ny_scale = _manifest_group(source["normal_manifest"], "ny")
     if ny_scale != normal_scale:
         raise ValueError("normal channels have inconsistent scales")
-    nx_array, ny_array = LocalZarrV2(nx_path), LocalZarrV2(ny_path)
+    nx_array, ny_array = open_zarr(nx_path), open_zarr(ny_path)
     normal_halo = float(settings["render_half_width_base"])+2*normal_scale
     normal_lo_xyz = np.maximum(0, np.floor((all_points.min(axis=0)-normal_halo)/normal_scale).astype(int))
     normal_hi_xyz = np.minimum(nx_array.shape[::-1],
         np.ceil((all_points.max(axis=0)+normal_halo)/normal_scale).astype(int)+1)
     normal_origin = normal_lo_xyz[::-1]
-    normal_x = nx_array.read(normal_origin, normal_hi_xyz[::-1])
-    normal_y = ny_array.read(normal_origin, normal_hi_xyz[::-1])
+    normal_x = _read_box(nx_array, normal_origin, normal_hi_xyz[::-1])
+    normal_y = _read_box(ny_array, normal_origin, normal_hi_xyz[::-1])
 
     endpoints = np.asarray([points[0][0], points[0][-1], points[1][0], points[1][-1]])
     nearest, squared = nearest_polyline_points(points[0], points[1])

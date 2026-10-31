@@ -295,7 +295,7 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
         self.assertEqual(case.target_resolution, 7.91)
         self.assertEqual(set(case.surface_volume_urls), {2.4})
 
-    def test_discovery_defaults_need_no_private_rclone_remote(self) -> None:
+    def test_discovery_defaults_need_no_private_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "open-data" / "2.4um-updated.tifxyz").mkdir(parents=True)
@@ -322,35 +322,32 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             default_case = viewer.discover_case(root)
             mirrored_case = viewer.discover_case(
-                root, ink_rclone_root="my-mirror:bucket/ink"
+                root, ink_root="s3://my-mirror/ink"
             )
 
         # The private ink dataset has no implicit default; the public
-        # open-data root reads anonymously without local rclone config.
+        # open-data root reads anonymously.
         self.assertIsNone(default_case.source_surface_volume_url)
         self.assertTrue(
-            default_case.surface_volume_urls[2.4].startswith(":s3,")
-        )
-        self.assertIn(
-            "env_auth=false", default_case.surface_volume_urls[2.4]
+            default_case.surface_volume_urls[2.4].startswith("s3://vesuvius-challenge-open-data/")
         )
         self.assertEqual(
             mirrored_case.source_surface_volume_url,
-            "my-mirror:bucket/ink/scroll-x/source.zarr",
+            "s3://my-mirror/ink/scroll-x/source.zarr",
         )
 
-    def test_cached_rclone_composite_needs_no_remote_metadata(self) -> None:
+    def test_cached_composite_needs_no_remote_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = Path(temp_dir) / "middle3.tif"
             expected = np.arange(12, dtype=np.uint8).reshape(3, 4)
             tifffile.imwrite(cache, expected)
             with mock.patch.object(
                 viewer,
-                "inspect_rclone_zarr",
+                "inspect_zarr",
                 side_effect=AssertionError("unexpected remote read"),
             ):
                 actual = viewer.load_middle_three_max(
-                    "remote:bucket/render.zarr", cache, preferred_level=2
+                    "s3://bucket/render.zarr", cache, preferred_level=2
                 )
         np.testing.assert_array_equal(actual, expected)
 
@@ -377,31 +374,20 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    viewer, "inspect_rclone_zarr", return_value=info
+                    viewer, "inspect_zarr", return_value=info
                 ),
                 mock.patch.object(
                     viewer,
-                    "extract_rclone_composite",
+                    "extract_composite",
                     side_effect=write_composite,
                 ),
             ):
                 viewer.load_middle_three_max(
-                    "remote:bucket/render.zarr",
+                    "s3://bucket/render.zarr",
                     cache,
                     preferred_level=2,
                     plane_count=13,
                 )
-
-    def test_rejects_http_urls(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache = Path(temp_dir) / "middle3.tif"
-            with self.assertRaisesRegex(ValueError, "rclone"):
-                viewer.load_middle_three_max(
-                    "https://example.test/volume.zarr",
-                    cache,
-                    preferred_level=0,
-                )
-            self.assertFalse(cache.exists())
 
 
 class _FakeLayer:

@@ -87,7 +87,7 @@ Run each module as `python -m vesuvius.tifxyz_label_transfer.MODULE --help`.
 
 | Module | Purpose |
 | --- | --- |
-| `prepare_canvas_offset_evidence` | Prepare CT comparisons; remote reads require configured `rclone` access. |
+| `prepare_canvas_offset_evidence` | Prepare CT comparisons; remote reads go through vc_reader, credentials from the environment or `~/.aws`. |
 | `estimate_canvas_offset_evidence` | Estimate a canvas offset from the prepared comparisons. |
 | `estimate_canvas_offset` | Diagnose a single render pair. |
 | `self_render_tifxyz` | Check alignment against raw CT. |

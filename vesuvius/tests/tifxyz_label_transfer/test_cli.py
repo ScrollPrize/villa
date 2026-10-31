@@ -99,9 +99,9 @@ def test_every_multiword_parser_accepts_underscore_aliases() -> None:
     assert evidence.case_dir == Path("case")
 
     preparation = prepare_canvas_offset_evidence.build_parser().parse_args(
-        ["--case_dir", "case", "--ink_rclone_root", "remote:ink"]
+        ["--case_dir", "case", "--ink_root", "s3://remote/ink"]
     )
-    assert preparation.ink_rclone_root == "remote:ink"
+    assert preparation.ink_root == "s3://remote/ink"
 
     rendering = self_render_tifxyz.build_parser().parse_args(
         ["--case_dir", "case", "--plan_only"]
