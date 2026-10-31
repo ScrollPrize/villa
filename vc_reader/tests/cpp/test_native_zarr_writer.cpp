@@ -532,6 +532,21 @@ static void pyramidReductions(const fs::path& root)
     if (!refused)
         throw std::runtime_error("mean refuses uint32");
 
+    // float16: stored as is; its elements read as numbers, its fill encodes.
+    CreateOptions half;
+    half.shape = {1};
+    half.chunks = {1};
+    half.dtype = "<f2";
+    half.fillValue = 1.5;
+    auto halves = Writer::create(root / "float16", half);
+    if (halves.meta().fill != std::vector<std::uint8_t>{0x00, 0x3e})
+        throw std::runtime_error("float16 fill is binary16");
+    const vcr::ElementType type{'f', 2, false};
+    const std::uint8_t subnormal[]{0x01, 0x00}, negative[]{0x00, 0xc0}, infinite[]{0x00, 0x7c};
+    if (type.load(halves.meta().fill.data()) != 1.5 || type.load(subnormal) != std::ldexp(1.0, -24) || type.load(negative) != -2.0 ||
+        !std::isinf(type.load(infinite)))
+        throw std::runtime_error("float16 elements read as numbers");
+
     MultiscalesOptions ome;
     ome.levels = 1;
     ome.reduction = Reduction::Nearest;

@@ -2,6 +2,7 @@
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
+#include "vc_reader/native/rounding.hpp"
 
 #include <bit>
 #include <cmath>
@@ -40,7 +41,7 @@ Typestr parseTypestr(const std::string& text)
         throw std::invalid_argument("unsupported Zarr dtype '" + text + "'");
     }
     const bool integer = t.kind == 'u' || t.kind == 'i';
-    if ((t.kind == 'b' && t.itemsize != 1) || (t.kind == 'f' && t.itemsize != 4 && t.itemsize != 8) ||
+    if ((t.kind == 'b' && t.itemsize != 1) || (t.kind == 'f' && t.itemsize != 2 && t.itemsize != 4 && t.itemsize != 8) ||
         (integer && t.itemsize != 1 && t.itemsize != 2 && t.itemsize != 4 && t.itemsize != 8))
         throw std::invalid_argument("unsupported Zarr dtype '" + text + "'");
     if (t.order == '=' || (t.order == '|' && t.itemsize > 1))
@@ -53,6 +54,23 @@ void put(std::vector<std::uint8_t>& out, T value)
 {
     out.resize(sizeof(T));
     std::memcpy(out.data(), &value, sizeof(T));
+}
+
+// A value as IEEE binary16, rounded to nearest, ties to even.
+std::uint16_t float16Bits(double v)
+{
+    const std::uint16_t sign = std::signbit(v) ? 0x8000 : 0;
+    if (std::isnan(v))
+        return sign | 0x7e00;
+    const double magnitude = std::fabs(v);
+    if (magnitude >= 65520.0)
+        return sign | 0x7c00;
+    if (magnitude < std::ldexp(1.0, -14))
+        return sign | std::uint16_t(round_half_even(std::ldexp(magnitude, 24)));
+    int exponent = 0;
+    const double mantissa = std::frexp(magnitude, &exponent);  // in [0.5, 1)
+    // A mantissa rounding up to 1024 carries into the exponent, as the format intends.
+    return sign | std::uint16_t(((exponent + 14) << 10) + std::uint16_t(round_half_even((mantissa * 2.0 - 1.0) * 1024.0)));
 }
 
 // One fill element in native byte order.
@@ -73,7 +91,9 @@ std::vector<std::uint8_t> fillBytes(const Json& fill, const Typestr& t)
                 v = -std::numeric_limits<double>::infinity();
             else if (s.starts_with("0x")) {  // v3: the raw bits
                 const auto bits = std::stoull(s.substr(2), nullptr, 16);
-                if (t.itemsize == 4)
+                if (t.itemsize == 2)
+                    put(out, static_cast<std::uint16_t>(bits));
+                else if (t.itemsize == 4)
                     put(out, static_cast<std::uint32_t>(bits));
                 else
                     put(out, static_cast<std::uint64_t>(bits));
@@ -85,7 +105,9 @@ std::vector<std::uint8_t> fillBytes(const Json& fill, const Typestr& t)
         } else {
             throw std::invalid_argument("invalid fill_value " + fill.dump());
         }
-        if (t.itemsize == 4)
+        if (t.itemsize == 2)
+            put(out, float16Bits(v));
+        else if (t.itemsize == 4)
             put(out, static_cast<float>(v));
         else
             put(out, v);

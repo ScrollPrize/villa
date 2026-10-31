@@ -1,7 +1,9 @@
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace vcr {
@@ -21,6 +23,16 @@ struct ElementType {
         case 'b':
             return b[0] != 0;
         case 'f':
+            if (itemsize == 2) {
+                std::uint16_t bits;
+                std::memcpy(&bits, b, 2);
+                const int exponent = (bits >> 10) & 0x1f, fraction = bits & 0x3ff;
+                const double magnitude = exponent == 0x1f ? (fraction ? std::numeric_limits<double>::quiet_NaN()
+                                                                       : std::numeric_limits<double>::infinity())
+                                         : exponent == 0   ? std::ldexp(double(fraction), -24)
+                                                           : std::ldexp(double(fraction + 1024), exponent - 25);
+                return bits & 0x8000 ? -magnitude : magnitude;
+            }
             if (itemsize == 4) {
                 float v;
                 std::memcpy(&v, b, 4);

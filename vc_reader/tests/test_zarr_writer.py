@@ -117,3 +117,20 @@ def test_writer_converts_to_numpy(tmp_path):
     writer = ZarrWriter.create(tmp_path / "a", shape=(2, 2), chunks=(2, 2), dtype="u1")
     writer[0, 1] = 5
     np.testing.assert_array_equal(np.asarray(writer), [[0, 5], [0, 0]])
+
+
+@pytest.mark.parametrize("fill", [0.0, -0.0, 1.5, 0.1, 1e-7, 6.1e-5, 6.104e-5, 1023.5, 65504.0, 65519.0, 65520.0, "Infinity", "-Infinity", "NaN"])
+def test_float16_fill_matches_numpy(tmp_path, fill):
+    writer = ZarrWriter.create(tmp_path / "a", shape=(2,), chunks=(2,), dtype=np.float16, fill_value=fill)
+    expected = np.float16(float(fill))
+    assert writer.fill_value.tobytes() == expected.tobytes()
+
+
+def test_float16_arrays_round_trip_with_zarr(tmp_path):
+    data = np.array([[0.5, -1.25], [65504.0, 0.1]], np.float16)
+    writer = ZarrWriter.create(tmp_path / "a", shape=data.shape, chunks=(1, 2), dtype=np.float16, cname="zstd", level=3)
+    writer[...] = data
+    np.testing.assert_array_equal(zarr.open_array(tmp_path / "a", mode="r")[:], data)
+    reader = open_zarr(tmp_path / "a")
+    assert reader.dtype == np.float16
+    np.testing.assert_array_equal(reader[...], data)
