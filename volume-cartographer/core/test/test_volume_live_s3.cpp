@@ -84,7 +84,10 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     CHECK(volume->shape() == untagged->shape());
     // Changing the annotation identity must reuse the pre-existing URL cache,
     // including the process cache shared with manually opened remote volumes.
-    CHECK(untagged->remotePersistentCachePath() == untagged->remoteCacheRoot() / untagged->id());
+    const auto ownFolder = untagged->remoteCacheRoot() / untagged->id();
+    CHECK(untagged->remotePersistentCachePath() ==
+          (std::filesystem::is_directory(ownFolder) ? ownFolder
+                                       : vcr::zarr::decodedCachePath(untagged->remoteCacheRoot(), untagged->sourceLocation())));
     CHECK(volume->remotePersistentCachePath() == untagged->remotePersistentCachePath());
     // vc_reader opens both at the same source with the same VC3D cache directory.
     CHECK(volume->sourceLocation() == untagged->sourceLocation());
@@ -156,7 +159,9 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
     CHECK(v->isRemote());
     CHECK_FALSE(v->remoteUrl().empty());
     CHECK_FALSE(v->id().empty());
-    CHECK(v->remotePersistentCachePath() == v->remoteCacheRoot() / v->id());
+    const auto folder = v->remoteCacheRoot() / v->id();
+    CHECK(v->remotePersistentCachePath() ==
+          (std::filesystem::is_directory(folder) ? folder : vcr::zarr::decodedCachePath(v->remoteCacheRoot(), v->sourceLocation())));
 }
 
 TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")

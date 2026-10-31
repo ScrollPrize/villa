@@ -462,11 +462,8 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // replace the annotation UUID (for example, with an open-data catalog ID).
     // Upstream metadata UUIDs still name their existing caches; otherwise the
     // name remains URL-derived. Every working level shares the physical pyramid's
-    // cache. vc_reader caches a remote volume only under an existing directory.
+    // cache.
     vol->remoteSourceCacheId_ = vol->id();
-    if (!vol->remoteCacheRoot_.empty())
-        vcr::zarr::createVc3dVolumeDir(vol->remoteCacheRoot_ / vol->remoteSourceCacheId_,
-                                       vc::settings::remoteCacheDelta3dEnabled());
 
     if (metadata.is_object()) {
         if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
@@ -517,7 +514,12 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
     if (!remoteAuth_.kind.empty())
         options.access = vcr::zarr::s3Access(sourceLocation(), remoteAuth_);
     if (!remoteCacheRoot_.empty()) {
-        options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;
+        // Chunks live at <root>/<scheme>/<bucket>/<path>, shared with every vc_reader
+        // user of the root. A volume cached by an earlier VC3D keeps its own folder.
+        options.cacheDirs = {remoteCacheRoot_.string()};
+        options.compressCache = vc::settings::remoteCacheDelta3dEnabled();
+        if (const auto folder = remoteCacheRoot_ / remoteSourceCacheId_; std::filesystem::is_directory(folder))
+            options.vc3dVolumeDir = folder;
         options.cacheMaxBytes = vc::settings::remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
         options.cacheMinFreeBytes = vc::settings::remoteCacheMinFreeBytes();
     }
@@ -532,7 +534,8 @@ std::filesystem::path Volume::remotePersistentCachePath() const
 {
     if (!isRemote_ || remoteCacheRoot_.empty())
         return {};
-    return remoteCacheRoot_ / remoteSourceCacheId_;
+    const auto folder = remoteCacheRoot_ / remoteSourceCacheId_;
+    return std::filesystem::is_directory(folder) ? folder : vcr::zarr::decodedCachePath(remoteCacheRoot_, sourceLocation());
 }
 
 int Volume::sliceWidth() const noexcept { return _width; }
