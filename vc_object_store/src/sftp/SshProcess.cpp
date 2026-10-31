@@ -31,6 +31,9 @@ namespace vc::sftp {
 namespace detail {
 namespace {
 constexpr size_t kDiagnosticBytes = 8192;
+// One drain reads at most this much, so a chatty stderr cannot keep callers from
+// their timeout checks; only the last kDiagnosticBytes are kept anyway.
+constexpr size_t kDrainBytes = 4 * kDiagnosticBytes;
 
 #ifndef _WIN32
 std::string controlPath()
@@ -249,16 +252,37 @@ std::wstring quoteArgument(const std::wstring& argument)
 }
 }  // namespace
 
+// ssh's standard input. Anonymous pipes cannot be written asynchronously, so a
+// stalled ssh would block WriteFile with no way to run `check`; our end of this
+// named pipe is overlapped instead, and the child's end is an ordinary handle.
+static bool createInputPipe(HANDLE& child, HANDLE& parent, SECURITY_ATTRIBUTES& inherit)
+{
+    static std::atomic<unsigned> serial{0};
+    const auto name = L"\\\\.\\pipe\\vc-ssh-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(serial.fetch_add(1));
+    parent = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                              PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
+    if (parent == INVALID_HANDLE_VALUE) { parent = nullptr; return false; }
+    child = CreateFileW(name.c_str(), GENERIC_READ, 0, &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (child == INVALID_HANDLE_VALUE) { child = nullptr; CloseHandle(parent); parent = nullptr; return false; }
+    return true;
+}
+
 struct SshProcess::Impl {
     HANDLE process = nullptr, input = nullptr, output = nullptr, errors = nullptr;
+    HANDLE written = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // completes overlapped input writes
     std::string tail;
+    ~Impl() { if (written) CloseHandle(written); }
     void drainErrors()
     {
         char buffer[4096];
-        for (DWORD available = 0; errors && PeekNamedPipe(errors, nullptr, 0, nullptr, &available, nullptr) && available;) {
+        DWORD available = 0;
+        for (size_t drained = 0; drained < kDrainBytes && errors &&
+             PeekNamedPipe(errors, nullptr, 0, nullptr, &available, nullptr) && available;) {
             DWORD n = 0;
             if (!ReadFile(errors, buffer, std::min<DWORD>(available, sizeof buffer), &n, nullptr) || !n) break;
             keepTail(tail, buffer, n);
+            drained += n;
         }
     }
 };
@@ -272,9 +296,12 @@ SshProcess::SshProcess(const Url& destination, const Options& options, Authentic
         command += (command.empty() ? L"" : L" ") + quoteArgument(widen(argument));
     SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE childInput = nullptr, childOutput = nullptr, childErrors = nullptr;
-    if (!CreatePipe(&childInput, &impl_->input, &inherit, 0) || !CreatePipe(&impl_->output, &childOutput, &inherit, 0) ||
-        !CreatePipe(&impl_->errors, &childErrors, &inherit, 0))
+    if (!impl_->written || !createInputPipe(childInput, impl_->input, inherit) ||
+        !CreatePipe(&impl_->output, &childOutput, &inherit, 0) || !CreatePipe(&impl_->errors, &childErrors, &inherit, 0)) {
+        for (auto handle : {childInput, childOutput, childErrors, impl_->input, impl_->output, impl_->errors})
+            if (handle) CloseHandle(handle);
         throw std::runtime_error("Cannot create pipes for OpenSSH ssh");
+    }
     for (auto handle : {impl_->input, impl_->output, impl_->errors}) SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOW startup{};
     startup.cb = sizeof startup;
@@ -287,8 +314,9 @@ SshProcess::SshProcess(const Url& destination, const Options& options, Authentic
                                         &startup, &info);
     for (auto handle : {childInput, childOutput, childErrors}) CloseHandle(handle);
     if (!started) {
+        const auto error = GetLastError();
         for (auto handle : {impl_->input, impl_->output, impl_->errors}) CloseHandle(handle);
-        throw std::runtime_error("Cannot start OpenSSH ssh (error " + std::to_string(GetLastError()) + ")");
+        throw std::runtime_error("Cannot start OpenSSH ssh (error " + std::to_string(error) + ")");
     }
     CloseHandle(info.hThread);
     impl_->process = info.hProcess;
@@ -305,8 +333,27 @@ void SshProcess::write(std::span<const std::byte> data, const std::function<void
 {
     for (size_t done = 0; done < data.size();) {
         check();
+        OVERLAPPED pending{};
+        pending.hEvent = impl_->written;
+        ResetEvent(impl_->written);
         DWORD n = 0;
-        if (!WriteFile(impl_->input, data.data() + done, DWORD(std::min<size_t>(data.size() - done, 1 << 20)), &n, nullptr))
+        if (!WriteFile(impl_->input, data.data() + done, DWORD(std::min<size_t>(data.size() - done, 1 << 20)), nullptr,
+                       &pending)) {
+            if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("SSH write failed: " + diagnostics());
+            // Wait as the POSIX path does: `check` every 100 ms, and it may throw.
+            while (WaitForSingleObject(impl_->written, 100) == WAIT_TIMEOUT) {
+                try {
+                    impl_->drainErrors();
+                    check();
+                } catch (...) {
+                    // The kernel still owns `pending` and the buffer until the write ends.
+                    CancelIoEx(impl_->input, &pending);
+                    GetOverlappedResult(impl_->input, &pending, &n, TRUE);
+                    throw;
+                }
+            }
+        }
+        if (!GetOverlappedResult(impl_->input, &pending, &n, TRUE))
             throw std::runtime_error("SSH write failed: " + diagnostics());
         done += n;
     }
@@ -352,9 +399,9 @@ struct SshProcess::Impl {
     void drainErrors()
     {
         char buffer[4096];
-        while (errors >= 0) {
+        for (size_t drained = 0; errors >= 0 && drained < kDrainBytes;) {
             const auto n = ::read(errors, buffer, sizeof buffer);
-            if (n > 0) { keepTail(tail, buffer, size_t(n)); continue; }
+            if (n > 0) { keepTail(tail, buffer, size_t(n)); drained += size_t(n); continue; }
             if (n == 0) { ::close(errors); errors = -1; }
             break;
         }
