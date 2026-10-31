@@ -18,11 +18,11 @@ from typing import Iterable, Iterator
 
 import numpy as np
 import tifffile
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, open_zarr
 
 from vesuvius.image_proc.run.workflow import gather_inputs, run_workflow
 
-_STORAGE: np.memmap | zarr.Array | None = None
+_STORAGE: np.memmap | ZarrWriter | None = None
 _EXPECTED_SHAPE: tuple[int, int] | None = None
 _EXPECTED_DTYPE: np.dtype | None = None
 
@@ -33,8 +33,6 @@ class StorageSpec:
     path: Path
     shape: tuple[int, int, int]
     dtype: np.dtype
-    array_path: str | None = None
-    sync_path: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -211,25 +209,13 @@ def _prepare_storage(
 
     if storage_mode == "zarr":
         store_dir = base_dir / f"stack_{uuid.uuid4().hex}.zarr"
-        store_dir.mkdir(parents=False, exist_ok=False)
-        sync_path = store_dir / ".sync"
-        store = zarr.DirectoryStore(str(store_dir))
-        synchronizer = zarr.ProcessSynchronizer(str(sync_path))
-        group = zarr.open_group(store=store, mode="w", synchronizer=synchronizer)
-        group.create_dataset(
-            "stack",
-            shape=shape,
-            dtype=dtype,
-            chunks=(1,) + shape[1:],
-            overwrite=True,
-        )
+        # One chunk per slice: workers write whole, distinct chunks and need no synchronizer.
+        ZarrWriter.create(store_dir, shape=shape, chunks=(1,) + shape[1:], dtype=dtype, auth=None)
         return StorageSpec(
             mode="zarr",
             path=store_dir,
             shape=shape,
             dtype=dtype,
-            array_path="stack",
-            sync_path=sync_path,
         )
 
     raise ValueError(f"Unsupported storage mode: {storage_mode}")
@@ -245,10 +231,7 @@ def _initialize_storage(spec: StorageSpec) -> None:
         return
 
     if spec.mode == "zarr":
-        assert spec.array_path is not None and spec.sync_path is not None
-        store = zarr.DirectoryStore(str(spec.path))
-        synchronizer = zarr.ProcessSynchronizer(str(spec.sync_path))
-        _STORAGE = zarr.open(store=store, path=spec.array_path, mode="r+", synchronizer=synchronizer)
+        _STORAGE = ZarrWriter.open(spec.path, auth=None)
         return
 
     raise ValueError(f"Unsupported storage mode: {spec.mode}")
@@ -287,16 +270,9 @@ def _open_storage_for_read(spec: StorageSpec):
         return array, cleanup
 
     if spec.mode == "zarr":
-        assert spec.array_path is not None and spec.sync_path is not None
-        store = zarr.DirectoryStore(str(spec.path))
-        synchronizer = zarr.ProcessSynchronizer(str(spec.sync_path))
-        array = zarr.open(store=store, path=spec.array_path, mode="r", synchronizer=synchronizer)
+        array = open_zarr(spec.path)
 
         def cleanup() -> None:
-            try:
-                array.store.flush()
-            except AttributeError:
-                pass
             shutil.rmtree(spec.path, ignore_errors=True)
 
         return array, cleanup
@@ -353,13 +329,13 @@ def _composite_mean(
     return np.rint(mean, out=mean).astype(dtype, copy=False)
 
 
-def _iter_slices(array: np.ndarray | zarr.Array) -> Iterator[np.ndarray]:
+def _iter_slices(array: np.ndarray | ZarrReader) -> Iterator[np.ndarray]:
     for index in range(array.shape[0]):
         yield np.asarray(array[index])
 
 
 def _composite_median(
-    array: np.ndarray | zarr.Array,
+    array: np.ndarray | ZarrReader,
     spatial_shape: tuple[int, int],
     chunk_rows: int,
     chunk_cols: int,
@@ -383,7 +359,7 @@ def _composite_median(
 
 
 def _write_output_stack(
-    array: np.ndarray | zarr.Array,
+    array: np.ndarray | ZarrReader,
     output_path: Path,
     *,
     compression: str | None,
@@ -392,7 +368,7 @@ def _write_output_stack(
 
 
 def _write_output_projection(
-    array: np.ndarray | zarr.Array,
+    array: np.ndarray | ZarrReader,
     *,
     projection: str,
     output_path: Path,

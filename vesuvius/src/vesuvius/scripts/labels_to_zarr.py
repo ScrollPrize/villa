@@ -31,8 +31,7 @@ import cv2
 import fastremap
 import numpy as np
 import tifffile
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import ObjectStore, ZarrWriter, create_group, ome_multiscales, open_zarr, write_pyramid
 from scipy.ndimage import label as label_components, find_objects
 from scipy.ndimage import distance_transform_edt as scipy_edt
 from tqdm import tqdm
@@ -522,7 +521,7 @@ def write_points_to_zarr(
     if len(z_voxels) == 0:
         return
 
-    zarr_array = zarr.open(zarr_path, mode="r+")
+    zarr_array = ZarrWriter.open(zarr_path, skip_empty=True, auth=None)
     chunks = zarr_array.chunks
 
     # Group points by chunk
@@ -570,12 +569,12 @@ def write_points_to_zarr(
         zarr_array[z_start:z_end, y_start:y_end, x_start:x_end] = chunk_data
 
 
-def get_initialized_chunk_indices(zarr_array: zarr.Array) -> set:
+def get_initialized_chunk_indices(zarr_path: str) -> set:
     """Get set of (cz, cy, cx) tuples for chunks that have data.
 
     Parameters
     ----------
-    zarr_array : zarr.Array
+    zarr_path : str
         The zarr array to inspect.
 
     Returns
@@ -583,7 +582,7 @@ def get_initialized_chunk_indices(zarr_array: zarr.Array) -> set:
     set
         Set of chunk index tuples.
     """
-    chunk_keys = [k for k in zarr_array.store.keys() if not k.startswith('.')]
+    chunk_keys = [k for k in ObjectStore(zarr_path, auth=None).keys() if not k.startswith('.')]
     indices = set()
     for key in chunk_keys:
         try:
@@ -678,7 +677,7 @@ def expand_chunk_worker(args: Tuple) -> dict:
     y_end_ext = min(shape[1], y_end + halo)
     x_end_ext = min(shape[2], x_end + halo)
 
-    zarr_array = zarr.open(zarr_path, mode='r+')
+    zarr_array = ZarrWriter.open(zarr_path, skip_empty=True, auth=None)
 
     # Read extended region
     extended_data = zarr_array[z_start_ext:z_end_ext,
@@ -864,12 +863,12 @@ def expand_labels_in_zarr(
     int
         Total number of chunks modified by expansion.
     """
-    zarr_array = zarr.open(zarr_path, mode='r')
+    zarr_array = open_zarr(zarr_path)
     shape = zarr_array.shape
     chunks = zarr_array.chunks
 
     # Find chunks with data
-    initialized_chunks = get_initialized_chunk_indices(zarr_array)
+    initialized_chunks = get_initialized_chunk_indices(zarr_path)
     print(f"Found {len(initialized_chunks)} initialized chunks")
 
     if not initialized_chunks:
@@ -1486,7 +1485,7 @@ def write_chunk_points_worker(args: Tuple) -> int:
     y_end = min(y_start + chunks[1], shape[1])
     x_end = min(x_start + chunks[2], shape[2])
 
-    zarr_array = zarr.open(zarr_path, mode='r+')
+    zarr_array = ZarrWriter.open(zarr_path, skip_empty=True, auth=None)
 
     # Read current chunk
     chunk_data = zarr_array[z_start:z_end, y_start:y_end, x_start:x_end]
@@ -1503,228 +1502,6 @@ def write_chunk_points_worker(args: Tuple) -> int:
     zarr_array[z_start:z_end, y_start:y_end, x_start:x_end] = chunk_data
 
     return len(values)
-
-
-def create_ome_zarr_metadata(
-    shape: Tuple[int, int, int],
-    num_levels: int,
-    dtype: str,
-) -> dict:
-    """Create OME-Zarr multiscales metadata.
-
-    Parameters
-    ----------
-    shape : Tuple[int, int, int]
-        Shape of level 0 (Z, Y, X).
-    num_levels : int
-        Number of pyramid levels.
-    dtype : str
-        Data type string.
-
-    Returns
-    -------
-    dict
-        OME-Zarr .zattrs content.
-    """
-    datasets = []
-    for level in range(num_levels):
-        scale = 2 ** level
-        datasets.append({
-            "path": str(level),
-            "coordinateTransformations": [
-                {
-                    "type": "scale",
-                    "scale": [float(scale), float(scale), float(scale)]
-                }
-            ]
-        })
-
-    return {
-        "multiscales": [{
-            "version": "0.4",
-            "name": "labels",
-            "axes": [
-                {"name": "z", "type": "space", "unit": "micrometer"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
-            ],
-            "datasets": datasets,
-            "type": "gaussian",
-            "metadata": {
-                "method": "cv2.resize with INTER_NEAREST",
-            }
-        }]
-    }
-
-
-def _downsample_chunk_worker(args: Tuple) -> Optional[Tuple[Tuple[int, int, int], np.ndarray]]:
-    """Worker function to downsample a single output chunk.
-
-    Parameters
-    ----------
-    args : Tuple
-        (out_chunk_idx, input_zarr_path, prev_level, prev_shape, out_shape, out_chunks)
-
-    Returns
-    -------
-    Optional[Tuple[Tuple[int, int, int], np.ndarray]]
-        (output_chunk_index, downsampled_data) or None if empty.
-    """
-    out_chunk_idx, input_zarr_path, prev_level, prev_shape, out_shape, out_chunks = args
-    cz, cy, cx = out_chunk_idx
-
-    # Calculate output chunk bounds
-    z_out_start = cz * out_chunks[0]
-    y_out_start = cy * out_chunks[1]
-    x_out_start = cx * out_chunks[2]
-    z_out_end = min(z_out_start + out_chunks[0], out_shape[0])
-    y_out_end = min(y_out_start + out_chunks[1], out_shape[1])
-    x_out_end = min(x_out_start + out_chunks[2], out_shape[2])
-
-    # Calculate corresponding input bounds (2x)
-    z_in_start = z_out_start * 2
-    y_in_start = y_out_start * 2
-    x_in_start = x_out_start * 2
-    z_in_end = min(z_out_end * 2, prev_shape[0])
-    y_in_end = min(y_out_end * 2, prev_shape[1])
-    x_in_end = min(x_out_end * 2, prev_shape[2])
-
-    # Read only the required input region
-    root = zarr.open(input_zarr_path, mode="r")
-    prev_arr = root[str(prev_level)]
-    input_chunk = prev_arr[z_in_start:z_in_end, y_in_start:y_in_end, x_in_start:x_in_end]
-
-    # Skip empty chunks (all values equal to fill_value)
-    fill_value = prev_arr.fill_value if prev_arr.fill_value is not None else 0
-    if np.all(input_chunk == fill_value):
-        return None
-
-    # Output dimensions for this chunk
-    out_z = z_out_end - z_out_start
-    out_y = y_out_end - y_out_start
-    out_x = x_out_end - x_out_start
-
-    # Downsample: take every other voxel (nearest neighbor for labels)
-    # This is much faster than cv2.resize for 3D data
-    downsampled = input_chunk[::2, ::2, ::2]
-
-    # Ensure correct output size (handle edge cases)
-    if downsampled.shape != (out_z, out_y, out_x):
-        result = np.full((out_z, out_y, out_x), fill_value, dtype=input_chunk.dtype)
-        sz = min(downsampled.shape[0], out_z)
-        sy = min(downsampled.shape[1], out_y)
-        sx = min(downsampled.shape[2], out_x)
-        result[:sz, :sy, :sx] = downsampled[:sz, :sy, :sx]
-        downsampled = result
-
-    return (out_chunk_idx, downsampled)
-
-
-def generate_pyramid_levels(
-    zarr_path: str,
-    num_levels: int,
-    chunks: Tuple[int, int, int],
-    compressor: Any,
-    dtype: np.dtype,
-    num_workers: int = 1,
-) -> None:
-    """Generate downsampled pyramid levels from level 0.
-
-    Uses parallel chunk-based processing for fast downsampling.
-
-    Parameters
-    ----------
-    zarr_path : str
-        Path to OME-Zarr root.
-    num_levels : int
-        Total number of levels (including level 0).
-    chunks : Tuple[int, int, int]
-        Chunk size for output arrays.
-    compressor : Any
-        Compressor for zarr arrays.
-    dtype : np.dtype
-        Data type for arrays.
-    num_workers : int
-        Number of parallel workers.
-    """
-    root = zarr.open(zarr_path, mode="r+")
-
-    # Get fill_value from level 0 to propagate to all levels
-    level0_fill_value = root["0"].fill_value if root["0"].fill_value is not None else 0
-
-    for level in range(1, num_levels):
-        prev_level = level - 1
-        prev_arr = root[str(prev_level)]
-        prev_shape = prev_arr.shape
-
-        # Calculate new shape (halve each dimension, minimum 1)
-        new_shape = tuple(max(1, s // 2) for s in prev_shape)
-
-        print(f"Generating level {level}: {prev_shape} -> {new_shape}")
-
-        # Create array for this level
-        level_chunks = tuple(min(c, s) for c, s in zip(chunks, new_shape))
-        new_arr = root.create_dataset(
-            str(level),
-            shape=new_shape,
-            chunks=level_chunks,
-            dtype=dtype,
-            compressor=compressor,
-            fill_value=level0_fill_value,
-            overwrite=True,
-            write_empty_chunks=False,
-        )
-
-        # Calculate number of chunks in each dimension
-        n_chunks_z = (new_shape[0] + level_chunks[0] - 1) // level_chunks[0]
-        n_chunks_y = (new_shape[1] + level_chunks[1] - 1) // level_chunks[1]
-        n_chunks_x = (new_shape[2] + level_chunks[2] - 1) // level_chunks[2]
-
-        # Generate all chunk indices
-        chunk_indices = [
-            (cz, cy, cx)
-            for cz in range(n_chunks_z)
-            for cy in range(n_chunks_y)
-            for cx in range(n_chunks_x)
-        ]
-
-        # Prepare worker arguments
-        worker_args = [
-            (idx, zarr_path, prev_level, prev_shape, new_shape, level_chunks)
-            for idx in chunk_indices
-        ]
-
-        print(f"  Processing {len(chunk_indices)} chunks with {num_workers} workers...")
-
-        # Process chunks in parallel
-        results = []
-        if num_workers > 1:
-            with Pool(processes=num_workers) as pool:
-                results = list(tqdm(
-                    pool.imap_unordered(_downsample_chunk_worker, worker_args),
-                    total=len(worker_args),
-                    desc=f"Level {level}",
-                ))
-        else:
-            for args in tqdm(worker_args, desc=f"Level {level}"):
-                results.append(_downsample_chunk_worker(args))
-
-        # Write non-empty results
-        written = 0
-        for result in results:
-            if result is not None:
-                (cz, cy, cx), data = result
-                z_start = cz * level_chunks[0]
-                y_start = cy * level_chunks[1]
-                x_start = cx * level_chunks[2]
-                new_arr[
-                    z_start:z_start + data.shape[0],
-                    y_start:y_start + data.shape[1],
-                    x_start:x_start + data.shape[2]
-                ] = data
-                written += 1
-
-        print(f"  Wrote {written} non-empty chunks")
 
 
 def write_metadata_json(
@@ -1838,22 +1615,22 @@ def main() -> None:
     # Create OME-Zarr structure
     z_dim, y_dim, x_dim = args.shape
     chunks = tuple(min(c, d) for c, d in zip(args.chunks, args.shape))
-    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
     dtype = np.dtype(args.dtype)
 
     # Create root group
-    root = zarr.open_group(str(output_path), mode="w")
+    root = create_group(output_path, overwrite=True, auth=None)
 
     # Create level 0 array (full resolution)
     level0_path = output_path / "0"
-    zarr_array = root.create_dataset(
+    zarr_array = root.create_array(
         "0",
         shape=(z_dim, y_dim, x_dim),
         chunks=chunks,
         dtype=dtype,
-        compressor=compressor,
+        cname="zstd",
+        level=3,
+        shuffle=2,
         fill_value=fill_value,
-        write_empty_chunks=False,
     )
     print(f"Created OME-Zarr level 0: shape={zarr_array.shape}, chunks={zarr_array.chunks}, fill_value={fill_value}")
 
@@ -2092,25 +1869,13 @@ def main() -> None:
     # Generate pyramid levels
     if args.num_levels > 1:
         print(f"\nGenerating {args.num_levels - 1} pyramid levels...")
-        generate_pyramid_levels(
-            str(output_path),
-            args.num_levels,
-            chunks,
-            compressor,
-            dtype,
-            num_workers=num_workers,
-        )
+        write_pyramid(output_path, args.num_levels - 1, reduction="nearest", threads=num_workers, overwrite=True)
 
-    # Write OME-Zarr metadata directly to .zattrs file
-    ome_metadata = create_ome_zarr_metadata(
-        (z_dim, y_dim, x_dim),
-        args.num_levels,
-        args.dtype,
-    )
-    zattrs_path = output_path / ".zattrs"
-    with open(zattrs_path, "w") as f:
-        json.dump(ome_metadata, f, indent=2)
-    print(f"Wrote OME-Zarr metadata to: {zattrs_path}")
+    # Write OME-Zarr metadata
+    root.attrs["multiscales"] = [
+        ome_multiscales(name="labels", levels=args.num_levels - 1, unit="micrometer", reduction="nearest")
+    ]
+    print(f"Wrote OME-Zarr metadata to: {output_path}")
 
     # Write metadata.json with source label files
     label_files = [(surf.name, label.name) for surf, label in surfaces]

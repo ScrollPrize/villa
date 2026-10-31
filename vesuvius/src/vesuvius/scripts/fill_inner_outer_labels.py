@@ -32,8 +32,7 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import ZarrReader, ZarrWriter, create_group, open_group, open_zarr
 from tqdm import tqdm
 
 # Try to import alphashape - required for outer region detection
@@ -361,8 +360,7 @@ def process_slice(
      n_angle_bins, shrink_factor, skip_outer, skip_inner) = args
 
     # Open zarr (each worker opens its own handle)
-    input_store = zarr.open(input_path, mode="r")
-    input_arr = input_store[str(compute_level)]
+    input_arr = open_zarr(f"{input_path}/{compute_level}", threads=1)
 
     # Read slice
     label_slice = input_arr[slice_idx, :, :]
@@ -403,10 +401,8 @@ def process_and_write_slice(
      n_angle_bins, shrink_factor, skip_outer, skip_inner, fill_value) = args
 
     # Open zarr (each worker opens its own handle)
-    input_store = zarr.open(input_path, mode="r")
-    output_store = zarr.open(output_path, mode="r+")
-    input_arr = input_store[str(level)]
-    output_arr = output_store[str(level)]
+    input_arr = open_zarr(f"{input_path}/{level}", threads=1)
+    output_arr = ZarrWriter.open(f"{output_path}/{level}", auth=None)
 
     # Read slice
     label_slice = input_arr[slice_idx, :, :]
@@ -467,8 +463,8 @@ def upscale_mask(
 
 def write_slice_with_fill(
     slice_idx: int,
-    input_arr: zarr.Array,
-    output_arr: zarr.Array,
+    input_arr: ZarrReader,
+    output_arr: ZarrWriter,
     output_level: int,
     compute_level: int,
     outer_mask: Optional[np.ndarray],
@@ -481,9 +477,9 @@ def write_slice_with_fill(
     ----------
     slice_idx : int
         Slice index at compute level.
-    input_arr : zarr.Array
+    input_arr : ZarrReader
         Input zarr array (shared handle).
-    output_arr : zarr.Array
+    output_arr : ZarrWriter
         Output zarr array (shared handle).
     output_level : int
         Output pyramid level.
@@ -580,8 +576,7 @@ def visualize_slice(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Read slice
-    input_store = zarr.open(input_path, mode="r")
-    input_arr = input_store[str(compute_level)]
+    input_arr = open_zarr(f"{input_path}/{compute_level}", threads=1)
     label_slice = input_arr[slice_idx, :, :]
 
     # Save original
@@ -638,37 +633,38 @@ def create_output_zarr(
     output_level : int
         Level to copy/create.
     """
-    input_store = zarr.open(str(input_path), mode="r")
+    input_store = open_group(input_path)
 
     # Create output store
     if output_path.exists():
         print(f"Output exists, opening in r+ mode")
-        output_store = zarr.open(str(output_path), mode="r+")
     else:
         print(f"Creating output zarr")
-        output_store = zarr.open(str(output_path), mode="w")
+    output_store = create_group(output_path, auth=None)
 
     # Copy the target level
     input_arr = input_store[str(output_level)]
 
     if str(output_level) not in output_store:
-        compressor = input_arr.compressor
-        if compressor is None:
-            compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-
-        output_store.create_dataset(
-            str(output_level),
-            shape=input_arr.shape,
-            chunks=input_arr.chunks,
-            dtype=input_arr.dtype,
-            compressor=compressor,
-            fill_value=input_arr.fill_value,
-        )
+        if input_arr.compressor is None:
+            ZarrWriter.create(
+                output_path / str(output_level),
+                shape=input_arr.shape,
+                chunks=input_arr.chunks,
+                dtype=input_arr.dtype,
+                cname="zstd",
+                level=3,
+                shuffle=2,
+                fill_value=input_arr.fill_value,
+                auth=None,
+            )
+        else:
+            ZarrWriter.create_like(output_path / str(output_level), input_arr, auth=None)
         print(f"Created output level {output_level}: shape={input_arr.shape}")
 
     # Copy attributes if present
-    if hasattr(input_store, 'attrs') and input_store.attrs:
-        output_store.attrs.update(dict(input_store.attrs))
+    if input_store.attrs:
+        output_store.attrs.update(input_store.attrs)
 
 
 def main() -> None:
@@ -682,7 +678,7 @@ def main() -> None:
     print(f"Using {num_workers} workers")
 
     # Open input to get metadata
-    input_store = zarr.open(str(input_path), mode="r")
+    input_store = open_group(input_path)
 
     # Validate compute level exists
     if str(args.compute_level) not in input_store:
@@ -809,10 +805,8 @@ def main() -> None:
         print("\nPhase 2: Upscaling masks and writing to output...")
 
         # Open stores ONCE and share across threads
-        input_store = zarr.open(str(input_path), mode="r")
-        output_store = zarr.open(str(output_path), mode="r+")
-        input_arr = input_store[str(args.output_level)]
-        output_arr = output_store[str(args.output_level)]
+        input_arr = open_zarr(input_path / str(args.output_level))
+        output_arr = ZarrWriter.open(output_path / str(args.output_level), auth=None)
 
         total_filled = 0
         with ThreadPoolExecutor(max_workers=num_workers) as executor:

@@ -27,8 +27,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import tifffile
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import create_group, ome_multiscales, write_pyramid
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -438,174 +437,6 @@ def process_xy_tile(args: Tuple) -> Tuple[int, int, int, int]:
     return (y_start, x_start, chunk_3d.shape[1], chunk_3d.shape[2])
 
 
-def create_ome_zarr_metadata(
-    shape: Tuple[int, int, int],
-    num_levels: int,
-    dtype: str,
-    name: str = "volume",
-) -> dict:
-    """Create OME-Zarr multiscales metadata."""
-    datasets = []
-    for level in range(num_levels):
-        scale = 2 ** level
-        datasets.append({
-            "path": str(level),
-            "coordinateTransformations": [
-                {
-                    "type": "scale",
-                    "scale": [float(scale), float(scale), float(scale)]
-                }
-            ]
-        })
-
-    return {
-        "multiscales": [{
-            "version": "0.4",
-            "name": name,
-            "axes": [
-                {"name": "z", "type": "space", "unit": "micrometer"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
-            ],
-            "datasets": datasets,
-            "type": "gaussian",
-            "metadata": {
-                "method": "strided 2x downsampling",
-            }
-        }]
-    }
-
-
-def downsample_chunk(args: Tuple) -> Optional[Tuple[Tuple[int, int, int], np.ndarray]]:
-    """Downsample a single chunk from the previous level."""
-    out_chunk_idx, zarr_path, prev_level, prev_shape, out_shape, out_chunks = args
-    cz, cy, cx = out_chunk_idx
-
-    # Calculate output chunk bounds
-    z_out_start = cz * out_chunks[0]
-    y_out_start = cy * out_chunks[1]
-    x_out_start = cx * out_chunks[2]
-    z_out_end = min(z_out_start + out_chunks[0], out_shape[0])
-    y_out_end = min(y_out_start + out_chunks[1], out_shape[1])
-    x_out_end = min(x_out_start + out_chunks[2], out_shape[2])
-
-    # Calculate corresponding input bounds (2x)
-    z_in_start = z_out_start * 2
-    y_in_start = y_out_start * 2
-    x_in_start = x_out_start * 2
-    z_in_end = min(z_out_end * 2, prev_shape[0])
-    y_in_end = min(y_out_end * 2, prev_shape[1])
-    x_in_end = min(x_out_end * 2, prev_shape[2])
-
-    # Read only the required input region
-    root = zarr.open(zarr_path, mode="r")
-    prev_arr = root[str(prev_level)]
-    input_chunk = prev_arr[z_in_start:z_in_end, y_in_start:y_in_end, x_in_start:x_in_end]
-
-    # Skip empty chunks
-    if input_chunk.max() == 0:
-        return None
-
-    # Output dimensions for this chunk
-    out_z = z_out_end - z_out_start
-    out_y = y_out_end - y_out_start
-    out_x = x_out_end - x_out_start
-
-    # Downsample: take every other voxel (strided 2x)
-    downsampled = input_chunk[::2, ::2, ::2]
-
-    # Ensure correct output size (handle edge cases)
-    if downsampled.shape != (out_z, out_y, out_x):
-        result = np.zeros((out_z, out_y, out_x), dtype=input_chunk.dtype)
-        sz = min(downsampled.shape[0], out_z)
-        sy = min(downsampled.shape[1], out_y)
-        sx = min(downsampled.shape[2], out_x)
-        result[:sz, :sy, :sx] = downsampled[:sz, :sy, :sx]
-        downsampled = result
-
-    return (out_chunk_idx, downsampled)
-
-
-def generate_pyramid_levels(
-    zarr_path: str,
-    num_levels: int,
-    chunks: Tuple[int, int, int],
-    compressor,
-    dtype: np.dtype,
-    num_workers: int = 1,
-) -> None:
-    """Generate downsampled pyramid levels from level 0."""
-    root = zarr.open(zarr_path, mode="r+")
-
-    for level in range(1, num_levels):
-        prev_level = level - 1
-        prev_arr = root[str(prev_level)]
-        prev_shape = prev_arr.shape
-
-        # Output shape is halved
-        out_shape = (
-            (prev_shape[0] + 1) // 2,
-            (prev_shape[1] + 1) // 2,
-            (prev_shape[2] + 1) // 2,
-        )
-
-        logger.info(f"Level {level}: {prev_shape} -> {out_shape}")
-
-        # Create output array
-        out_arr = root.create_dataset(
-            str(level),
-            shape=out_shape,
-            chunks=chunks,
-            dtype=dtype,
-            compressor=compressor,
-            overwrite=True,
-        )
-
-        # Generate chunk tasks
-        tasks = []
-        for cz in range((out_shape[0] + chunks[0] - 1) // chunks[0]):
-            for cy in range((out_shape[1] + chunks[1] - 1) // chunks[1]):
-                for cx in range((out_shape[2] + chunks[2] - 1) // chunks[2]):
-                    tasks.append((
-                        (cz, cy, cx),
-                        zarr_path,
-                        prev_level,
-                        prev_shape,
-                        out_shape,
-                        chunks,
-                    ))
-
-        # Process chunks in parallel
-        if num_workers > 1:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(downsample_chunk, task): task for task in tasks}
-                for future in tqdm(as_completed(futures), total=len(tasks), desc=f"Level {level}"):
-                    result = future.result()
-                    if result is not None:
-                        (cz, cy, cx), data = result
-                        z_start = cz * chunks[0]
-                        y_start = cy * chunks[1]
-                        x_start = cx * chunks[2]
-                        out_arr[
-                            z_start:z_start + data.shape[0],
-                            y_start:y_start + data.shape[1],
-                            x_start:x_start + data.shape[2],
-                        ] = data
-        else:
-            for task in tqdm(tasks, desc=f"Level {level}"):
-                result = downsample_chunk(task)
-                if result is not None:
-                    (cz, cy, cx), data = result
-                    z_start = cz * chunks[0]
-                    y_start = cy * chunks[1]
-                    x_start = cx * chunks[2]
-                    out_arr[
-                        z_start:z_start + data.shape[0],
-                        y_start:y_start + data.shape[1],
-                        x_start:x_start + data.shape[2],
-                    ] = data
-
-
 def convert_tifs_to_ome_zarr(
     input_folder: Path,
     output_path: Path,
@@ -693,9 +524,6 @@ def convert_tifs_to_ome_zarr(
     logger.info(f"XY tiles: {num_y_tiles} x {num_x_tiles} = {total_xy_tiles} tiles")
     logger.info(f"Memory per tile: {bytes_per_tile / 1024**2:.1f} MB")
 
-    # Create compressor
-    compressor = Blosc(cname="zstd", clevel=compressor_level, shuffle=Blosc.BITSHUFFLE)
-
     # Create output zarr
     logger.info(f"Creating OME-Zarr at {output_path}")
     if output_path.exists():
@@ -703,22 +531,24 @@ def convert_tifs_to_ome_zarr(
         logger.warning(f"Removing existing {output_path}")
         shutil.rmtree(output_path)
 
-    root = zarr.open(str(output_path), mode="w")
+    root = create_group(output_path, overwrite=True, auth=None)
 
     # Create level 0 array
-    arr_0 = root.create_dataset(
+    arr_0 = root.create_array(
         "0",
         shape=volume_shape,
         chunks=chunk_shape,
         dtype=output_dtype,
-        compressor=compressor,
+        cname="zstd",
+        level=compressor_level,
+        shuffle=2,
+        skip_empty=True,
     )
 
     # Write OME-Zarr metadata
-    metadata = create_ome_zarr_metadata(volume_shape, num_levels, str(output_dtype))
-    attrs_path = output_path / ".zattrs"
-    with open(attrs_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    root.attrs["multiscales"] = [
+        ome_multiscales(name="volume", levels=num_levels - 1, unit="micrometer", reduction="nearest")
+    ]
     logger.info("Wrote OME-Zarr metadata")
 
     # Process level 0 using XY-tile-major order (much faster!)
@@ -768,14 +598,7 @@ def convert_tifs_to_ome_zarr(
     # Generate pyramid levels
     if num_levels > 1:
         logger.info(f"Generating {num_levels - 1} pyramid levels")
-        generate_pyramid_levels(
-            str(output_path),
-            num_levels,
-            chunk_shape,
-            compressor,
-            output_dtype,
-            num_workers,
-        )
+        write_pyramid(output_path, num_levels - 1, reduction="nearest", threads=num_workers, overwrite=True)
 
     logger.info(f"Conversion complete: {output_path}")
 

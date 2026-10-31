@@ -24,28 +24,13 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
-import zarr
-from numcodecs import Blosc
+from vc_reader.reader import ZarrWriter, create_group, ome_multiscales, open_node
 from tqdm import tqdm
 
 from vesuvius.tifxyz import read_tifxyz
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def open_zarr_read(store_path: str):
-    """Open a Zarr store for reading, supporting local paths and URI stores."""
-    if "://" in store_path and not store_path.startswith("file://"):
-        import fsspec
-
-        storage_options = {}
-        if store_path.startswith("s3://"):
-            from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
-
-            storage_options = s3_storage_options_for_path(store_path)
-        return zarr.open(fsspec.get_mapper(store_path, **storage_options), mode="r")
-    return zarr.open(store_path, mode="r")
 
 
 def discover_tifxyz_dirs(folder: Path) -> List[Path]:
@@ -210,43 +195,6 @@ def compute_chunks_for_level(
     return level_chunks
 
 
-def create_ome_zarr_metadata(
-    shape: Tuple[int, int, int],
-    num_levels: int,
-    dtype: str,
-    name: str = "volume",
-) -> dict:
-    """Create OME-Zarr multiscales metadata."""
-    datasets = []
-    for level in range(num_levels):
-        scale = 2 ** level
-        datasets.append({
-            "path": str(level),
-            "coordinateTransformations": [
-                {
-                    "type": "scale",
-                    "scale": [float(scale), float(scale), float(scale)]
-                }
-            ]
-        })
-
-    return {
-        "multiscales": [{
-            "version": "0.4",
-            "name": name,
-            "axes": [
-                {"name": "z", "type": "space", "unit": "micrometer"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
-            ],
-            "datasets": datasets,
-            "type": "gaussian",
-            "metadata": {
-                "method": "sparse extraction from source zarr",
-            }
-        }]
-    }
-
 
 def copy_chunk_worker(args: Tuple) -> Tuple[Tuple[int, int, int], bool]:
     """Copy a single chunk from source to destination.
@@ -274,7 +222,7 @@ def copy_chunk_worker(args: Tuple) -> Tuple[Tuple[int, int, int], bool]:
 
     try:
         # Read from source
-        source = open_zarr_read(source_path)
+        source = open_node(source_path)
         src_arr = source[str(level)]
         chunk_data = src_arr[z_start:z_end, y_start:y_end, x_start:x_end]
 
@@ -283,8 +231,7 @@ def copy_chunk_worker(args: Tuple) -> Tuple[Tuple[int, int, int], bool]:
             return (chunk_idx, False)
 
         # Write to destination
-        dest = zarr.open(dest_path, mode="r+")
-        dest_arr = dest[str(level)]
+        dest_arr = ZarrWriter.open(f"{dest_path}/{level}", skip_empty=True, auth=None)
         dest_arr[z_start:z_end, y_start:y_end, x_start:x_end] = chunk_data
 
         return (chunk_idx, True)
@@ -317,7 +264,7 @@ def copy_sparse_chunks(
     Dict[int, int]
         Number of non-empty chunks copied per level.
     """
-    source = open_zarr_read(source_path)
+    source = open_node(source_path)
     copied_counts = {}
 
     for level in sorted(chunks_by_level.keys()):
@@ -394,12 +341,11 @@ def extract_sparse_ome_zarr(
 
     # Open source zarr to get metadata
     logger.info(f"Opening source zarr: {source_zarr}")
-    source = open_zarr_read(source_zarr)
+    source = open_node(source_zarr)
     src_arr = source["0"]
     volume_shape = src_arr.shape
     chunk_size = src_arr.chunks
     dtype = src_arr.dtype
-    compressor = src_arr.compressor
 
     logger.info(f"Source volume: shape={volume_shape}, chunks={chunk_size}, dtype={dtype}")
 
@@ -420,7 +366,7 @@ def extract_sparse_ome_zarr(
         logger.warning(f"Removing existing {output_zarr}")
         shutil.rmtree(output_zarr)
 
-    root = zarr.open(str(output_zarr), mode="w")
+    root = create_group(output_zarr, overwrite=True, auth=None)
 
     # Create arrays for all levels
     for level in range(num_levels):
@@ -428,22 +374,18 @@ def extract_sparse_ome_zarr(
         level_shape = tuple((s + scale - 1) // scale for s in volume_shape)
         level_chunks = tuple(min(c, s) for c, s in zip(chunk_size, level_shape))
 
-        root.create_dataset(
-            str(level),
+        ZarrWriter.create_like(
+            output_zarr / str(level),
+            src_arr,
             shape=level_shape,
             chunks=level_chunks,
-            dtype=dtype,
-            compressor=compressor,
             fill_value=0,
-            write_empty_chunks=False,
+            auth=None,
         )
         logger.info(f"Created level {level}: shape={level_shape}")
 
     # Write OME-Zarr metadata
-    metadata = create_ome_zarr_metadata(volume_shape, num_levels, str(dtype))
-    attrs_path = output_zarr / ".zattrs"
-    with open(attrs_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    root.attrs["multiscales"] = [ome_multiscales(name="volume", levels=num_levels - 1, unit="micrometer")]
     logger.info("Wrote OME-Zarr metadata")
 
     # Copy chunks

@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, create_group, open_group, open_zarr
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from torch.utils.data import Dataset
 
@@ -90,6 +90,7 @@ class TiffArrayHandle:
         return tifffile.imread(str(self._path))
 
     def read_window(self, start: Tuple[int, ...], size: Tuple[int, ...]) -> np.ndarray:
+        import zarr  # tifffile's aszarr store; goes with B6's TIFF windows
         store = self._ensure_zarr()
         arr = zarr.open(store, mode='r')
         slices = tuple(slice(s, s + sz) for s, sz in zip(start, size))
@@ -296,7 +297,7 @@ class MutexAffinityDataset(Dataset):
                 )
 
             image_handle = self._open_image_handle(image_path)
-            graph_root = zarr.open_group(str(affinity_path), mode="r")
+            graph_root = open_group(affinity_path)
 
             self._volume_ids.append(volume_id)
             self._image_handles.append(image_handle)
@@ -571,7 +572,7 @@ class MutexAffinityDataset(Dataset):
 
     def _open_image_handle(self, path: Path):
         if path.suffix == ".zarr" and path.is_dir():
-            array = zarr.open(str(path), mode="r")
+            array = open_zarr(path)
             spatial_shape = self._infer_spatial_shape(array)
             return ZarrArrayHandle(array, path=path, spatial_shape=spatial_shape)
 
@@ -595,7 +596,7 @@ class MutexAffinityDataset(Dataset):
         plan: Dict[Path, List[str]] = {}
         for path in affinity_paths:
             try:
-                group = zarr.open_group(str(path), mode="r")
+                group = open_group(path)
             except Exception as exc:
                 print(f"[MutexDataset] Warning: failed to inspect {path.name}: {exc}")
                 continue
@@ -705,7 +706,8 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
     converted: List[str] = []
     skipped: List[str] = []
 
-    group = zarr.open_group(str(store_path), mode="r+")
+    group = open_group(store_path)
+    root = create_group(store_path, auth=None)
 
     for key in keys:
         if key not in group:
@@ -718,28 +720,7 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             skipped.append(key)
             continue
 
-        parent, leaf = key.rsplit("/", 1) if "/" in key else ("", key)
-        dest_group = group[parent] if parent else group
-
-        tmp_name = f"{leaf}__tmp_uint8"
-        if tmp_name in dest_group:
-            del dest_group[tmp_name]
-
-        chunks = getattr(array, "chunks", None)
-        if chunks is None:
-            chunks = tuple(int(dim) for dim in array.shape)
-        else:
-            chunks = tuple(int(c) if c is not None else int(dim) for c, dim in zip(chunks, array.shape))
-
-        compressor = getattr(array, "compressor", None)
-        tmp_ds = dest_group.create_dataset(
-            tmp_name,
-            shape=array.shape,
-            dtype=np.uint8,
-            chunks=chunks,
-            compressor=compressor,
-            overwrite=True,
-        )
+        chunks = tuple(int(c) for c in array.chunks)
 
         # First, check if all data is binary before writing
         is_binary = True
@@ -753,13 +734,15 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             skipped.append(key)
             continue
 
-        # Now, write the data to the temporary dataset
+        # Now, write the data to a temporary array and put it in place
+        tmp_key = f"{key}__tmp_uint8"
+        tmp_ds = ZarrWriter.create_like(
+            store_path / tmp_key, array, dtype=np.uint8, fill_value=0, overwrite=True, auth=None
+        )
         for chunk_slices in _iter_chunk_slices(array.shape, chunks):
-            data = array[chunk_slices]
-            tmp_ds[chunk_slices] = data.astype(np.uint8, copy=False)
-        if leaf in dest_group:
-            del dest_group[leaf]
-        dest_group.move(tmp_name, leaf)
+            tmp_ds[chunk_slices] = array[chunk_slices].astype(np.uint8, copy=False)
+        del root[key]
+        os.replace(store_path / tmp_key, store_path / key)
         converted.append(key)
 
     return store_path_str, converted, skipped
