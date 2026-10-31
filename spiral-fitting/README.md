@@ -222,6 +222,16 @@ iterations` line; the final checkpoint and outputs are written as usual and
 record N as the completed iterations. `optimizer_num_training_steps` remains
 the upper bound and still sets the learning-rate decay horizon.
 
+A staged fit, where a loss term switches on part way through (a DT loss with
+weight above 0, its inputs loaded and its `loss_start_*` before the horizon,
+or a later start of the high-resolution flow learning-rate ramp), is not
+stopped before the last stage has run for two windows. The loss before a stage
+is not comparable with the loss after it, so the comparison restarts at each
+stage start (a 200-iteration block that straddles it is dropped), and the
+startup prints the stage starts and the earliest stop. A fit with no stage
+before its horizon, such as a 10,000-step fit with the default DT starts
+(25,000), stops as described above.
+
 ```bash
 FIT_SPIRAL_CONFIG_OVERRIDES='{"optimizer_auto_steps": true}' python fit_spiral.py --dataset <dataset dir>
 ```

@@ -86,7 +86,7 @@ from point_collection import (
     normalise_pcl_winding_annotations,
     umbilicus_inward_direction,
 )
-from auto_steps import auto_steps_should_stop
+from auto_steps import AutoStepsMonitor, auto_steps_stage_starts
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -1159,18 +1159,25 @@ def get_run_dt_resume_iteration(run_start, requested_iterations,
     return int(run_start) + suppressed
 
 
+def get_dt_loss_starts(cfg):
+    """Return the iteration after which each directional DT loss family acts."""
+    patch_start = cfg['loss_start_patch_dt']
+    track_start = (patch_start if cfg['loss_start_track_dt'] is None
+                   else cfg['loss_start_track_dt'])
+    return {
+        'verified_patch': patch_start,
+        'track': track_start,
+        'unattached_pcl': get_unattached_pcl_dt_start(cfg),
+    }
+
+
 def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
     """Return DT eligibility for every directional DT loss family."""
     run_eligible = (run_dt_resume_iteration is None
                     or iteration >= run_dt_resume_iteration)
-    patch_start = cfg['loss_start_patch_dt']
-    track_start = (patch_start if cfg['loss_start_track_dt'] is None
-                   else cfg['loss_start_track_dt'])
-    unattached_start = get_unattached_pcl_dt_start(cfg)
     return {
-        'verified_patch': run_eligible and iteration > patch_start,
-        'track': run_eligible and iteration > track_start,
-        'unattached_pcl': run_eligible and iteration > unattached_start,
+        family: run_eligible and iteration > start
+        for family, start in get_dt_loss_starts(cfg).items()
     }
 
 
@@ -5437,6 +5444,46 @@ class FitContext:
         threshold = float(self.config['optimizer_auto_steps_rel_threshold'])
         return window // _AUTO_STEPS_BLOCK, min_iterations, threshold
 
+    def _auto_steps_stage_starts(self):
+        """First iteration of each later stage of a staged fit: a directional
+        DT loss that acts (non-zero weight, inputs loaded) switching on at its
+        loss_start, or the start of a high-resolution flow LR ramp."""
+        cfg = self.config
+        acting = {
+            'verified_patch': (cfg['loss_weight_patch_dt'] > 0
+                               and bool(getattr(self, 'verified_patches_list', True))),
+            'unattached_pcl': (cfg['loss_weight_unattached_pcl_dt'] > 0
+                               and bool(getattr(self, 'unattached_pcl_strips', True))),
+            'track': (cfg['loss_weight_track_dt'] > 0
+                      and getattr(self, 'prepared_main_tracks', True) is not None),
+        }
+        starts = [start + 1 for family, start in get_dt_loss_starts(cfg).items()
+                  if acting[family]]
+        if (cfg['model_flow_field_high_res_lr_scale_initial']
+                != cfg['model_flow_field_high_res_lr_scale_final']):
+            starts.append(cfg['model_flow_field_high_res_lr_ramp_start_step'])
+        return auto_steps_stage_starts(
+            starts, start_iteration=self.start_iteration,
+            horizon=self.num_training_steps)
+
+    def _auto_steps_monitor(self):
+        """The automatic stop for this fit, None when off. Each stage of a
+        staged fit restarts it (see auto_steps.AutoStepsMonitor)."""
+        settings = self._auto_steps_settings()
+        if settings is None:
+            return None
+        window_blocks, min_iterations, threshold = settings
+        stage_starts = self._auto_steps_stage_starts()
+        monitor = AutoStepsMonitor(
+            window=window_blocks, block=_AUTO_STEPS_BLOCK,
+            min_iterations=min_iterations, rel_threshold=threshold,
+            stage_starts=stage_starts)
+        if stage_starts:
+            print(f'auto steps: staged fit, stages start at iterations '
+                  f'{", ".join(map(str, stage_starts))}; no stop before '
+                  f'{monitor.earliest_stop} iterations')
+        return monitor
+
     def run(self):
         """Drive one complete headless fit to the configured horizon, or to an
         automatic stop when optimizer_auto_steps is on.
@@ -5460,10 +5507,9 @@ class FitContext:
             'optimizing', 'Optimizing',
             step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
             unit='iterations')
-        auto_steps = self._auto_steps_settings()
-        window_blocks, min_iterations, threshold = auto_steps or (0, 0, 0.0)
+        auto_steps = self._auto_steps_monitor()
         completed_iterations = self.num_training_steps
-        loss_history, block_min = [], None
+        block_min = None
         for iteration in tqdm(
                 range(self.start_iteration, self.num_training_steps),
                 disable=not self.dist.is_main_process or has_progress):
@@ -5479,14 +5525,11 @@ class FitContext:
                 continue
             value = block_min.item()
             block_min = None
-            if math.isfinite(value):
-                loss_history.append(value)
-            if (iteration + 1 >= min_iterations
-                    and auto_steps_should_stop(loss_history, window=window_blocks, rel_threshold=threshold)):
+            if auto_steps.observe(iteration + 1, value):
                 completed_iterations = iteration + 1
                 print(f'auto steps: stopping after {completed_iterations} iterations; the best loss '
-                      f'of the last {window_blocks * _AUTO_STEPS_BLOCK} iterations is less than '
-                      f'{threshold:g} (relative) below the best before them')
+                      f'of the last {auto_steps.window * _AUTO_STEPS_BLOCK} iterations is less than '
+                      f'{auto_steps.rel_threshold:g} (relative) below the best before them')
                 break
 
         # ==========================================================================

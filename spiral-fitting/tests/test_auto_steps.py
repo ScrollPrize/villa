@@ -6,7 +6,7 @@ from auto_steps import auto_steps_relative_improvement, auto_steps_should_stop
 from config import Config
 from ddp_helpers import DistributedContext
 import fit_spiral
-from fit_spiral import FitContext
+from fit_spiral import FitContext, get_dt_loss_eligibility
 
 
 def test_no_decision_until_the_window_has_history_before_it():
@@ -40,10 +40,12 @@ def test_block_minima_give_the_same_decision_as_every_step():
                         == auto_steps_should_stop(per_step, window=window, rel_threshold=threshold))
 
 
-def _context(overrides, world_size=1):
+def _context(overrides, world_size=1, start_iteration=0):
     context = FitContext.__new__(FitContext)
     context.config = Config(overrides).as_dict()
     context.dist = DistributedContext(rank=0, world_size=world_size)
+    context.start_iteration = start_iteration
+    context.num_training_steps = context.config['optimizer_num_training_steps']
     return context
 
 
@@ -68,3 +70,56 @@ def test_window_must_be_a_whole_number_of_blocks():
 def test_multi_process_fits_run_to_the_horizon(capsys):
     assert _context({"optimizer_auto_steps": True}, world_size=2)._auto_steps_settings() is None
     assert "single-process fits only" in capsys.readouterr().out
+
+
+def test_default_fits_shorter_than_the_dt_start_are_single_stage():
+    # The DT losses start after 25,000 by default, so a 10,000-step fit has no
+    # stages and stops exactly as before.
+    context = _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 10_000})
+    assert context._auto_steps_stage_starts() == []
+    assert context._auto_steps_monitor().earliest_stop == 2000
+
+
+def test_staged_fit_waits_for_the_dt_stage():
+    # 30,000 steps with track DT switching on after 25,000, as in a staged recipe.
+    context = _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 30_000,
+                        "loss_start_track_dt": 25_000, "loss_weight_patch_dt": 0.0,
+                        "loss_weight_unattached_pcl_dt": 0.0})
+    assert context._auto_steps_stage_starts() == [25_001]
+    assert context._auto_steps_monitor().earliest_stop == 27_001
+
+
+def test_stage_starts_are_the_first_iteration_each_dt_loss_acts():
+    cfg = {"optimizer_num_training_steps": 30_000, "loss_start_patch_dt": 5000,
+           "loss_start_track_dt": 20_000, "loss_start_unattached_pcl_dt": None}
+    context = _context(cfg)
+    starts = context._auto_steps_stage_starts()
+    assert starts == [5001, 20_001]
+    for start, families in ((5001, ("verified_patch", "unattached_pcl")), (20_001, ("track",))):
+        before = get_dt_loss_eligibility(context.config, start - 1)
+        after = get_dt_loss_eligibility(context.config, start)
+        assert all(not before[f] and after[f] for f in families)
+
+
+def test_stage_starts_skip_dt_losses_that_do_not_act():
+    context = _context({"optimizer_num_training_steps": 30_000, "loss_start_patch_dt": 5000,
+                        "loss_start_track_dt": 20_000, "loss_weight_track_dt": 0.0})
+    assert context._auto_steps_stage_starts() == [5001]
+    context = _context({"optimizer_num_training_steps": 30_000, "loss_start_patch_dt": 5000,
+                        "loss_start_track_dt": 20_000})
+    context.verified_patches_list, context.unattached_pcl_strips = [], []
+    context.prepared_main_tracks = None
+    assert context._auto_steps_stage_starts() == []
+    context = _context({"optimizer_num_training_steps": 30_000, "loss_start_patch_dt": 5000,
+                        "loss_start_track_dt": 20_000}, start_iteration=10_000)
+    assert context._auto_steps_stage_starts() == [20_001]
+
+
+def test_stage_starts_include_a_later_high_res_lr_ramp():
+    context = _context({"optimizer_num_training_steps": 10_000,
+                        "model_flow_field_high_res_lr_scale_final": 1.0,
+                        "model_flow_field_high_res_lr_ramp_start_step": 8000})
+    assert context._auto_steps_stage_starts() == [8000]
+    context = _context({"optimizer_num_training_steps": 10_000,
+                        "model_flow_field_high_res_lr_ramp_start_step": 8000})
+    assert context._auto_steps_stage_starts() == []
