@@ -153,11 +153,15 @@ std::string ArrayMeta::codec() const
         }
         codec = it->second;
     }
-    if (!filters.is_null() && !filters.empty())
-        throw std::invalid_argument("vc_reader cannot read arrays with numcodecs filters");
+    bool packbits = false;
+    if (!filters.is_null() && !filters.empty()) {
+        packbits = filters.size() == 1 && filters[0].value("id", std::string()) == "packbits" && type.kind == 'b';
+        if (!packbits)
+            throw std::invalid_argument("vc_reader cannot read arrays with these numcodecs filters: " + filters.dump());
+    }
     if (order != "C")
         throw std::invalid_argument("vc_reader cannot read arrays stored in Fortran order");
-    return codec;
+    return packbits ? "packbits+" + codec : codec;
 }
 
 Json ArrayMeta::decodedZarray() const

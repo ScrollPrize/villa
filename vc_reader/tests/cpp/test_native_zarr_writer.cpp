@@ -558,6 +558,72 @@ static void pyramidReductions(const fs::path& root)
         throw std::runtime_error("nearest multiscales declare no translation");
 }
 
+// Bool arrays stored as bits: numcodecs' layout, unsharded and sharded, and in front of a compressor.
+static void packbitsFilter(const fs::path& root)
+{
+    std::vector<uint8_t> data(2 * 5 * 3);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] = i % 3 == 0 || i % 7 == 2;
+    for (const std::string compressor : {"none", "blosc"}) {
+        for (const int version : {2, 3}) {
+            for (const bool sharded : {false, true}) {
+                if (sharded && version == 2)
+                    continue;
+                vcr::zarr::CreateOptions options;
+                options.shape = {2, 5, 3};
+                options.chunks = {1, 5, 3};
+                options.dtype = "|b1";
+                options.fillValue = false;
+                options.compressor = compressor;
+                options.cname = "zstd";
+                options.version = version;
+                options.separator = "/";
+                options.packbits = true;
+                if (sharded)
+                    options.shardShape = {2, 5, 3};
+                const auto path = root / "packbits" / (compressor + std::to_string(version) + (sharded ? "s" : ""));
+                auto writer = vcr::zarr::Writer::create(path, options);
+                writer.writeRegion({0, 0, 0}, {2, 5, 3}, data.data());
+                require(read(writer.reader(), {0, 0, 0}, {2, 5, 3}, 1) == data, "packbits round trip");
+                vcr::zarr::OpenOptions open;
+                auto opened = vcr::zarr::openArray(path, open);
+                require(read(*opened.array, {0, 0, 0}, {2, 5, 3}, 1) == data, "packbits read through a new array");
+                auto like = vcr::zarr::createOptionsLike(writer.meta());
+                require(like.packbits, "createOptionsLike keeps packbits");
+                if (compressor == "none" && !sharded) {
+                    // 15 bits: one byte of padding count (1), then two bytes, first element in the high bit.
+                    std::ifstream in(path / (version == 3 ? "c/0/0/0" : "0/0/0"), std::ios::binary);
+                    std::vector<char> stored{std::istreambuf_iterator<char>(in), {}};
+                    require(stored.size() == 3 && stored[0] == 1, "packbits layout");
+                    require(uint8_t(stored[1]) >> 7 == data[0] && (uint8_t(stored[1]) >> 6 & 1) == data[1], "packbits bit order");
+                }
+            }
+        }
+    }
+    vcr::zarr::CreateOptions wrong;
+    wrong.shape = wrong.chunks = {4};
+    wrong.dtype = "|u1";
+    wrong.packbits = true;
+    must_fail([&] { vcr::zarr::Writer::create(root / "packbits" / "u8", wrong); }, "packbits on uint8");
+}
+
+static void bytesCodecs()
+{
+    std::vector<uint8_t> data(4096);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] = uint8_t(i / 16);
+    for (const Json& compressor : {Json(nullptr), Json{{"id", "blosc"}, {"cname", "zstd"}, {"clevel", 1}, {"shuffle", 1}},
+                                   Json{{"id", "zstd"}, {"level", 3}}, Json{{"id", "gzip"}, {"level", 1}}, Json{{"id", "lz4"}}}) {
+        const auto encoded = vcr::zarr::compressBytes(compressor, data, 8);
+        std::vector<uint8_t> decoded(data.size());
+        vcr::zarr::decompressBytes(compressor, encoded, decoded);
+        require(decoded == data, "bytes round trip " + compressor.dump());
+        std::vector<uint8_t> small(data.size() - 1);
+        must_fail([&] { vcr::zarr::decompressBytes(compressor, encoded, small); }, "wrong decoded size " + compressor.dump());
+    }
+    must_fail([&] { vcr::zarr::compressBytes(Json{{"id", "nonsense"}}, data); }, "unknown compressor");
+}
+
 static void generalOptions(const fs::path& root)
 {
     using namespace vcr::zarr;
@@ -617,6 +683,8 @@ int main()
         fs::create_directories(root);
         generalOptions(root);
         pyramidReductions(root);
+        packbitsFilter(root);
+        bytesCodecs();
         for (int version : {2, 3}) {
             const auto dir = root / std::to_string(version);
             codecs(dir, version);

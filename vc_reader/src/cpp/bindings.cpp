@@ -396,11 +396,32 @@ NB_MODULE(_reader, m)
 
     using vcr::zarr::Writer;
     using ConstBytes = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+    m.def("compress_bytes", [](ConstBytes data, const nb::object& compressor, std::size_t itemsize, const vcr::Index& shape) {
+        const auto config = to_json(compressor);
+        std::vector<std::uint8_t> encoded;
+        {
+            nb::gil_scoped_release release;
+            encoded = vcr::zarr::compressBytes(config, {static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, itemsize, shape);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    }, "data"_a, "compressor"_a.none(), "itemsize"_a, "shape"_a);
+    m.def("decompress_bytes", [](ConstBytes data, const nb::object& compressor, std::size_t size) {
+        const auto config = to_json(compressor);
+        auto decoded = nb::steal<nb::bytes>(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size)));
+        if (!decoded.is_valid())
+            throw nb::python_error();
+        auto* out = reinterpret_cast<std::uint8_t*>(PyBytes_AS_STRING(decoded.ptr()));
+        {
+            nb::gil_scoped_release release;
+            vcr::zarr::decompressBytes(config, {static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, {out, size});
+        }
+        return decoded;
+    }, "data"_a, "compressor"_a.none(), "size"_a);
     nb::class_<Writer>(m, "Writer", "A Zarr array, local or on S3, opened for writing.")
         .def_static("create", [](const std::string& path, const vcr::Index& shape, const vcr::Index& chunks,
                                  const std::string& dtype, const std::string& compressor, int level, const std::string& cname,
                                  int shuffle, bool overwrite, const std::string& separator, const nb::object& fill, int version,
-                                 const vcr::Index& shards, const vcr::zarr::Access& access) {
+                                 const vcr::Index& shards, bool packbits, const vcr::zarr::Access& access) {
             vcr::zarr::CreateOptions options;
             options.shape = shape;
             options.chunks = chunks;
@@ -414,10 +435,11 @@ NB_MODULE(_reader, m)
             options.fillValue = to_json(fill);
             options.version = version;
             options.shardShape = shards;
+            options.packbits = packbits;
             nb::gil_scoped_release release;
             return Writer::create(path, options, access);
         }, "path"_a, "shape"_a, "chunks"_a, "dtype"_a, "compressor"_a, "level"_a, "cname"_a, "shuffle"_a, "overwrite"_a,
-           "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "access"_a)
+           "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "packbits"_a, "access"_a)
         .def_static("create_like", [](const std::string& path, const ArrayMeta& like, const std::optional<vcr::Index>& shape,
                                       const std::optional<vcr::Index>& chunks, const std::optional<std::string>& dtype,
                                       const nb::object& fill, const std::optional<std::string>& separator, bool overwrite,
@@ -425,7 +447,10 @@ NB_MODULE(_reader, m)
             auto options = vcr::zarr::createOptionsLike(like);
             if (shape) options.shape = *shape;
             if (chunks) options.chunks = *chunks;
-            if (dtype) options.dtype = *dtype;
+            if (dtype) {
+                options.dtype = *dtype;
+                options.packbits = options.packbits && *dtype == "|b1";
+            }
             if (!fill.is_none()) options.fillValue = to_json(fill);
             if (separator) options.separator = *separator;
             options.overwrite = overwrite;

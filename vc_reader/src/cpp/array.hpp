@@ -328,8 +328,8 @@ public:
                 chunk_shift_[i] = std::countr_zero(c);
         }
         for (auto& l : spec_.layers)
-            codecs_.push_back(parse_codec(l.codec));
-        remote_codec_ = parse_codec(spec_.remote_codec);
+            codecs_.push_back(parse_chunk_codec(l.codec));
+        remote_codec_ = parse_chunk_codec(spec_.remote_codec);
         if (!spec_.remote_url.empty() && !spec_.offline)
             http_ = std::make_unique<HttpClient>(spec_.http);
         if (!spec_.source_root.empty() && !spec_.offline)
@@ -1841,8 +1841,8 @@ private:
     ThreadPool pool_;
     MapCache maps_;
     std::unique_ptr<HttpClient> http_;
-    std::vector<Codec> codecs_;
-    Codec remote_codec_ = Codec::Raw;
+    std::vector<ChunkCodec> codecs_;
+    ChunkCodec remote_codec_;
     Index chunk_strides_, grid_;
     std::vector<int> chunk_shift_;
     std::size_t chunk_bytes_ = 0;

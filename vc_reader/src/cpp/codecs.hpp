@@ -1,5 +1,6 @@
 // Chunk codecs implemented in C++: raw, blosc, zstd, zlib/gzip, LZ4, LZW, vc-delta3d and volcomp.
-// Every codec but LZW also encodes (Zarr writes and disk caches).
+// Every codec but LZW also encodes (Zarr writes and disk caches). The packbits filter goes
+// in front of any of them.
 #pragma once
 
 #include "lzw.hpp"
@@ -21,6 +22,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vcr {
@@ -271,6 +273,63 @@ inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, con
     }
     }
     throw std::invalid_argument("unknown codec");
+}
+
+// How an array's chunks are stored: a compressor, optionally over bool elements packed to
+// bits. Compares equal to a plain Codec only when nothing is packed.
+struct ChunkCodec {
+    Codec compressor = Codec::Raw;
+    bool packbits = false;
+
+    bool operator==(Codec other) const { return !packbits && compressor == other; }
+};
+
+inline ChunkCodec parse_chunk_codec(const std::string& id)
+{
+    constexpr std::string_view packed = "packbits+";
+    if (id.starts_with(packed))
+        return {parse_codec(id.substr(packed.size())), true};
+    return {parse_codec(id), false};
+}
+
+// Numcodecs PackBits: one byte holding the padding bit count, then the bits, first element
+// in the high bit.
+inline std::size_t packed_size(std::size_t elements) { return (elements + 7) / 8 + 1; }
+
+inline void unpack_bits(const std::uint8_t* packed, std::uint8_t* dst, std::size_t elements)
+{
+    if (packed[0] != (8 - elements % 8) % 8)
+        throw std::runtime_error("packbits chunk has the wrong padding");
+    for (std::size_t i = 0; i < elements; ++i)
+        dst[i] = (packed[1 + i / 8] >> (7 - i % 8)) & 1;
+}
+
+inline std::vector<std::uint8_t> pack_bits(const std::uint8_t* src, std::size_t elements)
+{
+    std::vector<std::uint8_t> packed(packed_size(elements), 0);
+    packed[0] = std::uint8_t((8 - elements % 8) % 8);
+    for (std::size_t i = 0; i < elements; ++i)
+        if (src[i])
+            packed[1 + i / 8] |= std::uint8_t(0x80 >> (i % 8));
+    return packed;
+}
+
+inline void decode(const ChunkCodec& codec, const std::uint8_t* src, std::size_t n, std::uint8_t* dst, std::size_t dst_n)
+{
+    if (!codec.packbits)
+        return decode(codec.compressor, src, n, dst, dst_n);
+    std::vector<std::uint8_t> packed(packed_size(dst_n));
+    decode(codec.compressor, src, n, packed.data(), packed.size());
+    unpack_bits(packed.data(), dst, dst_n);
+}
+
+inline std::vector<std::uint8_t> encode(const ChunkCodec& codec, const EncodeOptions& o, const std::uint8_t* src, std::size_t n,
+                                        std::size_t itemsize, const std::vector<std::int64_t>& shape)
+{
+    if (!codec.packbits)
+        return encode(codec.compressor, o, src, n, itemsize, shape);
+    const auto packed = pack_bits(src, n);
+    return encode(codec.compressor, o, packed.data(), packed.size(), 1, {std::int64_t(packed.size())});
 }
 
 }  // namespace vcr

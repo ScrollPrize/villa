@@ -77,6 +77,11 @@ std::string normalizeZarrMetadata(const std::string& text)
         if (shape[i] < 0 || chunks[i] <= 0)
             throw std::invalid_argument("invalid Zarr dimensions");
     }
+    Json filters = nullptr;
+    if (!codecs.empty() && codecs[0].at("name") == "numcodecs.packbits") {
+        filters = Json::array({{{"id", "packbits"}}});
+        codecs.erase(codecs.begin());
+    }
     // v3 compressor names -> v2 compressor ids.
     const auto& compressors = zarr::detail::v3Compressors;
     if (codecs.empty() || codecs.size() > 2 || codecs[0].at("name") != "bytes" ||
@@ -100,7 +105,7 @@ std::string normalizeZarrMetadata(const std::string& text)
     }
     return Json{
         {"zarr_format", 2}, {"shape", shape}, {"chunks", chunks}, {"dtype", dtype},
-        {"fill_value", d.at("fill_value")}, {"compressor", compressor}, {"filters", nullptr},
+        {"fill_value", d.at("fill_value")}, {"compressor", compressor}, {"filters", filters},
         {"order", "C"}, {"dimension_separator", sep},
         {"_vc_reader_v3", {{"metadata", d}, {"prefix", keyName == "default" ? "c" + sep : ""},
             {"shard_chunks", ratios}, {"index_end", indexEnd}, {"index_crc", indexCrc}}}}.dump();

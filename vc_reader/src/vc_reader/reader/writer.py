@@ -26,6 +26,18 @@ def _write_access(location: str, auth: Any):
     return resolve_access(location, "aws" if auth == "auto" else auth)
 
 
+def compress_bytes(data: Any, compressor: dict[str, Any] | None, *, itemsize: int = 1, shape: Sequence[int] = ()) -> bytes:
+    """``data``, any contiguous buffer, encoded by a numcodecs compressor config, such as ``{"id": "blosc", "cname": "zstd", "clevel": 1,
+    "shuffle": 1}``, as elements of ``itemsize`` bytes. ``shape`` is only read by vc-delta3d and volcomp.
+    """
+    return _reader.compress_bytes(np.frombuffer(data, np.uint8), compressor, int(itemsize), [int(n) for n in shape])
+
+
+def decompress_bytes(data: Any, compressor: dict[str, Any] | None, size: int) -> bytes:
+    """The reverse of :func:`compress_bytes`, decoding to exactly ``size`` bytes."""
+    return _reader.decompress_bytes(np.frombuffer(data, np.uint8), compressor, int(size))
+
+
 class ObjectStore:
     """The objects below a local directory or an ``s3://`` prefix, by relative name.
 
@@ -145,6 +157,7 @@ class ZarrWriter:
         fill_value: Any = 0,
         version: int = 2,
         shards: Sequence[int] | None = None,
+        packbits: bool = False,
         overwrite: bool = False,
         skip_empty: bool = False,
         auth: Any = "aws",
@@ -152,14 +165,15 @@ class ZarrWriter:
         """Create an array. ``compressor``: None, blosc, zstd, zlib, gzip, lz4, vc-delta3d or volcomp;
         ``cname`` and ``shuffle`` (0 none, 1 byte, 2 bit) configure blosc. ``level`` <= 0 is the codec's
         default. ``overwrite`` replaces whatever is at the path. ``skip_empty`` does not store chunks that
-        come out entirely ``fill_value``. ``shards`` is a v3 array's outer shape in elements.
+        come out entirely ``fill_value``. ``shards`` is a v3 array's outer shape in elements. ``packbits``
+        stores a bool array's elements as bits, in front of the compressor.
         """
         path = os.fspath(path)
         access = _write_access(path, auth)
         native = _reader.Writer.create(
             path, [int(n) for n in shape], [int(n) for n in chunks], np.dtype(dtype).str,
             compressor or "none", int(level), cname, int(shuffle), bool(overwrite), separator,
-            _plain(fill_value), int(version), [int(n) for n in shards or ()], access)
+            _plain(fill_value), int(version), [int(n) for n in shards or ()], bool(packbits), access)
         return cls(native, skip_empty, access)
 
     @classmethod
@@ -177,8 +191,8 @@ class ZarrWriter:
         skip_empty: bool = False,
         auth: Any = "aws",
     ) -> ZarrWriter:
-        """An array like ``source``: its shape, chunks, dtype, codec, separator, fill, format and
-        shards, except for what is given here. Filters and attributes are not kept.
+        """An array like ``source``: its shape, chunks, dtype, codec, separator, fill, format, shards
+        and packbits, except for what is given here. Attributes are not kept.
         """
         path = os.fspath(path)
         access = _write_access(path, auth)

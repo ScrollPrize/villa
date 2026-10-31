@@ -3,7 +3,9 @@
 
 #include "vc_reader/zarr.hpp"
 
+#include <span>
 #include <string_view>
+#include <vector>
 
 namespace vcr::zarr {
 
@@ -45,6 +47,15 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ---- codecs on plain bytes -------------------------------------------------------------
+
+// `data` encoded by a numcodecs compressor config ({"id": "blosc", "cname": ...}; null copies),
+// as a chunk of `itemsize`-byte elements. `shape` is only read by vc-delta3d and volcomp.
+std::vector<std::uint8_t> compressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::size_t itemsize = 1,
+                                        const Index& shape = {});
+// The reverse, into exactly `out.size()` bytes; throws on any other decoded size.
+void decompressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::span<std::uint8_t> out);
+
 // ---- writing --------------------------------------------------------------------------
 
 struct CreateOptions {
@@ -62,10 +73,11 @@ struct CreateOptions {
     int version = 2;               // Zarr format 2 or 3
     Index shardShape;               // v3 outer shape in elements; empty: unsharded
     bool shardIndexEnd = true, shardIndexCrc = true;
+    bool packbits = false;          // bool only: elements stored as bits, before the compressor
 };
 
 // What creates an array like `meta`: its shape, chunks, dtype, codec, separator, fill,
-// format and shards. Filters are not kept: Writer stores none.
+// format, shards and packbits. Packbits is the only filter Writer stores.
 CreateOptions createOptionsLike(const ArrayMeta& meta);
 
 // A Zarr v2/v3 array, in a local directory or at an s3:// location, opened for writing.

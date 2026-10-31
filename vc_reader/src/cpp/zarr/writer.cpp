@@ -70,6 +70,8 @@ Json v3Metadata(const ArrayMeta& meta, const CreateOptions& options)
         throw std::invalid_argument("unsupported Zarr v3 dtype " + meta.dtype);
     Json codecs = Json::array({{{"name", "bytes"},
                                {"configuration", {{"endian", meta.dtype[0] == '>' ? "big" : "little"}}}}});
+    if (options.packbits)
+        codecs.insert(codecs.begin(), Json{{"name", "numcodecs.packbits"}, {"configuration", Json::object()}});
     if (!meta.compressor.is_null()) {
         const auto id = meta.compressor.at("id").get<std::string>();
         auto config = meta.compressor;
@@ -160,7 +162,7 @@ struct Writer::Impl {
     fs::path path;
     std::optional<Store> store;
     ArrayMeta meta;
-    Codec codec = Codec::Raw;
+    ChunkCodec codec;
     EncodeOptions encode;
     std::unique_ptr<Array> reader;
     std::unique_ptr<ShardLayout> shards;
@@ -254,6 +256,19 @@ struct Writer::Impl {
     }
 };
 
+std::vector<std::uint8_t> compressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::size_t itemsize, const Index& shape)
+{
+    const auto codec = parse_codec(compressor.is_null() ? std::string() : compressor.at("id").get<std::string>());
+    return encode(codec, encodeOptions(compressor), data.data(), data.size(), itemsize,
+                  shape.empty() ? Index{std::int64_t(data.size() / itemsize)} : shape);
+}
+
+void decompressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::span<std::uint8_t> out)
+{
+    const auto codec = parse_codec(compressor.is_null() ? std::string() : compressor.at("id").get<std::string>());
+    decode(codec, data.data(), data.size(), out.data(), out.size());
+}
+
 CreateOptions createOptionsLike(const ArrayMeta& meta)
 {
     CreateOptions options;
@@ -263,6 +278,7 @@ CreateOptions createOptionsLike(const ArrayMeta& meta)
     options.separator = meta.separator;
     options.fillValue = meta.raw.value("fill_value", Json(0));
     options.compressor = meta.compressor.is_null() ? "none" : meta.compressor.at("id").get<std::string>();
+    options.packbits = !meta.filters.is_null() && !meta.filters.empty();
     if (!meta.compressor.is_null()) {
         const auto encode = encodeOptions(meta.compressor);
         options.level = options.compressor == "volcomp" ? int(encode.q) : encode.level;
@@ -308,11 +324,11 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
                 {"dtype", options.dtype},
                 {"compressor", compressorConfig(options)},
                 {"fill_value", options.fillValue},
-                {"filters", nullptr},
+                {"filters", options.packbits ? Json::array({{{"id", "packbits"}}}) : Json(nullptr)},
                 {"order", "C"},
                 {"dimension_separator", options.separator}};
     auto meta = parseArrayMeta(zarray);  // validates before anything is written
-    const auto codec = parse_codec(meta.codec());
+    const auto codec = parse_chunk_codec(meta.codec());
     if (codec == Codec::Volcomp && (meta.itemsize() != 1 || meta.chunks != Index{128, 128, 128}))
         throw std::invalid_argument("volcomp requires uint8 data and 128^3 chunks");
     if (codec == Codec::Delta3d && (meta.chunks.size() != 3 || meta.type.kind != 'u' || meta.itemsize() > 2))
@@ -350,7 +366,7 @@ Writer Writer::open(const fs::path& path, const Access& access)
         if (!impl->store->remote())
             impl->canonicalPath = fs::canonical(path);
     }
-    impl->codec = parse_codec(impl->meta.codec());
+    impl->codec = parse_chunk_codec(impl->meta.codec());
     impl->encode = encodeOptions(impl->meta.compressor);
     OpenOptions options;
     options.access = access;

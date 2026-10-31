@@ -134,3 +134,44 @@ def test_float16_arrays_round_trip_with_zarr(tmp_path):
     reader = open_zarr(tmp_path / "a")
     assert reader.dtype == np.float16
     np.testing.assert_array_equal(reader[...], data)
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_packbits_reads_and_writes_match_zarr(tmp_path, version):
+    from zarr.codecs import BloscCodec, BloscShuffle, PackBits
+
+    data = np.random.default_rng(0).random((4, 5, 3)) > 0.5
+    w = ZarrWriter.create(tmp_path / "ours", shape=data.shape, chunks=(1, 5, 3), dtype=bool, packbits=True, cname="zstd",
+                          level=1, fill_value=False, version=version, separator="/",
+                          shards=(2, 5, 3) if version == 3 else None)
+    w[:] = data
+    np.testing.assert_array_equal(open_zarr(tmp_path / "ours")[:], data)
+    assert np.asarray(zarr.open_array(tmp_path / "ours", mode="r")[:]).tolist() == data.tolist()
+    like = ZarrWriter.create_like(tmp_path / "like", w)
+    like[:] = data
+    np.testing.assert_array_equal(open_zarr(tmp_path / "like")[:], data)
+    if version == 3:
+        theirs = zarr.create_array(tmp_path / "theirs", shape=data.shape, chunks=(1, 5, 3), shards=(2, 5, 3), dtype="bool",
+                                   filters=[PackBits()], compressors=[BloscCodec(cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)])
+        theirs[:] = data
+        np.testing.assert_array_equal(open_zarr(tmp_path / "theirs")[:], data)
+        np.testing.assert_array_equal(open_zarr(tmp_path / "theirs")[2, 1:3], data[2, 1:3])
+        again = ZarrWriter.open(tmp_path / "theirs")
+        again[0, 0, 0] = not data[0, 0, 0]
+        assert bool(zarr.open_array(tmp_path / "theirs", mode="r")[0, 0, 0]) != bool(data[0, 0, 0])
+
+
+def test_bytes_codecs_match_numcodecs():
+    from numcodecs import Blosc
+
+    from vc_reader.reader import compress_bytes, decompress_bytes
+
+    records = np.arange(4096, dtype=np.uint64)
+    config = {"id": "blosc", "cname": "zstd", "clevel": 1, "shuffle": 1}
+    encoded = compress_bytes(records.tobytes(), config, itemsize=8)
+    theirs = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
+    assert np.frombuffer(theirs.decode(encoded), np.uint64).tolist() == records.tolist()
+    decoded = decompress_bytes(theirs.encode(records), config, records.nbytes)
+    assert np.frombuffer(decoded, np.uint64).tolist() == records.tolist()
+    with pytest.raises(RuntimeError):
+        decompress_bytes(encoded, config, records.nbytes - 1)
