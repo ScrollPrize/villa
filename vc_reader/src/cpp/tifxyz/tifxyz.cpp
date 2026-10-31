@@ -120,7 +120,7 @@ Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, s
     valid_.resize(cells);
     for (std::size_t i = 0; i < cells; ++i) {
         float* p = xyz_.data() + i * 3;
-        const bool present = p[0] >= 0 && p[1] >= 0 && p[2] >= 0 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) && (mask.empty() || mask[i]);
+        const bool present = vertexPresent(p) && (mask.empty() || mask[i]);
         valid_[i] = present;
         if (!present) p[0] = p[1] = p[2] = -1.f;
     }

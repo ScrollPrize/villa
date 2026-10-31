@@ -6,6 +6,7 @@
 #include "vc_reader/source_reader.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -35,11 +36,17 @@ struct Metadata {
 // Whether a stored bounding box holds tifxyz's -1 missing-point marker, so is not a real extent.
 [[nodiscard]] bool hasMissingMarker(const Bounds& bbox);
 
+// Whether stored XYZ coordinates are a real vertex: all finite and nonnegative. A negative
+// coordinate marks the vertex invalid, whatever its value.
+[[nodiscard]] inline bool vertexPresent(const float* xyz)
+{
+    return xyz[0] >= 0 && xyz[1] >= 0 && xyz[2] >= 0 && std::isfinite(xyz[0]) && std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
+}
+
 class Surface {
 public:
-    // `xyz` holds rows x cols x 3 XYZ floats. A vertex is present when all three coordinates
-    // are finite and nonnegative and `mask` (nonzero; may be empty) allows it; all three
-    // coordinates of any other are set to -1.
+    // `xyz` holds rows x cols x 3 XYZ floats. A vertex is present when vertexPresent says so and
+    // `mask` (nonzero; may be empty) allows it; all three coordinates of any other are set to -1.
     Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location = {});
 
     [[nodiscard]] std::int64_t rows() const { return rows_; }
@@ -86,8 +93,8 @@ private:
 // A whole surface. Without `useMask`, mask.tif is ignored. A stored bounding box with a missing-point marker becomes the real extent.
 [[nodiscard]] Surface read(const std::string& location, bool useMask = true, const sources::OptionsFor& options = {});
 
-// The grid as stored, rows x cols x 3 XYZ floats, for callers applying their own rule to which
-// vertices count. `window` (row, column, rows, columns), inside the grid, decodes only the strips
+// The grid as stored, rows x cols x 3 XYZ floats, nothing marked missing: for callers holding the
+// vertices in their own containers (vertexPresent says which count). `window` (row, column, rows, columns), inside the grid, decodes only the strips
 // and tiles it touches.
 struct Coordinates {
     std::int64_t rows = 0, cols = 0;  // of what was read

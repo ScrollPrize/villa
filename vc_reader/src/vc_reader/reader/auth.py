@@ -2,9 +2,12 @@
 
 ``auth`` (of :meth:`ZarrReader.open` and :meth:`ZarrGroup.open`) is one of:
 
-* ``"auto"`` (the default): ``s3://`` URLs of buckets without a known public
-  https form are signed with AWS credentials from the environment, as with
-  ``"aws"``, when there are any. Everything else is read anonymously.
+Open data locations are read anonymously under ``"auto"`` and ``"aws"``, whatever
+keys the environment holds.
+
+* ``"auto"`` (the default): other ``s3://`` URLs are signed with AWS credentials
+  from the environment, as with ``"aws"``, when there are any. Everything else
+  is read anonymously.
 * ``None``: anonymous.
 * ``"aws"``: AWS credentials from the environment:
   ``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY``/``AWS_SESSION_TOKEN``, then

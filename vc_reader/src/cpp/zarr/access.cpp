@@ -354,12 +354,13 @@ std::vector<s3::Object> listObjects(const Access& access, const std::string& loc
 Access resolveAccess(const std::string& location, AuthMode mode, bool offline)
 {
     const bool s3 = location.starts_with("s3://");
-    if (!isRemote(location) || mode == AuthMode::Anonymous)
+    // Open data is never signed, whatever keys the environment holds.
+    if (!isRemote(location) || mode == AuthMode::Anonymous || isPublicLocation(location))
         return {};
     // Cached reads need neither signing credentials nor a bucket region.
     if (offline && s3)
         return {};
-    if (mode == AuthMode::Auto && (!s3 || isPublicLocation(location)))
+    if (mode == AuthMode::Auto && !s3)
         return {};
     if (!s3)
         throw std::invalid_argument("AWS credentials need an s3:// URL, not '" + location + "'");
