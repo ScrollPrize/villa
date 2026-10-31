@@ -230,6 +230,49 @@ class SmearTransform(ImageOnlyTransform):
         return {}
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
+        # float32 CPU images use a compiled kernel with identical results; anything
+        # else (other dtypes, GPU, numba unavailable) uses the torch implementation.
+        if img.dtype == torch.float32 and img.device.type == "cpu" and img.ndim >= 3:
+            try:
+                from vesuvius.models.augmentation.transforms.noise._smear_kernel import smear_inplace
+            except (ImportError, RuntimeError):  # RuntimeError: numba has no writable cache location
+                smear_inplace = None
+            if smear_inplace is not None:
+                return self._apply_compiled(img, smear_inplace)
+        return self._apply_torch(img)
+
+    def _apply_compiled(self, img: torch.Tensor, smear_inplace) -> torch.Tensor:
+        num_spatial_dims = img.ndim - 1
+        if not (1 <= self.smear_axis <= num_spatial_dims):
+            raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
+        axis = self.smear_axis - 1
+        k = self.num_prev_slices
+        shift0 = self.shift[0] if len(self.shift) >= 1 else 0
+        shift1 = self.shift[1] if len(self.shift) >= 2 else 0
+        keep = np.float32(1 - self.alpha)
+        blend = np.float32(self.alpha)
+        k_float = np.float32(k)
+        out = img.clone()
+        for ch in range(img.shape[0]):
+            chan = out[ch]
+            if chan.shape[axis] <= k:
+                continue
+            others = [d for d in range(chan.ndim) if d != axis]
+            moved = np.ascontiguousarray(chan.permute(axis, *others).numpy())
+            if moved.ndim == 2:
+                # 1D slices are rolled along their only axis; the second shift does not apply
+                b_size, r_size, shift1_used = 1, 1, 0
+                flat = moved.reshape(moved.shape[0], moved.shape[1], 1)
+            else:
+                b_size = moved.shape[2]
+                r_size = int(np.prod(moved.shape[3:], dtype=np.int64))
+                shift1_used = shift1
+                flat = moved.reshape(moved.shape[0], moved.shape[1], -1)
+            smear_inplace(flat, b_size, r_size, k, int(shift0), int(shift1_used), keep, blend, k_float)
+            chan.copy_(torch.from_numpy(moved).movedim(0, axis))
+        return out
+
+    def _apply_torch(self, img: torch.Tensor) -> torch.Tensor:
         # Pure torch implementation; runs on CPU or GPU depending on img.device
         C = img.shape[0]
         spatial_shape = img.shape[1:]
