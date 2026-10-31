@@ -131,6 +131,11 @@ class ZarrGroup:
         """
         return tuple(self._group.levels())
 
+    def placement(self, path: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Where the level at ``path`` sits: ``level0 = scale * index + offset``, ``(scale, offset)`` in ZYX."""
+        scale, offset = self._group.placement(path)
+        return tuple(scale), tuple(offset)
+
     def level(self, index: int) -> ZarrReader:
         """The array of pyramid level ``index`` (a position in :attr:`levels`; negative counts from the coarsest)."""
         levels = self.levels

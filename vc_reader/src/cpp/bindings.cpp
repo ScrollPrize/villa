@@ -1,6 +1,8 @@
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
 #include "cuda_available.hpp"
+#include "vc_reader/composite.hpp"
+#include "vc_reader/computed.hpp"
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
@@ -18,7 +20,9 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/array.h>
 
+#include <cstring>
 #include <functional>
+#include <map>
 #include <numeric>
 
 namespace nb = nanobind;
@@ -345,6 +349,76 @@ NB_MODULE(_reader, m)
        "metadata"_a.none() = nb::none(), "attributes"_a.none() = nb::none());
 
     using vcr::zarr::Group;
+    m.def("composite_reduce", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> values, const std::string& method,
+                                 float iso_cutoff, float alpha_min, float alpha_max, float alpha_opacity, float alpha_cutoff,
+                                 float extinction, float emission, float ambient, nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> out) {
+        namespace composite = vcr::composite;
+        static const std::map<std::string, composite::Method> methods{
+            {"mean", composite::Method::Mean}, {"max", composite::Method::Max}, {"min", composite::Method::Min},
+            {"median", composite::Method::Median}, {"min_abs", composite::Method::MinAbs},
+            {"alpha", composite::Method::Alpha}, {"beer_lambert", composite::Method::BeerLambert}};
+        const auto found = methods.find(method);
+        if (found == methods.end())
+            throw nb::value_error(("unknown composite method '" + method + "'").c_str());
+        if (out.shape(0) != values.shape(1))
+            throw nb::value_error("composite output does not match the values");
+        composite::Options options;
+        options.method = found->second;
+        options.isoCutoff = iso_cutoff;
+        options.alphaMin = alpha_min;
+        options.alphaMax = alpha_max;
+        options.alphaOpacity = alpha_opacity;
+        options.alphaCutoff = alpha_cutoff;
+        options.extinction = extinction;
+        options.emission = emission;
+        options.ambient = ambient;
+        nb::gil_scoped_release release;
+        composite::reduce(values.data(), values.shape(0), values.shape(1), options, out.data());
+    }, "values"_a, "method"_a, "iso_cutoff"_a, "alpha_min"_a, "alpha_max"_a, "alpha_opacity"_a, "alpha_cutoff"_a,
+       "extinction"_a, "emission"_a, "ambient"_a, "out"_a);
+    m.def("open_computed", [](const std::vector<std::int64_t>& shape, const std::vector<std::int64_t>& chunks, const std::string& dtype,
+                              nb::object fill_value, const std::string& identity, nb::callable compute,
+                              std::optional<std::string> cache_dir, std::optional<std::int64_t> cache_max_bytes, bool compress_cache,
+                              std::shared_ptr<vcr::MemoryCache> memory_cache, std::size_t threads) {
+        vcr::computed::Options options;
+        options.shape = shape;
+        options.chunks = chunks;
+        options.dtype = dtype;
+        options.fillValue = to_json(fill_value);
+        options.identity = identity;
+        if (cache_dir)
+            options.cacheDir = *cache_dir;
+        options.cacheMaxBytes = cache_max_bytes;
+        options.compressCache = compress_cache;
+        options.memoryCache = std::move(memory_cache);
+        options.threads = threads;
+        OpenedArray opened;
+        opened.location = "computed:" + identity;
+        opened.meta = vcr::zarr::parseArrayMeta({{"zarr_format", 2}, {"shape", shape}, {"chunks", chunks}, {"dtype", dtype},
+            {"compressor", nullptr}, {"filters", nullptr}, {"order", "C"}, {"fill_value", options.fillValue}, {"dimension_separator", "/"}});
+        const std::size_t bytes = opened.meta.chunkBytes();
+        // The callback outlives this call inside the array; the GIL guards its reference count.
+        auto held = std::shared_ptr<nb::callable>(new nb::callable(std::move(compute)), [](nb::callable* c) {
+            nb::gil_scoped_acquire acquire;
+            delete c;
+        });
+        opened.array = vcr::computed::open(options, [held, bytes](const vcr::Index& chunk, std::uint8_t* out) {
+            nb::gil_scoped_acquire acquire;
+            nb::tuple index = nb::steal<nb::tuple>(PyTuple_New(Py_ssize_t(chunk.size())));
+            for (std::size_t i = 0; i < chunk.size(); ++i)
+                PyTuple_SET_ITEM(index.ptr(), Py_ssize_t(i), PyLong_FromLongLong(chunk[i]));
+            nb::object result = (*held)(index);
+            if (result.is_none())
+                return false;
+            const auto data = nb::cast<nb::bytes>(result);
+            if (data.size() != bytes)
+                throw std::invalid_argument("a computed chunk has the wrong size");
+            std::memcpy(out, data.c_str(), bytes);
+            return true;
+        });
+        return opened;
+    }, "shape"_a, "chunks"_a, "dtype"_a, "fill_value"_a, "identity"_a, "compute"_a, "cache_dir"_a.none(), "cache_max_bytes"_a.none(),
+       "compress_cache"_a, "memory_cache"_a.none(), "threads"_a);
     nb::class_<Group>(m, "Group")
         .def_static("open", [](const std::string& location, const OpenOptions& options) {
             nb::gil_scoped_release release;
@@ -359,6 +433,10 @@ NB_MODULE(_reader, m)
         .def_prop_ro("attributes", [](const Group& g) { return py_json(g.attributes()); })
         .def_prop_ro("multiscales", [](const Group& g) { return py_json(g.multiscales()); })
         .def("levels", &Group::levels, "probe_levels"_a = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("placement", [](const Group& g, const std::string& path) {
+            const auto placement = g.placement(path);
+            return nb::make_tuple(placement.scale, placement.offset);
+        }, "path"_a)
         .def("keys", &Group::keys, nb::call_guard<nb::gil_scoped_release>())
         .def("array_keys", &Group::arrayKeys, nb::call_guard<nb::gil_scoped_release>())
         .def("node", [](Group& g, const std::string& key) -> nb::object {

@@ -226,3 +226,57 @@ def test_a_token_stays_at_the_end_of_every_url(tmp_path):
         assert denied == []
     finally:
         server.shutdown()
+
+
+def test_computed_array_reads_like_a_stored_one(tmp_path):
+    from vc_reader.reader import ZarrReader
+
+    calls = []
+
+    def compute(index):
+        calls.append(index)
+        if index == (1, 1):
+            return None
+        return np.full((4, 4), index[0] * 10 + index[1], np.float32)
+
+    reader = ZarrReader.computed(compute, shape=(8, 8), chunks=(4, 4), dtype="<f4", fill_value=-1, identity="t",
+                                 memory_cache=1 << 20)
+    assert reader.shape == (8, 8) and reader.dtype == np.dtype("<f4")
+    values = reader[:]
+    assert values[0, 0] == 0 and values[0, 7] == 1 and values[7, 0] == 10 and values[7, 7] == -1
+    assert reader.sample(np.array([[1.5, 1.5]]), order=1, dtype=np.float32)[0] == 0
+    assert reader[:].sum() == values.sum() and len(calls) == 4, "chunks stay in the memory cache"
+    persisted = ZarrReader.computed(compute, shape=(8, 8), chunks=(4, 4), dtype="<f4", identity="p", cache_dir=tmp_path)
+    assert persisted[0, 7] == 1
+    calls.clear()
+    persisted.flush()
+    assert ZarrReader.computed(compute, shape=(8, 8), chunks=(4, 4), dtype="<f4", identity="p", cache_dir=tmp_path)[0, 7] == 1
+    assert calls == [], "a later open reuses what the cache holds"
+
+
+def test_composite_reduce_and_level_placement(tmp_path):
+    from vc_reader import _reader
+    from vc_reader.reader import open_group
+
+    values = np.array([[1, 5], [3, np.nan]], dtype=np.float32)
+    out = np.zeros(2, np.float32)
+    _reader.composite_reduce(values, "max", 0, 0, 1, 1, 1, 1.5, 1.5, .1, out)
+    assert out.tolist() == [3, 5]
+    with pytest.raises(ValueError, match="unknown"):
+        _reader.composite_reduce(values, "nope", 0, 0, 1, 1, 1, 1.5, 1.5, .1, out)
+    root = tmp_path / "p.zarr"
+    create_group(root, attrs={"multiscales": [ome_multiscales(name="p", levels=1, unit="micrometer")]})
+    for level, n in enumerate((8, 4)):
+        ZarrWriter.create(root / str(level), shape=(n, n, n), chunks=(n, n, n), dtype="|u1")
+    scale, offset = open_group(root).placement("1")
+    assert scale == (2, 2, 2) and offset == (.5, .5, .5)
+
+
+def test_affine_directions_and_normals():
+    from vc_reader import Affine
+
+    stretch = Affine.from_rows([[2, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]])
+    assert stretch.determinant == 2
+    assert stretch.map_direction((1, 1, 0)) == pytest.approx((2 / 5**.5, 1 / 5**.5, 0))
+    assert stretch.map_normal((1, 1, 0)) == pytest.approx((.5 / 1.25**.5, 1 / 1.25**.5, 0))
+    assert stretch.normal_transform().map_direction((1, 1, 0)) == pytest.approx(stretch.map_normal((1, 1, 0)))

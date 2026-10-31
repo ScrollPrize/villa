@@ -74,7 +74,11 @@ class ZarrReader:
         self.access = settings["access"]
         self.offline: bool = bool(settings["offline"]) and is_remote(self.location)
         self._options = _open_options(settings, cache)
-        if opened is None:
+        computed = settings.get("computed")
+        if opened is None and computed is not None:
+            opened = _reader.open_computed(**computed, memory_cache=cache._engine if cache is not None else None,
+                                           threads=settings["threads"] or (1 if _loader_worker() else 0))
+        elif opened is None:
             opened = _reader.open_array(self.location, self._options, settings["group"], settings["level_key"],
                                         settings["meta"], settings["attrs"])
         self._opened = opened
@@ -102,6 +106,46 @@ class ZarrReader:
         """
         from .cuda import CudaReader
         return CudaReader(self, cache_bytes=cache_bytes, device=device)
+
+    @classmethod
+    def computed(
+        cls,
+        compute: Any,
+        *,
+        shape: Sequence[int],
+        chunks: Sequence[int],
+        dtype: str = "|u1",
+        fill_value: Any = 0,
+        identity: str = "",
+        cache_dir: str | os.PathLike[str] | None = None,
+        cache_max_bytes: int | None = None,
+        compress_cache: bool = False,
+        memory_cache: int | MemoryCache | None = None,
+        threads: int | None = None,
+    ) -> ZarrReader:
+        """An array whose chunks ``compute(chunk_index)`` returns, read and sampled like a stored one.
+
+        ``compute`` returns the whole chunk, or ``None`` when it reads as ``fill_value``; it runs on the
+        reader's threads holding the GIL. ``identity`` names what the values depend on and is required with
+        ``cache_dir``, where computed chunks persist for later opens. Pickling needs a picklable ``compute``.
+        """
+        element = np.dtype(dtype)
+
+        def chunk_bytes(index):
+            result = compute(index)
+            return None if result is None else np.asarray(result, element).tobytes()
+
+        settings, cache = _make_settings(f"computed:{identity}", level=None, cache_dir=None, cache_writes=False,
+                                         cache_max_bytes=None, compress_cache=False, allow_lossy_cache=False,
+                                         memory_cache=memory_cache, threads=threads, connections=1,
+                                         read_mode="mmap", auth=None, offline=False)
+        settings["computed"] = {
+            "shape": [int(n) for n in shape], "chunks": [int(n) for n in chunks], "dtype": element.str,
+            "fill_value": fill_value, "identity": identity, "compute": chunk_bytes,
+            "cache_dir": None if cache_dir is None else os.fspath(cache_dir),
+            "cache_max_bytes": cache_max_bytes, "compress_cache": compress_cache,
+        }
+        return cls(settings, cache)
 
     @classmethod
     def open(

@@ -432,7 +432,14 @@ NB_MODULE(_catalog, m) {
         .def_prop_ro("translation", [](const VolumeTransform& a) { return nb::make_tuple(a.forward(0, 3), a.forward(1, 3), a.forward(2, 3)); })
         .def("apply", [](const VolumeTransform& a, const std::array<double, 3>& point) { return vecTuple(a.forward.apply(point)); })
         .def("__matmul__", [](const VolumeTransform& a, const VolumeTransform& b) { return VolumeTransform{a.forward * b.forward, {}}; })
-        .def("inverse", [](const VolumeTransform& a) { return VolumeTransform{a.forward.inverse(), {}}; });
+        .def("inverse", [](const VolumeTransform& a) { return VolumeTransform{a.forward.inverse(), {}}; })
+        .def_prop_ro("determinant", [](const VolumeTransform& a) { return a.forward.determinant(); })
+        .def("map_direction", [](const VolumeTransform& a, const std::array<double, 3>& d) { return vecTuple(a.forward.mapDirection(d)); }, nb::arg("direction"),
+             "A direction through the linear part, unit length; (0, 0, 0) for a zero result.")
+        .def("map_normal", [](const VolumeTransform& a, const std::array<double, 3>& n) { return vecTuple(a.forward.mapNormal(n)); }, nb::arg("normal"),
+             "A surface normal through the inverse transpose, unit length.")
+        .def("normal_transform", [](const VolumeTransform& a) { return VolumeTransform{a.forward.normalTransform(), {}}; },
+             "The inverse transpose: compute it once to map many normals with map_direction.");
 
     // ---- descriptors ----
     auto frame = nb::class_<Frame>(m, "Frame");
