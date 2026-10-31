@@ -203,7 +203,10 @@ def normalize_robust(
     mad = float(np.median(np.abs(valid - median)))
     scaled_mad = 1.4826 * mad
 
-    if not np.isfinite(scaled_mad) or scaled_mad < 1e-6:
+    # A window that is about half one constant value has a MAD near zero but a wide value range;
+    # treat it like a zero MAD instead of dividing by it.
+    value_span = (upper_val - lower_val) if lower_val is not None else (max_preclip - min_preclip)
+    if not np.isfinite(scaled_mad) or scaled_mad < max(1e-6, 1e-2 * value_span):
         percentile_span = None
         if lower_val is not None and upper_val is not None:
             percentile_span = upper_val - lower_val
