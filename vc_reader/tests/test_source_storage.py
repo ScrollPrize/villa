@@ -407,6 +407,10 @@ class RemoteTests(RemoteFixtureCase):
                            'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/volume.zarr'):
                 self.assertEqual(resolve_access(public, 'aws').kind, 'anonymous')
             self.assertEqual(resolve_access('s3://my-private-bucket/volume.zarr', 'aws').kind, 's3')
+            # A bucket root is open data too.
+            for public in ('s3://vesuvius-challenge-open-data', 's3+us-east-1://vesuvius-challenge-open-data',
+                           'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com'):
+                self.assertEqual(resolve_access(public, 'aws').kind, 'anonymous')
 
     def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
         from vc_reader.reader import ZarrGroup

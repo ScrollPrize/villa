@@ -297,7 +297,10 @@ namespace {
 void listPages(const Access& access, const std::string& location, std::string_view delimiter, const std::string& keyPrefix,
                const std::function<void(const s3::ListPage&, const std::string&)>& visit)
 {
-    const auto s3 = location.starts_with("s3://") ? std::optional<std::string>(location) : catalog::openDataS3Url(location);
+    // s3+<region>:// names the region for plain HTTP; listing goes through the bucket's own endpoint.
+    const auto regional = location.starts_with("s3+") ? location.find("://") : std::string::npos;
+    const auto s3 = regional != std::string::npos ? std::optional<std::string>("s3" + location.substr(regional))
+        : location.starts_with("s3://") ? std::optional<std::string>(location) : catalog::openDataS3Url(location);
     if (!s3)
         throw std::invalid_argument("cannot list " + location + ": plain HTTP has no listing and the group has no "
                                     "consolidated .zmetadata; open its children by name");

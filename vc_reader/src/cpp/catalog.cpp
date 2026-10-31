@@ -867,6 +867,14 @@ constexpr std::pair<std::string_view, std::string_view> kPublicChannels[] = {
     {"s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"},
 };
 
+// `url` in the channel's other form: below its root, or the root without its slash.
+std::optional<std::string> throughChannel(const std::string& url, std::string_view from, std::string_view to)
+{
+    if (startsWith(url, from)) return std::string(to) + url.substr(from.size());
+    if (url == from.substr(0, from.size() - 1)) return std::string(to.substr(0, to.size() - 1));
+    return std::nullopt;
+}
+
 std::optional<std::string> openDataHttpsUrl(std::string url)
 {
     if (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("s3://") || url.starts_with("s3+"))
@@ -877,7 +885,7 @@ std::optional<std::string> openDataHttpsUrl(std::string url)
 std::string resolveOpenDataUrl(std::string url)
 {
     for (const auto& [s3, https] : kPublicChannels)
-        if (startsWith(url, s3)) return std::string(https) + url.substr(s3.size());
+        if (auto out = throughChannel(url, s3, https)) return *out;
     if (startsWith(url, "s3://") || startsWith(url, "s3+")) {
         const auto scheme = url.find("://");
         if (scheme == std::string::npos) return url;
@@ -904,7 +912,7 @@ std::optional<std::string> openDataS3Url(std::string url)
 {
     if (startsWith(url, "s3://")) return url;
     for (const auto& [s3, https] : kPublicChannels)
-        if (startsWith(url, https)) return std::string(s3) + url.substr(https.size());
+        if (auto out = throughChannel(url, https, s3)) return out;
     return std::nullopt;
 }
 
