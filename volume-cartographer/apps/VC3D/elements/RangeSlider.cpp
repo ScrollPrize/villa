@@ -28,7 +28,6 @@ RangeSlider::RangeSlider(Qt::Orientation orientation, QWidget* parent)
     , _highValue(100)
     , _minimumSeparation(1)
     , _dragTarget(DragTarget::None)
-    , _handleBorderColor(palette().color(QPalette::Highlight))
 {
     setFocusPolicy(Qt::StrongFocus);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -63,6 +62,11 @@ void RangeSlider::setMinimumSeparation(int separation)
 {
     _minimumSeparation = std::max(0, separation);
     updateValues(_lowValue, _highValue);
+}
+
+QColor RangeSlider::handleBorderColor() const
+{
+    return palette().color(QPalette::Highlight);
 }
 
 void RangeSlider::updateValues(int low, int high)
@@ -144,7 +148,7 @@ void RangeSlider::paintEvent(QPaintEvent* event)
     const QRect highHandle = handleRectForValue(_highValue);
 
     painter.setBrush(palette().color(QPalette::Base));
-    QPen handlePen(_handleBorderColor);
+    QPen handlePen(handleBorderColor());
     handlePen.setWidth(kHandleBorderWidth);
     painter.setPen(handlePen);
     painter.drawEllipse(lowHandle);

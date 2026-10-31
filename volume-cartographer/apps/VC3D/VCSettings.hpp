@@ -171,6 +171,15 @@ namespace viewer {
 }
 
 // -----------------------------------------------------------------------------
+// Appearance Settings
+// -----------------------------------------------------------------------------
+namespace appearance {
+    // Theme id ("classic", "modern-dark", a user theme) or a theme file path.
+    constexpr auto THEME = "appearance/theme";
+    constexpr auto THEME_DEFAULT = "classic";
+}
+
+// -----------------------------------------------------------------------------
 // Performance Settings
 // -----------------------------------------------------------------------------
 namespace perf {
@@ -267,6 +276,14 @@ namespace window {
     constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";
     constexpr auto STATE_META_QT_VERSION = "mainWin/state_meta/qt_version";
     constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
+}
+
+// -----------------------------------------------------------------------------
+// Command Palette
+// -----------------------------------------------------------------------------
+namespace command_palette {
+    // Ids of the commands last run from the palette, most recent first.
+    constexpr auto RECENT = "commandPalette/recent";
 }
 
 namespace line_annotation {
