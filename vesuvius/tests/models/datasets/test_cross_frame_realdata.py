@@ -169,7 +169,7 @@ def test_single_patch_fetch_end_to_end(tmp_path: Path):
         pytest.skip("No FG+in-bounds patch found in the sampled region")
 
     t0 = time.perf_counter()
-    image_patch = affine.resample_image_to_label_grid(image, matrix, found, ps)
+    image_patch = image.read_affine(ps, matrix[:3, :3] @ np.asarray(found, dtype=np.float64) + matrix[:3, 3], matrix[:3, :3])
     elapsed = time.perf_counter() - t0
     assert image_patch.shape == ps
     print(f"\nFound FG patch at {found}; resample took {elapsed*1000:.1f} ms")

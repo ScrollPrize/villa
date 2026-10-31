@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from scipy import ndimage
 
 from vc_reader.reader import ObjectStore
 
@@ -160,67 +159,6 @@ def image_patch_label_aabb(
     )
 
 
-def resample_label_to_image_grid(
-    labels_array,
-    matrix_image_to_label_zyx: np.ndarray,
-    position_image_zyx: Tuple[int, int, int],
-    patch_shape_zyx: Tuple[int, int, int],
-    *,
-    order: int = 0,
-    cval: float = 0.0,
-) -> np.ndarray:
-    """Resample a patch of ``labels_array`` onto the image patch grid.
-
-    Default ``order=0`` (nearest neighbor) preserves binary label values.
-    The label slab fetched from disk is bounded by the forward-mapped AABB
-    of the image patch (much smaller than the image patch itself when the
-    image voxel size is finer than the label voxel size, which is the
-    typical fibers setting).
-    """
-    label_shape = tuple(labels_array.shape[-3:])
-    start, stop = image_patch_label_aabb(
-        matrix_image_to_label_zyx,
-        position_image_zyx,
-        patch_shape_zyx,
-        label_shape_zyx=label_shape,
-    )
-
-    if any(st >= sp for st, sp in zip(start, stop)):
-        return np.full(patch_shape_zyx, cval, dtype=np.float32)
-
-    slab = np.asarray(
-        labels_array[start[0]:stop[0], start[1]:stop[1], start[2]:stop[2]],
-        dtype=np.float32,
-    )
-
-    dz, dy, dx = patch_shape_zyx
-    zs = np.arange(dz, dtype=np.float64)
-    ys = np.arange(dy, dtype=np.float64)
-    xs = np.arange(dx, dtype=np.float64)
-    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")
-    grid = np.stack(
-        [
-            gz + position_image_zyx[0],
-            gy + position_image_zyx[1],
-            gx + position_image_zyx[2],
-        ],
-        axis=0,
-    ).reshape(3, -1)
-
-    mapped = apply_affine_zyx(matrix_image_to_label_zyx, grid.T).T
-    mapped -= np.array(start, dtype=np.float64).reshape(3, 1)
-
-    resampled = ndimage.map_coordinates(
-        slab,
-        mapped,
-        order=order,
-        mode="constant",
-        cval=cval,
-        prefilter=False,
-    )
-    return resampled.reshape(patch_shape_zyx).astype(np.float32)
-
-
 def apply_affine_zyx(matrix_zyx: np.ndarray, points_zyx: np.ndarray) -> np.ndarray:
     """Apply a 4x4 ZYX affine to an ``(N, 3)`` array of ZYX points."""
     if matrix_zyx.shape != (4, 4):
@@ -273,66 +211,6 @@ def label_patch_image_aabb(
     return tuple(int(v) for v in lo), tuple(int(v) for v in hi)  # type: ignore[return-value]
 
 
-def resample_image_to_label_grid(
-    image_array,
-    matrix_label_to_image_zyx: np.ndarray,
-    position_label_zyx: Tuple[int, int, int],
-    patch_shape_zyx: Tuple[int, int, int],
-    *,
-    order: int = 1,
-    cval: float = 0.0,
-) -> np.ndarray:
-    """Resample a patch of ``image_array`` onto the label patch grid.
-
-    The image patch returned has shape ``patch_shape_zyx`` and matches the
-    label patch at label-voxel position ``position_label_zyx`` after the
-    affine transform. ``image_array`` can be a zarr array or anything that
-    supports numpy-style slicing (``arr[start:stop, ...]``).
-    """
-    image_shape = tuple(image_array.shape[-3:])
-    start, stop = label_patch_image_aabb(
-        matrix_label_to_image_zyx,
-        position_label_zyx,
-        patch_shape_zyx,
-        image_shape_zyx=image_shape,
-    )
-
-    if any(st >= sp for st, sp in zip(start, stop)):
-        return np.full(patch_shape_zyx, cval, dtype=np.float32)
-
-    slab = np.asarray(
-        image_array[start[0]:stop[0], start[1]:stop[1], start[2]:stop[2]],
-        dtype=np.float32,
-    )
-
-    dz, dy, dx = patch_shape_zyx
-    zs = np.arange(dz, dtype=np.float64)
-    ys = np.arange(dy, dtype=np.float64)
-    xs = np.arange(dx, dtype=np.float64)
-    grid_z, grid_y, grid_x = np.meshgrid(zs, ys, xs, indexing="ij")
-    grid = np.stack(
-        [
-            grid_z + position_label_zyx[0],
-            grid_y + position_label_zyx[1],
-            grid_x + position_label_zyx[2],
-        ],
-        axis=0,
-    ).reshape(3, -1)
-
-    mapped = apply_affine_zyx(matrix_label_to_image_zyx, grid.T).T
-    mapped -= np.array(start, dtype=np.float64).reshape(3, 1)
-
-    resampled = ndimage.map_coordinates(
-        slab,
-        mapped,
-        order=order,
-        mode="constant",
-        cval=cval,
-        prefilter=False,
-    )
-    return resampled.reshape(patch_shape_zyx).astype(np.float32)
-
-
 def matrix_checksum(matrix: np.ndarray) -> str:
     """Short hex digest of a transform matrix, useful as a cache key."""
     import hashlib
@@ -352,8 +230,6 @@ __all__ = [
     "apply_affine_zyx",
     "label_patch_image_aabb",
     "image_patch_label_aabb",
-    "resample_image_to_label_grid",
-    "resample_label_to_image_grid",
     "matrix_checksum",
 ]
 

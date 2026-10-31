@@ -660,11 +660,11 @@ class CrossFrameZarrDataset(Dataset):
             )
             t_lbl_s = time.perf_counter()
 
-        label_patch = affine.resample_label_to_image_grid(
-            self._labels_array,
-            self._matrix_zyx_image_to_label,
-            pos,
+        linear = self._matrix_zyx_image_to_label[:3, :3]
+        label_patch = self._labels_array.read_affine(
             ps,
+            linear @ np.asarray(pos, dtype=np.float64) + self._matrix_zyx_image_to_label[:3, 3],
+            linear,
             order=0,  # nearest neighbor preserves integer labels
         )
         if self.binarize_labels:
