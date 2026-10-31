@@ -2191,6 +2191,8 @@ class BaseTrainer:
             print("Early stopping disabled")
 
         # ---- training! ----- #
+        # An empty resume range retains the loaded checkpoint epoch.
+        epoch = start_epoch - 1
         for epoch in range(start_epoch, self.mgr.max_epoch):
             # Ensure each rank shuffles differently per epoch
             if self.is_distributed and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -2632,7 +2634,7 @@ class BaseTrainer:
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                max_epoch=self.mgr.max_epoch,
+                max_epoch=epoch + 1,
                 model_ckpt_dir=model_ckpt_dir,
                 model_name=self.mgr.model_name,
                 model_config=getattr(model, 'final_config', None),
