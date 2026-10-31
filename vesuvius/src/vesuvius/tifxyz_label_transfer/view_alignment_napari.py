@@ -20,6 +20,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 from scipy.spatial import cKDTree
 import tifffile
+from vc_reader import tifxyz
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -361,12 +362,9 @@ def valid_coordinates(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray
 
 
 def load_surface(path: Path, max_points: int) -> Surface:
-    x = tifffile.imread(path / "x.tif")
-    y = tifffile.imread(path / "y.tif")
-    z = tifffile.imread(path / "z.tif")
-    if x.shape != y.shape or x.shape != z.shape:
-        raise ValueError(f"Coordinate shapes differ in {path}")
-    valid = valid_coordinates(x, y, z).ravel()
+    stored = tifxyz.read(path, mask=False)
+    x, y, z = stored.xyz[..., 0], stored.xyz[..., 1], stored.xyz[..., 2]
+    valid = stored.valid.ravel()
     indices = np.flatnonzero(valid)
     if indices.size > max_points:
         selection = np.linspace(
