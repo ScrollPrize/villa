@@ -970,17 +970,13 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(
             self._stage_for(self._base_request({"shell_num_theta_bins": 360})),
             "model")
-        # A session that loaded both a tracks store and the store's outer
-        # shell filtered the tracks against the shell; apply_config refuses
-        # the atlas settings there, so the request has to rebuild the host
+        # A session that read both tracks and the store's outer shell
+        # filtered the tracks against the shell; apply_config refuses the
+        # atlas settings there, so the request has to rebuild the host
         # inputs.
-        session.input_summary = {"outer_shell": "6d1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e12"}
-        live = SpiralInputPaths.from_mapping({
-            **self.state.session_paths.manifest(),
-            "tracks_dbm": str(self.root / "tracks.dbm"),
-        })
-        self.state.session_paths = live
-        self.state.session_request["paths"] = live.manifest()
+        session.input_summary = {"outer_shell": "6d1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e12",
+                                 "selection": {"track": 3}}
+        live = self.state.session_paths
         run = self._base_request({"shell_num_theta_bins": 360})["run"]
         _, run_config, preview, scroll = self.state._prepare_session_request(with_project(
             {"run": run}))
@@ -1042,13 +1038,13 @@ class DatasetOwnershipTests(unittest.TestCase):
         # dataset paths.
         self.assertFalse({"verified_patches", "fibers", "pcls"} & set(request["paths"]))
 
-        disabled = self.state._dataset_session_request({
-            "paths": {"tracks_dbm": "/not/an/advertised/store.dbm"},
-            "run": {"z_begin": 0, "z_end": 10, "config": {
-                "input_use_tracks": False,
-            }},
-        }, _PROJECT)
-        self.assertEqual(disabled["paths"]["tracks_dbm"], "")
+        self.assertNotIn("tracks_dbm", request["paths"])
+        with self.assertRaises(ApiError):
+            # Tracks come from the store too: a request cannot name a database.
+            self.state._dataset_session_request({
+                "paths": {"tracks_dbm": "/a/store.dbm"},
+                "run": {"z_begin": 0, "z_end": 10},
+            }, _PROJECT)
 
     def test_omitted_spacing_mode_preserves_default_winding_input(self):
         winding = self.root / "winding_inference"

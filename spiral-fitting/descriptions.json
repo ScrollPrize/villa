@@ -22,7 +22,6 @@
     "path_umbilicus": "umbilicus.json: the umbilicus axis the spiral is wound around. Always required.",
     "vertical_fiber_offset": "Vertical fibers sit on the back face of the sheet. When checked, the fit expects vertical fiber strips this many voxels radially outside the fitted winding instead of on it (pcl_vertical_fiber_radial_offset_*). Horizontal fibers are unaffected. Applies at the next Run without a rebuild.",
     "vertical_fiber_offset_voxels": "How far, in voxels, vertical fiber strips are expected radially outside the fitted winding. Used only while the offset is checked.",
-    "path_tracks_dbm": "Surface-track database (.dbm) extracted from surface predictions, used as track supervision. The only editable input path: it must be one of the candidates the service advertises. Changing it requires Rebuild Fit.",
     "track_length_bin_sampling": "Draw short, medium, and long tracks using configurable weights. The bin boundaries are computed from eligible-track arclength tertiles.",
     "track_length_bin_weights": "Relative sampling weights for short, medium and long tracks when length-bin sampling is on (track_length_bin_weights).",
     "max_track_crossings": "Maximum differently oriented crossing partners appended for each sampled primary track. Applies on the next Run; zero disables crossing-pair sampling. The upper bound is prepared when the session loads.",
@@ -153,7 +152,7 @@
     "patch_sampling_area_exponent": "Controls how often each patch is drawn for the patch losses: the chance is proportional to the patch's area inside the z range raised to this power. 0 draws every patch equally often; 1 draws in proportion to area, so large patches dominate; values in between balance the two.",
     "patch_erode_patches": "Number of grid cells to trim from the edges of each patch's valid region when patches are loaded, removing their often less reliable borders. A patch that erodes to nothing is dropped. 0 disables trimming. A patch can override this in its own metadata.",
     "input_use_verified_patches": "Read patches from the object store and allow their radius/DT supervision.",
-    "input_use_tracks": "Load tracks and allow track sampling and losses.",
+    "input_use_tracks": "Read tracks and their crossings from the object store and allow track sampling and losses.",
     "input_use_fibers": "Read fibers from the object store into the point-collection supervision pools.",
     "input_use_fiber_directions": "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute": "Read absolute-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
@@ -253,12 +252,13 @@
     "object_store_pcl_tags": "Also select the active point collections carrying any of these tags.",
     "object_store_fiber_uuids": "Fibers to use, by UUID (with the tags below). Unset with no tags selects every active fiber with geometry; an empty list selects none.",
     "object_store_fiber_tags": "Also select the active fibers carrying any of these tags.",
+    "object_store_track_uuids": "Tracks to use, by UUID (with the tags below). Unset with no tags selects every active track with geometry; an empty list selects none.",
+    "object_store_track_tags": "Also select the active tracks carrying any of these tags.",
     "object_store_normal_ct_path": "CT zarr whose structure-tensor normals guide fiber-patch link refresh when the fit has no lasagna normals. Lasagna normals are used for link refresh whenever input_use_normals is on and the normal stores exist, even with the dense-normal loss off. Without either, fiber-patch links are gated by the fiber centerline alone, with a warning.",
     "object_store_normal_ct_level": "Pyramid level of the normal CT zarr to read: the group <object_store_normal_ct_path>/<level>, whatever the zarr's multiscales metadata lists.",
     "object_store_normal_ct_downsampling": "Downsampling of the selected normal CT level relative to the fit volume (selected CT voxel = fit voxel / this).",
     "object_store_normal_ct_volume_uuid": "The volume the normal CT belongs to; must be the fit volume.",
     "fit_volume_uuid": "The reference volume whose voxels are the fit's units. Unset infers it from the frames the selected objects declare; it must agree with every declaration.",
-    "track_scale_factor": "Stored track coordinates = fit-volume voxel coordinates x this factor. Required when a track store is attached to an object-store fit; never inferred.",
     "spiral_outward_sense": "The direction the spiral winds outwards (CW or ACW) where the fit volume's catalog orientation does not decide it; one that disagrees with the orientation is refused. Read it off the CT, or from an already-fitted spiral."
   }
 }

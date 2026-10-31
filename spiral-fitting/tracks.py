@@ -467,41 +467,6 @@ def write_packed_track_store(
             shutil.rmtree(temporary, ignore_errors=True)
 
 
-def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
-    native = _load_native_track_store()
-    if native is None:
-        return None
-    try:
-        store = track_store_path(path)
-        if not store.is_dir():
-            return None
-        with (store / 'metadata.json').open('r', encoding='utf-8') as stream:
-            metadata = json.load(stream)
-        if metadata.get('version') != TRACK_STORE_VERSION:
-            raise ValueError('unsupported packed track-store version')
-        expected = [list(item) for item in _tracks_db_signature(path)]
-        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
-            raise ValueError('source DBM changed after the packed store was written')
-        result = native.load(
-            os.fspath(store),
-            z_minimum=-(1 << 63) if z_lo is None else int(z_lo),
-            z_maximum=(1 << 63) - 1 if z_hi is None else int(z_hi),
-            workers=min(32, os.cpu_count() or 1),
-        )
-        collection = PackedTrackCollection(
-            result['coordinates'], result['offsets'], result['source_ids'],
-            result['family_codes'], result['arclengths'],
-            result['tortuosities'], store_path=store)
-        print(
-            f'loaded packed track store {store}: {len(collection)} tracks, '
-            f'{len(collection.coordinates)} points in ROI')
-        return collection
-    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
-        if warn:
-            print(f'WARNING: ignoring packed track store: {error}')
-        return None
-
-
 def _packed_store_if_current(path):
     """Return an adjacent packed store only when it matches the source DBM."""
     store = track_store_path(path)
@@ -518,141 +483,6 @@ def _packed_store_if_current(path):
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
-
-
-def _dbm_source_id(key_ordinal, source_index):
-    if key_ordinal >= (1 << 32) or source_index >= (1 << 32):
-        raise ValueError('track DBM key and entry indices must fit in 32 bits')
-    return (int(key_ordinal) << 32) | int(source_index)
-
-
-def load_tracks_from_dbm(
-        path, z_lo=None, z_hi=None, return_families=False,
-        return_source_ids=False, show_progress=True, low_memory=False,
-        progress=None):
-    # Load tracks written by extract_surface_tracks.py. Each DBM value is a
-    # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
-    # within the full-resolution [z_lo, z_hi) ROI.
-    path = normalize_tracks_dbm_path(path)
-    if not low_memory:
-        packed = _load_packed_track_collection(path, z_lo, z_hi)
-        if packed is not None:
-            if return_families and return_source_ids:
-                return (packed, packed.selected_family_codes,
-                        packed.selected_source_ids)
-            if return_families:
-                return packed, packed.selected_family_codes
-            if return_source_ids:
-                return packed, packed.selected_source_ids
-            return packed
-    tracks = []
-    families = []
-    source_ids = []
-    with open_tracks_dbm(path) as db:
-        keys = db.keys()
-        if progress is not None:
-            progress.begin(
-                'loading', 'Loading tracks',
-                step=0, total_steps=len(keys), unit='DB keys')
-        key_ordinals = {key: index for index, key in enumerate(sorted(keys))}
-        for key_number, key in enumerate(tqdm(
-                keys, desc='loading tracks',
-                disable=not show_progress or progress is not None), start=1):
-            family = None
-            if return_families:
-                prefix = key.decode().split(':', 1)[0]
-                family = 'horizontal' if prefix == 'h' else (
-                    'vertical' if prefix in ('vx', 'vy') else None)
-            entries = pickle.loads(db[key])
-            if not entries:
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            if low_memory:
-                for source_index, entry in enumerate(entries):
-                    if not len(entry):
-                        continue
-                    z_column = entry[:, 0]
-                    if z_lo is not None and z_column.min() < z_lo:
-                        continue
-                    if z_hi is not None and z_column.max() >= z_hi:
-                        continue
-                    # The crossing builder consumes the DBM's native int32
-                    # voxel coordinates. Avoid a second per-key float32 copy.
-                    tracks.append(np.asarray(entry))
-                    if return_families:
-                        families.append(family)
-                    if return_source_ids:
-                        source_ids.append(_dbm_source_id(
-                            key_ordinals[key], source_index))
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            # Vectorize the per-track z min/max across the whole key: concatenate
-            # every non-empty track's z column and reduce per segment, rather
-            # than calling .min()/.max() once per track.
-            idx = [i for i in range(len(entries)) if len(entries[i])]
-            if not idx:
-                if progress is not None:
-                    progress.update(
-                        key_number, detail=f'{len(tracks):,} tracks retained')
-                continue
-            lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
-            zcat = np.concatenate([entries[i][:, 0] for i in idx])
-            offsets = np.zeros(len(idx), dtype=np.intp)
-            np.cumsum(lengths[:-1], out=offsets[1:])
-            zmins = np.minimum.reduceat(zcat, offsets)
-            zmaxs = np.maximum.reduceat(zcat, offsets)
-            keep = np.ones(len(idx), dtype=bool)
-            if z_lo is not None:
-                keep &= zmins >= z_lo
-            if z_hi is not None:
-                keep &= zmaxs < z_hi
-            for j in np.nonzero(keep)[0]:
-                source_index = idx[j]
-                tracks.append(entries[source_index].astype(np.float32))
-                if return_families:
-                    families.append(family)
-                if return_source_ids:
-                    source_ids.append(_dbm_source_id(
-                        key_ordinals[key], source_index))
-            if progress is not None:
-                progress.update(
-                    key_number, detail=f'{len(tracks):,} tracks retained')
-    if return_families and return_source_ids:
-        return tracks, families, np.asarray(source_ids, dtype=np.uint64)
-    if return_families:
-        return tracks, families
-    if return_source_ids:
-        return tracks, np.asarray(source_ids, dtype=np.uint64)
-    return tracks
-
-
-def _iter_tracks_from_dbm(path, z_lo=None, z_hi=None, show_progress=True):
-    """Yield native voxel tracks in stable source-id order, one DBM key at a time."""
-    path = normalize_tracks_dbm_path(path)
-    with open_tracks_dbm(path) as database:
-        keys = sorted(database.keys())
-        for key_ordinal, key in enumerate(tqdm(
-                keys, desc='streaming tracks', disable=not show_progress)):
-            prefix = key.decode().split(':', 1)[0]
-            family = 'horizontal' if prefix == 'h' else (
-                'vertical' if prefix in ('vx', 'vy') else None)
-            entries = pickle.loads(database[key])
-            for source_index, entry in enumerate(entries):
-                if not len(entry):
-                    continue
-                z_column = entry[:, 0]
-                if z_lo is not None and z_column.min() < z_lo:
-                    continue
-                if z_hi is not None and z_column.max() >= z_hi:
-                    continue
-                yield (
-                    np.asarray(entry), family,
-                    _dbm_source_id(key_ordinal, source_index),
-                )
 
 
 def validate_track_sampling_config(config):
@@ -1715,48 +1545,6 @@ def write_track_crossing_cache(
     return destination
 
 
-def track_store_z_range(z_begin, z_end, scale_factor):
-    """The stored-frame ``[z_lo, z_hi)`` selecting the same tracks as fit
-    ``[z_begin, z_end)`` when stored ZYX = fit ZYX x ``scale_factor``.
-
-    Stored track points lie on integer voxels, so the bounds round up: a
-    stored z is in range exactly when its fit z = z / scale_factor is.
-    """
-    if scale_factor == 1:
-        return z_begin, z_end
-    return (math.ceil(z_begin * scale_factor - 1e-9),
-            math.ceil(z_end * scale_factor - 1e-9))
-
-
-def tracks_in_fit_frame(tracks, scale_factor):
-    """Tracks loaded in their stored frame, converted to fit ZYX.
-
-    Positions and arclengths divide by ``scale_factor``; source ids, point
-    order and indices are kept. Scale 1 returns ``tracks`` itself.
-    """
-    if scale_factor == 1 or tracks is None:
-        return tracks
-    if isinstance(tracks, PackedTrackCollection):
-        return PackedTrackCollection(
-            tracks.coordinates / np.float32(scale_factor), tracks.offsets,
-            tracks.source_ids, tracks.family_codes,
-            tracks.arclengths / scale_factor, tracks.tortuosities,
-            store_path=tracks.store_path, rows=tracks.rows)
-    return [np.asarray(track, dtype=np.float32) / np.float32(scale_factor)
-            for track in tracks]
-
-
-def crossing_cache_in_fit_frame(crossing_cache, scale_factor):
-    """A crossing CSR found in the stored frame, with its arclength
-    positions and clearances in fit voxels; point indices are unchanged."""
-    if scale_factor == 1 or crossing_cache is None:
-        return crossing_cache
-    converted = dict(crossing_cache)
-    for name in ('positions', 'clearances'):
-        converted[name] = np.asarray(crossing_cache[name], dtype=np.float64) / scale_factor
-    return converted
-
-
 def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     """Load a valid adjacent CSR sidecar, or return ``None`` on a safe miss."""
     try:
@@ -2134,12 +1922,10 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None, track_graph=None, progress=None,
-        rediscover_crossings=True):
-    # rediscover_crossings=False forbids finding exact crossings from these
-    # coordinates: tracks converted out of their stored integer frame take
-    # crossings only from the stored-frame cache, and a cache that cannot
-    # serve them is an error rather than a rebuild.
+        track_graph=None, progress=None):
+    # Crossings come only from ``track_graph`` (the object store's crossing
+    # links, keyed by track_source_ids); without one no crossing index is
+    # built.
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2163,21 +1949,8 @@ def prepare_main_phase_tracks(
     if (working_source_ids is not None
             and working_source_ids.shape != (len(working_tracks),)):
         raise ValueError('track_source_ids must be parallel to tracks')
-    if crossing_cache is not None and working_source_ids is None:
-        raise ValueError('a crossing cache requires stable track_source_ids')
     if track_graph is not None and working_source_ids is None:
         raise ValueError('a track graph requires stable track_source_ids')
-    if crossing_cache is not None and track_graph is not None:
-        raise ValueError('pass either crossing_cache or track_graph, not both')
-    if crossing_cache is not None and exclusion_radius > 0:
-        if not rediscover_crossings:
-            raise ValueError(
-                'point-level track exclusion would rediscover crossings from '
-                'converted coordinates; set track_exclusion_radius to 0')
-        print(
-            'WARNING: track crossing cache cannot be used after point-level '
-            'track exclusion; rebuilding crossings from the clipped tracks')
-        crossing_cache = None
     arclengths = (working_tracks.selected_arclengths
                   if packed_input else _polyline_arclengths(working_tracks))
     if max_tortuosity is not None:
@@ -2204,7 +1977,7 @@ def prepare_main_phase_tracks(
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
 
     def finish_prepared(
-            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list,
+            flat_zyx_np, lengths_new, surviving_indices,
             crossing_csr_override=None):
         offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
         offsets_new[0] = 0
@@ -2223,23 +1996,16 @@ def prepare_main_phase_tracks(
             'length_bin_weights': None,
             'active_max_crossings': 0,
             'crossing_precompute_max': (
-                crossing_precompute_max
-                if (working_families is not None
-                    or crossing_cache is not None
-                    or track_graph is not None)
-                else 0),
+                crossing_precompute_max if track_graph is not None else 0),
         }
-        if crossing_precompute_max > 0:
+        if crossing_precompute_max > 0 and track_graph is not None:
             crossing_index = None
             restricted_csr = crossing_csr_override
             native = _load_native_track_crossings()
-            active_crossing_cache = crossing_cache
-            if restricted_csr is None and track_graph is not None:
-                active_crossing_cache = track_graph
+            if restricted_csr is None:
                 print(
-                    f'track crossings: using TrackGraph cache for '
+                    f'track crossings: using TrackGraph for '
                     f'{len(surviving_indices)} surviving tracks')
-            if active_crossing_cache is not None:
                 eligible_source_ids = working_source_ids[surviving_indices]
                 try:
                     if (native is not None
@@ -2247,51 +2013,33 @@ def prepare_main_phase_tracks(
                                 native, 'prepare_cached_crossing_index')):
                         crossing_index = native.prepare_cached_crossing_index(
                             np.asarray(
-                                active_crossing_cache['source_ids'],
+                                track_graph['source_ids'],
                                 dtype=np.uint64),
                             np.asarray(
-                                active_crossing_cache['offsets'],
+                                track_graph['offsets'],
                                 dtype=np.int64),
                             np.asarray(
-                                active_crossing_cache['partners'],
+                                track_graph['partners'],
                                 dtype=np.int32),
                             np.asarray(
-                                active_crossing_cache['self_local'],
+                                track_graph['self_local'],
                                 dtype=np.int32),
                             np.asarray(
-                                active_crossing_cache['partner_local'],
+                                track_graph['partner_local'],
                                 dtype=np.int32),
                             np.asarray(
                                 eligible_source_ids, dtype=np.uint64),
                             np.asarray(lengths_new, dtype=np.int32))
                     else:
                         restricted_csr = _restrict_crossing_partner_csr(
-                            active_crossing_cache, eligible_source_ids)
+                            track_graph, eligible_source_ids)
                     print(
-                        f'track crossings: used cached CSR for '
+                        f'track crossings: used the crossing CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
                 except (ValueError, RuntimeError) as error:
-                    if not rediscover_crossings:
-                        raise ValueError(
-                            'the track crossing cache does not cover the '
-                            'selected tracks, and crossings cannot be '
-                            'rediscovered from converted coordinates; rebuild '
-                            f'it for this z range: {error}') from error
-                    print(
-                        'WARNING: track crossing cache could not be remapped; '
-                        f'rebuilding exact crossings: {error}')
-            needs_rebuild = crossing_index is None and restricted_csr is None
-            if needs_rebuild and not rediscover_crossings:
-                raise ValueError(
-                    'no track crossing cache for converted coordinates; '
-                    'crossings cannot be rediscovered from them')
-            if needs_rebuild and working_families is not None:
-                eligible_families = [
-                    working_families[index] for index in surviving_indices]
-                rebuilt_csr = _build_crossing_partner_csr(
-                    prepared_track_list, eligible_families,
-                    flat_points=flat_zyx_np, offsets=offsets_new)
-                restricted_csr = rebuilt_csr
+                    raise ValueError(
+                        'the track crossings do not cover the selected '
+                        f'tracks: {error}') from error
             if crossing_index is None and restricted_csr is not None:
                 if (native is not None
                         and hasattr(native, 'prepare_crossing_index')):
@@ -2337,16 +2085,13 @@ def prepare_main_phase_tracks(
                 return None
             flat_zyx_np, offsets_new = surviving_collection.materialize()
             lengths_new = np.diff(offsets_new)
-            prepared_track_list = _MemmapTrackCollection(
-                flat_zyx_np, offsets_new)
             print(
                 f'track radius loss: {len(surviving_collection)}/'
                 f'{len(working_tracks)} tracks survive exclusion '
                 f'(radius {exclusion_radius:.1f}); '
                 f'{len(flat_zyx_np)} points retained'
             )
-            return finish_prepared(
-                flat_zyx_np, lengths_new, surviving, prepared_track_list)
+            return finish_prepared(flat_zyx_np, lengths_new, surviving)
         surviving = np.asarray([
             index for index, track in enumerate(working_tracks) if len(track) >= 2
         ], dtype=np.int64)
@@ -2367,8 +2112,7 @@ def prepare_main_phase_tracks(
             f'track radius loss: {len(surviving_tracks)}/{len(working_tracks)} tracks survive exclusion '
             f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
         )
-        return finish_prepared(
-            flat_zyx_np, lengths_new, surviving, surviving_tracks)
+        return finish_prepared(flat_zyx_np, lengths_new, surviving)
 
     if packed_input:
         flat_zyx_np, packed_offsets = working_tracks.materialize()
@@ -2414,15 +2158,12 @@ def prepare_main_phase_tracks(
             f'track crossings: remapped TrackGraph after point exclusion '
             f'({len(crossing_csr_override["partners"])} directed crossings)')
     del keep_np, flat_zyx_np
-    prepared_track_list = _MemmapTrackCollection(
-        compact_zyx_np,
-        np.r_[np.int64(0), np.cumsum(lengths_new, dtype=np.int64)])
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return finish_prepared(
-        compact_zyx_np, lengths_new, surviving, prepared_track_list,
+        compact_zyx_np, lengths_new, surviving,
         crossing_csr_override=crossing_csr_override)
 
 

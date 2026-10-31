@@ -16,8 +16,7 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA,
                          ScrollSpecError, SessionScroll, SessionState,
                          SpiralInputPaths, SpiralProject, load_scroll_spec,
-                         resolve_dataset_root,
-                         resolve_logical_dbm, validate_checkpoint_container)
+                         resolve_dataset_root, validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
@@ -118,13 +117,13 @@ class ScrollSpecTests(unittest.TestCase):
             write_scroll_spec(
                 temporary,
                 paths={"umbilicus": "annotations/umbilicus.json",
-                       "tracks_dbm": "/elsewhere/tracks.dbm"})
+                       "fiber_directions": "/elsewhere/fiber_directions.npz"})
             spec = load_scroll_spec(temporary)
             self.assertEqual(
                 spec.path_override("umbilicus"),
                 str(Path(temporary).resolve() / "annotations" / "umbilicus.json"))
-            self.assertEqual(spec.path_override("tracks_dbm"),
-                             "/elsewhere/tracks.dbm")
+            self.assertEqual(spec.path_override("fiber_directions"),
+                             "/elsewhere/fiber_directions.npz")
 
     def test_dataset_resolution_takes_an_optional_spec_and_honors_it(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -246,7 +245,7 @@ class DatasetResolverTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Legacy pickle checkpoints are not supported"):
                 validate_checkpoint_container(checkpoint)
 
-    def test_conventional_resolution_and_logical_dbm_suffix(self):
+    def test_conventional_resolution_reads_no_store_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_scroll_spec(root)
@@ -261,26 +260,11 @@ class DatasetResolverTests(unittest.TestCase):
             (root / "drawn_control_points.json").write_text("{}")
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
-            self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
-            # Patches, fibers and PCLs come from the object store: the
-            # dataset's files are not inputs any more.
-            self.assertFalse({"verified_patches", "fibers"} & set(result.resolved))
+            # Patches, fibers, PCLs and tracks come from the object store:
+            # the dataset's files are not inputs any more.
+            self.assertFalse({"verified_patches", "fibers", "tracks_dbm"}
+                             & set(result.resolved))
             self.assertFalse(hasattr(result, "pcl_inputs"))
-            self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
-                             str(root / "tracks" / "only.dbm"))
-
-    def test_dbm_ambiguity_is_deterministic(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            write_scroll_spec(root)
-            (root / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            (root / "tracks").mkdir()
-            for name in ("z.dbm.db", "a.dbm.db"):
-                (root / "tracks" / name).write_bytes(b"")
-            result = resolve_dataset_root(root)
-            self.assertEqual(result.ambiguities["tracks_dbm"], [
-                str(root / "tracks" / "a.dbm"), str(root / "tracks" / "z.dbm")])
 
 
 class HandoffTests(unittest.TestCase):

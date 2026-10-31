@@ -369,6 +369,12 @@ def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device
     inputs.manifest = {**inputs.manifest, 'volume_uuid': 'another-volume'}
     with pytest.raises(fit_spiral.InputReplacementRefused, match='volume_uuid differs'):
         context.prepare_input_replacement(inputs)
+    # Tracks and their crossings are prepared at build.
+    inputs.manifest = {**context.object_store_inputs.manifest, 'relationships': [
+        *context.object_store_inputs.manifest['relationships'],
+        {'uuid': 'a-new-crossing', 'kind': 'crossing', 'family': 'track_crossing'}]}
+    with pytest.raises(fit_spiral.InputReplacementRefused, match='tracks or their crossings'):
+        context.prepare_input_replacement(inputs)
     context.using_tracks = True
     context.config.update({'track_exclusion_radius': 4.0})
     with pytest.raises(fit_spiral.InputReplacementRefused, match='track exclusion'):

@@ -1,7 +1,7 @@
 """Fit inputs read from a vc_object_store database.
 
-Patches, fibers and point collections (PCLs), and the relationships between
-them, come from one object store. This module turns a selection of them into
+Patches, fibers, point collections (PCLs) and tracks, and the relationships
+between them, come from one object store. This module turns a selection of them into
 the fitter's runtime inputs in three stages:
 
 1. Snapshot extraction (read_snapshot): resolve object selectors to explicit
@@ -11,8 +11,9 @@ the fitter's runtime inputs in three stages:
 2. Frame conversion (ObjectFrame): every selected object declares its frame in
    ``meta.coordinates``; geometry and anchors convert once from stored XYZ to
    ZYX voxels of one reference volume, the only units the fitter uses.
-3. Runtime materialization: patches, PCL and fiber constraints built from the
-   frozen snapshot (materialize_* below).
+3. Runtime materialization: patches, PCL and fiber constraints and the track
+   collection with its crossings, built from the frozen snapshot
+   (materialize_* below).
 
 The store's automatic detectors are authoritative: their relationships are
 consumed as they are, never relinked by proximity here.
@@ -34,22 +35,25 @@ from collections import Counter
 
 import numpy as np
 
-KINDS = ('surface', 'point_collection', 'fiber')
+KINDS = ('surface', 'point_collection', 'fiber', 'track')
 # The tag of the scroll's outer shell: a surface the fit reads on its own
 # (InputSnapshot.outer_shell, FitInputs.outer_shell), never as a patch.
 OUTER_SHELL_TAG = 'spiral-outer-shell'
 KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
-               'fiber': 'fibers'}
+               'fiber': 'fibers', 'track': 'tracks'}
 
 # Relationship families the fitter consumes, keyed by (edge kind, endpoint
 # kinds in KINDS order). Surface overlaps and fiber-surface contacts share the
 # detectors' 'same-surface' edge kind and differ by endpoint kinds. Family
-# names are Spiral's roles and keep the fitter's "patch" vocabulary.
+# names are Spiral's roles and keep the fitter's "patch" vocabulary. Track
+# crossings feed the track graph; track-surface edges ('same-surface' between
+# a surface and a track) constrain nothing in the fit and are excluded.
 FAMILIES = {
     ('point-surface', ('surface', 'point_collection')): 'pcl_patch',
     ('same-surface', ('surface', 'fiber')): 'fiber_patch',
     ('same-surface', ('surface', 'surface')): 'patch_overlap',
     ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
+    ('crossing', ('track', 'track')): 'track_crossing',
 }
 
 # The coordinates the fitter works in, recorded with every provenance.
@@ -88,6 +92,12 @@ class Selector:
     @property
     def is_default(self):
         return self.uuids is None and self.tags is None
+
+    def provenance(self):
+        """The selector as JSON holds it (lists, not tuples), so a recorded
+        manifest compares equal to the live one."""
+        return {key: None if value is None else list(value)
+                for key, value in dataclasses.asdict(self).items()}
 
     def describe(self):
         if self.is_default:
@@ -178,7 +188,7 @@ def content_sha256(value):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def adapter_metadata(kind, meta, fiber=None):
+def adapter_metadata(kind, meta, fiber=None, track=None):
     """The metadata the adapter reads from one object of ``kind``.
 
     With the geometry revision (points, arrays and point annotations) it is
@@ -198,6 +208,10 @@ def adapter_metadata(kind, meta, fiber=None):
         read['hv_classification'] = source.get('hv_classification')
         read['family'] = (fiber or {}).get('family')
         read['manual_family'] = (fiber or {}).get('manual_family')
+    elif kind == 'track':
+        # The family gates crossings; the dataset and key order the tracks.
+        for key in ('family', 'dataset_ref', 'external_key'):
+            read[key] = (track or {}).get(key)
     return read
 
 
@@ -212,10 +226,11 @@ class StoredObject:
     geometry_revision: str
     frame: ObjectFrame = None
     fiber: dict = None
+    track: dict = None
 
     @property
     def metadata_sha256(self):
-        return content_sha256(adapter_metadata(self.kind, self.meta, self.fiber))
+        return content_sha256(adapter_metadata(self.kind, self.meta, self.fiber, self.track))
 
     def provenance(self):
         """``metadata`` is what the adapter read, so a client compares it
@@ -224,7 +239,7 @@ class StoredObject:
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
                 'object_revision': self.object_revision,
                 'geometry_revision': self.geometry_revision,
-                'metadata': adapter_metadata(self.kind, self.meta, self.fiber),
+                'metadata': adapter_metadata(self.kind, self.meta, self.fiber, self.track),
                 'metadata_sha256': self.metadata_sha256,
                 'scale_factor': self.frame.scale_factor}
 
@@ -299,7 +314,7 @@ class InputSnapshot:
             'units': FIT_UNITS,
             'approved_links_only': self.request.approved_links_only,
             'selection': {
-                kind: {'selector': dataclasses.asdict(self.request.selector(kind)),
+                kind: {'selector': self.request.selector(kind).provenance(),
                        'count': len(self.objects_of(kind))}
                 for kind in KINDS},
             'objects': [obj.provenance() for obj in self.objects.values()],
@@ -611,7 +626,7 @@ def read_snapshot(store, request, uuids=None):
             meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
             object_revision=revision['uuid'],
             geometry_revision=revision['geometry_revision'], frame=frame,
-            fiber=record.get('fiber'))
+            fiber=record.get('fiber'), track=record.get('track'))
 
     objects = {}
     for revision in usable:
@@ -688,7 +703,9 @@ class FitInputs:
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
     ``fiber_links`` holds their resolved same-winding branch links.
     ``patch_overlaps`` maps resident ids to the two-point same-surface
-    collections of materialize_patch_overlaps.
+    collections of materialize_patch_overlaps. ``tracks`` holds the track
+    collection and its crossings (materialize_tracks), or None when no track
+    is selected.
     ``dropped_attachments`` lists ``(edge UUID, reason)`` for consumed
     attachments whose quad the patch losses do not sample (on_retained_quad).
     """
@@ -703,6 +720,7 @@ class FitInputs:
     # The outer shell as a fit-frame tifxyz.Patch (materialize_outer_shell),
     # or None.
     outer_shell: object = None
+    tracks: 'TrackInputs' = None
     # Complete input/frame provenance and its digest (load_fit_inputs).
     manifest: dict = None
     digest: str = None
@@ -1211,6 +1229,150 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     return collections, counts
 
 
+@dataclasses.dataclass
+class TrackInputs:
+    """The selected tracks as the track losses read them.
+
+    ``tracks`` is a fit-frame tracks.PackedTrackCollection of the tracks lying
+    entirely inside the z window, ordered by dataset and source key (the
+    order of the packed store they were ingested from); a track's source id is
+    its row among every selected track. ``crossings`` is the exact-crossing
+    CSR over every selected track (rows are source ids): partner rows,
+    crossing point indices on both tracks, and the crossing's arclength
+    position and clearance in fit voxels.
+    """
+    tracks: object
+    crossings: dict
+
+
+# Stored track family -> the crossing kernel's family code.
+TRACK_FAMILY_CODES = {'horizontal': 0, 'vertical': 1}
+
+
+def _track_order(obj):
+    """Tracks sort by dataset, then numeric source key, then UUID."""
+    track = obj.track or {}
+    key = str(track.get('external_key') or '')
+    return (str(track.get('dataset_ref') or ''), not key.isdigit(),
+            int(key) if key.isdigit() else 0, key, obj.uuid)
+
+
+def _track_crossing_csr(snapshot, tracks, lengths, problems):
+    """The crossing CSR of the snapshot's track crossings over ``tracks``."""
+    row = {obj.uuid: index for index, obj in enumerate(tracks)}
+    records = []
+    for rel in snapshot.relationships_of('track_crossing'):
+        meta = rel.meta.get('track_crossing') or {}
+        endpoints = meta.get('endpoints') or {}
+        ends = []
+        for uuid, anchor in ((rel.a, rel.a_anchor), (rel.b, rel.b_anchor)):
+            local = _anchor_index(anchor, 'points')
+            arclength = (endpoints.get(uuid) or {}).get('arclength_voxels')
+            if local is None or arclength is None:
+                problems.append(f'track crossing {rel.uuid} lacks a point anchor '
+                                f'or arclength for {uuid}')
+            elif not 0 <= local < lengths[row[uuid]]:
+                problems.append(f'track crossing {rel.uuid} anchors point {local} '
+                                f'outside the {lengths[row[uuid]]} points of {uuid}')
+            else:
+                ends.append((row[uuid], local,
+                             float(arclength) * tracks[row[uuid]].frame.to_fit))
+        clearance = meta.get('clearance_voxels')
+        if clearance is None:
+            problems.append(f'track crossing {rel.uuid} lacks its clearance')
+        if len(ends) < 2 or clearance is None:
+            continue
+        clearance = float(clearance) * tracks[ends[0][0]].frame.to_fit
+        (a, a_local, a_position), (b, b_local, b_position) = ends
+        records.append((a, b, a_local, b_local, a_position, clearance))
+        records.append((b, a, b_local, a_local, b_position, clearance))
+    table = np.array(records, dtype=np.float64).reshape(-1, 6)
+    table = table[np.lexsort((table[:, 1], table[:, 0]))]
+    rows = table[:, 0].astype(np.int64)
+    offsets = np.zeros(len(tracks) + 1, dtype=np.int64)
+    np.cumsum(np.bincount(rows, minlength=len(tracks)), out=offsets[1:])
+    return {
+        'source_ids': np.arange(len(tracks), dtype=np.uint64),
+        'offsets': offsets,
+        'partners': table[:, 1].astype(np.int32),
+        'self_local': table[:, 2].astype(np.int32),
+        'partner_local': table[:, 3].astype(np.int32),
+        'positions': table[:, 4].copy(),
+        'clearances': table[:, 5].copy(),
+    }
+
+
+def materialize_tracks(store, snapshot, *, z_begin, z_end):
+    """The snapshot's tracks and crossings (TrackInputs), or None without
+    tracks; and counts.
+
+    A track is kept when every point's fit-frame z lies in ``[z_begin,
+    z_end)``. Arclengths and tortuosities are measured on the stored integer
+    voxels, as the packed track store measures them, then converted to fit
+    voxels.
+    """
+    from tracks import PackedTrackCollection
+
+    tracks = sorted(snapshot.objects_of('track'), key=_track_order)
+    counts = Counter()
+    if not tracks:
+        return None, counts
+    problems = []
+    lengths = np.zeros(len(tracks), dtype=np.int64)
+    kept, stored, fit, families, scales = [], [], [], [], []
+    for index, obj in enumerate(tracks):
+        arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
+        xyz = arrays['points']
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
+            continue
+        lengths[index] = len(xyz)
+        if not len(xyz):
+            continue
+        z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
+        if z.min() < z_begin or z.max() >= z_end:
+            counts['tracks outside the z window'] += 1
+            continue
+        family = (obj.track or {}).get('family') or ''
+        kept.append(index)
+        stored.append(np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32))
+        fit.append(obj.frame.xyz_to_fit_zyx(xyz))
+        families.append(TRACK_FAMILY_CODES.get(family, -1))
+        scales.append(obj.frame.to_fit)
+    crossings = _track_crossing_csr(snapshot, tracks, lengths, problems)
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    track_lengths = np.array([len(points) for points in stored], dtype=np.int64)
+    offsets = np.zeros(len(stored) + 1, dtype=np.int64)
+    np.cumsum(track_lengths, out=offsets[1:])
+    if stored:
+        coordinates = np.concatenate(stored)
+        starts = offsets[:-1]
+        steps = np.empty(len(coordinates), dtype=np.float64)
+        steps[0] = 0.0
+        deltas = np.subtract(coordinates[1:], coordinates[:-1], dtype=np.float64)
+        steps[1:] = np.linalg.norm(deltas, axis=1)
+        steps[starts] = 0.0
+        arclengths = np.add.reduceat(steps, starts)
+        chords = np.linalg.norm(
+            coordinates[offsets[1:] - 1].astype(np.float64)
+            - coordinates[starts].astype(np.float64), axis=1)
+        tortuosities = np.full(len(stored), np.inf, dtype=np.float64)
+        np.divide(arclengths, chords, out=tortuosities, where=chords > 0)
+        arclengths = arclengths * np.asarray(scales, dtype=np.float64)
+        points = np.concatenate(fit)
+    else:
+        arclengths = tortuosities = np.empty(0, dtype=np.float64)
+        points = np.empty((0, 3), dtype=np.float32)
+    collection = PackedTrackCollection(
+        points, offsets, np.asarray(kept, dtype=np.uint64),
+        np.asarray(families, dtype=np.int8), arclengths, tortuosities)
+    counts['tracks'] = len(kept)
+    counts['track crossings'] = len(crossings['partners']) // 2
+    return TrackInputs(collection, crossings), counts
+
+
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
                 overlap_pair_spacing=8.0, overlap_max_pairs=16):
@@ -1237,10 +1399,13 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         max_pairs=overlap_max_pairs,
         first_id=len(point_collections) + len(fibers), dropped=dropped)
     counts.update(overlap_counts)
+    tracks, track_counts = materialize_tracks(store, snapshot, z_begin=z_begin, z_end=z_end)
+    counts.update(track_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
                      fiber_links, counts, dropped_attachments=dropped,
                      patch_overlaps=patch_overlaps,
-                     outer_shell=materialize_outer_shell(store, snapshot))
+                     outer_shell=materialize_outer_shell(store, snapshot),
+                     tracks=tracks)
 
 
 def materialize_from_config(store, snapshot, config):
@@ -1430,6 +1595,7 @@ def empty_family_warnings(snapshot):
         'pcl_patch': count['surface'] and count['point_collection'],
         'fiber_patch': count['surface'] and count['fiber'],
         'patch_overlap': count['surface'] > 1,
+        'track_crossing': count['track'] > 1,
     }
     families = Counter(rel.family for rel in snapshot.relationships)
     excluded = sum(snapshot.exclusions.values())
@@ -1458,7 +1624,8 @@ class LinkRefreshError(ObjectStoreInputError):
     """Startup link refresh failed; the fit must not train."""
 
 
-_SELECTOR_CONFIG = {'surface': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber'}
+_SELECTOR_CONFIG = {'surface': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber',
+                    'track': 'track'}
 _NONE = Selector(uuids=())
 
 
@@ -1480,6 +1647,8 @@ def request_from_config(config):
         selectors['surface'] = _NONE
     if not config['input_use_fibers']:
         selectors['fiber'] = _NONE
+    if not config['input_use_tracks']:
+        selectors['track'] = _NONE
     roles = {key: config[key] for key in (
         'input_use_pcl_absolute', 'input_use_pcl_relative', 'input_use_pcl_same_winding')}
     if len(set(roles.values())) > 1:
@@ -1567,6 +1736,7 @@ DETECTORS = (
     ('pcl_patch', ('surface', 'point_collection')),
     ('fiber_patch', ('surface', 'fiber')),
     ('patch_overlap', ('surface',)),
+    ('track_crossing', ('track',)),
 )
 
 
@@ -1636,6 +1806,10 @@ def refresh_links(store, snapshot, config, normal_source, cache_directory=None):
             **({'cache_directory': cache_directory} if cache_directory else {})),
         'patch_overlap': lambda: store.link_surface_overlaps(
             volume_uuid=volume, surface_uuids=selected['surface']),
+        # Crossings are exact shared voxels of the stored tracks, found with
+        # the store's default angle, tangent and clustering parameters.
+        'track_crossing': lambda: store.link_tracks_to_tracks(
+            track_uuids=selected['track'], workers=os.cpu_count() or 1),
     }
     outcomes = []
     for detector, kinds in DETECTORS:
@@ -2054,6 +2228,19 @@ def _geometry_identity(manifest):
     return manifest
 
 
+def track_identity(manifest):
+    """The tracks and track crossings a manifest records, by the identities
+    every replica shares (REPLICA_LOCAL_FIELDS left out): a fit consumes them
+    at build, so two manifests with different ones need a rebuild."""
+    compared = _compared(manifest)
+    return {
+        'objects': [entry for entry in compared.get('objects') or ()
+                    if entry.get('kind') == 'track'],
+        'relationships': [entry for entry in compared.get('relationships') or ()
+                          if entry.get('family') == 'track_crossing'],
+    }
+
+
 def input_summary(inputs):
     """A small description of materialized inputs for a status poll: their
     identity (digest, store, fit volume) and counts. The manifest holds the
@@ -2233,8 +2420,7 @@ def _parse_args(argv):
     parser.add_argument('store')
     parser.add_argument('--volume', help='fit volume UUID (default: inferred)')
     parser.add_argument('--approved-only', action='store_true')
-    for kind, flag in (('surface', 'patch'), ('point_collection', 'pcl'),
-                       ('fiber', 'fiber')):
+    for kind, flag in _SELECTOR_CONFIG.items():
         parser.add_argument(f'--{flag}-uuid', action='append', dest=f'{kind}_uuids')
         parser.add_argument(f'--{flag}-tag', action='append', dest=f'{kind}_tags')
     parser.add_argument('--z-begin', type=int,

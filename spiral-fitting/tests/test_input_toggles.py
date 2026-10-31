@@ -33,14 +33,12 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     }).as_dict()
     paths = SpiralInputPaths(
         umbilicus="/inputs/umbilicus.json",
-        tracks_dbm="/inputs/tracks.dbm",
         lasagna="/inputs/s.lasagna.json",
         winding_inference="/inputs/winding",
     )
 
     context = make_context(config, paths)
 
-    assert context.tracks_dbm_path is None
     assert context.lasagna_source is None
     assert context.winding_inference_path is None
     assert context.config["loss_weight_track_radius"] == 73.0

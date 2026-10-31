@@ -78,6 +78,32 @@ def put_fiber(db, line_zyxs, control_positions, control_ids=None, *,
                coordinates=coordinates, **record)
 
 
+def put_track(db, stored_zyxs, key, family, *, dataset='tracks.vctracks',
+              coordinates=frame(), **record):
+    """A track from stored integer ZYX voxels, as a packed track store row
+    ``key`` of ``dataset`` ingests it."""
+    xyz = np.asarray(stored_zyxs, dtype=np.int64)[:, ::-1]
+    return put(db, 'track', [array('points', xyz, '<i4')],
+               coordinates=coordinates,
+               track={'dataset_ref': dataset, 'external_key': str(key),
+                      'family': family}, **record)
+
+
+def crossing_edge(db, a, a_index, a_arclength, b, b_index, b_arclength,
+                  clearance, **record):
+    """An explicit track crossing at stored point indices, its arclength
+    positions and clearance in stored voxels."""
+    anchor = lambda index: {'points': [{'array': 'points', 'index': [index]}]}
+    return db.add_edge({
+        'kind': 'crossing', 'a': a, 'b': b,
+        'a_anchor': anchor(a_index), 'b_anchor': anchor(b_index),
+        'meta': {'track_crossing': {
+            'clearance_voxels': clearance,
+            'endpoints': {a: {'arclength_voxels': a_arclength},
+                          b: {'arclength_voxels': b_arclength}}}},
+        **record})
+
+
 def branch(db, a, a_control_id, b, b_control_id, *, adjacent=False, **record):
     anchor = lambda ident: {'points': [{'array': 'control_point_ids',
                                          'index': [ident]}],

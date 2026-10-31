@@ -85,16 +85,10 @@ from dt_targets import (
 from tracks import (
     PackedTrackCollection,
     configure_prepared_track_sampling,
-    crossing_cache_in_fit_frame,
     filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
     iter_track_losses,
-    load_track_crossing_cache,
-    load_tracks_from_dbm,
     prepare_main_phase_tracks,
-    track_crossing_cache_path,
-    track_store_z_range,
-    tracks_in_fit_frame,
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
@@ -1071,9 +1065,6 @@ class FitContext:
         self.fiber_directions_path = (
             (paths.fiber_directions or None)
             if input_source_enabled(config, 'fiber_directions') else None)
-        self.tracks_dbm_path = (
-            (paths.tracks_dbm or None)
-            if input_source_enabled(config, 'tracks_dbm') else None)
 
         # Deployment/presentation values.
         self.cache_path = cache_dir if cache_dir is not None else (paths.cache_directory or None)
@@ -1313,9 +1304,9 @@ class FitContext:
         """Load and prepare every host-side input for a fit.
 
         Seeds the host RNG streams, then reads patches, point collections,
-        fibers and their relationships from the object store
+        fibers, tracks and their relationships from the object store
         (object_store_inputs.load_fit_inputs: one link refresh, then a frozen
-        snapshot), loads tracks and the outer shell, classifies the point
+        snapshot), builds the track crossing graph, classifies the point
         constraints; builds the sampling caches, host-prepared patch atlases, the
         trusted-geometry index and the whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
@@ -1339,7 +1330,7 @@ class FitContext:
         - sampling: patch_sampling_probabilities, patch_atlas
         - trusted geometry: trusted_geometry_tree
         - tracks: tracks, track_families, track_source_ids,
-          track_crossing_cache, track_graph, track_reload_source /
+          track_graph, track_reload_source /
           _families / _source_ids, track_sampling_config, using_tracks,
           filter_tracks_by_shell
         - misc: umbilicus, scroll_zarr, shell_envelope,
@@ -1384,9 +1375,9 @@ class FitContext:
         # Outer shell and object-store inputs
         # ==========================================================================
 
-        # Patches, PCLs, fibers and the outer shell come only from the object
-        # store, linked by its detectors; nothing here reads them from files
-        # or links them.
+        # Patches, PCLs, fibers, tracks and the outer shell come only from the
+        # object store, linked by its detectors; nothing here reads them from
+        # files or links them.
         if self.object_store_inputs is None:
             if not self.config['object_store_path']:
                 raise RuntimeError(
@@ -1397,7 +1388,9 @@ class FitContext:
         # request refused a store without one when the fit needs it.
         shell_patch = (self.object_store_inputs.outer_shell
                        if input_source_enabled(self.config, 'outer_shell') else None)
-        filter_tracks_by_shell = bool(self.tracks_dbm_path) and shell_patch is not None
+        track_inputs = (self.object_store_inputs.tracks
+                        if input_source_enabled(self.config, 'tracks') else None)
+        filter_tracks_by_shell = track_inputs is not None and shell_patch is not None
         verified_patches = dict(self.object_store_inputs.patches)
         print(f' loaded {len(verified_patches)} patches from the object store')
         self._derive_object_store_point_inputs(
@@ -1437,50 +1430,25 @@ class FitContext:
         track_sampling_config = validate_track_sampling_config(self.config)
         track_families = None
         track_source_ids = None
-        track_crossing_cache = None
         track_graph = None
         track_reload_source = None
         track_reload_families = None
         track_reload_source_ids = None
-        # Stored track ZYX = fit ZYX x this; crossings are rediscovered from
-        # the loaded coordinates only while it is 1 (prepare_main_phase_tracks).
-        self.track_frame_scale = 1
-        if self.tracks_dbm_path is not None:
-            progress.begin(
-                'loading', 'Resolving track store',
-                detail=os.path.basename(self.tracks_dbm_path))
-            print(f'loading tracks from {self.tracks_dbm_path}')
-            # Object-store fits declare the track frame; tracks then load in
-            # their stored frame (ROI included) and convert to fit voxels.
-            track_scale = (self._object_store_track_scale()
-                           if self.object_store_inputs is not None else 1)
-            self.track_frame_scale = track_scale
-            track_z_lo, track_z_hi = track_store_z_range(
-                self.z_begin, self.z_end, track_scale)
-            if track_scale != 1:
-                print(f'tracks: stored coordinates = fit voxels x {track_scale:g}')
+        if track_inputs is not None:
+            # The store's tracks lying in the z window, in fit voxels, with
+            # the crossings its track-crossing detector linked.
+            tracks = track_inputs.tracks
             if track_sampling_config['crossing_precompute_max'] > 0:
-                track_crossing_cache = crossing_cache_in_fit_frame(
-                    load_track_crossing_cache(self.tracks_dbm_path), track_scale)
-                if track_crossing_cache is None and track_scale != 1:
-                    raise RuntimeError(
-                        'the track crossing cache is unusable; with '
-                        f'track_scale_factor {track_scale:g} crossings come '
-                        'only from it')
-                if track_crossing_cache is not None:
-                    track_graph = TrackGraph(track_crossing_cache)
-                    print(
-                        f'built TrackGraph: {len(track_graph)} tracks, '
-                        f'{track_graph.edge_count} crossings in '
-                        f'{track_graph.build_seconds:.1f}s')
-                    track_crossing_cache = None
-                tracks, track_families, track_source_ids = load_tracks_from_dbm(
-                    self.tracks_dbm_path, track_z_lo, track_z_hi, return_families=True,
-                    return_source_ids=True, progress=progress)
-            else:
-                tracks = load_tracks_from_dbm(
-                    self.tracks_dbm_path, track_z_lo, track_z_hi, progress=progress)
-            tracks = tracks_in_fit_frame(tracks, track_scale)
+                progress.begin(
+                    'loading', 'Building track crossing graph',
+                    detail=f'{len(track_inputs.crossings["partners"]) // 2:,} crossings')
+                track_graph = TrackGraph(track_inputs.crossings)
+                print(
+                    f'built TrackGraph: {len(track_graph)} tracks, '
+                    f'{track_graph.edge_count} crossings in '
+                    f'{track_graph.build_seconds:.1f}s')
+                track_families = tracks.selected_family_codes
+                track_source_ids = tracks.selected_source_ids
             track_reload_source = tracks
             track_reload_families = track_families
             track_reload_source_ids = track_source_ids
@@ -1523,7 +1491,6 @@ class FitContext:
         self.tracks = tracks
         self.track_families = track_families
         self.track_source_ids = track_source_ids
-        self.track_crossing_cache = track_crossing_cache
         self.track_graph = track_graph
         self.track_reload_source = track_reload_source
         self.track_reload_families = track_reload_families
@@ -1651,34 +1618,6 @@ class FitContext:
             patches, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
         )
 
-    def _object_store_track_scale(self):
-        """The declared track_scale_factor of an object-store fit attaching a
-        track store (stored track ZYX = fit ZYX x it); None without tracks."""
-        if not self.tracks_dbm_path:
-            return None
-        scale = self.config['track_scale_factor']
-        if scale is None:
-            raise RuntimeError(
-                'a track store is attached to an object-store fit: declare '
-                'track_scale_factor (stored track coordinates = fit-volume '
-                'voxel coordinates x it); it is never inferred')
-        scale = float(scale)
-        if scale != 1 and self.config['track_crossing_precompute_max'] > 0:
-            # Exact-voxel crossing discovery works on integer stored
-            # coordinates: crossings must come from the stored-frame cache,
-            # and point-level exclusion would rediscover them on scaled ones.
-            if not track_crossing_cache_path(self.tracks_dbm_path).is_file():
-                raise RuntimeError(
-                    f'track_scale_factor {scale:g} needs the track store\'s '
-                    'crossing cache (build_track_crossings.py), found in the '
-                    'stored frame; crossings are not rediscovered in fit voxels')
-            if float(self.config['track_exclusion_radius']) > 0:
-                raise RuntimeError(
-                    f'track_scale_factor {scale:g} with track crossings needs '
-                    'track_exclusion_radius 0: exclusion would rediscover '
-                    'crossings from scaled coordinates')
-        return scale
-
     @property
     def lasagna_group(self):
         """The Lasagna arrays' name, or None when the fit reads no dataset."""
@@ -1693,16 +1632,14 @@ class FitContext:
     def _external_input_frames(self):
         """Frames of the inputs read outside the object store, for the input
         manifest. Each is declared in fit-volume voxels: the umbilicus by its
-        coordinate scale, lasagna stores by their downsampling, tracks by
-        track_scale_factor; the others by their existing contract."""
+        coordinate scale, lasagna stores by their downsampling; the others by
+        their existing contract (store objects declare their own frames)."""
         frames = {'umbilicus': {
             'coordinate_scale': float(self.scroll.umbilicus_coordinate_scale)}}
         if self.lasagna_source is not None:
             frames['lasagna'] = {'identity': self.lasagna_source.identity,
                                  'group': self.lasagna_source.group,
                                  'downsampling': int(self.lasagna_scale)}
-        if self.tracks_dbm_path:
-            frames['tracks'] = {'scale_factor': self._object_store_track_scale()}
         for name, path in (('fiber_directions', self.fiber_directions_path),
                            ('winding_inference', self.winding_inference_path)):
             if path:
@@ -2510,16 +2447,16 @@ class FitContext:
                 sampling_config=self.track_sampling_config,
                 track_families=self.track_families,
                 track_source_ids=self.track_source_ids,
-                crossing_cache=self.track_crossing_cache,
                 track_graph=self.track_graph,
                 progress=self.progress,
-                rediscover_crossings=getattr(self, 'track_frame_scale', 1) == 1,
             )
-            # The sidecar CSR is setup-only. The prepared bundle now owns only its
-            # fixed-width training tables, so release the whole-DB graph promptly.
+            # The crossing graph is setup-only. The prepared bundle now owns only
+            # its fixed-width training tables, so release the graph promptly.
             if interactive_driver is None:
-                self.track_crossing_cache = None
                 self.track_graph = None
+                # The store's crossing CSR backs the graph: release it too.
+                if self.object_store_inputs.tracks is not None:
+                    self.object_store_inputs.tracks.crossings = None
             # With the usual zero exclusion radius, the training bundle already
             # contains every authoritative track point as one flat CPU tensor.  Reuse it
             # for preview bounds instead of walking millions of short NumPy tracks.
@@ -3481,10 +3418,8 @@ class FitContext:
                     sampling_config=validate_track_sampling_config(self.config),
                     track_families=self.track_families,
                     track_source_ids=self.track_source_ids,
-                    crossing_cache=self.track_crossing_cache,
                     track_graph=self.track_graph,
-                    progress=self.progress,
-                    rediscover_crossings=getattr(self, 'track_frame_scale', 1) == 1)
+                    progress=self.progress)
                 replace_prepared_tracks = True
 
             target_tracks = (
@@ -3984,9 +3919,9 @@ class FitContext:
 
         Raises InputReplacementRefused when the inputs cannot replace these
         without changing more than supervision: another fit volume or
-        external frames (the model's frame), or track exclusion masks that
-        depend on the trusted geometry. Returns the candidate for
-        replace_inputs().
+        external frames (the model's frame), track exclusion masks that
+        depend on the trusted geometry, or other tracks or crossings than the
+        fit prepared. Returns the candidate for replace_inputs().
         """
         current = getattr(self, 'object_store_inputs', None)
         if current is None or current.manifest is None:
@@ -4001,6 +3936,11 @@ class FitContext:
         if self.using_tracks and float(self.config['track_exclusion_radius']) > 0:
             problems.append('track exclusion masks depend on the trusted geometry of the '
                             'inputs (track_exclusion_radius > 0)')
+        # Tracks and their crossings are consumed at build (the prepared
+        # track tables).
+        from object_store_inputs import track_identity
+        if track_identity(current.manifest) != track_identity(inputs.manifest):
+            problems.append('the tracks or their crossings differ from the fit\'s')
         if problems:
             raise InputReplacementRefused(
                 'the inputs cannot replace this fit\'s; rebuild it instead: ' + '; '.join(problems))

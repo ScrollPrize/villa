@@ -82,15 +82,16 @@ def test_a_specification_naming_retired_patch_or_fiber_paths_still_parses(tmp_pa
         "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
         "spiral_outward_sense": "CW",
         "paths": {"verified_patches": "patches", "fibers": "fibers",
-                  "outer_shell": "shell"}}, tmp_path)
+                  "outer_shell": "shell", "tracks_dbm": "tracks/t.dbm"}}, tmp_path)
     assert dict(spec.path_overrides) == {}
-    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {"verified_patches", "fibers", "outer_shell"}
+    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {
+        "verified_patches", "fibers", "outer_shell", "tracks_dbm"}
 
 
 def test_source_toggles_and_dependencies_are_centralized():
-    assert input_source_enabled({}, "tracks_dbm") is True
-    assert input_source_enabled({"input_use_tracks": False}, "tracks_dbm") is False
-    assert fit_input("tracks_dbm").enabled({"input_use_tracks": False}) is False
+    assert input_source_enabled({}, "tracks") is True
+    assert input_source_enabled({"input_use_tracks": False}, "tracks") is False
+    assert fit_input("tracks_dbm") is None
 
     winding = {"dense_spacing_mode": "winding_model"}
     assert winding_inference_enabled(winding) is True

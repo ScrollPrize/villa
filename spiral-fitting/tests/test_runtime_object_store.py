@@ -133,7 +133,8 @@ def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
     assert status['input_digest'] == inputs.digest
     summary = status['input_summary']
     assert summary['digest'] == inputs.digest
-    assert summary['selection'] == {'surface': 2, 'point_collection': 1, 'fiber': 0}
+    assert summary['selection'] == {'surface': 2, 'point_collection': 1, 'fiber': 0,
+                                    'track': 0}
     assert summary['relationships'] == {'pcl_patch': 3}
     # The status lists the inputs read by path, and the store's by digest.
     manifest = status['input_manifest']

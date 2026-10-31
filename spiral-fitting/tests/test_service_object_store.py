@@ -451,7 +451,7 @@ def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store)
     assert inputs['ok'] and inputs['volume_uuid'] == '20260411134726'
     assert inputs['volume_source'] == 'inferred'
     assert {kind: entry['count'] for kind, entry in inputs['selection'].items()} == {
-        'surface': 2, 'point_collection': 1, 'fiber': 1}
+        'surface': 2, 'point_collection': 1, 'fiber': 1, 'track': 0}
     assert inputs['selection']['fiber']['scales'] == [[2.0, 1]]
     assert inputs['selection']['surface']['description'] == 'all active'
     assert inputs['relationships'] == {'pcl_patch': 1}

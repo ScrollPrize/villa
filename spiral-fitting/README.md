@@ -135,7 +135,9 @@ direction of its cross-product normal, which renders correct with
 `flip-normals = not left_handed_coordinates`.
 
 Optional `paths` object for per-input overrides when a dataset's file names
-don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
+don't match the catalog's conventional defaults (e.g. `fiber_directions`).
+Overrides of inputs that now come from the object store (`verified_patches`,
+`fibers`, `outer_shell`, `tracks_dbm`) are ignored.
 
 Also optional, and easy to get wrong silently: `lasagna_scale` (default `4`),
 the Lasagna arrays' downsampling relative to the fit volume. The arrays
@@ -167,22 +169,19 @@ Example (PHerc0826, whose Lasagna arrays are a 4x downsample of its fit volume):
   "name": "PHerc0826",
   "voxel_size_um": 9.362,
   "spiral_outward_sense": "CW",
-  "lasagna_scale": 4,
-  "paths": {
-    "tracks_dbm": "tracks/PHerc0826_20250821151701_surface_m7_L0_th0.2.dbm"
-  }
+  "lasagna_scale": 4
 }
 ```
 
 ## Object-store inputs
 
-`fit_spiral.py` reads patches, fibers and point collections (PCLs), and the
-relationships between them, from a `vc_object_store` database
-(`object_store_inputs.py`). It never reads patch directories, fiber JSONs or
-PCL documents, and never links points to patches itself: the store's
-detectors do. The other inputs (umbilicus, lasagna normal/gradient stores,
-outer shell, fiber directions, winding inference, tracks) still come from the
-dataset's conventional layout and `spiral-scroll.json`.
+`fit_spiral.py` reads patches, fibers, point collections (PCLs) and tracks,
+and the relationships between them, from a `vc_object_store` database
+(`object_store_inputs.py`). It never reads patch directories, fiber JSONs,
+PCL documents or track databases, and never links points to patches or finds
+track crossings itself: the store's detectors do. The other inputs (umbilicus,
+lasagna normal/gradient stores, fiber directions, winding inference) still
+come from the dataset's conventional layout and `spiral-scroll.json`.
 
 ### One-time dataset ingest
 
@@ -207,12 +206,16 @@ $ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
     --point-collections dataset/same_windings.json
 $ingest --scale-factor 4 --drop-dangling-branches --fiber dataset/fibers
 $ingest --scale-factor 1 --tag spiral-outer-shell --surface dataset/outer_shell
+$ingest --scale-factor S --tracks dataset/tracks/2um_ds2_ps256_surf_v2.dbm
 ```
 
 `VOLUME` names the reference volume (its catalog `metadata.json` id, or any
 stable name such as `s1-reference`); the fit infers it from the objects. Fibers
 declaring `coordinate_base_shape_zyx` need the scale that domain implies
-instead of 4. The two repair flags handle the 2026-10 Spiral dataset's defects
+instead of 4. Tracks are read from the DBM's packed `.vctracks` mirror (see
+"Packing large track databases"); `S` is their stored voxels per fit-volume
+voxel (1 when they were extracted from the fit volume itself). The two repair
+flags handle the 2026-10 Spiral dataset's defects
 (branches to fiber files that do not exist; `same_windings.json` collections
 that each number their points from 0) and are recorded on the objects.
 
@@ -221,7 +224,8 @@ stored as kind `surface`), the outer shell (a tifxyz surface tagged
 `spiral-outer-shell`), the PCL role documents, and the fiber directory with
 its same-winding branches
 (which become `fiber_branch` relationships; adjacent branches are kept but
-never used by the fit). A collection is absolute-winding when its
+never used by the fit), and tracks (`--tracks`, one object per track, keyed by
+its packed store and source ID). A collection is absolute-winding when its
 `meta.source.winding_is_absolute` is true, which the ingest sets for a
 document named `abs_winding.json`; otherwise its points' `wind_a` annotations
 make it relative, and none make it same-winding. `patch-overlap-pcls.json` is
@@ -240,10 +244,11 @@ FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
   --object-store-author me
 ```
 
-At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber}_{uuids,tags}`;
+At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber,track}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
 off select none), validates every selected object's frame, then refreshes the
-PCL-patch, fiber-patch and patch-overlap links as `--object-store-author`,
+PCL-patch, fiber-patch, patch-overlap and track-crossing links as
+`--object-store-author`,
 writing them back to the store. Detectors whose object kinds are not all
 selected are skipped. Every detector failure is reported together and stops
 the fit before training (detectors that already committed are named; a rerun
@@ -269,8 +274,10 @@ alone (with a warning). The log names the source.
 After refresh every rank reads the same frozen snapshot and materializes it:
 patch grids, PCL points by stable ID with their `wind_a`, fibers trimmed and
 decimated with every patch contact and branch endpoint kept, branch links,
-and patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
-group `patch_overlaps`). Attachments on patch quads the losses do not sample
+patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
+group `patch_overlaps`), and the tracks lying entirely inside the z window
+with the crossing CSR of their `crossing` relationships, from which the fit
+builds its track crossing graph. Track-surface relationships are not used. Attachments on patch quads the losses do not sample
 are dropped and reported. The ranks' input digests must agree. The log prints
 the selection, consumed relationships and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
@@ -318,8 +325,9 @@ object without a declared frame, or frames naming different volumes, is an
 error; nothing is assumed to be at scale 1. The umbilicus keeps its
 `spiral-scroll.json` coordinate scale and lasagna stores their
 `lasagna_scale`; the outer shell, fiber directions and winding inference are
-in fit-volume voxels. A track store declares `track_scale_factor` (stored
-track coordinates = fit voxels × it); it is never inferred.
+in fit-volume voxels. Tracks declare their frames like every other object;
+their crossings are found on the stored integer voxels and their arclength
+positions and clearances converted to fit voxels.
 
 ### Tests and smoke checks
 
@@ -332,13 +340,15 @@ PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin
   spiral-fitting/tests/test_object_store_materialize.py \
   spiral-fitting/tests/test_object_store_fibers.py \
   spiral-fitting/tests/test_object_store_overlaps.py \
+  spiral-fitting/tests/test_object_store_tracks.py \
   spiral-fitting/tests/test_object_store_startup.py
 ```
 
 These build small stores and cover selection, frames and scales, refresh and
 its idempotency, aggregated failures, read-only and approved-only modes,
-two-rank startup (success, failure, manifest mismatch), resume refusal, track
-scales, and the runtime constraints against
+two-rank startup (success, failure, manifest mismatch), resume refusal, tracks
+and their crossings (equal to the ones Spiral's own exact-crossing builder
+finds), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
 produced from the same fixture. An opt-in startup test refreshes and
 materializes a real store (give it a scratch copy: it writes links):
@@ -576,9 +586,9 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the inputs: it is launched
-with `--dataset` (tracks, fiber directions, winding inference and an
+with `--dataset` (fiber directions, winding inference and an
 optional scroll specification), `--object-store`
-(patches, point collections, fibers and their links; see
+(patches, point collections, fibers, tracks and their links; see
 [Object-store inputs](#object-store-inputs)) and `--output` (all generated
 state), resolves them once at startup, and advertises the result through
 `/dataset`. The scroll's facts, the umbilicus and the Lasagna stores come
@@ -1291,21 +1301,19 @@ python convert_track_store.py \
 
 This writes `2um_ds2_ps256_surf_v2.dbm.vctracks/` atomically. The directory
 contains contiguous coordinates, ragged offsets, source IDs, family codes,
-Z bounds, arclengths, and tortuosities. `fit_spiral.py` automatically prefers
-a current adjacent packed store while retaining the DBM as the authoritative
-source and compatibility fallback. A source-file fingerprint prevents a stale
+Z bounds, arclengths, and tortuosities. It is what `vc_object_ingest --tracks`
+imports into an object store (fits read tracks only from there), while the DBM
+stays the authoritative source. A source-file fingerprint prevents a stale
 store from being used after the DBM changes; rerun with `--force` to replace it.
-
-The native `vc_spiral.track_store` loader memory-maps the packed files, applies the Z
-ROI from per-track metadata, and emits one compact float32 ragged array without
-constructing per-track Python objects. The crossing builder also stages
-directly from a current packed store, bypassing DBM and pickle decoding.
+The crossing builder below also stages directly from a current packed store,
+bypassing DBM and pickle decoding.
 
 ## Caching exact track crossings
 
-Crossing-connected track sampling needs the exact shared voxels between the
-horizontal and vertical track families. Build that index once as a CSR
-sidecar instead of sorting every track point whenever a fit session loads:
+A fit takes its track crossings from the object store (its link refresh runs
+the store's track-crossing detector, which uses the same exact-crossing
+kernel). `grow_track_graph.py` instead reads them from a CSR sidecar beside
+the DBM; build it once:
 
 ```sh
 python build_track_crossings.py \
@@ -1334,15 +1342,10 @@ the temporary workspace is created beside the tracks DBM rather than under the
 system temporary directory.
 
 The script writes
-`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically.
-`fit_spiral.py` finds it automatically from the configured tracks path. The
-sidecar includes a fingerprint of every DBM backing file; a stale or malformed
-file is ignored and the fitter falls back to its in-memory exact crossing
-scan. Re-run the builder after changing the DBM (`--force` replaces a current
-cache). A range-limited sidecar can serve the same or a narrower fitting Z
-range; building another range replaces it. Point-level track exclusion also
-uses the fallback because clipping a
-track changes its crossing-local indices.
+`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically. The
+sidecar includes a fingerprint of every DBM backing file, so a stale one is
+rebuilt rather than reused. Re-run the builder after changing the DBM
+(`--force` replaces a current cache); building another range replaces it.
 
 ## Converting track DBMs to OME-Zarr
 

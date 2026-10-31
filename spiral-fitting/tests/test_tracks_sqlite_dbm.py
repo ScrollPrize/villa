@@ -52,9 +52,11 @@ class SQLiteTrackDBMTests(unittest.TestCase):
                 with tracks.open_tracks_dbm(path) as database:
                     self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
                     self.assertEqual(len(pickle.loads(database[b'h:0'])), 1)
-                loaded = tracks.load_tracks_from_dbm(path, show_progress=False)
-            self.assertEqual(len(loaded), 2)
-            self.assertEqual(sorted(len(track) for track in loaded), [21, 21])
+                # The packed store the object store ingests reads it too.
+                packed = tracks.write_packed_track_store(
+                    path, Path(temporary) / 'packed.vctracks', show_progress=False)
+            offsets = np.fromfile(packed / 'offsets.i64', dtype=np.int64)
+            self.assertEqual(np.diff(offsets).tolist(), [21, 21])
 
     @unittest.skipUnless(importlib.util.find_spec('dbm.sqlite3'), 'needs dbm.sqlite3 (Python >= 3.13)')
     def test_native_dbm_path_is_unchanged(self):

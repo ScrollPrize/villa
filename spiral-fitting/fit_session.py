@@ -198,7 +198,12 @@ from surface_orientation import spiral_outward_sense_for
 # fit with the fiber-direction loss reads the samples extracted for that
 # identity and scale from the cache (<cache>/fiber-directions/), not the
 # dataset's fiber_directions.npz.
-API_VERSION = 43
+# 44: tracks come from the object store. paths no longer carries "tracks_dbm"
+# (neither /dataset nor a load request names a track database); the fit reads
+# the selected tracks (object_store_track_uuids/_tags, input_use_tracks) and
+# their crossing links, which its link refresh makes. The input manifest lists
+# tracks and track_crossing relationships like any other input.
+API_VERSION = 44
 
 
 class SessionState(str, Enum):
@@ -246,7 +251,7 @@ def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
-    "tracks_dbm": "input_use_tracks",
+    "tracks": "input_use_tracks",
     "fibers": "input_use_fibers",
     "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
@@ -283,10 +288,6 @@ def _always(config: Mapping[str, Any]) -> bool:
 
 def _never(config: Mapping[str, Any]) -> bool:
     return False
-
-
-def _tracks_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "tracks_dbm")
 
 
 def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
@@ -365,7 +366,7 @@ class FitInputSpec:
 
     # SpiralInputPaths field name (and manifest/path-change key).
     key: str
-    # "file" | "directory" | "dbm" | "lasagna".
+    # "file" | "directory" | "lasagna".
     kind: str
     # File contents must parse as JSON.
     json_content: bool = False
@@ -394,9 +395,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  conventional_relative="fiber_directions.npz",
                  enabled=fiber_directions_required,
                  required=fiber_directions_required),
-    FitInputSpec("tracks_dbm", "dbm",
-                 conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm",
-                 enabled=_tracks_enabled),
     # The Lasagna dataset (lasagna_source): a *.lasagna.json manifest, by
     # convention the one in lasagna_inputs/ (LASAGNA_MANIFEST_DIRECTORY).
     FitInputSpec("lasagna", "lasagna",
@@ -421,7 +419,6 @@ class SpiralInputPaths:
     dataset_root: str = ""
     umbilicus: str = ""
     fiber_directions: str = ""
-    tracks_dbm: str = ""
     lasagna: str = ""
     winding_inference: str = ""
     scroll_zarr: str = ""
@@ -548,7 +545,8 @@ SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(spec.key for spec in FIT_INPUT_CATALOG)
 # Overrides of inputs that now come from the object store (the outer shell is
 # its surface tagged spiral-outer-shell). A specification written for the
 # file-input service may still name them; they are ignored.
-RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers", "outer_shell")
+RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers", "outer_shell",
+                              "tracks_dbm")
 
 # The directory whose one *.lasagna.json is a dataset's Lasagna dataset.
 LASAGNA_MANIFEST_DIRECTORY = "lasagna_inputs"
@@ -1259,7 +1257,6 @@ def conventional_input_paths(
         dataset_root=str(root),
         umbilicus=resolve("umbilicus"),
         fiber_directions=resolve("fiber_directions"),
-        tracks_dbm=resolve("tracks_dbm"),
         lasagna=(spec.path_override("lasagna")
                  or find_dataset_manifest(f"{root}/{LASAGNA_MANIFEST_DIRECTORY}")),
         winding_inference=resolve("winding_inference"),
@@ -1277,24 +1274,6 @@ def _normalise_path(value: Any, base: Path | None = None) -> str:
         path = base / path
     # strict=False is important for proposed output/cache paths.
     return str(path.resolve(strict=False))
-
-
-def _has_dbm_backing(path: Path) -> bool:
-    if path.is_file():
-        return True
-    suffixes = (".db", ".dat", ".dir", ".bak", ".pag")
-    return any(Path(str(path) + suffix).is_file() for suffix in suffixes)
-
-
-def resolve_logical_dbm(path: str | Path) -> str:
-    """Return the DBM logical base while accepting implementation suffix files."""
-    candidate = Path(path)
-    text = str(candidate)
-    for suffix in (".db", ".dat", ".dir", ".bak", ".pag"):
-        if text.endswith(".dbm" + suffix):
-            candidate = Path(text[: -len(suffix)])
-            break
-    return _normalise_path(candidate) if _has_dbm_backing(candidate) else ""
 
 
 def validate_checkpoint_container(path: str | Path) -> None:
@@ -1536,21 +1515,6 @@ def select_startup_autosave(
     return AutosaveSelection(selected=selected, rejected=tuple(rejected))
 
 
-def _dbm_candidates(root: Path) -> list[str]:
-    logical: set[str] = set()
-    tracks = root / "tracks"
-    if not tracks.is_dir():
-        return []
-    for entry in sorted(tracks.iterdir(), key=lambda item: item.name):
-        text = str(entry)
-        if ".dbm" not in entry.name:
-            continue
-        base = text[: text.index(".dbm") + len(".dbm")]
-        if _has_dbm_backing(Path(base)):
-            logical.add(_normalise_path(base))
-    return sorted(logical)
-
-
 def default_user_cache_dir() -> str:
     """The one documented user cache location, outside any dataset.
 
@@ -1586,9 +1550,8 @@ def resolve_dataset_root(
         result.scroll_spec = {**fields, "path_overrides": overrides}
 
     for input_spec in FIT_INPUT_CATALOG:
-        # DBM inputs need backing-file probing (below); the project supplies
-        # PROJECT_INPUT_KEYS.
-        if (input_spec.kind == "dbm" or not input_spec.conventional_relative
+        # The project supplies PROJECT_INPUT_KEYS.
+        if (not input_spec.conventional_relative
                 or input_spec.key in PROJECT_INPUT_KEYS):
             continue
         override = overrides.get(input_spec.key, "")
@@ -1602,21 +1565,6 @@ def resolve_dataset_root(
             result.missing_required.append(input_spec.key)
         else:
             result.missing_optional.append(input_spec.key)
-
-    tracks_override = overrides.get("tracks_dbm", "")
-    preferred = Path(tracks_override) if tracks_override \
-        else root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
-    preferred_logical = resolve_logical_dbm(preferred)
-    if preferred_logical:
-        result.resolved["tracks_dbm"] = preferred_logical
-    else:
-        candidates = _dbm_candidates(root)
-        if len(candidates) == 1:
-            result.resolved["tracks_dbm"] = candidates[0]
-        elif len(candidates) > 1:
-            result.ambiguities["tracks_dbm"] = candidates
-        else:
-            result.missing_optional.append("tracks_dbm")
 
     # Dataset resolution describes inputs only. The service binds the
     # startup-resolved --output/--cache into the advertised resolution
@@ -1712,10 +1660,6 @@ def validate_session_request(
         elif spec.kind == "lasagna":
             check_lasagna(getattr(paths, spec.key), spec.key,
                           required=spec.required(run.config))
-        elif spec.kind == "dbm":
-            value = getattr(paths, spec.key)
-            if value and not resolve_logical_dbm(value):
-                errors.append({"field": spec.key, "message": "DBM logical base or backing file was not found"})
 
     # The Lasagna store requirements (see the catalog's predicates) are
     # checked after the dense-spacing mode below, so an invalid mode errors

@@ -5,22 +5,15 @@ import tempfile
 import unittest
 
 import numpy as np
-import torch
 
 from build_track_crossings import build_cache
 from tracks import (
-    PackedTrackCollection,
     _build_crossing_partner_csr,
     _db_signatures_match,
     _load_native_track_crossings,
     _pack_track_points,
-    _restrict_crossing_partner_csr,
     load_track_crossing_cache,
-    load_tracks_from_dbm,
-    prepare_main_phase_tracks,
-    _sample_prepared_track_points,
     track_crossing_cache_path,
-    write_packed_track_store,
 )
 
 
@@ -59,75 +52,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 cache['offsets'][1:] - cache['offsets'][:-1], [1, 0, 1])
 
-    def test_fit_remaps_whole_db_cache_after_z_filtering(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            build_cache(path, show_progress=False)
-            cache = load_track_crossing_cache(path)
-            tracks, families, source_ids = load_tracks_from_dbm(
-                path, 0, 20, return_families=True,
-                return_source_ids=True, show_progress=False)
-
-            prepared = prepare_main_phase_tracks(
-                tracks, None, 0.0, 'cpu',
-                sampling_config={
-                    'track_crossing_precompute_max': 1,
-                    'track_max_track_crossing_per_step': 1,
-                },
-                track_families=families,
-                track_source_ids=source_ids,
-                crossing_cache=cache,
-            )
-
-            horizontal = families.index('horizontal')
-            vertical = families.index('vertical')
-            self.assertIn('crossing_index', prepared)
-            self.assertEqual(
-                int(prepared['crossing_index_stats']['directed_crossings']), 2)
-            probabilities = np.zeros(len(families), dtype=np.float32)
-            probabilities[horizontal] = 1
-            prepared['sampling_probabilities'] = torch.from_numpy(probabilities)
-            sample = _sample_prepared_track_points(prepared, 1, 4)
-            self.assertEqual(sample['track_idx'].tolist(), [horizontal, vertical])
-            np.testing.assert_array_equal(
-                sample['sampled_scroll'][sample['primary_cross_flat'][0]].numpy(),
-                sample['sampled_scroll'][sample['partner_cross_flat'][0]].numpy())
-
-    def test_packed_store_loads_and_prepares_without_track_objects(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            build_cache(path, show_progress=False)
-            cache = load_track_crossing_cache(path)
-            write_packed_track_store(path, show_progress=False)
-            build_cache(
-                path, force=True, z_lo=0, z_hi=20,
-                show_progress=False)
-            cache = load_track_crossing_cache(
-                path, expected_z_range=(0, 20))
-
-            tracks, family_codes, source_ids = load_tracks_from_dbm(
-                path, 0, 20, return_families=True,
-                return_source_ids=True, show_progress=False)
-
-            self.assertIsInstance(tracks, PackedTrackCollection)
-            self.assertEqual(len(tracks), 2)
-            np.testing.assert_array_equal(family_codes, [0, 1])
-            np.testing.assert_array_equal(source_ids, [0, 1 << 32])
-            prepared = prepare_main_phase_tracks(
-                tracks, None, 0.0, 'cpu',
-                sampling_config={
-                    'track_crossing_precompute_max': 1,
-                    'track_max_track_crossing_per_step': 1,
-                },
-                track_families=family_codes,
-                track_source_ids=source_ids,
-                crossing_cache=cache,
-            )
-            self.assertEqual(prepared['lengths'].tolist(), [21, 21])
-            self.assertIn('crossing_index', prepared)
-            self.assertEqual(
-                int(prepared['crossing_index_stats']['directed_crossings']), 2)
-
     def test_builder_limits_cache_to_half_open_z_range(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
@@ -141,24 +65,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             self.assertEqual(len(cache['partners']), 2)
             self.assertIsNone(load_track_crossing_cache(
                 path, warn=False, expected_z_range=(20, 40)))
-
-            tracks, families, source_ids = load_tracks_from_dbm(
-                path, 0, 20, return_families=True,
-                return_source_ids=True, show_progress=False,
-                low_memory=True)
-            self.assertTrue(all(track.dtype == np.int32 for track in tracks))
-            prepared = prepare_main_phase_tracks(
-                tracks, None, 0.0, 'cpu',
-                sampling_config={
-                    'track_crossing_precompute_max': 1,
-                    'track_max_track_crossing_per_step': 1,
-                },
-                track_families=families,
-                track_source_ids=source_ids,
-                crossing_cache=cache,
-            )
-            self.assertEqual(
-                int(prepared['crossing_index_stats']['connected_tracks']), 2)
 
     def test_hybrid_builder_uses_first_local_index_for_repeated_voxel(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -161,7 +161,7 @@ def input_upload_error():
 # Base input paths are owned by the service (every launch carries --dataset);
 # a load request may only choose among service-advertised values for these
 # keys.
-_DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm")
+_DATASET_CLIENT_SELECTABLE = ("checkpoint",)
 
 
 def parse_gpu_ids(value):
@@ -1193,7 +1193,6 @@ class ServiceState:
         # validating any client-selectable override so the manifest, validator,
         # and fitter all describe the same source set.
         selected_paths = {
-            "tracks_dbm": "tracks_dbm",
             "winding_inference": "winding_inference",
         }
         for path_key, source in selected_paths.items():
@@ -1203,19 +1202,6 @@ class ServiceState:
             paths["lasagna"] = ""
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
-
-        tracks = str(requested_paths.get("tracks_dbm") or "").strip()
-        if not input_source_enabled(config, "tracks_dbm"):
-            tracks = ""
-        if tracks:
-            candidates = set(resolution.get("ambiguities", {}).get("tracks_dbm", []))
-            if resolution["resolved"].get("tracks_dbm"):
-                candidates.add(resolution["resolved"]["tracks_dbm"])
-            if str(Path(tracks).resolve(strict=False)) not in candidates:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "tracks_dbm must be one of the service-advertised candidates",
-                               [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
-            paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
 
         resolved_request = {**request, "paths": paths}
         if include_input_config:
@@ -1715,11 +1701,12 @@ class ServiceState:
         # A session that read tracks and the store's outer shell filtered
         # its tracks against the shell at load: the fitter refuses the shell
         # atlas settings there, and only the full rebuild can apply them.
+        summary = self.session.status().get("input_summary") or {}
         return rebuild_stage(
             changed,
             shell_filtered_tracks=bool(
-                paths.tracks_dbm
-                and (self.session.status().get("input_summary") or {}).get("outer_shell")))
+                (summary.get("selection") or {}).get("track")
+                and summary.get("outer_shell")))
 
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
