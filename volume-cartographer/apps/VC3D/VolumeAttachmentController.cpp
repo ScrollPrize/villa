@@ -1,4 +1,5 @@
 #include "VolumeAttachmentController.hpp"
+#include <vc_reader/zarr.hpp>
 #include "OpenDataManifest.hpp"
 
 #include <QFutureWatcher>
@@ -74,7 +75,7 @@ bool VolumeAttachmentController::prepare(
     }
 
     VolumeAttachmentRequest prepared;
-    if (vc::project::isLocationRemote(input)) {
+    if (vcr::zarr::isRemote(input)) {
         const auto spec = vc::parseRemoteVolumeSpec(input);
         prepared.location = QString::fromStdString(spec.portableLocator);
         if (!resolveRemoteAuth(prepared.location, &prepared.auth, errorMessage)) {
@@ -187,14 +188,14 @@ bool VolumeAttachmentController::start(
             TaskResult result;
             try {
                 const std::string location = request.location.toStdString();
-                if (vc::project::isLocationRemote(location)) {
+                if (vcr::zarr::isRemote(location)) {
                     const bool anonymous = std::find(
                         request.tags.begin(), request.tags.end(),
                         vc::project::kAnonymousRemoteAuthTag) !=
                         request.tags.end();
                     result.volume = Volume::NewFromUrl(
                         location,
-                        anonymous ? vc::HttpAuth{} : request.auth,
+                        anonymous ? vcr::Auth{} : request.auth,
                         vc::project::catalogVolumeMetadata(
                             vc3d::opendata::cachedCatalog().get(), location),
                         !anonymous);
@@ -220,7 +221,7 @@ bool VolumeAttachmentController::inFlight() const
 
 bool VolumeAttachmentController::resolveRemoteAuth(
     const QString& url,
-    vc::HttpAuth* authOut,
+    vcr::Auth* authOut,
     QString* errorMessage) const
 {
     if (!authOut)
@@ -232,9 +233,9 @@ bool VolumeAttachmentController::resolveRemoteAuth(
         return true;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    *authOut = vc::loadAwsCredentials();
+    *authOut = vcr::zarr::awsCredentials().value_or(vcr::Auth{});
 
-    if (authOut->access_key.empty() || authOut->secret_key.empty()) {
+    if (authOut->user.empty() || authOut->secret.empty()) {
         const auto savedAccess =
             settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
         const auto savedSecret =
@@ -242,9 +243,10 @@ bool VolumeAttachmentController::resolveRemoteAuth(
         const auto savedToken =
             settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
         if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            authOut->access_key = savedAccess.toStdString();
-            authOut->secret_key = savedSecret.toStdString();
-            authOut->session_token = savedToken.toStdString();
+            authOut->kind = "s3";
+            authOut->user = savedAccess.toStdString();
+            authOut->secret = savedSecret.toStdString();
+            authOut->token = savedToken.toStdString();
         }
     }
 

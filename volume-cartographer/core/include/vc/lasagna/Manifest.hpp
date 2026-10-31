@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 #include <filesystem>
 #include <array>
@@ -32,7 +32,7 @@ struct LasagnaChannelGroup {
     // Remote groups: the vc_reader disk cache directory of their chunks and
     // how requests are signed (explicit keys, else AWS discovery when allowed).
     std::filesystem::path remoteCacheRoot;
-    vc::HttpAuth remoteAuth;
+    vcr::Auth remoteAuth;
     bool discoverAwsCredentials = true;
     int scaledown = 0;
     std::vector<std::string> channels;

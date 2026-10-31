@@ -1,4 +1,5 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include <vc_reader/zarr.hpp>
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include <vc_object_store/objects/Project.hpp>
 #include <vc_object_store/Uuid.hpp>
@@ -513,7 +514,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     }
 
     const std::string volumeLocation = volume.toStdString();
-    if (!vc::project::isLocationRemote(volumeLocation) &&
+    if (!vcr::zarr::isRemote(volumeLocation) &&
         !vc::project::resolveLocalPath(volumeLocation).is_absolute()) {
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "local volume path must be absolute", data};
@@ -626,7 +627,7 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     }
 
     const std::string input = location.toStdString();
-    if (!vc::project::isLocationRemote(input) &&
+    if (!vcr::zarr::isRemote(input) &&
         !vc::project::resolveLocalPath(input).is_absolute()) {
         throw AgentBridgeError{
             -32602,

@@ -12,7 +12,7 @@
 #include "utils/Json.hpp"
 #include <opencv2/core/mat.hpp>
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 namespace vcr::zarr { struct OpenOptions; }
 
@@ -46,7 +46,7 @@ public:
     // persisted beneath the process-wide remote cache root.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
-        const vc::HttpAuth& auth = {},
+        const vcr::Auth& auth = {},
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);
 
@@ -56,7 +56,7 @@ public:
     [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
-    [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
+    [[nodiscard]] const vcr::Auth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
     // Source identity before project/catalog metadata overrides: annotation IDs
     // and working levels do not rename disk caches.
@@ -107,6 +107,6 @@ protected:
     std::string remoteSourceCacheId_;  // the cache of the physical (not rebased) pyramid
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;
-    vc::HttpAuth remoteAuth_;
+    vcr::Auth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
 };

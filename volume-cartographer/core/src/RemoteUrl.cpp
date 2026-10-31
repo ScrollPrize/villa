@@ -1,5 +1,5 @@
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 #include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
@@ -101,12 +101,6 @@ std::optional<std::string> s3Location(const std::string& url)
     return "s3://" + host.substr(0, s3) + (key.empty() ? std::string() : "/" + key);
 }
 
-HttpAuth loadAwsCredentials()
-{
-    const auto keys = vcr::zarr::awsCredentials();
-    return keys ? HttpAuth{keys->user, keys->secret, keys->token, keys->region} : HttpAuth{};
-}
-
 RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
 {
     const auto fragmentPos = input.find('#');
@@ -132,30 +126,6 @@ RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
     }
     spec.useAwsSigv4 = s3Location(spec.sourceUrl).has_value();
     return spec;
-}
-
-std::string joinRemoteUrlPath(const std::string& baseUrl, const std::string& childPath)
-{
-    const auto queryPos = baseUrl.find('?');
-    std::string path = queryPos == std::string::npos
-        ? baseUrl
-        : baseUrl.substr(0, queryPos);
-    const std::string query = queryPos == std::string::npos
-        ? std::string{}
-        : baseUrl.substr(queryPos);
-
-    while (!path.empty() && path.back() == '/') {
-        path.pop_back();
-    }
-    std::size_t childStart = 0;
-    while (childStart < childPath.size() && childPath[childStart] == '/') {
-        ++childStart;
-    }
-    if (childStart < childPath.size()) {
-        path.push_back('/');
-        path.append(childPath, childStart, std::string::npos);
-    }
-    return path + query;
 }
 
 }  // namespace vc

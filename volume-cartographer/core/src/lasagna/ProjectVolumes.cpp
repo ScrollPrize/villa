@@ -91,7 +91,7 @@ std::shared_ptr<Volume> openRegularVolumeForGroup(
     if (group.isRemote()) {
         const auto auth = group.discoverAwsCredentials
             ? group.remoteAuth
-            : vc::HttpAuth{};
+            : vcr::Auth{};
         return Volume::NewFromUrl(
             location, auth, {}, group.discoverAwsCredentials);
     }

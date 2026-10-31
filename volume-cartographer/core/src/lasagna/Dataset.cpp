@@ -53,11 +53,11 @@ namespace {
 
 // Keys sign s3:// requests; otherwise public buckets are read anonymously and others
 // with discovered AWS credentials when allowed.
-[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, const vc::HttpAuth& keys, bool discover)
+[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, const vcr::Auth& keys, bool discover)
 {
-    if (!keys.empty())
+    if (!keys.kind.empty())
         if (const auto s3 = vc::s3Location(location); s3 && !vcr::zarr::isPublicLocation(*s3))
-            return vcr::zarr::s3Access(*s3, vc::readerAuth(keys));
+            return vcr::zarr::s3Access(*s3, keys);
     return vcr::zarr::resolveAccess(location, discover ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
 }
 
@@ -112,7 +112,7 @@ void fetchManifest(const std::string& location, const std::filesystem::path& pat
 
 void applyRemoteGroup(LasagnaChannelGroup& group,
                       std::filesystem::path remoteCacheRoot,
-                      const vc::HttpAuth& remoteAuth,
+                      const vcr::Auth& remoteAuth,
                       bool discoverAwsCredentials)
 {
     if (remoteCacheRoot.empty()) {
@@ -139,9 +139,9 @@ void resolveGroupLocations(
             : optionRemoteCacheRoot;
     const bool discoverAwsCredentials =
         manifest.discoverAwsCredentials && options.discoverAwsCredentials;
-    const vc::HttpAuth remoteAuth = discoverAwsCredentials
+    const vcr::Auth remoteAuth = discoverAwsCredentials
         ? options.remoteAuth
-        : vc::HttpAuth{};
+        : vcr::Auth{};
 
     for (auto& group : manifest.groups) {
         group.sourceLocation.clear();
@@ -165,7 +165,7 @@ void resolveGroupLocations(
 
         if (!manifest.remoteBaseUrl.empty()) {
             const auto key = normalizedRelativeRemoteKey(group.relativeZarrKey);
-            group.sourceLocation = vc::joinRemoteUrlPath(
+            group.sourceLocation = vcr::joinLocation(
                 manifest.remoteSourceBaseLocation.empty()
                     ? manifest.remoteBaseUrl
                     : manifest.remoteSourceBaseLocation,
@@ -211,11 +211,6 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 {
 }
 
-bool isRemoteLasagnaLocation(std::string_view location)
-{
-    return vcr::zarr::isRemote(std::string(location));
-}
-
 void downloadLasagnaManifest(const std::string& location, const std::filesystem::path& path)
 {
     fetchManifest(location, path, vcr::zarr::metadataReader(vcr::zarr::resolveAccess(location, vcr::zarr::AuthMode::Anonymous)));
@@ -239,7 +234,7 @@ MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manife
     const auto normalized = vc::normalizedRemoteUrl(manifestLocation);
     const bool hit = !options.refreshManifest && std::filesystem::is_regular_file(manifestPath);
     if (!hit) {
-        const auto keys = options.discoverAwsCredentials ? options.remoteAuth : vc::HttpAuth{};
+        const auto keys = options.discoverAwsCredentials ? options.remoteAuth : vcr::Auth{};
         fetchManifest(manifestLocation, manifestPath, options.manifestReader ? options.manifestReader
             : vcr::zarr::metadataReader(lasagnaAccess(sourceName(manifestLocation), keys, options.discoverAwsCredentials)));
     }

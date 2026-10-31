@@ -174,7 +174,7 @@ bool shouldHideCatalogRootEntry(const S3Location& loc, const std::string& keyOrP
 }
 
 RemoteListResult listS3Prefix(const QString& urlPrefix,
-                              const vc::HttpAuth& auth,
+                              const vcr::Auth& auth,
                               const QString& continuationToken = {})
 {
     RemoteListResult result;
@@ -187,7 +187,7 @@ RemoteListResult listS3Prefix(const QString& urlPrefix,
     vcr::s3::ListPage page;
     try {
         vcr::HttpOptions options;
-        options.auth = vc::readerAuth(auth);
+        options.auth = auth;
         vcr::HttpClient http(options);
         std::vector<std::uint8_t> body;
         http.get(vcr::s3::listUrl(loc->listing, "/", continuationToken.toStdString()), body);

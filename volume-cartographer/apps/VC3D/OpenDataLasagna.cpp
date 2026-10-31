@@ -162,7 +162,7 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
 std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumePkg& pkg,
                                                                    const vc::project::Entry& entry)
 {
-    if (!pkg.catalog() || vc::project::isLocationRemote(entry.location)) return std::nullopt;
+    if (!pkg.catalog() || vcr::zarr::isRemote(entry.location)) return std::nullopt;
     const auto marker = vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()).parent_path() /
                         vc::lasagna::kLasagnaRemoteMarker;
     std::error_code ec;
@@ -493,7 +493,7 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     if (manualLocation.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
-    const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
+    const auto resolvedLocation = vcr::zarr::isRemote(manualLocation)
         ? manualLocation
         : vc::project::resolveLocalPath(
               manualLocation, pkg.path().parent_path()).string();

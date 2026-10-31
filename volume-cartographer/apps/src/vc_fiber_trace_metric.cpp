@@ -1,4 +1,5 @@
 #include "FiberTraceEvaluationCli.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -278,8 +279,8 @@ CliOptions parseArgs(int argc, char** argv)
             "tangent/normal smoothness");
     }
     const bool usesRemoteManifest =
-        vc::lasagna::isRemoteLasagnaLocation(options.fiberManifest) ||
-        vc::lasagna::isRemoteLasagnaLocation(options.normalManifest);
+        vcr::zarr::isRemote(options.fiberManifest) ||
+        vcr::zarr::isRemote(options.normalManifest);
     if (usesRemoteManifest && options.remoteCacheDir.empty()) {
         failOption("remote Lasagna manifests require --remote-cache-dir");
     }

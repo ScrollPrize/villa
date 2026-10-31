@@ -27,7 +27,7 @@ namespace {
 // A catalog Zarr VC3D opens remotely.
 bool isRemoteZarr(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    return vcr::catalog::isZarrArtifact(artifact) && vc::project::isLocationRemote(artifact.url());
+    return vcr::catalog::isZarrArtifact(artifact) && vcr::zarr::isRemote(artifact.url());
 }
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
@@ -73,7 +73,7 @@ bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
     const auto source = vc::parseRemoteVolumeSpec(location).sourceUrl;
     return std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
         return entry.location == location ||
-               (vc::project::isLocationRemote(entry.location) &&
+               (vcr::zarr::isRemote(entry.location) &&
                 vc::parseRemoteVolumeSpec(entry.location).sourceUrl == source);
     });
 }

@@ -33,8 +33,4 @@ std::optional<std::string> s3Location(const std::string& url);
 // zero canonicalizes to a selector-free portable locator.
 RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input);
 
-// Append a child object path before an existing query string. The query bytes
-// are preserved exactly (no decoding, reordering, or re-encoding).
-std::string joinRemoteUrlPath(const std::string& baseUrl, const std::string& childPath);
-
 }  // namespace vc

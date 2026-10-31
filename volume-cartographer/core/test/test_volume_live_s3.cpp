@@ -161,17 +161,18 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
 
 TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")
 {
-    vc::HttpAuth invalid;
-    invalid.access_key = "INVALIDACCESSKEY";
-    invalid.secret_key = "INVALIDSECRET";
-    invalid.session_token = "INVALIDSESSIONTOKEN";
+    vcr::Auth invalid;
+    invalid.kind = "s3";
+    invalid.user = "INVALIDACCESSKEY";
+    invalid.secret = "INVALIDSECRET";
+    invalid.token = "INVALIDSESSIONTOKEN";
     invalid.region = "us-east-1";
 
     try {
         const auto volume = Volume::NewFromUrl(kVolumeUrl, invalid);
         REQUIRE(volume != nullptr);
         CHECK(volume->isRemote());
-        CHECK(volume->remoteAuth().empty());
+        CHECK(volume->remoteAuth().kind.empty());
     } catch (const std::exception& e) {
         if (requireNetwork()) {
             FAIL("invalid-credential anonymous fallback failed: " << e.what());

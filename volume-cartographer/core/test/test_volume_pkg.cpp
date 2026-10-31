@@ -18,7 +18,6 @@
 
 namespace fs = std::filesystem;
 using vc::project::Category;
-using vc::project::isLocationRemote;
 using vc::project::resolveLocalPath;
 using vc::project::validateLocation;
 using vc::project::validateSingleVolumeLocation;
@@ -37,18 +36,6 @@ fs::path tmpDir(const std::string& tag)
 } // namespace
 
 // --- Free helpers ---
-
-TEST_CASE("isLocationRemote: schemes")
-{
-    CHECK(isLocationRemote("s3://bucket/key"));
-    CHECK(isLocationRemote("s3+eu-west-1://bucket"));
-    CHECK(isLocationRemote("http://example.com"));
-    CHECK(isLocationRemote("https://example.com"));
-    CHECK_FALSE(isLocationRemote("/local/path"));
-    CHECK_FALSE(isLocationRemote("relative/path"));
-    CHECK_FALSE(isLocationRemote("file:///tmp/x"));
-    CHECK_FALSE(isLocationRemote(""));
-}
 
 TEST_CASE("resolveLocalPath: absolute, relative+base, file:// prefix")
 {

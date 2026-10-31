@@ -47,7 +47,6 @@ struct LoadOptions {
     std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
 };
 
-bool isLocationRemote(const std::string& location);
 std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 

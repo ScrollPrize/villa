@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 class CWindow;
 class Volume;
@@ -28,7 +28,7 @@ enum class VolumeAttachmentPreparationFailure {
 struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
-    vc::HttpAuth auth;
+    vcr::Auth auth;
     VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
 };
 
@@ -60,7 +60,7 @@ public:
 
     bool resolveRemoteAuth(
         const QString& url,
-        vc::HttpAuth* authOut,
+        vcr::Auth* authOut,
         QString* errorMessage = nullptr) const;
 private:
     struct TaskResult;

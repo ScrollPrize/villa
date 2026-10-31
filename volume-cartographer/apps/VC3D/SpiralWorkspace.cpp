@@ -1168,7 +1168,7 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
     for (const QString& candidate : candidates) {
         try {
             const std::string location = candidate.toStdString();
-            const std::string resolved = vc::project::isLocationRemote(location)
+            const std::string resolved = vcr::zarr::isRemote(location)
                 ? location
                 : vc::project::resolveLocalPath(
                       location, vpkg->path().parent_path()).string();

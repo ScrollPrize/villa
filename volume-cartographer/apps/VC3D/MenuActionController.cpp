@@ -1,4 +1,5 @@
 #include "MenuActionController.hpp"
+#include <vc_reader/zarr.hpp>
 #include "OpenedVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
 
@@ -485,7 +486,7 @@ void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
     if (url.trimmed().isEmpty()) {
         return;
     }
-    if (!vc::project::isLocationRemote(url.toStdString())) {
+    if (!vcr::zarr::isRemote(url.toStdString())) {
         QMessageBox::warning(_window, QObject::tr("Attach failed"),
             QObject::tr("Select a remote volume, or use Attach Volume for a local one."));
         return;
@@ -1622,7 +1623,7 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
-    dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
+    dlg.setAuthResolver([this](const QString& url, vcr::Auth* out, QString* err) {
         auto* attachment = _window
             ? _window->_volumeAttachmentController.get()
             : nullptr;
@@ -1936,7 +1937,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
         if (location.isEmpty())
             return;
-        if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
+        if (!vcr::zarr::isRemote(location.toStdString())) {
             QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, https://, or sftp:// manifest."));
             return;
         }
@@ -1965,7 +1966,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             const auto localManifest = std::filesystem::path(location.toStdString());
             const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(localManifest);
             const auto remoteGroup = std::find_if(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
-                return vc::lasagna::isRemoteLasagnaLocation(group.relativeZarrKey);
+                return vcr::zarr::isRemote(group.relativeZarrKey);
             });
             if (remoteGroup != parsed.groups.end()) {
                 needsRemoteCache = true;
@@ -1978,7 +1979,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
                     const auto marker = utils::Json::parse_file(markerPath);
                     const auto artifactUrl = marker.value(
                         "artifact_url", std::string{});
-                    if (vc::lasagna::isRemoteLasagnaLocation(artifactUrl)) {
+                    if (vcr::zarr::isRemote(artifactUrl)) {
                         needsRemoteAuth = true;
                         authLocation = QString::fromStdString(artifactUrl);
                     }

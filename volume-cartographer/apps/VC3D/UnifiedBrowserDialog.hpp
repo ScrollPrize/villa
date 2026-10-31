@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <functional>
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 class QButtonGroup;
 class QCheckBox;
@@ -32,7 +32,7 @@ public:
     void setStartUri(const QString& uri, bool isFile = false);
 
     using AuthResolver = std::function<bool(const QString& url,
-                                             vc::HttpAuth* out,
+                                             vcr::Auth* out,
                                              QString* err)>;
     void setAuthResolver(AuthResolver r) { _authResolver = std::move(r); }
 
@@ -66,7 +66,7 @@ private:
     QString _currentRemoteUrl;
     bool _pathBarEdited = false;
 
-    vc::HttpAuth _auth;
+    vcr::Auth _auth;
     bool _authResolved = false;
     QString _authProbeUrl;
     AuthResolver _authResolver;

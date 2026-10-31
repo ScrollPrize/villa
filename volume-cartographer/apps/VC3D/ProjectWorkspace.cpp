@@ -1,4 +1,5 @@
 #include "ProjectWorkspace.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include "CState.hpp"
 #include "MenuActionController.hpp"
@@ -160,7 +161,7 @@ void hideEmptyColumns(QTreeWidget* tree, int first)
 void reveal(const QString& location)
 {
     if (location.isEmpty()) return;
-    if (vc::project::isLocationRemote(location.toStdString())) {
+    if (vcr::zarr::isRemote(location.toStdString())) {
         QApplication::clipboard()->setText(location);
         return;
     }
@@ -633,7 +634,7 @@ void ProjectWorkspace::rebuildResources()
     _resources->clear();
 
     const auto resolved = [&](const std::string& location) {
-        return trimmedLocation(vc::project::isLocationRemote(location)
+        return trimmedLocation(vcr::zarr::isRemote(location)
             ? QString::fromStdString(location)
             : QString::fromStdString(vc::project::resolveLocalPath(location, pkg->directory()).string()));
     };
@@ -829,7 +830,7 @@ void ProjectWorkspace::updateResourceButtons()
                                 _state->vpkg() && _state->vpkg()->writable());
     const auto location = item ? item->data(0, kRevealRole).toString() : QString();
     _revealResource->setEnabled(!location.isEmpty());
-    _revealResource->setText(vc::project::isLocationRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
+    _revealResource->setText(vcr::zarr::isRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
 }
 
 void ProjectWorkspace::measureVolumeCaches()

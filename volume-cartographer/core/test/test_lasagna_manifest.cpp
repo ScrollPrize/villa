@@ -365,12 +365,6 @@ TEST_CASE("LasagnaDataset supports absolute remote group paths with explicit cac
 
 TEST_CASE("LasagnaDataset remote manifest requires explicit cache before fetch")
 {
-    CHECK(vc::lasagna::isRemoteLasagnaLocation(
-        "s3://bucket/path/fiber.lasagna.json"));
-    CHECK(vc::lasagna::isRemoteLasagnaLocation(
-        "https://example.test/fiber.lasagna.json"));
-    CHECK_FALSE(vc::lasagna::isRemoteLasagnaLocation(
-        "/tmp/fiber.lasagna.json"));
     CHECK_THROWS_AS(
         vc::lasagna::LasagnaDataset::openLocation(
             "s3://bucket/path/fiber.lasagna.json"),
@@ -391,8 +385,9 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     int fetches = 0;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = dir;
-    options.remoteAuth.access_key = "test-access";
-    options.remoteAuth.secret_key = "test-secret";
+    options.remoteAuth.kind = "s3";
+    options.remoteAuth.user = "test-access";
+    options.remoteAuth.secret = "test-secret";
     options.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
         ++fetches;
         return R"({
@@ -418,7 +413,7 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     REQUIRE(first.manifest().groups.size() == 1);
     CHECK(first.manifest().groups.front().sourceLocation ==
           "s3+eu-west-2://bucket/artifact/pred.zarr");
-    CHECK(first.manifest().groups.front().remoteAuth.access_key == "test-access");
+    CHECK(first.manifest().groups.front().remoteAuth.user == "test-access");
     CHECK(first.manifest().groups.front().remoteCacheRoot ==
           fs::absolute(dir).lexically_normal());
     CHECK(first.manifest().manifestPath ==
@@ -441,9 +436,10 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
     const auto dir = makeTmpDir("public-s3-auth-fallback");
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = dir;
-    options.remoteAuth.access_key = "AKIAIOSFODNN7EXAMPLE";
-    options.remoteAuth.secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    options.remoteAuth.session_token = "malformed-session-token";
+    options.remoteAuth.kind = "s3";
+    options.remoteAuth.user = "AKIAIOSFODNN7EXAMPLE";
+    options.remoteAuth.secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    options.remoteAuth.token = "malformed-session-token";
     options.remoteAuth.region = "us-east-1";
 
     const std::string location =

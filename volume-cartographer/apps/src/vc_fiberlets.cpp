@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
@@ -280,8 +281,8 @@ CliOptions parseArgs(int argc, char** argv) {
     if (needsPathExtraction(options.command) && options.normalManifestLocation.empty()) fail("--normal-manifest is required");
     if (options.storageChunkSideBaseVoxels <= 0) fail("--storage-chunk-side must be positive");
     vc::fiber_tracer::validateFiberletPathConfig(options.paths);
-    if ((vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
-         vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation)) && options.remoteCacheDirectory.empty())
+    if ((vcr::zarr::isRemote(options.manifestLocation) ||
+         vcr::zarr::isRemote(options.normalManifestLocation)) && options.remoteCacheDirectory.empty())
         fail("direct remote manifests require --remote-cache-dir");
     return options;
 }

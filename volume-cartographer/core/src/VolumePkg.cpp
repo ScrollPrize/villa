@@ -45,16 +45,6 @@ bool isFiberLasagnaEntry(const Entry& entry)
     return hasEntryTag(entry, kFiberLasagnaTag);
 }
 
-bool isLocationRemote(const std::string& location)
-{
-    if (vcr::sftp::isSftpUrl(location)) return true;
-    if (location.rfind("s3://", 0) == 0) return true;
-    if (location.rfind("s3+", 0) == 0) return true;
-    if (location.rfind("http://", 0) == 0) return true;
-    if (location.rfind("https://", 0) == 0) return true;
-    return false;
-}
-
 fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 {
     constexpr const char* kFile = "file://";
@@ -119,12 +109,12 @@ constexpr const char* kDirectRemoteZarrRequired =
 std::shared_ptr<Volume> openRemoteVolumeEntry(
     const vc::project::Entry& entry,
     const vcr::catalog::OpenDataManifest* catalog,
-    const vc::HttpAuth& auth = {})
+    const vcr::Auth& auth = {})
 {
     const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
     return Volume::NewFromUrl(
         entry.location,
-        anonymous ? vc::HttpAuth{} : auth,
+        anonymous ? vcr::Auth{} : auth,
         vc::project::catalogVolumeMetadata(catalog, entry.location),
         !anonymous);
 }
@@ -161,7 +151,7 @@ bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
         return true;
-    if (!vc::project::isLocationRemote(a) || !vc::project::isLocationRemote(b))
+    if (!vcr::zarr::isRemote(a) || !vcr::zarr::isRemote(b))
         return false;
     try {
         const auto aSpec = vc::parseRemoteVolumeSpec(a);
@@ -203,8 +193,8 @@ bool sameAttachmentLocation(
     const std::string& b,
     const fs::path& projectDirectory)
 {
-    const bool aRemote = vc::project::isLocationRemote(a);
-    const bool bRemote = vc::project::isLocationRemote(b);
+    const bool aRemote = vcr::zarr::isRemote(a);
+    const bool bRemote = vcr::zarr::isRemote(b);
     if (aRemote != bRemote)
         return false;
     if (!aRemote) {
@@ -231,8 +221,8 @@ bool entryBacksAttachmentLocation(
             entryLocation, attachmentLocation, projectDirectory)) {
         return true;
     }
-    if (vc::project::isLocationRemote(entryLocation) ||
-        vc::project::isLocationRemote(attachmentLocation)) {
+    if (vcr::zarr::isRemote(entryLocation) ||
+        vcr::zarr::isRemote(attachmentLocation)) {
         return false;
     }
     const auto entryPath = absoluteLocalPath(entryLocation, projectDirectory);
@@ -258,7 +248,7 @@ bool loadedVolumeMatchesLocation(
     if (volume->isRemote())
         return sameAttachmentLocation(
             volume->remoteLocator(), location, projectDirectory);
-    if (vc::project::isLocationRemote(location))
+    if (vcr::zarr::isRemote(location))
         return false;
     auto loadedPath = volume->path();
     if (loadedPath.is_relative())
@@ -325,7 +315,7 @@ namespace vc::project {
 std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::catalog::OpenDataManifest* catalog,
                                                                   const std::string& location)
 {
-    if (!catalog || !isLocationRemote(location)) return std::nullopt;
+    if (!catalog || !vcr::zarr::isRemote(location)) return std::nullopt;
     try {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         return catalog->volumeAt(spec.sourceUrl, spec.baseScaleLevel);
@@ -356,7 +346,7 @@ std::string validateLocation(Category category, const std::string& location)
 {
     if (location.empty()) return "Location is empty.";
 
-    if (isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         if (category != Category::Volumes) {
             return "Remote locations are only supported for volumes.";
         }
@@ -384,7 +374,7 @@ std::string validateLocation(Category category, const std::string& location)
 std::string validateSingleVolumeLocation(const std::string& location)
 {
     if (location.empty()) return "Location is empty.";
-    if (isLocationRemote(location))
+    if (vcr::zarr::isRemote(location))
         return validateRemoteVolumeLocation(location, true);
 
     const auto path = resolveLocalPath(location);
@@ -466,7 +456,7 @@ std::string VolumePkg::entryOwner(const std::string&) const { return {}; }
 namespace {
 // Keep resources inside the project tree portable; external paths stay absolute.
 std::string portableResource(const std::string& location, const fs::path& directory) {
-    if (location.empty() || vc::project::isLocationRemote(location)) return location;
+    if (location.empty() || vcr::zarr::isRemote(location)) return location;
     const auto path = vc::project::resolveLocalPath(location);
     if (!path.is_absolute()) return location;
     const auto relative = path.lexically_normal().lexically_relative(directory);
@@ -601,7 +591,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
 {
     if (location.empty()) return false;
     std::string persistedLocation = portableResource(location, directory());
-    if (vc::project::isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         if (spec.hasBaseScaleSelector)
             persistedLocation = spec.portableLocator;
@@ -611,7 +601,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
         // to a selector-free locator, which dedupes only by exact string.
         if (samePersistedVolumeIdentity(e.location, persistedLocation) ||
             samePersistedVolumeIdentity(e.location, location) ||
-            (!vc::project::isLocationRemote(e.location) && !vc::project::isLocationRemote(persistedLocation) &&
+            (!vcr::zarr::isRemote(e.location) && !vcr::zarr::isRemote(persistedLocation) &&
              vc::project::resolveLocalPath(e.location, directory()).lexically_normal() == vc::project::resolveLocalPath(persistedLocation, directory()).lexically_normal())) return false;
     }
     vc::project::Entry entry{persistedLocation, portableTags(std::move(tags), directory())};
@@ -631,7 +621,7 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
         throw std::invalid_argument("volume location and prepared volume are required");
 
     std::string persistedLocation = portableResource(location, directory());
-    if (vc::project::isLocationRemote(location)) {
+    if (vcr::zarr::isRemote(location)) {
         const auto spec = vc::parseRemoteVolumeSpec(location);
         if (spec.hasBaseScaleSelector)
             persistedLocation = spec.portableLocator;
@@ -817,7 +807,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         for (const auto& prepared : preparedVolumes) {
             std::string persistedLocation = portableResource(prepared.location, directory());
             const auto tags = portableTags(prepared.tags, directory());
-            if (vc::project::isLocationRemote(prepared.location)) {
+            if (vcr::zarr::isRemote(prepared.location)) {
                 const auto spec = vc::parseRemoteVolumeSpec(prepared.location);
                 if (spec.hasBaseScaleSelector)
                     persistedLocation = spec.portableLocator;
@@ -1019,7 +1009,7 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
 {
     if (volumeDirName.empty()) return false;
     for (const auto& e : volumes_) {
-        if (vc::project::isLocationRemote(e.location)) continue;
+        if (vcr::zarr::isRemote(e.location)) continue;
         const auto base = vc::project::resolveLocalPath(e.location, directory());
         const auto candidate = base / volumeDirName;
         if (!isSingleZarrVolumeDir(candidate)) continue;
@@ -1085,7 +1075,7 @@ bool VolumePkg::isRemote() const
 {
     auto anyRemote = [](const std::vector<vc::project::Entry>& v) {
         return std::any_of(v.begin(), v.end(),
-                           [](const auto& e) { return vc::project::isLocationRemote(e.location); });
+                           [](const auto& e) { return vcr::zarr::isRemote(e.location); });
     };
     return anyRemote(volumes_) || anyRemote(normalGrids_);
 }
@@ -1103,7 +1093,7 @@ void VolumePkg::resolveAll()
     std::vector<std::size_t> remoteIndices;
     remoteIndices.reserve(volumes_.size());
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
-        if (vc::project::isLocationRemote(volumes_[i].location)) {
+        if (vcr::zarr::isRemote(volumes_[i].location)) {
             remoteIndices.push_back(i);
         }
     }
@@ -1159,7 +1149,7 @@ void VolumePkg::resolveAll()
 
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
         const auto& entry = volumes_[i];
-        if (!vc::project::isLocationRemote(entry.location)) {
+        if (!vcr::zarr::isRemote(entry.location)) {
             resolveVolumeEntry(entry);
             continue;
         }
@@ -1195,7 +1185,7 @@ void VolumePkg::resolveDeferredEntries()
 
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
-    if (vc::project::isLocationRemote(e.location)) {
+    if (vcr::zarr::isRemote(e.location)) {
         try {
             if (!isDirectRemoteZarrLocation(e.location)) {
                 Logger()->warn("Skipping remote volume location '{}': {}",
@@ -1251,7 +1241,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 
 void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
 {
-    if (vc::project::isLocationRemote(e.location)) {
+    if (vcr::zarr::isRemote(e.location)) {
         Logger()->warn("Remote normal_grid entry '{}' not yet supported.", e.location);
         return;
     }

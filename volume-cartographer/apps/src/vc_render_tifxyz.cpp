@@ -1149,7 +1149,7 @@ int main(int argc, char *argv[])
     int workingLevel = 0;
     if (useRemoteCache) {
         try {
-            remoteVolume = Volume::NewFromUrl(remoteUrl, vc::loadAwsCredentials());
+            remoteVolume = Volume::NewFromUrl(remoteUrl, vcr::zarr::awsCredentials().value_or(vcr::Auth{}));
         } catch (const std::exception& e) {
             logPrintf(stderr, "Error opening remote zarr: %s\n", e.what());
             return EXIT_FAILURE;

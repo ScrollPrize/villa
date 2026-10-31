@@ -52,16 +52,6 @@ TEST_CASE("selector parsing rejects malformed fragments")
     }
 }
 
-TEST_CASE("remote object paths are joined before an unchanged query")
-{
-    CHECK(vc::joinRemoteUrlPath(
-              "https://example.test/source.zarr/?token=a%2Fb&order=1+2",
-              "/2/.zarray") ==
-          "https://example.test/source.zarr/2/.zarray?token=a%2Fb&order=1+2");
-    CHECK(vc::joinRemoteUrlPath("https://example.test/source.zarr", "metadata.json") ==
-          "https://example.test/source.zarr/metadata.json");
-}
-
 
 TEST_CASE("fragment-free remote volume specs retain existing resolution")
 {

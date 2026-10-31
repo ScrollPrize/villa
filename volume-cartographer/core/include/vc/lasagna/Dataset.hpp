@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
@@ -17,12 +17,11 @@ namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 
-[[nodiscard]] bool isRemoteLasagnaLocation(std::string_view location);
 
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
     std::filesystem::path remoteCacheRoot;
-    vc::HttpAuth remoteAuth;
+    vcr::Auth remoteAuth;
     bool refreshManifest = false;  // download a remote manifest even when it is cached
     // Reads a remote manifest instead of a request, given its parent and file name.
     std::function<std::optional<std::string>(const std::string&, const std::string&)> manifestReader;

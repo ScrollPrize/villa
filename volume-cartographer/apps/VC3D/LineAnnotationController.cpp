@@ -1,4 +1,5 @@
 #include <vc_object_store/Uuid.hpp>
+#include <vc_reader/zarr.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryEdits.hpp>
@@ -435,7 +436,7 @@ QString fiberDisplayNameFromFileName(const std::string& fileName)
 std::string datasetEntryMenuLabel(const vc::project::Entry& entry)
 {
     QString label;
-    if (!vc::project::isLocationRemote(entry.location)) {
+    if (!vcr::zarr::isRemote(entry.location)) {
         label = QFileInfo(QString::fromStdString(entry.location)).fileName();
     }
     if (label.isEmpty()) {
@@ -5061,7 +5062,7 @@ LineAnnotationController::resolveAlignmentMetricsDataset()
         vc::lasagna::LasagnaDatasetOpenOptions options;
         options.workingToBaseScale = scale;
         options.remoteCacheRoot = vc3d::remoteCachePathFs();
-        const auto resolved = vc::project::isLocationRemote(location)
+        const auto resolved = vcr::zarr::isRemote(location)
             ? location
             : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
         return std::make_shared<vc::lasagna::LasagnaDataset>(
@@ -8225,7 +8226,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             selectedIdentity =
                 vc3d::opendata::lasagnaSourceManifestLocation(*vpkg, *selectedEntry);
         }
-        if (!vc::project::isLocationRemote(selected)) {
+        if (!vcr::zarr::isRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         }
     } else {
@@ -8251,7 +8252,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         options.workingToBaseScale = workingToBaseScale;
         options.remoteCacheRoot = vc3d::remoteCachePathFs();
         const std::string resolved =
-            vc::project::isLocationRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
+            vcr::zarr::isRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
         return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
     };
 
@@ -8458,7 +8459,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     }
 
     fs::path manifestPath;
-    if (!selected.empty() && !vc::project::isLocationRemote(selected)) {
+    if (!selected.empty() && !vcr::zarr::isRemote(selected)) {
         manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
     }
     if (selected.empty()) {
@@ -8481,12 +8482,12 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         }
         selected = *picked;
         selectedIdentity = selected;
-        if (!vc::project::isLocationRemote(selected))
+        if (!vcr::zarr::isRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
-            const std::string resolved = vc::project::isLocationRemote(selected)
+            const std::string resolved = vcr::zarr::isRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
@@ -8522,7 +8523,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
-            const std::string resolved = vc::project::isLocationRemote(selected)
+            const std::string resolved = vcr::zarr::isRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
@@ -8558,7 +8559,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             options.workingToBaseScale = session.fiberTraceToBaseScale;
             options.remoteCacheRoot = vc3d::remoteCachePathFs();
             const std::string normalLocation =
-                vc::project::isLocationRemote(session.selectedDatasetLocation)
+                vcr::zarr::isRemote(session.selectedDatasetLocation)
                     ? session.selectedDatasetLocation
                     : vc::project::resolveLocalPath(
                           session.selectedDatasetLocation,
@@ -12151,7 +12152,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
     const auto resolveLocation = [vpkg](const std::string& location) {
-        return vc::project::isLocationRemote(location)
+        return vcr::zarr::isRemote(location)
             ? location
             : vc::project::resolveLocalPath(
                   location, vpkg->path().parent_path()).string();

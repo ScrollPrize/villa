@@ -36,22 +36,6 @@ static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 namespace
 {
 
-std::string normalizeRemoteVolumeUrl(std::string url)
-{
-    while (!url.empty() && url.back() == '/')
-        url.pop_back();
-    return url;
-}
-
-std::string deriveRemoteVolumeName(const std::string& url)
-{
-    const auto normalized = normalizeRemoteVolumeUrl(url);
-    const auto pos = normalized.rfind('/');
-    if (pos != std::string::npos && pos + 1 < normalized.size())
-        return normalized.substr(pos + 1);
-    return normalized.empty() ? std::string("remote") : normalized;
-}
-
 // Record the voxel size resolved from the store's document. When there is
 // none, say so: a volume without one reports 0, and every physical measurement
 // derived from it -- surface areas, the min_area_cm gate, the scale bar --
@@ -89,18 +73,6 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const vcr::zarr::StoreMetada
         return json;
     }
     return std::nullopt;
-}
-
-std::string deriveRemoteVolumeId(const std::string& url)
-{
-    const auto normalized = normalizeRemoteVolumeUrl(url);
-    const auto name = deriveRemoteVolumeName(normalized);
-    const auto hash = utils::fnv1a(std::string_view(normalized));
-
-    std::ostringstream out;
-    out << name << "-" << std::hex << std::nouppercase << std::setw(16)
-        << std::setfill('0') << hash;
-    return out.str();
 }
 
 std::string normalizeLocalVolumePathForId(const std::filesystem::path& path)
@@ -385,7 +357,7 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
-    const vc::HttpAuth& authIn,
+    const vcr::Auth& authIn,
     const utils::Json& metadata,
     bool discoverAwsCredentials)
 {
@@ -395,12 +367,12 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     // Recognized S3 sources are tried anonymously, then with the given or
     // discovered credentials only when anonymous access fails.
-    const auto openLevels = [&](const vc::HttpAuth& requestAuth) {
+    const auto openLevels = [&](const vcr::Auth& requestAuth) {
         vcr::zarr::OpenOptions options;
         std::string location = remoteUrl;
-        if (!requestAuth.empty()) {
+        if (!requestAuth.kind.empty()) {
             location = signedS3Location(remoteUrl);
-            options.access = vcr::zarr::s3Access(location, vc::readerAuth(requestAuth));
+            options.access = vcr::zarr::s3Access(location, requestAuth);
         }
         options.cacheDirs = {vc::settings::remoteCachePath().string()};
         return std::pair{vcr::zarr::pyramidLevels(location, options), options};
@@ -413,10 +385,10 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
             opened = openLevels({});
             auth = {};
         } catch (const std::exception&) {
-            if (auth.empty() && discoverAwsCredentials) {
-                auth = vc::loadAwsCredentials();
+            if (auth.kind.empty() && discoverAwsCredentials) {
+                auth = vcr::zarr::awsCredentials().value_or(vcr::Auth{});
             }
-            if (auth.empty())
+            if (auth.kind.empty())
                 throw;
             opened = openLevels(auth);
         }
@@ -455,9 +427,9 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->_height = static_cast<int>(static_cast<size_t>(firstShape[1]) * firstScale);
     vol->_width = static_cast<int>(static_cast<size_t>(firstShape[2]) * firstScale);
 
-    const auto id = deriveRemoteVolumeId(remoteUrl);
+    const auto id = vcr::zarr::vc3dVolumeId(remoteUrl);
     vol->metadata_["uuid"] = id;
-    vol->metadata_["name"] = deriveRemoteVolumeName(remoteUrl);
+    vol->metadata_["name"] = id.substr(0, id.rfind('-'));
     vol->metadata_["type"] = "vol";
     vol->metadata_["format"] = "zarr";
     vol->metadata_["width"] = vol->_width;
@@ -534,7 +506,7 @@ std::string Volume::sourceLocation() const
 {
     if (!isRemote_)
         return path_.string();
-    return remoteAuth_.empty() ? remoteUrl_ : signedS3Location(remoteUrl_);
+    return remoteAuth_.kind.empty() ? remoteUrl_ : signedS3Location(remoteUrl_);
 }
 
 vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
@@ -542,8 +514,8 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
     vcr::zarr::OpenOptions options;
     if (!isRemote_)
         return options;
-    if (!remoteAuth_.empty())
-        options.access = vcr::zarr::s3Access(sourceLocation(), vc::readerAuth(remoteAuth_));
+    if (!remoteAuth_.kind.empty())
+        options.access = vcr::zarr::s3Access(sourceLocation(), remoteAuth_);
     if (!remoteCacheRoot_.empty()) {
         options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;
         options.cacheMaxBytes = vc::settings::remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
