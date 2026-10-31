@@ -145,7 +145,7 @@ NB_MODULE(_transforms, m) {
     nb::class_<Named>(m, "Param").def(nb::init<std::string>(), "name"_a);
     nb::class_<Target>(m, "Target");
     m.def("default_targets", &default_targets);
-    m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"));
+    m.def("Image", [](double fill, nb::object valid, bool refill) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); t.refill = refill; return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"), "refill"_a = true);
     m.def("Label", [](double fill) { Target t; t.role = Role::Label; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ScalarField", [](double fill) { Target t; t.role = Role::Scalar; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ValidMask", [] { Target t; t.role = Role::Valid; return t; });
@@ -175,7 +175,7 @@ NB_MODULE(_transforms, m) {
         using N = Normalization;
         t.masked = option("masked", {N::MinMax, N::ZScore, N::Robust, N::Percentile}, t.masked);
         t.nonzero = option("nonzero", {N::ZScore}, t.nonzero);
-        t.eps = option("eps", {N::ZScore}, t.eps);
+        t.eps = option("eps", {N::MinMax, N::ZScore}, t.eps);
         t.lower = option("lower", {N::Robust, N::Percentile}, t.lower);
         t.upper = option("upper", {N::Robust, N::Percentile}, t.upper);
         t.clip = option("clip", {N::Robust}, t.clip);

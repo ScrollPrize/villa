@@ -4,6 +4,7 @@ PyTorch is imported only when this module or Pipeline.batch() is used. Dataset
 selection, batching and multiprocessing remain the wrapped loader's job.
 """
 from collections.abc import Mapping
+import functools
 import operator
 import os
 
@@ -12,7 +13,7 @@ import torch
 
 from .cuda import DeviceArray
 
-__all__ = ["CudaLoader"]
+__all__ = ["CudaLoader", "normalize"]
 
 
 def _main_process():
@@ -179,6 +180,35 @@ def _batch(pipeline, batch, *, seeds, device=None, params=None):
         return pending.wait()
     finally:
         pending.close()
+
+
+@functools.lru_cache(maxsize=None)
+def _normalizer(mode, eps, masked, backend):
+    from . import transforms as A
+    options = dict(nonzero=False) if mode == "zscore" else {}
+    targets = {"image": A.Image(valid="valid" if masked else None, refill=False)}
+    if masked:
+        targets["valid"] = A.ValidMask()
+    return A.Pipeline([A.Normalize(mode, masked=masked, eps=eps, **options)], targets=targets, backend=backend)
+
+
+def normalize(image, mode="zscore", *, valid=None, eps=1e-6):
+    """Min-max or population z-score of each sample and channel of a (B, C, ...) tensor, on its device.
+
+    ``A.Normalize`` outside a pipeline call. Statistics use the voxels where ``valid`` (optional, same shape, or one
+    channel) is nonzero, all of them for a sample with none; every voxel is transformed. ``eps`` bounds the divisor
+    from below. Returns a new tensor.
+    """
+    if image.ndim < 3 or not image.shape[0]:
+        raise ValueError("normalize requires a nonempty (B, C, ...) tensor")
+    masked = valid is not None
+    batch = {"image": image}
+    if masked:
+        batch["valid"] = valid.to(torch.uint8)
+    pipeline = _normalizer(mode, float(eps), masked, "cuda" if image.device.type == "cuda" else "cpu")
+    if image.device.type == "cuda":
+        return _batch(pipeline, batch, seeds=[0] * image.shape[0], device=image.device)["image"]
+    return torch.stack([pipeline({k: v[i] for k, v in batch.items()}, seed=0)["image"] for i in range(image.shape[0])])
 
 
 class CudaLoader:

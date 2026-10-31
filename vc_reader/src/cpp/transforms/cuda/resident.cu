@@ -125,7 +125,7 @@ struct restore_kernel_launch {
 };
 void Session::restore_valid(const Sample& s) {
     for (const auto& [key,f] : s) {
-        if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
+        if (f.target.role != Role::Image || !f.target.refill || !s.count(f.target.valid)) continue;
         auto& image = arrays.at(key); const auto& mask = arrays.at(f.target.valid);
         require(image.spatial() == mask.spatial() && (mask.shape[0] == 1 || mask.shape[0] == image.shape[0]),"validity mask no longer matches image channels");
         mask.typed([&](auto valid) {

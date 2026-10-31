@@ -87,6 +87,7 @@ template<int Phase> __device__ void finish_normalization(KernelIndex vcr_launch,
                 params->scale = 2; params->center = q.low/2;
                 params->divisor = q.high/2-params->center;
             }
+            if (!zscore) params->divisor = fmax(params->divisor,eps/params->scale);
         } else if constexpr (Phase == 1) params->center = q.sum/params->count;
         else params->divisor = fmax(sqrt(q.sum/params->count),eps/params->scale);
     }

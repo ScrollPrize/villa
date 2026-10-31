@@ -269,6 +269,7 @@ struct Target {
     double fill = 0;
     std::string valid = "padding_mask", components = "zyx", outside = "keep";
     bool normalize = false, external = true;
+    bool refill = true;  // images: voxels outside the validity mask return to `fill` after each transform
     bool operator==(const Target&) const = default;
 };
 // Whether a target holds continuous values (labels and validity masks do not).
@@ -331,7 +332,7 @@ inline void validate(const Sample& s, bool values = true) {
 }
 inline void restore_valid(Sample& s) {
     for (auto& [name, f] : s) {
-        if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
+        if (f.target.role != Role::Image || !f.target.refill || !s.count(f.target.valid)) continue;
         const auto& mask = s.at(f.target.valid).array;
         const bool pseudo = f.source.find('\x1f') != std::string::npos;
         require(mask.spatial() == f.array.spatial() &&

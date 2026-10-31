@@ -130,6 +130,7 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
     double scale = 1, center = lo, divisor = hi - lo;
     if (t.mode == Normalization::MinMax) {
         if (!std::isfinite(divisor)) { scale = 2; center = lo / scale; divisor = hi / scale - center; }
+        divisor = std::max(divisor, t.eps / scale);
     } else {
         const double magnitude = std::max(std::abs(lo), std::abs(hi));
         // Scale extreme finite doubles so sums of squared deviations cannot
