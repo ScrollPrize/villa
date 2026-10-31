@@ -14,7 +14,7 @@ grid by normalized column index aligns them; the reducer then yields a robust
 consensus surface that stays on the true sheet.
 
 Invalid points use the -1 sentinel (z<=0 is also treated invalid, matching the
-QuadSurface reader). Output format mirrors spiral-fitting/tifxyz.py:save_tifxyz.
+QuadSurface reader). Output is written by vc_reader.tifxyz.
 
 Example:
     python merge_concat_runs.py /path/to/parent --out /path/to/merged --method median \\
@@ -25,12 +25,12 @@ import argparse
 import glob
 import json
 import os
-import uuid
 
 import cv2
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 
+from surface_export import new_surface
 from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
 
 
@@ -51,10 +51,7 @@ def find_runs(parent, exclude):
 
 def load_xyz(winding_dir):
     """Load a winding folder as (H, W, 3) float32 in x,y,z order, -1 = invalid."""
-    x = tifffile.imread(os.path.join(winding_dir, "x.tif")).astype(np.float32)
-    y = tifffile.imread(os.path.join(winding_dir, "y.tif")).astype(np.float32)
-    z = tifffile.imread(os.path.join(winding_dir, "z.tif")).astype(np.float32)
-    return np.stack([x, y, z], axis=-1)
+    return tifxyz.read(winding_dir).xyz
 
 
 def invalid_mask(pts):
@@ -108,44 +105,6 @@ def step_from_meta(meta_path):
 def meta_of(winding_dir):
     with open(os.path.join(winding_dir, "meta.json")) as f:
         return json.load(f)
-
-
-def save_tifxyz(pts, out_winding_dir, step_size, voxel_um, source, layout_metadata=None):
-    """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
-    `pts` is (H,W,3) in x,y,z order with -1 for invalid, in the layout
-    `layout_metadata` records. A new surface receives a fresh random UUID."""
-    os.makedirs(out_winding_dir, exist_ok=True)
-    tifffile.imwrite(os.path.join(out_winding_dir, "x.tif"), pts[..., 0].astype(np.float32))
-    tifffile.imwrite(os.path.join(out_winding_dir, "y.tif"), pts[..., 1].astype(np.float32))
-    tifffile.imwrite(os.path.join(out_winding_dir, "z.tif"), pts[..., 2].astype(np.float32))
-    valid_vertex = np.any(pts != -1, axis=-1)
-    vq = (
-        valid_vertex[:-1, :-1] & valid_vertex[1:, :-1]
-        & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
-    )
-    area_vx2 = int(vq.sum()) * step_size ** 2
-    # bbox over valid vertices only, [x,y,z] low/high (matches tifxyz.py:save_tifxyz)
-    valid_pts = pts[valid_vertex]
-    bbox = (
-        [valid_pts.min(axis=0).tolist(), valid_pts.max(axis=0).tolist()]
-        if valid_vertex.any()
-        else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
-    )
-    meta = {
-        "scale": [1.0 / step_size, 1.0 / step_size],
-        "bbox": bbox,
-        "area_vx2": area_vx2,
-        "area_cm2": area_vx2 * voxel_um ** 2 / 1.0e8 if voxel_um else None,
-        "format": "tifxyz",
-        "type": "seg",
-        "uuid": str(uuid.uuid4()),
-        "source": source,
-    }
-    if layout_metadata is not None:
-        meta[LAYOUT_METADATA_KEY] = layout_metadata
-    with open(os.path.join(out_winding_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=4)
-    return area_vx2
 
 
 def pick_ref_run(runs, ref):
@@ -228,12 +187,14 @@ def main():
         merged[~np.isfinite(merged).all(axis=-1)] = -1.0
         merged = merged.astype(np.float32)
 
-        area = save_tifxyz(merged, os.path.join(args.out, w), step_size, voxel_um,
-                           f"merge_concat_runs {args.method} of {len(wdirs)} runs",
-                           ref_layout)
+        surface = new_surface(merged, step_size, voxel_um,
+                              f"merge_concat_runs {args.method} of {len(wdirs)} runs",
+                              layout_metadata=ref_layout)
+        tifxyz.write(os.path.join(args.out, w), surface,
+                     compression="none", tile=None, mask=False, overwrite=True)
         n_pts = int((merged[..., 0] != -1).sum())
         print(f"{w}: runs={len(wdirs)} grid={ref_shape[0]}x{ref_shape[1]} "
-              f"valid_pts={n_pts} max_overlap={int(n_valid.max())} area_vx2={area}")
+              f"valid_pts={n_pts} max_overlap={int(n_valid.max())} area_vx2={surface.extra['area_vx2']}")
 
     print(f"\nDone. Output: {args.out}")
 

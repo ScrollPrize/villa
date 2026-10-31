@@ -9,7 +9,7 @@ import torch
 
 import connect_overlapping_patches as cop
 import find_inconsistent_windings as fiw
-from tifxyz import Patch
+from patches import Patch
 
 DR = torch.tensor(12.0)
 RADIUS = 800.0

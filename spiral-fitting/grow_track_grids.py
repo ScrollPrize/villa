@@ -32,14 +32,11 @@ import os
 from pathlib import Path
 import pickle
 import random
-import shutil
-import tempfile
 import time
-import uuid
 from typing import Callable, Iterable
 
 import numpy as np
-import tifffile
+from vc_reader import tifxyz
 from tqdm import tqdm
 
 
@@ -1304,57 +1301,42 @@ def write_surface(output_root: Path, graph: TrackGraph, surface: Surface,
     destination = output_root / name
     if destination.exists():
         return destination
-    temporary = Path(tempfile.mkdtemp(prefix=f".{name}.tmp-", dir=output_root))
-    try:
-        xyz = np.pad(surface.grid["xyz"], ((1, 1), (1, 1), (0, 0)),
-                     constant_values=-1).astype(np.float32, copy=False)
-        for channel, channel_name in enumerate(("x", "y", "z")):
-            tifffile.imwrite(temporary / f"{channel_name}.tif", xyz[..., channel],
-                             dtype=np.float32, compression=None)
-        valid_points = xyz[xyz[..., 0] >= 0]
-        metadata = {
-            "format": "tifxyz",
-            "type": "seg",
-            "uuid": str(uuid.uuid4()),
-            "scale": [1.0, 1.0],
-            "bbox": [valid_points.min(axis=0).astype(float).tolist(),
-                     valid_points.max(axis=0).astype(float).tolist()],
-            "source": "exact-voxel recursive track-grid growth",
-            "seed_track": graph.provenance[anchor],
-            "seed_track_arclength": float(graph.lengths[anchor]),
-            "random_seed": task_seed,
-            "length_bin": bin_name,
-            "length_bin_edges": list(bin_bounds),
-            "minimum_side_arclength": config.min_side,
-            "maximum_side_arclength": (
-                None if math.isinf(config.max_side) else config.max_side),
-            "maximum_edge_tortuosity": config.max_edge_tortuosity,
-            "maximum_edge_deviation_fraction": config.max_edge_deviation,
-            "minimum_normal_dot": config.min_normal_dot,
-            "maximum_local_recenters": config.max_local_recenters,
-            "maximum_local_center_attempts": config.max_local_attempts,
-            "contact_tolerance_voxels": 0,
-            "anchor": graph.provenance[surface.anchor],
-            "crossing_partner": graph.provenance[surface.partner],
-            "initial_quadrant_counts": surface.initial_quadrant_counts,
-            "recenter_count": len(surface.recenter_history),
-            "recenter_history": surface.recenter_history,
-            "growth_stats": surface.growth_stats,
-            "grid_shape": list(xyz.shape[:2]),
-            "invalid_border_padding": 1,
-            "invalid_value": -1,
-            "valid_vertices": surface.grid["valid_vertices"],
-            "valid_quads": surface.grid["valid_quads"],
-            "three_corner_boundary_cells": surface.grid["three_corner_cells"],
-            "row_tracks": [graph.provenance[item] for item in surface.grid["rows"]],
-            "column_tracks": [graph.provenance[item] for item in surface.grid["columns"]],
-            "growth_seconds": elapsed,
-        }
-        (temporary / "meta.json").write_text(json.dumps(metadata, indent=2) + "\n")
-        os.replace(temporary, destination)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+    xyz = np.pad(surface.grid["xyz"], ((1, 1), (1, 1), (0, 0)),
+                 constant_values=-1).astype(np.float32, copy=False)
+    metadata = {
+        "source": "exact-voxel recursive track-grid growth",
+        "seed_track": graph.provenance[anchor],
+        "seed_track_arclength": float(graph.lengths[anchor]),
+        "random_seed": task_seed,
+        "length_bin": bin_name,
+        "length_bin_edges": list(bin_bounds),
+        "minimum_side_arclength": config.min_side,
+        "maximum_side_arclength": (
+            None if math.isinf(config.max_side) else config.max_side),
+        "maximum_edge_tortuosity": config.max_edge_tortuosity,
+        "maximum_edge_deviation_fraction": config.max_edge_deviation,
+        "minimum_normal_dot": config.min_normal_dot,
+        "maximum_local_recenters": config.max_local_recenters,
+        "maximum_local_center_attempts": config.max_local_attempts,
+        "contact_tolerance_voxels": 0,
+        "anchor": graph.provenance[surface.anchor],
+        "crossing_partner": graph.provenance[surface.partner],
+        "initial_quadrant_counts": surface.initial_quadrant_counts,
+        "recenter_count": len(surface.recenter_history),
+        "recenter_history": surface.recenter_history,
+        "growth_stats": surface.growth_stats,
+        "grid_shape": list(xyz.shape[:2]),
+        "invalid_border_padding": 1,
+        "invalid_value": -1,
+        "valid_vertices": surface.grid["valid_vertices"],
+        "valid_quads": surface.grid["valid_quads"],
+        "three_corner_boundary_cells": surface.grid["three_corner_cells"],
+        "row_tracks": [graph.provenance[item] for item in surface.grid["rows"]],
+        "column_tracks": [graph.provenance[item] for item in surface.grid["columns"]],
+        "growth_seconds": elapsed,
+    }
+    tifxyz.write(destination, tifxyz.Surface(xyz, extra=metadata),
+                 compression="none", tile=None, mask=False)
     return destination
 
 

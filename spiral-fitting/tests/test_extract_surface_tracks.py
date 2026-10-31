@@ -444,7 +444,7 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     pytest.importorskip('cc3d')
     _small_configuration(monkeypatch)
     volume = synthetic_predictions()
-    monkeypatch.setattr(est, 'open_predictions', lambda path: volume)
+    monkeypatch.setattr(est, 'open_zarr', lambda path: volume)
 
     # Kimimaro's worker processes would dominate the run time of this small volume.
     def skeletonize(labels, **kwargs):
@@ -507,12 +507,10 @@ def _gpu_device():
 
 
 def _write_zarr_v2(path, volume, chunks, separator):
-    import zarr
-    from numcodecs import Blosc
-    array = zarr.create_array(
-        store=str(path), shape=volume.shape, chunks=chunks, dtype='uint8', fill_value=0,
-        zarr_format=2, compressors=Blosc(cname='lz4', clevel=5, shuffle=Blosc.SHUFFLE),
-        chunk_key_encoding={'name': 'v2', 'separator': separator})
+    from vc_reader.reader import ZarrWriter
+    array = ZarrWriter.create(path, shape=volume.shape, chunks=chunks, dtype='uint8', fill_value=0,
+                              compressor='blosc', cname='lz4', level=5, shuffle=1,
+                              separator=separator)
     array[...] = volume
     return str(path)
 
@@ -525,18 +523,16 @@ def test_gpu_backend_matches_per_slab_brook(monkeypatch, tmp_path):
     if importlib.util.find_spec('cucim') is None:
         pytest.skip('cucim is not installed')
     pytest.importorskip('cc3d')
-    zarr = pytest.importorskip('zarr')
     device = _gpu_device()
     if device is None:
         pytest.skip('needs an NVIDIA GPU of compute capability 8.0 or newer '
                     '(the first CUDA_VISIBLE_DEVICES entry when set)')
 
     _small_configuration(monkeypatch)
-    monkeypatch.setattr(est, 'open_predictions', functools.partial(zarr.open_array, mode='r'))
     volume = synthetic_predictions()
-    # '/' keys, blosc and an x chunk that is a multiple of 8: the direct chunk reader.
+    # '/' keys and an x chunk that is a multiple of 8.
     direct = _write_zarr_v2(tmp_path / 'direct.zarr', volume, (64, 64, 64), '/')
-    # '.' keys and an x chunk of 50: read through open_predictions.
+    # '.' keys and an x chunk of 50.
     fallback = _write_zarr_v2(tmp_path / 'fallback.zarr', volume, (48, 50, 50), '.')
 
     # The original per-slab loop with Brook in place of Kimimaro.

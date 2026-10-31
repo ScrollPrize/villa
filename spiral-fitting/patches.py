@@ -1,17 +1,13 @@
+"""The fit's patches: a stored surface as tensors, with the projection math the losses use."""
 
 import os
 import json
-import math
 import torch
 import numpy as np
-from PIL import Image
 from typing import Optional, Union, Literal
-from uuid import uuid4
-from einops import rearrange
-import torch.nn.functional as F
 from dataclasses import dataclass, field
 
-from surface_orientation import METADATA_KEY as ORIENTATION_METADATA_KEY, GridLayout, export_metadata
+from vc_reader import images, tifxyz
 
 
 @dataclass
@@ -354,7 +350,7 @@ def patch_from_payload(payload):
     return patch
 
 
-def load_tifxyz(path, *, z_range=None):
+def load_patch(path, *, z_range=None):
     """Load a patch, optionally rejecting it before x/y TIFF decoding.
 
     The z plane and validity mask are sufficient to prove that a patch cannot
@@ -362,49 +358,28 @@ def load_tifxyz(path, *, z_range=None):
     historical metadata bboxes because producers have emitted multiple bbox
     axis orders.
     """
-
-    with open(f'{path}/meta.json', 'r') as meta_json:
-        metadata = json.load(meta_json)
-        # Reject input errors before tensor construction so live preparation
-        # can discard the batch without masking worker/device failures.
-        if not isinstance(metadata, dict):
-            raise ValueError(f'{path}/meta.json must contain an object')
-        scale_values = metadata.get('scale')
-        if (not isinstance(scale_values, list) or len(scale_values) != 2
-                or any(type(value) not in (int, float)
-                       or not 0 < value < math.inf for value in scale_values)):
-            raise ValueError(
-                f'{path}/meta.json scale must contain two finite positive numbers')
-        scale = torch.tensor(metadata['scale'])
-        uuid = metadata.get('uuid')
-        erosion_cells_override = metadata.get('spiral_patch_erode_cells')
-    z_np = np.array(Image.open(f'{path}/z.tif'))
-
-    # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
-    # x/y/z, so masked-out vertices can carry real coordinates. Force those to -1 so the standard
-    # validity logic (zyxs != -1) is correct. Patches without mask.tif are unaffected.
-    mask_path = f'{path}/mask.tif'
-    mask = None
-    if os.path.exists(mask_path):
-        mask = np.array(Image.open(mask_path))
-        if mask.ndim == 3:
-            mask = mask[..., 0]
+    # Input errors raise here, before tensor construction, so live preparation
+    # can discard the batch without masking worker/device failures.
+    try:
+        tifxyz.read_metadata(path)
+    except (ValueError, RuntimeError) as error:
+        raise ValueError(f'{path}/meta.json: {error}') from error
 
     if z_range is not None:
         z_begin, z_end = z_range
+        z_np = images.read(f'{path}/z.tif')
         in_range = (z_np >= z_begin) & (z_np < z_end)
+        mask = tifxyz.read_mask(path, z_np.shape)
         if mask is not None:
-            in_range &= mask != 0
+            in_range &= mask
         if not in_range.any():
             return None
 
-    y_np = np.array(Image.open(f'{path}/y.tif'))
-    x_np = np.array(Image.open(f'{path}/x.tif'))
-    zyxs_np = np.stack([z_np, y_np, x_np], axis=-1)
-    if mask is not None:
-        zyxs_np[mask == 0] = -1.0
-
-    zyxs = torch.from_numpy(zyxs_np).to(torch.float32)
+    surface = tifxyz.read(path)
+    zyxs = torch.from_numpy(surface.xyz[..., ::-1].copy())
+    # Patch.scale keeps meta.json's order: columns, rows.
+    scale = torch.tensor([surface.scale[1], surface.scale[0]])
+    erosion_cells_override = surface.extra.get('spiral_patch_erode_cells')
 
     if os.path.exists(f'{path}/overlapping.json'):
         with open(f'{path}/overlapping.json', 'r') as overlapping_json:
@@ -414,7 +389,7 @@ def load_tifxyz(path, *, z_range=None):
 
     winding_path = f'{path}/winding.tif'
     if os.path.exists(winding_path):
-        winding_np = np.array(Image.open(winding_path))
+        winding_np = images.read(winding_path)
         assert winding_np.shape[:2] == zyxs.shape[:2] and winding_np.ndim == 2 and winding_np.dtype == np.float32
         wt = torch.from_numpy(winding_np)
         if (torch.isnan(wt) | (wt == 0.)).all():  # all zero/NaN -> mark as single winding
@@ -424,236 +399,5 @@ def load_tifxyz(path, *, z_range=None):
     else:
         winding_value = None
 
-    return Patch(zyxs, scale, overlapping_ids, winding_value, uuid,
+    return Patch(zyxs, scale, overlapping_ids, winding_value, surface.uuid,
                  erosion_cells_override)
-
-
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None):
-    """Write a NEW tifxyz surface to ``path/uuid``.
-
-    ``uuid`` names the directory only; meta.json gets a fresh random
-    identity, never one derived from the name. ``layout_metadata`` describes
-    the export layout of the supplied grid.
-    """
-    path = f'{path}/{uuid}'
-    os.makedirs(path, exist_ok=True)
-    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
-    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
-    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
-    valid_vertex = np.any(zyxs != -1, axis=-1)
-    valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
-    area_vx2 = int(valid_quad.sum()) * step_size ** 2
-    valid_zyxs = zyxs[valid_vertex]
-    bbox = (
-        [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
-        if valid_vertex.any()
-        else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
-    )
-    metadata = {
-        'scale': [1 / step_size, 1 / step_size],
-        'bbox': bbox,
-        'area_vx2': area_vx2,
-        'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
-        'format': 'tifxyz',
-        'type': 'seg',
-        'uuid': str(uuid4()),
-        'source': source,
-    }
-    if layout_metadata is not None:
-        metadata[ORIENTATION_METADATA_KEY] = layout_metadata
-    with open(f'{path}/meta.json', 'w') as f:
-        json.dump(metadata, f, indent=4)
-    return True
-
-
-def save_combined_tifxyz(
-    winding_zyxs,
-    path,
-    uuid,
-    step_size,
-    voxel_size_um,
-    source,
-    *,
-    z_direction_is_top_to_bottom,
-    first_winding=10,
-    cleanup_erosion_cells=None,
-    base_shape_zyx=None,
-):
-    """Atomically write consecutive winding grids as one QuadSurface.
-
-    ``winding_zyxs`` is a mapping from integer winding id to equally tall
-    ``[z, theta, 3]`` ZYX float arrays in spiral order. They are laid side by
-    side innermost first and the whole grid is then put in the export layout
-    (surface_orientation) for ``z_direction_is_top_to_bottom``, so the
-    outermost winding comes first. Winding ranges use
-    half-open column bounds, in the written grid, for display filtering, but
-    they are not QuadSurface components: adjacent windings remain joined by
-    quads across their shared seam. ``winding_column_ranges`` pairs with
-    ``component_winding_ids`` and runs left to right.
-    """
-    import os
-    import shutil
-    import tempfile
-
-    if not winding_zyxs:
-        raise ValueError("No winding grids were supplied")
-    if base_shape_zyx is not None:
-        if (not isinstance(base_shape_zyx, (list, tuple))
-                or len(base_shape_zyx) != 3
-                or any(type(value) is not int or value <= 0
-                       for value in base_shape_zyx)):
-            raise ValueError(
-                "base_shape_zyx must be a ZYX list of three positive integers")
-        base_shape_zyx = [int(value) for value in base_shape_zyx]
-    by_id = {int(key): np.asarray(value, dtype=np.float32) for key, value in winding_zyxs.items()}
-    last_winding = max(by_id)
-    if last_winding < int(first_winding):
-        raise ValueError(
-            f"No preview winding is at or above {int(first_winding)} (last={last_winding})"
-        )
-    ids = list(range(int(first_winding), last_winding + 1))
-    missing = [winding for winding in ids if winding not in by_id]
-    if missing:
-        raise ValueError(f"Missing preview winding grids: {missing}")
-
-    rows = None
-    blocks = []
-    components = []
-    cursor = 0
-    for index, winding in enumerate(ids):
-        block = by_id[winding]
-        if block.ndim != 3 or block.shape[-1] != 3 or block.shape[1] < 2:
-            raise ValueError(f"Winding {winding} must have shape [rows, cols>=2, 3]")
-        if rows is None:
-            rows = block.shape[0]
-        if block.shape[0] != rows:
-            raise ValueError("All winding grids must have the same row count")
-        if not np.isfinite(block[block != -1]).all():
-            raise ValueError(f"Winding {winding} contains non-finite coordinates")
-        start = cursor
-        blocks.append(block)
-        cursor += block.shape[1]
-        components.append([start, cursor])
-    combined = np.concatenate(blocks, axis=1)
-    cleanup_metadata = None
-    if cleanup_erosion_cells is not None:
-        import scipy.ndimage
-
-        erosion_cells = int(cleanup_erosion_cells)
-        if erosion_cells < 0:
-            raise ValueError("cleanup_erosion_cells must be non-negative")
-        valid = np.isfinite(combined).all(axis=-1) & ~np.all(combined == -1.0, axis=-1)
-        if erosion_cells:
-            valid = scipy.ndimage.binary_erosion(
-                valid, iterations=erosion_cells, border_value=0)
-        labels, component_count = scipy.ndimage.label(
-            valid, structure=scipy.ndimage.generate_binary_structure(2, 1))
-        if component_count == 0:
-            raise ValueError(
-                "Preview cleanup removed every valid TIFXYZ vertex "
-                f"after {erosion_cells}-cell erosion")
-        component_sizes = np.bincount(labels.ravel())
-        component_sizes[0] = 0
-        valid = labels == int(np.argmax(component_sizes))
-        combined = combined.copy()
-        combined[~valid] = -1.0
-        cleanup_metadata = {
-            "erosion_cells": erosion_cells,
-            "component_connectivity": 4,
-            "components_after_erosion": int(component_count),
-        }
-    width = combined.shape[1]
-    combined = GridLayout.export(z_direction_is_top_to_bottom).apply(combined)
-    # Reversing the columns puts the windings outermost first.
-    components = [[width - end, width - begin] for begin, end in reversed(components)]
-    component_ids = ids[::-1]
-    destination = os.path.abspath(os.fspath(path))
-    parent = os.path.dirname(destination)
-    os.makedirs(parent, exist_ok=True)
-    temp_root = tempfile.mkdtemp(prefix=f".{os.path.basename(destination)}.", dir=parent)
-    try:
-        surface_dir = os.path.join(temp_root, uuid)
-        os.makedirs(surface_dir)
-        Image.fromarray(combined[..., 2]).save(os.path.join(surface_dir, "x.tif"))
-        Image.fromarray(combined[..., 1]).save(os.path.join(surface_dir, "y.tif"))
-        Image.fromarray(combined[..., 0]).save(os.path.join(surface_dir, "z.tif"))
-
-        valid_vertex = np.any(combined != -1, axis=-1)
-        valid_quad = (
-            valid_vertex[:-1, :-1]
-            & valid_vertex[1:, :-1]
-            & valid_vertex[:-1, 1:]
-            & valid_vertex[1:, 1:]
-        )
-        area_vx2 = int(valid_quad.sum()) * step_size ** 2
-        valid_zyxs = combined[valid_vertex]
-        bbox = (
-            [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
-            if valid_zyxs.size
-            else [[-1.0] * 3, [-1.0] * 3]
-        )
-        metadata = {
-            "scale": [1 / step_size, 1 / step_size],
-            "bbox": bbox,
-            "area_vx2": area_vx2,
-            "area_cm2": area_vx2 * voxel_size_um ** 2 / 1.e8,
-            "voxel_size_um": float(voxel_size_um),
-            "format": "tifxyz",
-            "type": "seg",
-            # ``uuid`` is the directory name (manifest surface_id); the
-            # surface's identity is a fresh random UUID.
-            "uuid": str(uuid4()),
-            "source": source,
-            "winding_column_ranges": components,
-            "component_winding_ids": component_ids,
-            "output_first_winding": ids[0],
-            "output_last_winding": ids[-1],
-            ORIENTATION_METADATA_KEY: export_metadata(z_direction_is_top_to_bottom),
-        }
-        if base_shape_zyx is not None:
-            metadata["base_shape_zyx"] = base_shape_zyx
-        if cleanup_metadata is not None:
-            metadata["lasagna_input_cleanup"] = cleanup_metadata
-        meta_path = os.path.join(surface_dir, "meta.json")
-        with open(meta_path, "w", encoding="utf-8") as stream:
-            json.dump(metadata, stream, indent=4)
-            stream.flush()
-            os.fsync(stream.fileno())
-
-        published = {
-            "schema_version": 2,
-            "kind": "spiral_combined_preview",
-            "surface_path": os.path.join(destination, uuid),
-            "surface_id": uuid,
-            "first_winding": ids[0],
-            "last_winding": ids[-1],
-            "winding_column_ranges": components,
-            "winding_ids": component_ids,
-            "voxel_size_um": float(voxel_size_um),
-            ORIENTATION_METADATA_KEY: export_metadata(z_direction_is_top_to_bottom),
-            "manifest_path": os.path.join(destination, "manifest.json"),
-        }
-        if base_shape_zyx is not None:
-            published["base_shape_zyx"] = base_shape_zyx
-        with open(os.path.join(temp_root, "manifest.json"), "w", encoding="utf-8") as stream:
-            json.dump(published, stream, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-
-        # Publish the generation directory only after all files and metadata are complete.
-        if os.path.exists(destination):
-            raise FileExistsError(destination)
-        os.replace(temp_root, destination)
-        temp_root = ""
-        try:
-            parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        except OSError:
-            pass
-        return published
-    finally:
-        if temp_root:
-            shutil.rmtree(temp_root, ignore_errors=True)

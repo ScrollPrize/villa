@@ -22,7 +22,6 @@ try:
 except ImportError:  # pragma: no cover - unavailable on Windows
     resource = None
 from collections.abc import Mapping
-import zarr
 import torch
 import wandb
 import datetime
@@ -75,7 +74,8 @@ from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
-from tifxyz import load_tifxyz, patch_from_payload
+from patches import load_patch, patch_from_payload
+from vc_reader.reader import open_zarr
 from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
 from point_collection import (
     PatchLinkOptions,
@@ -1464,9 +1464,9 @@ class FitContext:
             'loading', f'Loading and filtering {label}',
             step=0, total_steps=len(entries), unit='patches')
 
-        # Patch decode is dominated by per-file Python overhead (PIL TIFF tag
-        # parsing etc.), so threads serialize on the GIL — worker processes
-        # are required to actually parallelize.  Each worker runs a few IO
+        # Per-patch Python work (tensors, masks, erosion) serializes threads on
+        # the GIL, so worker processes are required to actually parallelize.
+        # Each worker runs a few IO
         # threads so per-file latency (e.g. NFS round trips) overlaps with
         # decode; patches come back as numpy payloads (see patch_to_payload).
         world_size = max(1, self.dist.world_size)
@@ -2060,7 +2060,7 @@ class FitContext:
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
-            scroll_zarr = zarr.open(self.scroll_zarr_path, mode='r')
+            scroll_zarr = open_zarr(self.scroll_zarr_path)
         else:
             scroll_zarr = None
 
@@ -2098,7 +2098,7 @@ class FitContext:
                     'the outer shell is required by shell losses or winding-model '
                     'supervision, but no outer shell path is set')
             progress.begin('loading', 'Loading outer shell')
-            shell_patch = load_tifxyz(self.shell_path)
+            shell_patch = load_patch(self.shell_path)
 
         use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
         if not use_verified_patches:
@@ -4296,7 +4296,7 @@ class FitContext:
                     # (z range, erosion, name filter, and input toggles).
                     # An absent baseline must stay excluded, not be read
                     # again through the stricter live-revision loader.
-                    patch = load_tifxyz(path)
+                    patch = load_patch(path)
                     patch._source_path = os.path.abspath(path)
                     cells = patch.erosion_cells(self.config['patch_erode_patches'])
                     valid = cells <= 0 or erode_patch_valid_region(patch, cells)

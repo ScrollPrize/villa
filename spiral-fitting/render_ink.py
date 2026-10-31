@@ -47,13 +47,10 @@ import click
 import numpy as np
 import scipy.ndimage
 from PIL import Image
-
-# Full-scroll strips are legitimately enormous (hundreds of megapixels); disable PIL's
-# decompression-bomb guard so max_composite can open them.
-Image.MAX_IMAGE_PIXELS = None
+from vc_reader import images, tifxyz
 
 from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
-from tifxyz import load_tifxyz, save_tifxyz
+from surface_export import new_surface
 
 
 def default_lasagna_dir(script_path=__file__):
@@ -99,7 +96,7 @@ def image_bin(widx, base):
 
 
 def read_step_and_voxel(meta_path):
-    """Recover the step_size and voxel_size_um that save_tifxyz encoded into a mesh's
+    """Recover the step_size and voxel_size_um that new_surface encoded into a mesh's
     meta.json, so a concatenated mesh can be written with matching metadata."""
     with open(meta_path, 'r') as f:
         meta = json.load(f)
@@ -127,7 +124,7 @@ def concat_meshes(mesh_paths):
             f'Cannot concatenate meshes written in different layouts: {mesh_paths[0]} vs {mixed[0]}')
     if layout is not None:
         mesh_paths = list(reversed(mesh_paths))
-    grids = [load_tifxyz(p).zyxs.cpu().numpy() for p in mesh_paths]
+    grids = [tifxyz.read(p).xyz[..., ::-1] for p in mesh_paths]
     max_h = max(g.shape[0] for g in grids)
     padded = [
         g if g.shape[0] == max_h
@@ -221,14 +218,16 @@ def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
     name = f'w{lo:03d}-{hi:03d}'
     mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in ordered]
     concat_zyxs, layout = concat_meshes(mesh_paths)
-    save_tifxyz(
-        concat_zyxs,
-        concat_dir,
-        uuid=name,
-        step_size=step_size,
-        voxel_size_um=voxel_size_um,
-        source=f'render_ink full-scroll concat {os.path.basename(meshes_dir.rstrip("/"))}',
-        layout_metadata=layout,
+    tifxyz.write(
+        os.path.join(concat_dir, name),
+        new_surface(
+            concat_zyxs[..., ::-1],
+            step_size,
+            voxel_size_um,
+            f'render_ink full-scroll concat {os.path.basename(meshes_dir.rstrip("/"))}',
+            layout_metadata=layout,
+        ),
+        compression='none', tile=None, mask=False, overwrite=True,
     )
     return name, os.path.join(concat_dir, name), int(concat_zyxs.shape[1])
 
@@ -295,7 +294,7 @@ def trim_tifxyz_to_valid(tifxyz_path):
     meta.json keeps its identity and gets a recomputed bbox. Returns the
     (old_hw, new_hw) grid shapes, or None when there is nothing to keep.
     """
-    axes = {a: np.array(Image.open(os.path.join(tifxyz_path, f'{a}.tif')), dtype=np.float32)
+    axes = {a: images.read(os.path.join(tifxyz_path, f'{a}.tif')).astype(np.float32)
             for a in 'xyz'}
     valid = axes['x'] != -1
     if not valid.any():
@@ -312,13 +311,13 @@ def trim_tifxyz_to_valid(tifxyz_path):
         if ext != '.tif':
             continue
         path = os.path.join(tifxyz_path, name)
-        data = axes[stem] if stem in axes else np.array(Image.open(path))
+        data = axes[stem] if stem in axes else images.read(path)
         ch, cw = data.shape[:2]
         if ch % h or cw % w:
             print(f'{name}: {cw}x{ch} is not a multiple of the {w}x{h} grid, left untrimmed')
             continue
         sy, sx = ch // h, cw // w
-        Image.fromarray(np.ascontiguousarray(data[r0 * sy:r1 * sy, c0 * sx:c1 * sx])).save(path)
+        images.write_tiff(path, np.ascontiguousarray(data[r0 * sy:r1 * sy, c0 * sx:c1 * sx]))
 
     meta_path = os.path.join(tifxyz_path, 'meta.json')
     with open(meta_path) as f:
@@ -333,7 +332,7 @@ def trim_tifxyz_to_valid(tifxyz_path):
 def max_composite(tif_paths):
     composite = None
     for tif_path in tif_paths:
-        layer = np.asarray(Image.open(tif_path))
+        layer = images.read(tif_path)
         if composite is None:
             composite = layer
         else:
@@ -490,16 +489,18 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
                 elif removed:
                     print(f'{name}: cleanup removed {removed} cells '
                           f'(erode {pre_erode}, largest component)')
-            save_tifxyz(
-                concat_zyxs,
-                concat_dir,
-                uuid=name,
-                step_size=step_size,
-                voxel_size_um=voxel_size_um,
-                source=f'render_ink concat {os.path.basename(meshes_dir.rstrip("/"))}',
-                layout_metadata=layout,
-            )
             concat_path = os.path.join(concat_dir, name)
+            tifxyz.write(
+                concat_path,
+                new_surface(
+                    concat_zyxs[..., ::-1],
+                    step_size,
+                    voxel_size_um,
+                    f'render_ink concat {os.path.basename(meshes_dir.rstrip("/"))}',
+                    layout_metadata=layout,
+                ),
+                compression='none', tile=None, mask=False, overwrite=True,
+            )
             chunks.append((name, concat_path))
             print(f'wrote {concat_path} '
                   f'({len(chunk)} windings, {concat_zyxs.shape[1]}px wide tifxyz mesh)')

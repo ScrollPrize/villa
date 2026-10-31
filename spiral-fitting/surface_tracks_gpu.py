@@ -9,9 +9,7 @@ fewer than 10 vertices dropped, ``pickle.dumps([])`` for empty slabs) and the sa
 
 Design:
 
-  input     A local zarr v2 array in the layout of the surface predictions (uint8, blosc, '/'
-            chunk keys) is decoded straight from its chunk files by parent threads; any other
-            array is read through the caller's ``open_array``. Either way the z-range is
+  input     Parent threads read the array through ``vc_reader``. The z-range is
             binarized once (``> 0``) into one bit-packed block in POSIX shared memory,
             (z1 - z0) * Y * ceil(X / 8) bytes, which every GPU worker maps. The same pass
             records the foreground bounding box at the slices ``find_yx_range`` samples.
@@ -50,7 +48,6 @@ import dbm
 import errno
 import functools
 import importlib.util
-import json
 import math
 import multiprocessing as mp
 import os
@@ -67,9 +64,9 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 EMPTY = pickle.dumps([])
 MIN_COMPUTE_CAPABILITY = (8, 0)
@@ -310,44 +307,7 @@ def _place(array, node):
 
 
 # ------------------------------------------------------------------------------------------------
-# Input: the direct zarr v2 reader and the bit-packing kernels
-
-def _direct_meta(path):
-    """The ``.zarray`` metadata of a local zarr v2 array the direct reader decodes, else None.
-
-    The direct reader handles the layout of the surface predictions: 3-D uint8 in C order,
-    blosc without filters, fill value 0, '/'-separated chunk keys, and a chunk x size that is a
-    whole number of bytes of the bit-packed block (a multiple of 8). This one predicate decides
-    between the direct reader and ``open_array``."""
-    text = os.fspath(path)
-    if '://' in text:
-        return None
-    try:
-        meta = json.loads((Path(text) / '.zarray').read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(meta, dict):
-        return None
-    shape, chunks = meta.get('shape'), meta.get('chunks')
-    ok = (meta.get('zarr_format') == 2 and isinstance(shape, list) and len(shape) == 3
-          and isinstance(chunks, list) and len(chunks) == 3 and chunks[2] % 8 == 0
-          and (meta.get('compressor') or {}).get('id') == 'blosc' and not meta.get('filters')
-          and meta.get('order') == 'C' and meta.get('dtype') in ('|u1', '<u1')
-          and meta.get('dimension_separator') == '/' and meta.get('fill_value') in (0, None))
-    return meta if ok else None
-
-
-def _open_input(path, open_array):
-    """``(array, direct)``: the metadata as an array stand-in when the direct reader applies,
-    else ``open_array(path)``."""
-    meta = _direct_meta(path)
-    if meta is not None:
-        return SimpleNamespace(shape=tuple(meta['shape']), chunks=tuple(meta['chunks'])), True
-    arr = open_array(path)
-    if len(arr.shape) != 3:
-        raise ValueError(f'{path}: expected a 3-D array, not shape {tuple(arr.shape)}')
-    return arr, False
-
+# Input: the bit-packing kernels
 
 def _packbits_nz_py(src, dst):
     """numba kernel source: ``np.packbits(src != 0, axis=-1)`` into ``dst``."""
@@ -428,8 +388,8 @@ class _Decoder:
     """Binarizes z0..z1 of the input into the bit-packed block, one task per (chunk row, chunk
     column in y), and records the foreground's bounding box at the sampled slices."""
 
-    def __init__(self, path, arr, direct, z0, z1, sampled):
-        self.path, self.arr, self.direct = os.fspath(path), arr, direct
+    def __init__(self, arr, z0, z1, sampled):
+        self.arr = arr
         self.z0, self.z1, self.sampled = z0, z1, sampled
         self.C = tuple(int(c) for c in arr.chunks)
         self.block = None
@@ -456,29 +416,16 @@ class _Decoder:
                    x0 // 8:x0 // 8 + bits.shape[2]] = bits
 
     def decode(self, row, cy):
-        cz, cyy, cxx = self.C
-        Z, Y, X = self.arr.shape
+        cz, cyy, _ = self.C
+        Z, Y, _ = self.arr.shape
         zr0 = row * cz
         lo, hi = max(self.z0 - zr0, 0), min(self.z1 - zr0, cz, Z - zr0)
         y0 = cy * cyy
         ny = min(cyy, Y - y0)
-        if not self.direct:
-            # The whole x extent in one piece, so that any chunk x size keeps the bytes aligned;
-            # binarized with > 0 as the Kimimaro path does (signed and float inputs included).
-            strip = np.asarray(self.arr[zr0 + lo:zr0 + hi, y0:y0 + ny, :]) > 0
-            self._store(zr0 + lo, y0, 0, strip.view(np.uint8))
-            return row
-        from numcodecs import blosc
-        buf = np.empty(cz * cyy * cxx, np.uint8)
-        for cx in range(-(-X // cxx)):
-            try:
-                with open(f'{self.path}/{row}/{cy}/{cx}', 'rb') as f:
-                    raw = f.read()
-            except FileNotFoundError:            # an absent chunk is all fill value 0: the block is zeroed
-                continue
-            blosc.decompress(raw, buf)
-            chunk = buf.reshape(cz, cyy, cxx)[lo:hi, :ny, :min(cxx, X - cx * cxx)]
-            self._store(zr0 + lo, y0, cx * cxx, chunk)
+        # The whole x extent in one piece, so that any chunk x size keeps the bytes aligned;
+        # binarized with > 0 as the Kimimaro path does (signed and float inputs included).
+        strip = self.arr[zr0 + lo:zr0 + hi, y0:y0 + ny, :] > 0
+        self._store(zr0 + lo, y0, 0, strip.view(np.uint8))
         return row
 
 
@@ -1010,7 +957,7 @@ class _Job:
     """One z-range into one DBM: decodes the input, plans the slabs, dispatches batches to the GPU
     workers, turns the skeletons into tracks and writes them in key order."""
 
-    def __init__(self, pool, path, arr, direct, z_min, z_max, out, geometry, skeletonize_kwargs, say):
+    def __init__(self, pool, arr, z_min, z_max, out, geometry, skeletonize_kwargs, say):
         self.pool, self.arr, self.say = pool, arr, say
         self.out = Path(out)
         self.geometry = geometry
@@ -1021,7 +968,7 @@ class _Job:
         step = max(1, (self.z1 - self.z0) // 20)             # the slices find_yx_range samples
         self.sampled = list(range(self.z0, self.z1, step))
         self.block_shape = (self.z1 - self.z0, Y, (X + 7) // 8)
-        self.decoder = _Decoder(path, arr, direct, self.z0, self.z1, self.sampled)
+        self.decoder = _Decoder(arr, self.z0, self.z1, self.sampled)
 
     def start_decode(self):
         self.block_name, self.decoder.block = self.pool.new_block(self.block_shape)
@@ -1459,7 +1406,7 @@ def _track_job(key, offset, v_off, e_off, vertices, edges):
 
 # ------------------------------------------------------------------------------------------------
 
-def run(predictions_path, tracks_dbm_path, *, z_min, z_max, geometry, skeletonize_kwargs, open_array,
+def run(predictions_path, tracks_dbm_path, *, z_min, z_max, geometry, skeletonize_kwargs,
         gpus=None, log=print):
     """Extract the tracks of z_min..z_max into the DBM at ``tracks_dbm_path`` on the GPUs.
 
@@ -1467,7 +1414,6 @@ def run(predictions_path, tracks_dbm_path, *, z_min, z_max, geometry, skeletoniz
     yx_stride_v, dust_threshold, max_area_threshold), in full-resolution voxels.
     ``skeletonize_kwargs``: the options that determine the skeletons (teasar_params, anisotropy,
     dust_threshold, fix_branching, fix_borders, fill_holes), passed to Brook.
-    ``open_array(path)``: opens the input when the direct zarr v2 reader does not apply.
     ``gpus``: nvidia-smi indices (default: CUDA_VISIBLE_DEVICES, else every GPU).
     Keys already in the DBM are skipped. Returns dict(keys_written, seconds, gpus).
     """
@@ -1485,7 +1431,9 @@ def run(predictions_path, tracks_dbm_path, *, z_min, z_max, geometry, skeletoniz
     ds = geometry['downsample_factor']
     if geometry['z_chunk_depth_h'] < ds or geometry['yx_chunk_thickness_v'] < ds:
         raise ValueError('z_chunk_depth_h and yx_chunk_thickness_v must be at least downsample_factor')
-    arr, direct = _open_input(predictions_path, open_array)
+    arr = open_zarr(predictions_path)
+    if len(arr.shape) != 3:
+        raise ValueError(f'{predictions_path}: expected a 3-D array, not shape {tuple(arr.shape)}')
     Z = arr.shape[0]
     if min(z_max, Z) <= min(z_min, Z):
         # nothing to extract (as in the Kimimaro path, the DBM is still created)
@@ -1524,12 +1472,12 @@ def run(predictions_path, tracks_dbm_path, *, z_min, z_max, geometry, skeletoniz
         # the workers were spawned, so they overlap the workers' start-up; the decode threads use
         # the kernel, which releases the GIL, from their first chunk
         _packbits_kernel()
-        job = _Job(pool, predictions_path, arr, direct, z_min, z_max, tracks_dbm_path, geometry,
+        job = _Job(pool, arr, z_min, z_max, tracks_dbm_path, geometry,
                    skeletonize_kwargs, say)
         job.start_decode()
         threading.Thread(target=_warm_numba, daemon=True).start()
         say(f'input {os.fspath(predictions_path)} {tuple(arr.shape)} chunks {tuple(arr.chunks)}, '
-            f'{"direct" if direct else "open_array"} reader ({job.decoder.pack_name} bit packing); '
+            f'{job.decoder.pack_name} bit packing; '
             f'GPUs {",".join(selected)}; NUMA {"nodes " + ",".join(map(str, nodes)) if numa else "off"}; '
             f'{pool.decode_threads} decode threads')
         nw = job.run()

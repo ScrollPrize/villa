@@ -24,7 +24,7 @@ from fit_spiral import (
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
-from tifxyz import load_tifxyz
+from patches import load_patch
 
 
 class RunDtLossScheduleTests(unittest.TestCase):
@@ -352,16 +352,35 @@ class TifxyzMetadataTests(unittest.TestCase):
                 "spiral_patch_erode_cells": 0,
             })
 
-            patch = load_tifxyz(root)
+            patch = load_patch(root)
 
             self.assertEqual(patch.erosion_cells(7), 0)
+
+    def test_patch_scale_keeps_meta_json_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_patch(root, {"format": "tifxyz", "scale": [0.5, 0.25]})
+
+            patch = load_patch(root)
+
+            self.assertEqual(patch.scale.tolist(), [0.5, 0.25])
+
+    def test_malformed_metadata_is_an_input_error_naming_the_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_patch(root, {"scale": [1.0, 1.0]})
+            for metadata in ([], {}, {"scale": [1]}, {"scale": ["bad", 1]},
+                             {"scale": [0, 1]}, {"scale": [float("inf"), 1]}):
+                (root / "meta.json").write_text(json.dumps(metadata))
+                with self.assertRaisesRegex(ValueError, "meta.json"):
+                    load_patch(root)
 
     def test_ordinary_patch_uses_configured_erosion(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self._write_patch(root, {"format": "tifxyz", "scale": [1.0, 1.0]})
 
-            patch = load_tifxyz(root)
+            patch = load_patch(root)
 
             self.assertEqual(patch.erosion_cells(7), 7)
 
@@ -375,7 +394,7 @@ class TifxyzMetadataTests(unittest.TestCase):
                 root / "z.tif")
             # x.tif and y.tif deliberately do not exist: returning None proves
             # the expensive coordinate planes were never opened.
-            self.assertIsNone(load_tifxyz(root, z_range=(100, 200)))
+            self.assertIsNone(load_patch(root, z_range=(100, 200)))
 
     def test_z_prefilter_respects_mask_and_half_open_interval(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -389,9 +408,9 @@ class TifxyzMetadataTests(unittest.TestCase):
             mask = np.ones((2, 2), dtype=np.uint8)
             mask[0, 0] = 0
             Image.fromarray(mask).save(root / "mask.tif")
-            self.assertIsNone(load_tifxyz(root, z_range=(150, 151)))
+            self.assertIsNone(load_patch(root, z_range=(150, 151)))
             # z == end is excluded.
-            self.assertIsNone(load_tifxyz(root, z_range=(99, 100)))
+            self.assertIsNone(load_patch(root, z_range=(99, 100)))
 
 
 class ShellOuterWindingIdxResolutionTests(unittest.TestCase):

@@ -19,7 +19,7 @@ from point_collection import (
     load_point_collection,
     umbilicus_inward_direction,
 )
-from tifxyz import Patch
+from patches import Patch
 
 
 class LoadPointCollectionTests(unittest.TestCase):

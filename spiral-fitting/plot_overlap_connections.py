@@ -19,7 +19,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from tifxyz import load_tifxyz
+from patches import load_patch
 
 
 def patch_xyz(patch):
@@ -84,7 +84,7 @@ def main(patches_path, collection_output, pairs_output, out_dir, limit):
 
     def get_xyz(pid):
         if pid not in patch_cache:
-            patch_cache[pid] = patch_xyz(load_tifxyz(os.path.join(patches_path, pid)))
+            patch_cache[pid] = patch_xyz(load_patch(os.path.join(patches_path, pid)))
         return patch_cache[pid]
 
     items = sorted(coll.items(), key=lambda kv: int(kv[0]))

@@ -35,7 +35,7 @@ import torch
 
 from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
-from tifxyz import save_combined_tifxyz
+from surface_export import save_combined_tifxyz
 from transforms import SpiralAndTransform
 from umbilicus import json_umbilicus_z_to_yx
 

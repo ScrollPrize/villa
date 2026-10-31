@@ -16,7 +16,7 @@ from fit_session import (SessionState, SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, parse_scroll_spec)
 from input_publication import fingerprint
 from spiral_runtime import create_session
-from tifxyz import load_tifxyz
+from patches import load_patch
 
 
 def make_real_revision_session(tmp_path):
@@ -37,7 +37,7 @@ def make_real_revision_session(tmp_path):
         values = np.array(raster)
     values[values != -1] += 2
     Image.fromarray(values).save(replacement / 'x.tif')
-    patch = load_tifxyz(str(baseline))
+    patch = load_patch(str(baseline))
     zs = patch.zyxs[..., 0][patch.valid_vertex_mask]
     spec = json.loads((source / 'spiral-scroll.json').read_text())
     config = {
@@ -111,7 +111,7 @@ def test_real_patch_revision_boundaries(tmp_path):
             torch.testing.assert_close(before, after, rtol=0, atol=0)
         assert list(context.verified_patches) == ['baseline']
         torch.testing.assert_close(context.verified_patches['baseline'].zyxs,
-                                   load_tifxyz(str(replacement)).zyxs, rtol=0, atol=0)
+                                   load_patch(str(replacement)).zyxs, rtol=0, atol=0)
         # Invalid selected batch never removes its preceding valid member.
         invalid = {**record, 'id': str(uuid.uuid4()), 'path': str(tmp_path / 'missing')}
         assert not apply([{**record, 'deleted': True, 'revision': 3}, invalid])['applied']

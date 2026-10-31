@@ -2955,6 +2955,7 @@ class MappedPreviewArtifactTests(unittest.TestCase):
     @staticmethod
     def _write_surface(path, xyz):
         path.mkdir()
+        (path / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0]}))
         for axis, values in zip("xyz", np.moveaxis(xyz, -1, 0)):
             Image.fromarray(values.astype(np.float32)).save(
                 path / f"{axis}.tif")

@@ -40,7 +40,7 @@ from scipy.ndimage import distance_transform_edt
 from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra
 from tqdm import tqdm
 
-from tifxyz import Patch, load_tifxyz
+from patches import Patch, load_patch
 
 
 def load_patches(patches_path, limit=None, segment_id_filter=lambda s: True):
@@ -63,7 +63,7 @@ def load_patches(patches_path, limit=None, segment_id_filter=lambda s: True):
         if meta.get('format') != 'tifxyz' or not segment_id_filter(entry):
             continue
         try:
-            patches[entry] = load_tifxyz(segment_path)
+            patches[entry] = load_patch(segment_path)
         except Exception as e:
             print(f'Failed to load segment {entry}: {e}')
             failed_count += 1

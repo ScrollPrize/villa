@@ -21,6 +21,7 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+from vc_reader import images, tifxyz
 
 TOP_ARCLENGTH_FRACTION = 0.30
 VOXEL_SIZE_UM = 9.6
@@ -2340,38 +2341,6 @@ def output_surface(grid: np.ndarray, meta_extra: dict) -> tuple[np.ndarray, dict
     return bordered, meta
 
 
-def write_tifxyz(
-    out: Path,
-    bordered: np.ndarray,
-    meta: dict,
-    scale: tuple = (1.0, 1.0),
-) -> None:
-    import tifffile
-
-    out.mkdir(parents=True, exist_ok=False)
-    for channel, name in enumerate(("x", "y", "z")):
-        tifffile.imwrite(
-            out / f"{name}.tif",
-            bordered[..., channel],
-            dtype=np.float32,
-            compression=None,
-            photometric="minisblack",
-        )
-    points = bordered[bordered[..., 0] >= 0]
-    meta = {
-        "format": "tifxyz",
-        "type": "seg",
-        "uuid": str(uuid.uuid4()),
-        "scale": [float(scale[0]), float(scale[1])],
-        "bbox": [
-            points.min(axis=0).astype(float).tolist(),
-            points.max(axis=0).astype(float).tolist(),
-        ],
-        **meta,
-    }
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-
-
 def store_surface(args, seed: int, bordered: np.ndarray, meta: dict, scale: tuple) -> str:
     """A grown patch as a new surface in --store bound to --volume-uuid."""
     from vc_object_store.surfaces import create_surface
@@ -2422,8 +2391,6 @@ def retire_surfaces(store: str | Path, uuids: list[str]) -> None:
 
 def is_complete_tifxyz(path: str | Path) -> bool:
     """Return whether a directory contains a readable tifxyz output."""
-    import tifffile
-
     path = Path(path)
     if not path.is_dir():
         return False
@@ -2436,8 +2403,8 @@ def is_complete_tifxyz(path: str | Path) -> bool:
             channel = path / name
             if not channel.is_file():
                 return False
-            with tifffile.TiffFile(channel) as image:
-                shapes.append(image.series[0].shape)
+            with images.open(channel) as image:
+                shapes.append(image.shape)
         return len(set(shapes)) == 1 and len(shapes[0]) == 2 and all(shapes[0])
     except (IndexError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -2726,7 +2693,9 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
         if out is None:
             result.update(grid=bordered, meta=meta, scale=scale)
         else:
-            write_tifxyz(out, bordered, meta, scale=scale)
+            # meta.json's scale is columns, rows; a surface's is rows, columns.
+            tifxyz.write(out, tifxyz.Surface(bordered, scale=(scale[1], scale[0]), extra=meta),
+                         compression="none", tile=None, mask=False)
             result["out"] = str(out)
         stage("write")
         return result

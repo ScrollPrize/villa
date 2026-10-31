@@ -12,8 +12,9 @@ from tqdm import tqdm
 from devices import float_hi, scatter_reduce_
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from surface_orientation import GridLayout, export_metadata
-from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
-                    save_combined_tifxyz)
+from patches import load_patch, patch_to_payload
+from surface_export import new_surface, save_combined_tifxyz
+from vc_reader import tifxyz
 from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
@@ -48,7 +49,7 @@ def load_patch_payload_chunk(path, entries, z_begin, z_end,
     def load_one(entry):
         segment_path = os.path.join(path, entry)
         try:
-            patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
+            patch = load_patch(segment_path, z_range=(z_begin, z_end))
             if patch is None:
                 return entry, None, None, 'z ROI prefilter'
             cells_to_erode = patch.erosion_cells(erode_cells_default)
@@ -1539,14 +1540,16 @@ def save_mesh(
                 invalid_mask = (winding_slice == -1.0).all(dim=-1).cpu().numpy()
                 winding_zyxs = winding_slice.cpu().numpy().astype(np.float32)
                 winding_zyxs[invalid_mask] = -1.0
-                save_tifxyz(
-                    layout.apply(winding_zyxs),
-                    out_dir,
-                    uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
-                    step_size=step_size,
-                    voxel_size_um=voxel_size_um,
-                    source=f'fit_spiral {name}{uuid_suffix}',
-                    layout_metadata=layout_metadata,
+                tifxyz.write(
+                    f'{out_dir}/w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
+                    new_surface(
+                        layout.apply(winding_zyxs)[..., ::-1],
+                        step_size,
+                        voxel_size_um,
+                        f'fit_spiral {name}{uuid_suffix}',
+                        layout_metadata=layout_metadata,
+                    ),
+                    compression='none', tile=None, mask=False, overwrite=True,
                 )
             offset += num_thetas
             output_done += 1
@@ -1736,7 +1739,7 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
         if meta.get('format') != 'tifxyz' or not segment_id_filter(entry):
             continue
         try:
-            patches[entry] = load_tifxyz(segment_path)
+            patches[entry] = load_patch(segment_path)
         except Exception as e:
             print(f'Failed to load segment {entry}: {e}')
             failed_count += 1

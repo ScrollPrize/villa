@@ -16,7 +16,8 @@ from loss_maps import LossMapRecorder, capture_loss_maps, record_loss_samples
 from render_ink import concat_meshes
 import spiral_helpers
 from surface_orientation import GridLayout, export_metadata, spiral_outward_sense_for
-from tifxyz import save_tifxyz
+from surface_export import new_surface
+from vc_reader import tifxyz
 
 DR, STEP, Z_END, WINDINGS = 10.0, 2, 40, [10, 11, 12]
 
@@ -141,12 +142,15 @@ def test_run_diff_pairs_windings_in_the_export_layout(tmp_path):
 def test_render_ink_concatenates_outermost_winding_first(tmp_path):
     grids = {w: np.full((3, w - 8, 3), float(w), np.float32) for w in (10, 11)}
     for w, grid in grids.items():
-        save_tifxyz(GridLayout.export(True).apply(grid), tmp_path, f"w{w}", 1, 9.6, "t",
-                    layout_metadata=export_metadata(True))
+        tifxyz.write(tmp_path / f"w{w}",
+                     new_surface(GridLayout.export(True).apply(grid)[..., ::-1], 1, 9.6, "t",
+                                 layout_metadata=export_metadata(True)),
+                     compression="none", tile=None, mask=False)
     combined, layout = concat_meshes([f"{tmp_path}/w10", f"{tmp_path}/w11"])
     assert layout == export_metadata(True)
     np.testing.assert_array_equal(combined, np.concatenate([grids[11], grids[10]], 1))
-    save_tifxyz(grids[10], tmp_path, "legacy", 1, 9.6, "t")
+    tifxyz.write(tmp_path / "legacy", new_surface(grids[10][..., ::-1], 1, 9.6, "t"),
+                 compression="none", tile=None, mask=False)
     with pytest.raises(click.ClickException):
         concat_meshes([f"{tmp_path}/w11", f"{tmp_path}/legacy"])
 

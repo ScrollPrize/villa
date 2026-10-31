@@ -17,6 +17,7 @@ import re
 
 import numpy as np
 from PIL import Image
+from vc_reader import images
 
 from surface_orientation import GridLayout
 
@@ -77,12 +78,11 @@ class LossMapRecorder:
             "winding_column_ranges", preview_manifest.get("components", [])
         )
         surface = self.generation_path / preview_manifest["surface_id"] / "x.tif"
-        with Image.open(surface) as image:
-            self.width, self.height = image.size
-            # Combined previews use the exact -1 sentinel for every coordinate
-            # of an invalid vertex.  One channel is sufficient to recover the
-            # validity mask and avoids painting splats into black preview gaps.
-            self.surface_valid = np.asarray(image).copy() != -1.0
+        # Combined previews use the exact -1 sentinel for every coordinate
+        # of an invalid vertex.  One channel is sufficient to recover the
+        # validity mask and avoids painting splats into black preview gaps.
+        self.surface_valid = images.read(surface) != -1.0
+        self.height, self.width = self.surface_valid.shape
         # Samples are placed in spiral order (theta and z ascending) and then
         # mapped into the layout the surface was written in.
         self.layout = GridLayout.from_metadata(preview_manifest)

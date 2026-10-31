@@ -7,7 +7,7 @@ import torch
 
 import point_collection
 from point_collection import link_unattached_points_to_patches
-from tifxyz import Patch
+from patches import Patch
 
 
 class _FakePatch:

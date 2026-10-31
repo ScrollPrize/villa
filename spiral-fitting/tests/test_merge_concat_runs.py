@@ -5,8 +5,8 @@ import unittest
 
 import numpy as np
 
-import merge_concat_runs
-import tifxyz
+from surface_export import new_surface
+from vc_reader import tifxyz
 
 
 def _points():
@@ -29,12 +29,16 @@ def _meta(path):
         return json.load(stream)
 
 
+def _write(points, path, *, layout_metadata=None):
+    tifxyz.write(path, new_surface(points, 20.0, 7.91, "test", layout_metadata=layout_metadata),
+                 compression="none", tile=None, mask=False, overwrite=True)
+
+
 class MergeConcatRunsTests(unittest.TestCase):
     def test_bbox_excludes_sentinel_and_is_xyz_ordered(self):
         points = _points()
         with tempfile.TemporaryDirectory() as temporary:
-            merge_concat_runs.save_tifxyz(
-                points, temporary, 20.0, 7.91, "test")
+            _write(points, temporary)
             bbox = _meta(temporary)["bbox"]
 
         valid = points[np.any(points != -1, axis=-1)]
@@ -44,39 +48,20 @@ class MergeConcatRunsTests(unittest.TestCase):
                 self.assertAlmostEqual(actual, expected_value, places=5)
         self.assertNotIn(-1.0, bbox[0] + bbox[1])
 
-    def test_bbox_matches_reference_writer(self):
-        points = _points()
-        with tempfile.TemporaryDirectory() as temporary:
-            merge_path = os.path.join(temporary, "merge")
-            reference_path = os.path.join(temporary, "reference")
-            merge_concat_runs.save_tifxyz(
-                points, merge_path, 20.0, 7.91, "test")
-            tifxyz.save_tifxyz(
-                points[..., ::-1], reference_path, "w000", 20.0, 7.91, "test")
-            merge_meta = _meta(merge_path)
-            reference_meta = _meta(os.path.join(reference_path, "w000"))
-
-        for actual_row, expected_row in zip(
-            merge_meta["bbox"], reference_meta["bbox"]):
-            for actual, expected in zip(actual_row, expected_row):
-                self.assertAlmostEqual(actual, expected, places=5)
-        self.assertEqual(merge_meta["area_vx2"], reference_meta["area_vx2"])
-
-    def test_all_invalid_grid_keeps_sentinel_bbox(self):
+    def test_all_invalid_grid_has_vc_reader_empty_bbox(self):
         points = np.full((6, 5, 3), -1.0, dtype=np.float32)
         with tempfile.TemporaryDirectory() as temporary:
-            merge_concat_runs.save_tifxyz(
-                points, temporary, 20.0, 7.91, "test")
+            _write(points, temporary)
             metadata = _meta(temporary)
 
         self.assertEqual(
             metadata["bbox"],
-            [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
         )
         self.assertEqual(metadata["area_vx2"], 0)
 
 
-def test_writers_preserve_layout_and_assign_distinct_uuids(tmp_path):
+def test_writes_preserve_layout_and_assign_distinct_uuids(tmp_path):
     from uuid import UUID
     from surface_orientation import METADATA_KEY
 
@@ -84,14 +69,30 @@ def test_writers_preserve_layout_and_assign_distinct_uuids(tmp_path):
     layout = {'test_layout': 'preserved'}
     merged = tmp_path / 'merged'
     reference = tmp_path / 'reference'
-    merge_concat_runs.save_tifxyz(
-        points, merged, 20.0, 7.91, 'test', layout_metadata=layout)
-    tifxyz.save_tifxyz(
-        points[..., ::-1], reference, 'w000', 20.0, 7.91, 'test',
-        layout_metadata=layout)
+    _write(points, merged, layout_metadata=layout)
+    _write(points, reference, layout_metadata=layout)
     first = _meta(merged)
-    second = _meta(reference / 'w000')
+    second = _meta(reference)
     assert str(UUID(first['uuid'])) == first['uuid']
     assert str(UUID(second['uuid'])) == second['uuid']
     assert first['uuid'] != second['uuid']
     assert first[METADATA_KEY] == second[METADATA_KEY] == layout
+
+
+def test_main_merges_runs_into_one_surface(tmp_path, monkeypatch):
+    import sys
+
+    import merge_concat_runs
+
+    points = _points()
+    for run, offset in (('a_baseline', 0.0), ('b', 2.0)):
+        moved = np.where(points == -1, -1, points + offset)
+        _write(moved.astype(np.float32), tmp_path / 'runs' / run / 'meshes' / 'm' / 'concat' / 'w000')
+    out = tmp_path / 'out'
+    monkeypatch.setattr(sys, 'argv', ['merge', str(tmp_path / 'runs'), '--out', str(out), '--method', 'mean'])
+    merge_concat_runs.main()
+    merged = tifxyz.read(out / 'w000')
+    assert merged.valid.sum() == points.shape[0] * points.shape[1] - 2
+    np.testing.assert_array_equal(merged.xyz[merged.valid], (points + 1)[merged.valid])
+    assert _meta(out / 'w000')['format'] == 'tifxyz'
+    assert sorted(os.listdir(out / 'w000')) == ['meta.json', 'x.tif', 'y.tif', 'z.tif']

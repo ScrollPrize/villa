@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from config import Config
 from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
-from tifxyz import Patch
+from patches import Patch
 from transforms import SpiralAndTransform
 from tracks import (
     _grouped_same_radius_loss,

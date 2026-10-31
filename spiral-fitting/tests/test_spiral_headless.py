@@ -29,7 +29,7 @@ from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
 import spiral_helpers
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
-from tifxyz import save_combined_tifxyz
+from surface_export import save_combined_tifxyz
 
 
 def _zip_checkpoint_bytes(payload=b"payload"):

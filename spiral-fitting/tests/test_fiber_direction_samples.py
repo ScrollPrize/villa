@@ -19,37 +19,6 @@ def test_parse_z_roi():
     assert _parse_z_roi("10000,11000") == (10000, 11000)
 
 
-def test_read_chunk_crops_full_sized_boundary_chunk():
-    import fiber_direction_samples as module
-
-    stored = np.arange(4 * 4 * 4, dtype=np.uint8).reshape(4, 4, 4)
-
-    class Response:
-        status_code = 200
-        content = stored.tobytes()
-
-        @staticmethod
-        def raise_for_status():
-            return None
-
-    class Session:
-        @staticmethod
-        def get(*args, **kwargs):
-            return Response()
-
-    metadata = {
-        "shape": [5, 4, 4],
-        "chunks": [4, 4, 4],
-        "dtype": "|u1",
-        "compressor": None,
-        "order": "C",
-    }
-    result = module._read_chunk(Session(), "https://example.invalid/a", metadata,
-                                (1, 0, 0))
-    assert result.shape == (1, 4, 4)
-    np.testing.assert_array_equal(result, stored[:1])
-
-
 def test_cell_argmax_keeps_one_highest_presence_voxel_per_cell():
     presence = np.zeros((4, 4, 4), dtype=np.uint8)
     presence[0, 0, 0] = 180
@@ -104,3 +73,29 @@ def test_direction_loss_is_zero_for_sheet_tangent_and_one_for_normal():
     assert torch.isclose(get_fiber_direction_loss(transform, normal, 1, 1,
                                                   torch.device("cpu")),
                          torch.tensor(1.0), atol=1e-6)
+
+
+def test_extract_reads_chunks_of_a_store_and_skips_empty_ones(tmp_path):
+    from fiber_direction_samples import extract
+    from vc_reader.reader import ZarrWriter
+
+    presence = np.zeros((8, 8, 8), dtype=np.uint8)
+    presence[5, 1, 2] = 200
+    presence[1, 6, 6] = 100  # below the threshold
+    nx = np.full((8, 8, 8), 11, dtype=np.uint8)
+    ny = np.full((8, 8, 8), 22, dtype=np.uint8)
+    for name, values in (("presence", presence), ("nx", nx), ("ny", ny)):
+        array = ZarrWriter.create(tmp_path / f"{name}.zarr", shape=values.shape, chunks=(4, 4, 4),
+                                  dtype="|u1", skip_empty=True)
+        array[...] = values
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "source_to_base": 1,
+        "groups": {name: {"zarr": f"{name}.zarr", "scaledown": 0}
+                   for name in ("presence", "nx", "ny")},
+    }))
+    output = tmp_path / "samples.npz"
+    extract(str(tmp_path / "manifest.json"), (0, 8), output, workers=2)
+    with np.load(output) as packed:
+        np.testing.assert_array_equal(packed["position_zyx"], [[5, 1, 2]])
+        assert packed["presence"].tolist() == [200]
+        assert packed["nx"].tolist() == [11] and packed["ny"].tolist() == [22]

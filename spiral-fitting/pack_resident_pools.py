@@ -4,7 +4,7 @@ A sidecar holds every *occupied* brick of a (chunk-sparse) uint8 zarr array as
 one flat pool file per channel, plus an int32 brick-grid table mapping brick
 coordinates to pool rows (0 = absent, served by a reserved all-zero row).
 Loading it is a single sequential read per channel instead of tens of
-thousands of demand-fills through tensorstore, and a fully resident pool never
+thousands of demand-fills, and a fully resident pool never
 evicts, so the per-step LRU thrash disappears entirely.
 
 CT masking: the giant outside-the-scroll mask region (CT volume reads 0) can
@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+from vc_reader.reader import decompress_bytes, open_zarr
 
 RESPOOL_FORMAT_VERSION = 2
 
@@ -94,14 +95,7 @@ def _chunk_path(array_dir: Path, key: tuple[int, int, int], separator: str) -> P
 
 
 def _make_chunk_reader(compressor: dict | None, chunk_voxels: int):
-    if compressor is None:
-        def read(path: Path) -> np.ndarray:
-            data = np.fromfile(path, dtype=np.uint8)
-            if data.size != chunk_voxels:
-                raise ValueError(f'{path}: raw chunk has {data.size} bytes, expected {chunk_voxels}')
-            return data
-        return read
-    codec_id = compressor.get('id')
+    codec_id = None if compressor is None else compressor.get('id')
     if codec_id == 'vcz1':
         delta3d = _load_delta3d(codec_id)
 
@@ -116,18 +110,10 @@ def _make_chunk_reader(compressor: dict | None, chunk_voxels: int):
                     f'expected {chunk_voxels}')
             return decoded
         return read
-    if codec_id == 'vc-delta3d':
-        _load_delta3d(codec_id)  # Import registers the numcodecs adapter.
-    import numcodecs
-    codec = numcodecs.get_codec(compressor)
 
     def read(path: Path) -> np.ndarray:
         with open(path, 'rb') as f:
-            decoded = codec.decode(f.read())
-        decoded = np.frombuffer(decoded, dtype=np.uint8)
-        if decoded.size != chunk_voxels:
-            raise ValueError(f'{path}: decoded chunk has {decoded.size} bytes, expected {chunk_voxels}')
-        return decoded
+            return np.frombuffer(decompress_bytes(f.read(), compressor, chunk_voxels), dtype=np.uint8)
     return read
 
 
@@ -428,10 +414,8 @@ def open_pool(sidecar_dir: str):
 def verify_pool(sidecar_dir: str, num_samples: int, seed: int = 0) -> None:
     """Compare random voxels against the source zarrs. Where the sidecar was
     CT-masked, a pool zero is accepted iff the mapped CT voxel is zero."""
-    import zarr
-
     meta, table, _coords, pools = open_pool(sidecar_dir)
-    arrays = [zarr.open(path, mode='r') for path in meta['channels']]
+    arrays = [open_zarr(path) for path in meta['channels']]
     masker = None
     if meta.get('ct_mask'):
         masker = CtMasker(meta['ct_mask']['path'], meta['ct_mask']['group'],
@@ -447,10 +431,9 @@ def verify_pool(sidecar_dir: str, num_samples: int, seed: int = 0) -> None:
     mismatches = masked = 0
     for channel, (pool, array) in enumerate(zip(pools, arrays)):
         got = pool[rows, linear]
-        for i in range(num_samples):
-            expected = array[points[i, 0], points[i, 1], points[i, 2]]
-            if got[i] == expected:
-                continue
+        stored = array.read_points(points)
+        for i in np.flatnonzero(got != stored):
+            expected = stored[i]
             if (masker is not None and got[i] == 0
                     and masker.ct_value_at(points[i]) == 0):
                 masked += 1

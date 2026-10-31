@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import zarr
+from vc_reader.reader import open_group
 from click.testing import CliRunner
 
 from tracks_to_ome_zarr import (
@@ -123,7 +123,7 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
                 raise result.exception
             self.assertEqual(result.exit_code, 0, result.output)
 
-            root = zarr.open_group(output_path, mode='r')
+            root = open_group(output_path)
             array = root['0']
             self.assertEqual(array.dtype, np.dtype('uint8'))
             self.assertEqual(array.shape, (16, 16, 16))
@@ -178,8 +178,8 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
                 raise pipelined.exception
 
             np.testing.assert_array_equal(
-                zarr.open_group(serial_path, mode='r')['0'][:],
-                zarr.open_group(pipelined_path, mode='r')['0'][:],
+                open_group(serial_path)['0'][:],
+                open_group(pipelined_path)['0'][:],
             )
 
 

@@ -46,9 +46,9 @@ import importlib.util
 import os
 import pickle
 import re
-import sys
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 
 predictions_zarr_path = 's3://<bucket>/<volpkg>/volumes/<surface-predictions>.zarr/0'
@@ -70,15 +70,6 @@ path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal n
 BACKENDS = ('auto', 'gpu', 'cpu')
 # An unfilled placeholder such as '<bucket>' in a configured path.
 _PLACEHOLDER = re.compile(r'<[^<>/]+>')
-
-
-def open_predictions(path):
-    """Open the predictions array read-only with vesuvius's ``open_zarr`` (local path or URL)."""
-    vesuvius_src = f'{os.path.dirname(os.path.abspath(__file__))}/../vesuvius/src'
-    if vesuvius_src not in sys.path:
-        sys.path.insert(0, vesuvius_src)
-    from vesuvius.data.utils import open_zarr
-    return open_zarr(path, mode='r')
 
 
 def downsample_maxpool(x, factor):
@@ -300,7 +291,7 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
 def run_cpu(predictions_path, tracks_dbm_path):
     """Extract every slab in turn on the CPU (Kimimaro), writing each key as it completes."""
     print(f'opening {predictions_path}')
-    predictions_zarr_array = open_predictions(predictions_path)
+    predictions_zarr_array = open_zarr(predictions_path)
 
     with dbm.open(tracks_dbm_path, 'c') as tracks_db:
 
@@ -323,7 +314,7 @@ def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
     import surface_tracks_gpu
     return surface_tracks_gpu.run(
         predictions_path, tracks_dbm_path, z_min=z_min, z_max=z_max, geometry=geometry(),
-        skeletonize_kwargs=skeletonize_kwargs(), open_array=open_predictions, gpus=gpus)
+        skeletonize_kwargs=skeletonize_kwargs(), gpus=gpus)
 
 
 def _have_kimimaro():

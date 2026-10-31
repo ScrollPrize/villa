@@ -190,11 +190,13 @@ def test_missing_sampling_weight_rejects_batch_without_stopping_resident(context
 ])
 def test_malformed_patch_metadata_preserves_resident(context, resident, tmp_path, metadata):
     import json
-    from tifxyz import save_tifxyz
+    from surface_export import new_surface
+    from vc_reader import tifxyz
 
-    save_tifxyz(context._source_verified_patches['baseline'].zyxs.numpy(),
-                str(tmp_path), 'draft', 1, 1, 'test')
     path = tmp_path / 'draft'
+    tifxyz.write(path, new_surface(
+        context._source_verified_patches['baseline'].zyxs.numpy()[..., ::-1], 1, 1, 'test'),
+        compression='none', tile=None, mask=False)
     meta_path = path / 'meta.json'
     valid_metadata = meta_path.read_text()
     meta_path.write_text(json.dumps(metadata))
@@ -231,7 +233,7 @@ def test_invalid_absolute_annotations_fail_during_preparation(context, tmp_path)
 def test_rejected_patch_revision_does_not_remove_previous_geometry(context, monkeypatch):
     import fit_spiral
     original = context.verified_patches['baseline']
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz', lambda path: copy.copy(original))
+    monkeypatch.setattr(fit_spiral, 'load_patch', lambda path: copy.copy(original))
 
     def reject(candidate):
         del candidate.verified_patches['baseline']
@@ -261,7 +263,7 @@ def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypa
     # A baseline may be absent because it has no valid quads, was eroded
     # away, or was excluded by the ROI, name filter, or source toggle.
     # Registration must not try to reinterpret any of those decisions.
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
+    monkeypatch.setattr(fit_spiral, 'load_patch',
                         lambda path: pytest.fail('excluded baseline was reloaded'))
     original = context._source_verified_patches['baseline']
     candidate = context.prepare_input_changes([{
@@ -364,7 +366,7 @@ def test_theta_rejected_baseline_replay(context, monkeypatch, adopt):
         return warnings + build_theta(candidate)
 
     monkeypatch.setattr(FitContext, '_build_theta_crossing_map', reject)
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
+    monkeypatch.setattr(fit_spiral, 'load_patch',
                         lambda path: pytest.fail('baseline was reloaded') if adopt
                         else copy.copy(excluded))
     record = {'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
@@ -414,7 +416,7 @@ def test_patch_additions_rederive_one_view_per_collection(context, monkeypatch, 
         for point in pcl['points'].values():
             point['winding_annotation'] = 1.0
     context._source_point_collections = {5: pcl}
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz', lambda path: relink._flat_patch(50, 510, 510))
+    monkeypatch.setattr(fit_spiral, 'load_patch', lambda path: relink._flat_patch(50, 510, 510))
     context.install_input_changes(context.prepare_input_changes([
         {'id': 'new', 'kind': 'patch', 'path': '/immutable/patch'}]))
     assert len(context.cross_patch_pcls) == 1

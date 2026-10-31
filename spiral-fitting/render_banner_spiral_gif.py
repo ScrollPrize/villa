@@ -10,12 +10,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import imageio.v2 as imageio
 import numpy as np
-import s3fs
-import zarr
 from PIL import Image, ImageDraw, ImageFilter
 from scipy.optimize import least_squares
+from vc_reader import tifxyz
+from vc_reader.reader import ZarrReader, open_group
 
 
 ZARR_URL = (
@@ -81,14 +80,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_tif(path: Path) -> np.ndarray:
-    return np.asarray(Image.open(path), dtype=np.float32)
-
-
 def extract_z_curve(path: Path, z0: float) -> np.ndarray:
-    z = read_tif(path / "z.tif")
-    y = read_tif(path / "y.tif")
-    x = read_tif(path / "x.tif")
+    x, y, z = np.moveaxis(tifxyz.read(path).xyz, -1, 0)
 
     points: list[tuple[float, float]] = []
     for col_idx in range(z.shape[1]):
@@ -224,14 +217,12 @@ def fit_ideal_spiral(curves: list[WindingCurve]) -> tuple[float, float, float, f
     return float(cy), float(cx), dr, phase, sense
 
 
-def open_s3_zarr(url: str, level: int) -> zarr.Array:
-    fs = s3fs.S3FileSystem(anon=True)
-    group = zarr.open_group(s3fs.S3Map(root=url, s3=fs, check=False), mode="r")
-    return group[str(level)]
+def open_s3_zarr(url: str, level: int) -> ZarrReader:
+    return open_group(url, auth=None)[str(level)]
 
 
 def load_background(
-    array: zarr.Array | None,
+    array: ZarrReader | None,
     z0: float,
     crop_yx: tuple[int, int, int, int],
     mesh_to_zarr_divisor: float,
@@ -453,7 +444,7 @@ def main() -> None:
         )
         for i in range(FRAME_COUNT)
     ]
-    imageio.mimsave(args.output, frames, duration=0.07, loop=0)
+    frames[0].save(args.output, save_all=True, append_images=frames[1:], duration=70, loop=0)
     frames[-1].convert("RGB").save(args.preview)
 
     print(f"curves: {len(curves)} windings {curves[0].winding}-{curves[-1].winding}")

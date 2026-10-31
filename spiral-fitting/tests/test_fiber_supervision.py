@@ -22,7 +22,7 @@ from losses import get_radial_normal_in_scroll_space
 from point_collection import SIDE_BEHIND, SIDE_FRONT
 from sample_spiral import get_radial_covector_in_scroll_space, get_radial_normal_stretch
 from spiral_helpers import classify_fiber_hv, fiber_collection_hv_tag
-from tifxyz import Patch
+from patches import Patch
 
 import test_live_patch_relink as relink
 from test_revisioned_geometry import context

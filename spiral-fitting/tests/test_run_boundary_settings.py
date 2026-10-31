@@ -383,7 +383,7 @@ def test_fiber_link_side_rules_are_a_no_op_without_a_fiber_catalog():
 
 
 def _z_plane_patch(z, y0=-20.0, x0=-20.0, size=5, spacing=10.0):
-    from tifxyz import Patch
+    from patches import Patch
     grid = torch.zeros((size, size, 3), dtype=torch.float32)
     for i in range(size):
         for j in range(size):
