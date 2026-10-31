@@ -17,20 +17,19 @@ import time
 from typing import List, Tuple, Optional, Union, Dict, Protocol
 from contextlib import suppress
 
+import cv2
 import numpy as np
 import torch
 from device_utils import amp_device_type, empty_cache
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
-import zarr
+from vc_reader.reader import ZarrGroup, ZarrWriter
 
 from k8s import get_tqdm_kwargs
 from profiling import get_worker_profiler, scoped_timer
-from processing import path_exists, get_cached_zarr_store
+from processing import path_exists, open_surface_volume
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -146,10 +145,9 @@ class LayersSource:
             if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
             self._arr = None
-            store = get_cached_zarr_store(src)
-            root = zarr.open(store, mode='r')
+            root = open_surface_volume(src)
 
-            if isinstance(root, zarr.Group):
+            if isinstance(root, ZarrGroup):
                 if "0" in root:
                     self._mm = root["0"]
                 else:
@@ -251,13 +249,14 @@ def preprocess_layers(
 class SlidingWindowDataset(Dataset):
     """
     Lazily materializes (tile_h, tile_w, C) from the source object per tile,
-    applies clipping and transforms, and returns tensors as (1, C, H, W).
+    applies clipping, resizing to `size` and scaling by `max_value`, and returns tensors as (1, C, H, W).
     """
-    def __init__(self, source: LayersSource, xyxys: np.ndarray, reverse: bool, transform):
+    def __init__(self, source: LayersSource, xyxys: np.ndarray, reverse: bool, size: int, max_value: float):
         self.source = source
         self.xyxys = xyxys.astype(np.int32, copy=False)
         self.reverse = reverse
-        self.transform = transform
+        self.size = size
+        self.max_value = max_value
 
     def __len__(self) -> int:
         return int(self.xyxys.shape[0])
@@ -281,8 +280,10 @@ class SlidingWindowDataset(Dataset):
             # Clip to match training range - in-place for speed
             np.clip(tile, 0, CFG.max_clip_value, out=tile)
 
-            data = self.transform(image=tile)  # -> tensor (C,H,W)
-            tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
+            if tile.shape[:2] != (self.size, self.size):
+                tile = cv2.resize(tile, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+            image = tile.astype(np.float32) / self.max_value
+            tens = torch.from_numpy(image.transpose(2, 0, 1)).unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
             return tens, self.xyxys[idx], valid
 
 def create_inference_dataloader(
@@ -349,17 +350,7 @@ def create_inference_dataloader(
                 f"({len(xyxys)} tiles out of {total_tiles} total)"
             )
 
-        # Build transforms; avoid no-op resize
-        tfm_list = []
-        if CFG.tile_size != CFG.size:
-            tfm_list.append(A.Resize(CFG.size, CFG.size))
-        tfm_list += [
-            A.ToFloat(max_value=CFG.max_clip_value),
-            ToTensorV2(),
-        ]
-        transform = A.Compose(tfm_list)
-
-        dataset = SlidingWindowDataset(source, np.asarray(xyxys), reverse, transform)
+        dataset = SlidingWindowDataset(source, np.asarray(xyxys), reverse, CFG.size, CFG.max_clip_value)
 
         loader = DataLoader(
             dataset,
@@ -490,41 +481,37 @@ def predict_fn(
             pbar.close()
 
         # Always write results to zarr
-        from numcodecs import LZ4
-
         logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
         os.makedirs(CFG.zarr_output_dir, exist_ok=True)
 
         mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
         mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
 
-        compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
+        compressor = "lz4" if CFG.use_zarr_compression else None
 
         # Create and write mask_pred zarr
         with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
-            mask_pred_z = zarr.open(
+            mask_pred_z = ZarrWriter.create(
                 mask_pred_path,
-                mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
                 compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
+                overwrite=True,
+                skip_empty=True,
             )
             mask_pred_z[:] = mask_pred
 
         # Create and write mask_count zarr
         with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
-            mask_count_z = zarr.open(
+            mask_count_z = ZarrWriter.create(
                 mask_count_path,
-                mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
                 compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
+                overwrite=True,
+                skip_empty=True,
             )
             mask_count_z[:] = mask_count
         if profiler is not None:

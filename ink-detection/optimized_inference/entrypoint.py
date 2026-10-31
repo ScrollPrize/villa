@@ -1,27 +1,9 @@
 import os
 import io
 import sys
-import logging as _logging
-import warnings
 
 # Allow huge images before anything imports cv2 (and before importing inference_timesformer)
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
-
-# Suppress harmless "Unclosed client session / connector" noise from aiohttp.
-# s3fs/fsspec create aiohttp sessions that aren't explicitly closed when
-# DataLoader worker processes exit.  aiohttp.__del__ emits these via two paths:
-#   1) warnings.warn(..., ResourceWarning)  — suppressed by the filter below
-#   2) loop.call_exception_handler()        — suppressed by the asyncio log filter
-warnings.filterwarnings("ignore", message="Unclosed", category=ResourceWarning)
-
-
-class _FilterUnclosed(_logging.Filter):
-    def filter(self, record: _logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return "Unclosed client session" not in msg and "Unclosed connector" not in msg
-
-
-_logging.getLogger("asyncio").addFilter(_FilterUnclosed())
 
 import json
 import time
@@ -29,22 +11,21 @@ import math
 import shutil
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import uuid
-import boto3
 import numpy as np
-from botocore.config import Config
 import cv2
 import concurrent.futures
-import zarr
-import tifffile as tiff
+from vc_reader import images as image_files
+from vc_reader.reader import ObjectStore, open_zarr
 from huggingface_hub import snapshot_download
 from contextlib import suppress
 
 from profiling import (
     FLAG_APPROXIMATE,
     FLAG_ESTIMATED,
-    TransferTracker,
     WorkflowProfiler,
     aggregate_workflow_profiling,
     build_runtime_parameters,
@@ -284,8 +265,12 @@ def build_profiler(inputs: Inputs, template_name: str) -> WorkflowProfiler:
     return profiler
 
 
+@lru_cache(maxsize=None)
+def s3_bucket(bucket: str) -> ObjectStore:
+    return ObjectStore(f"s3://{bucket}")
+
+
 def profiled_s3_download_file(
-    s3_client,
     bucket: str,
     key: str,
     output_path: str,
@@ -293,17 +278,19 @@ def profiled_s3_download_file(
     metric_name: str = "download_seconds",
     bytes_metric: str = "s3_download_bytes",
 ) -> None:
-    tracker = TransferTracker()
     start = time.monotonic()
-    s3_client.download_file(bucket, key, output_path, Callback=tracker)
+    data = s3_bucket(bucket).read(key)
+    if data is None:
+        raise FileNotFoundError(f"s3://{bucket}/{key}")
+    with open(output_path, "wb") as handle:
+        handle.write(data)
     elapsed = time.monotonic() - start
     if profiler is not None:
         profiler.add_duration(metric_name, elapsed)
-        profiler.increment_counter(bytes_metric, tracker.bytes_transferred)
+        profiler.increment_counter(bytes_metric, len(data))
 
 
 def profiled_s3_upload_file(
-    s3_client,
     local_path: str,
     bucket: str,
     key: str,
@@ -311,13 +298,13 @@ def profiled_s3_upload_file(
     metric_name: str = "upload_seconds",
     bytes_metric: str = "s3_upload_bytes",
 ) -> None:
-    tracker = TransferTracker()
     start = time.monotonic()
-    s3_client.upload_file(local_path, bucket, key, Callback=tracker)
+    data = Path(local_path).read_bytes()
+    s3_bucket(bucket).write(key, data)
     elapsed = time.monotonic() - start
     if profiler is not None:
         profiler.add_duration(metric_name, elapsed)
-        profiler.increment_counter(bytes_metric, tracker.bytes_transferred)
+        profiler.increment_counter(bytes_metric, len(data))
 
 
 def write_aggregate_output_parameters(results: Dict[str, str]) -> None:
@@ -330,39 +317,35 @@ def write_aggregate_output_parameters(results: Dict[str, str]) -> None:
 
 
 def list_layers_objects(
-    s3_client, bucket: str, prefix: str, start_layer: int, end_layer: int, profiler: Optional[WorkflowProfiler] = None
+    bucket: str, prefix: str, start_layer: int, end_layer: int, profiler: Optional[WorkflowProfiler] = None
 ) -> List[Tuple[str, str]]:
     # Return list of (key, basename) for .tif/.tiff/.png/.jpeg/.jpg files inside any "layers/" folder under prefix
     # OR directly under prefix for surface-volumes (e.g., paths ending in .tifs/)
-    paginator = s3_client.get_paginator("list_objects_v2")
     keys: List[Tuple[str, str]] = []
     SUPPORTED_IMAGE_FORMATS = {'.tif', '.tiff', '.png', '.jpeg', '.jpg'}
     with scoped_timer(profiler, "s3_list_seconds"):
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
+        for key in s3_bucket(bucket).keys(prefix):
+            # Check if it's a layer file with supported format
+            # Support both: paths with "/layers/" subdirectory AND surface-volumes with .tifs/ directory
+            if "/layers/" not in key.lower() and not prefix.endswith(".tifs/"):
+                continue
 
-                # Check if it's a layer file with supported format
-                # Support both: paths with "/layers/" subdirectory AND surface-volumes with .tifs/ directory
-                if "/layers/" not in key.lower() and not prefix.endswith(".tifs/"):
-                    continue
+            base = os.path.basename(key)
+            name, ext = os.path.splitext(base)
 
-                base = os.path.basename(key)
-                name, ext = os.path.splitext(base)
+            # Check if the file extension is supported
+            if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
+                continue
 
-                # Check if the file extension is supported
-                if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
-                    continue
+            try:
+                # Tolerate leading zeros, e.g., 01, 02, ...
+                layer_idx = int(name)
+            except ValueError:
+                continue
 
-                try:
-                    # Tolerate leading zeros, e.g., 01, 02, ...
-                    layer_idx = int(name)
-                except ValueError:
-                    continue
-
-                # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
-                if start_layer <= layer_idx < end_layer:
-                    keys.append((key, base))
+            # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
+            if start_layer <= layer_idx < end_layer:
+                keys.append((key, base))
     if not keys:
         raise RuntimeError(
             f"No layers found within range [{start_layer}, {end_layer}) under s3://{bucket}/{prefix}"
@@ -373,21 +356,14 @@ def list_layers_objects(
 
 
 def download_layers(
-    s3_client, bucket: str, objects: List[Tuple[str, str]], out_dir: str, profiler: Optional[WorkflowProfiler] = None
+    bucket: str, objects: List[Tuple[str, str]], out_dir: str, profiler: Optional[WorkflowProfiler] = None
 ) -> List[str]:
     os.makedirs(out_dir, exist_ok=True)
-
-    session = boto3.Session()
-    config = Config(
-        max_pool_connections=20,
-        retries={'max_attempts': 3, 'mode': 'adaptive'}
-    )
 
     def _download_one(args):
         idx, key, base, bucket, out_dir = args
         out_path = os.path.join(out_dir, base)
-        client = session.client("s3", config=config)
-        profiled_s3_download_file(client, bucket, key, out_path, profiler)
+        profiled_s3_download_file(bucket, key, out_path, profiler)
         logger.info(f"Finished downloading layer {idx}: {out_path}")
         return out_path
 
@@ -433,7 +409,7 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
     return stacked_layers
 
 
-def download_model_weights(model_name: str, dest_dir: str, s3_client, profiler: Optional[WorkflowProfiler] = None) -> str:
+def download_model_weights(model_name: str, dest_dir: str, profiler: Optional[WorkflowProfiler] = None) -> str:
     """
     Resolve model weights by checking S3 registry first, then fall back to Hugging Face.
 
@@ -459,21 +435,18 @@ def download_model_weights(model_name: str, dest_dir: str, s3_client, profiler: 
         f"Attempting to locate weights in S3 registry s3://{registry_bucket}/{registry_prefix}"
     )
     try:
-        paginator = s3_client.get_paginator("list_objects_v2")
         found_keys: List[str] = []
         with scoped_timer(profiler, "s3_list_seconds"):
-            for page in paginator.paginate(Bucket=registry_bucket, Prefix=registry_prefix):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    lower = key.lower()
-                    if lower.endswith(".ckpt") or lower.endswith(".safetensors") or lower.endswith(".bin") or lower.endswith(".pt"):
-                        found_keys.append(key)
+            for key in s3_bucket(registry_bucket).keys(registry_prefix):
+                lower = key.lower()
+                if lower.endswith(".ckpt") or lower.endswith(".safetensors") or lower.endswith(".bin") or lower.endswith(".pt"):
+                    found_keys.append(key)
 
         chosen_key = _prefer(found_keys)
         if chosen_key:
             logger.info(f"Found weights in S3 registry: s3://{registry_bucket}/{chosen_key}")
             local_path = os.path.join(dest_dir, os.path.basename(chosen_key))
-            profiled_s3_download_file(s3_client, registry_bucket, chosen_key, local_path, profiler)
+            profiled_s3_download_file(registry_bucket, chosen_key, local_path, profiler)
             logger.info(f"Downloaded weights from S3 to: {local_path}")
             return local_path
         else:
@@ -582,14 +555,13 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
 
 
 def save_and_upload_prediction(
-    s3_client, prediction: np.ndarray, output_path: str, model_key: str, start_layer: int, end_layer: int,
+    prediction: np.ndarray, output_path: str, model_key: str, start_layer: int, end_layer: int,
     default_bucket: str = None, default_prefix: str = None
 ) -> str:
     """
     Save and upload prediction to specified output path.
 
     Args:
-        s3_client: Boto3 S3 client
         prediction: Prediction array to save
         output_path: Full output path (S3 URI or local path). If empty, uses default bucket/prefix
         model_key: Model identifier
@@ -624,7 +596,7 @@ def save_and_upload_prediction(
 
         # Upload to S3
         logger.info(f"Uploading prediction to S3: {final_output_path}")
-        s3_client.upload_file(local_path, bucket, key)
+        s3_bucket(bucket).write(key, Path(local_path).read_bytes())
     else:
         # Local file path
         os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
@@ -647,15 +619,12 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
         logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
 
-    # S3 setup
-    logger.info("Setting up S3 client...")
-    s3_client = boto3.client("s3")
     logger.info(f"Parsing S3 URI: {inputs.s3_path}")
     bucket, prefix = parse_s3_uri(inputs.s3_path)
 
     logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
     layer_objects = list_layers_objects(
-        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
+        bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
     )
     logger.info(f"Found {len(layer_objects)} layer objects to download")
     # The zarr's channel k must be source layer layer_start + k: refuse gaps and duplicate indices up front.
@@ -669,7 +638,7 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
     ensure_clean_dir(os.path.join(work_dir, "input"))
 
     logger.info(f"Downloading layer files to {input_dir} ...")
-    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir, profiler=profiler)
+    layer_paths = download_layers(bucket, layer_objects, input_dir, profiler=profiler)
     logger.info(f"Downloaded {len(layer_paths)} layer files")
 
     if inputs.surface_volume_zarr:
@@ -765,10 +734,6 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
 
-    # S3 setup (for model download)
-    logger.info("Setting up S3 client...")
-    s3_client = boto3.client("s3")
-
     # Device
     device = select_device()
     logger.info(f"Using device: {device}")
@@ -776,7 +741,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     # Resolve and download model weights (S3-first, then HF fallback)
     logger.info(f"Resolving model for key: {inputs.model_key}")
     logger.info(f"Looking for weights in S3 registry, else HF repo: {inputs.model_key}")
-    weight_path = download_model_weights(inputs.model_key, models_dir, s3_client, profiler=profiler)
+    weight_path = download_model_weights(inputs.model_key, models_dir, profiler=profiler)
     logger.info(f"Loading model from weights at: {weight_path}")
 
     # Load model with dynamic number of frames
@@ -882,9 +847,6 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
 
     logger.info(f"Starting reduce step: blending {inputs.num_parts} partitions")
 
-    # S3 setup (need it for uploading final result)
-    s3_client = boto3.client("s3")
-
     # Handle WebKnossos workflow to get s3_path
     if inputs.wk_inference:
         logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
@@ -898,8 +860,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
 
     logger.info(f"Reading prediction shape from {mask_pred_path}")
     with scoped_timer(profiler, "local_read_seconds", flag=FLAG_APPROXIMATE):
-        z = zarr.open(mask_pred_path, mode='r')
-        pred_shape = z.shape
+        pred_shape = open_zarr(mask_pred_path).shape
     if profiler is not None:
         profiler.increment_counter("local_read_bytes", dir_size_bytes(mask_pred_path), flag=FLAG_APPROXIMATE)
     logger.info(f"Prediction shape: {pred_shape}")
@@ -950,7 +911,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
     if final_output_path.startswith("s3://"):
         output_bucket, output_key = parse_s3_uri(final_output_path)
         logger.info(f"Uploading tiled TIFF to S3: {final_output_path}")
-        profiled_s3_upload_file(s3_client, local_tiff_path, output_bucket, output_key, profiler)
+        profiled_s3_upload_file(local_tiff_path, output_bucket, output_key, profiler)
         result_uri = final_output_path
     else:
         # Local file path
@@ -974,7 +935,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
         # Read the TIFF back as numpy array for WebKnossos upload
         logger.info(f"Reading TIFF for WebKnossos upload: {local_tiff_path}")
         with scoped_timer(profiler, "local_read_seconds", flag=FLAG_APPROXIMATE):
-            prediction = tiff.imread(local_tiff_path)
+            prediction = image_files.read(local_tiff_path)
         if profiler is not None:
             profiler.increment_counter("local_read_bytes", os.path.getsize(local_tiff_path), flag=FLAG_APPROXIMATE)
         # Convert uint8 back to float32 [0, 1] as expected by upload_to_webknossos

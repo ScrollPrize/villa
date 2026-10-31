@@ -57,7 +57,7 @@ This workflow now emits best-effort profiling artifacts for `prepare`, each infe
 
 ## Limitations And Caveats
 
-- Explicit boto3 transfers have exact byte accounting. Hidden zarr / fsspec traffic is timed at the real call site, but byte attribution is only exact when the underlying buffer size is exposed.
+- Explicit `ObjectStore` transfers have exact byte accounting. Hidden Zarr traffic is timed at the real call site, but byte attribution is only exact when the underlying buffer size is exposed.
 - Local image decode is timed around the read-and-decode call. Pure kernel-level file-read time cannot be separated cleanly there, so local read timing is labeled `approximate`.
 - Linux `iowait` is recorded only as a system signal. It is not treated as exact process I/O time.
 - NVML, USS, PSS, cgroup metrics, or PyTorch CUDA stats may be unavailable depending on the environment. When that happens the summary stores `flag: "unavailable"` plus a reason.

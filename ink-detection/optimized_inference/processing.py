@@ -7,7 +7,6 @@ tasks (prepare, reduce) to run without loading torch.
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 
-import hashlib
 import logging
 import shutil
 import math
@@ -17,13 +16,9 @@ import concurrent.futures
 
 import numpy as np
 import cv2
-import zarr
-import tifffile as tiff
-from numcodecs import LZ4
+from vc_reader import images
+from vc_reader.reader import ObjectStore, ZarrWriter, open_node, open_zarr
 from tqdm.auto import tqdm
-import fsspec
-from vendored_cache_store import CacheStore
-from zarr.storage import LocalStore, FsspecStore, MemoryStore
 
 from k8s import get_tqdm_kwargs
 from profiling import dir_size_bytes, get_active_profiler
@@ -32,136 +27,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def path_exists(path: str) -> bool:
-    """Check if path exists (supports local paths and S3 URLs)."""
+    """Check if a zarr exists at path (supports local paths and S3 URLs)."""
     if path.startswith("s3://"):
-        import s3fs
-        fs = s3fs.S3FileSystem(anon=False)
-        return fs.exists(path)
+        store = ObjectStore(path)
+        return any(store.exists(name) for name in (".zarray", ".zgroup", "zarr.json"))
     return os.path.exists(path)
 
 
-def get_cached_zarr_store(path: str):
-    """Get read-only cached zarr store for path (supports local paths and S3 URLs).
+def open_surface_volume(path: str):
+    """The zarr array or group at path, for reading (supports local paths and S3 URLs).
 
-    This function is intended for read operations with performance optimization.
-    For S3 paths, automatically applies disk-based caching using zarr3's CacheStore
-    to improve performance and reduce S3 request costs.
-
-    For write operations, use get_writable_zarr_store() instead.
-
-    Args:
-        path: Local file path or S3 URL (s3://bucket/path)
-
-    Returns:
-        Cached zarr store (CacheStore for S3, path string for local)
+    S3 chunks go through a disk cache and an in-memory cache, sized from the environment.
     """
-    if path.startswith("s3://"):
-        # Create S3 filesystem with credentials
-        fs = fsspec.filesystem(
-            's3',
-            anon=False,
-            asynchronous=True,
-            s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
-        )
-
-        # Remove s3:// prefix to get the path for FsspecStore
-        s3_path = path[5:]  # Remove 's3://'
-
-        # Create base S3 store using zarr3's FsspecStore
-        base_store = FsspecStore(fs=fs, path=s3_path, read_only=True)
-
-        # Configure cache settings from environment variables.
-        # Cached keys are store-relative (".zarray", "0/0/0/1"), so every source volume
-        # gets its own subdirectory; in a shared directory a second volume would be
-        # served the first volume's metadata and chunks.
-        cache_dir = os.path.join(
-            os.environ.get("ZARR_CACHE_DIR", "./zarr_cache"),
-            hashlib.sha1(path.rstrip("/").encode()).hexdigest()[:12],
-        )
-        cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
-        cache_max_age = os.environ.get("ZARR_CACHE_MAX_AGE", "infinity")
-
-        # Convert cache size from GB to bytes
-        cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)
-
-        # Create cache directory if it doesn't exist
-        os.makedirs(cache_dir, exist_ok=True)
-
-        # Create LocalStore for persistent disk-based caching
-        cache_store = LocalStore(cache_dir)
-
-        # Wrap S3 store with CacheStore for automatic caching
-        cached_store = CacheStore(
-            store=base_store,
-            cache_store=cache_store,
-            max_size=cache_size_bytes,
-            max_age_seconds=cache_max_age
-        )
-
-        logger.info(
-            f"Enabled zarr3 disk cache for S3 path: {path}\n"
-            f"  Cache dir: {cache_dir}\n"
-            f"  Cache size limit: {cache_size_gb} GB\n"
-            f"  Cache max age: {cache_max_age}"
-        )
-
-        # Optional in-memory layer on top of disk cache to avoid repeated
-        # pathlib read_bytes/open calls during sliding window inference.
-        mem_cache_mb = int(os.environ.get("ZARR_MEM_CACHE_MB", "512"))
-        if mem_cache_mb > 0:
-            cached_store = CacheStore(
-                store=cached_store,
-                cache_store=MemoryStore(),
-                max_size=mem_cache_mb * 1024 * 1024,
-                max_age_seconds="infinity",
-            )
-            logger.info(f"  In-memory cache layer: {mem_cache_mb} MB")
-
-        return cached_store
-
-    return path
-
-
-def get_writable_zarr_store(path: str):
-    """Get writable zarr store for path (supports local paths and S3 URLs).
-
-    This function is intended for write operations and does not apply caching.
-    For read-only operations with caching, use get_cached_zarr_store() instead.
-
-    Args:
-        path: Local file path or S3 URL (s3://bucket/path)
-
-    Returns:
-        Writable zarr store (fsspec mapper for S3, path string for local)
-    """
-    if path.startswith("s3://"):
-        # Return writable fsspec mapper for S3
-        return fsspec.get_mapper(path, anon=False, s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'})
-    return path
-
-
-def get_zarr_store(path: str):
-    """Get zarr store for path (supports local paths and S3 URLs).
-
-    .. deprecated::
-        Use get_cached_zarr_store() for read operations or get_writable_zarr_store()
-        for write operations instead. This function defaults to cached read behavior
-        for backwards compatibility.
-
-    Args:
-        path: Local file path or S3 URL (s3://bucket/path)
-
-    Returns:
-        Cached zarr store (defaults to read-only cached behavior)
-    """
-    import warnings
-    warnings.warn(
-        "get_zarr_store() is deprecated. Use get_cached_zarr_store() for reads "
-        "or get_writable_zarr_store() for writes.",
-        DeprecationWarning,
-        stacklevel=2
+    if not path.startswith("s3://"):
+        return open_node(path)
+    cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
+    cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
+    mem_cache_mb = int(os.environ.get("ZARR_MEM_CACHE_MB", "512"))
+    logger.info(
+        f"Disk cache for S3 path: {path}\n"
+        f"  Cache dir: {cache_dir}\n"
+        f"  Cache size limit: {cache_size_gb} GB\n"
+        f"  In-memory cache: {mem_cache_mb} MB"
     )
-    return get_cached_zarr_store(path)
+    return open_node(
+        path,
+        cache_dir=cache_dir,
+        cache_max_bytes=int(cache_size_gb * 1024 ** 3),
+        memory_cache=(mem_cache_mb << 20) or None,
+    )
 
 
 # ----------------------------- Surface Volume Creation ------------------------------
@@ -173,10 +67,7 @@ def _read_gray_any(path: str) -> np.ndarray:
     start = time.monotonic()
     try:
         if ext in (".tif", ".tiff"):
-            img = tiff.imread(path)
-            if img is None:
-                logger.warning(f"Failed to read image: {path}")
-                return None
+            img = images.read(path)
             if img.ndim > 2:
                 img = img[..., 0]
             if img.dtype == np.uint16:
@@ -225,9 +116,7 @@ def contiguous_layer_window(layer_names: List[str]) -> Tuple[int, int]:
 
 def record_layer_window(zarr_path: str, start_layer: int, end_layer: int) -> None:
     """Record which source layers a prepared surface-volume zarr holds (channel k = layer start_layer + k)."""
-    z = zarr.open(get_writable_zarr_store(zarr_path), mode="r+")
-    z.attrs["layer_start"] = int(start_layer)
-    z.attrs["layer_end"] = int(end_layer)
+    ZarrWriter.open(zarr_path).attrs.update(layer_start=int(start_layer), layer_end=int(end_layer))
 
 
 def resolve_zarr_layer_window(zarr_path: str, start_layer: int, end_layer: int):
@@ -237,7 +126,7 @@ def resolve_zarr_layer_window(zarr_path: str, start_layer: int, end_layer: int):
     [layer_start, layer_end); the requested window is rebased onto it. A zarr without the attrs
     (an externally built full-depth stack) is indexed with the absolute layer indices as before.
     """
-    attrs = zarr.open(get_cached_zarr_store(zarr_path), mode="r").attrs
+    attrs = open_surface_volume(zarr_path).attrs
     if "layer_start" not in attrs:
         return int(start_layer), int(end_layer)
     base, top = int(attrs["layer_start"]), int(attrs["layer_end"])
@@ -305,32 +194,27 @@ def create_surface_volume_zarr(
     else:
         logger.info(
             f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
-            f"~{estimated_gib:.2f} GiB estimated with LZ4). Writing to S3 with INTELLIGENT_TIERING."
+            f"~{estimated_gib:.2f} GiB estimated with LZ4). Writing to S3."
         )
 
     # Fail if zarr already exists
     if path_exists(output_path):
         raise RuntimeError(f"Surface volume zarr already exists at {output_path}. Please remove it or use a different path.")
 
-    # Get writable zarr store (handles both local and S3)
-    store = get_writable_zarr_store(output_path)
-
     # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
     # Optionally use LZ4 compression (fast with decent ratio)
-    compressor = LZ4(acceleration=1) if use_compression else None
     compression_msg = "with LZ4 compression" if use_compression else "without compression"
     logger.info(f"Creating zarr array {compression_msg}")
 
     open_start = time.monotonic()
-    z = zarr.open(
-        store,
-        mode="w",
+    z = ZarrWriter.create(
+        output_path,
         shape=(h, w, c),
         chunks=(chunk_size, chunk_size, 1),
         dtype=np.uint8,
-        compressor=compressor,
-        zarr_format=2,
-        config={'write_empty_chunks': False}  # Don't write chunks that are entirely fill_value
+        compressor="lz4" if use_compression else None,
+        overwrite=True,
+        skip_empty=True,  # Don't write chunks that are entirely fill_value
     )
     if profiler is not None:
         profiler.add_duration("zarr_write_seconds", time.monotonic() - open_start, flag="approximate")
@@ -680,9 +564,9 @@ def reduce_partitions(
                 profiler.increment_counter("local_read_bytes", bytes_to_copy)
                 profiler.increment_counter("local_write_bytes", bytes_to_copy)
 
-        # Open zarr arrays from cache
-        mask_pred_z = zarr.open(cached_pred_path, mode='r')
-        mask_count_z = zarr.open(cached_count_path, mode='r')
+        # Open zarr arrays from cache. A tile is one chunk; many partitions must not each hold a thread pool.
+        mask_pred_z = open_zarr(cached_pred_path, threads=1)
+        mask_count_z = open_zarr(cached_count_path, threads=1)
 
         return (mask_pred_z, mask_count_z)
 
@@ -791,35 +675,16 @@ def write_tiled_tiff(
     """
     try:
         H, W = shape
-
-        # Build tiff.imwrite kwargs
-        tiff_kwargs = {
-            'shape': (H, W),
-            'dtype': np.uint8,
-            'compression': 'deflate',
-            'tile': (tile_size, tile_size),
-            'metadata': {'software': 'optimized_inference'}
-        }
-
-        # Add resolution metadata if provided
-        if pixel_resolution_um is not None:
-            # Convert µm/pixel to DPI (dots per inch)
-            # 1 inch = 25400 µm, so DPI = 25400 / (µm per pixel)
-            dpi = 25400.0 / pixel_resolution_um
-            tiff_kwargs['resolution'] = (dpi, dpi)
-            tiff_kwargs['resolutionunit'] = 'INCH'
-            logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}), tile size {tile_size}x{tile_size}, "
-                       f"and resolution {pixel_resolution_um:.3f} µm/pixel ({dpi:.2f} DPI)")
-        else:
-            logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}), tile size {tile_size}x{tile_size} "
-                       f"(no resolution metadata)")
+        logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}), tile size {tile_size}x{tile_size}"
+                    + (f", and resolution {pixel_resolution_um:.3f} µm/pixel" if pixel_resolution_um is not None else " (no resolution metadata)"))
 
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
         # Write with tiling and compression using iterator
         write_start = time.monotonic()
-        tiff.imwrite(output_path, tile_iterator, **tiff_kwargs)
+        with images.TiffWriter(output_path, (H, W), np.uint8, compression='deflate', tile=(tile_size, tile_size), pixel_um=pixel_resolution_um) as writer:
+            writer.write_tiles(tile_iterator)
         elapsed = time.monotonic() - write_start
         if profiler is not None:
             profiler.add_duration("local_write_seconds", elapsed, flag="approximate")

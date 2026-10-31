@@ -5,9 +5,8 @@ import logging
 import concurrent.futures
 from typing import Tuple, List
 
-import boto3
-from botocore.config import Config
 from huggingface_hub import snapshot_download
+from vc_reader.reader import ObjectStore
 
 
 logging.basicConfig(
@@ -43,8 +42,7 @@ def upload_files_to_s3(
     bucket: str,
     base_prefix: str,
 ) -> None:
-    config = Config(max_pool_connections=32, retries={"max_attempts": 3, "mode": "adaptive"})
-    s3_client = boto3.client("s3", config=config)
+    store = ObjectStore(f"s3://{bucket}", connections=32)
 
     def _to_s3_key(local_path: str) -> str:
         rel = os.path.relpath(local_path, start=local_root)
@@ -55,7 +53,8 @@ def upload_files_to_s3(
 
     def _upload_one(path: str) -> str:
         key = _to_s3_key(path)
-        s3_client.upload_file(path, bucket, key)
+        with open(path, "rb") as handle:
+            store.write(key, handle.read())
         return key
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:

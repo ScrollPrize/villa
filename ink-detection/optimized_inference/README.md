@@ -121,7 +121,7 @@ docker run --rm --gpus all \
 
 Authentication options:
 - In AWS/Kubernetes, prefer IAM roles (IRSA) for S3 access.
-- For local runs, standard AWS env vars/credentials are supported by `boto3`.
+- For local runs, AWS credentials come from the environment and the shared AWS files (vc_reader); SSO, assumed roles and instance metadata are not supported.
 
 ### CPU utility-only run
 
