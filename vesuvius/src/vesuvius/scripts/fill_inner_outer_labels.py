@@ -36,6 +36,9 @@ import zarr
 from numcodecs import Blosc
 from tqdm import tqdm
 
+from vesuvius.data.utils import open_zarr_group
+from vesuvius.image_proc.run.zarr_tasks.utils import create_level_dataset
+
 # Try to import alphashape - required for outer region detection
 try:
     import alphashape
@@ -643,10 +646,10 @@ def create_output_zarr(
     # Create output store
     if output_path.exists():
         print(f"Output exists, opening in r+ mode")
-        output_store = zarr.open(str(output_path), mode="r+")
+        output_store = open_zarr_group(str(output_path), mode="r+")
     else:
         print(f"Creating output zarr")
-        output_store = zarr.open(str(output_path), mode="w")
+        output_store = open_zarr_group(str(output_path), mode="w")
 
     # Copy the target level
     input_arr = input_store[str(output_level)]
@@ -656,13 +659,14 @@ def create_output_zarr(
         if compressor is None:
             compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
-        output_store.create_dataset(
+        create_level_dataset(
+            str(output_path),
             str(output_level),
             shape=input_arr.shape,
             chunks=input_arr.chunks,
             dtype=input_arr.dtype,
             compressor=compressor,
-            fill_value=input_arr.fill_value,
+            overwrite=False,
         )
         print(f"Created output level {output_level}: shape={input_arr.shape}")
 
