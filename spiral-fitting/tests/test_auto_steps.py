@@ -138,3 +138,13 @@ def test_resumed_fit_waits_two_windows_after_the_resume():
     context = _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 10_000},
                        start_iteration=6000)
     assert context._auto_steps_monitor().earliest_stop == 8000
+
+
+def test_startup_line_reports_the_earliest_stop(capsys):
+    _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 10_000})._auto_steps_monitor()
+    assert "earliest stop after 2000 of 10000 iterations" in capsys.readouterr().out
+    _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 30_000})._auto_steps_monitor()
+    out = capsys.readouterr().out
+    assert "stages start at iterations 25001" in out and "earliest stop after 27001 of 30000" in out
+    _context({"optimizer_auto_steps": True, "optimizer_num_training_steps": 26_000})._auto_steps_monitor()
+    assert "runs to all 26000 iterations" in capsys.readouterr().out

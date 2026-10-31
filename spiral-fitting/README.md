@@ -233,7 +233,10 @@ stage start (a 200-iteration block that straddles it is dropped), and the
 startup prints the stage starts and the earliest stop. A fit with no stage
 before its horizon, such as a 10,000-step fit with the default DT starts
 (25,000), stops as described above. A fit resumed from a checkpoint also runs
-two windows after the resume before it can stop.
+two windows after the resume before it can stop. With the default horizon
+(30,000) and DT starts (25,000), a fit with patches, tracks or fibers loaded
+can stop no earlier than 27,001 iterations; the startup line `auto steps: on
+(...)` gives the earliest stop for each fit.
 
 ```bash
 FIT_SPIRAL_CONFIG_OVERRIDES='{"optimizer_auto_steps": true}' python fit_spiral.py --dataset <dataset dir>

@@ -5481,10 +5481,16 @@ class FitContext:
             window=window_blocks, block=_AUTO_STEPS_BLOCK,
             min_iterations=min_iterations, rel_threshold=threshold,
             stage_starts=stage_starts, start_iteration=self.start_iteration)
-        if stage_starts:
-            print(f'auto steps: staged fit, stages start at iterations '
-                  f'{", ".join(map(str, stage_starts))}; no stop before '
-                  f'{monitor.earliest_stop} iterations')
+        stages = (f'stages start at iterations {", ".join(map(str, stage_starts))}; '
+                  if stage_starts else '')
+        if monitor.earliest_stop < self.num_training_steps:
+            when = (f'earliest stop after {monitor.earliest_stop} of '
+                    f'{self.num_training_steps} iterations')
+        else:
+            when = (f'the last stage leaves less than two windows, so the fit runs '
+                    f'to all {self.num_training_steps} iterations')
+        print(f'auto steps: on (window {window_blocks * _AUTO_STEPS_BLOCK} iterations, '
+              f'threshold {threshold:g}); {stages}{when}')
         return monitor
 
     def run(self):
