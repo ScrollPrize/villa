@@ -73,7 +73,7 @@ def _perfect_spiral_fiber(wraps, winding=66, spacing=40.0, theta0=0.0):
     return np.asarray(pts, dtype=np.float32)
 
 
-def _flat_bundle(zyxs_list, radial_offsets=None):
+def _flat_bundle(zyxs_list, radial_offsets=None, fit_masks=None):
     lengths = np.array([len(z) for z in zyxs_list], dtype=np.int64)
     starts = np.concatenate([[0], np.cumsum(lengths)])
     flat = {
@@ -86,14 +86,20 @@ def _flat_bundle(zyxs_list, radial_offsets=None):
         flat['radial_offsets'] = torch.from_numpy(np.concatenate([
             np.full(len(z), float(o), dtype=np.float32)
             for z, o in zip(zyxs_list, radial_offsets)]))
+    if fit_masks is not None:
+        mask = np.concatenate([np.asarray(m, dtype=bool) for m in fit_masks])
+        flat['fit_mask'] = torch.from_numpy(mask)
+        flat['has_excluded_points'] = bool(not mask.all())
     return flat
 
 
-def _strips(zyxs_list):
+def _strips(zyxs_list, fit_masks=None):
     return [
         {'id': i, 'name': f'strip{i}', 'source_file': None,
          'zyxs': z, 'windings': np.zeros(len(z), dtype=np.float32),
-         'link_points': {}}
+         'link_points': {},
+         **({'fit_mask': np.asarray(fit_masks[i], dtype=bool)}
+            if fit_masks is not None else {})}
         for i, z in enumerate(zyxs_list)
     ]
 
@@ -102,11 +108,11 @@ def _run_losses(
         zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0,
         num_points_per_pcl=None, transform=None, whole_object_cache=False,
         components=None, component_edges=None, num_pcls_per_step=None,
-        radial_offsets=None):
+        radial_offsets=None, fit_masks=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    strips = _strips(zyxs_list)
-    flat = _flat_bundle(zyxs_list, radial_offsets)
+    strips = _strips(zyxs_list, fit_masks)
+    flat = _flat_bundle(zyxs_list, radial_offsets, fit_masks)
     crossing_map = ThetaCrossingMap('cpu')
     node_start = crossing_map.register_nodes(
         flat['total'], lambda lo, hi: flat['zyxs'][lo:hi])
@@ -138,7 +144,8 @@ def _run_losses(
         dt_target_cache = compute_strip_dt_target_cache(
             transform, dr, flat['zyxs'], flat['starts_cpu'],
             windings=flat['windings'], num_points_per_strip=512,
-            max_stride=128, radial_offsets=flat.get('radial_offsets'))
+            max_stride=128, radial_offsets=flat.get('radial_offsets'),
+            fit_mask=flat.get('fit_mask'))
     if num_points_per_pcl is None:
         num_points_per_pcl = cfg[
             'sample_count_unattached_pcl_points_per_step']
@@ -478,3 +485,226 @@ def test_radial_offset_only_moves_the_offset_strip():
         components=[[0, 1]], component_edges=[[(0, 1, 1, 0)]])
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
+
+
+# --- gap/damaged fiber spans: masked points stay in the strip, constrain nothing
+
+
+def _spiral_with_thetas(wraps, winding=66, spacing=40.0):
+    # _perfect_spiral_fiber plus each point's theta.
+    pts, thetas = [], []
+    theta = 0.0
+    while theta < wraps * 2 * np.pi:
+        r = DR * (winding + theta / (2 * np.pi))
+        pts.append([0.0, np.sin(theta) * r, np.cos(theta) * r])
+        thetas.append(theta)
+        theta += spacing / r
+    return np.asarray(pts, dtype=np.float32), np.asarray(thetas)
+
+
+def _chord_bridged_fiber(wraps, gap_begin, gap_extent):
+    # A perfect spiral fiber whose points with theta in [gap_begin, gap_begin
+    # + gap_extent) are replaced by the tracer's straight bridge between the
+    # gap's two ends (a `gap` span); the bridge points are fit-excluded. At
+    # r ~ 800 a 20 degree chord sags r (1 - cos 10 deg) ~ 12 voxels = DR
+    # below the sheet at its middle.
+    pts, thetas = _spiral_with_thetas(wraps)
+    inside = np.flatnonzero((thetas >= gap_begin) & (thetas < gap_begin + gap_extent))
+    assert len(inside) >= 3
+    before, after = inside[0] - 1, inside[-1] + 1
+    fractions = (inside - before) / (after - before)
+    pts[inside] = pts[before] + fractions[:, None] * (pts[after] - pts[before])
+    mask = np.ones(len(pts), dtype=bool)
+    mask[inside] = False
+    return pts, mask
+
+
+def _displaced_segment_fiber(wraps, begin, extent, delta):
+    # A perfect spiral fiber whose points with theta in [begin, begin + extent)
+    # are moved `delta` voxels radially outward and fit-excluded.
+    pts, thetas = _spiral_with_thetas(wraps)
+    inside = (thetas >= begin) & (thetas < begin + extent)
+    pts[inside] = _radially_displaced(pts[inside], delta)
+    return pts, ~inside
+
+
+def test_masked_bridge_points_constrain_neither_loss():
+    cfg = _make_cfg()
+    fiber, mask = _chord_bridged_fiber(2.0, gap_begin=2.0, gap_extent=np.radians(20))
+    for whole_object_cache in (False, True):
+        radius_losses, dt_losses = _run_losses(
+            [fiber], cfg, num_steps=10, fit_masks=[mask],
+            whole_object_cache=whole_object_cache)
+        assert radius_losses.max() < 1e-3
+        assert dt_losses.max() < 1e-3
+    # The same bridge unmasked pulls on both losses.
+    radius_losses, dt_losses = _run_losses([fiber], cfg, num_steps=10)
+    assert radius_losses.max() > 1e-2
+    assert dt_losses.max() > 1e-2
+
+
+def test_unwrap_continues_through_a_masked_segment_longer_than_half_a_turn():
+    # The masked points are still walked, so a tagged span wider than pi
+    # keeps both sides of the fiber on one winding: a whole-winding radial
+    # excursion inside the span costs nothing when masked and is a gross
+    # inconsistency when not.
+    cfg = _make_cfg()
+    fiber, mask = _displaced_segment_fiber(
+        3.0, begin=2 * np.pi + 0.5, extent=1.2 * np.pi, delta=DR)
+    assert 0.15 * len(mask) < (~mask).sum() < 0.25 * len(mask)
+    for whole_object_cache in (False, True):
+        radius_losses, dt_losses = _run_losses(
+            [fiber], cfg, num_steps=10, fit_masks=[mask],
+            whole_object_cache=whole_object_cache)
+        assert radius_losses.max() < 1e-3
+        assert dt_losses.max() < 1e-3
+    radius_losses, _ = _run_losses([fiber], cfg, num_steps=10)
+    assert radius_losses.min() > 1.0
+
+
+def test_dt_target_cache_ignores_excluded_points():
+    # 60% of the strip sits one winding out but is excluded: the whole-strip
+    # target follows the kept 40%, through the index-stride decimation too; a
+    # strip with no kept point is invalid.
+    fiber, mask = _displaced_segment_fiber(2.0, begin=0.8 * 2 * np.pi, extent=10.0, delta=DR)
+    assert 0.55 < (~mask).mean() < 0.65
+    other = _perfect_spiral_fiber(1.0)
+    flat = _flat_bundle([fiber, other], fit_masks=[mask, np.zeros(len(other), bool)])
+    dr = torch.tensor(DR)
+    for num_points_per_strip in (512, 48):
+        masked = compute_strip_dt_target_cache(
+            IdentityTransform(), dr, flat['zyxs'], flat['starts_cpu'],
+            windings=flat['windings'], fit_mask=flat['fit_mask'],
+            num_points_per_strip=num_points_per_strip, max_stride=128)
+        plain = compute_strip_dt_target_cache(
+            IdentityTransform(), dr, flat['zyxs'], flat['starts_cpu'],
+            windings=flat['windings'],
+            num_points_per_strip=num_points_per_strip, max_stride=128)
+        assert int(masked['target_relative'][0]) == 66
+        assert int(plain['target_relative'][0]) == 67
+        assert masked['valid'].tolist() == [True, False]
+        assert plain['valid'].tolist() == [True, True]
+        # The max_total_points recursion forwards the mask per chunk and
+        # merges the per-strip caches unchanged.
+        chunked = compute_strip_dt_target_cache(
+            IdentityTransform(), dr, flat['zyxs'], flat['starts_cpu'],
+            windings=flat['windings'], fit_mask=flat['fit_mask'],
+            num_points_per_strip=num_points_per_strip, max_stride=128,
+            max_total_points=len(fiber))
+        for key in ('target_relative', 'valid', 'anchor_theta', 'anchor_adjustment'):
+            assert torch.equal(chunked[key], masked[key]), key
+
+
+def test_satisfaction_counts_skip_excluded_points():
+    from fit_spiral import _build_strip_flat_bundle
+    from satisfaction_metrics import get_unattached_pcl_satisfied_counts
+    fiber, mask = _chord_bridged_fiber(2.0, gap_begin=2.0, gap_extent=np.radians(20))
+    strips = _strips([fiber], [mask])
+    zeros = np.zeros(len(fiber), np.float32)
+    masked = _build_strip_flat_bundle([(fiber, zeros, None, None, mask)], torch.device('cpu'))
+    assert masked['has_excluded_points']
+    satisfied, total, per_point = get_unattached_pcl_satisfied_counts(
+        IdentityTransform(), torch.tensor(DR), strips, lambda _s, _d: masked)
+    assert int(total[0]) == int(mask.sum()) < len(fiber)
+    assert int(satisfied[0]) == int(mask.sum())
+    assert per_point[0][torch.from_numpy(mask)].all()
+    assert not per_point[0][torch.from_numpy(~mask)].any()
+    plain = _build_strip_flat_bundle([(fiber, zeros)], torch.device('cpu'))
+    assert 'fit_mask' not in plain
+    satisfied, total, _ = get_unattached_pcl_satisfied_counts(
+        IdentityTransform(), torch.tensor(DR), _strips([fiber]), lambda _s, _d: plain)
+    assert int(total[0]) == len(fiber)
+    assert int(satisfied[0]) < len(fiber)
+
+
+def test_all_true_fit_masks_leave_the_bundle_unmasked():
+    # An all-True mask is flagged as having no excluded points, and every
+    # consumer then computes exactly what it computes without a mask: the
+    # strip losses (both DT modes), the whole-strip DT targets and the
+    # satisfaction counts, on an off-sheet strip so the values are nonzero.
+    from fit_spiral import _build_strip_flat_bundle
+    from satisfaction_metrics import get_unattached_pcl_satisfied_counts
+    fiber = _perfect_spiral_fiber(1.0)
+    zeros = np.zeros(len(fiber), np.float32)
+    bundle = _build_strip_flat_bundle(
+        [(fiber, zeros, None, None, np.ones(len(fiber), bool))], torch.device('cpu'))
+    assert bundle['fit_mask'].all()
+    assert not bundle['has_excluded_points']
+
+    cfg = _make_cfg()
+    pts, thetas = _spiral_with_thetas(1.5)
+    off_sheet = pts.copy()
+    off_sheet[thetas > np.pi] = _radially_displaced(pts[thetas > np.pi], 0.6 * DR)
+    all_true = [np.ones(len(off_sheet), bool)]
+    for whole_object_cache in (False, True):
+        plain = _run_losses([off_sheet], cfg, num_steps=4, whole_object_cache=whole_object_cache)
+        masked = _run_losses([off_sheet], cfg, num_steps=4, fit_masks=all_true,
+                             whole_object_cache=whole_object_cache)
+        assert plain[1].min() > 0.0
+        np.testing.assert_array_equal(masked[0], plain[0])
+        np.testing.assert_array_equal(masked[1], plain[1])
+    off_zeros = np.zeros(len(off_sheet), np.float32)
+    flat_plain = _build_strip_flat_bundle([(off_sheet, off_zeros)], torch.device('cpu'))
+    flat_masked = _build_strip_flat_bundle(
+        [(off_sheet, off_zeros, None, None, all_true[0])], torch.device('cpu'))
+    dr = torch.tensor(DR)
+    caches = [compute_strip_dt_target_cache(
+        IdentityTransform(), dr, flat['zyxs'], flat['starts_cpu'], windings=flat['windings'],
+        fit_mask=flat.get('fit_mask'), num_points_per_strip=48, max_stride=128)
+        for flat in (flat_plain, flat_masked)]
+    for key in ('target_relative', 'valid', 'anchor_theta', 'anchor_adjustment'):
+        assert torch.equal(caches[0][key], caches[1][key]), key
+    results = [get_unattached_pcl_satisfied_counts(
+        IdentityTransform(), dr, _strips([off_sheet]), lambda _s, _d, flat=flat: flat)
+        for flat in (flat_plain, flat_masked)]
+    assert 0 < int(results[0][0][0]) < len(off_sheet)
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][2][0], results[1][2][0])
+
+
+def test_rows_without_eligible_samples_leave_the_dt_power_mean():
+    # A fully excluded strip contributes no DT row: the valid strip's DT loss
+    # is the same with and without it (every point sampled, so the row is
+    # deterministic), instead of being diluted by a zero row.
+    from satisfaction_metrics import summarize_unattached_pcl_satisfaction
+    cfg = _make_cfg()
+    pts, thetas = _spiral_with_thetas(1.0)
+    off_sheet = pts.copy()
+    second_half = thetas > np.pi
+    off_sheet[second_half] = _radially_displaced(pts[second_half], 0.5 * DR)
+    excluded = _perfect_spiral_fiber(1.0, theta0=0.4)
+    kwargs = dict(num_steps=3, num_points_per_pcl=4096, whole_object_cache=True)
+    alone_radius, alone_dt = _run_losses([off_sheet], cfg, **kwargs)
+    assert alone_dt.min() > 0.1
+    with_excluded_radius, with_excluded_dt = _run_losses(
+        [off_sheet, excluded], cfg,
+        fit_masks=[np.ones(len(off_sheet), bool), np.zeros(len(excluded), bool)],
+        **kwargs)
+    np.testing.assert_allclose(with_excluded_dt, alone_dt, rtol=1e-5)
+    np.testing.assert_allclose(with_excluded_radius, alone_radius, rtol=1e-5)
+    fully, num_fully, num_evaluated = summarize_unattached_pcl_satisfaction(
+        torch.tensor([5, 0, 3]), torch.tensor([5, 0, 4]))
+    assert fully.tolist() == [True, False, False]
+    assert (num_fully, num_evaluated) == (1, 2)
+
+
+def test_unequal_rows_with_excluded_endpoints_stay_satisfied():
+    # Two perfect strips of different lengths whose first and last points are
+    # excluded: the DT anchor (a walk origin, so an excluded endpoint) still
+    # transfers the frame, padding and masking agree, and both losses read
+    # zero with and without the whole-object cache.
+    cfg = _make_cfg()
+    long_fiber = _perfect_spiral_fiber(2.0)
+    short_fiber = _perfect_spiral_fiber(0.4, theta0=1.0)
+    masks = []
+    for fiber in (long_fiber, short_fiber):
+        mask = np.ones(len(fiber), bool)
+        mask[0] = mask[-1] = False
+        masks.append(mask)
+    for whole_object_cache in (False, True):
+        radius_losses, dt_losses = _run_losses(
+            [long_fiber, short_fiber], cfg, num_steps=5, fit_masks=masks,
+            num_points_per_pcl=16, whole_object_cache=whole_object_cache)
+        assert radius_losses.max() < 1e-3
+        assert dt_losses.max() < 1e-3

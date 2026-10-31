@@ -588,7 +588,7 @@ def _merge_endpoint_strip_caches(caches):
 def compute_strip_dt_target_cache(
     slice_to_spiral_transform, dr_per_winding, zyxs, starts,
     windings=None, floating_threshold=0.25, num_points_per_strip=None, max_stride=None,
-    chunk_size=65536, max_total_points=None, radial_offsets=None,
+    chunk_size=65536, max_total_points=None, radial_offsets=None, fit_mask=None,
 ):
     # Whole-strip DT target determination for ordered point strips (unattached-pcl
     # strips and tracks), given their flat concatenated bundle: zyxs (N, 3) and
@@ -607,7 +607,10 @@ def compute_strip_dt_target_cache(
     # adjacency assumption in the same way patch sampling bounds its grid stride
     # (there converted to grid cells via patch.scale). Values are unwrapped per
     # strip (segmented cumsum) and
-    # annotation-normalised. The returned cache always has the same representation:
+    # annotation-normalised. fit_mask (bool per point, None = all True) marks the
+    # points that may set the target: excluded ones (gap/damaged fiber spans) are
+    # unwrapped like the rest but left out of the medians, and a strip without a
+    # kept point is invalid. The returned cache always has the same representation:
     # one target and two endpoint frame anchors per strip on the loss device. All
     # interior refresh samples are discarded.
     device = dr_per_winding.device
@@ -646,6 +649,7 @@ def compute_strip_dt_target_cache(
                 windings=windings[p0:p1] if windings is not None else None,
                 radial_offsets=(radial_offsets[p0:p1]
                                 if radial_offsets is not None else None),
+                fit_mask=fit_mask[p0:p1] if fit_mask is not None else None,
                 floating_threshold=floating_threshold,
                 num_points_per_strip=num_points_per_strip,
                 max_stride=max_stride, chunk_size=chunk_size,
@@ -687,6 +691,8 @@ def compute_strip_dt_target_cache(
             windings = windings[src.to(windings.device)].to(device)
         if radial_offsets is not None:
             radial_offsets = radial_offsets[src.to(radial_offsets.device)].to(device)
+        if fit_mask is not None:
+            fit_mask = fit_mask[src.to(fit_mask.device)].to(device)
         starts = new_starts
         lengths = counts
     else:
@@ -696,6 +702,8 @@ def compute_strip_dt_target_cache(
             windings = windings.to(device)
         if radial_offsets is not None:
             radial_offsets = radial_offsets.to(device)
+        if fit_mask is not None:
+            fit_mask = fit_mask.to(device)
 
     spiral_zyxs = _transform_in_chunks(slice_to_spiral_transform, zyxs, chunk_size)
     if radial_offsets is not None and bool((radial_offsets != 0).any()):
@@ -729,14 +737,27 @@ def compute_strip_dt_target_cache(
 
     # Determine the same ambiguity-aware whole-object target as patches, using
     # segmented sorts to obtain per-strip medians without a GPU-synchronising loop.
-    valid = lengths > 0
     normalised = values / dr
     distance_to_sheet = (normalised - torch.round(normalised)).abs()
+    if fit_mask is not None:
+        # Excluded points sort behind their strip's kept values (+inf) and the
+        # median index counts kept points only.
+        kept_counts = torch.zeros(num_strips, dtype=torch.int64, device=device)
+        kept_counts.scatter_add_(0, strip_id, fit_mask.to(torch.int64))
+        valid = kept_counts > 0
+        median_lengths = kept_counts
+        normalised = torch.where(fit_mask, normalised, torch.full_like(normalised, torch.inf))
+        distance_to_sheet = torch.where(
+            fit_mask, distance_to_sheet, torch.full_like(distance_to_sheet, torch.inf))
+    else:
+        valid = lengths > 0
+        median_lengths = lengths
 
     def segmented_median(v):
         order = torch.argsort(v)
         order = order[torch.argsort(strip_id[order], stable=True)]
-        median_idx = starts[:-1] + torch.div((lengths - 1).clamp(min=0), 2, rounding_mode='floor')
+        median_idx = starts[:-1] + torch.div(
+            (median_lengths - 1).clamp(min=0), 2, rounding_mode='floor')
         median_idx = median_idx.clamp(max=v.numel() - 1)
         return v[order][median_idx]
 

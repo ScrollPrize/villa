@@ -14,6 +14,8 @@ from sample_spiral import (
     radius_from_unwrapped_shifted,
 )
 from spiral_helpers import (
+    strip_fit_counts,
+    strip_flat_fit_mask,
     compute_winding_range_and_input_extents,
     save_mesh,
     _segmented_median_per_strip,
@@ -712,6 +714,8 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         normalised_radii = unwrapped_shifted - windings * dr - radial_offsets
 
     ctx = {
+        # None, or False for points that must not count (gap/damaged spans).
+        'fit_mask': strip_flat_fit_mask(flat),
         'spiral_tolerance': spiral_tolerance,
         'scan_tolerance': scan_tolerance,
         'dr': dr,
@@ -776,6 +780,8 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
         scan_in_band = scan_distances <= scan_tolerance
 
         satisfied = spiral_in_band & scan_in_band
+        if ctx.get('fit_mask') is not None:
+            satisfied = satisfied & ctx['fit_mask']
 
         satisfied_counts_dev = torch.zeros(S, dtype=torch.int64, device=device)
         satisfied_counts_dev.scatter_add_(0, strip_id, satisfied.to(torch.int64))
@@ -795,7 +801,9 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
     # quad satisfaction. Returns three values: (satisfied_count_per_pcl,
     # total_count_per_pcl, per_point_satisfaction) — the first two are 1-D int64
     # tensors, and per_point_satisfaction is a list of CPU bool tensors (one per
-    # pcl, of length N for that pcl; empty pcls get an empty tensor).
+    # pcl, of length N for that pcl; empty pcls get an empty tensor). Points
+    # excluded from the fit (gap/damaged fiber spans, flat['fit_mask'] False)
+    # are never satisfied and do not count towards the totals.
     #
     # All strips are processed in a single batched pass: points are concatenated
     # into one flat (T, 3) tensor, the scan->spiral transform runs once over
@@ -816,7 +824,23 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
         target_normalised_per_strip = torch.round(medians / dr) * dr
 
     satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
-    return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
+    total_counts = lengths_cpu.clone()
+    if ctx.get('fit_mask') is not None:
+        total_counts = strip_fit_counts(ctx['fit_mask'], ctx['strip_id'], S).cpu()
+    return satisfied_counts, total_counts, per_point_satisfaction
+
+
+def summarize_unattached_pcl_satisfaction(satisfied_counts, total_counts):
+    """Collection-level satisfaction from per-strip counts.
+
+    A strip counts as evaluated only when it has points eligible for the fit
+    (total > 0; gap/damaged fiber span points are not), and as fully
+    satisfied when every eligible point is. Returns
+    ``(fully_satisfied_per_strip, num_fully_satisfied, num_evaluated)``.
+    """
+    evaluated = total_counts > 0
+    fully_satisfied = evaluated & (satisfied_counts == total_counts)
+    return fully_satisfied, int(fully_satisfied.sum().item()), int(evaluated.sum().item())
 
 
 def save_overlay_and_print_satisfaction(
@@ -905,9 +929,9 @@ def save_overlay_and_print_satisfaction(
         unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(
             slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips, get_or_build_unattached_pcl_flat,
         )
-        unattached_pcl_fully_satisfied = (unattached_pcl_satisfied_counts == unattached_pcl_total_counts)
-        fully_satisfied_pcls = int(unattached_pcl_fully_satisfied.sum().item())
-        num_pcls = len(unattached_pcl_strips)
+        unattached_pcl_fully_satisfied, fully_satisfied_pcls, num_pcls = (
+            summarize_unattached_pcl_satisfaction(
+                unattached_pcl_satisfied_counts, unattached_pcl_total_counts))
         fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
         print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
         satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
