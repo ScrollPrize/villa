@@ -41,6 +41,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
     volume_cache_dirs,
 )
 from vc_reader.reader import ZarrReader
+from vc_reader.torch import normalize as _normalize_tensor
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     control_point_line_index,
 )
@@ -1444,16 +1445,9 @@ def _normalize_image(volume: torch.Tensor, valid_mask: torch.Tensor, mode: str) 
     valid = valid_mask.to(dtype=torch.bool)
     if not bool(valid.any()):
         return volume
-    values = volume[valid]
-    if mode_l == "zscore":
-        mean = values.mean()
-        std = values.std(unbiased=False).clamp_min(1.0e-6)
-        return (volume - mean) / std
-    if mode_l == "minmax":
-        lo = values.min()
-        hi = values.max()
-        return (volume - lo) / (hi - lo).clamp_min(1.0e-6)
-    raise ValueError(f"unsupported image_normalization {mode!r}")
+    if mode_l not in {"zscore", "minmax"}:
+        raise ValueError(f"unsupported image_normalization {mode!r}")
+    return _normalize_tensor(volume[None, None], mode_l, valid=valid[None, None])[0, 0]
 
 def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
     """Retained shared 1D kernel helper for trace-to-control-point smoothing."""
@@ -1762,13 +1756,9 @@ def _normalize_complete_image(volume: torch.Tensor, mode: str) -> torch.Tensor:
     mode_l = str(mode).lower()
     if mode_l in {"none", "raw", "identity"}:
         return volume
-    if mode_l == "zscore":
-        return (volume - volume.mean()) / volume.std(unbiased=False).clamp_min(1.0e-6)
-    if mode_l == "minmax":
-        lo = volume.min()
-        hi = volume.max()
-        return (volume - lo) / (hi - lo).clamp_min(1.0e-6)
-    raise ValueError(f"unsupported image_normalization {mode!r}")
+    if mode_l not in {"zscore", "minmax"}:
+        raise ValueError(f"unsupported image_normalization {mode!r}")
+    return _normalize_tensor(volume[None, None], mode_l)[0, 0]
 
 
 def _apply_value_augmentation_prefix_3d(
@@ -1901,25 +1891,10 @@ def apply_value_augmentation_batch_3d(
         raise ValueError("batched value augmentation descriptor count mismatch")
     reduce_dims = (1, 2, 3, 4)
     mode = str(config.image_normalization).lower()
-    zscore_mean: torch.Tensor | None = None
-    zscore_std: torch.Tensor | None = None
-    source_lo: torch.Tensor | None = None
-    source_hi: torch.Tensor | None = None
     if mode in {"none", "raw", "identity"}:
         out = volume
-    elif mode == "zscore":
-        variance, zscore_mean = torch.var_mean(
-            volume,
-            dim=reduce_dims,
-            correction=0,
-            keepdim=True,
-        )
-        zscore_std = variance.sqrt().clamp_min_(1.0e-6)
-        out = volume.sub(zscore_mean).div_(zscore_std)
-    elif mode == "minmax":
-        lo = volume.amin(dim=reduce_dims, keepdim=True)
-        hi = volume.amax(dim=reduce_dims, keepdim=True)
-        out = (volume - lo) / (hi - lo).clamp_min(1.0e-6)
+    elif mode in {"zscore", "minmax"}:
+        out = _normalize_tensor(volume, mode)
     else:
         raise ValueError(f"unsupported image_normalization {config.image_normalization!r}")
 
@@ -1928,16 +1903,15 @@ def apply_value_augmentation_batch_3d(
         needs_contrast = any(item.contrast != 1.0 for item in params)
         needs_brightness = any(item.brightness != 0.0 for item in params)
         needs_gamma = any(item.gamma != 1.0 for item in params)
-        if needs_gamma and mode == "zscore":
-            source_lo = volume.amin(dim=reduce_dims, keepdim=True)
-            source_hi = volume.amax(dim=reduce_dims, keepdim=True)
+        normalized_lo = out.amin(dim=reduce_dims, keepdim=True) if needs_gamma and mode == "zscore" else None
+        normalized_hi = out.amax(dim=reduce_dims, keepdim=True) if needs_gamma and mode == "zscore" else None
         if needs_contrast:
             contrast = torch.as_tensor(
                 [item.contrast for item in params], dtype=out.dtype, device=out.device
             ).view(shape)
             center = (
-                torch.zeros_like(zscore_mean)
-                if mode == "zscore" and zscore_mean is not None
+                torch.zeros(shape, dtype=out.dtype, device=out.device)
+                if mode == "zscore"
                 else out.mean(dim=reduce_dims, keepdim=True)
             )
             out = (out - center) * contrast + center
@@ -1954,15 +1928,9 @@ def apply_value_augmentation_batch_3d(
             gamma = torch.as_tensor(
                 [item.gamma for item in params], dtype=out.dtype, device=out.device
             ).view(shape)
-            if (
-                mode == "zscore"
-                and source_lo is not None
-                and source_hi is not None
-                and zscore_mean is not None
-                and zscore_std is not None
-            ):
-                endpoint_a = (source_lo - zscore_mean) / zscore_std * contrast + brightness
-                endpoint_b = (source_hi - zscore_mean) / zscore_std * contrast + brightness
+            if normalized_lo is not None:
+                endpoint_a = normalized_lo * contrast + brightness
+                endpoint_b = normalized_hi * contrast + brightness
                 lo = torch.minimum(endpoint_a, endpoint_b)
                 hi = torch.maximum(endpoint_a, endpoint_b)
             else:

@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from vc_reader.torch import normalize
 import napari
 from pathlib import Path
 import torch.nn as nn
@@ -155,10 +156,7 @@ class MonaiInferer:
 
         inputs = inputs.to(device=self.device)
         
-        def normalize(x):
-            return (x - x.min()) / (x.max() - x.min() + 1e-5)
-            
-        inputs = normalize(inputs)
+        inputs = normalize(inputs.float(), "minmax", eps=1e-5)
         
         with torch.no_grad():
             outputs = self.sliding_window_inferer(inputs, self.model)

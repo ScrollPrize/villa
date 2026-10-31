@@ -6022,7 +6022,7 @@ def _image_to_u8(
     if not bool(mask.any()):
         return out
     norm_t = _normalize_image(
-        torch.as_tensor(arr, dtype=torch.float32),
+        torch.as_tensor(np.where(mask, arr, 0.0), dtype=torch.float32),
         torch.as_tensor(mask, dtype=torch.bool),
         normalization,
     )

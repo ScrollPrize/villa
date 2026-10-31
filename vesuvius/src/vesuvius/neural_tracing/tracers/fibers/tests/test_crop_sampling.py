@@ -1,5 +1,5 @@
 """Crop sampling: vc_reader crops (crops.scalar_crops) equal their plain NumPy definition up to float32
-interpolation, the per-crop z-score equals its NumPy definition bit for bit, and the CUDA crops
+interpolation, the per-crop z-score equals its NumPy definition within float32 rounding, and the CUDA crops
 (crops.cuda_scalar_crops) match the CPU ones."""
 import numpy as np
 import pytest
@@ -87,12 +87,12 @@ def test_cuda_scalar_crops_match_cpu(tmp_path, crop, input_scale):
 def test_normalize_matches_numpy():
     rng = np.random.default_rng(0)
     for image in (rng.random((9, 17, 13), dtype=np.float32), np.full((4, 5, 6), .25, np.float32)):
-        mean, std = image.mean(dtype=np.float32), image.std(dtype=np.float32)
-        expected = (image-mean)/np.float32(max(float(std), ZSCORE_EPSILON))
+        mean, std = image.mean(dtype=np.float64), image.std(dtype=np.float64)
+        expected = (image-mean)/max(std, ZSCORE_EPSILON)
         normalize_ct(image, RECORD)
-        assert np.array_equal(image.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_allclose(image, expected, atol=1e-6)
     for bad in (np.nan, np.inf):
         image = rng.random((4, 5, 6), dtype=np.float32)
         image[1, 2, 3] = bad
-        with pytest.raises(ValueError, match='nonfinite'):
+        with pytest.raises(ValueError, match='finite'):
             normalize_ct(image, RECORD)

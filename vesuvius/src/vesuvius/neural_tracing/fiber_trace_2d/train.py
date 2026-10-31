@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vc_reader.torch import normalize
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     apply_value_augmentation_batch,
@@ -293,12 +294,7 @@ def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torc
 def _normalize_image_tensor(images: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
-    counts = valid.sum(dim=(2, 3), keepdim=True).clamp_min(1)
-    masked = torch.where(valid, images, torch.zeros_like(images))
-    mean = masked.sum(dim=(2, 3), keepdim=True) / counts
-    var = torch.where(valid, (images - mean) ** 2, torch.zeros_like(images)).sum(dim=(2, 3), keepdim=True) / counts
-    std = torch.sqrt(var.clamp_min(1.0e-6))
-    return torch.where(valid, (images - mean) / std, torch.zeros_like(images))
+    return torch.where(valid, normalize(images, valid=valid), torch.zeros_like(images))
 
 
 def _batch_images_to_tensors(
