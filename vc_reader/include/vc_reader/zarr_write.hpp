@@ -34,8 +34,9 @@ public:
     void discard(const std::string& name) const;
     // Everything below the location; whether anything was there.
     bool removeAll() const;
-    // Every object below the location: keys relative to it, in key order.
-    std::vector<s3::Object> list() const;
+    // Every object below the location whose relative key starts with `keyPrefix`: keys
+    // relative to the location, in key order.
+    std::vector<s3::Object> list(const std::string& keyPrefix = {}) const;
     // The immediate subdirectories (prefixes), sorted.
     std::vector<std::string> children() const;
     // Whether the location holds Zarr v2 or v3 node metadata / is an array.

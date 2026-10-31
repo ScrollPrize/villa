@@ -230,6 +230,8 @@ def test_object_store(s3, tmp_path):
         store.write("c", b"\x00\x01")
         assert store.read("a/b.json") == b'{"x": 1}' and store.exists("c")
         assert store.keys() == ["a/b.json", "c"] and store.sizes()["c"] == 2 and store.children() == ["a"]
+        assert store.keys("a/") == ["a/b.json"] and store.keys("c") == ["c"] and store.keys("z") == []
+        assert [o["key"] for o in store.objects("c")] == ["c"] and store.objects("c")[0]["size"] == 2
         assert pickle.loads(pickle.dumps(store)).read("c") == b"\x00\x01"
         assert store.remove("c") and not store.remove("c")
         assert store.remove_all() and store.keys() == []

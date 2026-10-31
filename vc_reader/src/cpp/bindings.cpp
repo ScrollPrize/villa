@@ -512,6 +512,23 @@ NB_MODULE(_reader, m)
         .def("exists", &Store::exists, "name"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("remove", &Store::remove, "name"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_all", &Store::removeAll, nb::call_guard<nb::gil_scoped_release>())
+        .def("objects", [](const Store& s, const std::string& prefix) {
+            std::vector<vcr::s3::Object> objects;
+            {
+                nb::gil_scoped_release release;
+                objects = s.list(prefix);
+            }
+            nb::list out;
+            for (const auto& object : objects) {
+                nb::dict entry;
+                entry["key"] = object.key;
+                entry["size"] = object.size;
+                entry["etag"] = object.etag;
+                entry["last_modified"] = object.lastModified;
+                out.append(entry);
+            }
+            return out;
+        }, "prefix"_a = "")
         .def("list", [](const Store& s) {
             std::vector<std::pair<std::string, std::uint64_t>> out;
             {

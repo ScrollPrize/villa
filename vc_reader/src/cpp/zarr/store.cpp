@@ -147,18 +147,21 @@ bool Store::removeAll() const
     return !objects.empty();
 }
 
-std::vector<s3::Object> Store::list() const
+std::vector<s3::Object> Store::list(const std::string& keyPrefix) const
 {
     std::vector<s3::Object> objects;
     if (!impl_->remote) {
         std::error_code ec;
         for (fs::recursive_directory_iterator it(impl_->location, ec), end; !ec && it != end; it.increment(ec))
-            if (it->is_regular_file(ec))
-                objects.push_back({it->path().lexically_relative(impl_->location).generic_string(), it->file_size(ec)});
+            if (it->is_regular_file(ec)) {
+                auto key = it->path().lexically_relative(impl_->location).generic_string();
+                if (key.starts_with(keyPrefix))
+                    objects.push_back({std::move(key), it->file_size(ec), {}, {}});
+            }
         std::sort(objects.begin(), objects.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
         return objects;
     }
-    return impl_->signedRequest([&] { return listObjects(impl_->access, impl_->location); });
+    return impl_->signedRequest([&] { return listObjects(impl_->access, impl_->location, keyPrefix); });
 }
 
 std::vector<std::string> Store::children() const

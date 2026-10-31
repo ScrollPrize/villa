@@ -85,7 +85,7 @@ bool isPublicLocation(const std::string& location);
 // Throws std::invalid_argument for anything else: plain HTTP has no listing.
 std::vector<std::string> listChildren(const Access& access, const std::string& location);
 // Every object below such a location: keys relative to it, in key order.
-std::vector<s3::Object> listObjects(const Access& access, const std::string& location);
+std::vector<s3::Object> listObjects(const Access& access, const std::string& location, const std::string& keyPrefix = {});
 // AWS keys from AWS_ACCESS_KEY_ID/..., then the AWS_PROFILE (or default) profile of
 // the shared credentials and config files. kind is "s3"; region is the profile's.
 std::optional<Auth> awsCredentials(const std::string& profile = {});

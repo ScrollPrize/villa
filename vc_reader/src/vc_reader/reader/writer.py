@@ -73,12 +73,20 @@ class ObjectStore:
         """Removes everything below the location; whether anything was there."""
         return self._native.remove_all()
 
-    def keys(self) -> list[str]:
-        """Every object below the location, relative to it, in key order."""
-        return [key for key, _ in self._native.list()]
+    def keys(self, prefix: str = "") -> list[str]:
+        """Every object below the location whose relative key starts with ``prefix``, relative to
+        the location, in key order.
+        """
+        return [entry["key"] for entry in self._native.objects(prefix)]
 
     def sizes(self) -> dict[str, int]:
         return dict(self._native.list())
+
+    def objects(self, prefix: str = "") -> list[dict[str, Any]]:
+        """As :meth:`keys`, each a dict: ``key``, ``size``, and on S3 the listing's ``etag`` and
+        ``last_modified``.
+        """
+        return self._native.objects(prefix)
 
     def children(self) -> list[str]:
         """The immediate subdirectories (prefixes), sorted."""

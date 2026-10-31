@@ -294,7 +294,7 @@ std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& p
 
 namespace {
 // Every page of a listing under `location`, with its key prefix.
-void listPages(const Access& access, const std::string& location, std::string_view delimiter,
+void listPages(const Access& access, const std::string& location, std::string_view delimiter, const std::string& keyPrefix,
                const std::function<void(const s3::ListPage&, const std::string&)>& visit)
 {
     const auto s3 = location.starts_with("s3://") ? std::optional<std::string>(location) : catalog::openDataS3Url(location);
@@ -309,7 +309,7 @@ void listPages(const Access& access, const std::string& location, std::string_vi
         prefixKey.pop_back();
     if (!prefixKey.empty())
         prefixKey += '/';
-    const s3::Prefix prefix{origin, prefixKey};
+    const s3::Prefix prefix{origin, prefixKey + keyPrefix};
     HttpOptions options;
     options.connections = 1;
     options.auth = access.auth;
@@ -329,7 +329,7 @@ void listPages(const Access& access, const std::string& location, std::string_vi
 std::vector<std::string> listChildren(const Access& access, const std::string& location)
 {
     std::vector<std::string> names;
-    listPages(access, location, "/", [&](const s3::ListPage& page, const std::string& prefixKey) {
+    listPages(access, location, "/", {}, [&](const s3::ListPage& page, const std::string& prefixKey) {
         for (const auto& child : page.commonPrefixes) {
             auto name = child.substr(prefixKey.size());
             while (!name.empty() && name.back() == '/')
@@ -341,12 +341,12 @@ std::vector<std::string> listChildren(const Access& access, const std::string& l
     return names;
 }
 
-std::vector<s3::Object> listObjects(const Access& access, const std::string& location)
+std::vector<s3::Object> listObjects(const Access& access, const std::string& location, const std::string& keyPrefix)
 {
     std::vector<s3::Object> objects;
-    listPages(access, location, "", [&](const s3::ListPage& page, const std::string& prefixKey) {
+    listPages(access, location, "", keyPrefix, [&](const s3::ListPage& page, const std::string& prefixKey) {
         for (const auto& object : page.objects)
-            objects.push_back({object.key.substr(prefixKey.size()), object.size});
+            objects.push_back({object.key.substr(prefixKey.size()), object.size, object.etag, object.lastModified});
     });
     return objects;
 }
