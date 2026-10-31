@@ -486,7 +486,7 @@ class MutexAffinityDataset(Dataset):
         # Extract image
         image_data = image_handle.read_window(start, size)
         if self.normalizer is not None:
-            image_data = self.normalizer.run(image_data)
+            image_data = self.normalizer(image_data)
         if self.is_2d:
             from vesuvius.utils.utils import pad_or_crop_2d
             image_data = pad_or_crop_2d(image_data.astype(np.float32), size)

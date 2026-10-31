@@ -857,7 +857,7 @@ class ZarrDataset(Dataset):
                 data = np.asarray(arr[slices])
                 original_shape = data.shape
                 if normalize and self.normalizer is not None:
-                    data = self.normalizer.run(data)
+                    data = self.normalizer(data)
                 data = pad_or_crop(data.astype(np.float32), size)
             data = mask_neighbor_intrusion(data)
             if return_original_shape:

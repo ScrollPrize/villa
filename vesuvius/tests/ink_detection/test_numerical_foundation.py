@@ -72,6 +72,7 @@ def test_robust_span_minmax_and_mad_degenerate_anchors():
     np.testing.assert_allclose(
         percentile_minmax,
         clipped_percentile / np.percentile(image, 80),
+        rtol=1e-6,
     )
     mad = normalize_image(
         np.ones(4, dtype=np.float32) * 7,

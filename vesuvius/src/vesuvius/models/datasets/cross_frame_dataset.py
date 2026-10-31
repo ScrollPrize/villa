@@ -643,7 +643,7 @@ class CrossFrameZarrDataset(Dataset):
             )
 
         if self.normalizer is not None:
-            image_patch = self.normalizer.run(image_patch)
+            image_patch = self.normalizer(image_patch)
         image_patch = image_patch.astype(np.float32, copy=False)
 
         # Resample labels through the forward affine into the image grid.
