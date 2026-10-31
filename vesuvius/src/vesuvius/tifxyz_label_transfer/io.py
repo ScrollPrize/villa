@@ -75,9 +75,9 @@ def load_tifxyz_mask(
 
 
 def _open_zarr_label(path: Path):
-    import zarr
+    from vc_reader.reader import open_group
 
-    group = zarr.open_group(str(path), mode="r")
+    group = open_group(path)
     if "0" not in group:
         raise ValueError(f"label Zarr {path} has no level-0 array")
     return group["0"]

@@ -675,9 +675,9 @@ def read_label_display(path: Path, shape: tuple[int, int]) -> np.ndarray:
 
     zarr_path = path if path.suffix == ".zarr" else path.with_suffix(".zarr")
     if zarr_path.is_dir():
-        import zarr
+        from vc_reader.reader import open_group
 
-        group = zarr.open_group(str(zarr_path), mode="r")
+        group = open_group(zarr_path)
         levels = sorted((int(key) for key in group.array_keys()))
         candidates = [
             level

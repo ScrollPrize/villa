@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import zarr
+from vc_reader.reader import create_group
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.common import (
@@ -1259,8 +1260,8 @@ class _SparseChunkOutputMerger:
 
     def finalize(self):
         try:
-            outputs = self.root.require_group("outputs")
-            avg_group = outputs.require_group("avg")
+            outputs = self.root.create_group("outputs")
+            avg_group = outputs.create_group("avg")
             avg_group.attrs["window_min_zyx"] = self.root.attrs.get("window_min_zyx", [0, 0, 0])
             avg_group.attrs["window_shape_zyx"] = self.root.attrs.get("window_shape_zyx", None)
             avg_group.attrs["merge_backing"] = "mmap"
@@ -1271,7 +1272,7 @@ class _SparseChunkOutputMerger:
                 if output_name in avg_group:
                     del avg_group[output_name]
 
-                avg = avg_group.create_dataset(
+                avg = avg_group.create_array(
                     output_name,
                     shape=(int(channels), *self.window_shape),
                     chunks=(int(channels), *self.chunks_3d),
@@ -1850,6 +1851,10 @@ def _apply_surface_attract_correction(sampler, candidate):
     return corrected, usable
 
 
+def _store_array(group, name, *, data, chunks):
+    group.create_array(name, shape=data.shape, chunks=chunks, dtype=data.dtype)[...] = data
+
+
 def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window_min, zarr_root):
     velocity = _require_avg_field(avg_group, "velocity_dir", 3)
     attract = _require_avg_field(avg_group, "surface_attract", 3)
@@ -1966,7 +1971,7 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window
     diag_validity_oob = diag_validity_oob_t.detach().cpu().numpy()
     diag_validity_nonfinite = diag_validity_nonfinite_t.detach().cpu().numpy()
     diag_low_validity = diag_low_validity_t.detach().cpu().numpy()
-    integration = zarr_root.require_group("streamline_integration")
+    integration = zarr_root.create_group("streamline_integration")
     for name in (
         "seed_zyx",
         "points_zyx",
@@ -1993,48 +1998,48 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window
     ):
         if name in integration:
             del integration[name]
-    integration.create_dataset("seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("points_zyx", data=traces_world.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
-    integration.create_dataset("cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
-    integration.create_dataset("endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("endpoint_active", data=endpoint_active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
-    integration.create_dataset(
+    _store_array(integration, "seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "points_zyx", data=traces_world.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
+    _store_array(integration, "cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
+    _store_array(integration, "endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "endpoint_active", data=endpoint_active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
+    _store_array(integration,
         "support_source_sparse_index",
         data=seed_bundle["source_sparse_index"].astype(np.int64),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_offset_full_res",
         data=seed_bundle["support_offset_full_res"].astype(np.float32),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_weight",
         data=seed_bundle["support_weight"].astype(np.float32),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_is_center",
         data=seed_bundle["support_is_center"].astype(np.uint8),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "sparse_edge_index",
         data=seed_bundle["sparse_edge_indices"].astype(np.int64),
         chunks=(min(seed_bundle["sparse_seed_count"], 4096),),
     )
-    integration.create_dataset("diagnostic_step_index", data=np.arange(1, n_steps + 1, dtype=np.int32), chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_active_before", data=diag_active_before, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_accepted", data=diag_accepted, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_oob", data=diag_velocity_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_nonfinite", data=diag_velocity_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_zero", data=diag_velocity_zero, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_attract_oob", data=diag_attract_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_candidate_nonfinite", data=diag_candidate_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_validity_oob", data=diag_validity_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_validity_nonfinite", data=diag_validity_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_low_validity", data=diag_low_validity, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_step_index", data=np.arange(1, n_steps + 1, dtype=np.int32), chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_active_before", data=diag_active_before, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_accepted", data=diag_accepted, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_oob", data=diag_velocity_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_nonfinite", data=diag_velocity_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_zero", data=diag_velocity_zero, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_attract_oob", data=diag_attract_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_candidate_nonfinite", data=diag_candidate_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_validity_oob", data=diag_validity_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_validity_nonfinite", data=diag_validity_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_low_validity", data=diag_low_validity, chunks=(min(n_steps, 4096),))
     integration.attrs["tifxyz_voxel_step"] = float(TIFXYZ_VOXEL_STEP)
     integration.attrs["tifxyz_steps"] = int(TIFXYZ_STEPS)
     integration.attrs["integration_steps"] = int(len(step_sizes))
@@ -2409,17 +2414,17 @@ def _cleanup_temp_output_zarr(output_path):
 
 
 def _store_iteration_geometry(output_root, bboxes, edge):
-    geometry = output_root.require_group("geometry")
+    geometry = output_root.create_group("geometry")
     bboxes = np.asarray(bboxes, dtype=np.int64).reshape(-1, 6)
     edge = np.asarray(edge, dtype=np.float32).reshape(-1, 3)
     if bboxes.shape[0] > 0:
-        geometry.create_dataset(
+        _store_array(geometry,
             "bboxes",
             data=bboxes,
             chunks=(min(int(bboxes.shape[0]), 4096), 6),
         )
     if edge.shape[0] > 0:
-        geometry.create_dataset(
+        _store_array(geometry,
             "edge_zyx",
             data=edge,
             chunks=(min(int(edge.shape[0]), 4096), 3),
@@ -2601,7 +2606,7 @@ def _run_streamline_iteration(
         output_root = None
         if context.is_rank0:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_root = zarr.open_group(str(output_path), mode="w")
+            output_root = create_group(output_path, overwrite=True, auth=None)
             output_root.attrs["input_tifxyz_path"] = str(input_tifxyz_path)
             output_root.attrs["iteration"] = int(iteration_idx)
             output_root.attrs["total_iterations"] = int(total_iterations)
