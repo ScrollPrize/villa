@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import fastremap
 import numpy as np
-import tifffile
+from vc_reader import images
 from vc_reader.reader import ObjectStore, ZarrWriter, create_group, ome_multiscales, open_zarr, write_pyramid
 from scipy.ndimage import label as label_components, find_objects
 from scipy.ndimage import distance_transform_edt as scipy_edt
@@ -384,7 +384,7 @@ def read_label_image(label_path: Path) -> np.ndarray:
         Label image as 2D array.
     """
     if label_path.suffix.lower() in (".tif", ".tiff"):
-        img = tifffile.imread(str(label_path))
+        img = images.read(str(label_path))
     else:
         # Use cv2 for PNG
         img = cv2.imread(str(label_path), cv2.IMREAD_UNCHANGED)
@@ -981,7 +981,7 @@ def preprocess_surface(
             # Save the resized label back to the source folder
             resized_path = label_file.parent / f"{label_file.stem}_resized{label_file.suffix}"
             if label_file.suffix.lower() in (".tif", ".tiff"):
-                tifffile.imwrite(str(resized_path), label_img)
+                images.write_tiff(str(resized_path), label_img)
             else:
                 cv2.imwrite(str(resized_path), label_img)
             print(f"  Saved resized label to: {resized_path}")

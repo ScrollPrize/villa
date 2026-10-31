@@ -28,7 +28,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
@@ -157,7 +157,7 @@ def main(argv=None):
                           length_mm=float(length)*args.base_voxel_um/1000., decisions=len(arcs),
                           nodes=nodes, path=str(out.relative_to(args.out)), checkpoint=checkpoint)
             if expected is not None:
-                tifffile.imwrite(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
+                images.write_tiff(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
                 record['expected_error_vox'] = float(np.nanmean(np.where(keep, expected, np.nan)))
             record['seconds'] = round(time.time()-tick, 2)
             log.write(json.dumps(record)+'\n')

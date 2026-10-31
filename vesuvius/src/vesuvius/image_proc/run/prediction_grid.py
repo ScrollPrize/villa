@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import tifffile
+from vc_reader import images
 
 # Optional text rendering backends
 try:  # pragma: no cover - optional dependency
@@ -870,7 +870,7 @@ def _process_task(task: Task, *, alpha: float, pred_alpha: float, threshold: flo
     """Process one image -> write mosaic. Returns (stem, success, message)."""
     stem = task.image_path.stem
     try:
-        base = tifffile.imread(str(task.image_path))
+        base = images.read(str(task.image_path))
     except Exception as e:
         return stem, False, f"Failed to read image: {e}"
 
@@ -894,7 +894,7 @@ def _process_task(task: Task, *, alpha: float, pred_alpha: float, threshold: flo
     gt_mask_b_for_tiles = None
     if label_path and label_path.exists():
         try:
-            gt = tifffile.imread(str(label_path))
+            gt = images.read(str(label_path))
         except Exception as e:
             gt = None
         if gt is not None:
@@ -952,7 +952,7 @@ def _process_task(task: Task, *, alpha: float, pred_alpha: float, threshold: flo
                 tiles.append(_pad_and_title_tile(base_rgb, f"{model_name} (missing)", pad_px, title_color))
             continue
         try:
-            pred = tifffile.imread(str(pred_path))
+            pred = images.read(str(pred_path))
         except Exception:
             if gt_mask_b_for_tiles is not None:
                 try:
@@ -1017,10 +1017,10 @@ def _process_task(task: Task, *, alpha: float, pred_alpha: float, threshold: flo
         stats_stack = np.repeat(stats_table_2d[None, ...], Z, axis=0)
         grid = np.concatenate([grid, stats_stack], axis=1)
 
-    # Write TIF (use single imwrite; tifffile handles ZxHxWx3 as multi-page RGB)
+    # ZxHxWx3 is written as multi-page RGB.
     try:
         task.out_path.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(task.out_path), grid, photometric='rgb', compression='lzw')
+        images.write_tiff(str(task.out_path), grid, compression='lzw')
     except Exception as e:
         return stem, False, f"Failed to write output: {e}"
 

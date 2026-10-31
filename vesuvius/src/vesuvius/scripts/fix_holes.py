@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-import tifffile as tiff
+from vc_reader import images
 from scipy import ndimage as ndi
 from tqdm import tqdm
 
@@ -341,8 +341,8 @@ def _process_folder(
     if label_path is None or label_path.suffix.lower() not in TIFF_EXTS:
         return False, f"[WARN] Missing label in {folder} (glob={label_glob})"
 
-    label = tiff.imread(str(label_path))
-    hole_mask = tiff.imread(str(hole_path))
+    label = images.read(str(label_path))
+    hole_mask = images.read(str(hole_path))
 
     if label.shape != hole_mask.shape:
         return False, f"[WARN] Shape mismatch in {folder}: label {label.shape} vs hole_mask {hole_mask.shape}"
@@ -397,7 +397,7 @@ def _process_folder(
 
     out_name = f"{label_path.stem}_{suffix}{label_path.suffix}"
     out_path = folder / out_name
-    tiff.imwrite(str(out_path), fixed.astype(label.dtype))
+    images.write_tiff(str(out_path), fixed.astype(label.dtype))
     ok_msg = f"[OK] Wrote {out_path}"
     if msg:
         ok_msg = msg + " | " + ok_msg

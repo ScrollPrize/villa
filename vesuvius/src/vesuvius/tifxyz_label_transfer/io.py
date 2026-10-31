@@ -13,7 +13,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
-import tifffile
+from vc_reader import images
 
 from vc_reader import tifxyz
 
@@ -22,9 +22,9 @@ from .core import Surface
 
 def _read_tiff(path: Path) -> NDArray:
     try:
-        return tifffile.memmap(path, mode="r")
+        return images.memmap(path)
     except ValueError:
-        return tifffile.imread(path)
+        return images.read(path)
 
 
 def _open_zarr_label(path: Path):
@@ -59,8 +59,7 @@ def read_image(path: Path | str) -> NDArray:
     elif image_path.suffix.lower() in {".tif", ".tiff"}:
         image = np.asarray(_read_tiff(image_path))
     else:
-        with Image.open(image_path) as handle:
-            image = np.asarray(handle)
+        image = images.read(image_path)
     image = np.squeeze(image)
     if image.ndim != 2:
         raise ValueError(
@@ -74,25 +73,16 @@ def read_image_shape(path: Path | str) -> Tuple[int, int]:
     image_path = Path(path)
     if image_path.is_dir() and image_path.suffix.lower() == ".zarr":
         return _zarr_label_shape(_open_zarr_label(image_path), image_path)
-    if image_path.suffix.lower() in {".tif", ".tiff"}:
-        with tifffile.TiffFile(image_path) as handle:
-            shape = tuple(int(value) for value in handle.series[0].shape)
-        while len(shape) > 2 and shape[0] == 1:
-            shape = shape[1:]
-        if len(shape) != 2:
-            raise ValueError(
-                f"reference image must be 2D grayscale; "
-                f"{image_path} has shape {shape}"
-            )
-        return shape[0], shape[1]
-    with Image.open(image_path) as handle:
-        width, height = handle.size
-        if len(handle.getbands()) != 1:
-            raise ValueError(
-                f"reference image must be grayscale; "
-                f"{image_path} has bands {handle.getbands()}"
-            )
-    return int(height), int(width)
+    with images.open(image_path) as reader:
+        shape = tuple(int(value) for value in reader.shape)
+    while len(shape) > 2 and shape[0] == 1:
+        shape = shape[1:]
+    if len(shape) != 2:
+        raise ValueError(
+            f"reference image must be 2D grayscale; "
+            f"{image_path} has shape {shape}"
+        )
+    return shape[0], shape[1]
 
 
 def load_surface(path: Path | str, use_mask: bool = True) -> Surface:
@@ -122,13 +112,7 @@ def write_image(path: Path | str, image: NDArray) -> None:
     suffix = output_path.suffix.lower()
     if suffix in {".tif", ".tiff"}:
         estimated_bytes = int(np.prod(image.shape)) * int(image.dtype.itemsize)
-        tifffile.imwrite(
-            output_path,
-            image,
-            bigtiff=estimated_bytes >= (4 * 1024**3),
-            compression="zlib",
-            metadata=None,
-        )
+        images.write_tiff(output_path, image, compression="deflate")
         return
     if suffix != ".png":
         raise ValueError("output image extension must be .tif, .tiff, or .png")
@@ -245,20 +229,14 @@ class StreamingTiffOutputs:
     ) -> None:
         ended = threading.Event()
         try:
-            tifffile.imwrite(
+            with images.TiffWriter(
                 temporary,
-                self._tile_iterator(output_queue, ended),
-                shape=self.shape,
-                dtype=dtype,
-                bigtiff=(
-                    int(np.prod(self.shape)) * dtype.itemsize >= 4 * 1024**3
-                ),
+                self.shape,
+                dtype,
                 tile=(self.tile_size, self.tile_size),
-                compression="zlib",
-                photometric="minisblack",
-                metadata=None,
-                maxworkers=1,
-            )
+                compression="deflate",
+            ) as writer:
+                writer.write_tiles(self._tile_iterator(output_queue, ended))
         except BaseException as error:
             self._record_error(error)
             # Unblock a producer waiting on this bounded queue.

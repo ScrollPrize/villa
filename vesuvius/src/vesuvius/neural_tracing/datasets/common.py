@@ -12,7 +12,7 @@ import re
 from functools import lru_cache
 from scipy import ndimage
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
-import tifffile
+from vc_reader import images
 import warnings
 
 
@@ -226,7 +226,7 @@ def _filter_triplet_overlap_chunks(patches, config):
                     )
                 continue
 
-            overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
+            overlap_mask = np.asarray(images.read(str(mask_path))) > 0
 
             if overlap_filter_mode == "any_masked_pixel":
                 has_overlap = _wrap_chunk_has_overlap(overlap_mask, wrap, patch.world_bbox)

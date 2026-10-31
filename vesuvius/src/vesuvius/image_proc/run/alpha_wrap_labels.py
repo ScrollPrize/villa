@@ -1,5 +1,5 @@
 import alphashape
-import tifffile
+from vc_reader import images
 from tqdm import tqdm
 import argparse
 from pathlib import Path
@@ -19,7 +19,7 @@ def worker_fn(args):
             return f"Skipped {img_path} - output exists"
 
         # Load image and derive sample points for the alpha shape
-        img = tifffile.imread(img_path)
+        img = images.read(img_path)
         pts_2d, img_shape = arr_to_indices(
             img,
             subsample_rate=subsample_rate,
@@ -37,7 +37,7 @@ def worker_fn(args):
 
         # Save the alpha shape as image
         output_array = fill_alpha_shape(img_shape, alpha_shape, fill_value=255)
-        tifffile.imwrite(output_path, output_array, compression='packbits')
+        images.write_tiff(output_path, output_array, compression='packbits')
 
         return f"Processed {img_path} -> {output_path}"
 

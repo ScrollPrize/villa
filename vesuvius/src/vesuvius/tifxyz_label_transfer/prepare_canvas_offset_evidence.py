@@ -27,7 +27,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 from PIL import Image
-import tifffile
+from vc_reader import images
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -420,14 +420,7 @@ def extract_composite(
     # Paris4 level-2 composites exceed 200 MiB.  Back the output directly by
     # its final TIFF instead of briefly retaining another complete raster in
     # RAM while Napari may still be releasing the previous case.
-    output = tifffile.memmap(
-        partial_output,
-        shape=(shape[1], shape[2]),
-        dtype=dtype,
-        photometric="minisblack",
-        metadata=None,
-    )
-    output[...] = 0
+    output = images.memmap(partial_output, (shape[1], shape[2]), dtype)
     print(
         f"Extracting {info.remote} level {info.level} Z "
         f"{indices[0]}..{indices[-1]} -> {output_path}",
@@ -606,9 +599,9 @@ def _resize_annotation_render(
     output: Path,
     overwrite: bool,
 ) -> Path:
-    with tifffile.TiffFile(source) as handle:
-        page = handle.pages[0]
-        source_shape = tuple(int(value) for value in page.shape)
+    with images.open(source) as reader:
+        source_shape = tuple(int(value) for value in reader.shape)
+        source_dtype = np.dtype(reader.dtype)
     if source_shape == shape_yx:
         return source
     if len(source_shape) != 2:
@@ -634,22 +627,13 @@ def _resize_annotation_render(
     if integer_downsample:
         if output.exists():
             output.unlink()
-        destination = tifffile.memmap(
-            output, shape=shape_yx, dtype=page.dtype, metadata=None
-        )
-        with tifffile.TiffFile(source) as handle:
-            for segment, indices, _ in handle.pages[0].segments():
-                row = int(indices[2])
-                col = int(indices[3])
-                block = np.squeeze(segment)
-                block = block[
-                    : min(block.shape[0], source_shape[0] - row),
-                    : min(block.shape[1], source_shape[1] - col),
-                ]
+        destination = images.memmap(output, shape_yx, source_dtype)
+        band = factor_y * max(1, 1024 // factor_y)
+        with images.open(source) as reader:
+            for row in range(0, source_shape[0], band):
+                block = reader[row : row + band, :]
                 usable_y = block.shape[0] // factor_y * factor_y
                 usable_x = block.shape[1] // factor_x * factor_x
-                if usable_y == 0 or usable_x == 0:
-                    continue
                 reduced = block[:usable_y, :usable_x].reshape(
                     usable_y // factor_y,
                     factor_y,
@@ -660,7 +644,7 @@ def _resize_annotation_render(
                     reduced = np.rint(reduced)
                 destination[
                     row // factor_y : row // factor_y + reduced.shape[0],
-                    col // factor_x : col // factor_x + reduced.shape[1],
+                    : reduced.shape[1],
                 ] = reduced.astype(destination.dtype)
         destination.flush()
     else:

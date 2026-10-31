@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -562,7 +562,7 @@ def _write_overlap_mask(mask: np.ndarray, wrap_dir: Path, overwrite: bool) -> Pa
         raise FileExistsError(
             f"{out_path} already exists. Re-run with --overwrite to replace it."
         )
-    tifffile.imwrite(str(out_path), (mask.astype(np.uint8) * 255), compression="zlib")
+    images.write_tiff(str(out_path), mask.astype(np.uint8) * 255, compression="deflate")
     return out_path
 
 

@@ -36,7 +36,7 @@ except Exception:
     sk_euler_number = None
     _HAS_SKIMAGE = False
 import numpy as np
-import tifffile as tiff
+from vc_reader import images
 from tqdm import tqdm
 
 from scipy import ndimage as ndi
@@ -115,7 +115,7 @@ def _suffix_from_glob(pattern: str) -> str:
 
 
 def load_tif_3d(path: Path, allow_2d: bool = False) -> np.ndarray:
-    arr = tiff.imread(str(path))
+    arr = images.read(str(path))
     arr = np.asarray(arr)
     if arr.ndim == 2:
         if not allow_2d:
@@ -568,7 +568,7 @@ def main() -> None:
                     shutil.copy2(image_path, sample_dir / image_path.name)
                 else:
                     print(f"[WARN] Image not found: {image_path}")
-            tiff.imwrite(str(sample_dir / "hole_mask.tif"), hole_mask.astype(np.uint8))
+            images.write_tiff(str(sample_dir / "hole_mask.tif"), hole_mask.astype(np.uint8))
             print(f"[OK] Saved hole output to {sample_dir}")
 
     def _process_result_subfolder(sample_dir: Path, label_path: Path, result: Tuple[List[Dict], Optional[np.ndarray]]) -> None:
@@ -586,7 +586,7 @@ def main() -> None:
         if out_path.exists() and not args.overwrite_hole_mask:
             print(f"[WARN] Hole mask exists, skipping write: {out_path}")
             return
-        tiff.imwrite(str(out_path), hole_mask.astype(np.uint8))
+        images.write_tiff(str(out_path), hole_mask.astype(np.uint8))
         print(f"[OK] Saved hole output to {out_path}")
 
     if args.subfolders:

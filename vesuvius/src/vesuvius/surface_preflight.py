@@ -86,7 +86,7 @@ def _read_metadata(surface_path: Path) -> tuple[dict[str, Any], tuple[float, flo
 
 def _read_tiff(path: Path) -> np.ndarray:
     try:
-        import tifffile
+        from vc_reader import images
     except ImportError as exc:  # pragma: no cover - depends on installation extras
         raise RuntimeError(
             "TIFXYZ preflight requires the label-transfer extra: "
@@ -94,12 +94,10 @@ def _read_tiff(path: Path) -> np.ndarray:
         ) from exc
 
     try:
-        return tifffile.memmap(path, mode="r")
+        return images.memmap(path)
     except ValueError:
-        # Compressed TIFFs cannot be mapped directly.  tifffile creates a
-        # temporary memory-mapped array rather than retaining the full raster
-        # in process memory.
-        return tifffile.imread(path, out="memmap")
+        # Compressed TIFFs cannot be mapped directly.
+        return images.read(path)
 
 
 def _load_tifxyz_mask(surface_path: Path, shape) -> np.ndarray:

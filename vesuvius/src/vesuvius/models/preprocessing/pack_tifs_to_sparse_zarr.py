@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from scipy import ndimage
 from vc_reader.reader import ZarrWriteGroup, ZarrWriter, create_group
 from tqdm import tqdm
@@ -127,11 +127,11 @@ def _process_single_sample(
         return None
 
     # Read shape from image
-    sample_data = tifffile.imread(str(img_path))
+    sample_data = images.read(str(img_path))
     shape = sample_data.shape
 
     # Read label and compute validation metrics
-    label_data = tifffile.imread(str(label_path))
+    label_data = images.read(str(label_path))
     non_zero_count = int(np.count_nonzero(label_data))
     total_voxels = label_data.size
     has_labels = non_zero_count > 0
@@ -545,8 +545,8 @@ def write_sample_to_ome_zarr(
     """
     try:
         # Read TIF files
-        image_data = tifffile.imread(str(sample.image_path))
-        label_data = tifffile.imread(str(sample.label_path))
+        image_data = images.read(str(sample.image_path))
+        label_data = images.read(str(sample.label_path))
 
         # Resize if needed
         if target_shape is not None and image_data.shape != target_shape:
@@ -794,7 +794,7 @@ def main():
     codec = {'cname': 'zstd', 'level': args.compression_level, 'shuffle': 2}
 
     # Determine dtype from first sample
-    sample_data = tifffile.imread(str(samples[0].image_path))
+    sample_data = images.read(str(samples[0].image_path))
     dtype = str(sample_data.dtype)
     logger.info(f"Data type: {dtype}")
 

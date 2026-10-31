@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 from vc_reader.reader import ZarrWriter, open_zarr
 from tqdm import tqdm
@@ -413,7 +413,7 @@ def process_zarr_array(input_path, output_path, config, batch_size=1):
 
 def load_tiff(filepath):
     """Load a TIFF image and convert to torch tensor."""
-    img = tifffile.imread(filepath)
+    img = images.read(filepath)
     img_array = np.asarray(img)
     original_shape = img_array.shape
     original_dtype = img_array.dtype
@@ -493,7 +493,7 @@ def save_tiff(tensor, filepath, original_shape, original_dtype):
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    tifffile.imwrite(filepath, img_array, photometric='minisblack', compression='lzw')
+    images.write_tiff(filepath, img_array, compression='lzw')
 
 
 def generate_sample_parameters():
@@ -598,7 +598,7 @@ def process_tiff_folder(
             arr = result.squeeze().cpu().numpy()
             thr = threshold_otsu(arr)
             bin8 = (arr >= thr).astype(np.uint8) * 255
-            tifffile.imwrite(out_fp, bin8, photometric='minisblack', compression='lzw')
+            images.write_tiff(out_fp, bin8, compression='lzw')
         else:
             save_tiff(result, out_fp, original_shape, original_dtype)
     print(f"\nProcessing complete. Outputs saved to: {out_path}")
@@ -787,7 +787,7 @@ def main():
                 arr = result.squeeze().cpu().numpy()
                 thr = threshold_otsu(arr)
                 bin8 = (arr >= thr).astype(np.uint8) * 255
-                tifffile.imwrite(args.output, bin8, photometric='minisblack', compression='lzw')
+                images.write_tiff(args.output, bin8, compression='lzw')
             else:
                 save_tiff(result, args.output, original_shape, original_dtype)
             print("Done!")

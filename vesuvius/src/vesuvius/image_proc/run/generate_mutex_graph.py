@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from vc_reader.reader import create_group
 from scipy import ndimage
 from tqdm import tqdm
@@ -212,7 +212,7 @@ def process_volume(
     repulsive_offsets: Sequence[tuple[int, int, int]],
     long_range_offsets: set[tuple[int, int, int]],
 ) -> None:
-    volume = tifffile.imread(path)
+    volume = images.read(path)
     if volume.ndim != 3:
         raise ValueError(f"Expected 3D volume in {path}, got shape {volume.shape}")
     volume = np.asarray(volume)

@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from vc_reader import images
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
@@ -34,7 +35,7 @@ def _write_plane_patch(patch: Path, rows: int, cols: int) -> None:
     patch.mkdir(parents=True)
     r, c = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
     for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
+        images.write_tiff(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(json.dumps(dict(scale=[.5, .5])))
 
 
@@ -406,7 +407,7 @@ def test_index_uses_measured_cell_when_meta_scale_is_wrong(tmp_path):
         patch = tmp_path/'p'/name
         patch.mkdir(parents=True)
         for axis, values in dict(x=np.full(r.shape, 5.), y=2.*c, z=2.*r).items():
-            tifffile.imwrite(patch/f'{axis}.tif', values.astype(np.float32))
+            images.write_tiff(patch/f'{axis}.tif', values.astype(np.float32))
         (patch/'meta.json').write_text(json.dumps(dict(scale=[scale, scale])))
     infos = {i.name: i for i in build_index(tmp_path/'p', tmp_path/'cache')}
     assert infos['right'].cell == 2. and not infos['right'].stated_cell
@@ -629,10 +630,10 @@ def test_resample_isotropic_squares_the_grid(tmp_path):
     xyz = dict(x=np.full(r.shape, 60.5), y=10.+5*c, z=10.+20*r)
     xyz['x'][3, 8] = -1  # the node new column 2 starts from
     for name, values in xyz.items():
-        tifffile.imwrite(src/f'{name}.tif', values.astype(np.float32))
+        images.write_tiff(src/f'{name}.tif', values.astype(np.float32))
     (src/'meta.json').write_text(json.dumps(dict(scale=[.05, .05])))
     mod.main([str(tmp_path/'src'), str(tmp_path/'out')])
-    out = np.stack([tifffile.imread(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
+    out = np.stack([images.read(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
     ok = np.all(out != -1, -1)
     assert out.shape[:2] == (30, 20) and np.allclose(mod.steps(out, ok), (20., 20.))  # 79 * 5 / 20 + 1 columns
     assert not ok[3, 2] and ok.sum() == 30*20-1  # only the new node built from the invalid one is dropped
@@ -1080,7 +1081,7 @@ def test_two_way_fiber_traces_are_written_as_one_surface(tmp_path):
     conf_up[2, 6] = 0.  # one masked point
     conf_down[3] = 0.  # the last down row is not kept
     write_two_way_trace(tmp_path/'both', (up, conf_up), (down, conf_down), cfg, .5, dict(direction='both'))
-    x, z = (tifffile.imread(tmp_path/'both'/f'{c}.tif') for c in 'xz')
+    x, z = (images.read(tmp_path/'both'/f'{c}.tif') for c in 'xz')
     assert x.shape == (7, 13) and json.loads((tmp_path/'both'/'trace.json').read_text())['seed_row'] == 3
     assert np.allclose(z[1:, 0], [60., 80., 100., 120., 140., 160.]) and (x[0] == -1).all()  # down reversed, then up
     assert x[5, 6] == -1 and (x[1:] != -1).sum() == 6*13-1

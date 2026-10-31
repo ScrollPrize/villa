@@ -479,13 +479,13 @@ def _trace2cp_z_layer_tiff_stack(
 
 
 def _write_multilayer_tif(path: Path, stack: np.ndarray) -> None:
-    import tifffile
+    from vc_reader import images as image_files
 
     pages = np.asarray(stack, dtype=np.uint8)
     if pages.ndim != 3:
         raise ValueError(f"multilayer TIFF stack must have shape pages,H,W; got {pages.shape}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(path), pages, photometric="minisblack")
+    image_files.write_tiff(str(path), pages)
 
 
 def _write_trace2cp_z_layers_tif(path: Path, debug: "_Trace2CpZTraceDebug") -> None:

@@ -10,9 +10,8 @@ from pathlib import Path
 import shutil
 from typing import Iterable, Literal, Sequence
 
-import cv2
 import numpy as np
-import tifffile
+from vc_reader import images
 from tqdm.auto import tqdm
 from vc_reader.reader import ZarrWriter, write_pyramid_level
 
@@ -31,6 +30,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 STREAM_BLOCK_SIZE = 1024
+STREAM_DECODED_BYTES = 1 << 30
 SKIP_DIR_NAMES = {".git", "__pycache__"}
 
 
@@ -112,23 +112,6 @@ def _normalize_to_2d(image: np.ndarray, source_path: Path) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
-def _decoded_block_to_2d(decoded: np.ndarray, source_path: Path) -> np.ndarray:
-    """Return a decoded tile or strip as 2D without losing a length-1 row axis.
-
-    ``page.decode`` returns ``(depth, rows, columns, samples)`` for a strip
-    exactly as it does for a tile. ``_normalize_to_2d`` squeezes, which is
-    right for a whole image but drops the row axis of a one-row strip --
-    ``(1, 1, width, 1)`` becomes ``(width,)`` -- so index the axes explicitly.
-    One-row strips arise when ``rowsperstrip == 1``, or when
-    ``height % rowsperstrip == 1`` leaves a single row in the final strip.
-    Tiles cannot hit this: TIFF tile heights are multiples of 16.
-    """
-    block = np.asarray(decoded)
-    if block.ndim == 4:
-        return np.ascontiguousarray(block[0, :, :, 0])
-    return _normalize_to_2d(block, source_path)
-
-
 def _normalized_2d_shape(
     shape: Sequence[int], source_path: Path
 ) -> tuple[int, int]:
@@ -142,15 +125,9 @@ def _normalized_2d_shape(
     return int(squeezed[0]), int(squeezed[1])
 
 
-def _image_page_count(tif: tifffile.TiffFile) -> int:
-    """Number of full-resolution pages, ignoring pyramid reduced-image IFDs.
-
-    Call it before ``tif.asarray()``/``tif.series``: those may switch
-    ``tif.pages`` to lightweight frames, which carry no ``subfiletype``.
-    """
-    return sum(
-        1 for page in tif.pages if not (int(getattr(page, "subfiletype", 0)) & 1)
-    )
+def _image_page_count(reader) -> int:
+    """Number of pages in the file's first series."""
+    return int(reader.shape[0]) if reader.axes[0] == "z" else 1
 
 
 def _warn_extra_pages(path: Path, page_count: int) -> None:
@@ -169,20 +146,11 @@ def _warn_extra_pages(path: Path, page_count: int) -> None:
 def load_image(path: Path) -> np.ndarray:
     """Read a TIFF or PNG as one contiguous two-dimensional array.
 
-    A multi-page TIFF is read as its first page. Loading it whole would
-    stack the pages into a ``(pages, height, width)`` array and the channel
-    squeeze below would then mistake the page axis for height (#1738).
+    A multi-page TIFF is read as its first page (#1738).
     """
-    if path.suffix.lower() in {".tif", ".tiff"}:
-        with tifffile.TiffFile(path) as tif:
-            page_count = _image_page_count(tif)
-            _warn_extra_pages(path, page_count)
-            image = tif.pages[0].asarray() if page_count > 1 else tif.asarray()
-    else:
-        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise RuntimeError(f"Failed to read image data from {path}")
-    return _normalize_to_2d(image, path)
+    with images.open(path) as reader:
+        _warn_extra_pages(path, _image_page_count(reader))
+    return _normalize_to_2d(images.read(path, page=0), path)
 
 
 def _embed_label_volume(
@@ -261,174 +229,32 @@ def _write_levels_above_zero(
 def _get_streamable_tiff_metadata(
     path: Path,
 ) -> tuple[tuple[int, int], np.dtype] | None:
-    """Whether this TIFF can be converted without loading the whole image.
-
-    tifffile exposes tiled and striped TIFFs through the same block API --
-    ``page.chunks``/``page.chunked``/``page.dataoffsets``/``page.databytecounts``
-    describe a strip identically to how they describe a tile, just with a
-    chunk shape of ``(rows_per_strip, full_width)`` and a chunk grid that is
-    ``N`` blocks tall by 1 wide instead of a 2D grid. ``page.decode()`` accepts
-    either. Verified directly against tifffile 2026.3.3: for a striped page,
-    ``position[2]`` from ``decode()`` is the strip's y-offset, exactly as it is
-    the tile's y-offset for a tiled page -- the same indexing in
-    ``_write_streamed_tiff_level_zero`` below is correct for both.
-
-    Gating only on ``is_tiled`` (an earlier version of this function) meant
-    the only published label images that stream are the ones that happen to
-    be tiled; every other TIFF -- including any written with a default
-    ``tifffile.imwrite``, which produces strips -- silently falls through to
-    ``write_label_pyramid``, which loads the entire volume into memory.
-    That is invisible until someone converts a large enough image (a full
-    z-stack label volume, not a single flattened image) and hits an OOM with
-    no indication that a streamed path exists or why it wasn't used.
-    """
+    """Shape and dtype of a TIFF, which is converted without loading the whole image."""
     if path.suffix.lower() not in {".tif", ".tiff"}:
         return None
-    with tifffile.TiffFile(path) as tif:
-        page = tif.pages[0]
-        if page.is_tiled:
-            # Tiled input streamed before this change, unconditionally. Leave
-            # that exactly as it was: every extra condition here is a tiled
-            # file that regresses to the in-memory path it was exempt from.
-            # Streaming reads page 1 only; say so for a multi-page file, as
-            # the in-memory path does.
-            _warn_extra_pages(path, _image_page_count(tif))
-            return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
-
-        # Striped input is what this change adds. The two conditions below
-        # apply only to it.
-        if len(tif.pages) != 1:
-            # Streaming is wired for one IFD. A striped file with more than
-            # one falls through to load_image, which converts page 1 and
-            # warns about the rest (#1738).
-            return None
-        if page.compression not in _STREAMABLE_COMPRESSIONS:
-            # Some codecs (notably old-style JPEG, compression 6) need
-            # cross-block state tifffile does not expose per-block, so a block
-            # cannot be decoded in isolation. Fall through to the in-memory
-            # path rather than decode blocks independently for a codec that
-            # does not support it.
-            return None
-        return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
-
-
-# Codecs verified to support independent per-block decode via page.decode():
-# none (1), LZW (5), old-style Deflate (32946) and Deflate/zlib (8), PackBits
-# (32773). Excludes old-JPEG (6) and other codecs with cross-block state.
-_STREAMABLE_COMPRESSIONS = frozenset({1, 5, 8, 32773, 32946})
+    with images.open(path) as reader:
+        pages = _image_page_count(reader)
+        _warn_extra_pages(path, pages)
+        shape = reader.shape[1:] if reader.axes[0] == "z" else reader.shape
+        return _normalized_2d_shape(shape, path), np.dtype(reader.dtype)
 
 
 def _write_streamed_tiff_level_zero(input_path: Path, dataset: ZarrWriter) -> None:
-    """Stream a tiled OR striped TIFF's level-0 data into ``dataset``.
-
-    Reads ``page.chunks``/``page.chunked`` generically -- for a tiled page
-    these describe the tile grid; for a striped page they describe strips as
-    a chunk grid one column wide (verified: ``page.chunks == (rows_per_strip,
-    full_width)``, ``page.chunked == (n_strips, 1)``). The block-addressing
-    math below never distinguishes the two cases, because tifffile does not
-    either at this level of its API.
-    """
-    with tifffile.TiffFile(input_path) as tif:
-        page = tif.pages[0]
-        if not page.is_tiled and page.compression not in _STREAMABLE_COMPRESSIONS:
-            raise ValueError(
-                f"Expected a streamable TIFF (tiled or striped, compression in "
-                f"{sorted(_STREAMABLE_COMPRESSIONS)}) for the streaming path: "
-                f"{input_path} has compression {page.compression}"
-            )
-        image_height, image_width = _normalized_2d_shape(page.shape, input_path)
-        tile_height, tile_width = page.chunks
-        tiles_down, tiles_across = page.chunked
-
-        # Destination blocks, keyed by (block_y, block_x). Each entry holds the
-        # partially-filled array and a count of source chunks still to come. A
-        # block is held only while chunks that can contribute to it remain
-        # unread; since chunks are visited in row-major order, at most one row
-        # of destination blocks is resident at a time.
-        blocks: dict[tuple[int, int], np.ndarray] = {}
-        pending: dict[tuple[int, int], int] = {}
-
-        def _block_span(start: int, length: int, extent: int) -> range:
-            """Destination block origins covering [start, start+length)."""
-            first = (start // STREAM_BLOCK_SIZE) * STREAM_BLOCK_SIZE
-            stop = min(start + length, extent)
-            return range(first, stop, STREAM_BLOCK_SIZE)
-
-        # Count contributions per destination block up front, from the chunk
-        # grid alone -- no decoding required. A block is complete, and can be
-        # written and released, once its count reaches zero.
-        for tile_row in range(tiles_down):
-            tile_y = tile_row * tile_height
-            for tile_col in range(tiles_across):
-                tile_x = tile_col * tile_width
-                for by in _block_span(tile_y, tile_height, image_height):
-                    for bx in _block_span(tile_x, tile_width, image_width):
-                        pending[(by, bx)] = pending.get((by, bx), 0) + 1
-
-        itemsize = np.dtype(page.dtype).itemsize
-
-        def _flush(key: tuple[int, int]) -> None:
-            block_YX = blocks.pop(key)
-            by, bx = key
-            dataset[
-                DEFAULT_LABEL_SLICE,
-                by : by + block_YX.shape[0],
-                bx : bx + block_YX.shape[1],
-            ] = block_YX
-
-        # Source-chunk-major: decode each chunk exactly once.
-        for tile_index in range(tiles_down * tiles_across):
-            if tile_index >= len(page.dataoffsets):
-                continue
-            bytecount = page.databytecounts[tile_index]
-            if bytecount == 0:
-                # Sparse TIFFs may record empty chunks; nothing to scatter, but
-                # the pending counts still have to be settled.
-                decoded = None
-            else:
-                tif.filehandle.seek(page.dataoffsets[tile_index])
-                data = tif.filehandle.read(bytecount)
-                decoded, position, _ = page.decode(
-                    data, tile_index, jpegtables=page.jpegtables
-                )
-
-            if decoded is None:
-                tile_row, tile_col = divmod(tile_index, tiles_across)
-                tile_y, tile_x = tile_row * tile_height, tile_col * tile_width
-                tile_h, tile_w = tile_height, tile_width
-                tile_YX = None
-            else:
-                tile_YX = _decoded_block_to_2d(decoded, input_path)
-                tile_y, tile_x = position[2], position[3]
-                tile_h, tile_w = tile_YX.shape
-
-            for by in _block_span(tile_y, tile_h, image_height):
-                bh = min(STREAM_BLOCK_SIZE, image_height - by)
-                for bx in _block_span(tile_x, tile_w, image_width):
-                    bw = min(STREAM_BLOCK_SIZE, image_width - bx)
-                    key = (by, bx)
-                    if key not in blocks:
-                        blocks[key] = np.zeros((bh, bw), dtype=page.dtype)
-                    if tile_YX is not None:
-                        y0 = max(by, tile_y)
-                        y1 = min(by + bh, tile_y + tile_h)
-                        x0 = max(bx, tile_x)
-                        x1 = min(bx + bw, tile_x + tile_w)
-                        if y0 < y1 and x0 < x1:
-                            blocks[key][
-                                y0 - by : y1 - by, x0 - bx : x1 - bx
-                            ] = tile_YX[
-                                y0 - tile_y : y1 - tile_y, x0 - tile_x : x1 - tile_x
-                            ]
-                    pending[key] -= 1
-                    if pending[key] == 0:
-                        _flush(key)
-                        del pending[key]
-
-        # Any block whose contributions were all skipped (missing offsets in a
-        # truncated file) is still zero-filled and must be written.
-        for key in sorted(blocks):
-            _flush(key)
+    """Copy a TIFF's first page into ``dataset`` block by block."""
+    # Retained strips and tiles keep a block's neighbours from decoding one twice.
+    with images.open(input_path, decoded_cache_bytes=STREAM_DECODED_BYTES) as reader:
+        stack = reader.axes[0] == "z"
+        height, width = _normalized_2d_shape(reader.shape[1:] if stack else reader.shape, input_path)
+        channels = reader.axes[-1] == "c"
+        for by in range(0, height, STREAM_BLOCK_SIZE):
+            for bx in range(0, width, STREAM_BLOCK_SIZE):
+                window = (*((0,) if stack else ()), slice(by, by + STREAM_BLOCK_SIZE), slice(bx, bx + STREAM_BLOCK_SIZE), *((0,) if channels else ()))
+                block_YX = reader[window]
+                dataset[
+                    DEFAULT_LABEL_SLICE,
+                    by : by + block_YX.shape[0],
+                    bx : bx + block_YX.shape[1],
+                ] = block_YX
 
 
 def convert_image(

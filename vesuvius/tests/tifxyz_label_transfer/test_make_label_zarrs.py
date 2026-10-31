@@ -110,7 +110,7 @@ class MakeLabelZarrsTests(unittest.TestCase):
     def test_rejects_non_2d_input(self) -> None:
         input_path = self.tmp_path / "bad_inklabels.tif"
         tifffile.imwrite(input_path, np.zeros((2, 8, 8, 2), dtype=np.uint8))
-        with self.assertRaisesRegex(ValueError, "2D"):
+        with self.assertRaisesRegex(ValueError, "declare"):
             convert_label_tiff(input_path)
 
     def test_present_corrupt_transfer_report_fails_factually(self) -> None:

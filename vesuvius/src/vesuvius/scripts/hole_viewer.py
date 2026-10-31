@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import tifffile as tiff
+from vc_reader import images
 
 import napari
 from magicgui import magicgui
@@ -74,7 +74,7 @@ def load_folder(viewer: napari.Viewer, index: int) -> None:
     # --- suffix1: Labels layer (editable) ---
     path1 = _find_file_by_suffix(folder, args.suffix1)
     if path1 is not None:
-        data1 = tiff.imread(str(path1))
+        data1 = images.read(str(path1))
         viewer.add_labels(data1, name=args.suffix1, metadata={"source_path": str(path1)})
     else:
         print(f"[WARN] No file matching suffix1 '{args.suffix1}' in {folder}")
@@ -82,7 +82,7 @@ def load_folder(viewer: napari.Viewer, index: int) -> None:
     # --- suffix2: Labels layer ---
     path2 = _find_file_by_suffix(folder, args.suffix2)
     if path2 is not None:
-        data2 = tiff.imread(str(path2))
+        data2 = images.read(str(path2))
         viewer.add_labels(data2, name=args.suffix2, metadata={"source_path": str(path2)})
     else:
         print(f"[WARN] No file matching suffix2 '{args.suffix2}' in {folder}")
@@ -180,7 +180,7 @@ def make_save_widget(viewer: napari.Viewer) -> Container:
             stem = layer.name
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = folder / f"{stem}_{ts}.tif"
-        tiff.imwrite(str(out_path), data)
+        images.write_tiff(str(out_path), data)
         print(f"[OK] Saved {out_path}")
 
     btn_save.changed.connect(_on_save)

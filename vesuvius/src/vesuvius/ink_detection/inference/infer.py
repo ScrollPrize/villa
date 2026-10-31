@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -826,17 +826,12 @@ def write_output_tiff(
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
-        shape=tuple(int(value) for value in prob_sum_store.shape),
-        dtype=np.uint8,
-        compression="lzw",
-        tile=tuple(int(value) for value in tile_shape),
-        bigtiff=True,
-        metadata=None,
-        software="vesuvius.ink_detection.inference.infer",
-    )
+    height, width = (int(value) for value in prob_sum_store.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
+            writer.write_tile(y0, x0, tile)
 
 
 def open_temp_zarr_array(
@@ -853,7 +848,7 @@ def open_temp_zarr_array(
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
     """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
 
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    image = np.squeeze(np.asarray(images.read(path)))
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:

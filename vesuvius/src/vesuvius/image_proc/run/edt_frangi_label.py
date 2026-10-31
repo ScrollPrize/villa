@@ -5,7 +5,7 @@ import argparse
 import multiprocessing
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from tqdm import tqdm
 
 from vesuvius.image_proc.distance import dilate_by_inverse_edt
@@ -17,7 +17,7 @@ from vesuvius.image_proc.features.ridges_vessels import (
 
 def process_file(file_path, output_folder, dilation_distance=3, ridge_threshold=0.5):
     try:
-        volume = tifffile.imread(file_path)
+        volume = images.read(file_path)
         
         # Check if input is 2D or 3D
         if volume.ndim == 2:
@@ -39,7 +39,7 @@ def process_file(file_path, output_folder, dilation_distance=3, ridge_threshold=
         
         filename = os.path.basename(file_path)
         output_path = os.path.join(output_folder, filename)
-        tifffile.imwrite(output_path, binary_ridges, compression='packbits')
+        images.write_tiff(output_path, binary_ridges, compression='packbits')
         return file_path, True
     except Exception as e:
         return file_path, False, str(e)

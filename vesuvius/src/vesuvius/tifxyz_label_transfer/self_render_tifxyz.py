@@ -20,7 +20,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, map_coordinates
-import tifffile
+from vc_reader import images
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -963,9 +963,7 @@ def _open_output(
         if not overwrite:
             raise FileExistsError(f"{path} exists; pass --overwrite")
         path.unlink()
-    image = tifffile.memmap(path, shape=shape, dtype=np.uint8, metadata=None)
-    image[:] = 0
-    return image
+    return images.memmap(path, shape, np.uint8)
 
 
 def _source_canvas_measurements(

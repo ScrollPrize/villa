@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+from vc_reader import images
 import torch
 from vc_reader.reader import ZarrReader, ZarrWriter, create_group, open_group, open_zarr
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -73,28 +74,19 @@ class TiffArrayHandle:
         self._path = path
         self._spatial_shape = spatial_shape
         self._dtype = dtype
-        self._zarr_store = None
+        self._reader = None
 
     @property
     def spatial_shape(self) -> Tuple[int, ...]:
         return self._spatial_shape
 
-    def _ensure_zarr(self):
-        if self._zarr_store is None:
-            import tifffile
-            self._zarr_store = tifffile.imread(str(self._path), aszarr=True)
-        return self._zarr_store
-
     def read(self) -> np.ndarray:
-        import tifffile
-        return tifffile.imread(str(self._path))
+        return images.read(self._path)
 
     def read_window(self, start: Tuple[int, ...], size: Tuple[int, ...]) -> np.ndarray:
-        import zarr  # tifffile's aszarr store; goes with B6's TIFF windows
-        store = self._ensure_zarr()
-        arr = zarr.open(store, mode='r')
-        slices = tuple(slice(s, s + sz) for s, sz in zip(start, size))
-        return np.asarray(arr[slices])
+        if self._reader is None:
+            self._reader = images.open(self._path)
+        return self._reader[tuple(slice(s, s + sz) for s, sz in zip(start, size))]
 
 
 # -----------------------------------------------------------------------------
@@ -580,11 +572,9 @@ class MutexAffinityDataset(Dataset):
         if suffix not in {".tif", ".tiff"}:
             raise ValueError(f"Unsupported image format for {path}")
 
-        import tifffile
-        with tifffile.TiffFile(str(path)) as tif:
-            series = tif.series[0]
-            spatial_shape = tuple(int(v) for v in series.shape)
-            dtype = np.dtype(series.dtype)
+        with images.open(path) as reader:
+            spatial_shape = tuple(int(v) for v in reader.shape)
+            dtype = np.dtype(reader.dtype)
 
         return TiffArrayHandle(path, spatial_shape=spatial_shape, dtype=dtype)
 

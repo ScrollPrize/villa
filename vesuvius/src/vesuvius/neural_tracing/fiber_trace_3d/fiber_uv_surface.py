@@ -206,7 +206,7 @@ def run(settings):
 
 def audit(settings):
     """Audit completed artifact bands and provenance; never render a surface."""
-    import tifffile
+    from vc_reader import images
     results=[]
     for item in settings['solutions']:
         cfg=json.loads((Path(item['run_root'])/'summary.json').read_text())['config']
@@ -217,8 +217,8 @@ def audit(settings):
         step=float(settings.get('grid_step',100.))
         assert stats['grid_step']==step
         assert meta['scale']==[1/step]*2
-        bands=[tifffile.imread(path/(a+'.tif')) for a in ('x','y','z')]
-        mask=tifffile.imread(path/'mask.tif')
+        bands=[images.read(path/(a+'.tif')) for a in ('x','y','z')]
+        mask=images.read(path/'mask.tif')
         assert all(b.dtype==np.float32 and b.shape==mask.shape for b in bands)
         valid=mask==255
         assert np.array_equal(valid,bands[2]>0)

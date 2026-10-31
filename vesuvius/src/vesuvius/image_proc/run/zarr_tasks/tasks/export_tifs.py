@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from vc_reader.reader import open_node
 
 from ..base import TaskConfig, ZarrTask, make_task_config
@@ -167,24 +167,14 @@ def _export_chunk_worker(args: Tuple) -> Optional[Path]:
     output_path = Path(target_dir) / output_filename
 
     # Use ZSTD compression
-    tifffile.imwrite(
-        output_path,
-        chunk_data,
-        compression="zstd",
-        photometric="minisblack",
-    )
+    images.write_tiff(output_path, chunk_data, compression="zstd")
 
     # Process second zarr if provided
     if zarr_data2 is not None:
         chunk_data2 = zarr_data2[z_start:z_end, y_start:y_end, x_start:x_end]
 
         output_path2 = Path(output_dir2) / output_filename
-        tifffile.imwrite(
-            output_path2,
-            chunk_data2,
-            compression="zstd",
-            photometric="minisblack",
-        )
+        images.write_tiff(output_path2, chunk_data2, compression="zstd")
 
     return output_path
 

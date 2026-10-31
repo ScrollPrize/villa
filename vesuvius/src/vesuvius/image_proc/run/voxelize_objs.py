@@ -146,11 +146,11 @@ def _write_sparse_slice(dataset, slice_index, slice_data):
 
 
 def _write_tif_slice(output_dir, slice_index, slice_data, digits, compression):
-    import tifffile
+    from vc_reader import images
 
     os.makedirs(output_dir, exist_ok=True)
     filename = os.path.join(output_dir, f"{slice_index:0{digits}d}.tif")
-    tifffile.imwrite(filename, slice_data, compression=compression)
+    images.write_tiff(filename, slice_data, compression=compression)
 
 
 def _write_slice_output_worker(zslice, label_img, normals_img, frame_img):
@@ -200,7 +200,7 @@ def _write_slice_output_worker(zslice, label_img, normals_img, frame_img):
             slice_index,
             label_data,
             state.get("tif_slice_digits", 5),
-            state.get("tif_compression", "zlib"),
+            state.get("tif_compression", "deflate"),
         )
     else:
         raise ValueError(f"Unsupported output format '{fmt}'.")
@@ -1179,11 +1179,6 @@ def main():
     print(f"Label output dtype: {label_dtype}")
 
     if args.format == "tifs":
-        try:
-            import tifffile
-        except ImportError as exc:
-            print("ERROR: tifffile is required for TIFF output format. Install it and retry.")
-            sys.exit(1)
         if args.output_normals or args.output_surface_frame:
             print("ERROR: TIFF output format does not support normals or surface frame volumes.")
             sys.exit(1)
@@ -1673,7 +1668,7 @@ def main():
         "format": args.format,
         "label_dtype": label_dtype,
         "tif_slice_digits": max(5, len(str(z_dim - 1))) if z_dim > 0 else 1,
-        "tif_compression": "zlib",
+        "tif_compression": "deflate",
     }
 
     def _write_slice_output(zslice, label_img, normals_img, frame_img):

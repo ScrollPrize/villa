@@ -9,6 +9,7 @@ from unittest import mock
 
 import numpy as np
 import tifffile
+from vc_reader import images
 
 from vesuvius.tifxyz_label_transfer.estimate_canvas_offset_evidence import (
     assess_evidence,
@@ -361,8 +362,8 @@ class RcloneCompositeTests(unittest.TestCase):
                 ),
                 mock.patch(
                     "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence."
-                    "tifffile.memmap",
-                    wraps=tifffile.memmap,
+                    "images.memmap",
+                    wraps=images.memmap,
                 ) as memmap,
             ):
                 audit = extract_composite(

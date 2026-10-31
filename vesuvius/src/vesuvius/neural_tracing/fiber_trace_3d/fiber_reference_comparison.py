@@ -464,7 +464,7 @@ def affine_vertical_setup(settings,surface,sample):
 
 
 def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=None):
-    import tifffile
+    from vc_reader import images
     if v_transform is not None:
         pitch=surface.meta['output_step_vx']*xyz_scale
         factor=(height-1)/(z_range[1]-z_range[0]);a,b=v_transform
@@ -481,8 +481,8 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                     image=np.full((tile,tile,3),255,np.uint8)
                     image[:len(r),:len(c)]=np.where(valid[...,None],palette(winding_at(c,surface.x,surface.q))[None],255)
                     yield image
-        tifffile.imwrite(root/'reference_own.tif',tiles_affine(),shape=(height,width,3),dtype=np.uint8,
-                         tile=(tile,tile),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+        with images.TiffWriter(root/'reference_own.tif',(height,width,3),np.uint8,tile=(tile,tile),compression='lzw') as writer:
+            writer.write_tiles(tiles_affine())
         return
     if z_range is not None:
         pitch=surface.meta['output_step_vx']*xyz_scale
@@ -498,7 +498,7 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                 mask=physical_z_column_mask(surface.full[2][:,cols]*xyz_scale,valid,z_range,height)
                 colors=palette(winding_at(cols,surface.x,surface.q))
                 strip[:,left:left+len(cols)]=np.where(mask[...,None],colors[None],255)
-            tifffile.imwrite(root/'reference_own.tif',strip,tile=(512,512),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+            images.write_tiff(root/'reference_own.tif', strip, tile=(512,512), compression='lzw')
         finally:
             del strip
             (root/'reference_z_raster.tmp').unlink(missing_ok=True)
@@ -516,24 +516,23 @@ def render_reference(surface,root,height,z_range=None,xyz_scale=4.,v_transform=N
                 color=palette(winding_at(c,surface.x,surface.q))
                 image[:len(r),:len(c)]=np.where(valid[...,None],color[None],255)
                 yield image
-    tifffile.imwrite(root/'reference_own.tif',tiles(),shape=(height,width,3),dtype=np.uint8,
-                     tile=(tile,tile),photometric='rgb',compression='lzw',bigtiff=True,metadata=None)
+    with images.TiffWriter(root/'reference_own.tif',(height,width,3),np.uint8,tile=(tile,tile),compression='lzw') as writer:
+        writer.write_tiles(tiles())
 
 
 def preview(path):
     """Small central crop for checking output; full map remains TIFF/SVG."""
-    import tifffile
+    from vc_reader import images
     from PIL import Image
-    image=tifffile.imread(path)
+    image=images.read(path)
     h,w=image.shape[:2];left=max(0,w//2-h//2)
     detail=np.asarray(Image.fromarray(image[:,left:min(left+h,w)]).resize((1000,1000)))
-    tifffile.imwrite(path.with_name(path.stem+'_detail.tif'),detail,
-                     photometric='rgb',compression='lzw',metadata=None)
+    images.write_tiff(path.with_name(path.stem+'_detail.tif'), detail, compression='lzw')
 
 
 def convert_detail_pngs(root):
     """Migrate only known comparison detail crops; verify before removing PNG."""
-    import tifffile
+    from vc_reader import images
     from PIL import Image
     root=Path(root); converted=[]
     paths=[root/'reference_own_detail.png']
@@ -546,12 +545,11 @@ def convert_detail_pngs(root):
         target=path.with_suffix('.tif'); temporary=target.with_suffix('.partial.tif')
         if target.is_symlink() or temporary.exists() or temporary.is_symlink():
             raise ValueError('Unsafe or unfinished detail TIFF target')
-        if target.exists() and not np.array_equal(tifffile.imread(target),pixels):
+        if target.exists() and not np.array_equal(images.read(target),pixels):
             raise ValueError('Existing detail TIFF has different pixels')
-        tifffile.imwrite(temporary,pixels,photometric='rgb',compression='lzw',metadata=None)
-        with tifffile.TiffFile(temporary) as image:
-            if image.pages[0].compression.name!='LZW' or not np.array_equal(image.asarray(),pixels):
-                raise ValueError('Detail TIFF verification failed')
+        images.write_tiff(temporary, pixels, compression='lzw')
+        if not np.array_equal(images.read(temporary),pixels):
+            raise ValueError('Detail TIFF verification failed')
         temporary.replace(target)
         path.unlink()
         converted.append(str(target))

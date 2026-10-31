@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
-from tifffile import imread
+from vc_reader import images
 from tqdm import tqdm
 
 from vesuvius.image_proc.features.skeletonization import skeletonize_stack_2d
@@ -61,7 +61,7 @@ def find_label_files(input_dir: Path, recursive: bool) -> List[Path]:
 
 def _load_mask(label_path: Path) -> np.ndarray:
     """Load a TIFF label and return a squeezed binary numpy array."""
-    arr = imread(label_path)
+    arr = images.read(label_path)
     arr = np.squeeze(arr)
     if arr.ndim not in (2, 3):
         raise ValueError(f"Expected 2D or 3D label, got shape {arr.shape}")

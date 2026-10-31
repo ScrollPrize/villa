@@ -17,10 +17,10 @@ import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from vc_reader.reader import ZarrReader, open_node
 from tqdm import tqdm
 
@@ -60,7 +60,7 @@ class DatasetJob:
     parallelism: str
     workers: int
     no_progress: bool
-    compression: str | None
+    compression: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,8 +129,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--compression",
-        default="zlib",
-        help="Compression passed to tifffile. Use 'none' to disable compression.",
+        default="deflate",
+        help="TIFF compression: lzw, deflate, zstd, packbits, or 'none'.",
     )
     parser.add_argument(
         "--overwrite",
@@ -146,9 +146,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     if args.workers <= 0:
         parser.error("--workers must be at least 1.")
-
-    if isinstance(args.compression, str) and args.compression.lower() == "none":
-        args.compression = None
 
     return args
 
@@ -254,7 +251,7 @@ def _build_jobs(
     parallelism: str,
     workers: int,
     no_progress: bool,
-    compression: str | None,
+    compression: str,
 ) -> list[DatasetJob]:
     zarr_dirs = _discover_zarr_dirs(input_root)
     if not zarr_dirs:
@@ -437,24 +434,21 @@ def _write_projection(job: DatasetJob) -> None:
                 leave=False,
             )
 
-            def _yield_tiles() -> Iterator[np.ndarray]:
-                try:
-                    for tile in tile_iter:
-                        progress.update(1)
-                        yield tile
-                finally:
-                    progress.close()
-
-            with tifffile.TiffWriter(str(staged_output), bigtiff=True) as writer:
-                writer.write(
-                    data=_yield_tiles(),
-                    shape=(job.shape[1], job.shape[2]),
-                    dtype=np.uint8,
+            tile_h, tile_w = job.tile_shape
+            positions = ((y, x) for y in range(0, job.shape[1], tile_h) for x in range(0, job.shape[2], tile_w))
+            try:
+                with images.TiffWriter(
+                    str(staged_output),
+                    (job.shape[1], job.shape[2]),
+                    np.uint8,
                     tile=job.tile_shape,
-                    photometric="minisblack",
                     compression=job.compression,
-                    maxworkers=1,
-                )
+                ) as writer:
+                    for (y, x), tile in zip(positions, tile_iter):
+                        progress.update(1)
+                        writer.write_tile(y, x, tile)
+            finally:
+                progress.close()
         publish_staged_output(staged_output, job.output_path)
     finally:
         discard_staged_output(staged_output)

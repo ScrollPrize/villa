@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ZarrReader, open_node
@@ -28,6 +28,7 @@ LABEL_TIFF_NAME_RE = re.compile(
 )
 REQUIRED_LABEL_KINDS = ("inklabels", "supervision_mask")
 ALLOWED_BINARY_LABEL_VALUES = frozenset({0, 1, 255})
+LABEL_BAND_ROWS = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,12 +187,8 @@ def _normalize_tiff_shape(shape: Sequence[int], source_path: Path) -> tuple[int,
 
 
 def _read_tiff_series_shape(path: Path) -> tuple[int, ...]:
-    with tifffile.TiffFile(path) as tif:
-        if tif.series:
-            return tuple(int(dimension) for dimension in tif.series[0].shape)
-        if tif.pages:
-            return tuple(int(dimension) for dimension in tif.pages[0].shape)
-        raise RuntimeError(f"No TIFF image data found in {path}")
+    with images.open(path) as reader:
+        return tuple(int(dimension) for dimension in reader.shape)
 
 
 def read_tiff_metadata(path: Path) -> TiffMetadata:
@@ -222,29 +219,6 @@ def _label_has_alpha_channel(shape: Sequence[int]) -> bool:
     return int(squeezed[channel_axis]) in {2, 4}
 
 
-def _normalize_label_tile(tile: np.ndarray, source_path: Path) -> np.ndarray:
-    squeezed = np.squeeze(np.asarray(tile))
-
-    if squeezed.ndim == 2:
-        return np.ascontiguousarray(squeezed)
-    if squeezed.ndim != 3:
-        raise ValueError(f"Expected a 2D or channelized label TIFF in {source_path}, got shape={tuple(squeezed.shape)}")
-
-    channel_axis = _label_channel_axis(squeezed.shape)
-    if channel_axis is None:
-        raise ValueError(
-            f"Could not determine the channel axis for label TIFF {source_path} with shape={tuple(squeezed.shape)}"
-        )
-
-    channel_count = int(squeezed.shape[channel_axis])
-    if channel_axis == 2:
-        color = squeezed[..., :-1] if channel_count in {2, 4} else squeezed
-        return np.ascontiguousarray(np.max(color, axis=2))
-
-    color = squeezed[:-1, ...] if channel_count in {2, 4} else squeezed
-    return np.ascontiguousarray(np.max(color, axis=0))
-
-
 def _preview_invalid_values(values: set[int]) -> str:
     ordered = sorted(values)
     preview = ", ".join(str(value) for value in ordered[:8])
@@ -253,23 +227,24 @@ def _preview_invalid_values(values: set[int]) -> str:
     return preview
 
 
-def _iter_label_tiles(path: Path, *, workers: int) -> Iterator[np.ndarray]:
-    with tifffile.TiffFile(path) as tif:
-        if tif.series:
-            page = tif.series[0].pages[0]
-        elif tif.pages:
-            page = tif.pages[0]
-        else:
-            raise RuntimeError(f"No TIFF image data found in {path}")
-
-        for tile, _, _ in page.segments(maxworkers=workers):
-            if tile is None:
-                continue
-            yield tile
+def _iter_label_tiles(path: Path) -> Iterator[np.ndarray]:
+    """The first page in bands of rows, as one value per pixel: the largest colour channel."""
+    with images.open(path) as reader:
+        axes = reader.axes
+        page = (0,) if axes[0] == "z" else ()
+        channels = axes.index("c") - len(page) if "c" in axes else None
+        height = reader.shape[axes.index("y")]
+        for row in range(0, height, LABEL_BAND_ROWS):
+            band = reader[(*page, slice(row, row + LABEL_BAND_ROWS))] if channels != 0 else reader[(*page, slice(None), slice(row, row + LABEL_BAND_ROWS))]
+            if channels is not None:
+                count = band.shape[channels]
+                color = np.take(band, range(count - 1), axis=channels) if count in {2, 4} else band
+                band = np.max(color, axis=channels)
+            yield band
 
 
 def validate_label_tiff(
-    path: Path, *, workers: int, raw_shape: Sequence[int]
+    path: Path, *, raw_shape: Sequence[int]
 ) -> tuple[str, ...]:
     issues: list[str] = []
 
@@ -277,9 +252,8 @@ def validate_label_tiff(
         issues.append("label image has an alpha channel")
 
     invalid_values: set[int] = set()
-    for tile in _iter_label_tiles(path, workers=workers):
-        normalized = _normalize_label_tile(tile, path)
-        tile_values = np.unique(normalized)
+    for band in _iter_label_tiles(path):
+        tile_values = np.unique(band)
         invalid_values.update(
             int(value)
             for value in tile_values.tolist()
@@ -442,7 +416,7 @@ def validate_root(
             try:
                 messages = [
                     message
-                    for message in validate_label_tiff(label_path, workers=workers, raw_shape=raw_shape)
+                    for message in validate_label_tiff(label_path, raw_shape=raw_shape)
                     if message != "label image has an alpha channel"
                 ]
                 for message in messages:

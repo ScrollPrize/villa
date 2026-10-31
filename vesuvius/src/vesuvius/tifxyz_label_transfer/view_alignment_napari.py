@@ -19,7 +19,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
-import tifffile
+from vc_reader import images
 from vc_reader import tifxyz
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -581,30 +581,30 @@ def read_render_tiff(path: Path) -> np.ndarray:
     """Open a cached render without copying the complete raster into RAM."""
 
     try:
-        return tifffile.memmap(path, mode="r")
+        return images.memmap(path)
     except (OSError, ValueError):
         # Externally supplied evidence may be tiled or compressed and therefore
         # cannot be memory-mapped.  Keep compatibility with those files.
-        return tifffile.imread(path)
+        return images.read(path)
+
+
+NEAREST_READ_ROWS = 1024
 
 
 def read_tiff_nearest(path: Path, shape: tuple[int, int]) -> np.ndarray:
     """Read a 2D TIFF directly at ``shape`` without materialising it whole.
 
     Transfer TIFFs can decode to several gigabytes even though the viewer only
-    needs a render-sized raster. Decode just the strips or tiles touched by the
-    nearest-neighbour output grid and discard each compressed segment
-    immediately.
+    needs a render-sized raster. Read bands of rows and keep only the
+    nearest-neighbour output grid of each.
     """
 
-    with tifffile.TiffFile(path) as tif:
-        series = tif.series[0]
-        if len(series.pages) != 1 or len(series.shape) != 2:
-            return resize_nearest(tif.asarray(), shape)
-        page = series.pages[0]
-        source_shape = tuple(int(value) for value in series.shape)
+    with images.open(path) as reader:
+        source_shape = tuple(int(value) for value in reader.shape)
+        if len(source_shape) != 2:
+            return resize_nearest(reader[...], shape)
         if source_shape == shape:
-            return tif.asarray()
+            return reader[...]
         rows = np.minimum(
             (
                 (np.arange(shape[0], dtype=np.float64) + 0.5)
@@ -621,51 +621,13 @@ def read_tiff_nearest(path: Path, shape: tuple[int, int]) -> np.ndarray:
             ).astype(np.int64),
             source_shape[1] - 1,
         )
-        output = np.empty(shape, dtype=series.dtype)
-        handle = tif.filehandle
-
-        if page.is_tiled:
-            tile_height = int(page.tilelength)
-            tile_width = int(page.tilewidth)
-            tiles_across = math.ceil(source_shape[1] / tile_width)
-            row_tiles = np.unique(rows // tile_height)
-            column_tiles = np.unique(columns // tile_width)
-            for tile_row in row_tiles:
-                output_rows = np.flatnonzero(rows // tile_height == tile_row)
-                source_rows = rows[output_rows] - tile_row * tile_height
-                for tile_column in column_tiles:
-                    output_columns = np.flatnonzero(
-                        columns // tile_width == tile_column
-                    )
-                    source_columns = (
-                        columns[output_columns] - tile_column * tile_width
-                    )
-                    index = int(tile_row * tiles_across + tile_column)
-                    handle.seek(page.dataoffsets[index])
-                    encoded = handle.read(page.databytecounts[index])
-                    decoded, _, _ = page.decode(encoded, index)
-                    tile = np.asarray(decoded).squeeze()
-                    output[np.ix_(output_rows, output_columns)] = tile[
-                        np.ix_(source_rows, source_columns)
-                    ]
-            return output
-
-        rows_per_strip = int(page.rowsperstrip)
-        if rows_per_strip > 0:
-            for strip in np.unique(rows // rows_per_strip):
-                output_rows = np.flatnonzero(rows // rows_per_strip == strip)
-                source_rows = rows[output_rows] - strip * rows_per_strip
-                index = int(strip)
-                handle.seek(page.dataoffsets[index])
-                encoded = handle.read(page.databytecounts[index])
-                decoded, _, _ = page.decode(encoded, index)
-                segment = np.asarray(decoded).squeeze()
-                if segment.ndim == 1:
-                    segment = segment[None, :]
-                output[output_rows] = segment[np.ix_(source_rows, columns)]
-            return output
-
-        return resize_nearest(tif.asarray(), shape)
+        output = np.empty(shape, dtype=reader.dtype)
+        for band in np.unique(rows // NEAREST_READ_ROWS):
+            output_rows = np.flatnonzero(rows // NEAREST_READ_ROWS == band)
+            first = int(rows[output_rows[0]])
+            window = reader[first : int(rows[output_rows[-1]]) + 1, :]
+            output[output_rows] = window[np.ix_(rows[output_rows] - first, columns)]
+        return output
 
 
 def read_label_display(path: Path, shape: tuple[int, int]) -> np.ndarray:
@@ -916,8 +878,8 @@ def register_render(
         fill_seams=fill_seams,
     )
     cache.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(cache, registered)
-    tifffile.imwrite(cache.with_name(f"{cache.stem}.valid.tif"), valid)
+    images.write_tiff(cache, registered)
+    images.write_tiff(cache.with_name(f"{cache.stem}.valid.tif"), np.asarray(valid, dtype=np.uint8))
     cache_report_path.write_text(
         json.dumps(
             {

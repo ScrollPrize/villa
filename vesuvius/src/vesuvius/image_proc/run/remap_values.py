@@ -5,7 +5,7 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from tqdm import tqdm
 
 
@@ -67,7 +67,7 @@ def pair_files(images_dir: Path, labels_dir: Path):
 
 def safe_overwrite_tif(path: Path, array: np.ndarray, compression: str = "lzw"):
     tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
-    tifffile.imwrite(tmp, array, compression=compression)
+    images.write_tiff(tmp, array, compression=compression)
     os.replace(tmp, path)
 
 
@@ -75,8 +75,8 @@ def worker(args):
     img_path, lbl_path, mask_value = args
 
     try:
-        img = tifffile.imread(img_path)
-        lbl = tifffile.imread(lbl_path)
+        img = images.read(img_path)
+        lbl = images.read(lbl_path)
 
         if img.shape != lbl.shape:
             return f"Mismatch: {img_path.name} vs {lbl_path.name} shapes {img.shape} != {lbl.shape}"

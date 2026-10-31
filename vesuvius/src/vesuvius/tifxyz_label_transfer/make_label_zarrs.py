@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
-import tifffile
+from vc_reader import images
 
 from vc_reader.reader import write_pyramid_level
 from vesuvius.label_zarr import (
@@ -26,7 +26,7 @@ BLOCK_SIZE = 1024
 
 
 def _load_label_2d(path: Path) -> np.ndarray:
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    image = np.squeeze(np.asarray(images.read(path)))
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:

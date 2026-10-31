@@ -13,7 +13,7 @@ from typing import Sequence
 
 import numpy as np
 from PIL import Image
-import tifffile
+from vc_reader import images
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -176,23 +176,14 @@ def write_array_to_temp_memmap(array: np.ndarray) -> tuple[np.memmap, Path]:
 
 
 def prepare_prediction(path: Path) -> PreparedPrediction:
-    suffix = path.suffix.lower()
-    if suffix in {".tif", ".tiff"}:
-        with tifffile.TiffFile(path) as tif:
-            if len(tif.pages) == 0:
-                raise RuntimeError(f"No TIFF pages found in {path}")
-            memmap_array = tif.pages[0].asarray(out="memmap")
-        normalized = normalize_prediction_array(memmap_array, path=path)
-        memmap_path = Path(memmap_array.filename)
-        cleanup_path = (
-            None
-            if memmap_path.resolve() == path.resolve()
-            else memmap_path
-        )
-        return PreparedPrediction(path=path, array=normalized, cleanup_path=cleanup_path)
-
-    with Image.open(path) as image:
-        loaded = normalize_prediction_array(np.asarray(image), path=path)
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        try:
+            mapped = images.memmap(path)
+        except ValueError:
+            pass
+        else:
+            return PreparedPrediction(path=path, array=normalize_prediction_array(mapped, path=path), cleanup_path=None)
+    loaded = normalize_prediction_array(images.read(path, page=0), path=path)
     memmap_array, cleanup_path = write_array_to_temp_memmap(loaded)
     return PreparedPrediction(path=path, array=memmap_array, cleanup_path=cleanup_path)
 
@@ -342,7 +333,7 @@ def validate_prediction_shapes(predictions: Sequence[PreparedPrediction]) -> tup
 
 def write_prediction_image(output_path: Path, output_array: np.ndarray) -> None:
     if output_path.suffix.lower() in {".tif", ".tiff"}:
-        tifffile.imwrite(output_path, output_array, compression="lzw")
+        images.write_tiff(output_path, output_array, compression="lzw")
         return
     Image.fromarray(np.asarray(output_array), mode="L").save(output_path)
 

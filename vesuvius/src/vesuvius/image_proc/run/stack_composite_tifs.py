@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
-import tifffile
+from vc_reader import images
 from vc_reader.reader import ZarrReader, ZarrWriter, open_zarr
 
 from vesuvius.image_proc.run.workflow import gather_inputs, run_workflow
@@ -113,8 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compression",
         type=str,
-        default="zlib",
-        help="Compression argument forwarded to tifffile.imwrite ('' disables).",
+        default="deflate",
+        help="TIFF compression: lzw, deflate, zstd, packbits ('' disables).",
     )
     parser.add_argument(
         "--recursive",
@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-cols must be at least 1.")
 
     if args.compression == "":
-        args.compression = None
+        args.compression = "none"
 
     if args.mode == "stack" and args.projection:
         # Projection is ignored for stack mode but we keep the argument optional.
@@ -179,11 +179,10 @@ def _resolve_slice_range(
 
 
 def _inspect_slice_metadata(path: Path) -> tuple[tuple[int, int], np.dtype]:
-    with tifffile.TiffFile(path) as tif:
-        series = tif.series[0]
-        if series.ndim != 2:
-            raise ValueError(f"Slice {path} expected to be 2D, got shape {series.shape}.")
-        return tuple(series.shape), np.dtype(series.dtype)
+    with images.open(path) as reader:
+        if len(reader.shape) != 2:
+            raise ValueError(f"Slice {path} expected to be 2D, got shape {reader.shape}.")
+        return tuple(reader.shape), np.dtype(reader.dtype)
 
 
 def _prepare_storage(
@@ -242,7 +241,7 @@ def _stack_worker(item: tuple[int, Path]) -> Path:
         raise RuntimeError("Worker storage not initialized.")
 
     index, slice_path = item
-    data = tifffile.imread(slice_path)
+    data = images.read(slice_path)
     if data.shape != _EXPECTED_SHAPE:
         raise ValueError(f"Slice {slice_path} shape {data.shape} does not match expected {_EXPECTED_SHAPE}.")
     if data.dtype != _EXPECTED_DTYPE:
@@ -364,7 +363,7 @@ def _write_output_stack(
     *,
     compression: str | None,
 ) -> None:
-    tifffile.imwrite(output_path, np.asarray(array), compression=compression)
+    images.write_tiff(output_path, np.asarray(array), compression=compression)
 
 
 def _write_output_projection(
@@ -403,7 +402,7 @@ def _write_output_projection(
     else:
         raise ValueError(f"Unsupported projection: {projection}")
 
-    tifffile.imwrite(output_path, data, compression=compression)
+    images.write_tiff(output_path, data, compression=compression)
 
 
 def main() -> int:

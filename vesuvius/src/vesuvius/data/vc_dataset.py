@@ -2,7 +2,6 @@ import os
 from typing import Optional, Tuple, Union
 import numpy as np
 # import zarr # No longer needed directly in VCDataset
-# import tifffile # No longer needed directly in VCDataset
 import torch
 from torch.utils.data import Dataset
 import re

@@ -1,5 +1,5 @@
 import numpy as np
-import tifffile
+from vc_reader import images
 from tqdm import tqdm
 import argparse
 from pathlib import Path
@@ -12,8 +12,8 @@ def apply_mask(args):
 
     try:
         # Read image and mask
-        img = tifffile.imread(img_path)
-        mask = tifffile.imread(mask_path)
+        img = images.read(img_path)
+        mask = images.read(mask_path)
 
         # Check if shapes match
         if img.shape != mask.shape:
@@ -41,7 +41,7 @@ def apply_mask(args):
         masked_img = masked_img.astype(np.uint8)
 
         # Save the masked image
-        tifffile.imwrite(output_path, masked_img, compression='lzw')
+        images.write_tiff(output_path, masked_img, compression='lzw')
 
         return f"Processed {img_path.name} -> {output_path.name}"
 

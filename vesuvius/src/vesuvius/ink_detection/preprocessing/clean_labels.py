@@ -13,9 +13,8 @@ from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
-from PIL import Image
 from scipy import ndimage
-import tifffile
+from vc_reader import images
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -173,24 +172,8 @@ def find_target_images(root: Path, *, version_id: int | None = None) -> List[Pat
     return matches
 
 
-def _read_tiff_first_page(path: Path) -> np.ndarray:
-    with tifffile.TiffFile(path) as tif:
-        if len(tif.pages) == 0:
-            raise RuntimeError(f"No TIFF pages found in {path}")
-        return tif.pages[0].asarray()
-
-
 def load_image(path: Path) -> np.ndarray:
-    suffix = path.suffix.lower()
-    if suffix in {".tif", ".tiff"}:
-        image = _read_tiff_first_page(path)
-    else:
-        with Image.open(path) as pil_image:
-            image = np.asarray(pil_image)
-
-    if image is None:
-        raise RuntimeError(f"Failed to read image data from {path}")
-    return np.asarray(image)
+    return images.read(path, page=0)
 
 
 def normalize_mask_image(image: np.ndarray) -> np.ndarray:
@@ -295,20 +278,7 @@ def backup_path_for_input(root: Path, input_path: Path) -> Path:
 
 def write_tiff(output_path: Path, image: np.ndarray) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        image,
-        compression="lzw",
-        tile=DEFAULT_TILE_SHAPE,
-        photometric="minisblack",
-        metadata=None,
-        bigtiff=bool(image.nbytes >= (4 * 1024**3)),
-    )
-
-
-def _configure_image_policy() -> None:
-    os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
-    Image.MAX_IMAGE_PIXELS = None
+    images.write_tiff(output_path, image, compression="lzw", tile=DEFAULT_TILE_SHAPE)
 
 
 def process_one(
@@ -320,7 +290,6 @@ def process_one(
     max_hole_area: int,
     overwrite: bool,
 ) -> Dict[str, str]:
-    _configure_image_policy()
     output_path = output_path_for_input(input_path)
     backup_path = backup_path_for_input(root, input_path)
     output_conflict = output_path != input_path and output_path.exists()

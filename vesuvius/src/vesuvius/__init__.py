@@ -18,7 +18,7 @@ try:
 except Exception:
     structure_tensor = None  # type: ignore
 try:
-    from . import tifxyz  # tifxyz format I/O (requires tifffile, scipy)
+    from . import tifxyz  # tifxyz format I/O
 except Exception:
     tifxyz = None  # type: ignore
 
