@@ -80,6 +80,8 @@ public:
     // per unit of physical offset along the unit physical normal (the unit normal when
     // spacing is 1). Either output may be null.
     void resample(const Raster& raster, float* xyz, float* normals) const;
+    // The same at `n` real-valued grid positions (`xy`: column, row pairs).
+    void pointsAt(const float* xy, std::size_t n, float* xyz, float* normals) const;
 
     struct Impl;
 

@@ -272,6 +272,28 @@ void Surface::resample(const Raster& raster, float* xyz, float* normals) const
     });
 }
 
+void Surface::pointsAt(const float* xy, std::size_t n, float* xyz, float* normals) const
+{
+    std::vector<float> scratch;
+    if (!xyz) {
+        scratch.resize(n * 3);
+        xyz = scratch.data();
+    }
+    const std::size_t parts = std::clamp<std::size_t>(n / 65536, 1, 64);
+    const PointMap g = impl_->map();
+    const GridView grid = impl_->view();
+    resamplePool().parallel_for(parts, [&](std::size_t k) {
+        for (std::size_t i = n * k / parts; i < n * (k + 1) / parts; ++i) {
+            float step[3];
+            if (!point(g, grid, xy[i * 2], xy[i * 2 + 1], xyz + i * 3, nullptr, step)) {
+                xyz[i * 3] = xyz[i * 3 + 1] = xyz[i * 3 + 2] = kNaN;
+                step[0] = step[1] = step[2] = kNaN;
+            }
+            if (normals) std::copy_n(step, 3, normals + i * 3);
+        }
+    });
+}
+
 namespace {
 
 // A level's voxels through a few recently used chunks, for sampling::point: a tile's

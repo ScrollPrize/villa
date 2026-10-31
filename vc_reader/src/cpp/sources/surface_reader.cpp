@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "vc_reader/grid.hpp"
+#include "vc_reader/tifxyz.hpp"
 #include "../reader_types.hpp"
 
 namespace vcr::sources {
@@ -159,11 +160,8 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
             }
         }
         files.close();
-        const auto scale = meta.value("scale", json::array());
-        if (!scale.is_array() || scale.size() != 2 || !scale[0].is_number() || !scale[1].is_number() || !std::isfinite(scale[0].get<double>()) || !std::isfinite(scale[1].get<double>()) ||
-            scale[0].get<double>() <= 0 || scale[1].get<double>() <= 0)
-            bad("tifxyz scale must contain two positive finite UV scales");
-        const PixelAffine observed{{{1 / scale[0].get<double>(), 0, 0}, {0, 1 / scale[1].get<double>(), 0}}};
+        const auto scale = tifxyz::parseMetadata(meta, root).scale;  // rows, columns
+        const PixelAffine observed{{{1 / scale[1], 0, 0}, {0, 1 / scale[0], 0}}};
         if (grid && *grid != observed) bad("surface pixel_to_uv contradicts tifxyz scale");
         grid = observed;
         for (const char* axis : {"x", "y", "z"}) {
