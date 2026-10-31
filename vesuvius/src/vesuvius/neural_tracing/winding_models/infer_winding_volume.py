@@ -54,6 +54,17 @@ import numpy as np
 
 # Output zarr chunk edge; prob-volume spill buckets are full z/y/x chunks.
 _OUTPUT_CHUNK = 128
+# Every array this script creates: v3 layout, empty chunks stay unstored.
+_OUTPUT_ARRAY = {"separator": "/", "skip_empty": True}
+
+
+def _open_output_array(group_path, name):
+    """One array of an output group, opened for writing."""
+    from vc_reader.reader import ZarrWriter
+
+    return ZarrWriter.open(f"{group_path}/{name}", skip_empty=True)
+
+
 # Raw prob-volume record used only by the portable CPU fallback.
 _PROB_RECORD = np.dtype([("key", "<u8"), ("val", "u1")])
 # Spill records are partial reductions, not individual slab observations.
@@ -93,131 +104,41 @@ _PROB_KEY_MASK = (1 << 21) - 1
 _PROB_GPU_FLUSH_RECORDS = 1 << 26
 
 
-def _append_prob_aggregates(path, records):
-    """Append one independently compressed aggregate block."""
-    from numcodecs import Blosc
+# Byte shuffle is both faster and smaller than bitshuffle for these structured
+# records (e.g. u64/u64/u32/u8).  On representative full-resolution spills it
+# reduced encode time by ~28% and bytes by ~22%.
+_SPILL_CODEC = {"id": "blosc", "cname": "zstd", "clevel": 1, "shuffle": 1}
 
-    # Byte shuffle is both faster and smaller than bitshuffle for this
-    # structured record (u64/u64/u32/u8).  On representative full-resolution
-    # spills it reduced encode time by ~28% and bytes by ~22%.
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
+
+def _append_aggregates(path, records):
+    """Append one independently compressed block of aggregate records."""
+    from vc_reader.reader import compress_bytes
+
+    records = np.ascontiguousarray(records)
+    encoded = compress_bytes(
+        records, _SPILL_CODEC, itemsize=records.dtype.itemsize)
     with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
+        handle.write(struct.pack("<QQ", len(encoded), records.nbytes))
         handle.write(encoded)
 
 
-def _iter_prob_aggregates(path):
-    """Yield aggregate arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
+def _iter_aggregates(path, dtype):
+    """Yield record arrays from concatenated compressed blocks."""
+    from vc_reader.reader import decompress_bytes
 
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
     with open(path, "rb") as handle:
         while True:
-            header = handle.read(8)
+            header = handle.read(16)
             if not header:
                 return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated probability spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
+            if len(header) != 16:
+                raise RuntimeError(f"truncated spill header: {path}")
+            size, decoded = struct.unpack("<QQ", header)
             encoded = handle.read(size)
             if len(encoded) != size:
-                raise RuntimeError(f"truncated probability spill block: {path}")
-            yield np.frombuffer(codec.decode(encoded), dtype=_PROB_AGG_RECORD)
-
-
-def _append_phase_aggregates(path, records):
-    """Append one independently compressed phase-consensus block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_phase_aggregates(path):
-    """Yield phase-consensus arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated phase spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(f"truncated phase spill block: {path}")
-            yield np.frombuffer(codec.decode(encoded), dtype=_PHASE_AGG_RECORD)
-
-
-def _append_phase_label_aggregates(path, records):
-    """Append one independently compressed labeled-phase block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_phase_label_aggregates(path):
-    """Yield labeled-phase arrays from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(
-                    f"truncated labeled-phase spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(
-                    f"truncated labeled-phase spill block: {path}")
+                raise RuntimeError(f"truncated spill block: {path}")
             yield np.frombuffer(
-                codec.decode(encoded), dtype=_PHASE_LABEL_AGG_RECORD)
-
-
-def _append_winding_aggregates(path, records):
-    """Append one compressed source-vote aggregate block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_winding_aggregates(path):
-    """Yield source-vote aggregates from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated winding aggregate header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(f"truncated winding aggregate block: {path}")
-            yield np.frombuffer(
-                codec.decode(encoded), dtype=_WINDING_AGG_RECORD)
+                decompress_bytes(encoded, _SPILL_CODEC, decoded), dtype=dtype)
 
 
 def _spiral_scripts_dir():
@@ -1157,14 +1078,11 @@ class _NativePhaseCacheWriter:
     """Write one GPU's native phase, validity, and geometric frames."""
 
     def __init__(self, group_path, gpu):
-        import zarr
-
-        group = zarr.open_group(str(group_path), mode="r+")
         name = f"shard_{gpu}"
-        self.phase = group["phase"][name]
-        self.valid = group["valid"][name]
-        self.frame = group["frame"][name]
-        self.available = group["available"][name]
+        self.phase = _open_output_array(group_path, f"phase/{name}")
+        self.valid = _open_output_array(group_path, f"valid/{name}")
+        self.frame = _open_output_array(group_path, f"frame/{name}")
+        self.available = _open_output_array(group_path, f"available/{name}")
 
     @staticmethod
     def _runs(indices):
@@ -1196,9 +1114,9 @@ class _NativePhaseCacheReader:
     """Random-access view of globally ordered, physically sharded phase data."""
 
     def __init__(self, group_path):
-        import zarr
+        from vc_reader.reader import open_group
 
-        self.group = zarr.open_group(str(group_path), mode="r")
+        self.group = open_group(str(group_path))
         shards = list(self.group.attrs["phase_shards"])
         self.bounds = np.asarray(
             [int(shards[0]["lo"])] + [int(item["hi"]) for item in shards],
@@ -1248,9 +1166,9 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     device = torch.device(f"cuda:{gpu}")
     phase_reader = None
     if getattr(args, "phase_cache", None):
-        import zarr
+        from vc_reader.reader import open_group
 
-        cache_attrs = zarr.open_group(args.phase_cache, mode="r").attrs
+        cache_attrs = open_group(args.phase_cache).attrs
         model_cfg = {
             "ray_length": int(cache_attrs["ray_length"]),
             "transverse_size": int(cache_attrs["transverse_size"]),
@@ -1529,10 +1447,9 @@ def _output_shape(reference, output_downsample):
 
 def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
     """Create the lossless, independently writable native-phase artifact."""
-    import zarr
-    from zarr.codecs import BloscCodec, BloscShuffle, PackBits
+    from vc_reader.reader import create_group
 
-    group = zarr.open_group(args.output, mode="w")
+    group = create_group(args.output, version=3, overwrite=True)
     phase_group = group.create_group("phase")
     valid_group = group.create_group("valid")
     frame_group = group.create_group("frame")
@@ -1542,14 +1459,16 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
         value = np.asarray(rays[key])
         first_chunk = max(1, min(len(value), 1 << 16))
         rays_group.create_array(
-            key, data=value, chunks=(first_chunk, *value.shape[1:]))
+            key, shape=value.shape, dtype=value.dtype,
+            chunks=(first_chunk, *value.shape[1:]),
+            **_OUTPUT_ARRAY)[:] = value
 
     ray_length = int(model_cfg.get("ray_length", 384))
     transverse = int(model_cfg.get("transverse_size", 128))
     column_stride = int(model_cfg.get("column_stride", 4))
     native_columns = transverse // column_stride
-    compressor = BloscCodec(
-        cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)
+    compressor = dict(
+        _OUTPUT_ARRAY, compressor="blosc", cname="zstd", level=1, shuffle=1)
     shards = []
     for slot, gpu in enumerate(gpus):
         lo, hi = int(bounds[slot]), int(bounds[slot + 1])
@@ -1563,19 +1482,19 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
             chunks=(1, native_columns, native_columns, ray_length),
             shards=(min(32, max(1, count)), native_columns, native_columns,
                     ray_length),
-            dtype="float32", compressors=[compressor])
+            dtype="float32", **compressor)
         valid_group.create_array(
             name, shape=(count, transverse, transverse, ray_length),
             chunks=(1, transverse, transverse, ray_length),
             shards=(min(32, max(1, count)), transverse, transverse, ray_length),
-            dtype="bool", filters=[PackBits()], compressors=[compressor])
+            dtype="bool", packbits=True, fill_value=False, **compressor)
         compact_chunk = max(1, min(count, 1 << 12))
         frame_group.create_array(
             name, shape=(count, 4, 3), chunks=(compact_chunk, 4, 3),
-            dtype="float64", compressors=[compressor])
+            dtype="float64", **compressor)
         available_group.create_array(
             name, shape=(count,), chunks=(compact_chunk,), dtype="bool",
-            filters=[PackBits()], compressors=[compressor], fill_value=False)
+            packbits=True, fill_value=False, **compressor)
         shards.append({"name": name, "gpu": int(gpu), "lo": lo, "hi": hi})
 
     group.attrs.update({
@@ -1605,9 +1524,9 @@ def _initialize_native_phase_cache(args, rays, bounds, gpus, model_cfg):
 
 def _load_native_phase_cache(args):
     """Load cached rays and validate immutable model geometry."""
-    import zarr
+    from vc_reader.reader import open_group
 
-    group = zarr.open_group(str(args.phase_cache), mode="r")
+    group = open_group(str(args.phase_cache))
     if group.attrs.get("artifact_type") != "winding_native_phase_cache":
         raise ValueError(f"not a native winding phase cache: {args.phase_cache}")
     if not bool(group.attrs.get("complete", False)):
@@ -1750,7 +1669,7 @@ class _ProbSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_prob_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -1770,7 +1689,7 @@ class _ProbSpillWriter:
             aggregate["maximum"] = np.maximum.reduceat(values, starts)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_prob_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 aggregate)
         self.buffers.clear()
@@ -1813,7 +1732,7 @@ class _PhaseSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_phase_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -1854,7 +1773,7 @@ class _PhaseLabelSpillWriter:
             bucket = int(bucket_value)
             zy, bx = divmod(bucket, self.nx_chunks)
             bz, by = divmod(zy, self.ny_chunks)
-            _append_phase_label_aggregates(
+            _append_aggregates(
                 self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
                 records,
             )
@@ -2571,7 +2490,7 @@ class _WindingAggregateSpillWriter:
                 if not mask.any():
                     continue
                 target = own + delta
-                _append_winding_aggregates(
+                _append_aggregates(
                     self.directory / (
                         f"{target[0]:05d}_{target[1]:05d}_"
                         f"{target[2]:05d}.rec"),
@@ -3006,13 +2925,11 @@ def _render_winding_aggregates_cuda(
 
 def _write_winding_aggregate_bucket(task, gpu):
     """Merge one source-vote chunk and render it on ``gpu``."""
-    import zarr
-
     group_path, out_shape, chunk, bz, by, bx, paths = task
     pieces = [
         records
         for path in paths
-        for records in _iter_winding_aggregates(path)
+        for records in _iter_aggregates(path, _WINDING_AGG_RECORD)
     ]
     if not pieces:
         return 0
@@ -3042,10 +2959,9 @@ def _write_winding_aggregate_bucket(task, gpu):
     if rendered is None:
         return 0
     dense_winding, dense_confidence = rendered
-    group = zarr.open_group(group_path, mode="r+")
-    group["winding"][lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = dense_winding
-    group["confidence"][lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = \
-        dense_confidence
+    region = (slice(lo[0], hi[0]), slice(lo[1], hi[1]), slice(lo[2], hi[2]))
+    _open_output_array(group_path, "winding")[region] = dense_winding
+    _open_output_array(group_path, "confidence")[region] = dense_confidence
     return int((dense_winding >= 0).sum())
 
 
@@ -3136,8 +3052,6 @@ def _write_prob_bucket(task):
     applies to the combined value. Buckets partition the chunk grid, so no
     two workers touch one chunk.
     """
-    import zarr
-
     group_path, name, out_shape, chunk, bz, by, bx, paths, combine, floor = task
     lo = (bz * chunk, by * chunk, bx * chunk)
     shape = tuple(
@@ -3150,7 +3064,7 @@ def _write_prob_bucket(task):
         total = np.zeros(size, dtype=np.float64)
         count = np.zeros(size, dtype=np.int64)
     for path in paths:
-        for records in _iter_prob_aggregates(path):
+        for records in _iter_aggregates(path, _PROB_AGG_RECORD):
             key = records["key"]
             z = (key >> 42).astype(np.int64) - lo[0]
             y = ((key >> 21) & _PROB_KEY_MASK).astype(np.int64) - lo[1]
@@ -3174,7 +3088,7 @@ def _write_prob_bucket(task):
         ).astype(np.uint8).reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3244,8 +3158,6 @@ def _render_phase_label_consensus(
 
 def _write_phase_bucket(task):
     """Fold one registered-phase bucket and render crossing evidence."""
-    import zarr
-
     (group_path, name, out_shape, chunk, bz, by, bx, paths, floor,
      sigma_voxels, agreement_power, min_observations) = task
     lo = (bz * chunk, by * chunk, bx * chunk)
@@ -3258,7 +3170,7 @@ def _write_phase_bucket(task):
     weight = np.zeros(size, dtype=np.float64)
     count = np.zeros(size, dtype=np.uint64)
     for path in paths:
-        for records in _iter_phase_aggregates(path):
+        for records in _iter_aggregates(path, _PHASE_AGG_RECORD):
             key = records["key"]
             z = (key >> 42).astype(np.int64) - lo[0]
             y = ((key >> 21) & _PROB_KEY_MASK).astype(np.int64) - lo[1]
@@ -3278,7 +3190,7 @@ def _write_phase_bucket(task):
         min_observations=min_observations).reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3290,8 +3202,6 @@ def _write_phase_bucket(task):
 
 def _write_phase_label_bucket(task):
     """Fold labeled-phase records and choose the best winding per voxel."""
-    import zarr
-
     (group_path, name, out_shape, chunk, bz, by, bx, paths, floor,
      sigma_voxels, agreement_power, min_observations,
      min_effective_observations, min_weight) = task
@@ -3301,7 +3211,7 @@ def _write_phase_label_bucket(task):
     pieces = [
         records
         for path in paths
-        for records in _iter_phase_label_aggregates(path)
+        for records in _iter_aggregates(path, _PHASE_LABEL_AGG_RECORD)
     ]
     if not pieces:
         return 0
@@ -3335,7 +3245,7 @@ def _write_phase_label_bucket(task):
     dense = dense.reshape(shape)
     if floor > 0:
         dense[dense < floor] = 0
-    array = zarr.open_group(group_path, mode="r+")[name]
+    array = _open_output_array(group_path, name)
     if dense.any():
         array[
             lo[0]:lo[0] + shape[0],
@@ -3461,7 +3371,7 @@ def _merge_phase_label_spill(
 
 
 _ARCHIVE_WORKER_CONTEXT = None
-_ARCHIVE_WORKER_GROUP = None
+_ARCHIVE_WORKER_ARRAYS = None
 
 
 def _read_sharded_stream(context, name, dtype, start, end, tail_shape=()):
@@ -3493,25 +3403,26 @@ def _read_sharded_stream(context, name, dtype, start, end, tail_shape=()):
 
 def _init_archive_worker(context):
     """Open output metadata once per archive materialization process."""
-    global _ARCHIVE_WORKER_CONTEXT, _ARCHIVE_WORKER_GROUP
-    import zarr
-
+    global _ARCHIVE_WORKER_CONTEXT, _ARCHIVE_WORKER_ARRAYS
     _ARCHIVE_WORKER_CONTEXT = context
-    _ARCHIVE_WORKER_GROUP = zarr.open_group(context["group_path"], mode="r+")
+    _ARCHIVE_WORKER_ARRAYS = {
+        name: _open_output_array(context["group_path"], name)
+        for name in ("points/xyz", "points/winding", "points/prob",
+                     "strips/offsets", "strips/slab")
+    }
 
 
 def _write_archive_chunk(task):
     """Write one disjoint point or strip chunk into the final archive."""
     context = _ARCHIVE_WORKER_CONTEXT
-    group = _ARCHIVE_WORKER_GROUP
+    arrays = _ARCHIVE_WORKER_ARRAYS
     kind, start, end, point_start = task
     if kind == "point":
-        points = group["points"]
-        points["xyz"][start:end] = _read_sharded_stream(
+        arrays["points/xyz"][start:end] = _read_sharded_stream(
             context, "xyz", np.float32, start, end, (3,))
-        points["winding"][start:end] = _read_sharded_stream(
+        arrays["points/winding"][start:end] = _read_sharded_stream(
             context, "winding", np.int16, start, end)
-        points["prob"][start:end] = _read_sharded_stream(
+        arrays["points/prob"][start:end] = _read_sharded_stream(
             context, "prob", np.uint8, start, end)
         return end - start
 
@@ -3536,8 +3447,8 @@ def _write_archive_chunk(task):
         if len(offsets) > 1:
             offsets[1:] = int(point_start) + np.cumsum(
                 lengths[:-1], dtype=np.int64)
-    group["strips"]["offsets"][start:end] = offsets
-    group["strips"]["slab"][start:end] = slabs
+    arrays["strips/offsets"][start:end] = offsets
+    arrays["strips/slab"][start:end] = slabs
     return end - start
 
 
@@ -3606,7 +3517,7 @@ def _materialize_archive(group_path, result_paths, shard_results, ray_bounds,
 
 
 def write_output(args, rays, shard_results, result_paths, elapsed_total):
-    import zarr
+    from vc_reader.reader import create_group
 
     reference = Path(args.reference_zarr)
     out_shape = _output_shape(reference, int(args.output_downsample))
@@ -3617,32 +3528,34 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     ray_bounds = np.linspace(
         0, len(rays["seed_xyz"]), len(shard_results) + 1).astype(int)
 
-    group = zarr.open_group(args.output, mode="w")
+    group = create_group(args.output, version=3, overwrite=True)
     chunk = _OUTPUT_CHUNK
     group.create_array(
         "winding", shape=out_shape, chunks=(chunk, chunk, chunk),
-        dtype="int16", fill_value=-1)
+        dtype="int16", fill_value=-1, **_OUTPUT_ARRAY)
     group.create_array(
         "confidence", shape=out_shape, chunks=(chunk, chunk, chunk),
-        dtype="uint8", fill_value=0)
+        dtype="uint8", fill_value=0, **_OUTPUT_ARRAY)
 
     point_chunk = max(1, min(num_points, 1 << 20))
     strip_chunk = max(1, min(num_strips + 1, 1 << 20))
     points = group.create_group("points")
     points.create_array(
         "xyz", shape=(num_points, 3), dtype="float32",
-        chunks=(point_chunk, 3))
+        chunks=(point_chunk, 3), **_OUTPUT_ARRAY)
     points.create_array(
-        "winding", shape=(num_points,), dtype="int16", chunks=(point_chunk,))
+        "winding", shape=(num_points,), dtype="int16", chunks=(point_chunk,),
+        **_OUTPUT_ARRAY)
     points.create_array(
-        "prob", shape=(num_points,), dtype="uint8", chunks=(point_chunk,))
+        "prob", shape=(num_points,), dtype="uint8", chunks=(point_chunk,),
+        **_OUTPUT_ARRAY)
     strips = group.create_group("strips")
     strip_offsets_arr = strips.create_array(
         "offsets", shape=(num_strips + 1,), dtype="int64",
-        chunks=(strip_chunk,))
+        chunks=(strip_chunk,), **_OUTPUT_ARRAY)
     strips.create_array(
         "slab", shape=(num_strips,), dtype="int64",
-        chunks=(max(1, min(num_strips, 1 << 20)),))
+        chunks=(max(1, min(num_strips, 1 << 20)),), **_OUTPUT_ARRAY)
     strip_offsets_arr[0] = 0
 
     materialize_started = time.time()
@@ -3667,7 +3580,7 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     if getattr(args, "prob_volume", False):
         group.create_array(
             "crossing_prob", shape=out_shape, chunks=(chunk, chunk, chunk),
-            dtype="uint8", fill_value=0)
+            dtype="uint8", fill_value=0, **_OUTPUT_ARRAY)
         prob_merge_started = time.time()
         if getattr(args, "prob_combine", "mean") == "phase-label":
             spill_dirs = sorted(
@@ -3719,8 +3632,10 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
         if key not in rays:
             continue
         value = rays[key]
-        rays_group.create_array(key, shape=value.shape, dtype=value.dtype,
-                                chunks=value.shape)[:] = value
+        rays_group.create_array(
+            key, shape=value.shape, dtype=value.dtype,
+            chunks=tuple(max(1, n) for n in value.shape),
+            **_OUTPUT_ARRAY)[:] = value
 
     group.attrs.update({
         "fit_checkpoint": str(Path(args.fit_checkpoint).resolve()),
@@ -3832,8 +3747,9 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
 
 
 def _reference_shape(reference: Path):
-    import zarr
-    node = zarr.open(str(reference), mode="r")
+    from vc_reader.reader import open_node
+
+    node = open_node(str(reference))
     if hasattr(node, "shape"):
         return node.shape
     return node["0"].shape
@@ -4087,11 +4003,12 @@ def main():
     ]
     inference_elapsed = time.time() - started
     if args.native_phase_only:
-        import zarr
+        from vc_reader.reader import create_group
 
-        cache = zarr.open_group(args.output, mode="r+")
+        cache = create_group(args.output, version=3)
         available = sum(
-            int(np.count_nonzero(cache["available"][item["name"]][:]))
+            int(np.count_nonzero(
+                cache["available"][item["name"]][:]))
             for item in cache.attrs["phase_shards"])
         cache.attrs.update({
             "complete": True,
@@ -4106,10 +4023,12 @@ def main():
     num_points = write_output(
         args, rays, shard_results, result_paths, inference_elapsed)
     elapsed = time.time() - started
-    import zarr
-    output_group = zarr.open_group(args.output, mode="r+")
-    output_group.attrs["inference_elapsed_seconds"] = inference_elapsed
-    output_group.attrs["elapsed_seconds"] = elapsed
+    from vc_reader.reader import create_group
+
+    create_group(args.output, version=3).attrs.update({
+        "inference_elapsed_seconds": inference_elapsed,
+        "elapsed_seconds": elapsed,
+    })
     slabs = sum(int(r["slabs"]) for r in shard_results)
     print(f"[main] wrote {num_points:,} crossings from {slabs:,} slabs to "
           f"{args.output} in {elapsed:.0f}s total "
