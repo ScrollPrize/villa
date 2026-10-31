@@ -1,4 +1,8 @@
-"""Writing local Zarr arrays and groups: NumPy indexing and conversion over ``vcr::zarr::Writer``."""
+"""Writing Zarr arrays and groups, local or on S3: NumPy indexing and conversion over ``vcr::zarr::Writer``.
+
+Remote locations are ``s3://`` URLs. ``auth`` is an :class:`S3Credentials`, or ``"aws"`` (the
+default) for AWS credentials from the environment; see :mod:`vc_reader.reader.auth`.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ import numpy as np
 
 from .. import _reader
 from ._indexing import parse_index
+from .auth import resolve_access
 from .zarr_reader import ZarrReader
 
 
@@ -17,14 +22,69 @@ def _plain(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
+def _write_access(location: str, auth: Any):
+    return resolve_access(location, "aws" if auth == "auto" else auth)
+
+
+class ObjectStore:
+    """The objects below a local directory or an ``s3://`` prefix, by relative name.
+
+    Replacing an object is atomic. Reads of a public prefix work with ``auth=None``. Picklable.
+    """
+
+    def __init__(self, location: str | os.PathLike[str], *, auth: Any = "aws", connections: int = 16):
+        location = os.fspath(location)
+        self._native = _reader.Store(location, _write_access(location, auth), connections)
+        self.location = self._native.location
+
+    def __getstate__(self):
+        return self.location, self._native.access
+
+    def __setstate__(self, state):
+        self.__init__(state[0], auth=state[1])
+
+    def read(self, name: str) -> bytes | None:
+        """The object's bytes; None when it does not exist."""
+        return self._native.read(name)
+
+    def write(self, name: str, data: bytes | str) -> None:
+        self._native.write(name, data.encode() if isinstance(data, str) else bytes(data))
+
+    def exists(self, name: str) -> bool:
+        return self._native.exists(name)
+
+    def remove(self, name: str) -> bool:
+        """Whether the object was there."""
+        return self._native.remove(name)
+
+    def remove_all(self) -> bool:
+        """Removes everything below the location; whether anything was there."""
+        return self._native.remove_all()
+
+    def keys(self) -> list[str]:
+        """Every object below the location, relative to it, in key order."""
+        return [key for key, _ in self._native.list()]
+
+    def sizes(self) -> dict[str, int]:
+        return dict(self._native.list())
+
+    def children(self) -> list[str]:
+        """The immediate subdirectories (prefixes), sorted."""
+        return self._native.children()
+
+
 class _Attributes(MutableMapping):
     """A node's attributes: every change is written, and only this mapping's keys change."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, access):
         self._path = path
+        self._access = access
 
     def _read(self) -> dict[str, Any]:
-        return _reader.read_attributes(self._path)
+        return _reader.read_attributes(self._path, self._access)
+
+    def _write(self, attributes: dict[str, Any]) -> None:
+        _reader.write_attributes(self._path, attributes, self._access)
 
     def __getitem__(self, key: str) -> Any:
         return self._read()[key]
@@ -35,7 +95,7 @@ class _Attributes(MutableMapping):
     def __delitem__(self, key: str) -> None:
         attributes = self._read()
         del attributes[key]
-        _reader.write_attributes(self._path, attributes)
+        self._write(attributes)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._read())
@@ -46,26 +106,27 @@ class _Attributes(MutableMapping):
     def update(self, *args: Any, **kwargs: Any) -> None:
         attributes = self._read()
         attributes.update(*args, **kwargs)
-        _reader.write_attributes(self._path, attributes)
+        self._write(attributes)
 
     def put(self, attributes: dict[str, Any]) -> None:
         """Replace all attributes."""
-        _reader.write_attributes(self._path, dict(attributes))
+        self._write(dict(attributes))
 
 
 class ZarrWriter:
-    """A local Zarr v2/v3 array opened for writing. Use :meth:`create` or :meth:`open`.
+    """A Zarr v2/v3 array, local or on S3, opened for writing. Use :meth:`create` or :meth:`open`.
 
-    Chunk files are replaced atomically, so readers never see a partial chunk. Distinct
-    chunks may be written from any number of threads or processes; partial writes to one
-    chunk, and processes writing one shard, need the caller's coordination. Picklable.
+    Chunks are replaced atomically, so readers never see a partial chunk. Distinct chunks
+    may be written from any number of threads or processes; partial writes to one chunk,
+    and processes writing one shard, need the caller's coordination. Picklable.
     """
 
-    def __init__(self, native, skip_empty: bool = False):
+    def __init__(self, native, skip_empty: bool = False, access=None):
         self._native = native
         self.path = native.path
         self.skip_empty = skip_empty
-        self.attrs = _Attributes(self.path)
+        self._access = access if access is not None else _reader.anonymous_access()
+        self.attrs = _Attributes(self.path, self._access)
         self._reader: ZarrReader | None = None
 
     @classmethod
@@ -86,28 +147,33 @@ class ZarrWriter:
         shards: Sequence[int] | None = None,
         overwrite: bool = False,
         skip_empty: bool = False,
+        auth: Any = "aws",
     ) -> ZarrWriter:
         """Create an array. ``compressor``: None, blosc, zstd, zlib, gzip, lz4, vc-delta3d or volcomp;
         ``cname`` and ``shuffle`` (0 none, 1 byte, 2 bit) configure blosc. ``level`` <= 0 is the codec's
         default. ``overwrite`` replaces whatever is at the path. ``skip_empty`` does not store chunks that
         come out entirely ``fill_value``. ``shards`` is a v3 array's outer shape in elements.
         """
+        path = os.fspath(path)
+        access = _write_access(path, auth)
         native = _reader.Writer.create(
-            os.fspath(path), [int(n) for n in shape], [int(n) for n in chunks], np.dtype(dtype).str,
+            path, [int(n) for n in shape], [int(n) for n in chunks], np.dtype(dtype).str,
             compressor or "none", int(level), cname, int(shuffle), bool(overwrite), separator,
-            _plain(fill_value), int(version), [int(n) for n in shards or ()])
-        return cls(native, skip_empty)
+            _plain(fill_value), int(version), [int(n) for n in shards or ()], access)
+        return cls(native, skip_empty, access)
 
     @classmethod
-    def open(cls, path: str | os.PathLike[str], *, skip_empty: bool = False) -> ZarrWriter:
-        """An existing local array."""
-        return cls(_reader.Writer.open(os.fspath(path)), skip_empty)
+    def open(cls, path: str | os.PathLike[str], *, skip_empty: bool = False, auth: Any = "aws") -> ZarrWriter:
+        """An existing array."""
+        path = os.fspath(path)
+        access = _write_access(path, auth)
+        return cls(_reader.Writer.open(path, access), skip_empty, access)
 
     def __getstate__(self):
-        return self.path, self.skip_empty
+        return self.path, self.skip_empty, self._access
 
     def __setstate__(self, state):
-        self.__init__(_reader.Writer.open(state[0]), state[1])
+        self.__init__(_reader.Writer.open(state[0], state[2]), state[1], state[2])
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -138,7 +204,7 @@ class ZarrWriter:
     def __getitem__(self, key: Any) -> np.ndarray:
         """What is stored now, by the indexing of :class:`ZarrReader`."""
         if self._reader is None:
-            self._reader = ZarrReader.open(self.path, read_mode="slab")
+            self._reader = ZarrReader.open(self.path, read_mode="slab", auth=self._access)
         return self._reader[key]
 
     def set_fill_value(self, value: Any) -> None:
@@ -159,55 +225,61 @@ class ZarrWriter:
 
 
 class ZarrWriteGroup:
-    """A local Zarr group opened for writing. Use :func:`create_group`."""
+    """A Zarr group, local or on S3, opened for writing. Use :func:`create_group`."""
 
-    def __init__(self, path: str, version: int):
+    def __init__(self, path: str, version: int, access):
         self.path = path
         self.version = version
-        self.attrs = _Attributes(path)
+        self._access = access
+        self.attrs = _Attributes(path, access)
 
     def create_array(self, name: str, **kwargs: Any) -> ZarrWriter:
         """A child array: the arguments of :meth:`ZarrWriter.create`."""
         kwargs.setdefault("version", self.version)
+        kwargs.setdefault("auth", self._access)
         return ZarrWriter.create(os.path.join(self.path, name), **kwargs)
 
     def create_group(self, name: str) -> ZarrWriteGroup:
         """A child group, kept when it exists."""
-        return create_group(os.path.join(self.path, name), version=self.version)
+        return create_group(os.path.join(self.path, name), version=self.version, auth=self._access)
 
     def _child(self, name: str) -> str:
         return os.path.join(self.path, name)
 
+    def _node(self, name: str):
+        return _reader.Store(self._child(name), self._access, 1)
+
     def __contains__(self, name: str) -> bool:
-        return _reader.is_zarr_node(self._child(name))
+        return self._node(name).is_node()
 
     def __getitem__(self, name: str) -> ZarrWriter | ZarrWriteGroup:
-        child = self._child(name)
-        if not _reader.is_zarr_node(child):
+        node = self._node(name)
+        if not node.is_node():
             raise KeyError(name)
-        if _reader.is_zarr_array(child):
-            return ZarrWriter.open(child)
-        return ZarrWriteGroup(child, self.version)
+        if node.is_array():
+            return ZarrWriter.open(self._child(name), auth=self._access)
+        return ZarrWriteGroup(self._child(name), self.version, self._access)
 
     def __delitem__(self, name: str) -> None:
-        if not _reader.remove_node(self._child(name)):
+        if not _reader.remove_node(self._child(name), self._access):
             raise KeyError(name)
 
     def keys(self) -> list[str]:
-        return _reader.node_children(self.path)
+        return _reader.node_children(self.path, self._access)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
 
 
 def create_group(path: str | os.PathLike[str], *, attrs: dict[str, Any] | None = None,
-                 version: int = 2, overwrite: bool = False) -> ZarrWriteGroup:
-    """A local group, kept when it exists unless ``overwrite``; ``attrs`` replace its attributes."""
+                 version: int = 2, overwrite: bool = False, auth: Any = "aws") -> ZarrWriteGroup:
+    """A group, kept when it exists unless ``overwrite``; ``attrs`` replace its attributes."""
     path = os.fspath(path)
+    access = _write_access(path, auth)
     if overwrite:
-        _reader.remove_node(path)
-    _reader.create_group(path, attrs, version)
-    return ZarrWriteGroup(path, version)
+        _reader.remove_node(path, access)
+    _reader.create_group(path, attrs, version, access)
+    return ZarrWriteGroup(path, version, access)
 
 
-__all__ = ["ZarrWriter", "ZarrWriteGroup", "create_group"]
+__all__ = ["ObjectStore", "ZarrWriter", "ZarrWriteGroup", "create_group"]

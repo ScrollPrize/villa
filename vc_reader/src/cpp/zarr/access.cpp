@@ -292,7 +292,10 @@ std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& p
     return {*user, *password};
 }
 
-std::vector<std::string> listChildren(const Access& access, const std::string& location)
+namespace {
+// Every page of a listing under `location`, with its key prefix.
+void listPages(const Access& access, const std::string& location, std::string_view delimiter,
+               const std::function<void(const s3::ListPage&, const std::string&)>& visit)
 {
     const auto s3 = location.starts_with("s3://") ? std::optional<std::string>(location) : catalog::openDataS3Url(location);
     if (!s3)
@@ -311,13 +314,22 @@ std::vector<std::string> listChildren(const Access& access, const std::string& l
     options.connections = 1;
     options.auth = access.auth;
     HttpClient http(options);
-    std::vector<std::string> names;
     std::string token;
     do {
         std::vector<std::uint8_t> body;
-        if (!http.get(s3::listUrl(prefix, "/", token), body))
+        if (!http.get(s3::listUrl(prefix, delimiter, token), body))
             throw NotFound("cannot list " + *s3 + ": bucket not found");
         const auto page = s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
+        visit(page, prefixKey);
+        token = page.nextContinuationToken;
+    } while (!token.empty());
+}
+}  // namespace
+
+std::vector<std::string> listChildren(const Access& access, const std::string& location)
+{
+    std::vector<std::string> names;
+    listPages(access, location, "/", [&](const s3::ListPage& page, const std::string& prefixKey) {
         for (const auto& child : page.commonPrefixes) {
             auto name = child.substr(prefixKey.size());
             while (!name.empty() && name.back() == '/')
@@ -325,9 +337,18 @@ std::vector<std::string> listChildren(const Access& access, const std::string& l
             if (!name.empty())
                 names.push_back(std::move(name));
         }
-        token = page.nextContinuationToken;
-    } while (!token.empty());
+    });
     return names;
+}
+
+std::vector<s3::Object> listObjects(const Access& access, const std::string& location)
+{
+    std::vector<s3::Object> objects;
+    listPages(access, location, "", [&](const s3::ListPage& page, const std::string& prefixKey) {
+        for (const auto& object : page.objects)
+            objects.push_back({object.key.substr(prefixKey.size()), object.size});
+    });
+    return objects;
 }
 
 Access resolveAccess(const std::string& location, AuthMode mode, bool offline)

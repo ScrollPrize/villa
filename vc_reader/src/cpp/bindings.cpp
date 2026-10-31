@@ -396,11 +396,11 @@ NB_MODULE(_reader, m)
 
     using vcr::zarr::Writer;
     using ConstBytes = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
-    nb::class_<Writer>(m, "Writer", "A local Zarr array opened for writing.")
+    nb::class_<Writer>(m, "Writer", "A Zarr array, local or on S3, opened for writing.")
         .def_static("create", [](const std::string& path, const vcr::Index& shape, const vcr::Index& chunks,
                                  const std::string& dtype, const std::string& compressor, int level, const std::string& cname,
                                  int shuffle, bool overwrite, const std::string& separator, const nb::object& fill, int version,
-                                 const vcr::Index& shards) {
+                                 const vcr::Index& shards, const vcr::zarr::Access& access) {
             vcr::zarr::CreateOptions options;
             options.shape = shape;
             options.chunks = chunks;
@@ -415,10 +415,13 @@ NB_MODULE(_reader, m)
             options.version = version;
             options.shardShape = shards;
             nb::gil_scoped_release release;
-            return Writer::create(path, options);
+            return Writer::create(path, options, access);
         }, "path"_a, "shape"_a, "chunks"_a, "dtype"_a, "compressor"_a, "level"_a, "cname"_a, "shuffle"_a, "overwrite"_a,
-           "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a)
-        .def_static("open", [](const std::string& path) { return Writer::open(path); }, "path"_a)
+           "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "access"_a)
+        .def_static("open", [](const std::string& path, const vcr::zarr::Access& access) {
+            nb::gil_scoped_release release;
+            return Writer::open(path, access);
+        }, "path"_a, "access"_a)
         .def_prop_ro("meta", &Writer::meta, nb::rv_policy::reference_internal)
         .def_prop_ro("path", [](const Writer& w) { return w.path().string(); })
         .def("write_region", [](Writer& w, const vcr::Index& start, const vcr::Index& shape, ConstBytes data, bool skip_empty) {
@@ -439,18 +442,73 @@ NB_MODULE(_reader, m)
         }, "chunk"_a, "data"_a, "skip_empty"_a = false)
         .def("chunk_exists", &Writer::chunkExists, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_chunk", &Writer::removeChunk, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
-        .def("set_fill_value", [](Writer& w, const nb::object& value) { w.setFillValue(to_json(value)); }, "value"_a.none());
-    m.def("read_attributes", [](const std::string& path) { return py_json(vcr::zarr::readAttributes(path)); }, "path"_a);
-    m.def("write_attributes", [](const std::string& path, const nb::object& attributes) {
-        vcr::zarr::writeAttributes(path, to_json(attributes));
-    }, "path"_a, "attributes"_a);
-    m.def("create_group", [](const std::string& path, const nb::object& attributes, int version) {
-        vcr::zarr::createGroup(path, attributes.is_none() ? std::nullopt : std::optional<Json>(to_json(attributes)), version);
-    }, "path"_a, "attributes"_a.none(), "version"_a);
-    m.def("remove_node", [](const std::string& path) { return vcr::zarr::removeNode(path); }, "path"_a);
-    m.def("node_children", [](const std::string& path) { return vcr::zarr::nodeChildren(path); }, "path"_a);
-    m.def("is_zarr_node", [](const std::string& path) { return vcr::zarr::isLocalZarrNode(path); }, "path"_a);
-    m.def("is_zarr_array", [](const std::string& path) { return vcr::zarr::isLocalZarrArray(path); }, "path"_a);
+        .def("set_fill_value", [](Writer& w, const nb::object& value) {
+            const auto fill = to_json(value);
+            nb::gil_scoped_release release;
+            w.setFillValue(fill);
+        }, "value"_a.none());
+    using vcr::zarr::Store;
+    nb::class_<Store>(m, "Store", "The objects below a local directory or an s3:// prefix.")
+        .def("__init__", [](Store* store, const std::string& location, const vcr::zarr::Access& access, int connections) {
+            new (store) Store(location, access, connections);
+        }, "location"_a, "access"_a, "connections"_a = 16)
+        .def_prop_ro("location", &Store::location)
+        .def_prop_ro("access", [](const Store& s) { return s.access(); })
+        .def_prop_ro("remote", &Store::remote)
+        .def("read", [](const Store& s, const std::string& name) -> nb::object {
+            std::optional<std::string> data;
+            {
+                nb::gil_scoped_release release;
+                data = s.read(name);
+            }
+            if (!data) return nb::none();
+            return nb::bytes(data->data(), data->size());
+        }, "name"_a)
+        .def("write", [](const Store& s, const std::string& name, const nb::bytes& data) {
+            const std::string_view view(data.c_str(), data.size());
+            nb::gil_scoped_release release;
+            s.write(name, view);
+        }, "name"_a, "data"_a)
+        .def("exists", &Store::exists, "name"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove", &Store::remove, "name"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove_all", &Store::removeAll, nb::call_guard<nb::gil_scoped_release>())
+        .def("list", [](const Store& s) {
+            std::vector<std::pair<std::string, std::uint64_t>> out;
+            {
+                nb::gil_scoped_release release;
+                for (auto& object : s.list())
+                    out.emplace_back(std::move(object.key), object.size);
+            }
+            return out;
+        })
+        .def("children", &Store::children, nb::call_guard<nb::gil_scoped_release>())
+        .def("is_node", &Store::isNode, nb::call_guard<nb::gil_scoped_release>())
+        .def("is_array", &Store::isArray, nb::call_guard<nb::gil_scoped_release>());
+    using vcr::zarr::Access;
+    m.def("read_attributes", [](const std::string& path, const Access& access) {
+        Json attributes;
+        {
+            nb::gil_scoped_release release;
+            attributes = vcr::zarr::readAttributes(path, access);
+        }
+        return py_json(attributes);
+    }, "path"_a, "access"_a);
+    m.def("write_attributes", [](const std::string& path, const nb::object& attributes, const Access& access) {
+        const auto json = to_json(attributes);
+        nb::gil_scoped_release release;
+        vcr::zarr::writeAttributes(path, json, access);
+    }, "path"_a, "attributes"_a, "access"_a);
+    m.def("create_group", [](const std::string& path, const nb::object& attributes, int version, const Access& access) {
+        const auto json = attributes.is_none() ? std::nullopt : std::optional<Json>(to_json(attributes));
+        nb::gil_scoped_release release;
+        vcr::zarr::createGroup(path, json, version, access);
+    }, "path"_a, "attributes"_a.none(), "version"_a, "access"_a);
+    m.def("remove_node", [](const std::string& path, const Access& access) {
+        nb::gil_scoped_release release;
+        return vcr::zarr::removeNode(path, access);
+    }, "path"_a, "access"_a);
+    m.def("node_children", [](const std::string& path, const Access& access) { return vcr::zarr::nodeChildren(path, access); },
+          "path"_a, "access"_a, nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,

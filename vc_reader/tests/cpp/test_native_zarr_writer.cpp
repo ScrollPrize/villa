@@ -4,6 +4,7 @@
 #include "vc_reader/array.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/rounding.hpp"
+#include "vc_reader/native/sigv4.hpp"
 
 #include <algorithm>
 #include <barrier>
@@ -513,6 +514,19 @@ static void generalOptions(const fs::path& root)
         throw std::runtime_error("remove a node once");
 }
 
+// AWS's published example of signing a PUT ("Example: PUT Object", S3 API reference).
+void signsAwsPutExample()
+{
+    const vcr::S3Key key{"AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "", "us-east-1"};
+    const auto headers = vcr::sigv4_headers(
+        "PUT", "https://examplebucket.s3.amazonaws.com/test%24file.text", key, "20130524T000000Z",
+        {{"date", "Fri, 24 May 2013 00:00:00 GMT"}, {"x-amz-storage-class", "REDUCED_REDUNDANCY"}},
+        vcr::to_hex(vcr::Sha256::of("Welcome to Amazon S3.")));
+    require(headers.back().first == "authorization" &&
+                headers.back().second.ends_with("Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"),
+            "AWS PUT signature: " + headers.back().second);
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() /
@@ -534,6 +548,7 @@ int main()
             editing(dir, version);
             mutableChunks(dir, version);
         }
+        signsAwsPutExample();
         v3Metadata(root);
         codecs(root / "sharded-codecs", 3, true);
         mutableChunks(root / "sharded-mutable", 3, true);

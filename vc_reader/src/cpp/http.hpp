@@ -1,4 +1,4 @@
-// HTTP(S) GETs over a bounded pool of libcurl handles: anonymous, HTTP basic
+// HTTP(S) requests over a bounded pool of libcurl handles: anonymous, HTTP basic
 // auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh:// URLs are
 // read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
@@ -18,6 +18,7 @@
 #include <exception>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -120,19 +121,51 @@ public:
     {
         if (sftp::isSftpUrl(url))
             return get_sftp(url, reset, write, extra, body_status, begin_body);
+        return perform("GET", url, reset, std::move(write), extra, body_status, std::move(begin_body), nullptr, 0);
+    }
+
+    // PUT `size` bytes to `url`, with the retries of a read: replacing an object is
+    // idempotent. Throws unless the server accepted it.
+    void put(const std::string& url, const void* data, std::size_t size)
+    {
+        const auto response = perform("PUT", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, data, size);
+        if (response.status / 100 != 2)
+            throw std::runtime_error("PUT " + url + ": HTTP " + std::to_string(response.status));
+    }
+
+    // Whether `url` exists (HEAD): false for 404.
+    bool head(const std::string& url)
+    {
+        return perform("HEAD", url, [] {}, [](const char*, std::size_t) {}, {}, 200, {}, nullptr, 0).status / 100 == 2;
+    }
+
+    // DELETE `url`. S3 answers the same whether or not the object was there.
+    void remove(const std::string& url)
+    {
+        perform("DELETE", url, [] {}, [](const char*, std::size_t) {}, {}, 204, {}, nullptr, 0);
+    }
+
+private:
+    HttpResponse perform(const char* method, const std::string& url, const std::function<void()>& reset,
+                         std::function<void(const char*, std::size_t)> write,
+                         const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
+                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size)
+    {
         Lease lease(*this);
         CURL* h = lease.handle;
         std::shared_ptr<const Auth> auth;
         { std::lock_guard lock(mutex_); auth = auth_; }
         float delay = 0.25f;
         std::string last_error;
+        const bool get = std::strcmp(method, "GET") == 0, put = std::strcmp(method, "PUT") == 0;
+        const std::string payload = put && auth->kind == "s3" ? payload_hash(upload, upload_size) : sigv4_empty_payload();
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
             Transfer transfer{write, body_status, begin_body};
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, get ? 1L : 0L);  // a redirected write is an error
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
             curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, options_.connect_timeout_ms);
@@ -144,7 +177,19 @@ public:
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
             curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &HttpClient::header);
             curl_easy_setopt(h, CURLOPT_HEADERDATA, &transfer);
+            Upload body{static_cast<const char*>(upload), upload_size};
             HeaderList headers;
+            if (put) {
+                curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(h, CURLOPT_READFUNCTION, &HttpClient::send);
+                curl_easy_setopt(h, CURLOPT_READDATA, &body);
+                curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(upload_size));
+                headers.append("Expect:");  // no extra round trip per chunk
+            } else if (std::strcmp(method, "HEAD") == 0) {
+                curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+            } else if (!get) {
+                curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+            }
             if (auth->kind == "basic") {
                 curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
                 curl_easy_setopt(h, CURLOPT_USERNAME, auth->user.c_str());
@@ -152,7 +197,7 @@ public:
             }
             if (auth->kind == "s3") {
                 const S3Key key{auth->user, auth->secret, auth->token, auth->region};
-                for (const auto& [name, value] : sigv4_get_headers(url, key, amz_date(std::time(nullptr)), extra))
+                for (const auto& [name, value] : sigv4_headers(method, url, key, amz_date(std::time(nullptr)), extra, payload))
                     headers.append(name + ": " + value);
             } else {
                 for (const auto& [name, value] : extra) headers.append(name + ": " + value);
@@ -164,10 +209,10 @@ public:
                 long status = 0;
                 curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
                 transfer.response.status = status;
-                if (status == body_status || status == 304 || status == 404)
+                if (status == body_status || status == 304 || status == 404 || (!get && status / 100 == 2))
                     return transfer.response;
                 if (status != 429 && status < 500) {
-                    const std::string what = "GET " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
+                    const std::string what = std::string(method) + " " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
                     if (status == 401 || status == 403) throw HttpDenied(what);
                     throw std::runtime_error(what);
                 }
@@ -178,11 +223,17 @@ public:
                 delay = std::min(delay * 2, 8.0f);
             }
         }
-        throw std::runtime_error("GET " + url + " failed after " + std::to_string(options_.retries + 1) +
+        throw std::runtime_error(std::string(method) + " " + url + " failed after " + std::to_string(options_.retries + 1) +
                                  " attempts: " + last_error);
     }
 
-private:
+    static std::string payload_hash(const void* data, std::size_t size)
+    {
+        Sha256 hash;
+        hash.update(data, size);
+        return to_hex(hash.finish());
+    }
+
     // sftp:// and ssh:// objects through pooled OpenSSH sessions, answered like HTTP:
     // 200/206 with the body, 404 when absent, HttpDenied when not permitted. Range
     // and If-Match headers are honoured; the etag is the file's mtime and size.
@@ -306,6 +357,21 @@ private:
         std::string snippet;
         std::exception_ptr error;
     };
+
+    struct Upload {
+        const char* data;
+        std::size_t left;
+    };
+
+    static std::size_t send(char* out, std::size_t size, std::size_t count, void* user) noexcept
+    {
+        auto& upload = *static_cast<Upload*>(user);
+        const auto n = std::min(size * count, upload.left);
+        std::memcpy(out, upload.data, n);
+        upload.data += n;
+        upload.left -= n;
+        return n;
+    }
 
     static std::size_t receive(char* data, std::size_t size, std::size_t count, void* user) noexcept
     {

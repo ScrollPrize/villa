@@ -1,9 +1,49 @@
 #pragma once
-// Writing local Zarr v2/v3 arrays and multiscale pyramids.
+// Writing Zarr v2/v3 arrays, local or on S3, and local multiscale pyramids.
 
 #include "vc_reader/zarr.hpp"
 
+#include <string_view>
+
 namespace vcr::zarr {
+
+// ---- stores ---------------------------------------------------------------------------
+
+// The objects below a local directory or an s3:// prefix. Replacing an object is atomic:
+// a local file is renamed into place, an S3 object is one PUT. Remote stores read through
+// `access`; writing to them needs signed S3 access (Access::Kind::S3). AWS keys from the
+// environment are read again once when they stop working. Thread-safe.
+class Store {
+public:
+    explicit Store(const std::filesystem::path& location, const Access& access = {}, int connections = 16);
+    Store(Store&&) noexcept;
+    Store& operator=(Store&&) noexcept;
+    ~Store();
+
+    const std::string& location() const;
+    const Access& access() const;
+    bool remote() const;
+
+    std::optional<std::string> read(const std::string& name) const;
+    void write(const std::string& name, std::string_view data) const;
+    bool exists(const std::string& name) const;
+    // Whether the object was there. On S3 that costs a request `discard` does not make.
+    bool remove(const std::string& name) const;
+    void discard(const std::string& name) const;
+    // Everything below the location; whether anything was there.
+    bool removeAll() const;
+    // Every object below the location: keys relative to it, in key order.
+    std::vector<s3::Object> list() const;
+    // The immediate subdirectories (prefixes), sorted.
+    std::vector<std::string> children() const;
+    // Whether the location holds Zarr v2 or v3 node metadata / is an array.
+    bool isNode() const;
+    bool isArray() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // ---- writing --------------------------------------------------------------------------
 
@@ -24,24 +64,25 @@ struct CreateOptions {
     bool shardIndexEnd = true, shardIndexCrc = true;
 };
 
-// A local Zarr v2/v3 array opened for writing. Chunk files are replaced atomically,
-// so readers never see a partial chunk. Thread-safe for distinct chunks in one
-// process, including chunks sharing a shard. Separate processes must coordinate
-// updates to the same shard. Partial writes to the same chunk require coordination.
+// A Zarr v2/v3 array, in a local directory or at an s3:// location, opened for writing.
+// Chunks are replaced atomically, so readers never see a partial chunk. Thread-safe for
+// distinct chunks in one process, including chunks sharing a shard. Separate processes
+// must coordinate updates to the same shard. Partial writes to the same chunk require
+// coordination. Each update of an S3 shard downloads and uploads the whole shard.
 class Writer {
 public:
     // Writes array metadata and a matching parent group marker when absent.
     // Refuses to replace a node of a different Zarr format.
-    static Writer create(const std::filesystem::path& path, const CreateOptions& options);
-    // An existing local array.
-    static Writer open(const std::filesystem::path& path);
+    static Writer create(const std::filesystem::path& path, const CreateOptions& options, const Access& access = {});
+    // An existing array.
+    static Writer open(const std::filesystem::path& path, const Access& access = {});
     Writer(Writer&&) noexcept;
     Writer& operator=(Writer&&) noexcept;
     ~Writer();
 
     const ArrayMeta& meta() const;
     const std::filesystem::path& path() const;
-    // Reads the stored array (no memory cache: always what is on disk).
+    // Reads the stored array (no memory cache: always what is stored).
     Array& reader();
 
     // Change the fill used for absent chunks, preserving stored chunks and all
@@ -55,7 +96,8 @@ public:
     bool chunkExists(const Index& chunk) const;
     // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.
     void writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size);
-    // Skips a chunk that is entirely the fill value, removing any stored one.
+    // Skips a chunk that is entirely the fill value, removing any stored one. A
+    // skipped chunk on S3 is still one DELETE.
     // Returns whether the chunk was written.
     bool writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size);
     bool removeChunk(const Index& chunk);
@@ -70,18 +112,19 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// A local group (marker and attributes), kept when it already exists; `attributes` replace
-// its attributes when given. Parent directories are created.
-void createGroup(const std::filesystem::path& path, const std::optional<Json>& attributes = std::nullopt, int version = 2);
+// A group (marker and attributes), kept when it already exists; `attributes` replace
+// its attributes when given. Local parent directories are created.
+void createGroup(const std::filesystem::path& path, const std::optional<Json>& attributes = std::nullopt, int version = 2,
+                 const Access& access = {});
 
-// Removes a local array or group with everything in it; whether anything was there.
-bool removeNode(const std::filesystem::path& path);
-// Names of the arrays and groups directly in a local directory, sorted.
-std::vector<std::string> nodeChildren(const std::filesystem::path& path);
+// Removes an array or group with everything in it; whether anything was there.
+bool removeNode(const std::filesystem::path& path, const Access& access = {});
+// Names of the arrays and groups directly in a location, sorted.
+std::vector<std::string> nodeChildren(const std::filesystem::path& path, const Access& access = {});
 
-// Attributes of a local v2/v3 group or array (an empty object when absent).
-Json readAttributes(const std::filesystem::path& node);
-void writeAttributes(const std::filesystem::path& node, const Json& attributes);
+// Attributes of a v2/v3 group or array (an empty object when absent).
+Json readAttributes(const std::filesystem::path& node, const Access& access = {});
+void writeAttributes(const std::filesystem::path& node, const Json& attributes, const Access& access = {});
 
 // ---- writing pyramids -----------------------------------------------------------------
 

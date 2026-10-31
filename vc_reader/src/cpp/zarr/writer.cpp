@@ -1,4 +1,4 @@
-// Writing local Zarr arrays: metadata, encoded chunk files and regions.
+// Writing Zarr arrays, local or on S3: metadata, encoded chunks and regions.
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/array.hpp"
@@ -6,8 +6,11 @@
 #include "format.hpp"
 #include "files.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <fstream>
+#include <sstream>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -104,9 +107,39 @@ Json storedMetadata(const ArrayMeta& meta)
     return meta.v3 ? meta.v3->metadata : meta.raw;
 }
 
-fs::path metadataPath(const fs::path& path, const ArrayMeta& meta)
+const char* metadataName(const ArrayMeta& meta)
 {
-    return path / (meta.v3 ? "zarr.json" : ".zarray");
+    return meta.v3 ? "zarr.json" : ".zarray";
+}
+
+const char* groupMarker(int version)
+{
+    return version == 3 ? "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {}}\n"
+                        : "{\"zarr_format\": 2}\n";
+}
+
+// A file named for this process and call, removed afterwards.
+struct TemporaryFile {
+    fs::path path;
+    TemporaryFile()
+    {
+        static std::atomic<std::uint64_t> sequence{0};
+        path = fs::temp_directory_path() / ("vc_reader-shard-" + std::to_string(::getpid()) + "-" + std::to_string(++sequence));
+    }
+    ~TemporaryFile()
+    {
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+};
+
+// The location's parent, when it has one to hold a group marker.
+std::optional<fs::path> parentLocation(const Store& store)
+{
+    const fs::path path(store.location());
+    if (store.remote() && store.location().find('/', store.location().find("://") + 3) == std::string::npos)
+        return std::nullopt;  // a bucket has no parent
+    return path.has_parent_path() ? std::optional<fs::path>(path.parent_path()) : std::nullopt;
 }
 
 // Bounded lock table shared by all Writer instances. Canonical array paths make
@@ -125,6 +158,7 @@ void putLittle(std::uint8_t* out, std::uint64_t value, int bytes)
 
 struct Writer::Impl {
     fs::path path;
+    std::optional<Store> store;
     ArrayMeta meta;
     Codec codec = Codec::Raw;
     EncodeOptions encode;
@@ -132,12 +166,51 @@ struct Writer::Impl {
     std::unique_ptr<ShardLayout> shards;
     fs::path canonicalPath;
 
+    // The object name of a chunk, or of the shard containing it.
+    std::string chunkKey(const Index& chunk) const
+    {
+        if (chunk.size() != meta.shape.size())
+            throw std::invalid_argument("chunk index rank does not match the array");
+        std::string key = meta.v3 ? meta.v3->prefix : "";
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+            const auto grid = meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0);
+            if (chunk[i] < 0 || chunk[i] >= std::max<std::int64_t>(grid, 1))
+                throw std::out_of_range("chunk index outside the array");
+            if (i)
+                key += meta.separator;
+            key += std::to_string(shards ? chunk[i] / shards->ratios[i] : chunk[i]);
+        }
+        return key;
+    }
+
+    // A remote shard edited as a local file: downloaded, patched and uploaded whole.
+    bool updateShard(const std::string& key, std::size_t target, const std::vector<std::uint8_t>* replacement)
+    {
+        if (!store->remote()) {
+            std::lock_guard lock(shardMutex((canonicalPath / key).string()));
+            return patchShard(path / key, target, replacement);
+        }
+        std::lock_guard lock(shardMutex(store->location() + "/" + key));
+        TemporaryFile local;
+        if (const auto stored = store->read(key))
+            atomicWrite(local.path, *stored);
+        const bool result = patchShard(local.path, target, replacement);
+        std::ifstream in(local.path, std::ios::binary);
+        if (in) {
+            std::ostringstream text;
+            text << in.rdbuf();
+            store->write(key, text.str());
+        } else {
+            store->discard(key);
+        }
+        return result;
+    }
+
     // Keep encoded neighbors intact and bound scratch memory to one payload
     // and the index. A failed copy never replaces the existing shard.
-    bool updateShard(const fs::path& file, std::size_t target, const std::vector<std::uint8_t>* replacement)
+    bool patchShard(const fs::path& file, std::size_t target, const std::vector<std::uint8_t>* replacement)
     {
         const auto& layout = *shards;
-        std::lock_guard lock(shardMutex(canonicalPath / file.lexically_relative(path)));
         LocalShard previous(file, layout);
         bool existed = false;
         std::size_t remaining = 0;
@@ -186,21 +259,22 @@ Writer::Writer(Writer&&) noexcept = default;
 Writer& Writer::operator=(Writer&&) noexcept = default;
 Writer::~Writer() = default;
 
-Writer Writer::create(const fs::path& path, const CreateOptions& options)
+Writer Writer::create(const fs::path& path, const CreateOptions& options, const Access& access)
 {
     if (options.version != 2 && options.version != 3)
         throw std::invalid_argument("Zarr version must be 2 or 3");
     if (options.version != 3 && !options.shardShape.empty())
         throw std::invalid_argument("indexed shards require Zarr v3");
+    const Store store(path, access);
     if (options.overwrite)
-        fs::remove_all(path);
-    if (fs::exists(path / ".zgroup") ||
-        (options.version == 3 && fs::exists(path / ".zarray")) ||
-        (options.version == 2 && fs::exists(path / "zarr.json")))
+        store.removeAll();
+    if (store.exists(".zgroup") ||
+        (options.version == 3 && store.exists(".zarray")) ||
+        (options.version == 2 && store.exists("zarr.json")))
         throw std::invalid_argument("cannot replace a group or change the Zarr format at " + path.string());
-    if (options.version == 3 && fs::exists(path / "zarr.json")) {
-        std::ifstream in(path / "zarr.json");
-        if (Json::parse(in).value("node_type", "") != "array")
+    if (options.version == 3) {
+        const auto existing = store.read("zarr.json");
+        if (existing && Json::parse(*existing).value("node_type", "") != "array")
             throw std::invalid_argument("cannot replace a group with an array at " + path.string());
     }
     Json zarray{{"zarr_format", 2},
@@ -222,39 +296,43 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options)
         zarray = v3Metadata(meta, options);
         meta = parseArrayMeta(zarray);
     }
-    fs::create_directories(path);
-    atomicWrite(metadataPath(path, meta), zarray.dump(2) + "\n");
-    std::error_code ec;
-    if (path.has_parent_path() && !fs::exists(path.parent_path() / ".zgroup", ec) &&
-        !fs::exists(path.parent_path() / "zarr.json", ec))
-        atomicWrite(path.parent_path() / (meta.v3 ? "zarr.json" : ".zgroup"),
-                    meta.v3 ? "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {}}\n"
-                            : "{\"zarr_format\": 2}\n");
-    return open(path);
+    if (!store.remote())
+        fs::create_directories(path);
+    store.write(metadataName(meta), zarray.dump(2) + "\n");
+    if (const auto parent = parentLocation(store)) {
+        const Store above(*parent, access, 1);
+        if (!above.exists(".zgroup") && !above.exists("zarr.json"))
+            above.write(meta.v3 ? "zarr.json" : ".zgroup", groupMarker(meta.v3 ? 3 : 2));
+    }
+    return open(path, access);
 }
 
-Writer Writer::open(const fs::path& path)
+Writer Writer::open(const fs::path& path, const Access& access)
 {
-    std::ifstream in(path / ".zarray");
-    if (!in)
-        in.open(path / "zarr.json");
-    if (!in)
+    Store store(path, access);
+    auto stored = store.read(".zarray");
+    if (!stored)
+        stored = store.read("zarr.json");
+    if (!stored)
         throw std::runtime_error("no Zarr array to write at " + path.string());
     auto impl = std::make_unique<Impl>();
     impl->path = path;
-    impl->meta = parseArrayMeta(Json::parse(in));
+    impl->store = std::move(store);
+    impl->meta = parseArrayMeta(Json::parse(*stored));
     if (impl->meta.v3 && !impl->meta.v3->shards.empty()) {
         const auto& v3 = *impl->meta.v3;
         impl->shards = std::make_unique<ShardLayout>(v3.shards, v3.indexEnd, v3.indexCrc, impl->meta.chunkBytes());
-        impl->canonicalPath = fs::canonical(path);
+        if (!impl->store->remote())
+            impl->canonicalPath = fs::canonical(path);
     }
     impl->codec = parse_codec(impl->meta.codec());
     impl->encode = encodeOptions(impl->meta.compressor);
     OpenOptions options;
+    options.access = access;
     options.threads = 4;
     // Mutable arrays must see atomic replacements by this or another writer.
     options.readMode = "slab";
-    impl->reader = std::move(openArray(path.string(), options).array);
+    impl->reader = std::move(openArray(impl->store->location(), options).array);
     return Writer(std::move(impl));
 }
 
@@ -266,50 +344,42 @@ void Writer::setFillValue(const Json& value)
 {
     // Fetch the current v3 attributes as another writer may have updated them.
     auto raw = storedMetadata(impl_->meta);
-    if (impl_->meta.v3) {
-        std::ifstream in(metadataPath(impl_->path, impl_->meta));
-        raw = Json::parse(in);
-    }
+    if (impl_->meta.v3)
+        raw = Json::parse(impl_->store->read(metadataName(impl_->meta)).value());
     raw["fill_value"] = value;
     auto meta = parseArrayMeta(raw);
     OpenOptions options;
+    options.access = impl_->store->access();
     options.threads = 4;
     options.readMode = "slab";
     ArrayHints hints;
     hints.metadata = raw;
-    auto opened = openArray(impl_->path.string(), options, hints);
-    atomicWrite(metadataPath(impl_->path, meta), raw.dump(2) + "\n");
+    auto opened = openArray(impl_->store->location(), options, hints);
+    impl_->store->write(metadataName(meta), raw.dump(2) + "\n");
     impl_->meta = std::move(meta);
     impl_->reader = std::move(opened.array);
 }
 
 fs::path Writer::chunkPath(const Index& chunk) const
 {
-    const auto& meta = impl_->meta;
-    if (chunk.size() != meta.shape.size())
-        throw std::invalid_argument("chunk index rank does not match the array");
-    std::string key = meta.v3 ? meta.v3->prefix : "";
-    for (std::size_t i = 0; i < chunk.size(); ++i) {
-        const auto grid = meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0);
-        if (chunk[i] < 0 || chunk[i] >= std::max<std::int64_t>(grid, 1))
-            throw std::out_of_range("chunk index outside the array");
-        if (i)
-            key += meta.separator;
-        key += std::to_string(impl_->shards ? chunk[i] / impl_->shards->ratios[i] : chunk[i]);
-    }
-    return impl_->path / key;
+    return impl_->path / impl_->chunkKey(chunk);
 }
 
 bool Writer::chunkExists(const Index& chunk) const
 {
-    const auto file = chunkPath(chunk);
+    const auto key = impl_->chunkKey(chunk);
     if (impl_->shards) {
-        LocalShard shard(file, *impl_->shards);
+        TemporaryFile local;
+        if (impl_->store->remote()) {
+            const auto stored = impl_->store->read(key);
+            if (!stored) return false;
+            atomicWrite(local.path, *stored);
+        }
+        LocalShard shard(impl_->store->remote() ? local.path : impl_->path / key, *impl_->shards);
         return !shard.index.empty() &&
                impl_->shards->entry(shard.index, impl_->shards->locate(chunk).second, shard.total).has_value();
     }
-    std::error_code ec;
-    return fs::exists(file, ec);
+    return impl_->store->exists(key);
 }
 
 void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size)
@@ -318,13 +388,13 @@ void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_
     if (size != meta.chunkBytes())
         throw std::invalid_argument("chunk data has " + std::to_string(size) + " bytes, expected " +
                                     std::to_string(meta.chunkBytes()));
-    const auto path = chunkPath(chunk);
+    const auto key = impl_->chunkKey(chunk);
     const auto bytes = encode(impl_->codec, impl_->encode, data, size, meta.itemsize(), meta.chunks);
     if (impl_->shards) {
-        impl_->updateShard(path, impl_->shards->locate(chunk).second, &bytes);
+        impl_->updateShard(key, impl_->shards->locate(chunk).second, &bytes);
         return;
     }
-    atomicWrite(path, std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    impl_->store->write(key, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 }
 
 bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size)
@@ -336,7 +406,10 @@ bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, s
     for (std::size_t i = 0; allFill && i < size; i += fill.size())
         allFill = std::memcmp(data + i, fill.data(), fill.size()) == 0;
     if (allFill) {
-        removeChunk(chunk);
+        if (impl_->shards)
+            removeChunk(chunk);
+        else
+            impl_->store->discard(impl_->chunkKey(chunk));
         return false;
     }
     writeChunk(chunk, data, size);
@@ -345,14 +418,10 @@ bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, s
 
 bool Writer::removeChunk(const Index& chunk)
 {
-    const auto file = chunkPath(chunk);
+    const auto key = impl_->chunkKey(chunk);
     if (impl_->shards)
-        return impl_->updateShard(file, impl_->shards->locate(chunk).second, nullptr);
-    std::error_code ec;
-    const bool removed = fs::remove(file, ec);
-    if (ec)
-        throw std::system_error(ec, "removing " + chunkPath(chunk).string());
-    return removed;
+        return impl_->updateShard(key, impl_->shards->locate(chunk).second, nullptr);
+    return impl_->store->remove(key);
 }
 
 void Writer::writeRegion(const Index& start, const Index& shape, const std::uint8_t* data, bool skipEmpty)
@@ -409,58 +478,56 @@ void Writer::writeRegion(const Index& start, const Index& shape, const std::uint
     } while (nextIndex(idx, c0, c1));
 }
 
-bool removeNode(const fs::path& path)
+bool removeNode(const fs::path& path, const Access& access)
 {
-    return fs::remove_all(path) > 0;
+    return Store(path, access).removeAll();
 }
 
-std::vector<std::string> nodeChildren(const fs::path& path)
+std::vector<std::string> nodeChildren(const fs::path& path, const Access& access)
 {
     std::vector<std::string> out;
-    std::error_code ec;
-    for (const auto& child : fs::directory_iterator(path, ec))
-        if (child.is_directory() && isLocalZarrNode(child.path()))
-            out.push_back(child.path().filename().string());
-    std::sort(out.begin(), out.end());
+    for (const auto& name : Store(path, access, 1).children())
+        if (Store(path / name, access, 1).isNode())
+            out.push_back(name);
     return out;
 }
 
-void createGroup(const fs::path& path, const std::optional<Json>& attributes, int version)
+void createGroup(const fs::path& path, const std::optional<Json>& attributes, int version, const Access& access)
 {
     if (version != 2 && version != 3)
         throw std::invalid_argument("Zarr version must be 2 or 3");
-    fs::create_directories(path);
-    if (fs::exists(path / ".zarray"))
+    const Store store(path, access, 1);
+    if (!store.remote())
+        fs::create_directories(path);
+    if (store.exists(".zarray"))
         throw std::invalid_argument("an array is at " + path.string());
-    if (!fs::exists(path / ".zgroup") && !fs::exists(path / "zarr.json"))
-        atomicWrite(path / (version == 3 ? "zarr.json" : ".zgroup"),
-                    version == 3 ? "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {}}\n"
-                                 : "{\"zarr_format\": 2}\n");
+    if (!store.exists(".zgroup") && !store.exists("zarr.json"))
+        store.write(version == 3 ? "zarr.json" : ".zgroup", groupMarker(version));
     if (attributes)
-        writeAttributes(path, *attributes);
+        writeAttributes(path, *attributes, access);
 }
 
-Json readAttributes(const fs::path& node)
+Json readAttributes(const fs::path& node, const Access& access)
 {
-    std::ifstream v3(node / "zarr.json");
-    if (v3)
-        return Json::parse(v3).value("attributes", Json::object());
-    std::ifstream in(node / ".zattrs");
-    return in ? Json::parse(in) : Json::object();
+    const Store store(node, access, 1);
+    if (const auto v3 = store.read("zarr.json"))
+        return Json::parse(*v3).value("attributes", Json::object());
+    const auto attributes = store.read(".zattrs");
+    return attributes ? Json::parse(*attributes) : Json::object();
 }
 
-void writeAttributes(const fs::path& node, const Json& attributes)
+void writeAttributes(const fs::path& node, const Json& attributes, const Access& access)
 {
     if (!attributes.is_object())
         throw std::invalid_argument("Zarr attributes must be an object");
-    std::ifstream in(node / "zarr.json");
-    if (in) {
-        auto metadata = Json::parse(in);
+    const Store store(node, access, 1);
+    if (const auto v3 = store.read("zarr.json")) {
+        auto metadata = Json::parse(*v3);
         metadata["attributes"] = attributes;
-        atomicWrite(node / "zarr.json", metadata.dump(2) + "\n");
+        store.write("zarr.json", metadata.dump(2) + "\n");
         return;
     }
-    atomicWrite(node / ".zattrs", attributes.dump(2) + "\n");
+    store.write(".zattrs", attributes.dump(2) + "\n");
 }
 
 }  // namespace vcr::zarr

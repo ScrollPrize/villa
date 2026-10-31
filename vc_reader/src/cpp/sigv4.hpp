@@ -1,4 +1,4 @@
-// AWS Signature Version 4 for S3 GETs, and the SHA-256 / HMAC-SHA256 it needs.
+// AWS Signature Version 4 for S3 requests, and the SHA-256 / HMAC-SHA256 it needs.
 #pragma once
 
 #include <algorithm>
@@ -209,11 +209,20 @@ inline std::string amz_date(std::time_t t)
     return buf;
 }
 
-// Headers that sign a GET of `url` (http(s)://host[:port]/path[?query]) for S3.
-// `extra` headers (lowercase names) are sent and signed as well.
-inline std::vector<std::pair<std::string, std::string>> sigv4_get_headers(
-    const std::string& url, const S3Key& key, const std::string& date,
-    const std::vector<std::pair<std::string, std::string>>& extra = {})
+// The hex SHA-256 of a request without a body.
+inline const std::string& sigv4_empty_payload()
+{
+    static const std::string hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    return hash;
+}
+
+// Headers that sign a `method` request of `url` (http(s)://host[:port]/path[?query]) for S3.
+// `extra` headers (lowercase names) are sent and signed as well. `payload` is the hex
+// SHA-256 of the body.
+inline std::vector<std::pair<std::string, std::string>> sigv4_headers(
+    const std::string& method, const std::string& url, const S3Key& key, const std::string& date,
+    const std::vector<std::pair<std::string, std::string>>& extra = {},
+    const std::string& payload = sigv4_empty_payload())
 {
     // Split the URL.
     const std::size_t scheme_end = url.find("://");
@@ -251,9 +260,8 @@ inline std::vector<std::pair<std::string, std::string>> sigv4_get_headers(
     for (const auto& [k, v] : params)
         canonical_query += (canonical_query.empty() ? "" : "&") + k + "=" + v;
 
-    static const std::string empty_payload = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     std::vector<std::pair<std::string, std::string>> headers = extra;
-    headers.emplace_back("x-amz-content-sha256", empty_payload);
+    headers.emplace_back("x-amz-content-sha256", payload);
     headers.emplace_back("x-amz-date", date);
     if (!key.session_token.empty())
         headers.emplace_back("x-amz-security-token", key.session_token);
@@ -266,7 +274,7 @@ inline std::vector<std::pair<std::string, std::string>> sigv4_get_headers(
         names += (names.empty() ? "" : ";") + k;
     }
     const std::string canonical_request =
-        "GET\n" + canonical_uri + "\n" + canonical_query + "\n" + canonical_headers + "\n" + names + "\n" + empty_payload;
+        method + "\n" + canonical_uri + "\n" + canonical_query + "\n" + canonical_headers + "\n" + names + "\n" + payload;
 
     const std::string day = date.substr(0, 8);
     const std::string scope = day + "/" + key.region + "/s3/aws4_request";

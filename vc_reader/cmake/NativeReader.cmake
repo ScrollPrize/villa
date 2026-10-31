@@ -50,6 +50,7 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/layers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/open.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/pyramid.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/store.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/store_metadata.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/writer.cpp")
 # CPU and CUDA composites evaluate the same unfused float32 formulas (the kernels
