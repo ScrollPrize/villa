@@ -3003,6 +3003,35 @@
       },
       "params": {
         "properties": {
+          "composite": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "layersBehind": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "layersFront": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "method": {
+                "enum": [
+                  "mean",
+                  "max",
+                  "min",
+                  "alpha",
+                  "beerLambert",
+                  "volumetric"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "highlightedSurfaceIds": {
             "items": {
               "type": "string"

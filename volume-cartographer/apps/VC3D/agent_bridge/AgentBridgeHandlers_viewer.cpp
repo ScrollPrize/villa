@@ -1,4 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QJsonArray>
@@ -344,6 +346,17 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
         for (const std::string& id : panel->highlightedSurfaceIds())
             highlightIds.append(QString::fromStdString(id));
     o["highlightedSurfaceIds"] = highlightIds;
+
+    // The primary view's composite, which the composite panel edits.
+    if (auto* segmentation = mgr->segmentationViewer()) {
+        const auto& settings = segmentation->compositeRenderSettings();
+        QJsonObject composite;
+        composite["enabled"] = settings.enabled;
+        composite["method"] = QString::fromStdString(settings.params.method);
+        composite["layersFront"] = settings.layersFront;
+        composite["layersBehind"] = settings.layersBehind;
+        o["composite"] = composite;
+    }
     return o;
 }
 
@@ -446,6 +459,15 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         normalMaxArrows = std::clamp(v, 4, 100);
     }
 
+    const bool hasComposite = p.contains("composite");
+    const QJsonObject composite = p.value("composite").toObject();
+    VolumeViewerBase* compositeViewer = hasComposite ? mgr->segmentationViewer() : nullptr;
+    if (hasComposite && !compositeViewer) {
+        QJsonObject data;
+        data["detail"] = "no segmentation viewer";
+        throw AgentBridgeError{-32010, "Viewer unavailable", data};
+    }
+
     // Apply as a group. Global controls go via ViewerManager (broadcast +
     // QSettings-persisted).
     if (hasIntersectionOpacity)
@@ -495,6 +517,18 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::viewer::NORMAL_MAX_ARROWS, normalMaxArrows);
         broadcast([normalMaxArrows](VolumeViewerBase* base) { base->setNormalMaxArrows(normalMaxArrows); });
+    }
+
+    if (compositeViewer) {
+        auto settings = compositeViewer->compositeRenderSettings();
+        settings.enabled = composite.value("enabled").toBool(settings.enabled);
+        if (composite.contains("method"))
+            settings.params.method = composite.value("method").toString().toStdString();
+        settings.layersFront = std::max(0, composite.value("layersFront").toInt(settings.layersFront));
+        settings.layersBehind = std::max(0, composite.value("layersBehind").toInt(settings.layersBehind));
+        compositeViewer->setCompositeRenderSettings(settings);
+        if (_window->_viewerCompositePanel)
+            _window->_viewerCompositePanel->setSegmentationCompositeChecked(settings.enabled);
     }
 
     // Echo the resulting full settings (unknown keys are ignored).
