@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from threadpoolctl import threadpool_limits
-from vc_reader.reader import ObjectStore, ZarrWriter, create_group, open_zarr, write_pyramid_level
+from vc_reader.reader import ZarrWriter, create_group, open_zarr, write_pyramid_level
 
 from vesuvius.neural_tracing.normals import decode_normals as _decode_normals
 
@@ -208,21 +208,10 @@ def _crop_chunk_range(
 	return begin, end
 
 
-def stored_chunks(array_path: str | Path) -> set[tuple[int, ...]]:
-	"""Indices of the chunks stored for a local array, from a listing of its objects (the grid is not scanned)."""
-	meta = open_zarr(array_path).meta
-	stored = set()
-	for key in ObjectStore(array_path, auth=None).keys():
-		parts = key.removeprefix("c/").split(meta.separator)
-		if len(parts) == meta.ndim and all(part.isdigit() for part in parts):
-			stored.add(tuple(int(part) for part in parts))
-	return stored
-
-
 def _stored_output_chunks(source_path: str | Path, dst_chunks) -> set[tuple[int, int, int]]:
 	"""The output chunks over any chunk stored in the source level."""
 	src_chunks = open_zarr(source_path).chunks
-	return {tuple(i * s // 2 // d for i, s, d in zip(index, src_chunks, dst_chunks)) for index in stored_chunks(source_path)}
+	return {tuple(i * s // 2 // d for i, s, d in zip(index, src_chunks, dst_chunks)) for index in ZarrWriter.open(source_path).stored_chunks()}
 
 
 def _pool_chunks(

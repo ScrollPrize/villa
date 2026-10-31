@@ -117,9 +117,9 @@ except ImportError:
 	)
 
 try:
-	from omezarr_pyramid import invalidate_coarser_chunks, stored_chunks
+	from omezarr_pyramid import invalidate_coarser_chunks
 except ImportError:
-	from lasagna.omezarr_pyramid import invalidate_coarser_chunks, stored_chunks
+	from lasagna.omezarr_pyramid import invalidate_coarser_chunks
 
 try:
 	from normal_encoding import encode_normal_nxny_u8, estimate_normal as _estimate_normal
@@ -779,7 +779,7 @@ def _compute_pred_dt_slab(
 				return False
 		return True
 
-	stored_pred = stored_chunks(pred_path)
+	stored_pred = set(ZarrWriter.open(pred_path).stored_chunks())
 	pcz, pcy, pcx = (int(v) for v in pred_zarr.chunks)
 
 	def _pred_has_chunks(cz0, cz1, cy0, cy1, cx0, cx1):

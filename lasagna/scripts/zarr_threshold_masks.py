@@ -26,7 +26,6 @@ from omezarr_pyramid import (
     build_scalar_omezarr_pyramid,
     clear_coarser_levels,
     print_progress as _print_progress,
-    stored_chunks,
 )
 
 
@@ -168,7 +167,7 @@ def _missing_chunk_mask_for_slab(
     if not array_path.exists():
         return np.zeros((z_range[1] - z_range[0], shape[-2], shape[-1]), dtype=bool)
 
-    stored = stored_chunks(array_path)
+    stored = set(ZarrWriter.open(array_path).stored_chunks())
 
     z0, z1 = z_range
     if len(shape) == 3:
@@ -783,7 +782,7 @@ def _apply_external_keep_mask(
     )
 
     chunks = tuple(int(v) for v in grad_chunks_all)
-    stored = stored_chunks(grad_level_path)
+    stored = set(ZarrWriter.open(grad_level_path).stored_chunks())
     skipped_missing = 0
     total = 0
     work: list[tuple[int, int, int, int, int, int]] = []

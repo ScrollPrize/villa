@@ -219,7 +219,7 @@ class CompactOutputAdapter:
             return False
 
     def build_pyramids(self, workers=1):
-        from lasagna.omezarr_pyramid import _mean_pool2x_u8, _mean_pool2x_f32, _moment_pool2x_normals, stored_chunks
+        from lasagna.omezarr_pyramid import _mean_pool2x_u8, _mean_pool2x_f32, _moment_pool2x_normals
         from lasagna.tiled_predict3d import _product_channel_kind
         for native, products in self.by_level.items():
             names = [c.name for p in products for c in p.channels]
@@ -230,7 +230,7 @@ class CompactOutputAdapter:
                 dest = _writer(str(self.array_path(products[0], level)))
                 # Discover only chunks with source data; never scan the full volume grid.
                 origins = {tuple((i*c//2//d)*d for i,c,d in zip(index[1:], source.chunks[1:], dest.chunks[1:]))
-                           for index in stored_chunks(parent)}
+                           for index in ZarrWriter.open(parent).stored_chunks()}
                 def build(origin):
                     if self._chunk_stored(products[0], level, origin):
                         return

@@ -24,12 +24,7 @@ from typing import Callable, Iterable
 import numpy as np
 from dtypes import numpy_float_hi
 from scipy import ndimage
-from vc_reader.reader import ZarrGroup, open_node
-
-try:
-	from omezarr_pyramid import stored_chunks
-except ImportError:
-	from lasagna.omezarr_pyramid import stored_chunks
+from vc_reader.reader import ZarrGroup, ZarrWriter, open_node
 
 
 DEFAULT_CHANNELS = ("grad_mag",)
@@ -490,9 +485,9 @@ def _iter_chunk_coords(grid_shape: tuple[int, int, int]) -> Iterable[ChunkCoord]
 def _stored_chunk_coords(target: ScanTarget, arr) -> set[ChunkCoord]:
 	"""The spatial chunks stored for the target's channel."""
 	if target.channel_index is None:
-		return stored_chunks(arr.location)
+		return set(ZarrWriter.open(arr.location).stored_chunks())
 	channel = int(target.channel_index) // int(arr.chunks[0])
-	return {index[1:] for index in stored_chunks(arr.location) if index[0] == channel}
+	return {index[1:] for index in ZarrWriter.open(arr.location).stored_chunks() if index[0] == channel}
 
 
 def _read_chunk_data(

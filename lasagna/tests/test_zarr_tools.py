@@ -11,7 +11,7 @@ from vc_reader.reader import ZarrWriter, create_group, open_group, open_zarr
 import convert_fit_zarr_to_vc3d_omezarr as convert
 import mix_channels
 import predict3d_holescan as holescan
-from omezarr_pyramid import _mean_pool2x_u8, _moment_pool2x_normals, build_normal_omezarr_pyramid, build_scalar_omezarr_pyramid, stored_chunks
+from omezarr_pyramid import _mean_pool2x_u8, _moment_pool2x_normals, build_normal_omezarr_pyramid, build_scalar_omezarr_pyramid
 from scripts import rechunk_omezarr, zarr_threshold_masks
 
 
@@ -47,7 +47,7 @@ def test_crop_limits_scalar_pyramid(tmp_path):
     data = _volume()
     root = _pyramid(tmp_path / "s.zarr", data)
     build_scalar_omezarr_pyramid(root, 0, 2, workers=1, crop_zyx=(0, 0, 0, 4, 4, 4))
-    assert stored_chunks(root / "1") == {(0, 0, 0)}
+    assert set(ZarrWriter.open(root / "1").stored_chunks()) == {(0, 0, 0)}
 
 
 def test_zero_overrides_and_normal_pyramids_match_their_reductions(tmp_path):
@@ -96,7 +96,7 @@ def test_rechunk_does_not_store_missing_source_chunks(tmp_path, monkeypatch):
     ZarrWriter.open(src / "0")[0:8, 0:8, 0:8] = 9
     dst = tmp_path / "d.zarr"
     _run_rechunk(monkeypatch, src, dst, "-c", "8", "--levels", "1", "-j", "1")
-    assert stored_chunks(dst / "0") == {(0, 0, 0)}
+    assert set(ZarrWriter.open(dst / "0").stored_chunks()) == {(0, 0, 0)}
 
 
 def test_rechunk_rebuild_scales_of_normal_pair(tmp_path, monkeypatch):
