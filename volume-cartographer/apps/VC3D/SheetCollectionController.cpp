@@ -36,6 +36,7 @@
 #include <QPushButton>
 #include <QtMath>
 #include <QSettings>
+#include <QStandardItemModel>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTimer>
@@ -46,7 +47,16 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -101,6 +111,87 @@ int metricBucket(double good)
 QColor metricBucketColour(int b) { return metricColour((b + 0.5) / kMetricBuckets); }
 // Neutral grey for sheets whose chosen metric is missing (NaN: NULL or older .asv).
 QColor kMissingColour() { return QColor(150, 150, 150); }
+
+// --- affinity colour ramp ----------------------------------------------------
+// 0 -> blue, 1 -> red (distinct from the red->green metric ramp). Hue swept from 240deg
+// (blue) up through magenta to 360deg (= red), so the ramp carries no green.
+QColor affinityColour(double a)
+{
+    float h = 0.6667f + float(clamp01(a)) * 0.3333f;  // 0.667 (blue) .. 1.0 (== 0.0, red)
+    if (h >= 1.0f)
+        h -= 1.0f;
+    return QColor::fromHsvF(h, 0.9f, 1.0f);
+}
+// Colour at the centre of metric bucket b on the affinity ramp (reuses the metric buckets).
+QColor affinityBucketColour(int b) { return affinityColour((b + 0.5) / kMetricBuckets); }
+
+// --- GASP agglomeration ------------------------------------------------------
+// Average-linkage GASP (Generalized Algorithm for Signed graph Partitioning) over a signed
+// weighted graph: repeatedly merge the pair of clusters with the highest AVERAGE inter-cluster
+// edge weight while that average is positive; a negative (repulsive) accumulation blocks a
+// merge, so no threshold is needed. `n` nodes labelled 0..n-1; `edges` are {u, v, w} triples
+// (pre-aggregate duplicate pairs by mean before calling). Returns each node's cluster label
+// (a representative node id). Lazy priority queue: a stale entry (whose recomputed average no
+// longer matches, or has gone non-positive) is skipped.
+std::vector<int> gaspAverageLinkage(int n, const std::vector<std::tuple<int, int, double>>& edges)
+{
+    std::vector<int> parent(n);
+    std::iota(parent.begin(), parent.end(), 0);
+    auto find = [&](int x) {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+    // Current cluster adjacency: root -> (neighbour root -> {summed weight, edge count}).
+    std::vector<std::unordered_map<int, std::pair<double, long long>>> adj(n);
+    for (const auto& [u, v, w] : edges) {
+        if (u == v || u < 0 || v < 0 || u >= n || v >= n)
+            continue;
+        auto& a = adj[u][v]; a.first += w; a.second += 1;
+        auto& b = adj[v][u]; b.first += w; b.second += 1;
+    }
+    using QE = std::tuple<double, int, int>;  // (average weight, root u, root v), max-first
+    std::priority_queue<QE> pq;
+    for (int u = 0; u < n; ++u)
+        for (const auto& [v, sc] : adj[u])
+            if (u < v) {
+                const double a = sc.first / double(sc.second);
+                if (a > 0.0)
+                    pq.emplace(a, u, v);
+            }
+    while (!pq.empty()) {
+        const auto [w, u, v] = pq.top();
+        pq.pop();
+        const int ru = find(u), rv = find(v);
+        if (ru == rv)
+            continue;
+        const auto it = adj[ru].find(rv);
+        if (it == adj[ru].end())
+            continue;
+        const double cur = it->second.first / double(it->second.second);
+        if (cur <= 0.0 || std::abs(cur - w) > 1e-9)
+            continue;  // stale: a fresher entry exists, or the merge turned repulsive
+        // Merge rv into ru: fold rv's adjacency into ru's and redirect its neighbours.
+        for (const auto& [x, sc] : adj[rv]) {
+            if (x == ru)
+                continue;
+            auto& into = adj[ru][x]; into.first += sc.first; into.second += sc.second;
+            auto& back = adj[x]; auto& be = back[ru]; be.first += sc.first; be.second += sc.second;
+            back.erase(rv);
+        }
+        adj[ru].erase(rv);
+        adj[rv].clear();
+        parent[rv] = ru;
+        for (const auto& [x, sc] : adj[ru]) {
+            const double a = sc.first / double(sc.second);
+            if (a > 0.0)
+                pq.emplace(a, ru, x);
+        }
+    }
+    std::vector<int> label(n);
+    for (int i = 0; i < n; ++i)
+        label[i] = find(i);
+    return label;
+}
 
 // Chain a sheet's crossing segments into connected polylines. Adjacent triangles share
 // the exact crossing point (same edge, same interpolation), so endpoints match by value;
@@ -333,9 +424,16 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     colourBy_->addItem(tr("Coverage"));                  // ColourMode::Coverage
     colourBy_->addItem(tr("Mass fraction"));             // ColourMode::MassFrac
     colourBy_->addItem(tr("Fit RMS"));                   // ColourMode::FitRms
+    colourBy_->addItem(tr("Affinity (stitch)"));         // ColourMode::Affinity — enabled only while stitching
     colourBy_->setToolTip(tr("How to colour the sheet curves. The metric modes shade each sheet "
                              "red (low/poor) → green (high/good); unscored sheets are grey."));
-    colourBy_->setCurrentIndex(settings.value("sheetCollections/colourMode", int(ColourMode::Rainbow)).toInt());
+    // Restore the saved mode, but NEVER into Affinity: it needs an active stitch on an
+    // affinities-bearing .asv, neither of which holds at startup. Falling back to the default
+    // here is what keeps a previously-saved Affinity selection from colouring an empty map.
+    int savedColour = settings.value("sheetCollections/colourMode", int(ColourMode::Rainbow)).toInt();
+    if (savedColour < int(ColourMode::Solid) || savedColour >= int(ColourMode::Affinity))
+        savedColour = int(ColourMode::Rainbow);
+    colourBy_->setCurrentIndex(savedColour);
     colourLay->addWidget(colourBy_, 1);
     layout->addWidget(colourRow);
 
@@ -424,6 +522,29 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     form->addRow(tr("Min mass fraction"), minMassFrac_);
     form->addRow(tr("Max fit RMS"), maxFitRms_);
     layout->addLayout(form);
+
+    // Auto-stitch: GASP-agglomerate the latest selected sheet's affinity graph over a window
+    // neighbourhood and add its cluster to the stitch. Only usable in stitch mode on an
+    // affinities-bearing .asv (enabled by refreshAffinityAvailability()).
+    auto* autoRow = new QWidget(body);
+    auto* autoLay = new QHBoxLayout(autoRow);
+    autoLay->setContentsMargins(0, 0, 0, 0);
+    autoStitch_ = new QPushButton(tr("Auto-stitch"), autoRow);
+    autoStitch_->setToolTip(tr("Grow the stitch from the latest selected sheet: agglomerate its stitcher "
+                               "affinity graph (GASP, average linkage over the signed logits) across the "
+                               "surrounding windows and add the sheet's resulting cluster. Needs an .asv with "
+                               "an affinities table, in stitch mode."));
+    autoRadius_ = new QSpinBox(autoRow);
+    autoRadius_->setRange(1, 5);
+    autoRadius_->setValue(1);
+    autoRadius_->setPrefix(QStringLiteral("±"));
+    autoRadius_->setSuffix(tr(" win"));
+    autoRadius_->setToolTip(tr("Window neighbourhood radius: ±1 = the 3×3×3 block of windows around the "
+                               "selected sheet's window, ±2 = 5×5×5, and so on."));
+    autoLay->addWidget(autoStitch_, 1);
+    autoLay->addWidget(autoRadius_);
+    layout->addWidget(autoRow);
+
     layout->addStretch(1);
 
     dock_->setWidget(body);
@@ -448,6 +569,7 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     // Colour mode is a draw-only change (the cached meshes already carry the metrics).
     connect(colourBy_, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this, persist]() { persist(); invalidateDraw(); });
+    connect(autoStitch_, &QPushButton::clicked, this, [this]() { autoStitch(); });
     // Spinboxes debounce (1 s) so dragging a value does not re-render on every step. max-displayed and line width
     // only change the draw; min-size and slice distance change which sheets are fetched.
     connect(lineWidth_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(false); });
@@ -457,6 +579,8 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     // Quality thresholds change which sheets are fetched -> re-query (debounced).
     for (QDoubleSpinBox* sp : {minConfidence_, minCoverage_, minMassFrac_, maxFitRms_})
         connect(sp, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(true); });
+
+    refreshAffinityAvailability();  // Affinity starts disabled (no stitch, no .asv yet)
 
     bindToViewerManager(manager_);
 }
@@ -477,10 +601,14 @@ void SheetCollectionController::openCollection(const QString& path)
     views_.clear();
     reader_.reset();
     path_.clear();
+    hasAffinities_ = false;
+    affinityRef_ = 0;
+    affinityVals_.clear();
     if (!path.isEmpty()) {
         try {
             reader_ = std::make_unique<SheetCollection>(path.toStdString());
             path_ = path;
+            hasAffinities_ = reader_->hasAffinities();  // offer affinity colouring only if the table exists
             bool ok = false;
             const double g = QString::fromStdString(reader_->metadata("grid_step_um")).toDouble(&ok);
             if (ok && g > 0)
@@ -508,6 +636,7 @@ void SheetCollectionController::openCollection(const QString& path)
     } else {
         status_->setText(tr("Open an Automated Sheet Volume (.asv)."));
     }
+    refreshAffinityAvailability();  // enable/disable Affinity for THIS file's affinities table
     invalidateQuery();
     emit collectionOpened(path_);  // persisted next to the project by the window
 }
@@ -555,9 +684,161 @@ int64_t SheetCollectionController::minVertsThreshold() const
 SheetCollectionController::ColourMode SheetCollectionController::colourMode() const
 {
     const int i = colourBy_ ? colourBy_->currentIndex() : int(ColourMode::Rainbow);
-    if (i < int(ColourMode::Solid) || i > int(ColourMode::FitRms))
+    if (i < int(ColourMode::Solid) || i > int(ColourMode::Affinity))
         return ColourMode::Rainbow;
-    return ColourMode(i);
+    const ColourMode m = ColourMode(i);
+    // Affinity only applies during a stitch on a .asv that has the affinities table; otherwise
+    // fall back to the default so it is never drawn (and never reads an empty affinity map).
+    if (m == ColourMode::Affinity && !(stitchMode_ && hasAffinities_))
+        return ColourMode::Rainbow;
+    return m;
+}
+
+int64_t SheetCollectionController::affinityReference() const
+{
+    // The "latest selected sheet": the most-recently added one, else the anchor.
+    return stitchMode_ ? (lastAdded_ ? lastAdded_ : seedId_) : 0;
+}
+
+void SheetCollectionController::ensureAffinityValues()
+{
+    const int64_t ref = affinityReference();
+    if (ref == affinityRef_)
+        return;  // already computed for this reference (changes only when the selection changes)
+    affinityRef_ = ref;
+    affinityVals_.clear();
+    if (!ref || !reader_ || !hasAffinities_)
+        return;
+    const auto edges = reader_->affinities(ref);  // (dst, logit), both directions stored
+    if (edges.empty())
+        return;
+    // Softmax over the reference's affinity logits, then normalise so the strongest neighbour
+    // reads 1 (red); every rendered sheet not in this set stays 0 (blue).
+    double maxLogit = -std::numeric_limits<double>::infinity();
+    for (const auto& e : edges)
+        maxLogit = std::max(maxLogit, e.second);
+    std::vector<double> w(edges.size());
+    double sum = 0.0;
+    for (size_t i = 0; i < edges.size(); ++i) {
+        w[i] = std::exp(edges[i].second - maxLogit);
+        sum += w[i];
+    }
+    double peak = 0.0;
+    for (size_t i = 0; i < edges.size(); ++i) {
+        w[i] = sum > 0.0 ? w[i] / sum : 0.0;
+        peak = std::max(peak, w[i]);
+    }
+    const double inv = peak > 0.0 ? 1.0 / peak : 1.0;
+    for (size_t i = 0; i < edges.size(); ++i)
+        affinityVals_[edges[i].first] = clamp01(w[i] * inv);
+}
+
+void SheetCollectionController::refreshAffinityAvailability()
+{
+    if (!colourBy_)
+        return;
+    const bool avail = hasAffinities_ && stitchMode_;
+    if (auto* model = qobject_cast<QStandardItemModel*>(colourBy_->model())) {
+        if (QStandardItem* item = model->item(int(ColourMode::Affinity)))
+            item->setEnabled(avail);
+    }
+    if (autoStitch_)
+        autoStitch_->setEnabled(avail);  // auto-stitch needs the same (affinities × stitch)
+    if (autoRadius_)
+        autoRadius_->setEnabled(avail);
+    // Never leave Affinity selected when it is not usable: pull it back to the default so the
+    // next repaint colours by the default mode (a previously-saved Affinity choice can't crash).
+    if (!avail && colourBy_->currentIndex() == int(ColourMode::Affinity))
+        colourBy_->setCurrentIndex(int(ColourMode::Rainbow));
+}
+
+void SheetCollectionController::autoStitch()
+{
+    if (!stitchMode_ || !reader_ || !hasAffinities_)
+        return;
+    const int64_t ref = affinityReference();  // the latest selected sheet
+    if (!ref)
+        return;
+    const int radius = autoRadius_ ? autoRadius_->value() : 1;
+
+    auto parseWin = [](const std::string& s, long long& z, long long& y, long long& x) {
+        return std::sscanf(s.c_str(), "z%lld_y%lld_x%lld", &z, &y, &x) == 3;
+    };
+    long long sz = 0, sy = 0, sx = 0;
+    if (!parseWin(reader_->summary(ref).window, sz, sy, sx))
+        return;
+
+    // Parse every sheet's window and build sorted unique per-axis coordinates, so a window's
+    // distance in window-STEPS is well defined even if the grid has gaps.
+    const auto sw = reader_->sheetWindows();
+    std::set<long long> zs, ys, xs;
+    std::vector<std::tuple<int64_t, long long, long long, long long>> parsed;
+    parsed.reserve(sw.size());
+    for (const auto& [id, win] : sw) {
+        long long z = 0, y = 0, x = 0;
+        if (!parseWin(win, z, y, x))
+            continue;
+        zs.insert(z); ys.insert(y); xs.insert(x);
+        parsed.emplace_back(id, z, y, x);
+    }
+    auto rank = [](const std::set<long long>& u, long long v) {
+        return int(std::distance(u.begin(), u.lower_bound(v)));
+    };
+    const int rz = rank(zs, sz), ry = rank(ys, sy), rx = rank(xs, sx);
+
+    // Candidate sheets: window within `radius` steps of the reference's window on every axis
+    // (the (2*radius+1)^3 block). The reference is always included.
+    std::unordered_set<int64_t> cand;
+    for (const auto& [id, z, y, x] : parsed)
+        if (std::abs(rank(zs, z) - rz) <= radius && std::abs(rank(ys, y) - ry) <= radius &&
+            std::abs(rank(xs, x) - rx) <= radius)
+            cand.insert(id);
+    cand.insert(ref);
+    if (cand.size() < 2)
+        return;
+
+    // Dense node ids for the candidates.
+    std::vector<int64_t> nodes(cand.begin(), cand.end());
+    std::sort(nodes.begin(), nodes.end());
+    std::unordered_map<int64_t, int> idx;
+    idx.reserve(nodes.size() * 2);
+    for (int i = 0; i < int(nodes.size()); ++i)
+        idx[nodes[i]] = i;
+
+    // Edges among candidates, with duplicate pairs (both directions + several corners)
+    // aggregated to the mean logit (docs §9.1).
+    const long long M = (long long)nodes.size();
+    std::unordered_map<long long, std::pair<double, long long>> acc;  // key = a*M + b with a<b
+    for (int64_t c : nodes) {
+        const int iu = idx[c];
+        for (const auto& [dst, logit] : reader_->affinities(c)) {
+            const auto jt = idx.find(dst);
+            if (jt == idx.end() || jt->second == iu)
+                continue;
+            const int a = std::min(iu, jt->second), b = std::max(iu, jt->second);
+            auto& e = acc[(long long)a * M + b];
+            e.first += logit; e.second += 1;
+        }
+    }
+    std::vector<std::tuple<int, int, double>> edges;
+    edges.reserve(acc.size());
+    for (const auto& [k, e] : acc)
+        edges.emplace_back(int(k / M), int(k % M), e.first / double(e.second));
+
+    const std::vector<int> label = gaspAverageLinkage(int(nodes.size()), edges);
+    const int seedLabel = label[idx[ref]];
+    int added = 0;
+    for (int i = 0; i < int(nodes.size()); ++i)
+        if (label[i] == seedLabel && stitched_.insert(nodes[i]).second)
+            ++added;
+
+    refreshSelectionMeshes();
+    updateStitchBanner();
+    rebuildStitchPreview();
+    invalidateDraw();
+    if (status_)
+        status_->setText(tr("Auto-stitch (±%1 win): added %2 sheet(s) → %3 in stitch.")
+                             .arg(radius).arg(added).arg(int(stitched_.size())));
 }
 
 vc::sheets::QualityFilter SheetCollectionController::qualityFilter() const
@@ -814,12 +1095,19 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         return;  // nothing cached yet; the async result will refresh this viewport
 
     const ColourMode mode = colourMode();
+    if (mode == ColourMode::Affinity)
+        ensureAffinityValues();  // (re)compute the reference sheet's softmaxed affinities if it changed
     const qreal width = lineWidth_->value();
     const int64_t minV = minVertsThreshold();
     const size_t cap = size_t(maxDisplayed_->value());
-    // Per-sheet "goodness" (0 poor -> 1 good) for the active metric mode, or NaN when
-    // the sheet lacks that value (NULL column / older .asv) -> drawn grey.
-    auto goodness = [mode](const SheetMesh& sm) -> double {
+    // Per-sheet "goodness" (0 poor -> 1 good) for the active mode, or NaN when the sheet
+    // lacks that value (NULL column / older .asv) -> drawn grey. Affinity maps the softmaxed
+    // affinity to the reference sheet (missing from the map = 0 = not in range -> blue end).
+    auto goodness = [this, mode](const SheetMesh& sm) -> double {
+        if (mode == ColourMode::Affinity) {
+            const auto it = affinityVals_.find(sm.id);
+            return it != affinityVals_.end() ? it->second : 0.0;
+        }
         switch (mode) {
             case ColourMode::Confidence: return sm.confidence;
             case ColourMode::Coverage:   return sm.coverage;
@@ -924,6 +1212,9 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
                 strokePolys(p, rainbow[b], hueOf(b));
         } else if (mode == ColourMode::Solid) {
             strokePolys(p, plain, QColor("#40c0ff"));
+        } else if (mode == ColourMode::Affinity) {
+            for (int b = 0; b < kMetricBuckets; ++b)        // blue (0) -> red (1), no "missing" (0 = blue)
+                strokePolys(p, metricB[b], affinityBucketColour(b));
         } else {
             strokePolys(p, missing, kMissingColour());  // unscored first (underneath)
             for (int b = 0; b < kMetricBuckets; ++b)
@@ -964,6 +1255,11 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         } else if (mode == ColourMode::Solid) {
             QPainterPath pp = toPath(plain);
             if (!pp.isEmpty()) { style.penColor = QColor("#40c0ff"); builder.addPainterPath(pp, style); }
+        } else if (mode == ColourMode::Affinity) {
+            for (int b = 0; b < kMetricBuckets; ++b) {       // blue (0) -> red (1)
+                QPainterPath pp = toPath(metricB[b]);
+                if (!pp.isEmpty()) { style.penColor = affinityBucketColour(b); builder.addPainterPath(pp, style); }
+            }
         } else {
             QPainterPath pm = toPath(missing);
             if (!pm.isEmpty()) { style.penColor = kMissingColour(); builder.addPainterPath(pm, style); }
@@ -1073,6 +1369,14 @@ bool SheetCollectionController::maybeShowStitchMenu(VolumeViewerBase* viewer, QP
         QAction* a = menu.addAction(tr("Stitch into segment"));
         connect(a, &QAction::triggered, this, [this, hit]() { enterStitch(hit); });
     } else {
+        if (hasAffinities_) {
+            QAction* autoA = menu.addAction(tr("Auto-stitch from latest (±%1 win)")
+                                                .arg(autoRadius_ ? autoRadius_->value() : 1));
+            autoA->setToolTip(tr("Agglomerate the latest selected sheet's affinity graph (GASP) over the "
+                                 "surrounding windows and add its cluster."));
+            connect(autoA, &QAction::triggered, this, [this]() { autoStitch(); });
+            menu.addSeparator();
+        }
         QAction* interp = menu.addAction(tr("Interpolate gaps && consolidate"));
         interp->setToolTip(tr("Fill the gaps between the selected sheets and bake the result as a base "
                               "you can keep stitching onto."));
@@ -1150,6 +1454,7 @@ void SheetCollectionController::enterStitch(int64_t seedId)
     lastAdded_ = 0;  // nothing appended yet; only the red anchor
     stitched_ = {seedId};
     refreshSelectionMeshes();
+    refreshAffinityAvailability();  // Affinity colouring becomes selectable now (if the .asv has it)
     if (cwin_) {
         cwin_->sheetStitchEnterLayout();
         updateStitchBanner();
@@ -1200,6 +1505,9 @@ void SheetCollectionController::exitStitch()
     lastAdded_ = 0;
     selMeshes_.clear();
     consolidatedBase_ = {};
+    affinityRef_ = 0;
+    affinityVals_.clear();
+    refreshAffinityAvailability();  // disable Affinity + pull the selection back to the default
     if (cwin_) {
         cwin_->sheetStitchHideBanner();
         cwin_->sheetStitchExitLayout();  // restores layout AND the pre-stitch segmentation surface

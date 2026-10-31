@@ -238,6 +238,7 @@ Point ViewRegion::project(const Point& p) const
 struct SheetCollection::Impl {
     sqlite3* db{};
     std::set<std::string, std::less<>> sheetCols;  // columns present in `sheets` (schema may predate quality cols)
+    bool hasAffinities{false};                      // stitcher `affinities` edge table present (hercuvit stitcher infer)
     ~Impl()
     {
         if (db) sqlite3_close(db);
@@ -326,6 +327,13 @@ SheetCollection::SheetCollection(const std::filesystem::path& path)
     Statement cols(impl_->db, "PRAGMA table_info(sheets)");
     while (cols.row())
         impl_->sheetCols.insert(columnText(cols.value, 1));  // col 1 = name
+    // Optional stitcher affinities edge table (hercuvit stitcher infer): detect once so the
+    // UI only offers affinity colouring on a file that actually has it.
+    {
+        Statement t(impl_->db,
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='affinities' LIMIT 1");
+        impl_->hasAffinities = t.row();
+    }
 }
 
 SheetCollection::~SheetCollection() = default;
@@ -402,6 +410,29 @@ std::string SheetCollection::annotation(int64_t sheetId) const
     Statement s(impl_->db, "SELECT annotation FROM sheets WHERE id=?");
     s.bind(1, sheetId);
     return s.row() ? columnText(s.value, 0) : std::string{};
+}
+
+bool SheetCollection::hasAffinities() const { return impl_->hasAffinities; }
+
+std::vector<std::pair<int64_t, double>> SheetCollection::affinities(int64_t src) const
+{
+    std::vector<std::pair<int64_t, double>> out;
+    if (!impl_->hasAffinities)
+        return out;
+    Statement s(impl_->db, "SELECT dst, logit FROM affinities WHERE src=?");
+    s.bind(1, src);
+    while (s.row())
+        out.emplace_back(sqlite3_column_int64(s.value, 0), sqlite3_column_double(s.value, 1));
+    return out;
+}
+
+std::vector<std::pair<int64_t, std::string>> SheetCollection::sheetWindows() const
+{
+    std::vector<std::pair<int64_t, std::string>> out;
+    Statement s(impl_->db, "SELECT id, window FROM sheets");
+    while (s.row())
+        out.emplace_back(sqlite3_column_int64(s.value, 0), columnText(s.value, 1));
+    return out;
 }
 
 std::vector<SheetMesh> SheetCollection::region(

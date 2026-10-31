@@ -19,6 +19,7 @@ class QDockWidget;
 class QLabel;
 class QCheckBox;
 class QComboBox;
+class QPushButton;
 class QDoubleSpinBox;
 class QSpinBox;
 class QTimer;
@@ -72,8 +73,12 @@ private:
     struct View;  // per-viewport cache + in-flight query (defined in the .cpp)
 
     // How sheet curves are coloured. Solid = one colour; Rainbow = a per-sheet hue (id
-    // hash); the rest map a per-sheet quality metric through a red->green ramp.
-    enum class ColourMode { Solid, Rainbow, Confidence, Coverage, MassFrac, FitRms };
+    // hash); the quality metrics map a per-sheet value through a red->green ramp. Affinity
+    // (stitch mode only, on an affinities-bearing .asv) shades every sheet by its softmaxed
+    // stitcher affinity to the latest selected sheet, blue (0) -> red (1).
+    enum class ColourMode { Solid, Rainbow, Confidence, Coverage, MassFrac, FitRms, Affinity };
+    // The selection resolved to an EFFECTIVE mode: Affinity falls back to the default when a
+    // stitch is not active or the .asv has no affinities, so it is never drawn when invalid.
     ColourMode colourMode() const;
 
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
@@ -92,6 +97,23 @@ private:
     // Per-sheet quality thresholds from the dock spinboxes (empty when all at default).
     vc::sheets::QualityFilter qualityFilter() const;
     void showQualityHelp();  // popup explaining the .asv per-sheet quality columns
+
+    // --- affinity colouring (stitch mode) -----------------------------------
+    // The reference sheet whose affinities colour the view: the latest selected sheet
+    // (most-recently added, else the anchor). 0 when not stitching.
+    int64_t affinityReference() const;
+    // Recompute affinityVals_ (softmax of the reference's affinities, winner normalised to
+    // 1) when the reference changed. Cheap, cached; a no-op if the reference is unchanged.
+    void ensureAffinityValues();
+    // Enable/disable the Affinity combo item for the current (.asv has-affinities × stitch)
+    // state, and pull a stale Affinity selection back to the default so it is never active
+    // when invalid (avoids colouring by an empty map after a reload or on exit).
+    void refreshAffinityAvailability();
+
+    // Auto-stitch: from the latest selected sheet, agglomerate the affinity graph over the
+    // (2*radius+1)^3 block of windows around it (GASP, average linkage over the signed logits)
+    // and add the sheet's resulting cluster to the stitch. Requires an affinities table.
+    void autoStitch();
 
     // --- manual sheet stitching ---------------------------------------------
     // One drawn sheet's slice crossing in scene coords, kept so a click can be
@@ -139,6 +161,8 @@ private:
     QDoubleSpinBox* minCoverage_{};    // hide sheets below this mask coverage (0..1)
     QDoubleSpinBox* minMassFrac_{};    // hide sheets below this normalised mass fraction (0..1)
     QDoubleSpinBox* maxFitRms_{};      // hide sheets with worse mesh-vs-mask RMS (um); 0 = off
+    QPushButton* autoStitch_{};        // GASP auto-expand the stitch from the latest selected sheet
+    QSpinBox* autoRadius_{};           // window-neighbourhood radius for auto-stitch (±N windows)
 
     std::unique_ptr<vc::sheets::SheetCollection> reader_;  // UI-thread: metadata/count only
     QString path_;
@@ -171,4 +195,9 @@ private:
     std::unordered_map<VolumeViewerBase*, std::vector<SheetHit>> hits_;  // per-viewer hit geometry
     std::map<int64_t, vc::sheets::Mesh> selMeshes_;  // decoded meshes of the selected sheets
     vc::sheets::Mesh consolidatedBase_;  // baked interpolated base (pseudo-sheet); empty = none
+
+    // Affinity colouring state.
+    bool hasAffinities_{false};                     // the open .asv carries an affinities table
+    int64_t affinityRef_{0};                        // sheet affinityVals_ was computed for (0 = none)
+    std::unordered_map<int64_t, double> affinityVals_;  // dst sheet id -> softmaxed affinity (winner = 1)
 };

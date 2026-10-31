@@ -158,6 +158,19 @@ public:
     Mesh mesh(int64_t sheetId) const;
     std::string annotation(int64_t sheetId) const;
 
+    // True if this .asv carries a stitcher `affinities` edge table (written by
+    // `hercuvit stitcher infer`). Affinity colouring is only offered when this holds.
+    bool hasAffinities() const;
+    // Affinities FROM sheet `src` to its in-range neighbours as (dst id, logit),
+    // one indexed lookup on `src` (both directions are stored, so this is complete).
+    // Empty when there is no affinities table or `src` has no neighbours.
+    std::vector<std::pair<int64_t, double>> affinities(int64_t src) const;
+
+    // (id, window) for every sheet, so a caller can pick the sheets whose source window
+    // lies in a neighbourhood of another's (the window id is "z<Z>_y<Y>_x<X>", the native-L0
+    // window origin). One scan of the `sheets` table.
+    std::vector<std::pair<int64_t, std::string>> sheetWindows() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
