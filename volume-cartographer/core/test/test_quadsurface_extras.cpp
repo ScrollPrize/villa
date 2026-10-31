@@ -10,7 +10,7 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -156,7 +156,7 @@ TEST_CASE("channel: on-disk file load (no in-memory mat)")
     seed.save(d);
     // 32x32 image with untiled (single strip) write.
     cv::Mat sideCh(32, 32, CV_8UC1, cv::Scalar(123));
-    writeTiff(d / "side.tif", sideCh, CV_8UC1, /*tileW=*/0, /*tileH=*/0);
+    vcr::sources::writeTiff(d / "side.tif", sideCh.data, "|u1", sideCh.rows, sideCh.cols);
 
     QuadSurface reloaded(d);
     reloaded.setChannel("side", cv::Mat());
@@ -201,7 +201,9 @@ TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid point
     // Write a 129x129 mask of all 255 (no trimming) just to exercise the
     // mask-application code path.
     cv::Mat mask(129, 129, CV_8UC1, cv::Scalar(255));
-    writeTiff(dst / "mask.tif", mask, CV_8UC1, /*tileW=*/128, /*tileH=*/128);
+    vcr::sources::TiffOptions tiled;
+    tiled.tile = std::array<int, 2>{128, 128};
+    vcr::sources::writeTiff(dst / "mask.tif", mask.data, "|u1", mask.rows, mask.cols, 1, tiled);
 
     auto qs = load_quad_from_tifxyz(dst.string(), 0);
     REQUIRE(qs);

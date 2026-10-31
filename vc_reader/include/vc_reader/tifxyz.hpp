@@ -86,6 +86,16 @@ private:
 // A whole surface. Without `useMask`, mask.tif is ignored. A stored bounding box with a missing-point marker becomes the real extent.
 [[nodiscard]] Surface read(const std::string& location, bool useMask = true, const sources::OptionsFor& options = {});
 
+// The grid as stored, rows x cols x 3 XYZ floats, for callers applying their own rule to which
+// vertices count. `window` (row, column, rows, columns), inside the grid, decodes only the strips
+// and tiles it touches.
+struct Coordinates {
+    std::int64_t rows = 0, cols = 0;  // of what was read
+    std::array<std::int64_t, 2> whole{};  // of the grid
+    std::vector<float> xyz;
+};
+[[nodiscard]] Coordinates readCoordinates(const std::string& location, const std::optional<std::array<std::int64_t, 4>>& window = std::nullopt, const sources::OptionsFor& options = {});
+
 struct Entry {
     std::string location;
     Metadata metadata;

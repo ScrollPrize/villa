@@ -7,7 +7,6 @@
 #include "vc/core/util/GrowthMask.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -2274,7 +2273,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
                   << " holes, " << inpaint_skip << " skipped" << std::endl;
 
         auto surf = new QuadSurface(result_points_storage.release(), {1/T, 1/T});
-        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setDpi(voxelsize > 0 ? float(25400.0 / voxelsize) : 0.f);
         surf->setChannel("generations", resume_generations.clone());
 
         if (!mask.empty()) {
@@ -2333,7 +2332,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
         cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
-        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setDpi(voxelsize > 0 ? float(25400.0 / voxelsize) : 0.f);
         surf->setChannel("generations", generations_crop.clone());
 
         if (params.value("vis_losses", false)) {

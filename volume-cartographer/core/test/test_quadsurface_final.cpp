@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -58,7 +58,7 @@ TEST_CASE("invalidateMask removes the on-disk mask.tif")
         seed.save(segDir);
     }
     cv::Mat mask(8, 8, CV_8UC1, cv::Scalar(255));
-    writeTiff(segDir / "mask.tif", mask, CV_8UC1, /*tileW=*/0, /*tileH=*/0);
+    vcr::sources::writeTiff(segDir / "mask.tif", mask.data, "|u1", mask.rows, mask.cols);
     REQUIRE(fs::exists(segDir / "mask.tif"));
 
     QuadSurface qs(segDir);

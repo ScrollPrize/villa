@@ -410,7 +410,6 @@ vc_add_test(NAME test_gridstore_malformed)
 # Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
-vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)
 
@@ -424,7 +423,6 @@ vc_add_test(NAME test_normal_grid_generate)
 
 vc_add_test(NAME test_surface_patch_index)
 
-vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_global_cache_root)
 
@@ -433,7 +431,6 @@ vc_add_test(NAME test_global_cache_root)
 vc_add_test(NAME test_normal_grid_live)
 set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
-vc_add_test(NAME test_tiff_more)
 
 vc_add_test(NAME test_geometry)
 

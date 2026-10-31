@@ -30,7 +30,6 @@ add_library(vc_core
         src/QuadSurfaceStore.cpp
         src/StoreSurfaces.cpp
         src/SurfaceMeshing.cpp
-        src/Tiff.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteCacheSettings.cpp

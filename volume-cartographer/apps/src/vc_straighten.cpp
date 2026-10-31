@@ -25,7 +25,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Rect3D.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include "utils/Json.hpp"
 
@@ -116,14 +116,16 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
 
     std::vector<cv::Mat> xyz;
     cv::split(P, xyz);
-    writeTiff(outdir / "x.tif", xyz[0], -1, 0, 0, -1.0f, COMPRESSION_ADOBE_DEFLATE);
-    writeTiff(outdir / "y.tif", xyz[1], -1, 0, 0, -1.0f, COMPRESSION_ADOBE_DEFLATE);
-    writeTiff(outdir / "z.tif", xyz[2], -1, 0, 0, -1.0f, COMPRESSION_ADOBE_DEFLATE);
+    vcr::sources::TiffOptions tiff;
+    tiff.compression = "deflate";
+    vcr::sources::writeTiff(outdir / "x.tif", xyz[0].data, "<f4", g.H(), g.W(), 1, tiff);
+    vcr::sources::writeTiff(outdir / "y.tif", xyz[1].data, "<f4", g.H(), g.W(), 1, tiff);
+    vcr::sources::writeTiff(outdir / "z.tif", xyz[2].data, "<f4", g.H(), g.W(), 1, tiff);
     cv::Mat mask(g.H(), g.W(), CV_8U);
     for (int r = 0; r < g.H(); ++r)
         for (int c = 0; c < g.W(); ++c)
             mask.at<uint8_t>(r, c) = g.valid(r, c) ? 255 : 0;
-    writeTiff(outdir / "mask.tif", mask, -1, 0, 0, 0.0f, COMPRESSION_ADOBE_DEFLATE);
+    vcr::sources::writeTiff(outdir / "mask.tif", mask.data, "|u1", g.H(), g.W(), 1, tiff);
 
     Json meta;
     const fs::path sm = srcdir / "meta.json";

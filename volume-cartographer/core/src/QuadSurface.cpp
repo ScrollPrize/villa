@@ -4,8 +4,10 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/util/Tiff.hpp"
 #include <vc_object_store/Tiff.hpp>
+#include <vc_reader/image_write.hpp>
+#include <vc_reader/source_reader.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 
@@ -250,6 +252,13 @@ bool readSamplesTiffFirst(const std::filesystem::path& path)
     return samples == 2 || samples > 4;
 }
 
+vcr::sources::TiffOptions tiffOptions(float dpi)
+{
+    vcr::sources::TiffOptions options;
+    if (dpi > 0) options.pixelUm = 25400.0 / dpi;
+    return options;
+}
+
 // OpenCV depths as TIFF samples (TiffSamples::bits, sampleFormat).
 bool tiffSampleFormat(int depth, uint16_t& bits, uint16_t& format)
 {
@@ -390,20 +399,15 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
                                  (path / "meta.json").string());
     }
 
-    uint32_t width = 0;
-    uint32_t height = 0;
-    const auto xPath = path / "x.tif";
-    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
-    if (!tif) {
-        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
-    }
-    const bool haveGeometry =
-        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
-        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
-    TIFFClose(tif);
-    if (!haveGeometry || width == 0 || height == 0) {
-        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
-    }
+    vcr::sources::Source xSource;
+    xSource.id = (path / "x.tif").string();
+    xSource.storage.location = xSource.id;
+    xSource.storage.format = "tiff";
+    xSource.role = "scalar";
+    xSource.axes = std::vector<std::string>{"y", "x"};
+    vcr::sources::SourceReader xReader(vcr::sources::finished(std::move(xSource)), {});
+    const auto height = xReader.shape()[0];
+    const auto width = xReader.shape()[1];
 
     LazySurfaceGeometry result;
     result.scale = *scale;
@@ -971,7 +975,11 @@ void QuadSurface::writeValidMask(const cv::Mat& img)
     cv::Mat_<uint8_t> mask = validMask();
 
     if (img.empty()) {
-        writeTiff(maskPath, mask, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+        const cv::Mat stored = mask.isContinuous() ? cv::Mat(mask) : mask.clone();
+        auto options = tiffOptions(dpi_);
+        options.compression = "lzw";
+        options.tile = std::array<int, 2>{1024, 1024};
+        vcr::sources::writeTiff(maskPath, stored.data, "|u1", stored.rows, stored.cols, 1, options);
     } else {
         std::vector<cv::Mat> layers = {mask, img};
         cv::imwritemulti(maskPath.string(), layers);
@@ -1349,7 +1357,9 @@ void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::
         (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
     {
         try {
-            writeTiff(dir / (name + ".tif"), mat, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+            const cv::Mat stored = mat.isContinuous() ? mat : mat.clone();
+            const char* dtype = mat.type() == CV_8UC1 ? "|u1" : mat.type() == CV_16UC1 ? "<u2" : "<f4";
+            vcr::sources::writeTiff(dir / (name + ".tif"), stored.data, dtype, stored.rows, stored.cols, 1, tiffOptions(dpi_));
             wrote = true;
         } catch (...) {
             wrote = false; // Fall back to OpenCV
@@ -1374,9 +1384,10 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     cv::split((*_points), xyz);
 
     // QuadSurface tifxyz files are written as untiled, uncompressed TIFFs.
-    writeTiff(dir / "x.tif", xyz[0], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
-    writeTiff(dir / "y.tif", xyz[1], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
-    writeTiff(dir / "z.tif", xyz[2], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+    const auto options = tiffOptions(dpi_);
+    vcr::sources::writeTiff(dir / "x.tif", xyz[0].data, "<f4", xyz[0].rows, xyz[0].cols, 1, options);
+    vcr::sources::writeTiff(dir / "y.tif", xyz[1].data, "<f4", xyz[1].rows, xyz[1].cols, 1, options);
+    vcr::sources::writeTiff(dir / "z.tif", xyz[2].data, "<f4", xyz[2].rows, xyz[2].cols, 1, options);
 
     // Save additional channels
     for (auto const& [name, mat] : _channels) {
@@ -1725,334 +1736,26 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
 {
     recoverIncompleteSave(path);
 
-    cv::Rect loadedRegion;
-    auto read_band_into = [&requestedRegion, &loadedRegion](
-                             const std::filesystem::path& fpath,
-                             cv::Mat_<cv::Vec3f>& points,
-                             int channel,
-                             int& outW, int& outH) -> void
-    {
-        TIFF* tif = TIFFOpen(fpath.string().c_str(), "r");
-        if (!tif) {
-            throw std::runtime_error("Failed to open TIFF: " + fpath.string());
-        }
-
-        // Basic geometry
-        uint32_t W=0, H=0;
-        if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &W) ||
-            !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &H)) {
-            TIFFClose(tif);
-            throw std::runtime_error("TIFF missing width/height: " + fpath.string());
-        }
-
-        uint16_t spp = 1; TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-        if (spp != 1) {
-            TIFFClose(tif);
-            throw std::runtime_error("Expected 1 sample per pixel in " + fpath.string());
-        }
-        uint16_t bps = 0;  TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bps);
-        uint16_t fmt = SAMPLEFORMAT_UINT; TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &fmt);
-        const int bytesPer = (bps + 7) / 8;
-        if (!(bps==8 || bps==16 || bps==32 || bps==64)) {
-            TIFFClose(tif);
-            throw std::runtime_error("Unsupported BitsPerSample in " + fpath.string());
-        }
-
-        const cv::Rect fullRegion(0, 0, static_cast<int>(W), static_cast<int>(H));
-        const cv::Rect bandRegion = requestedRegion.value_or(fullRegion);
-        if (bandRegion.width <= 0 || bandRegion.height <= 0
-            || (bandRegion & fullRegion) != bandRegion) {
-            TIFFClose(tif);
-            throw std::runtime_error("Requested TIFF region is out of bounds in "
-                                     + fpath.string());
-        }
-
-        // Allocate destination if first band.
-        if (points.empty()) {
-            points.create(bandRegion.height, bandRegion.width);
-            // Initialize as invalid
-            for (int y=0;y<points.rows;++y)
-                for (int x=0;x<points.cols;++x)
-                    points(y,x) = cv::Vec3f(-1.f,-1.f,-1.f);
-            outW = static_cast<int>(W);
-            outH = static_cast<int>(H);
-            loadedRegion = bandRegion;
-        } else {
-            if (outW != static_cast<int>(W) || outH != static_cast<int>(H)
-                || loadedRegion != bandRegion) {
-                TIFFClose(tif);
-                throw std::runtime_error("Band size mismatch in " + fpath.string());
-            }
-        }
-
-        auto to_float = [fmt,bps,bytesPer](const uint8_t* p)->float {
-            float v=0.f;
-            switch(fmt) {
-                case SAMPLEFORMAT_IEEEFP:
-                    if (bps==32) { std::memcpy(&v, p, 4); return v; }
-                    if (bps==64) { double d=0.0; std::memcpy(&d, p, 8); return static_cast<float>(d); }
-                    break;
-                case SAMPLEFORMAT_UINT:
-                {
-                    if (bps==8)  { uint8_t  t=*p; return static_cast<float>(t); }
-                    if (bps==16) { uint16_t t; std::memcpy(&t,p,2); return static_cast<float>(t); }
-                    if (bps==32) { uint32_t t; std::memcpy(&t,p,4); return static_cast<float>(t); }
-                } break;
-                case SAMPLEFORMAT_INT:
-                {
-                    if (bps==8)  { int8_t  t=*reinterpret_cast<const int8_t*>(p); return static_cast<float>(t); }
-                    if (bps==16) { int16_t t; std::memcpy(&t,p,2); return static_cast<float>(t); }
-                    if (bps==32) { int32_t t; std::memcpy(&t,p,4); return static_cast<float>(t); }
-                } break;
-                default: break;
-            }
-            // Last resort: treat as 32-bit float bytes
-            std::memcpy(&v, p, std::min(bytesPer, (int)sizeof(float)));
-            return v;
-        };
-
-        if (TIFFIsTiled(tif)) {
-            uint32_t tileW=0, tileH=0;
-            TIFFGetField(tif, TIFFTAG_TILEWIDTH,  &tileW);
-            TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH);
-            if (tileW==0 || tileH==0) {
-                TIFFClose(tif);
-                throw std::runtime_error("Invalid tile geometry in " + fpath.string());
-            }
-            const tmsize_t tileBytes = TIFFTileSize(tif);
-            std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
-
-            const uint32_t firstTileY =
-                static_cast<uint32_t>(loadedRegion.y) / tileH * tileH;
-            const uint32_t firstTileX =
-                static_cast<uint32_t>(loadedRegion.x) / tileW * tileW;
-            const uint32_t regionEndY =
-                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
-            const uint32_t regionEndX =
-                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
-            for (uint32_t y0=firstTileY; y0<regionEndY; y0+=tileH) {
-                const uint32_t copyY0 =
-                    std::max(y0, static_cast<uint32_t>(loadedRegion.y));
-                const uint32_t copyY1 = std::min(
-                    std::min(y0 + tileH, H), regionEndY);
-                for (uint32_t x0=firstTileX; x0<regionEndX; x0+=tileW) {
-                    const uint32_t copyX0 =
-                        std::max(x0, static_cast<uint32_t>(loadedRegion.x));
-                    const uint32_t copyX1 = std::min(
-                        std::min(x0 + tileW, W), regionEndX);
-                    const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
-                    tmsize_t n = TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes);
-                    if (n < 0) {
-                        // fill with zeros on read error
-                        std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                    }
-                    for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
-                        const uint32_t ty = sourceY - y0;
-                        const uint8_t* row = tileBuf.data() + (static_cast<size_t>(ty)*tileW*bytesPer);
-                        for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
-                            const uint32_t tx = sourceX - x0;
-                            float fv = to_float(row + static_cast<size_t>(tx)*bytesPer);
-                            cv::Vec3f& dst = points(
-                                static_cast<int>(sourceY) - loadedRegion.y,
-                                static_cast<int>(sourceX) - loadedRegion.x);
-                            dst[channel] = fv;
-                        }
-                    }
-                }
-            }
-        } else {
-            const tmsize_t scanBytes = TIFFScanlineSize(tif);
-            std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-            const uint32_t endY =
-                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
-            const uint32_t endX =
-                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
-            for (uint32_t y=static_cast<uint32_t>(loadedRegion.y); y<endY; ++y) {
-                if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
-                    std::fill(scanBuf.begin(), scanBuf.end(), 0);
-                }
-                const uint8_t* row = scanBuf.data();
-                for (uint32_t x=static_cast<uint32_t>(loadedRegion.x); x<endX; ++x) {
-                    float fv = to_float(row + static_cast<size_t>(x)*bytesPer);
-                    cv::Vec3f& dst = points(
-                        static_cast<int>(y) - loadedRegion.y,
-                        static_cast<int>(x) - loadedRegion.x);
-                    dst[channel] = fv;
-                }
-            }
-        }
-        TIFFClose(tif);
-    };
-
     // Read meta first (scale, uuid, etc.)
     auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
     cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
 
-    auto points = std::make_unique<cv::Mat_<cv::Vec3f>>();
-    int W=0, H=0;
-    read_band_into(std::filesystem::path(path)/"x.tif", *points, 0, W, H);
-    read_band_into(std::filesystem::path(path)/"y.tif", *points, 1, W, H);
-    read_band_into(std::filesystem::path(path)/"z.tif", *points, 2, W, H);
+    std::optional<std::array<std::int64_t, 4>> window;
+    if (requestedRegion) window = std::array<std::int64_t, 4>{requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width};
+    const auto stored = vcr::tifxyz::readCoordinates(path.string(), window);
+    auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(int(stored.rows), int(stored.cols));
+    std::memcpy(points->data, stored.xyz.data(), stored.xyz.size() * sizeof(float));
 
-    // Missing vertices by the store's validity rule.
-    for (int j=0;j<points->rows;++j)
-        for (int i=0;i<points->cols;++i) {
-            const cv::Vec3f& p = (*points)(j,i);
-            if (!vc::geometry::validSurfacePoint(p))
-                (*points)(j,i) = cv::Vec3f(-1.f,-1.f,-1.f);
+    std::vector<std::uint8_t> mask;
+    if (!(flags & SURF_LOAD_IGNORE_MASK)) mask = vcr::tifxyz::readMask(path.string(), stored.whole[0], stored.whole[1]);
+    const auto offsetY = window ? (*window)[0] : 0, offsetX = window ? (*window)[1] : 0;
+    // Missing vertices by the store's validity rule, and the mask.
+    for (int j = 0; j < points->rows; ++j)
+        for (int i = 0; i < points->cols; ++i) {
+            const bool masked = !mask.empty() && !mask[std::size_t(j + offsetY) * std::size_t(stored.whole[1]) + std::size_t(i + offsetX)];
+            if (masked || !vc::geometry::validSurfacePoint((*points)(j, i)))
+                (*points)(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
         }
-
-    // Optional mask
-    const std::filesystem::path maskPath = std::filesystem::path(path)/"mask.tif";
-    if (!(flags & SURF_LOAD_IGNORE_MASK) && std::filesystem::exists(maskPath)) {
-        TIFF* mtif = TIFFOpen(maskPath.string().c_str(), "r");
-        if (mtif) {
-            uint32_t mW=0, mH=0;
-            TIFFGetField(mtif, TIFFTAG_IMAGEWIDTH, &mW);
-            TIFFGetField(mtif, TIFFTAG_IMAGELENGTH, &mH);
-            if (mW!=0 && mH!=0) {
-                uint16_t bps=0, fmt=SAMPLEFORMAT_UINT;
-                TIFFGetFieldDefaulted(mtif, TIFFTAG_BITSPERSAMPLE, &bps);
-                TIFFGetFieldDefaulted(mtif, TIFFTAG_SAMPLEFORMAT, &fmt);
-                uint16_t spp=1;
-                TIFFGetFieldDefaulted(mtif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-                uint16_t planarConfig = PLANARCONFIG_CONTIG;
-                TIFFGetFieldDefaulted(mtif, TIFFTAG_PLANARCONFIG, &planarConfig);
-                const int bytesPer = (bps+7)/8;
-                const uint16_t samplesPerPixel = std::max<uint16_t>(1, spp);
-                const bool isPlanarSeparate = (planarConfig == PLANARCONFIG_SEPARATE);
-                const size_t pixelStride = static_cast<size_t>(bytesPer) *
-                                           static_cast<size_t>(isPlanarSeparate ? 1 : samplesPerPixel);
-                auto computeScaleFactor = [](uint32_t maskDim, int targetDim) -> uint32_t {
-                    if (maskDim == static_cast<uint32_t>(targetDim)) {
-                        return 1;
-                    } else if (targetDim > 0 && (maskDim % static_cast<uint32_t>(targetDim)) == 0) {
-                        return maskDim / static_cast<uint32_t>(targetDim);
-                    } else {
-                        return 0;
-                    }
-                };
-                const uint32_t scaleX = computeScaleFactor(mW, W);
-                const uint32_t scaleY = computeScaleFactor(mH, H);
-                if (scaleX != 0 && scaleY != 0) {
-                    // Channel 0 encodes mask validity; later channels remain untouched.
-                    const double retainThreshold = [&]{
-                        switch(fmt) {
-                            case SAMPLEFORMAT_UINT:
-                            case SAMPLEFORMAT_INT:
-                            case SAMPLEFORMAT_IEEEFP:
-                                return 255.0;
-                        }
-                        return 255.0;
-                    }();
-                    auto to_valid = [fmt,bps,bytesPer,retainThreshold](const uint8_t* p)->bool{
-                        switch(fmt) {
-                            case SAMPLEFORMAT_IEEEFP:
-                                if (bps==32) { float v; std::memcpy(&v,p,4); return v>=static_cast<float>(retainThreshold); }
-                                if (bps==64) { double d; std::memcpy(&d,p,8); return d>=retainThreshold; }
-                                break;
-                            case SAMPLEFORMAT_UINT:
-                                if (bps==8)  return (*p)>=retainThreshold;
-                                if (bps==16) { uint16_t t; std::memcpy(&t,p,2); return t>=static_cast<uint16_t>(retainThreshold); }
-                                if (bps==32) { uint32_t t; std::memcpy(&t,p,4); return t>=static_cast<uint32_t>(retainThreshold); }
-                                break;
-                            case SAMPLEFORMAT_INT:
-                                if (bps==8)  { int8_t t=*reinterpret_cast<const int8_t*>(p);  return t>=static_cast<int8_t>(retainThreshold); }
-                                if (bps==16) { int16_t t; std::memcpy(&t,p,2); return t>=static_cast<int16_t>(retainThreshold); }
-                                if (bps==32) { int32_t t; std::memcpy(&t,p,4); return t>=static_cast<int32_t>(retainThreshold); }
-                                break;
-                        }
-                        // default
-                        return (*p)>=retainThreshold;
-                    };
-                    const cv::Vec3f invalidPoint(-1.f,-1.f,-1.f);
-                    auto invalidate = [&](uint32_t srcX, uint32_t srcY){
-                        const uint32_t dstX = (scaleX == 1) ? srcX : (srcX / scaleX);
-                        const uint32_t dstY = (scaleY == 1) ? srcY : (srcY / scaleY);
-                        if (dstX >= static_cast<uint32_t>(loadedRegion.x)
-                            && dstX < static_cast<uint32_t>(
-                                loadedRegion.x + loadedRegion.width)
-                            && dstY >= static_cast<uint32_t>(loadedRegion.y)
-                            && dstY < static_cast<uint32_t>(
-                                loadedRegion.y + loadedRegion.height)) {
-                            (*points)(static_cast<int>(dstY) - loadedRegion.y,
-                                      static_cast<int>(dstX) - loadedRegion.x) = invalidPoint;
-                        }
-                    };
-                    if (TIFFIsTiled(mtif)) {
-                        uint32_t tileW=0, tileH=0;
-                        TIFFGetField(mtif, TIFFTAG_TILEWIDTH,  &tileW);
-                        TIFFGetField(mtif, TIFFTAG_TILELENGTH, &tileH);
-                        const tmsize_t tileBytes = TIFFTileSize(mtif);
-                        std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
-                        const uint32_t maskX0 =
-                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
-                        const uint32_t maskY0 =
-                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
-                        const uint32_t maskX1 = std::min(
-                            mW, static_cast<uint32_t>(
-                                loadedRegion.x + loadedRegion.width) * scaleX);
-                        const uint32_t maskY1 = std::min(
-                            mH, static_cast<uint32_t>(
-                                loadedRegion.y + loadedRegion.height) * scaleY);
-                        const uint32_t firstTileX = maskX0 / tileW * tileW;
-                        const uint32_t firstTileY = maskY0 / tileH * tileH;
-                        for (uint32_t y0=firstTileY; y0<maskY1; y0+=tileH) {
-                            const uint32_t copyY0 = std::max(y0, maskY0);
-                            const uint32_t copyY1 =
-                                std::min(std::min(y0 + tileH, mH), maskY1);
-                            for (uint32_t x0=firstTileX; x0<maskX1; x0+=tileW) {
-                                const uint32_t copyX0 = std::max(x0, maskX0);
-                                const uint32_t copyX1 =
-                                    std::min(std::min(x0 + tileW, mW), maskX1);
-                                const ttile_t tidx = TIFFComputeTile(mtif, x0, y0, 0, 0);
-                                tmsize_t n = TIFFReadEncodedTile(mtif, tidx, tileBuf.data(), tileBytes);
-                                if (n < 0) std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                const size_t tileRowStride = static_cast<size_t>(tileW) * pixelStride;
-                                for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
-                                    const uint32_t ty = sourceY - y0;
-                                    const uint8_t* row = tileBuf.data() + static_cast<size_t>(ty) * tileRowStride;
-                                    for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
-                                        const uint32_t tx = sourceX - x0;
-                                        const uint8_t* px = row + static_cast<size_t>(tx) * pixelStride;
-                                        if (!to_valid(px)) {
-                                            invalidate(sourceX, sourceY);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        const tmsize_t scanBytes = TIFFScanlineSize(mtif);
-                        std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-                        const uint32_t maskX0 =
-                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
-                        const uint32_t maskY0 =
-                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
-                        const uint32_t maskX1 = std::min(
-                            mW, static_cast<uint32_t>(
-                                loadedRegion.x + loadedRegion.width) * scaleX);
-                        const uint32_t maskY1 = std::min(
-                            mH, static_cast<uint32_t>(
-                                loadedRegion.y + loadedRegion.height) * scaleY);
-                        for (uint32_t y=maskY0; y<maskY1; ++y) {
-                            if (TIFFReadScanline(mtif, scanBuf.data(), y, 0) != 1) {
-                                std::fill(scanBuf.begin(), scanBuf.end(), 0);
-                            }
-                            const uint8_t* row = scanBuf.data();
-                            for (uint32_t x=maskX0; x<maskX1; ++x) {
-                                const uint8_t* px = row + static_cast<size_t>(x) * pixelStride;
-                                if (!to_valid(px)) {
-                                    invalidate(x, y);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            TIFFClose(mtif);
-        }
-    }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     if (!requestedRegion) surf->path = path;

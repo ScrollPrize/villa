@@ -132,6 +132,26 @@ int main()
             CHECK(r[0] == p[0] && r[1] == p[1]);
         }
     }
+    // Coordinates as stored: the whole grid and a window of it.
+    {
+        auto surface = plane(40, 50, 1, "w");
+        const auto path = root / "window";
+        tifxyz::write(path, surface);
+        const auto whole = tifxyz::readCoordinates(path.string());
+        CHECK(whole.rows == 40 && whole.cols == 50 && whole.xyz == surface.xyz());
+        const auto part = tifxyz::readCoordinates(path.string(), std::array<std::int64_t, 4>{3, 4, 5, 6});
+        CHECK(part.rows == 5 && part.cols == 6 && part.whole[0] == 40);
+        for (int r = 0; r < 5; ++r)
+            for (int c = 0; c < 6; ++c)
+                for (int a = 0; a < 3; ++a) CHECK(part.xyz[std::size_t(r * 6 + c) * 3 + a] == whole.xyz[std::size_t((r + 3) * 50 + c + 4) * 3 + a]);
+        bool outside = false;
+        try {
+            (void)tifxyz::readCoordinates(path.string(), std::array<std::int64_t, 4>{38, 0, 5, 6});
+        } catch (const std::exception&) {
+            outside = true;
+        }
+        CHECK(outside);
+    }
     // Plain images: strips, tiles in any order, page stacks, zero pages, first page, mappable or not.
     {
         namespace src = vcr::sources;

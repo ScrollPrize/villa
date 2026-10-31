@@ -283,6 +283,39 @@ Surface read(const std::string& location, bool useMask, const sources::OptionsFo
     return out;
 }
 
+Coordinates readCoordinates(const std::string& location, const std::optional<std::array<std::int64_t, 4>>& window, const sources::OptionsFor& options)
+{
+    Coordinates out;
+    const auto component = [&](const std::string& name, std::size_t axis) {
+        sources::Source source;
+        source.id = child(location, name);
+        source.storage.location = source.id;
+        source.storage.format = "tiff";
+        source.role = "scalar";
+        source.axes = std::vector<std::string>{"y", "x"};
+        auto settings = settingsOf(options);
+        settings.decodedCacheBytes = std::nullopt;
+        sources::SourceReader reader(sources::finished(std::move(source)), std::move(settings));
+        const auto& shape = reader.shape();
+        const std::array<std::int64_t, 2> whole{shape[0], shape[1]};
+        const auto box = window.value_or(std::array<std::int64_t, 4>{0, 0, shape[0], shape[1]});
+        if (box[2] <= 0 || box[3] <= 0 || box[0] < 0 || box[1] < 0 || box[0] + box[2] > shape[0] || box[1] + box[3] > shape[1]) bad(location + ": window is outside the coordinate grid");
+        if (!axis) {
+            out.whole = whole;
+            out.rows = box[2];
+            out.cols = box[3];
+            out.xyz.resize(std::size_t(box[2]) * std::size_t(box[3]) * 3);
+        } else if (whole != out.whole) {
+            bad(location + ": tifxyz coordinates require matching YX grids");
+        }
+        copyComponent(reader.read({box[0], box[1]}, {box[2], box[3]}), out.xyz.data() + axis);
+    };
+    component("x.tif", 0);
+    component("y.tif", 1);
+    component("z.tif", 2);
+    return out;
+}
+
 std::vector<Entry> list(const std::string& folder, bool recursive, const std::optional<std::array<double, 2>>& zRange, const sources::OptionsFor& options)
 {
     const auto optionsFor = resolved(options);

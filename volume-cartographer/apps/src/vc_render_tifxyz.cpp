@@ -2,7 +2,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/Tiff.hpp"
+#include <vc_reader/image_write.hpp>
+#include <vc_reader/source_reader.hpp>
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -19,6 +20,8 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <filesystem>
+#include <map>
 #include <atomic>
 #include <boost/program_options.hpp>
 #include <limits>
@@ -403,7 +406,7 @@ static void renderTiles(
     int rotQuad, int flipAxis, int cvType,
     size_t CH, size_t CW, size_t tilesX, uint32_t rowStart, uint32_t rowEnd,
     vcr::zarr::Writer* dsOut,                 // null: no zarr output
-    std::vector<TiffWriter>* tifWriters,      // null: no TIFF output
+    std::vector<std::unique_ptr<vcr::sources::TiffWriter>>* tifWriters,      // null: no TIFF output
     bool quickTif, bool resume)
 {
     const auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
@@ -483,7 +486,8 @@ static void renderTiles(
                     if (quickTif && cvType == CV_8UC1)
                         slices[zi] &= cv::Scalar(0xF0);
                     std::lock_guard lock(tifLocks[zi]);
-                    (*tifWriters)[zi].writeTile(uint32_t(x0), uint32_t(y0), slices[zi]);
+                    const cv::Mat tile = slices[zi].isContinuous() ? slices[zi] : slices[zi].clone();
+                    (*tifWriters)[zi]->writeTile(y0, x0, tile.data, tile.rows, tile.cols);
                 }
             }
 
@@ -538,6 +542,84 @@ struct ResolvedVoxelSize {
         return source != VoxelSizeSource::Unspecified;
     }
 };
+
+static const char* tifDtypeOf(int cvType)
+{
+    return cvType == CV_8UC1 ? "|u1" : cvType == CV_16UC1 ? "<u2" : "<f4";
+}
+
+static bool readableTiff(const std::filesystem::path& path)
+{
+    try {
+        (void)vcr::sources::readImage(path.string());
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Merges the .partN.tif files of a multi-part render, tile by tile: a tile comes
+// from the first part that rendered anything there. The parts are removed.
+static bool mergeTiffParts(const std::string& outputPath, int numParts)
+{
+    std::filesystem::path outDir(outputPath);
+    if (!std::filesystem::is_directory(outDir)) outDir = outDir.parent_path();
+    if (outDir.empty()) outDir = ".";
+
+    std::map<std::filesystem::path, std::vector<std::filesystem::path>> groups;
+    for (const auto& entry : std::filesystem::directory_iterator(outDir)) {
+        const std::string fname = entry.path().filename().string();
+        const auto pos = fname.find(".part");
+        if (pos == std::string::npos || fname.find(".tif", pos) == std::string::npos) continue;
+        groups[outDir / (fname.substr(0, pos) + ".tif")].push_back(entry.path());
+    }
+    if (groups.empty()) {
+        logPrintf(stderr, "No .partN.tif files found in %s\n", outDir.c_str());
+        return false;
+    }
+
+    logPrintf(stdout, "Merging %zu TIFF(s) from %d parts...\n", groups.size(), numParts);
+    size_t failures = 0;
+    for (auto& [finalPath, partFiles] : groups) {
+        std::sort(partFiles.begin(), partFiles.end());
+        try {
+            std::vector<std::unique_ptr<vcr::sources::SourceReader>> parts;
+            for (const auto& part : partFiles)
+                parts.push_back(std::make_unique<vcr::sources::SourceReader>(vcr::sources::imageSource(part.string()), vcr::sources::SourceReader::Settings{}));
+            const auto rows = parts[0]->shape()[0], cols = parts[0]->shape()[1];
+            vcr::sources::TiffOptions tiff;
+            tiff.compression = "lzw";
+            tiff.tile = std::array<int, 2>{128, 128};
+            if (const auto& placement = parts[0]->resolved().storageFromArray) tiff.pixelUm = placement->forward(0, 0);
+            vcr::sources::TiffWriter out(finalPath, parts[0]->dtype(), rows, cols, 1, tiff);
+            size_t merged = 0;
+            for (std::int64_t y = 0; y < rows; y += 128)
+                for (std::int64_t x = 0; x < cols; x += 128) {
+                    const auto h = std::min<std::int64_t>(128, rows - y), w = std::min<std::int64_t>(128, cols - x);
+                    for (const auto& part : parts) {
+                        const auto block = part->read({y, x}, {h, w});
+                        if (std::all_of(block.data.get(), block.data.get() + block.nbytes, [](std::uint8_t b) { return b == 0; })) continue;
+                        out.writeTile(y, x, block.data.get(), h, w);
+                        ++merged;
+                        break;
+                    }
+                }
+            out.finish();
+            for (const auto& part : parts) part->close();
+            for (const auto& part : partFiles) std::filesystem::remove(part);
+            logPrintf(stdout, "  %s: %zu tiles from %zu parts\n", finalPath.filename().c_str(), merged, partFiles.size());
+        } catch (const std::exception& e) {
+            logPrintf(stderr, "Cannot merge %s: %s\n", finalPath.c_str(), e.what());
+            ++failures;
+        }
+    }
+    if (failures) {
+        logPrintf(stderr, "Merge failed: %zu of %zu TIFF(s) could not be created.\n", failures, groups.size());
+        return false;
+    }
+    logPrintf(stdout, "Merge complete.\n");
+    return true;
+}
 
 static const char* voxelSizeSourceName(VoxelSizeSource source)
 {
@@ -1050,7 +1132,7 @@ int main(int argc, char *argv[])
     }
 
     // Resolved below from the same CLI/metadata value used for OME-Zarr.
-    float tifDpi = 0.f;
+    std::optional<double> tifPixelUm;
 
     // --- Open source volume ---
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
@@ -1197,12 +1279,12 @@ int main(int argc, char *argv[])
             const double umPerOutputPixel = (ds_scale > 0 && tgt_scale > 0)
                 ? base_voxel_size / double(ds_scale) / double(tgt_scale)
                 : base_voxel_size;
-            tifDpi = voxelSizeToDpi(umPerOutputPixel);
+            tifPixelUm = umPerOutputPixel;
         } else {
             // There is no measurement to declare. Passing 0 tells writeZarrAttrs
             // that the physical size is unknown: it then writes no axis unit and
             // encodes only the relative pyramid scaling, keeping the multiscales
-            // discovery metadata intact. A zero tifDpi leaves the TIFF resolution
+            // discovery metadata intact. An unset tifPixelUm leaves the TIFF resolution
             // tags unset. Both outputs therefore say "unknown" instead of
             // inventing a size, and neither loses the image structure.
             logPrintf(stderr,
@@ -1383,7 +1465,7 @@ int main(int argc, char *argv[])
         }
 
         // ---- TIF setup (if requested) ----
-        std::vector<TiffWriter> tifWriters;
+        std::vector<std::unique_ptr<vcr::sources::TiffWriter>> tifWriters;
 
         if (wantTif) {
             int tifSlices = isCompositeMode ? 1 : num_slices;
@@ -1400,20 +1482,16 @@ int main(int argc, char *argv[])
                 return p;
             };
 
-            // Skip existing TIFFs only when explicitly resuming. A render
-            // killed mid-way (OOM, --timeout) leaves every slice with a
-            // header but no directory -- TiffWriter writes the IFD in
-            // close() -- and a bare exists() check would treat those torn
-            // files as done and skip them on every rerun (#1404).
-            // isReadableTiff also decodes every tile, so a slice whose
-            // directory survived but whose data did not is re-rendered too.
+            // Skip existing TIFFs only when explicitly resuming. A slice is
+            // published when complete, and reading it whole re-renders one
+            // whose data did not survive (#1404).
             bool tifSkip = false;
             if (resumeFlag && numParts <= 1) {
                 int missing = 0, torn = 0;
                 for (int z = 0; z < tifSlices; z++) {
                     const auto p = makePartPath(z);
                     if (!std::filesystem::exists(p)) missing++;
-                    else if (!isReadableTiff(p)) torn++;
+                    else if (!readableTiff(p)) torn++;
                 }
                 if (missing == 0 && torn == 0) {
                     if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return true; }
@@ -1426,10 +1504,12 @@ int main(int argc, char *argv[])
             }
             if (!tifSkip) {
                 // TIFF tiles are the render tiles (TIFF needs multiples of 16: 128).
-                uint16_t tifComp = quickTif ? COMPRESSION_PACKBITS : COMPRESSION_LZW;
+                vcr::sources::TiffOptions tiff;
+                tiff.compression = quickTif ? "packbits" : "lzw";
+                tiff.tile = std::array<int, 2>{int(CH), int(CW)};
+                tiff.pixelUm = tifPixelUm;
                 for (int z = 0; z < tifSlices; z++)
-                    tifWriters.emplace_back(makePartPath(z), uint32_t(outXY.width), uint32_t(outXY.height), cvType,
-                                            uint32_t(CW), uint32_t(CH), 0.0f, tifComp, tifDpi);
+                    tifWriters.push_back(std::make_unique<vcr::sources::TiffWriter>(makePartPath(z), tifDtypeOf(cvType), outXY.height, outXY.width, 1, tiff));
             }
         }
 
@@ -1463,6 +1543,7 @@ int main(int argc, char *argv[])
                     compositeMethod, rotQuad, flip_axis, cvType,
                     chunks0[1], chunks0[2], tilesX, rowStart, rowEnd,
                     dsOut.get(), tifs, quickTif, resumeFlag);
+            for (auto& writer : tifWriters) writer->finish();
             tifWriters.clear();
         }
 
