@@ -1733,7 +1733,7 @@ private:
             if (!http_ && found) ++stats_.disk_hits;
         } else {
             ++stats_.remote_fetches;
-            found = http_->get(spec_.remote_url + "/" + k, body, chunk_bytes_);
+            found = http_->get(joinLocation(spec_.remote_url, k), body, chunk_bytes_);
             stats_.remote_bytes += body.size();
         }
         if (!found) {

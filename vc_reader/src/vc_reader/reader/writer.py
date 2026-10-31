@@ -279,6 +279,10 @@ class ZarrWriter:
     def chunk_exists(self, chunk: Sequence[int]) -> bool:
         return self._native.chunk_exists([int(n) for n in chunk])
 
+    def stored_chunks(self) -> list[tuple[int, ...]]:
+        """Every stored chunk's index, in order, from a listing of the store."""
+        return [tuple(index) for index in self._native.stored_chunks()]
+
     def write_chunk(self, chunk: Sequence[int], data: Any) -> None:
         """One whole decoded chunk, without reading anything."""
         array = np.ascontiguousarray(np.asarray(data, self.dtype))

@@ -655,6 +655,34 @@ static void generalOptions(const fs::path& root)
 }
 
 // AWS's published example of signing a PUT ("Example: PUT Object", S3 API reference).
+static void storedChunks(const fs::path& root)
+{
+    using namespace vcr::zarr;
+    const std::vector<std::uint8_t> one(16, 7);
+    for (const int version : {2, 3}) {
+        CreateOptions options;
+        options.shape = {8, 8};
+        options.chunks = {4, 4};
+        options.dtype = "|u1";
+        options.version = version;
+        auto writer = Writer::create(root / ("stored" + std::to_string(version)), options);
+        require(writer.storedChunks().empty(), "a new array stores nothing");
+        writer.writeChunk({1, 0}, one.data(), one.size());
+        writer.writeChunk({0, 1}, one.data(), one.size());
+        require(writer.storedChunks() == std::vector<vcr::Index>{{0, 1}, {1, 0}}, "stored chunks in index order");
+    }
+    CreateOptions sharded;
+    sharded.shape = {8, 8};
+    sharded.chunks = {2, 2};
+    sharded.dtype = "|u1";
+    sharded.version = 3;
+    sharded.shardShape = {4, 4};
+    auto writer = Writer::create(root / "stored-sharded", sharded);
+    const std::vector<std::uint8_t> small(4, 7);
+    writer.writeChunk({1, 2}, small.data(), small.size());
+    require(writer.storedChunks() == std::vector<vcr::Index>{{1, 2}}, "a shard lists the chunks it holds");
+}
+
 void signsAwsPutExample()
 {
     const vcr::S3Key key{"AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "", "us-east-1"};
@@ -682,6 +710,7 @@ int main()
     try {
         fs::create_directories(root);
         generalOptions(root);
+        storedChunks(root);
         pyramidReductions(root);
         packbitsFilter(root);
         bytesCodecs();

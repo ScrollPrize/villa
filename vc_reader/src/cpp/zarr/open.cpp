@@ -802,7 +802,7 @@ std::optional<std::pair<Group::NodeKind, Json>> Group::node(const std::string& i
     std::lock_guard lock(*mutex_);
     if (const auto it = nodes_.find(key); it != nodes_.end())
         return it->second;
-    const auto location = location_ + "/" + key;
+    const auto location = joinLocation(location_, key);
     std::optional<std::pair<NodeKind, Json>> found;
     const bool offline = options_.offline && isRemote(location_);
     if (const auto meta = consolidated()) {
@@ -850,7 +850,7 @@ OpenedArray Group::array(const std::string& key)
     hints.group = location_;
     hints.levelKey = key;
     hints.metadata = n->second;
-    auto out = openArray(location_ + "/" + key, options_, std::move(hints));
+    auto out = openArray(joinLocation(location_, key), options_, std::move(hints));
     out.placement = placement(key);
     if (const auto meta = consolidated()) {
         out.attributes = meta->value(key + "/.zattrs", Json::object());
@@ -865,7 +865,7 @@ Group Group::group(const std::string& key)
     const auto n = node(key);
     if (!n || n->first != NodeKind::Group)
         throw std::out_of_range("no group '" + key + "' in " + location_);
-    const auto location = location_ + "/" + key;
+    const auto location = joinLocation(location_, key);
     if (version_ == 3)
         return Group::open(location, options_);
     Json attrs = Json::object();

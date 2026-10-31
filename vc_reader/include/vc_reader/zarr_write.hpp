@@ -116,6 +116,9 @@ public:
     // individual chunk's index entry, not merely the presence of this file.
     std::filesystem::path chunkPath(const Index& chunk) const;
     bool chunkExists(const Index& chunk) const;
+    // Every stored chunk, in index order, from a listing of the store: the grid is not scanned,
+    // except inside a shard, whose index is read per chunk.
+    std::vector<Index> storedChunks() const;
     // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.
     void writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size);
     // Skips a chunk that is entirely the fill value, removing any stored one. A

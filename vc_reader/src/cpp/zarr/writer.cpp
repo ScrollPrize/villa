@@ -6,10 +6,13 @@
 #include "format.hpp"
 #include "files.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -421,6 +424,64 @@ bool Writer::chunkExists(const Index& chunk) const
                impl_->shards->entry(shard.index, impl_->shards->locate(chunk).second, shard.total).has_value();
     }
     return impl_->store->exists(key);
+}
+
+std::vector<Index> Writer::storedChunks() const
+{
+    const auto& meta = impl_->meta;
+    const std::string prefix = meta.v3 ? meta.v3->prefix : "";
+    const auto rank = meta.shape.size();
+    Index grid(rank);
+    for (std::size_t i = 0; i < rank; ++i)
+        grid[i] = std::max<std::int64_t>(meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0), 1);
+    std::vector<Index> stored;
+    for (const auto& object : impl_->store->list(prefix)) {
+        Index index;
+        std::string_view rest(object.key);
+        rest.remove_prefix(prefix.size());
+        for (;;) {
+            const auto end = rest.find(meta.separator);
+            const auto part = rest.substr(0, end);
+            std::int64_t value = 0;
+            const auto parsed = std::from_chars(part.data(), part.data() + part.size(), value);
+            if (part.empty() || parsed.ec != std::errc{} || parsed.ptr != part.data() + part.size()) {
+                index.clear();
+                break;
+            }
+            index.push_back(value);
+            if (end == std::string_view::npos)
+                break;
+            rest.remove_prefix(end + meta.separator.size());
+        }
+        if (index.size() != rank)
+            continue;
+        if (!impl_->shards) {
+            bool inside = true;
+            for (std::size_t i = 0; i < rank; ++i)
+                inside &= index[i] >= 0 && index[i] < grid[i];
+            if (inside)
+                stored.push_back(std::move(index));
+            continue;
+        }
+        const auto& ratios = impl_->shards->ratios;
+        std::size_t count = 1;
+        for (std::size_t i = 0; i < rank; ++i)
+            count *= std::size_t(ratios[i]);
+        for (std::size_t n = 0; n < count; ++n) {
+            Index chunk(rank);
+            auto rem = n;
+            bool inside = true;
+            for (std::size_t i = rank; i-- > 0;) {
+                chunk[i] = index[i] * ratios[i] + std::int64_t(rem % std::size_t(ratios[i]));
+                rem /= std::size_t(ratios[i]);
+                inside &= chunk[i] >= 0 && chunk[i] < grid[i];
+            }
+            if (inside && chunkExists(chunk))
+                stored.push_back(std::move(chunk));
+        }
+    }
+    std::sort(stored.begin(), stored.end());
+    return stored;
 }
 
 void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size)

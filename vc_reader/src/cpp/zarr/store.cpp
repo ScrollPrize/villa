@@ -40,7 +40,7 @@ struct Store::Impl {
 
     std::string url(const std::string& name) const
     {
-        return access.url(name.empty() ? location : location + "/" + name);
+        return access.url(name.empty() ? location : joinLocation(location, name));
     }
 
     void needWritable() const

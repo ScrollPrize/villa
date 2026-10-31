@@ -29,6 +29,19 @@
 
 namespace vcr {
 
+// A key below a remote location; a query (a signed URL's token) stays at the end of the URL.
+// Anything without a scheme is a path, where ? and # are plain characters.
+inline std::string joinLocation(const std::string& location, const std::string& key)
+{
+    const auto query = location.find("://") == std::string::npos ? std::string::npos : location.find_first_of("?#");
+    if (query == std::string::npos)
+        return location + "/" + key;
+    auto end = query;
+    while (end > 0 && location[end - 1] == '/')
+        --end;
+    return location.substr(0, end) + "/" + key + location.substr(query);
+}
+
 struct HttpOptions {
     int connections = 16;          // concurrent requests (and kept-alive connections)
     long connect_timeout_ms = 10000;

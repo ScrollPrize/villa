@@ -483,6 +483,7 @@ NB_MODULE(_reader, m)
                 w.writeChunk(chunk, bytes, data.nbytes());
         }, "chunk"_a, "data"_a, "skip_empty"_a = false)
         .def("chunk_exists", &Writer::chunkExists, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("stored_chunks", &Writer::storedChunks, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_chunk", &Writer::removeChunk, "chunk"_a, nb::call_guard<nb::gil_scoped_release>())
         .def("set_fill_value", [](Writer& w, const nb::object& value) {
             const auto fill = to_json(value);

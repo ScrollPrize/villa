@@ -403,7 +403,7 @@ MetadataReader metadataReader(const Access& access, int connections)
         }
         std::vector<std::uint8_t> body;
         try {
-            if (!http->get(access.url(location + "/" + name), body))
+            if (!http->get(access.url(joinLocation(location, name)), body))
                 return std::nullopt;
         } catch (const HttpDenied& e) {
             if (access.kind == Access::Kind::Anonymous)

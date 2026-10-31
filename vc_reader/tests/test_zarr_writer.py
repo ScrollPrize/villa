@@ -175,3 +175,54 @@ def test_bytes_codecs_match_numcodecs():
     assert np.frombuffer(decoded, np.uint64).tolist() == records.tolist()
     with pytest.raises(RuntimeError):
         decompress_bytes(encoded, config, records.nbytes - 1)
+
+
+def test_stored_chunks_list_the_store(tmp_path):
+    w = ZarrWriter.create(tmp_path / "a.zarr", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1", compressor=None)
+    assert w.stored_chunks() == []
+    w[0:4, 4:8, 0:4] = 1
+    w[4:8, 0:4, 4:8] = 2
+    assert w.stored_chunks() == [(0, 1, 0), (1, 0, 1)]
+    v3 = ZarrWriter.create(tmp_path / "b.zarr", shape=(8, 8), chunks=(4, 4), dtype="|u1", version=3)
+    v3[4:8, 0:4] = 1
+    assert v3.stored_chunks() == [(1, 0)]
+    sharded = ZarrWriter.create(tmp_path / "c.zarr", shape=(8, 8), chunks=(2, 2), dtype="|u1", version=3, shards=(4, 4))
+    sharded[2:4, 4:6] = 1
+    assert sharded.stored_chunks() == [(1, 2)]
+
+
+def test_a_token_stays_at_the_end_of_every_url(tmp_path):
+    import http.server, threading, urllib.parse
+    from vc_reader.reader import open_group, open_zarr
+
+    expected = np.arange(512, dtype=np.uint8).reshape(8, 8, 8)
+    group = create_group(tmp_path / "g.zarr")
+    group.create_array("0", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1", compressor=None)[:] = expected
+    denied = []
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(tmp_path), **kwargs)
+
+        def do_GET(self):
+            url = urllib.parse.urlsplit(self.path)
+            if url.query != "token=a%2Fb":
+                denied.append(self.path)
+                self.send_error(403)
+                return
+            self.path = url.path
+            super().do_GET()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}/g.zarr"
+        assert np.array_equal(open_zarr(f"{base}/0?token=a%2Fb")[:], expected)
+        assert np.array_equal(open_zarr(f"{base}/0/?token=a%2Fb")[:], expected)
+        assert np.array_equal(open_group(f"{base}?token=a%2Fb")["0"][:], expected)
+        assert denied == []
+    finally:
+        server.shutdown()
