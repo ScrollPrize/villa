@@ -1,4 +1,5 @@
 #include "vc_reader/image_write.hpp"
+#include "../chunk_io.hpp"
 
 #include <tiffio.h>
 #include <unistd.h>
@@ -139,8 +140,7 @@ TiffWriter::TiffWriter(std::filesystem::path path, const std::string& dtype, std
     s.options = std::move(options);
     s.path = std::move(path);
     if (s.path.has_parent_path()) std::filesystem::create_directories(s.path.parent_path());
-    s.temporary = s.path;
-    s.temporary += "." + std::to_string(::getpid()) + ".tmp";
+    s.temporary = temporary_path(s.path.string());
     const auto bytes = std::size_t(s.options.pages) * std::size_t(rows) * std::size_t(cols) * s.pixel;
     // Large output, or compressed output that may not shrink, needs 64-bit offsets.
     s.tif.reset(TIFFOpen(s.temporary.c_str(), bytes >= (1ULL << 31) ? "w8" : "w"));

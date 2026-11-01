@@ -160,8 +160,7 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
 bool Store::readFile(const std::string& name, const fs::path& file) const
 {
     if (file.has_parent_path()) fs::create_directories(file.parent_path());
-    auto temporary = file;
-    temporary += "." + std::to_string(::getpid()) + ".tmp";
+    const fs::path temporary = temporary_path(file.string());
     const auto finish = [&](bool found) {
         if (found) fs::rename(temporary, file);
         else fs::remove(temporary);
