@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <functional>
+#include <optional>
 
 #include <QGraphicsView>
 #include <QPointF>
@@ -9,6 +11,7 @@
 
 #include <opencv2/core.hpp>
 #include "vc/core/util/PlaneSurface.hpp"
+#include "ViewerHud.hpp"
 
 class CVolumeViewerView : public QGraphicsView
 {
@@ -37,12 +40,38 @@ public:
         update();
     }
 
+    bool physicalUnits() const { return m_physicalUnits; }
+
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
     void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
     
     void showCoordinateFrame(bool visible);
     void setCoordinateFrame(PlaneSurface* plane);
+
+    // Measurement overlays drawn from the rendered frame (see ViewerHud.hpp).
+    void setHudOptions(const vc3d::hud::Options& options);
+    const vc3d::hud::Options& hudOptions() const { return _hud; }
+    // Line for the intensity profile, in viewport pixels; nullopt clears it.
+    void setProfileLine(std::optional<QLineF> line);
+    std::optional<QLineF> profileLine() const { return _profileLine; }
+    // How the overlays find volume positions: `sceneToVolume` gives NaN when the viewer
+    // shows nothing; `planar` says whether that map is affine (a plane view), which the
+    // grid needs; `extent` is the volume size in voxels (x, y, z), so the histogram and
+    // profile can leave out what lies outside the volume.
+    struct VolumeMapping {
+        std::function<cv::Vec3f(const QPointF&)> sceneToVolume;
+        std::function<bool()> planar;
+        std::function<std::optional<cv::Vec3d>()> extent;
+    };
+    void setVolumeMapping(VolumeMapping mapping);
+    // Numbers behind the line profile as last drawn, for scripts and tests.
+    struct ProfileReadout {
+        std::vector<float> values;
+        std::vector<int> peaks;
+        double lengthUnits = 0.0;  // in the scalebar's units (µm, or voxels)
+    };
+    ProfileReadout profileReadout() const;
 
     struct ScaleBarLabel {
         double displayLength = 0.0;
@@ -110,6 +139,15 @@ private:
     void drawCoordinateFrame(QPainter* painter) const;
     void drawTiltHandle(QPainter* painter) const;
     void drawScaleBar(QPainter* painter) const;
+    void drawHistogram(QPainter* painter) const;
+    void drawLineProfile(QPainter* painter) const;
+    void drawGrid(QPainter* painter) const;
+    void drawLoupe(QPainter* painter) const;
+    QPointF viewportToFramebuffer(const QPointF& vp) const;
+    std::optional<vc3d::hud::AffineMap> viewportToVolumeMap() const;
+    bool showsVolume() const;
+    // True for viewport points inside the volume; empty when that cannot be told.
+    std::function<bool(QPointF)> insideVolume() const;
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
@@ -135,4 +173,12 @@ private:
     
     bool _showFrame = false;
     cv::Vec3f _frame[3];
+
+    vc3d::hud::Options _hud;
+    std::optional<QLineF> _profileLine;
+    bool _profileDragging = false;
+    QPointF _lastCursorVp{-1.0, -1.0};
+    VolumeMapping _mapping;
+    mutable qint64 _histogramKey = 0;
+    mutable vc3d::hud::Histogram _histogram;
 };

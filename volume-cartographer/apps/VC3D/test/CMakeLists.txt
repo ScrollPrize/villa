@@ -631,6 +631,20 @@ vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_viewer_hud
+    test_viewer_hud.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerHud.hpp)
+set_target_properties(test_viewer_hud PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_viewer_hud PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_viewer_hud PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test)
+add_test(NAME viewer_hud COMMAND test_viewer_hud)
+vc_register_test_target(test_viewer_hud)
+vc_register_ctest(viewer_hud test_viewer_hud)
 # Exercise the production controller publication paths after Qt/state cleanup.
 # The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.

@@ -149,6 +149,7 @@ private:
     // viewerRenderSettingsJson() builds the shared get/set reply body.
     QJsonObject handleViewerGetRenderSettings(const QJsonValue& params);
     QJsonObject handleViewerSetRenderSettings(const QJsonValue& params);
+    QJsonObject handleViewerSetHud(const QJsonValue& params);
     QJsonObject viewerRenderSettingsJson() const;
     // Overlay-volume controls and per-viewer intersection sets.
     QJsonObject handleViewerGetOverlay(const QJsonValue& params);

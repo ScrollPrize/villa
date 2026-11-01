@@ -19,6 +19,7 @@
 
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
+#include "volume_viewers/ViewerHud.hpp"
 
 #include <array>
 
@@ -189,6 +190,9 @@ public:
     // --- Fleet setters: apply a viewer preference to every viewer ---
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
+    // Measurement overlays: on-screen histogram, line profile, volume grid, loupe.
+    void setHudOptions(const vc3d::hud::Options& options);
+    const vc3d::hud::Options& hudOptions() const { return _hudOptions; }
     void setPlaneIntersectionLinesVisible(bool visible);
 
     // --- Reset-view-on-surface-change policy ---
@@ -226,6 +230,7 @@ public:
                                                        float tolerance) const;
 
 signals:
+    void hudOptionsChanged(const vc3d::hud::Options& options);
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();
@@ -292,6 +297,7 @@ private:
     VolumeViewerBase* _pendingLinkedCursorSource{nullptr};
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
     bool _showCoordinateFrames{true};
+    vc3d::hud::Options _hudOptions;
     double _zScrollSensitivity{1.0};
 
     std::size_t _surfaceCacheBudgetBytes{0};
