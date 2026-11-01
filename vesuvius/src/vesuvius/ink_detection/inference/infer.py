@@ -1731,7 +1731,7 @@ def parse_args(argv: Sequence[str] | None = None):
         "--device",
         choices=DEVICE_CHOICES,
         default="auto",
-        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+        help="Device for the model. auto picks CUDA, then MPS, then XPU, then CPU; --gpus implies CUDA.",
     )
     parser.add_argument("--gpus")
     parser.add_argument("--compile-mode", default="reduce-overhead")
