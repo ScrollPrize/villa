@@ -2589,7 +2589,7 @@ TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty ch
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     const vc::fiber_tracer::FiberPredictionField field(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
-    const auto report = field.scanStoredPresenceChunks(3);
+    const auto report = field.scanStoredPresenceChunks();
     CHECK(report.shapeZYX == std::array<size_t, 3>{2, 2, 6});
     CHECK(report.chunksZYX == std::array<size_t, 3>{2, 2, 2});
     CHECK(report.chunkGridShapeZYX == std::array<size_t, 3>{1, 1, 3});
@@ -2605,7 +2605,7 @@ TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty ch
     const auto nonzeroDataset = vc::lasagna::LasagnaDataset::open(directory / "nonzero.lasagna.json");
     const vc::fiber_tracer::FiberPredictionField nonzeroField(nonzeroDataset,
         vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
-    CHECK_THROWS_WITH_AS(nonzeroField.scanStoredPresenceChunks(3),
+    CHECK_THROWS_WITH_AS(nonzeroField.scanStoredPresenceChunks(),
         doctest::Contains("fill_value=0"), std::invalid_argument);
     std::filesystem::remove_all(directory);
 }

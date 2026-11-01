@@ -44,6 +44,7 @@
 #include <filesystem>
 #include <map>
 #include "vc_reader/array.hpp"
+#include <vc_reader/source_reader.hpp>
 
 namespace {
 
@@ -82,14 +83,6 @@ QString trimmedLocation(QString location)
 QString volumeLocation(const Volume& volume)
 {
     return trimmedLocation(QString::fromStdString(volume.isRemote() ? volume.remoteUrl() : volume.path().string()));
-}
-
-QString dtypeName(const std::string& dtype)
-{
-    if (dtype == "|u1") return QStringLiteral("uint8");
-    if (dtype.ends_with("u2")) return QStringLiteral("uint16");
-    if (dtype.ends_with("f4")) return QStringLiteral("float32");
-    return QString::fromStdString(dtype);
 }
 
 void setBar(QProgressBar* bar, QLabel* text, quint64 used, std::optional<quint64> maximum, const QString& extra = {})
@@ -663,7 +656,7 @@ void ProjectWorkspace::rebuildResources()
         try {
             const auto& pyramid = _state->openedVolumes()->pyramid(volume);
             item->setText(ResLevels, QString::number(pyramid.levels.size()));
-            item->setText(ResType, dtypeName(pyramid.dtype));
+            item->setText(ResType, QString::fromStdString(vcr::sources::dtypeName(pyramid.dtype)));
         } catch (const std::exception& error) {
             item->setToolTip(ResLevels, QString::fromUtf8(error.what()));
         }

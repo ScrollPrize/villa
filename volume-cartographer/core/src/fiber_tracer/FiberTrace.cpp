@@ -4010,7 +4010,7 @@ public:
         return canonicalGridInfo_;
     }
 
-    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks() const
     {
         (void)storedGridInfo();
         const auto& binding = options_[*canonicalOptionIndex_].presence;
@@ -4025,55 +4025,41 @@ public:
         FiberPresenceChunkScanReport report;
         report.shapeZYX = binding.shapeZYX;
         report.chunksZYX = binding.chunksZYX;
+        const auto& grid = array->chunk_grid();
         size_t total = 1;
         for (size_t axis = 0; axis < 3; ++axis) {
-            report.chunkGridShapeZYX[axis] = (binding.shapeZYX[axis] + binding.chunksZYX[axis] - 1) / binding.chunksZYX[axis];
+            report.chunkGridShapeZYX[axis] = static_cast<size_t>(grid[axis]);
             if (report.chunkGridShapeZYX[axis] > std::numeric_limits<size_t>::max() / total) {
                 throw std::overflow_error("fiber presence chunk grid size overflows size_t");
             }
             total *= report.chunkGridShapeZYX[axis];
         }
 
-        struct Partial {
-            size_t missing = 0;
-            size_t empty = 0;
-            std::vector<std::array<size_t, 3>> nonempty;
-        };
-        const size_t workerCount = std::min<size_t>(total, static_cast<size_t>(std::max(1, parallelThreads)));
-        std::vector<std::future<Partial>> futures;
-        futures.reserve(workerCount);
-        for (size_t worker = 0; worker < workerCount; ++worker) {
-            const size_t begin = total * worker / workerCount;
-            const size_t end = total * (worker + 1) / workerCount;
-            futures.push_back(std::async(std::launch::async, [&, begin, end]() {
-                Partial partial;
-                partial.nonempty.reserve((end - begin) / 4);
-                std::vector<uint8_t> bytes(array->chunk_bytes());
-                const size_t yx = report.chunkGridShapeZYX[1] * report.chunkGridShapeZYX[2];
-                for (size_t linear = begin; linear < end; ++linear) {
-                    const size_t z = linear / yx;
-                    const size_t remainder = linear % yx;
-                    const size_t y = remainder / report.chunkGridShapeZYX[2];
-                    const size_t x = remainder % report.chunkGridShapeZYX[2];
-                    if (!array->read_chunk({int64_t(z), int64_t(y), int64_t(x)}, bytes.data(), bytes.size())) {
-                        ++partial.missing;
-                        continue;
-                    }
-                    if (std::any_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value != 0; }))
-                        partial.nonempty.push_back({z, y, x});
-                    else
-                        ++partial.empty;
-                }
-                return partial;
-            }));
-        }
-        for (auto& future : futures) {
-            auto partial = future.get();
-            report.missingChunks += partial.missing;
-            report.emptyChunks += partial.empty;
-            report.nonemptyChunksZYX.insert(
-                report.nonemptyChunksZYX.end(), std::make_move_iterator(partial.nonempty.begin()), std::make_move_iterator(partial.nonempty.end()));
-        }
+        // Every chunk is probed (a store lists stored chunks only through its writer), on
+        // the array's own thread pool.
+        std::atomic<size_t> missing{0}, empty{0};
+        std::mutex nonemptyMutex;
+        const size_t yx = report.chunkGridShapeZYX[1] * report.chunkGridShapeZYX[2];
+        array->parallel_for(total, [&](size_t linear) {
+            thread_local std::vector<uint8_t> bytes;
+            bytes.resize(array->chunk_bytes());
+            const size_t z = linear / yx;
+            const size_t remainder = linear % yx;
+            const size_t y = remainder / report.chunkGridShapeZYX[2];
+            const size_t x = remainder % report.chunkGridShapeZYX[2];
+            if (!array->read_chunk({int64_t(z), int64_t(y), int64_t(x)}, bytes.data(), bytes.size())) {
+                ++missing;
+                return;
+            }
+            if (std::any_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value != 0; })) {
+                std::lock_guard lock(nonemptyMutex);
+                report.nonemptyChunksZYX.push_back({z, y, x});
+            } else {
+                ++empty;
+            }
+        });
+        report.missingChunks = missing;
+        report.emptyChunks = empty;
         std::sort(report.nonemptyChunksZYX.begin(), report.nonemptyChunksZYX.end());
         return report;
     }
@@ -4220,10 +4206,10 @@ FiberPredictionGridInfo FiberPredictionField::storedGridInfo() const
     return impl_->storedGridInfo();
 }
 
-FiberPresenceChunkScanReport FiberPredictionField::scanStoredPresenceChunks(int parallelThreads) const
+FiberPresenceChunkScanReport FiberPredictionField::scanStoredPresenceChunks() const
 {
     impl_->requireOfflineStoredGrid();
-    return impl_->scanStoredPresenceChunks(parallelThreads);
+    return impl_->scanStoredPresenceChunks();
 }
 
 void FiberPredictionField::sampleStoredGridBatch(

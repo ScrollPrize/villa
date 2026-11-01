@@ -966,9 +966,10 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
 }
 
 static bool looks_like_normals_zarr_root(const fs::path& input_dir) {
-    // Minimal heuristic: groups x,y,z exist and each has a scale dataset directory ("0").
-    return fs::is_directory(input_dir / "x") && fs::is_directory(input_dir / "y") && fs::is_directory(input_dir / "z") &&
-           fs::is_directory(input_dir / "x" / "0") && fs::is_directory(input_dir / "y" / "0") && fs::is_directory(input_dir / "z" / "0");
+    // Groups x, y, z, each with a level-0 Zarr array.
+    for (const char* axis : {"x", "y", "z"})
+        if (!vcr::zarr::isLocalZarrArray(input_dir / axis / "0")) return false;
+    return true;
 }
 
 static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {

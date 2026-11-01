@@ -244,7 +244,7 @@ TEST_CASE("readiness covers every sampling entrypoint and enabled channel") {
     gated([&] { field.sampleStoredGridBatch({{0,0,0}},4,stored); });
     gated([&] { field.sampleStoredPresenceBatch({{0,0,0}},4,presence); });
     gated([&] { (void)field.sampleCornerBatchWithNormals(normals,floatPoints,&corners,nullptr); });
-    CHECK_THROWS(field.scanStoredPresenceChunks(1));
+    CHECK_THROWS(field.scanStoredPresenceChunks());
     CHECK(calls == expected); // Whole-volume scans must not discover a partial live cache.
     field.sampleBatch(std::vector<cv::Vec3f>{},std::vector<cv::Vec3f>{},1,samples,nullptr);
     CHECK(calls == expected);

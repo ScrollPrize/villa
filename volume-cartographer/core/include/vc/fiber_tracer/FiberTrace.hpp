@@ -368,7 +368,8 @@ public:
         FiberPredictionFieldBindingMode mode,
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
     [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const;
-    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const;
+    // Every stored presence chunk probed on the array's thread pool.
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks() const;
     void sampleStoredGridBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,
         int parallelThreads, std::vector<FiberStoredPredictionSample>& samples) const;
     void sampleStoredPresenceBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,

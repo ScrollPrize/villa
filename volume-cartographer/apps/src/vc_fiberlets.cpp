@@ -749,7 +749,7 @@ int runWholeVolumePreprocessing(
 
     auto finalDataset = FiberletChunkDataset::createOrOpen(options.outputDirectory, finalMetadata);
     std::cerr << "fiberlet_preprocess_presence status=started\n";
-    const auto scan = field.scanStoredPresenceChunks(options.anchors.parallelThreads);
+    const auto scan = field.scanStoredPresenceChunks();
     auto activeChunks = fiberletOutputChunksForNonemptyPresence(scan, finalMetadata, options.anchors.cellSizePredictionVoxels);
     finalDataset->configureExpectedChunks(activeChunks);
     const auto totalInput = scan.missingChunks + scan.emptyChunks + scan.nonemptyChunksZYX.size();

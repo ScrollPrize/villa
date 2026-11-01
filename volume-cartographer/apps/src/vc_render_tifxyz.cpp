@@ -947,11 +947,7 @@ int main(int argc, char *argv[])
     const int zarrCompressionLevel = parsed["zarr-compression-level"].as<int>();
     const std::string zarrSeparator = parsed["zarr-separator"].as<std::string>();
     {
-        static const std::set<std::string> kComp{"blosc", "zstd", "gzip", "lz4", "none"};
-        if (kComp.find(zarrCompressor) == kComp.end()) {
-            logPrintf(stderr, "Error: --zarr-compressor must be one of blosc, zstd, gzip, lz4, none\n");
-            return EXIT_FAILURE;
-        }
+        // An unknown --zarr-compressor is rejected by Writer::create below.
         if (zarrSeparator != "/" && zarrSeparator != ".") {
             logPrintf(stderr, "Error: --zarr-separator must be \"/\" or \".\"\n");
             return EXIT_FAILURE;
@@ -1443,7 +1439,12 @@ int main(int argc, char *argv[])
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
-                vcr::zarr::Writer::create(outFilePath / "0", outputOptions);
+                try {
+                    vcr::zarr::Writer::create(outFilePath / "0", outputOptions);
+                } catch (const std::exception& e) {
+                    logPrintf(stderr, "Error creating %s: %s\n", (outFilePath / "0").string().c_str(), e.what());
+                    return EXIT_FAILURE;
+                }
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
                     vcr::zarr::createPyramidLevels(outFilePath, outputOptions, kRenderPyramid);
@@ -1462,8 +1463,13 @@ int main(int argc, char *argv[])
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
-                dsOut = std::make_unique<vcr::zarr::Writer>(
-                    vcr::zarr::Writer::create(outFilePath / "0", outputOptions));
+                try {
+                    dsOut = std::make_unique<vcr::zarr::Writer>(
+                        vcr::zarr::Writer::create(outFilePath / "0", outputOptions));
+                } catch (const std::exception& e) {
+                    logPrintf(stderr, "Error creating %s: %s\n", (outFilePath / "0").string().c_str(), e.what());
+                    return EXIT_FAILURE;
+                }
             }
         }
 
