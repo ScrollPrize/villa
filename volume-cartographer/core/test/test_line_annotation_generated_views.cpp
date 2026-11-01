@@ -3,7 +3,11 @@
 
 #include "CState.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include <QTemporaryDir>
 #include "FiberLineGeometry.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
@@ -23,8 +27,6 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -1458,9 +1460,10 @@ TEST_CASE("focus bounds state distinguishes configured and active bounds")
 {
     QTemporaryDir directory;
     REQUIRE(directory.isValid());
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {64, 64, 64};
-    auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
+    const std::filesystem::path volumeRoot = directory.path().toStdString();
+    const vcr::zarr::CreateOptions levelZero{.shape = {64, 64, 64}, .chunks = {64, 64, 64}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    auto volume = Volume::New(volumeRoot);
     REQUIRE(volume);
     CState state;
     state.setCurrentVolume(volume);

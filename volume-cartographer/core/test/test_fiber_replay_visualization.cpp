@@ -2,7 +2,11 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -11,13 +15,9 @@
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include <vc_reader/grid.hpp>
-#include <vc_reader/zarr.hpp>
-#include <vc_reader/zarr_write.hpp>
 #include <cstdlib>
 #include <iostream>
 
-#include <filesystem>
-#include <fstream>
 #include <atomic>
 #include <iterator>
 #include <limits>
@@ -95,12 +95,12 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
 {
     using namespace vc::fiber_tracer;
     const auto directory = temporaryDirectory();
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {8,8,8};
-    options.chunkShapeZYX = {4,4,4};
-    options.dtype = "|u1";
-    options.numLevels = 2;
-    auto pyramid = vc::test::createZarrVolume(directory / "ct", options);
+    const std::filesystem::path volumeRoot1 = directory / "ct";
+    const vcr::zarr::CreateOptions levelZero1{.shape = {8, 8, 8}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+    vcr::zarr::createPyramidLevels(volumeRoot1, levelZero1, {.levels = 1});
+    vcr::zarr::createGroup(volumeRoot1, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 1})})}});
+    auto pyramid = Volume::New(volumeRoot1);
     REQUIRE(pyramid);
     pyramid.reset();
     const auto attrsPath = directory / "ct/.zattrs";
@@ -128,9 +128,10 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
         {0,0,0}, {0,1,1}, directory / "box"));
     CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {1,1,std::numeric_limits<double>::infinity()}, directory / "box"));
-    options.dtype = "<u2";
-    options.numLevels = 1;
-    auto wider = vc::test::createZarrVolume(directory / "uint16", options);
+    const std::filesystem::path volumeRoot2 = directory / "uint16";
+    const vcr::zarr::CreateOptions levelZero2{.shape = {8, 8, 8}, .chunks = {4, 4, 4}, .dtype = "<u2", .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+    auto wider = Volume::New(volumeRoot2);
     wider.reset();
     CHECK_THROWS(validateFiberReplayStripCtVolume(openCtLevel(directory / "uint16", "0")));
     std::filesystem::remove_all(directory);
@@ -415,12 +416,9 @@ bool cyanDominant(const cv::Vec3b& pixel)
 TEST_CASE("long-span overview maps overlays and endpoint markers to resampled columns")
 {
     const auto directory = temporaryDirectory();
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {64, 64, 64};
-    options.chunkShapeZYX = {16, 16, 16};
-    options.dtype = "|u1";
-    options.numLevels = 1;
-    vc::test::createZarrVolume(directory / "ct", options).reset();
+    const std::filesystem::path volumeRoot3 = directory / "ct";
+    const vcr::zarr::CreateOptions levelZero3{.shape = {64, 64, 64}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot3 / "0", levelZero3);
     const auto ct = openCtLevel(directory / "ct", "0");
     const std::vector<cv::Vec3d> reference{{8, 32, 32}, {40, 32, 32}};
     vc::fiber_tracer::FiberReplayTraceResult greedy;
@@ -474,12 +472,12 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
 TEST_CASE("full replay overview renders selected top and side strips with disconnected trace overlays")
 {
     const auto directory = temporaryDirectory() / "overview_ct";
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {32, 32, 32};
-    options.chunkShapeZYX = {16, 16, 16};
-    options.dtype = "|u1";
-    options.numLevels = 2;
-    auto pyramid = vc::test::createZarrVolume(directory, options);
+    const std::filesystem::path volumeRoot4 = directory;
+    const vcr::zarr::CreateOptions levelZero4{.shape = {32, 32, 32}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot4 / "0", levelZero4);
+    vcr::zarr::createPyramidLevels(volumeRoot4, levelZero4, {.levels = 1});
+    vcr::zarr::createGroup(volumeRoot4, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 1})})}});
+    auto pyramid = Volume::New(volumeRoot4);
     REQUIRE(pyramid);
     const std::vector<uint8_t> values(32 * 32 * 32, 96);
     vcr::zarr::Writer::open(directory / "0").writeRegion({0, 0, 0}, {32, 32, 32}, values.data());

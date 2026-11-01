@@ -9,16 +9,15 @@
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
-#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <regex>
 #include <sstream>
 
@@ -43,11 +42,10 @@ std::string run(const std::string& command, const fs::path& log)
 void writeSheets(const fs::path& dir, const std::vector<int>& centres)
 {
     fs::create_directories(dir);
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {128, 128, 128};
-    options.uuid = "test-volume";
-    options.name = "test-volume";
-    vc::test::createZarrVolume(dir / "volume.zarr", options);
+    const std::filesystem::path volumeRoot = dir / "volume.zarr";
+    const vcr::zarr::CreateOptions levelZero{.shape = {128, 128, 128}, .chunks = {64, 64, 64}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "test-volume"}, {"name", "test-volume"}, {"format", "zarr"}, {"width", 128}, {"height", 128}, {"slices", 128}, {"voxelsize", 1.0}}.dump();
     std::vector<uint8_t> sheet(128 * 128 * 128, 0);
     for (const int centre : centres)
         for (int z = centre - 4; z <= centre + 4; ++z)

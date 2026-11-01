@@ -27,14 +27,17 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "SurfaceCatalog.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 
 #include <memory>
-#include <filesystem>
 #include <cstdlib>
 #include <iostream>
 
@@ -190,12 +193,11 @@ int main(int argc, char** argv)
     // The store jobs read: a volume's surfaces, one of them a Lasagna fit
     // (its model in the store, the reference surface it read in its meta).
     namespace vo = vc::objects;
-    vc::test::ZarrVolumeSpec volumeOptions;
-    volumeOptions.shapeZYX = {4, 4, 4};
-    volumeOptions.chunkShapeZYX = {4, 4, 4};
-    volumeOptions.uuid = "lasagna-test-volume";
-    const auto volume = vc::test::createZarrVolume(std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString()),
-                                    volumeOptions);
+    const std::filesystem::path volumeRoot = std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString());
+    const vcr::zarr::CreateOptions levelZero{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "lasagna-test-volume"}, {"name", "lasagna-test-volume"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+    const auto volume = Volume::New(volumeRoot);
     const auto storePath = std::filesystem::path(tempDir.filePath(QStringLiteral("objects.vcobj")).toStdString());
     vo::OpenOptions storeOptions;
     storeOptions.author = "lasagna-panel-test";

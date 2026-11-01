@@ -9,19 +9,21 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
-#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_reader/catalog.hpp>
 #include <vc_reader/registrations.hpp>
 #include "VolumeRegistrations.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QThread>
-#include <filesystem>
 #include <iostream>
 #include <set>
 
@@ -40,9 +42,11 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir dir;
-        vc::test::ZarrVolumeSpec create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "vol1";
-        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
+        const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+        std::ofstream(volumeRoot1 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "vol1"}, {"name", "vol1"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+        const auto volume = Volume::New(volumeRoot1);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-catalog-test";
         { auto created = ObjectStore::create(path, options); }
@@ -316,9 +320,11 @@ int main(int argc, char** argv)
         // The volume at working level 1 is the same volume in half its voxels:
         // surfaces are listed at that scale, and those made there are kept in
         // the volume's own voxels at it, seen at full scale in the full volume.
-        vc::test::ZarrVolumeSpec coarse = create;
-        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2};
-        const auto level = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
+        const std::filesystem::path volumeRoot2 = fs::path(dir.path().toStdString()) / "level.zarr";
+        const vcr::zarr::CreateOptions levelZero2{.shape = {2, 2, 2}, .chunks = {2, 2, 2}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+        std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "vol1"}, {"name", "vol1"}, {"format", "zarr"}, {"width", 2}, {"height", 2}, {"slices", 2}, {"voxelsize", 1.0}}.dump();
+        const auto level = Volume::New(volumeRoot2);
         const VolumeVoxels atHalf{volume->id(), 0.5};
         const auto atLevel = util::newUuid();
         session->act(attachment, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {

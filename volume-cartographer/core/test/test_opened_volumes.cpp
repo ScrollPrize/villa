@@ -6,15 +6,16 @@
 
 #include "../../apps/VC3D/OpenedVolumes.hpp"
 #include "support/LoopbackHttpServer.hpp"
-#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Volume.hpp"
-
+#include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
+
 #include <vc_reader/array.hpp>
 
 #include <chrono>
-#include <filesystem>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -23,11 +24,12 @@ TEST_CASE("OpenedVolumes shares opened levels and maps coordinates through place
 {
     const auto dir = fs::temp_directory_path() /
                      ("vc-opened-volumes-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    vc::test::ZarrVolumeSpec spec;
-    spec.shapeZYX = {16, 16, 16};
-    spec.chunkShapeZYX = {8, 8, 8};
-    spec.numLevels = 2;
-    auto volume = vc::test::createZarrVolume(dir, spec);
+    const std::filesystem::path volumeRoot1 = dir;
+    const vcr::zarr::CreateOptions levelZero1{.shape = {16, 16, 16}, .chunks = {8, 8, 8}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot1 / "0", levelZero1);
+    vcr::zarr::createPyramidLevels(volumeRoot1, levelZero1, {.levels = 1});
+    vcr::zarr::createGroup(volumeRoot1, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 1})})}});
+    auto volume = Volume::New(volumeRoot1);
     REQUIRE(volume);
     std::vector<std::uint8_t> level0(16 * 16 * 16), level1(8 * 8 * 8);
     for (std::size_t i = 0; i < level0.size(); ++i)
@@ -71,11 +73,13 @@ TEST_CASE("OpenedVolumes describes each working base of one source, sharing the 
     // levels, base 1 two, whichever is asked first, and both bases open the same arrays.
     const auto dir = fs::temp_directory_path() /
                      ("vc-opened-volumes-bases-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    vc::test::ZarrVolumeSpec spec;
-    spec.shapeZYX = {16, 16, 16};
-    spec.chunkShapeZYX = {8, 8, 8};
-    spec.numLevels = 3;
-    REQUIRE(vc::test::createZarrVolume(dir, spec));
+    const std::filesystem::path volumeRoot2 = dir;
+    const vcr::zarr::CreateOptions levelZero2{.shape = {16, 16, 16}, .chunks = {8, 8, 8}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot2 / "0", levelZero2);
+    vcr::zarr::createPyramidLevels(volumeRoot2, levelZero2, {.levels = 2});
+    vcr::zarr::createGroup(volumeRoot2, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 2})})}});
+    std::ofstream(volumeRoot2 / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "bases"}, {"name", "bases"}, {"format", "zarr"}, {"width", 16}, {"height", 16}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+    REQUIRE(Volume::New(volumeRoot2));
     vc::test::LoopbackHttpServer server;
     server.serveDirectory(dir, "/vol.zarr");
     const std::string url = server.url() + "/vol.zarr";

@@ -11,7 +11,12 @@
 #include <mutex>
 #include <QTreeWidget>
 #include <QDoubleSpinBox>
-#include "support/TestZarrVolume.hpp"
+#include "vc/core/types/Volume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; an
 // Open Data sample's project (catalog surfaces of a volume the open one shows
@@ -34,9 +39,11 @@ int runSurfacePanelStoreTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     try {
         QTemporaryDir dir;
-        vc::test::ZarrVolumeSpec create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "panel-volume";
-        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        const std::filesystem::path volumeRoot = fs::path(dir.path().toStdString()) / "ct.zarr";
+        const vcr::zarr::CreateOptions levelZero{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+        std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "panel-volume"}, {"name", "panel-volume"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+        const auto volume = Volume::New(volumeRoot);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-panel-test";
         { auto created = ObjectStore::create(path, options); }

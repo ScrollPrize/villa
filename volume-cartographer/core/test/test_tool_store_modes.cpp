@@ -7,7 +7,9 @@
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
@@ -54,9 +56,9 @@ std::string tool(const char* variable)
 // A 128x192x192 uint8 volume with a deterministic ramp, covering the fixture surface.
 void writeRampVolume(const fs::path& path)
 {
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {128, 192, 192};
-    vc::test::createZarrVolume(path, options);
+    const std::filesystem::path volumeRoot = path;
+    const vcr::zarr::CreateOptions levelZero{.shape = {128, 192, 192}, .chunks = {64, 64, 64}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
     std::vector<uint8_t> ramp(128 * 192 * 192);
     for (size_t z = 0; z < 128; ++z)
         for (size_t y = 0; y < 192; ++y)

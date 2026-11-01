@@ -4,15 +4,16 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
-#include "vc/core/util/LoadJson.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
+#include "vc/core/util/LoadJson.hpp"
 
 
 #include <array>
 #include <cstddef>
-#include <filesystem>
-#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -30,21 +31,6 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-vc::test::ZarrVolumeSpec makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
-                                   std::array<size_t, 3> chunks = {32, 32, 32},
-                                   size_t numLevels = 2)
-{
-    vc::test::ZarrVolumeSpec opts;
-    opts.shapeZYX = shape;
-    opts.chunkShapeZYX = chunks;
-    opts.numLevels = numLevels;
-    opts.fillValue = 0.0;
-    opts.voxelSize = 1.0;
-    opts.uuid = "test-vol-uuid";
-    opts.name = "test-vol";
-    return opts;
-}
-
 void writeTextFile(const fs::path& path, const std::string& text)
 {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -60,8 +46,10 @@ TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
     // null, as text, or not at all, and each of those used to make the
     // accessor throw from deep inside whatever asked for a physical area.
     auto d = tmpDir("unusable_voxelsize");
-    auto opts = makeOpts({32, 32, 32}, {16, 16, 16}, 1);
-    vc::test::createZarrVolume(d, opts);
+    const std::filesystem::path volumeRoot = d;
+    const vcr::zarr::CreateOptions levelZero{.shape = {32, 32, 32}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "test-vol-uuid"}, {"name", "test-vol"}, {"format", "zarr"}, {"width", 32}, {"height", 32}, {"slices", 32}, {"voxelsize", 1.0}}.dump();
     const auto meta = vc::json::load_json_file(d / "meta.json");
     const auto metaWithVoxelSize = [&](const std::string& voxelsizeJson) {
         std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get_string() +

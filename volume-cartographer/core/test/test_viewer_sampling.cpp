@@ -7,13 +7,15 @@
 
 #include "../../apps/VC3D/OpenedVolumes.hpp"
 #include "../../apps/VC3D/volume_viewers/ViewerSampling.hpp"
-#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Volume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <vc_reader/zarr.hpp>
-#include <vc_reader/zarr_write.hpp>
 #include <vc_reader/array.hpp>
 
 #include <opencv2/core.hpp>
@@ -22,7 +24,6 @@
 #include <vc_reader/native/cuda_available.hpp>
 
 #include <cmath>
-#include <filesystem>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -38,11 +39,12 @@ struct Fixture {
 
     Fixture()
     {
-        vc::test::ZarrVolumeSpec spec;
-        spec.shapeZYX = {32, 32, 32};
-        spec.chunkShapeZYX = {8, 8, 8};
-        spec.numLevels = 2;
-        volume = vc::test::createZarrVolume(dir, spec);
+        const std::filesystem::path volumeRoot = dir;
+        const vcr::zarr::CreateOptions levelZero{.shape = {32, 32, 32}, .chunks = {8, 8, 8}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+        vcr::zarr::createPyramidLevels(volumeRoot, levelZero, {.levels = 1});
+        vcr::zarr::createGroup(volumeRoot, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 1})})}});
+        volume = Volume::New(volumeRoot);
         for (std::size_t i = 0; i < level0.size(); ++i)
             level0[i] = std::uint8_t(1 + i % 250);
         for (std::size_t i = 0; i < level1.size(); ++i)
