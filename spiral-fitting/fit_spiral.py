@@ -52,6 +52,7 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
+                         dense_spacing_inactive_reason,
                          fit_input, input_source_enabled, pcl_input_enabled,
                          pcl_role_toggle_key,
                          shell_losses_enabled, winding_inference_enabled)
@@ -2208,6 +2209,9 @@ class FitContext:
             and input_source_enabled(self.config, 'gradient_magnitude')
             and self.config['loss_weight_dense_spacing'] > 0
         )
+        spacing_off = dense_spacing_inactive_reason(self.config)
+        if spacing_off:
+            print(f'WARNING: {spacing_off}')
         shell_envelope = None
         if shell_patch is not None and filter_tracks_by_shell:
             progress.begin('loading', 'Building outer-shell lookup')
@@ -2703,9 +2707,13 @@ class FitContext:
         weight_key = 'loss_weight_dense_spacing_density'
         if self.config[weight_key] > 0 and weight_key not in self._density_inactive_warned:
             self._density_inactive_warned.add(weight_key)
-            print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
-                  f'{self.dense_spacing_mode!r}; this component runs only in '
-                  "'winding_model' mode and is INACTIVE.")
+            cause = (
+                'the winding-inference store or the outer shell is switched off'
+                if self.dense_spacing_mode == 'winding_model'
+                else f'dense_spacing_mode={self.dense_spacing_mode!r}')
+            print(f'WARNING: {weight_key} > 0 but {cause}; this component '
+                  'runs only when winding_model mode is active (store and '
+                  'outer shell both enabled) and is INACTIVE.')
 
     def _make_shell_polar_map(self):
         # A session that filtered its tracks against the shell already built

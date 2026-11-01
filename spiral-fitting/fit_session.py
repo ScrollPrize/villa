@@ -328,6 +328,47 @@ def winding_inference_enabled(config: Mapping[str, Any]) -> bool:
     return _winding_model_enabled(config)
 
 
+def dense_spacing_inactive_reason(config: Mapping[str, Any]) -> str | None:
+    """Why no dense winding-spacing loss will run, or None if one will.
+
+    Spacing between windings is supervised by exactly one of two losses:
+    winding_model (needs the winding-inference store AND the outer shell) or
+    grad_mag (needs dense_spacing_mode='grad_mag'). Switching off an input
+    the default winding_model mode depends on - the usual thing to do when
+    fitting from the public Lasagna release, which ships nx/ny/grad_mag but
+    no winding-inference store or outer shell - leaves neither loss active,
+    and input_use_gradient_magnitude=true does not change that. Only the
+    min-spacing barrier (a lower bound) then constrains winding spacing.
+    """
+    mode = _dense_spacing_mode(config)
+    if mode is None:
+        return None  # reported as its own validation error
+    if mode == "winding_model":
+        if _winding_model_enabled(config):
+            return None
+        off = [key for key, source in (
+                   ("input_use_winding_inference", "winding_inference"),
+                   ("input_use_outer_shell", "outer_shell"))
+               if not input_source_enabled(config, source)]
+        return (
+            "dense_spacing_mode='winding_model' needs the winding-inference "
+            f"store and the outer shell, but {' and '.join(off)} "
+            f"{'is' if len(off) == 1 else 'are'} false, so NO dense "
+            "winding-spacing loss runs (only the min-spacing barrier). To "
+            "supervise spacing from Lasagna gradient magnitude instead, set "
+            "dense_spacing_mode='grad_mag' and pack grad_mag "
+            "(pack_resident_pools.py --what normals,grad_mag).")
+    if not input_source_enabled(config, "gradient_magnitude"):
+        return ("dense_spacing_mode='grad_mag' but input_use_gradient_magnitude "
+                "is false, so NO dense winding-spacing loss runs (only the "
+                "min-spacing barrier).")
+    if float(config.get("loss_weight_dense_spacing",
+                        Config().loss_weight_dense_spacing)) <= 0:
+        return ("loss_weight_dense_spacing is 0, so NO dense winding-spacing "
+                "loss runs (only the min-spacing barrier).")
+    return None
+
+
 def shell_losses_enabled(config: Mapping[str, Any]) -> bool:
     return _shell_losses_enabled(config)
 
