@@ -507,6 +507,8 @@ private:
     std::uint64_t _renderSerial = 0;
     // The shown QuadSurface's vertex grid for vcr::grid; dropped on every edit.
     std::shared_ptr<const vcr::grid::Surface> _gridSurface;
+    // The frame's surface when it is `quad`, so cursor maths agrees with what is drawn.
+    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> surfaceForPoints(const QuadSurface& quad) const;
     const QuadSurface* _gridSurfaceFor = nullptr;
     // The view's geometry changed: the next frame does not carry the last one's pixels.
     bool _geometryDirty = true;

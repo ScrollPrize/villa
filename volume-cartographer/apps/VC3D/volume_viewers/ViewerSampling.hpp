@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <opencv2/core.hpp>
+
 #include <optional>
 #include <vector>
 
@@ -56,6 +58,18 @@ int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, in
 // The vertex grid of a QuadSurface for vcr::grid, with its interpolation mode,
 // quad validity and components. It views the surface's points: rebuild it after
 // any edit. Normals and layer offsets are taken in the levels' voxel spacing.
+// The point at a grid position of such a surface, and the move in vertex coordinates per
+// unit of physical offset along its normal; nullopt where the surface has no point.
+struct SurfacePoint {
+    cv::Vec3f position, offsetNormal;
+    // The physical offset of `point` along the normal, as a layer offset would place it.
+    [[nodiscard]] float offsetOf(const cv::Vec3f& point) const
+    {
+        return (point - position).dot(offsetNormal) / offsetNormal.dot(offsetNormal);
+    }
+};
+std::optional<SurfacePoint> surfacePointAt(const vcr::grid::Surface& surface, const cv::Vec2d& grid);
+
 std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface, const std::array<float, 3>& spacing = {1, 1, 1});
 
 // What a frame samples: a plane, or a raster over a grid surface.

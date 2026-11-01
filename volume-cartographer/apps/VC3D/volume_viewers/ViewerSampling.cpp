@@ -125,6 +125,16 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     return std::make_shared<const vcr::grid::Surface>(surface.gridVertices(valid, points), std::move(options));
 }
 
+std::optional<SurfacePoint> surfacePointAt(const vcr::grid::Surface& surface, const cv::Vec2d& grid)
+{
+    const float xy[2] = {float(grid[0]), float(grid[1])};
+    SurfacePoint point;
+    surface.pointsAt(xy, 1, point.position.val, point.offsetNormal.val);
+    if (!std::isfinite(point.position[0]) || !std::isfinite(point.offsetNormal[0]))
+        return std::nullopt;
+    return point;
+}
+
 vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const
 {
     auto result = plane ? vcr::grid::sample(*plane, request) : vcr::grid::sample(*surface, raster, request);

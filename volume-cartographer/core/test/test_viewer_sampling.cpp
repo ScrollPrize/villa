@@ -405,3 +405,20 @@ TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer 
     CHECK(coverage[0] != 0);
     CHECK(coverage[1] == 0);
 }
+
+TEST_CASE("a cursor's offset from a surface is the frame's layer offset, in physical units")
+{
+    cv::Mat_<cv::Vec3f> points(4, 4);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) points(r, c) = cv::Vec3f(float(c), float(r), 8.f);
+    QuadSurface quad(points, {1.f, 1.f});
+    const auto surface = vc3d::gridSurface(quad, {1.f, 1.f, 2.f});  // z voxels are twice as long
+    const auto point = vc3d::surfacePointAt(*surface, {1.5, 1.5});
+    REQUIRE(point);
+    CHECK(point->position == cv::Vec3f(1.5f, 1.5f, 8.f));
+    // A physical offset of 4 moves two z voxels, and maps back to 4.
+    const cv::Vec3f layer = point->position + point->offsetNormal * 4.f;
+    CHECK(std::abs(layer[2] - 8.f) == doctest::Approx(2.f));
+    CHECK(point->offsetOf(layer) == doctest::Approx(4.f));
+    CHECK_FALSE(vc3d::surfacePointAt(*surface, {10.0, 1.0}));
+}

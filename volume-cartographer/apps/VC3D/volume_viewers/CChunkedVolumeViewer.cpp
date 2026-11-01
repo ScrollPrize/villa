@@ -3075,13 +3075,12 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         // depth band the view actually displays accepts the point.
         float w = _zOff;
         float distance = dist;
-        const cv::Vec3f surfCoord = quad->coord(ptr);
-        const cv::Vec3f surfNormal = quad->normal(ptr);
-        if (vc::geometry::validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
-            w = (volPoint - surfCoord).dot(surfNormal);
+        const cv::Vec2d grid = quad->surfaceToGrid({double(ptr[0]) / quad->scale()[0], double(ptr[1]) / quad->scale()[1]});
+        if (const auto surfacePoint = vc3d::surfacePointAt(*surfaceForPoints(*quad), grid)) {
+            w = surfacePoint->offsetOf(volPoint);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
-            distance = depthBandDistance(volPoint, surfCoord, surfNormal, depthLo, depthHi);
+            distance = float(cv::norm(volPoint - (surfacePoint->position + surfacePoint->offsetNormal * std::clamp(w, depthLo, depthHi))));
         }
         const cv::Vec3f loc = quad->loc(ptr);
         return SurfaceProjection{loc[0], loc[1], w, true, distance};
@@ -3420,11 +3419,24 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
         p += plane->normal({0, 0, 0}) * _zOff;
     } else if (_zOff != 0.0f) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
-        const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
-        if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
-            p += n * _zOff;
+        // Where the frame's layer at _zOff lies, in the levels' voxel spacing.
+        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+            if (const auto point = vc3d::surfacePointAt(*surfaceForPoints(*quad), quad->surfaceToGrid({sp[0], sp[1]})))
+                p += point->offsetNormal * _zOff;
+        } else {
+            const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+            if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
+                p += n * _zOff;
+        }
     }
     return p;
+}
+
+std::shared_ptr<const vcr::grid::Surface> CChunkedVolumeViewer::surfaceForPoints(const QuadSurface& quad) const
+{
+    if (_gridSurface && _gridSurfaceFor == &quad)
+        return _gridSurface;
+    return vc3d::gridSurface(quad, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
 }
 
 void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)
