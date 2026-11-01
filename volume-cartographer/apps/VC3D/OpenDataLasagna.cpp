@@ -5,14 +5,12 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc_reader/native/http.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 
 #include <QSaveFile>
 
-#include <vc_reader/s3_listing.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -131,21 +129,18 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
 // The single root manifest in a public catalogue artifact directory.
 std::string discoverManifestUrl(const std::string& artifactUrl)
 {
-    const auto prefix = vcr::s3::splitPrefixUrl(artifactUrl);
-    if (!prefix || prefix->key.empty())
-        throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " + artifactUrl);
-    vcr::HttpClient http{vcr::HttpOptions{}};
-    std::vector<std::uint8_t> body;
-    http.get(vcr::s3::listUrl(*prefix, "/", {}, 100), body);
-    const auto page = vcr::s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
     std::vector<std::string> keys;
-    for (const auto& object : page.objects) {
-        if (object.key.rfind(prefix->key, 0) != 0) continue;
-        const auto relative = object.key.substr(prefix->key.size());
-        if (!relative.empty() && relative.find('/') == std::string::npos &&
-            relative.ends_with(".lasagna.json")) {
-            keys.push_back(object.key);
-        }
+    try {
+        const auto access = vcr::zarr::resolveAccess(artifactUrl);
+        std::string token;
+        do {
+            const auto page = vcr::zarr::listPage(access, artifactUrl, {}, token);
+            for (const auto& object : page.objects)
+                if (object.key.ends_with(".lasagna.json")) keys.push_back(object.key);
+            token = page.nextContinuationToken;
+        } while (!token.empty());
+    } catch (const std::invalid_argument& e) {
+        throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " + artifactUrl + " (" + e.what() + ")");
     }
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -154,7 +149,7 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
             "Lasagna artifact must contain exactly one root .lasagna.json; found " +
             std::to_string(keys.size()));
     }
-    return vcr::catalog::joinOpenDataUrl(prefix->origin, keys.front());
+    return vcr::catalog::joinOpenDataUrl(artifactUrl, keys.front());
 }
 
 // The catalog Lasagna artifact a dataset entry caches (the artifact_url of its

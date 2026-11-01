@@ -1,9 +1,11 @@
 #include "UnifiedBrowserDialog.hpp"
+#include "support/LoopbackHttpServer.hpp"
 #include <QRegularExpression>
 
 #include <QDir>
 #include <QCheckBox>
 #include <QFile>
+#include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
@@ -232,6 +234,61 @@ private slots:
             QCOMPARE(dialog.result(), int(QDialog::Accepted));
             QCOMPARE(dialog.selectedUri(), uri);
         }
+    }
+
+    void remoteListingThroughTheReader()
+    {
+        // A signed loopback bucket, reached with the environment's keys and endpoint; the
+        // dialog lists one level at a time through vc_reader and keeps the location's URIs.
+        QTemporaryDir temporary(QDir::current().filePath("browser-remote-XXXXXX"));
+        QVERIFY(temporary.isValid());
+        const QDir root(temporary.path());
+        const auto write = [&](const QString& relative, const QByteArray& bytes) {
+            QVERIFY(root.mkpath(QFileInfo(root.filePath(relative)).path()));
+            QFile file(root.filePath(relative));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write(bytes);
+        };
+        for (const char* plane : {"xy", "xz", "yz"})
+            write(QStringLiteral("bucket/ng/%1/000000.grid").arg(plane), "g");
+        write(QStringLiteral("bucket/ng/metadata.json"), "{}");
+        vc::test::LoopbackHttpServer server;
+        server.serveBucket("grids", root.filePath("bucket").toStdString(), true);
+        qputenv("AWS_ACCESS_KEY_ID", "key");
+        qputenv("AWS_SECRET_ACCESS_KEY", "secret");
+        qputenv("AWS_REGION", "us-east-1");
+        qputenv("AWS_ENDPOINT_URL", server.url().c_str());
+
+        UnifiedBrowserDialog dialog;
+        configureRemoteDialog(dialog, true, true);
+        dialog.setStartUri(QStringLiteral("s3://grids/ng/"));
+        auto* list = dialog.findChild<QListWidget*>();
+        QVERIFY(list);
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 4, 10000);
+        QCOMPARE(list->item(0)->text(), QStringLiteral("xy/"));
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toString(), QStringLiteral("s3://grids/ng/xy/"));
+        QVERIFY(list->item(0)->data(Qt::UserRole + 1).toBool());
+        QCOMPARE(list->item(2)->text(), QStringLiteral("yz/"));
+        QCOMPARE(list->item(3)->text(), QStringLiteral("metadata.json"));
+        QCOMPARE(list->item(3)->data(Qt::UserRole).toString(), QStringLiteral("s3://grids/ng/metadata.json"));
+        QVERIFY(!list->item(3)->data(Qt::UserRole + 1).toBool());
+        for (const auto& request : server.requests())
+            QVERIFY(request.signedV4());
+
+        // Into a subdirectory from the path bar.
+        typePath(dialog, QStringLiteral("s3://grids/ng/xz/"));
+        QTest::keyClick(pathBar(dialog), Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 1, 10000);
+        QCOMPARE(list->item(0)->text(), QStringLiteral("000000.grid"));
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toString(), QStringLiteral("s3://grids/ng/xz/000000.grid"));
+
+        // A location with no listing says so instead of failing.
+        typePath(dialog, QStringLiteral("http://127.0.0.1:1/plain/"));
+        QTest::keyClick(pathBar(dialog), Qt::Key_Return);
+        auto* status = dialog.findChild<QLabel*>(QStringLiteral("browserStatus"));
+        if (status) QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(QStringLiteral("Browsing is available")), 10000);
+        for (const char* name : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ENDPOINT_URL"})
+            qunsetenv(name);
     }
 
     void typedLocalDirectoryOpen()

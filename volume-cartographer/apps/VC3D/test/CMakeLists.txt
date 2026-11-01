@@ -101,7 +101,7 @@ set_target_properties(test_unified_browser_dialog PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 
 target_include_directories(test_unified_browser_dialog PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 
 target_link_libraries(test_unified_browser_dialog PRIVATE
     vc_core
