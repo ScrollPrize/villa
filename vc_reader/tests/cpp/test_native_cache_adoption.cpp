@@ -30,12 +30,73 @@ void unbounded(const fs::path& root)
     check(again.max_bytes()==32&&again.total_bytes()==32,"a kept limit reconciles on open");
 }
 
+// A root nobody limited is unlimited, and whatever is set stays until changed.
+void defaultBudget(const fs::path& root)
+{
+    constexpr auto none=std::numeric_limits<std::int64_t>::max();
+    {
+        vcr::DiskCache cache(root.string(),-1);
+        check(cache.max_bytes()==none,"a new budget is unlimited");
+        cache.set_max_bytes(2048);
+    }
+    {
+        vcr::DiskCache cache(root.string(),-1);
+        check(cache.max_bytes()==2048,"a limit the user set is kept");
+        cache.set_max_bytes(none);
+    }
+    vcr::DiskCache cache(root.string(),-1);
+    check(cache.max_bytes()==none,"the user can lift a limit");
+}
+
+void setStored(const fs::path& root,std::int64_t limit)
+{
+    sqlite3* db=nullptr;
+    check(sqlite3_open((root/".vc_reader_cache.sqlite3").c_str(),&db)==SQLITE_OK,"open the index");
+    const auto sql="UPDATE budget SET max_bytes="+std::to_string(limit)+" WHERE id=1; PRAGMA user_version=0;";
+    const int rc=sqlite3_exec(db,sql.c_str(),nullptr,nullptr,nullptr);
+    sqlite3_close(db);
+    check(rc==SQLITE_OK,"edit the index");
+}
+
+// A root indexed before budgets defaulted to unlimited holds the old 1 GiB seed, which
+// nobody chose. It must not evict; any other stored limit was chosen and stays.
+void seededByOlderVersion(const fs::path& root)
+{
+    constexpr auto none=std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t seed=1073741824;
+    { vcr::DiskCache cache(root.string(),-1); }
+    setStored(root,seed);
+    {
+        vcr::DiskCache cache(root.string(),-1);
+        check(cache.max_bytes()==none,"the old seed becomes unlimited");
+        cache.set_max_bytes(seed);
+    }
+    {
+        vcr::DiskCache cache(root.string(),-1);
+        check(cache.max_bytes()==seed,"1 GiB set after the change is the user's and stays");
+    }
+    setStored(root,seed);
+    {
+        vcr::DiskCache cache(root.string(),64);
+        check(cache.max_bytes()==64,"an explicit limit wins over the old seed");
+    }
+    setStored(root,32);
+    vcr::DiskCache cache(root.string(),-1);
+    check(cache.max_bytes()==32,"a chosen limit on an older index stays");
+}
+
 int main() try {
     const auto root=fs::temp_directory_path()/("vcr-adopt-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {fs::path p;~Cleanup(){fs::remove_all(p);}} cleanup{root};
     const fs::path other=root.string()+"-unbounded";
     struct CleanupOther {fs::path p;~CleanupOther(){fs::remove_all(p);}} cleanupOther{other};
     unbounded(other);
+    const fs::path fresh=root.string()+"-default";
+    struct CleanupFresh {fs::path p;~CleanupFresh(){fs::remove_all(p);}} cleanupFresh{fresh};
+    defaultBudget(fresh);
+    const fs::path seeded=root.string()+"-seeded";
+    struct CleanupSeeded {fs::path p;~CleanupSeeded(){fs::remove_all(p);}} cleanupSeeded{seeded};
+    seededByOlderVersion(seeded);
     const auto level=root/"volume/0";
     write(level/".zarray","{}");write(level/".zattrs","{}");
     write(level/"0.0.0",std::string(32,'a'));

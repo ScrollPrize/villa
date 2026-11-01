@@ -496,6 +496,72 @@ class RemoteTests(RemoteFixtureCase):
                 with sqlite3.connect(cache/'.vc_reader_cache.sqlite3') as db:
                     self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
 
+    def test_unsized_download_on_an_unlimited_budget_evicts_nothing(self):
+        payload = (self.root/'image.png').read_bytes()
+        def hook(handler):
+            if handler.path != '/unsized.png':
+                return False
+            handler.send_response(200)
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(payload)
+            handler.close_connection = True
+            return True
+        self.server.request_hook = hook
+        options = dict(cache_dir=self.cache)
+        read_remote_source(Source('kept', Storage(self.url+'/image.png', 'png')), options)
+        kept = list(cached_files(self.cache))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2**63-1)
+        read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertTrue(kept[0].exists(), 'the unsized download evicted a cached file')
+        self.assertEqual(len(list(cached_files(self.cache))), 2)
+
+    def unsized(self, *names):
+        payload = (self.root/'image.png').read_bytes()
+        def hook(handler):
+            if handler.path.lstrip('/') not in names:
+                return False
+            handler.send_response(200)
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(payload)
+            handler.close_connection = True
+            return True
+        self.server.request_hook = hook
+        return len(payload)
+
+    def test_unsized_download_on_a_limited_budget_evicts_only_what_it_needs(self):
+        size = self.unsized('unsized.png')
+        options = dict(cache_dir=self.cache, cache_max_bytes=2*size+size//2)
+        for name in ('first.png', 'second.png'):
+            (self.root/name).write_bytes((self.root/'image.png').read_bytes())
+            read_remote_source(Source(name, Storage(self.url+'/'+name, 'png')), options)
+        first, second = [decoded_cache_path(self.cache, self.url+'/'+n) for n in ('first.png', 'second.png')]
+        read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertFalse(Path(first).exists(), 'the oldest file makes room')
+        self.assertTrue(Path(second).exists(), 'nothing more than needed is evicted')
+        self.assertTrue(Path(decoded_cache_path(self.cache, self.url+'/unsized.png')).exists())
+
+    def test_unsized_download_past_the_limit_raises_and_leaves_no_reservation(self):
+        size = self.unsized('unsized.png')
+        options = dict(cache_dir=self.cache, cache_max_bytes=size-1)
+        with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
+            read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+
+    def test_concurrent_unsized_downloads_on_a_small_budget_all_finish(self):
+        names = [f'unsized{i}.png' for i in range(4)]
+        size = self.unsized(*names)
+        options = dict(cache_dir=self.cache, cache_max_bytes=size+size//2)
+        with ThreadPoolExecutor(4) as pool:
+            reads = [pool.submit(read_remote_source, Source(n, Storage(self.url+'/'+n, 'png')), options) for n in names]
+            for read in reads:
+                read.result(timeout=30)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
     def test_live_download_survives_another_cache_owner_and_budget_pressure(self):
         from vc_reader import _reader
         payload = (self.root/'image.png').read_bytes()
@@ -766,7 +832,12 @@ class RemoteTests(RemoteFixtureCase):
                     for result in pool.map(process_read, [reader]*4):
                         np.testing.assert_array_equal(result, self.data[:3, :4])
         self.assertEqual(len(list(cached_files(self.cache))), 1)
-        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 1 << 30)
+        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2**63-1)
+        # With no cache to write to, files go to a temporary directory that stays bounded.
+        with source.open(cache_writes=False) as reader:
+            reader.read((0, 0), (5, 7))
+            temporary = Path(reader._engine().temporary_directory)
+            self.assertEqual(disk_budget(str(temporary), None).max_bytes, 1 << 30)
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.root/'unused', cache_writes=False, cache_max_bytes=1)
         with source.open(cache_writes=False, cache_max_bytes=1024) as reader:

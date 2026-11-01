@@ -153,18 +153,20 @@ bulk float64 coordinate arrays are introduced.
 
 ## Bounded I/O, decoding, and workers
 
-Remote images stream into seekable disk files. The default encoded-file payload
-budget is 1 GiB. `cache_max_bytes` configures the shared directory budget for
-both image files and decoded Zarr chunks; omitting it reuses a previously set
-limit. Existing Zarr-only defaults are preserved. SQLite coordinates atomic
-publication and eviction across processes. Temporary materialization without
-a writable cache also has a finite budget. An image larger than the limit raises
-with instructions to increase it. Metadata/index files and filesystem overhead
+Remote images stream into seekable disk files. A cache directory's budget is
+unlimited until someone sets a limit, and only a limit evicts anything.
+`cache_max_bytes` configures the shared directory budget for both image files
+and decoded Zarr chunks; omitting it reuses a previously set limit, and
+`2**63 - 1` lifts one. SQLite coordinates atomic publication and eviction across
+processes. Temporary materialization without a writable cache is bounded at
+1 GiB unless `cache_max_bytes` says otherwise. An image larger than the limit
+raises with instructions to increase it. Metadata/index files and filesystem overhead
 are separate from the payload budget.
 
 Different image files download concurrently when the budget has room for their
-in-flight reservations. Responses without a usable Content-Length reserve the
-whole budget. Reducing the limit below active reservations raises; retry after
+in-flight reservations. Responses without a usable Content-Length reserve as
+their bytes arrive, evicting only what that takes, and download one at a time on
+a limited budget; an unlimited budget reserves nothing. Reducing the limit below active reservations raises; retry after
 the downloads finish. Interrupted workers' reservations are reclaimed using
 file locks, without removing live workers' temporary files.
 

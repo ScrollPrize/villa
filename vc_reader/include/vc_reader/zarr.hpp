@@ -108,7 +108,8 @@ std::optional<std::filesystem::path> vc3dCacheRoot();
 void createVc3dVolumeDir(const std::filesystem::path& volumeDir, bool delta3d);
 // cache_dir/<scheme>/<host or bucket>/<path>; public buckets are keyed by their s3:// form.
 std::filesystem::path decodedCachePath(const std::filesystem::path& cacheDir, const std::string& url);
-// One SQLite eviction index per directory and process, shared by writers.
+// One SQLite eviction index per directory and process, shared by writers. No maxBytes keeps
+// the limit stored in the directory, unlimited for a new one; a value replaces it.
 std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std::int64_t> maxBytes);
 
 // VC3D's shared lease on one of its cache directories (flock LOCK_SH).

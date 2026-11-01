@@ -300,9 +300,12 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     }
     if (options.offline) throw CacheMiss(location + ": encoded file is not cached (offline)");
     fs::path root;
+    auto limit = options.cacheMaxBytes;
     if (!roots.empty() && options.cacheWrites) {
         root = roots.front();
     } else {
+        // Scratch space the user did not choose: a large file must not fill it unasked.
+        limit = limit.value_or(std::int64_t{1} << 30);
         if (temporary_.empty()) {
             auto pattern = (fs::temp_directory_path() / "vc-reader-images-XXXXXX").string();
             if (!::mkdtemp(pattern.data())) throw std::system_error(errno, std::generic_category(), "mkdtemp");
@@ -310,9 +313,9 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
         }
         root = temporary_;
     }
-    // No limit reuses the directory's configured one, or the reader's 1 GiB default for a
-    // new directory; it never resets another reader's explicit budget.
-    auto budget = zarr::diskBudget(root.string(), options.cacheMaxBytes);
+    // No limit reuses the directory's configured one, unlimited for a new directory; it
+    // never resets another reader's explicit budget.
+    auto budget = zarr::diskBudget(root.string(), limit);
     auto [fd, received] = budget->open_file(zarr::decodedCachePath(root, location).string(), options.access.url(location), options.access.auth);
     bytesRead_ += received;
     if (fd < 0) throw zarr::NotFound(location + ": remote image does not exist");

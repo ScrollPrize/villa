@@ -18,6 +18,8 @@ namespace vcr {
 
 class DiskCache {
 public:
+    // max_bytes -1 keeps the limit stored in the root, unlimited for a new root;
+    // anything else replaces it. Only a limit ever evicts.
     DiskCache(const std::string& root, std::int64_t max_bytes)
         : root_(std::filesystem::weakly_canonical(root))
     {
@@ -37,7 +39,7 @@ public:
             exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
                  "CREATE TABLE IF NOT EXISTS budget(id INTEGER PRIMARY KEY, max_bytes INTEGER,"
                  " total INTEGER NOT NULL DEFAULT 0, clock INTEGER NOT NULL DEFAULT 0);"
-                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,1073741824);"
+                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,9223372036854775807);"
                  "CREATE TABLE IF NOT EXISTS chunks(path TEXT PRIMARY KEY, size INTEGER, age INTEGER);"
                  "CREATE INDEX IF NOT EXISTS oldest_chunk ON chunks(age,path);"
                  "CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN "
@@ -53,6 +55,11 @@ public:
             exec("CREATE TABLE IF NOT EXISTS downloads(path TEXT PRIMARY KEY, size INTEGER NOT NULL);");
             transaction([&] {
                 clean_downloads();
+                // Budgets used to be seeded at 1 GiB, which nobody chose and which evicted the
+                // cache of whoever opened the root without a limit. Once, per index: lift it.
+                if (number("PRAGMA user_version") == 0)
+                    exec("UPDATE budget SET max_bytes=9223372036854775807 WHERE id=1 AND max_bytes=1073741824;"
+                         "PRAGMA user_version=1");
                 if (max_bytes >= 0) set_limit(max_bytes);
                 // Without a byte limit nothing reads the index: a walk of a large root on
                 // every open would only keep an unused total right.
@@ -195,21 +202,34 @@ public:
             options.auth = auth;
             HttpClient client(options);
             std::size_t received = 0, reserved = 0;
+            bool grows = false;
+            File unsized_turn;
             auto response = client.get_stream(url, [&] {
                 std::lock_guard lock(mutex_);
                 transaction([&] { output->reset(); record_download(temporary, 0); });
                 received = reserved = 0;
             }, [&](const char* data, std::size_t n) {
-                if (n > reserved - received)
-                    throw std::runtime_error("encoded file exceeds cache_max_bytes or declared Content-Length");
+                if (n > reserved - received) {
+                    if (!grows)
+                        throw std::runtime_error("encoded file exceeds cache_max_bytes or declared Content-Length");
+                    reserved = grow_download(temporary, received + n);
+                }
                 output->write(reinterpret_cast<const std::uint8_t*>(data), n);
                 received += n;
             }, {}, 200, [&](const HttpResponse& header) {
-                // Content-Length describes wire bytes. Compressed or
-                // unsized responses reserve the whole budget before writing.
+                // Content-Length describes wire bytes. Compressed or unsized responses
+                // reserve as their bytes arrive, one at a time on a limited budget: two
+                // each holding part of it could otherwise wait for each other forever.
+                // Sized downloads never grow, so they always finish and free what they hold.
                 const auto size = header.content_encoding.empty() || header.content_encoding == "identity"
                     ? header.content_length : std::nullopt;
-                reserved = reserve_download(temporary, size);
+                grows = !size;
+                if (grows && unsized_turn.fd() < 0 && max_bytes() != std::numeric_limits<std::int64_t>::max()) {
+                    unsized_turn = File(::open((locks / "unsized.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+                    if (unsized_turn.fd() < 0) throw std::system_error(errno, std::generic_category(), "open cache file lock");
+                    lock_file(unsized_turn.fd());
+                }
+                reserved = size ? reserve_download(temporary, *size) : 0;
             });
             std::lock_guard lock(mutex_);
             transaction([&] {
@@ -360,16 +380,14 @@ private:
         }
     }
 
-    std::size_t reserve_download(const std::string& path, std::optional<std::size_t> size)
+    std::size_t reserve_download(const std::string& path, std::size_t needed)
     {
         for (;;) {
             {
                 std::lock_guard lock(mutex_);
                 bool admitted = false;
-                std::size_t needed = 0;
                 transaction([&] {
                     const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
-                    needed = size.value_or(static_cast<std::size_t>(limit));
                     if (needed > static_cast<std::uint64_t>(limit))
                         throw std::runtime_error("encoded file exceeds cache_max_bytes; increase the disk limit");
                     auto reserved = reserved_bytes();
@@ -387,6 +405,45 @@ private:
             }
             // Cross-process capacity wait; neither the mutex nor SQLite writer
             // lock is held while active transfers finish and publish their files.
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    // Raises a growing download's reservation to at least `needed` bytes, evicting only what
+    // that takes. Spare room is reserved too, so a free budget is not asked on every write.
+    std::size_t grow_download(const std::string& path, std::size_t needed)
+    {
+        constexpr std::int64_t step = 16 << 20;
+        for (;;) {
+            {
+                std::lock_guard lock(mutex_);
+                std::size_t granted = 0;
+                transaction([&] {
+                    const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                    if (needed > static_cast<std::uint64_t>(limit))
+                        throw std::runtime_error("encoded file exceeds cache_max_bytes; increase the disk limit");
+                    std::int64_t own = 0;
+                    {
+                        Statement s(db_, "SELECT COALESCE(SUM(size),0) FROM downloads WHERE path=?");
+                        s.text(1, path);
+                        s.step();
+                        own = sqlite3_column_int64(s.get(), 0);
+                    }
+                    auto others = reserved_bytes() - own;
+                    const auto wanted = static_cast<std::int64_t>(needed);
+                    if (wanted > limit - others) {
+                        clean_downloads();
+                        others = reserved_bytes() - own;
+                        if (wanted > limit - others) return;  // sized downloads hold it; they finish
+                    }
+                    const auto spare = limit - others - number("SELECT total FROM budget WHERE id=1") - wanted;
+                    const auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
+                    evict_to(limit - others - target);
+                    record_download(path, static_cast<std::size_t>(target));
+                    granted = static_cast<std::size_t>(target);
+                });
+                if (granted) return granted;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
