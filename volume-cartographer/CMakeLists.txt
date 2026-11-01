@@ -634,8 +634,8 @@ endif()
 
 # VC-Delta3D is maintained as a standalone first-party codec. Prefer an
 # installed package (useful for distro builds and local development), then
-# fetch the reviewed 0.2.0 release for ordinary builds.
-find_package(vc_delta3d CONFIG QUIET)
+# fetch the preset-enabled revision from ScrollPrize/vc-delta3d#7.
+find_package(vc_delta3d 0.3 CONFIG QUIET)
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
     set(VC_DELTA3D_BUILD_PYTHON OFF)
@@ -643,7 +643,7 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP OFF)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG v0.2.0
+        GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d
     )
     FetchContent_MakeAvailable(vc_delta3d)
 endif()
