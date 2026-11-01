@@ -325,6 +325,8 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
         throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
     if(trace.replayPresenceIgnoreWidth || trace.widthHardRelativeTolerance>0)
         throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
+    if(fiberStopScoreEnabled(trace))
+        throw std::invalid_argument("stop score is supported by the beam backend only");
     if(c.onlineRefineIterations && c.gpuLibrary.empty())
         throw std::invalid_argument("online refinement requires GPU backend");
     if(c.beamCommitMode=="rolling" && (c.gpuLibrary.empty() ||
@@ -690,6 +692,8 @@ std::shared_ptr<const FiberChunkPaths> FiberChunkTraceCache::get(const std::arra
     double scale,const FiberChunkParallelFor& parallelFor,const FiberChunkWait& wait)
 {
     validate(config_,scale);validateFiberTraceConfig(trace);
+    if(fiberStopScoreEnabled(trace))
+        throw std::invalid_argument("stop score is supported by the beam backend only");
     const auto spec=specification(config_,trace,scale,identity_);
     std::shared_ptr<std::promise<std::shared_ptr<const FiberChunkPaths>>> promise;
     std::shared_future<std::shared_ptr<const FiberChunkPaths>> future;

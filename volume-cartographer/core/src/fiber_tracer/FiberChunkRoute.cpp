@@ -40,6 +40,8 @@ std::shared_ptr<const FiberChunkPaths> getChunk(const FiberChunkProvider& get,co
 }
 void validateRoute(const FiberTraceConfig& t,double scale) {
     validateFiberTraceConfig(t);
+    if(fiberStopScoreEnabled(t))
+        throw std::invalid_argument("stop score is supported by the beam backend only");
     if(!std::isfinite(scale)||scale<=0||std::abs(t.stepVoxels*scale-stepBase)>1e-6)
         throw std::invalid_argument("chunk route requires 16 base voxel steps");
 }

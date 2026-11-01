@@ -897,6 +897,92 @@ TEST_CASE("native fiber tracer ignores presence only for the start branch")
     CHECK(std::abs(result.points.back()[1]) > 1.0);
 }
 
+TEST_CASE("native fiber tracer stop score is off by default and validated")
+{
+    vc::fiber_tracer::FiberTraceConfig config;
+    CHECK(!vc::fiber_tracer::fiberStopScoreEnabled(config));
+    config.stopScoreBias = 1.0;
+    CHECK(!vc::fiber_tracer::fiberStopScoreEnabled(config));
+    config.stopScoreWeights = {0.0, -2.0, 0.0};
+    CHECK(vc::fiber_tracer::fiberStopScoreEnabled(config));
+    CHECK(vc::fiber_tracer::fiberStopScore(config, {0.5, 0.25, 3.0}) == doctest::Approx(0.5));
+    config.stopScoreWeights[2] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(vc::fiber_tracer::validateFiberTraceConfig(config), std::invalid_argument);
+}
+
+TEST_CASE("native fiber tracer stop score features use presence, axis and side presence")
+{
+    // Fiber along x at y = 0 with a parallel rival at y = 16 base voxels.
+    class TwoFibers final : public vc::fiber_tracer::FiberPredictionSource {
+    public:
+        vc::fiber_tracer::FiberPredictionSample sample(
+            const cv::Vec3d& point, const cv::Vec3d&) const override
+        {
+            vc::fiber_tracer::FiberPredictionSample out;
+            const double base = 2.0 * point[1];
+            const float presence = std::abs(base) < 1.0 ? 0.5f : std::abs(base - 16.0) < 1.0 ? 0.75f : 0.0f;
+            out.options.push_back({{-1.0f, 0.0f, 0.0f}, presence, presence > 0.0f});
+            return out;
+        }
+    } predictions;
+    const auto along = vc::fiber_tracer::fiberStopScoreFeatures(
+        predictions, {10.0, 0.0, 0.0}, {8.0, 0.0, 0.0}, 2.0);
+    CHECK(along.presence == doctest::Approx(0.5));
+    CHECK(along.axisAgreement == doctest::Approx(1.0));
+    CHECK(along.lateralRival == doctest::Approx(0.25));
+    const auto across = vc::fiber_tracer::fiberStopScoreFeatures(
+        predictions, {10.0, 0.0, 0.0}, {10.0, 0.0, -2.0}, 2.0);
+    CHECK(across.axisAgreement == doctest::Approx(0.0));
+    CHECK_THROWS_AS(vc::fiber_tracer::fiberStopScoreFeatures(
+        predictions, {1.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 2.0), std::invalid_argument);
+}
+
+TEST_CASE("native fiber tracer stops before a committed step whose stop score is positive")
+{
+    // A valid fiber along x whose presence fades from 1 to 0.2 at x = 8.
+    class FadingPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+    public:
+        vc::fiber_tracer::FiberPredictionSample sample(
+            const cv::Vec3d& point, const cv::Vec3d& referenceDirection) const override
+        {
+            vc::fiber_tracer::FiberPredictionSample out;
+            out.options.push_back({
+                referenceDirection[0] < 0.0 ? cv::Vec3f{-1.0f, 0.0f, 0.0f} : cv::Vec3f{1.0f, 0.0f, 0.0f},
+                point[0] < 8.0 ? 1.0f : 0.2f,
+                true});
+            return out;
+        }
+    } predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {16.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
+    request.budgetSpanVoxels = 16.0;
+    request.config.stepVoxels = 2.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+    const auto stock = vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    request.config.stopScoreWeights = {-1.0, 0.0, 0.0};
+    request.config.stopScoreBias = 0.5; // stop where presence < 0.5
+    const auto stopped = vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    CHECK(stopped.reason == "stop_score");
+    CHECK(!stopped.reachedTargetPlane);
+    REQUIRE(!stopped.points.empty());
+    CHECK(stopped.points.back()[0] < 8.0);
+    CHECK(stock.reachedTargetPlane);
+    CHECK(stopped.points.size() < stock.points.size());
+    request.config.stopScoreBias = -0.5; // never positive: same trace as stock
+    const auto unchanged = vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    CHECK(unchanged.reason == stock.reason);
+    REQUIRE(unchanged.points.size() == stock.points.size());
+    for (size_t i = 0; i < stock.points.size(); ++i)
+        CHECK(cv::norm(unchanged.points[i] - stock.points[i]) == doctest::Approx(0.0));
+}
+
 TEST_CASE("native fiber tracer candidate loss uses the all-pairs direction product")
 {
     DirectionProductPrediction predictions;

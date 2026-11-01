@@ -178,6 +178,30 @@ struct PredictionFieldHandle {
     std::string location;
 };
 
+// Stop-score features along a base-voxel polyline, one row per point; each
+// point's tangent is the step from the point before it (the first point uses
+// the first step), exactly as the tracer scores its committed steps.
+nb::object stopScoreFeatures(const PredictionFieldHandle& field, const PointsIn& points)
+{
+    const auto base = toPoints(points, "points_base_xyz");
+    if (base.size() < 2)
+        throw std::invalid_argument("stop score features need at least two points");
+    const double scale = field.scales.traceToBaseScale;
+    std::vector<double> values(base.size() * 3, 0.0);
+    {
+        nb::gil_scoped_release release;
+        for (size_t i = 0; i < base.size(); ++i) {
+            const cv::Vec3d point = base[i] / scale;
+            const cv::Vec3d previous = i > 0 ? base[i - 1] / scale : point - (base[1] - base[0]) / scale;
+            const auto f = ft::fiberStopScoreFeatures(*field.field, point, previous, scale);
+            values[i * 3] = f.presence;
+            values[i * 3 + 1] = f.axisAgreement;
+            values[i * 3 + 2] = f.lateralRival;
+        }
+    }
+    return ownedArray(std::move(values), {base.size(), size_t{3}});
+}
+
 struct LiveBridgeHandle {
     std::shared_ptr<ft::FiberLiveBridge> bridge;
     LiveBridgeHandle(int port, const std::string& token, int timeout, bool heartbeat)
@@ -318,6 +342,8 @@ const std::vector<ConfigField>& configFields()
         field<int, &ft::FiberTraceConfig::replayReverseConvergenceSteps>("replay_reverse_convergence_steps"),
         field<bool, &ft::FiberTraceConfig::replayReverseToStart>("replay_reverse_to_start"),
         field<bool, &ft::FiberTraceConfig::replayReverseAllEndpoints>("replay_reverse_all_endpoints"),
+        field<std::array<double, 3>, &ft::FiberTraceConfig::stopScoreWeights>("stop_score_weights"),
+        field<double, &ft::FiberTraceConfig::stopScoreBias>("stop_score_bias"),
         field<double, &ft::FiberTraceConfig::widthRelativeTolerance>("width_relative_tolerance"),
         field<bool, &ft::FiberTraceConfig::widthCosineWeight>("width_cosine_weight"),
         field<double, &ft::FiberTraceConfig::widthReferenceMean>("width_reference_mean"),
@@ -881,6 +907,9 @@ NB_MODULE(fiber_trace, m)
         .def_ro("segments",&ft::FiberReplayTraceResult::segments)
         .def_ro("failures",&ft::FiberReplayTraceResult::failures);
 
+    m.def("stop_score_features", &stopScoreFeatures, "field"_a, "points_base_xyz"_a,
+          "Stop-score features [presence, axis agreement, lateral rival] at each point of a "
+          "base-voxel polyline, as the beam tracer computes them for stop_score_weights.");
     m.def("decode_directions", &decodeDirections, "nx"_a.noconvert(), "ny"_a.noconvert(),
           "Decode flat uint8 nx/ny arrays to unit xyz axes; missing bytes give zero axes.");
 
@@ -1076,6 +1105,8 @@ NB_MODULE(fiber_trace, m)
         .def_rw("replay_presence_modulated", &ft::FiberTraceConfig::replayPresenceModulated)
         .def_rw("replay_presence_ignore_width", &ft::FiberTraceConfig::replayPresenceIgnoreWidth)
         .def_rw("width_hard_relative_tolerance", &ft::FiberTraceConfig::widthHardRelativeTolerance)
+        .def_rw("stop_score_weights", &ft::FiberTraceConfig::stopScoreWeights)
+        .def_rw("stop_score_bias", &ft::FiberTraceConfig::stopScoreBias)
         .def_rw("width_relative_tolerance", &ft::FiberTraceConfig::widthRelativeTolerance)
         .def_rw("width_cosine_weight", &ft::FiberTraceConfig::widthCosineWeight)
         .def_rw("width_reference_mean", &ft::FiberTraceConfig::widthReferenceMean)
