@@ -4,7 +4,7 @@
 
 #include <utils/hash.hpp>
 
-#include <zstd.h>
+#include <vc_reader/zarr_write.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -18,6 +18,9 @@
 
 namespace vc::fiber_tracer
 {
+
+// The fiberlet field codec, as numcodecs spells it.
+const nlohmann::json kFiberletZstd = {{"id", "zstd"}, {"level", 3}};
 namespace
 {
 
@@ -327,14 +330,13 @@ void finishField(FieldBlock& field, bool compress)
         field.encoded = field.decoded;
         return;
     }
-    std::vector<std::byte> compressed(ZSTD_compressBound(field.decoded.size()));
-    const std::size_t size = ZSTD_compress(compressed.data(), compressed.size(), field.decoded.data(), field.decoded.size(), 3);
-    if (ZSTD_isError(size))
-        throw std::runtime_error(std::string("fiberlet zstd encode failed: ") + ZSTD_getErrorName(size));
-    compressed.resize(size);
-    if (size < field.decoded.size()) {
+    // zstd level 3 through vc_reader's codecs: the same bytes ZSTD_compress wrote.
+    const auto bytes = vcr::zarr::compressBytes(kFiberletZstd,
+        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(field.decoded.data()), field.decoded.size()));
+    if (bytes.size() < field.decoded.size()) {
         field.codec = BlockCodec::Zstd;
-        field.encoded = std::move(compressed);
+        field.encoded.assign(reinterpret_cast<const std::byte*>(bytes.data()),
+                             reinterpret_cast<const std::byte*>(bytes.data()) + bytes.size());
     } else {
         field.codec = BlockCodec::Raw;
         field.encoded = field.decoded;
@@ -532,9 +534,13 @@ DecodedPayload decodePayload(std::span<const std::byte> bytes, FiberletStorageCh
                 throw std::invalid_argument("fiberlet raw field length is invalid");
             std::copy(source.begin(), source.end(), decoded.begin());
         } else if (codec == BlockCodec::Zstd) {
-            const auto size = ZSTD_decompress(decoded.data(), decoded.size(), source.data(), source.size());
-            if (ZSTD_isError(size) || size != decoded.size())
+            try {
+                vcr::zarr::decompressBytes(kFiberletZstd,
+                    std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(source.data()), source.size()),
+                    std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(decoded.data()), decoded.size()));
+            } catch (const std::exception&) {
                 throw std::invalid_argument("fiberlet zstd field is invalid");
+            }
         } else {
             throw std::invalid_argument("fiberlet field codec is unknown");
         }

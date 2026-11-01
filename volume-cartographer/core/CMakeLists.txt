@@ -198,7 +198,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
-target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
