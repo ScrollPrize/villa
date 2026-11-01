@@ -717,7 +717,9 @@ class ServiceState:
 
     def __init__(self, bindings=None,
                  service_name=None, session_name="", logs=None, events=None,
-                 gpu_ids=(0,), startup_run=None, object_store=None):
+                 gpu_ids=(0,), startup_run=None, object_store=None,
+                 build_missing_lasagna_packs=False):
+        self.build_missing_lasagna_packs = bool(build_missing_lasagna_packs)
         self.lock = threading.RLock()
         self._service_condition = threading.Condition(self.lock)
         self._closing = False
@@ -1094,6 +1096,7 @@ class ServiceState:
         selection."""
         capabilities = dict(SERVICE_CAPABILITIES)
         positioned = self._positioned()
+        capabilities["build_missing_lasagna_packs"] = self.build_missing_lasagna_packs
         capabilities["input_positions"] = positioned
         # A service with positions updates a resident fit's inputs in place.
         capabilities["inputs_frozen"] = not positioned
@@ -1292,7 +1295,7 @@ class ServiceState:
         # The project supplies the umbilicus once the fit volume is known.
         errors = validate_session_request(
             paths, validation_run, supplied=VOLUME_INPUT_KEYS,
-            build_lasagna_packs=False,
+            build_lasagna_packs=self.build_missing_lasagna_packs,
             missing={"winding_inference": (
                 "winding-model supervision reads the service's winding-inference "
                 "binding, and this service has none: restart it with "
@@ -1803,6 +1806,9 @@ class ServiceState:
             if position is None:
                 return self._begin_prepared_build(paths, run, preview, scroll,
                                                   minimum)
+            if self.build_missing_lasagna_packs:
+                return self._begin_prepared_build(
+                    paths, run, preview, scroll, minimum, checkpoint_position=position)
             run = self._pin_run(run, position)
             record = {"hub": self.object_store.positions,
                       "sequence": position, "requested": None, "head": None,
@@ -1860,8 +1866,12 @@ class ServiceState:
             return None
         return int(position["sequence"])
 
-    def _begin_prepared_build(self, paths, run, preview, scroll, minimum):
-        """Link and pin a position off the HTTP thread, then build at it."""
+    def _begin_prepared_build(self, paths, run, preview, scroll, minimum,
+                              checkpoint_position=None):
+        """Prepare packs and a position off the HTTP thread, then build.
+
+        A checkpoint keeps its recorded position without refreshing links.
+        """
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
@@ -1876,7 +1886,7 @@ class ServiceState:
         try:
             self._start_background(
                 target=self._prepare_then_build,
-                args=(build_id, paths, run, preview, scroll, minimum),
+                args=(build_id, paths, run, preview, scroll, minimum, checkpoint_position),
                 name="spiral-input-position", daemon=True)
         except BaseException:
             with self.lock:
@@ -1912,6 +1922,7 @@ class ServiceState:
         from fit_session import lasagna_normal_inputs
         from object_store_inputs import (fit_volume_at, prepare_position,
                                          request_from_config)
+        self._prepare_lasagna_packs(paths, config)
         lasagna = lasagna_normal_inputs(
             load_lasagna_source(paths.lasagna) if paths.lasagna else None,
             config, scroll.lasagna_scale, paths.cache_directory)
@@ -1931,11 +1942,73 @@ class ServiceState:
                 return prepared
             return prepared, fit_volume_at(store, request, prepared)
 
-    def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum):
+    def _prepare_lasagna_packs(self, paths, config):
+        """Opted-in hosts build missing pools from local arrays before linking."""
+        if not self.build_missing_lasagna_packs or not paths.lasagna:
+            return
+        from fit_session import lasagna_packs_required, input_source_enabled
+        from lasagna_source import is_remote_location
+        source = load_lasagna_source(paths.lasagna)
+        kinds = set(lasagna_packs_required(config))
+        # Link refresh uses normals even when their dense loss is disabled.
+        if (input_source_enabled(config, "normals")
+                and source.stores.get("normal_x") and source.stores.get("normal_y")):
+            kinds.add("normals")
+        if not kinds:
+            return
+        for kind in sorted(kinds):
+            if os.path.isfile(os.path.join(
+                    source.pack_directory(paths.cache_directory, kind), "meta.json")):
+                continue
+            for array in source.arrays(kind):
+                if is_remote_location(array) or not os.path.isdir(array):
+                    raise ValueError(
+                        f"Cannot build missing Lasagna {kind} pack: {array} is not "
+                        "an accessible local array. Prepare the pack where the "
+                        "arrays are and copy it into the service cache.")
+        from lasagna_data import ensure_fit_sparse_stores, _require_sidecar
+        from spiral_progress import ProgressReporter
+
+        def publish(snapshot):
+            with self.lock:
+                if self._input_preparation is not None:
+                    self._input_preparation["progress"] = snapshot
+                    self.status_generation += 1
+
+        progress = ProgressReporter(publish, stream=sys.stderr)
+        try:
+            ensure_fit_sparse_stores(
+                source=source, cache_directory=paths.cache_directory,
+                use_normals="normals" in kinds, use_spacing="grad_mag" in kinds,
+                progress=progress)
+            for kind in sorted(kinds):
+                _require_sidecar(source, paths.cache_directory, kind)
+        finally:
+            progress.close()
+
+    def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum,
+                            checkpoint_position=None):
         try:
             project = scroll.project
-            prepared, volume, paths, scroll = self._prepare_inputs(
-                paths, run, scroll, minimum)
+            if checkpoint_position is None:
+                prepared, volume, paths, scroll = self._prepare_inputs(
+                    paths, run, scroll, minimum)
+                for line in prepared.lines:
+                    self.events.append("log", line, source="service",
+                                       operation="preparing_inputs")
+                record = {**prepared.position.provenance(), "requested": minimum,
+                          "head": prepared.head, "attempts": prepared.attempts,
+                          "source": "prepared"}
+                run = self._pin_run(run, prepared.position.sequence)
+            else:
+                run = self._pin_run(run, checkpoint_position)
+                volume = self._unprepared_volume(paths, scroll)
+                config = self._effective_config(paths, run)
+                paths, scroll = self._resolve_session_scroll(scroll, volume, paths, config)
+                self._prepare_lasagna_packs(paths, config)
+                record = {"hub": self.object_store.positions,
+                          "sequence": checkpoint_position, "requested": None,
+                          "head": None, "attempts": 0, "source": "checkpoint"}
         except BaseException as exc:
             cause = _cause(exc)
             with self.lock:
@@ -1951,13 +2024,6 @@ class ServiceState:
                 f"is unchanged: {cause}", severity="error", source="service",
                 operation="preparing_inputs")
             return
-        for line in prepared.lines:
-            self.events.append("log", line, source="service",
-                               operation="preparing_inputs")
-        record = {**prepared.position.provenance(), "requested": minimum,
-                  "head": prepared.head, "attempts": prepared.attempts,
-                  "source": "prepared"}
-        run = self._pin_run(run, prepared.position.sequence)
         with self.lock:
             self._input_preparation = None
             _, session_id, previous = self._publish_build_locked(
@@ -3840,6 +3906,9 @@ def main(argv=None):
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
+    parser.add_argument("--build-missing-lasagna-packs", action="store_true",
+                        help="Build missing Lasagna packs from accessible local arrays "
+                             "during input preparation (default: require prepared packs)")
     parser.add_argument("--cache", default=None,
                         help="Directory for derived host caches: prepared "
                              "Lasagna packs and fiber directions (default: "
@@ -3963,6 +4032,7 @@ def main(argv=None):
                          events=events,
                          gpu_ids=args.gpus,
                          object_store=object_store,
+                         build_missing_lasagna_packs=args.build_missing_lasagna_packs,
                          startup_run={"z_begin": args.z_begin,
                                       "z_end": args.z_end,
                                       "config": startup_config})

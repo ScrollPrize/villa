@@ -251,8 +251,12 @@ def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
     assert state.session_id == session_id
 
 
+@pytest.mark.parametrize("build_packs", [False, True])
 def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
-                                                       monkeypatch):
+                                                       monkeypatch, build_packs):
+    state.build_missing_lasagna_packs = build_packs
+    packed = []
+    monkeypatch.setattr(state, "_prepare_lasagna_packs", lambda *args: packed.append(True))
     built = []
     monkeypatch.setattr(state, '_build', lambda *args: built.append(args))
     monkeypatch.setattr(osi, 'prepare_position', lambda *args, **kwargs: pytest.fail(
@@ -274,6 +278,7 @@ def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
     _, _, _, pinned_run, _, _ = built[0]
     assert pinned_run.config['object_store_input_position'] == 7
     assert state.status()['input_position']['source'] == 'checkpoint'
+    assert bool(packed) == build_packs
 
 
 def test_a_shared_store_has_positions_of_its_own(store_path, tmp_path):

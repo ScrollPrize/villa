@@ -326,7 +326,8 @@ void SpiralServiceManager::startLocalProcess()
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
         outputRoot = defaultLocalOutputRoot(_localStorePath);
-    QStringList binding{QStringLiteral("--output"), outputRoot};
+    QStringList binding{QStringLiteral("--output"), outputRoot,
+                        QStringLiteral("--build-missing-lasagna-packs")};
     // A hosted replica's service works on its own replica of the same hub
     // (cloned at first launch, reattached later), never on this one.
     if (_storeBinding.localHosted())

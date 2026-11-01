@@ -440,7 +440,7 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     assert advertised['capabilities'] == {
         'input_source': 'object_store', 'inputs_frozen': False,
         'input_reload_rebuild': True, 'input_positions': True, 'input_updates': True,
-        'winding_inference': False}
+        'winding_inference': False, 'build_missing_lasagna_packs': False}
     # Nothing advertises patch, fiber or PCL files, or a host.
     assert 'pcl_inputs' not in advertised
     assert not {'root', 'resolved', 'detected_checkpoints', 'scroll_spec'} & set(advertised)
@@ -800,3 +800,58 @@ def test_a_service_initializes_from_project_and_store_alone(host, store, tmp_pat
     assert recorded['provenance'] == {'project': 's1',
                                       'output_directory': str(host.output),
                                       'cache_directory': str(host.cache)}
+
+
+def test_local_service_packs_before_linking_and_reuses_cache(host, store, tmp_path,
+                                                           monkeypatch):
+    import numpy as np
+    from test_sparse_cuda_cache import write_raw_pack_source
+    from lasagna_source import load_lasagna_source
+    import object_store_inputs as osi
+
+    lasagna = {'location': str(tmp_path / 'local.lasagna.json'),
+               'identity': 'local-test', 'group': '0'}
+    for channel in ('normal_x', 'normal_y', 'gradient_magnitude'):
+        path = tmp_path / channel
+        write_raw_pack_source(path / '0', np.full((16, 16, 16), 128, dtype=np.uint8))
+        lasagna[channel] = str(path)
+    body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
+    body['run']['config']['loss_weight_dense_spacing'] = 1
+    state = service(host, store, build_missing_lasagna_packs=True)
+    original = osi.prepare_position
+    linked = []
+
+    def link(*args, **kwargs):
+        for kind in ('normals', 'grad_mag'):
+            assert (host.cache / 'lasagna/local-test' / f'{kind}_g0/meta.json').is_file()
+        linked.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(osi, 'prepare_position', link)
+    paths, _ = _built(state, body)
+    assert linked
+    assert state.binding_advertisement()['capabilities']['build_missing_lasagna_packs']
+    source = load_lasagna_source(paths.lasagna)
+    meta = Path(source.pack_directory(paths.cache_directory, 'normals')) / 'meta.json'
+    before = meta.stat().st_mtime_ns
+    # Cached packs no longer require the local arrays.
+    for channel in ('normal_x', 'normal_y', 'gradient_magnitude'):
+        Path(lasagna[channel]).rename(tmp_path / (channel + '-unavailable'))
+    _built(service(host, store, build_missing_lasagna_packs=True), body)
+    assert meta.stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize('location', ['https://example.invalid/array', '/missing/array'])
+def test_pack_failure_preserves_resident_before_link_refresh(host, store,
+                                                            monkeypatch, location):
+    import object_store_inputs as osi
+    state = service(host, store, build_missing_lasagna_packs=True)
+    resident = SimpleNamespace(status=lambda: {"state": SessionState.Idle})
+    state.session = resident
+    monkeypatch.setattr(osi, 'prepare_position', lambda *a, **k: pytest.fail('must not link'))
+    lasagna = {'location': '/local.lasagna.json', 'identity': 'missing-test',
+               'group': '0', 'normal_x': location, 'normal_y': location}
+    body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
+    failure = _built(state, body)
+    assert 'not an accessible local array' in failure['message']
+    assert state.session is resident

@@ -544,9 +544,26 @@ channels' `scaledown`) beside them. The command-line fit derives `lasagna_scale`
 frame (see "Input manifest").
 
 The command-line fit builds a missing pool from the arrays (reporting chunk
-progress; in DDP only rank 0 builds). A service never builds one: it fits the
-project's dataset by the identity VC3D sends and refuses a build whose pools
-are not in its cache. Pack them where the arrays are and copy them over:
+progress; in DDP only rank 0 builds). By default a service requires prepared
+packs in its cache. VC3D automatically passes `--build-missing-lasagna-packs`
+when launching its owned local service. An independently launched service can
+opt in with the same flag:
+
+```sh
+python spiral_service.py --object-store /path/to/store --output /path/to/output \
+    --cache ~/.cache/vc3d/spiral --build-missing-lasagna-packs
+```
+
+The project supplies the dataset identity, array paths and scale. Missing packs
+are built only from accessible local arrays, with shared packing locks and
+progress reporting, before link refresh or replacement of the resident fit.
+Checkpoint resumes prepare missing packs too, retaining their recorded input
+position. Existing packs are reused without needing the source arrays. A packing
+failure leaves the resident session intact. This launch flag does not generate
+fiber-direction samples and cannot be enabled by a fit request.
+
+For remote arrays or a service without this flag, pack where the arrays are and
+copy the packs over:
 
 ```sh
 python pack_resident_pools.py /path/to/dataset.lasagna.json \
@@ -725,8 +742,9 @@ authenticated HTTP protocol:
 - **Localhost** — VC3D launches and owns the service on loopback. Nothing to
   set up beyond the Python environment; the optional output, cache and
   winding-inference paths are chosen in the connection panel and VC3D
-  launches the service bound to the project's store with those values.
-  Changing one restarts the owned service.
+  launches the service bound to the project's store with those values and
+  `--build-missing-lasagna-packs`: accessible local Lasagna arrays are packed
+  automatically on first use. Changing a binding restarts the owned service.
 - **Remote (SSH)** — the supported internet flow. SSH access to the host is
   the only client-side prerequisite: VC3D opens and manages its own SSH
   tunnel, reads the service's auto-generated API key over SSH, and attaches to
