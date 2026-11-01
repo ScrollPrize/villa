@@ -24,6 +24,7 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <QUrl>
@@ -330,8 +331,16 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
     if (uri.isEmpty()) return;
     const QString trimmed = uri.trimmed();
     const Mode m = detectModeFromUri(trimmed);
+    // Checking a radio fires onModeChanged, which lists the current location
+    // (the Open Data bucket at first) before the requested one is navigated.
+    {
+        const QSignalBlocker localSignals(_localRadio);
+        const QSignalBlocker remoteSignals(_remoteRadio);
+        (m == Mode::Remote ? _remoteRadio : _localRadio)->setChecked(true);
+    }
+    _mode = m;
+    _selectedUri.clear();
     if (m == Mode::Remote) {
-        _remoteRadio->setChecked(true);
         if (isFile && _acceptsFiles) {
             navigateRemote(trimmed.left(trimmed.lastIndexOf('/') + 1));
             _pathBar->setText(trimmed);
@@ -340,7 +349,6 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
             navigateRemote(withTrailingSlash(trimmed));
         }
     } else {
-        _localRadio->setChecked(true);
         QString p = fileUriToPath(trimmed);
         QFileInfo fi(p);
         if (fi.isFile()) p = fi.absolutePath();
