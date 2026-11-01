@@ -164,16 +164,20 @@ TEST_CASE("Streaming store: concurrent misses download in parallel, one request 
 TEST_CASE("Streaming store: low disk space stops caching, is reported, and deletes nothing")
 {
     Streamed s;
+    {
     NormalGridVolume warm(s.dir.string());
     REQUIRE(warm.get_grid(0, 0) != nullptr);
+    }  // the destructors wait for read-ahead, whose downloads hold temporaries
 
     writeIni(s.config, 1000000000ULL);  // more free space than any disk has
+    {
     NormalGridVolume starved(s.dir.string());
     CHECK(starved.get_grid(1, 0) == nullptr);
     const auto stats = starved.cacheStats();
     CHECK(stats.fetchFailures == 1);
     CHECK(stats.lastFetchError.find("free") != std::string::npos);
     CHECK(stats.lastFetchError.find("nothing cached was removed") != std::string::npos);
+    }
     CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid"));
     CHECK(fs::is_regular_file(s.dir / "xy" / "000000.grid"));
     CHECK(s.temporaries().empty());
