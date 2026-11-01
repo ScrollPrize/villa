@@ -1,4 +1,7 @@
 #include "CWindow.hpp"
+
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
 #include "VolumeComboTooltip.hpp"
 
 #include <QDateTime>
@@ -1024,16 +1027,27 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
+    // The free space of the cache root against VC's floor, every 5 s; whether vc_reader has
+    // actually refused a write is its budget's low_space(), which it decides on each write.
     auto updatePersistentCacheSpace = [this]() {
         std::error_code spaceError;
-        const auto space = std::filesystem::space(vc3d::remoteCachePathFs(), spaceError);
+        const auto root = vc3d::remoteCachePathFs();
+        const auto space = std::filesystem::space(root, spaceError);
         if (spaceError)
             return;
         if (space.available < static_cast<std::uintmax_t>(vc::settings::remoteCacheMinFreeBytes())) {
             const double freeGiB = static_cast<double>(space.available) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free. Chunks are no longer being cached; downloads continue without caching. Nothing already cached was removed.")
-                                     .arg(freeGiB, 0, 'f', 1);
+            bool refused = false;
+            try {
+                refused = vcr::zarr::diskBudget(root.string(), std::nullopt)->low_space();
+            } catch (const std::exception&) {
+                // No budget on this root yet: nothing has been refused.
+            }
+            const QString text = tr("Low disk space: %1 GiB free. %2 Nothing already cached was removed.")
+                                     .arg(freeGiB, 0, 'f', 1)
+                                     .arg(refused ? tr("Chunks are no longer being cached; downloads continue without caching.")
+                                                  : tr("Chunks will not be cached while the disk stays below the configured floor."));
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();
             if (!_persistentCacheBannerShownThisSession) {
