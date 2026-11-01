@@ -21,7 +21,6 @@
 #include <arm_neon.h>
 #endif
 
-#include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"

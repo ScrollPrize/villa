@@ -24,7 +24,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <opencv2/imgcodecs.hpp>
 
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
