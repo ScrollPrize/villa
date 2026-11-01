@@ -14,7 +14,7 @@
 namespace utils { class Json; }
 
 // Map a tile index through rotation + flip (pure integer tile coordinate transform).
-// Used by both zarr and tif writers.
+// Only test_zarr_helpers.cpp calls this now; vc_render_tifxyz uses srcRectForDst (RotateFlip.hpp).
 inline void mapTileIndex(int tx, int ty, int tilesX, int tilesY,
                          int quadRot, int flipType,
                          int& outTx, int& outTy, int& outTilesX, int& outTilesY)

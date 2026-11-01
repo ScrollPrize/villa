@@ -479,6 +479,10 @@ jobs:
         working-directory: volume-cartographer
         timeout-minutes: 2
         run: python3 core/test/test_render_band_prefetch.py build/ci-fast-cli/bin/vc_render_tifxyz
+      - name: Test renderer --rotate/--flip in both writers
+        working-directory: volume-cartographer
+        timeout-minutes: 5
+        run: python3 core/test/test_render_rotate_flip.py build/ci-fast-cli/bin/vc_render_tifxyz
 
   flatboi-compile:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)

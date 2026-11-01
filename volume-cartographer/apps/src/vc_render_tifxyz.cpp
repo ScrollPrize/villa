@@ -7,6 +7,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
+#include "vc/core/util/RotateFlip.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -181,16 +182,6 @@ static int normalizeQuadrantRotation(double angleDeg, double tol = 0.5)
     return -1;
 }
 
-static void rotateFlipIfNeeded(cv::Mat& m, int rotQuad, int flip_axis)
-{
-    if (rotQuad == 1)      cv::rotate(m, m, cv::ROTATE_90_COUNTERCLOCKWISE);
-    else if (rotQuad == 2) cv::rotate(m, m, cv::ROTATE_180);
-    else if (rotQuad == 3) cv::rotate(m, m, cv::ROTATE_90_CLOCKWISE);
-    if (flip_axis == 0)      cv::flip(m, m, 0);
-    else if (flip_axis == 1) cv::flip(m, m, 1);
-    else if (flip_axis == 2) cv::flip(m, m, -1);
-}
-
 // ============================================================
 // Surface generation helpers
 // ============================================================
@@ -201,14 +192,46 @@ static void computeCanvasOrigin(const cv::Size& size, float& u0, float& v0)
     v0 = -0.5f * (size.height - 1.0f);
 }
 
-static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
-                    float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
+// gen() output depends in its last bits on the call origin, so a rotated render rebuilds each source rect
+// from the blocks the unrotated render uses: 128x128 tiles, or full-width 128-row bands. A rot90/270 band
+// uses tiles instead, because full-width bands would cost a whole-width gen() per 128 rows.
+static cv::Size genBlockSize(bool tilePath, const cv::Size& tgtSize, int rotQuad)
 {
-    surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
+    if (tilePath || rotQuad == 1 || rotQuad == 3) return {128, 128};
+    return {tgtSize.width, 128};
+}
+
+// Generate the surface points for `src` (pixels relative to the crop); see genBlockSize.
+static void genTile(QuadSurface* surf, const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
+                    const cv::Rect& src, const cv::Size& block, int rotQuad, int flipAxis, float render_scale,
+                    cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
+{
+    auto genAt = [&](const cv::Rect& r, cv::Mat_<cv::Vec3f>& p, cv::Mat_<cv::Vec3f>& n) {
+        float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
+        u0 += float(crop.x) + float(r.x);
+        v0 += float(crop.y) + float(r.y);
+        surf->gen(&p, &n, r.size(), cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
+    };
     // NOTE: do NOT mutate `normals` here. gen() returns a view into a scratch
     // buffer it reuses across calls (thread_local per worker), so the next
     // gen() on this thread overwrites it. --flip-normals is applied later in
     // prepareBaseAndDirs() on the thread-private clone instead.
+    if (rotQuad <= 0 && flipAxis < 0) {
+        genAt(src, points, normals);
+        return;
+    }
+    points.create(src.size());
+    normals.create(src.size());
+    for (int y = src.y - src.y % block.height; y < src.y + src.height; y += block.height)
+        for (int x = src.x - src.x % block.width; x < src.x + src.width; x += block.width) {
+            const cv::Rect blk(x, y, std::min(block.width, tgtSize.width - x),
+                               std::min(block.height, tgtSize.height - y));
+            const cv::Rect part = blk & src;
+            cv::Mat_<cv::Vec3f> p, n;
+            genAt(blk, p, n);
+            p(part - blk.tl()).copyTo(points(part - src.tl()));
+            n(part - blk.tl()).copyTo(normals(part - src.tl()));
+        }
 }
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
@@ -432,7 +455,10 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     bool isComposite,
     int compositeStart,
     int compositeEnd,
-    vc::Sampling method)
+    vc::Sampling method,
+    int rotQuad,
+    int flipAxis,
+    const cv::Size& genBlock)
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
@@ -442,18 +468,16 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
     uint32_t totalRows = rowEnd > rowStart ? (rowEnd - rowStart) : 0;
+    const cv::Size outSize = vc::rotatedSize(tgtSize, rotQuad);
 
     for (uint32_t row = rowStart; row < rowEnd; row++) {
         uint32_t y0 = row * bandH;
-        uint32_t dy = std::min(bandH, uint32_t(tgtSize.height) - y0);
-
-        float u0, v0;
-        computeCanvasOrigin(fullSize, u0, v0);
-        u0 += float(crop.x);
-        v0 += float(crop.y) + float(y0);
+        uint32_t dy = std::min(bandH, uint32_t(outSize.height) - y0);
+        cv::Rect dst(0, int(y0), outSize.width, int(dy));
+        cv::Rect src = vc::srcRectForDst(dst, tgtSize, rotQuad, flipAxis);
 
         cv::Mat_<cv::Vec3f> bandPts, bandNrm;
-        genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
+        genTile(surf, fullSize, crop, tgtSize, src, genBlock, rotQuad, flipAxis, renderScale, bandPts, bandNrm);
 
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
@@ -519,7 +543,7 @@ static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int 
             std::vector<cv::Mat> samps(raw.begin() + zi * sps, raw.begin() + zi * sps + sps);
             result[zi] = accumulate<T>(samps, 0, sps, accumType, cvType);
         }
-        rotateFlipIfNeeded(result[zi], rotQuad, flipAxis);
+        vc::rotateFlipIfNeeded(result[zi], rotQuad, flipAxis);
     }
     return result;
 }
@@ -544,7 +568,8 @@ static void renderBands(
     uint32_t bandH,
     WriteFn&& writeSlices)
 {
-    const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
+    const cv::Size outSize = vc::rotatedSize(tgtSize, rotQuad);
+    const uint32_t numBands = (uint32_t(outSize.height) + bandH - 1) / bandH;
 
     // Build offset list for readMultiSlice
     auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
@@ -563,21 +588,21 @@ static void renderBands(
 
     for (uint32_t bi = bandStart; bi < bandEnd; bi++) {
         uint32_t y0 = bi * bandH;
-        uint32_t dy = std::min(bandH, uint32_t(tgtSize.height) - y0);
+        uint32_t dy = std::min(bandH, uint32_t(outSize.height) - y0);
+        cv::Rect src = vc::srcRectForDst(cv::Rect(0, int(y0), outSize.width, int(dy)), tgtSize, rotQuad, flipAxis);
 
         // Generate surface for this band
-        float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-        u0 += float(crop.x); v0 += float(crop.y) + float(y0);
         cv::Mat_<cv::Vec3f> bandPts, bandNrm;
-        genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
+        genTile(surf, fullSize, crop, tgtSize, src, genBlockSize(false, tgtSize, rotQuad), rotQuad, flipAxis,
+                renderScale, bandPts, bandNrm);
 
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
         // The band readers prefetch a bounding box around the band (readMultiSlice: all its
         // samples; readCompositeFast: its surface points). A band runs the full width of the
-        // segment, so on a winding that box covers the area inside the winding while the
-        // samples touch a thin ring of it. Queue exactly the
+        // segment (its full height under rotate 90/270), so on a winding that box covers the
+        // area inside the winding while the samples touch a thin ring of it. Queue exactly the
         // chunks this band samples instead (without waiting, as the box was queued) and
         // read through a view that drops the box request; reads still reach the source.
         // With --prefetch-remote the render was planned up front and cache is that view.
@@ -617,7 +642,7 @@ static void renderBands(
                                   compositeParams, vc::render::prefetch::samplingForRender(true));
             }
             cv::Mat s = compOut;
-            rotateFlipIfNeeded(s, rotQuad, flipAxis);
+            vc::rotateFlipIfNeeded(s, rotQuad, flipAxis);
             slices = {s};
         } else {
             // Normal: bulk read + accumulate
@@ -655,19 +680,13 @@ static void renderBands(
 
 static void writeTifBand(std::vector<TiffWriter>& writers,
                           const std::vector<cv::Mat>& slices,
-                          uint32_t bandY0, uint32_t tiffTileH,
-                          uint32_t srcHeight, int rotQuad, int flipAxis)
+                          uint32_t bandY0, uint32_t tiffTileH)
 {
-    uint32_t numTiffTiles = (srcHeight + tiffTileH - 1) / tiffTileH;
     for (size_t zi = 0; zi < slices.size(); zi++) {
         for (uint32_t ty = 0; ty < uint32_t(slices[zi].rows); ty += tiffTileH) {
             uint32_t tdy = std::min(tiffTileH, uint32_t(slices[zi].rows) - ty);
             cv::Mat sub = slices[zi](cv::Rect(0, ty, slices[zi].cols, tdy));
-            int dstBx, dstBy, rBX, rBY;
-            uint32_t srcTileIdx = (bandY0 + ty) / tiffTileH;
-            mapTileIndex(0, int(srcTileIdx), 1, int(numTiffTiles),
-                         std::max(rotQuad, 0), flipAxis, dstBx, dstBy, rBX, rBY);
-            writers[zi].writeTile(0, uint32_t(dstBy) * tiffTileH, sub);
+            writers[zi].writeTile(0, bandY0 + ty, sub);
         }
     }
 }
@@ -693,7 +712,7 @@ static void renderTiles(
     int cvType,
     // Zarr output
     vc::VcDataset* dsOut, const std::vector<size_t>& chunks0,
-    size_t tilesXSrc, size_t tilesYSrc,
+    size_t tilesXDst, size_t tilesYDst,
     // Pyramid datasets L1-L5 (empty = no inline pyramid)
     const std::vector<vc::VcDataset*>& pyramidDs,
     // TIF output (optional)
@@ -702,8 +721,9 @@ static void renderTiles(
     bool resume)
 {
     const size_t CH = chunks0[1], CW = chunks0[2];
-    const uint32_t numTileRows = static_cast<uint32_t>(tilesYSrc);
-    const uint32_t numTileCols = static_cast<uint32_t>(tilesXSrc);
+    const uint32_t numTileRows = static_cast<uint32_t>(tilesYDst);
+    const uint32_t numTileCols = static_cast<uint32_t>(tilesXDst);
+    const cv::Size outSize = vc::rotatedSize(tgtSize, rotQuad);
 
     // Pre-warm validMask cache (thread-safety: subsequent calls are read-only)
     surf->validMask();
@@ -755,7 +775,7 @@ static void renderTiles(
 
     for (uint32_t ty = tyStart; ty < tyEnd; ty++) {
         uint32_t y0 = ty * uint32_t(CH);
-        uint32_t dy = std::min(uint32_t(CH), uint32_t(tgtSize.height) - y0);
+        uint32_t dy = std::min(uint32_t(CH), uint32_t(outSize.height) - y0);
 
         // TIF row buffer: one tile-column's worth of slices per tx
         // tifRowBuf[tx] = vector of cv::Mat (one per output slice), each 128xdx
@@ -773,19 +793,14 @@ static void renderTiles(
             try {
                 // Resume: skip tile if L0 chunk already exists on disk
                 if (resume) {
-                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-                    int dTx = int(tx), dTy = int(ty), dTX, dTY;
-                    if (needsRotFlip)
-                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                     std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
-                    if (dsOut->chunkExists(0, size_t(dTy), size_t(dTx))) {
+                    if (dsOut->chunkExists(0, size_t(ty), size_t(tx))) {
                         // Still need to scatter into pyramid accum buffers
-                        // No rotation when inline pyramid is active
+                        // (pyrAccum is empty under rotation/flip: main() turns the inline pyramid off then)
                         if (!pyrAccum.empty()) {
                             size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
                             std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
-                            dsOut->readChunk(0, size_t(dTy), size_t(dTx), existingBuf.data());
-                            uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
+                            dsOut->readChunk(0, size_t(ty), size_t(tx), existingBuf.data());
+                            uint32_t dxTile = std::min(uint32_t(CW), uint32_t(outSize.width) - tx * uint32_t(CW));
                             size_t dy_actual = std::min(chunkY, size_t(dy));
                             size_t dx_actual = std::min(chunkX, size_t(dxTile));
                             size_t numZ = isComposite ? 1 : size_t(std::max(1, numSlices));
@@ -807,14 +822,13 @@ static void renderTiles(
                 }
 
                 uint32_t x0 = tx * uint32_t(CW);
-                uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
+                uint32_t dx = std::min(uint32_t(CW), uint32_t(outSize.width) - x0);
+                cv::Rect src = vc::srcRectForDst(cv::Rect(int(x0), int(y0), int(dx), int(dy)), tgtSize, rotQuad, flipAxis);
 
                 // 1. Generate surface for this tile
-                float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-                u0 += float(crop.x) + float(x0);
-                v0 += float(crop.y) + float(y0);
                 cv::Mat_<cv::Vec3f> tilePts, tileNrm;
-                genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
+                genTile(surf, fullSize, crop, tgtSize, src, genBlockSize(true, tgtSize, rotQuad), rotQuad, flipAxis,
+                        renderScale, tilePts, tileNrm);
 
                 // 2. Prepare base coords and step directions
                 cv::Mat_<cv::Vec3f> base, dirs;
@@ -838,47 +852,28 @@ static void renderTiles(
                     sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
                 }
 
-                // Accumulate (no rotation — applied per-zarr-chunk and per-tif-band separately)
-                std::vector<cv::Mat> slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, -1, -1);
+                // Accumulate, with rotation/flip applied for both writers
+                std::vector<cv::Mat> slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
 
-                // 4. Pack into zarr chunk (with rotation applied to pixel data)
+                // 4. Pack into zarr chunk
                 {
                     size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
                     size_t numZ = slices.size();
-                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-
-                    // Only clone+rotate when rotation/flip is active
-                    const std::vector<cv::Mat>* zarrSlices = &slices;
-                    std::vector<cv::Mat> rotSlices;
-                    if (needsRotFlip) {
-                        rotSlices.resize(numZ);
-                        for (size_t zi = 0; zi < numZ; zi++) {
-                            rotSlices[zi] = slices[zi].clone();
-                            rotateFlipIfNeeded(rotSlices[zi], rotQuad, flipAxis);
-                        }
-                        zarrSlices = &rotSlices;
-                    }
-
-                    int dstTx = int(tx), dstTy = int(ty), dTX, dTY;
-                    if (needsRotFlip)
-                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                     std::max(rotQuad, 0), flipAxis, dstTx, dstTy, dTX, dTY);
 
                     std::vector<T> chunkBuf(chunkZ * chunkY * chunkX, T(0));
-                    size_t dy_actual = std::min(chunkY, size_t((*zarrSlices)[0].rows));
-                    size_t dx_actual = std::min(chunkX, size_t((*zarrSlices)[0].cols));
+                    size_t dy_actual = std::min(chunkY, size_t(slices[0].rows));
+                    size_t dx_actual = std::min(chunkX, size_t(slices[0].cols));
                     for (size_t zi = 0; zi < numZ; zi++) {
                         size_t sliceOff = zi * chunkY * chunkX;
                         for (size_t yy = 0; yy < dy_actual; yy++) {
-                            const T* row = (*zarrSlices)[zi].ptr<T>(int(yy));
+                            const T* row = slices[zi].ptr<T>(int(yy));
                             std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
                         }
                     }
-                    dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
+                    dsOut->writeChunkSkipEmpty(0, size_t(ty), size_t(tx),
                                                chunkBuf.data(), chunkBuf.size() * sizeof(T));
 
                     // Scatter L0 tile into L1 pyramid accumulation buffer
-                    // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
                     // L0 tile (ty, tx) maps to L1 pyramid chunk (ty/2, tx/2)
                     // at sub-offset ((ty%2)*halfCH, (tx%2)*halfCW) within the L1 chunk
                     if (!pyrAccum.empty()) {
@@ -897,7 +892,7 @@ static void renderTiles(
                     }
                 }
 
-                // 5. Store unrotated slices for TIF assembly
+                // 5. Store slices for TIF assembly
                 if (wantTif) {
                     tifRowBuf[tx] = std::move(slices);
                 }
@@ -914,17 +909,15 @@ static void renderTiles(
         // After all tx done for this ty: assemble TIF if needed
         if (wantTif) {
             int outSlices = isComposite ? 1 : numSlices;
-            // Assemble full-width unrotated rows from tile columns
+            // Assemble full-width rows from tile columns
             std::vector<cv::Mat> fullWidthSlices(outSlices);
             for (int zi = 0; zi < outSlices; zi++) {
-                fullWidthSlices[zi] = cv::Mat(int(dy), tgtSize.width, cvType, cv::Scalar(0));
+                fullWidthSlices[zi] = cv::Mat(int(dy), outSize.width, cvType, cv::Scalar(0));
                 for (uint32_t tx = 0; tx < numTileCols; tx++) {
                     uint32_t x0t = tx * uint32_t(CW);
                     const cv::Mat& tileMat = tifRowBuf[tx][zi];
                     tileMat.copyTo(fullWidthSlices[zi](cv::Rect(int(x0t), 0, tileMat.cols, tileMat.rows)));
                 }
-                // Apply rotation/flip to assembled full-width row
-                rotateFlipIfNeeded(fullWidthSlices[zi], rotQuad, flipAxis);
             }
 
             if (quickTif && !useU16) {
@@ -935,15 +928,13 @@ static void renderTiles(
                             row[c] &= 0xF0;
                     }
             }
-            writeTifBand(*tifWriters, fullWidthSlices, y0, tiffTileH, uint32_t(tgtSize.height), rotQuad, flipAxis);
+            writeTifBand(*tifWriters, fullWidthSlices, y0, tiffTileH);
         }
 
         // ---- Pyramid row-group flush ----
         // At each level L (1..5), a pyramid chunk covers 2^L tile rows.
         // When the current tile-row completes a group, flush & cascade.
         if (!pyrAccum.empty()) {
-            // No rotation/flip when inline pyramid is active (ensured by caller),
-            // so tile-row ty maps directly to dest tile-row ty.
             uint32_t relRow = ty - tyStart + 1;
             bool isLastRow = (ty == tyEnd - 1);
 
@@ -1787,6 +1778,7 @@ int main(int argc, char *argv[])
                   crop.width, crop.height, crop.x, crop.y);
 
         const int rotQuad = rotQuadGlobal;
+        const cv::Size outXY = vc::rotatedSize(tgt_size, rotQuad);
 
         // Determine output dtype
         const bool useU16 = output_is_u16 && !isCompositeMode;
@@ -1798,12 +1790,10 @@ int main(int argc, char *argv[])
         std::vector<size_t> chunks0;
         std::unique_ptr<vc::VcDataset> dsOut;
         std::filesystem::path outFilePath(wantZarr ? zarrOutputArg : "/dev/null");
-        size_t tilesYSrc = 0, tilesXSrc = 0;
+        size_t tilesYDst = 0, tilesXDst = 0;
 
         if (wantZarr) {
-            cv::Size zarrXY = tgt_size;
-            if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
-            size_t baseY = zarrXY.height, baseX = zarrXY.width;
+            size_t baseY = outXY.height, baseX = outXY.width;
 
             outFilePath = zarrOutputArg;
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
@@ -1820,10 +1810,8 @@ int main(int argc, char *argv[])
                     createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
                                           zarrCompressor, zarrCompressionLevel, zarrSeparator);
 
-                cv::Size attrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               accum_type_str, accumOffsets.size(), outXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
@@ -1840,8 +1828,8 @@ int main(int argc, char *argv[])
                                               zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
             }
 
-            tilesYSrc = (tgt_size.height + CH - 1) / CH;
-            tilesXSrc = (tgt_size.width  + CW - 1) / CW;
+            tilesYDst = (outXY.height + CH - 1) / CH;
+            tilesXDst = (outXY.width  + CW - 1) / CW;
         }
 
         // ---- TIF setup (if requested) ----
@@ -1849,8 +1837,8 @@ int main(int argc, char *argv[])
         uint32_t tiffTileH = 16;
 
         if (wantTif) {
-            int outW = (rotQuad >= 0 && rotQuad % 2 == 1) ? tgt_size.height : tgt_size.width;
-            int outH = (rotQuad >= 0 && rotQuad % 2 == 1) ? tgt_size.width  : tgt_size.height;
+            int outW = outXY.width;
+            int outH = outXY.height;
             int tifSlices = isCompositeMode ? 1 : num_slices;
 
             auto makePath = [&](int zi) -> std::filesystem::path {
@@ -1899,17 +1887,14 @@ int main(int argc, char *argv[])
 
         // ---- Create pyramid datasets before render ----
         const bool hasRotFlip = (rotQuad >= 0 || flip_axis >= 0);
-        // Inline pyramid only works without rotation/flip (accumulation assumes
-        // source tile-rows map 1:1 to destination tile-rows for row-group flushing)
+        // With rotation/flip the pyramid is built from L0 after the render.
         const bool inlinePyramid = wantZarr && wantPyramid && !pre_flag && !hasRotFlip;
         std::vector<vc::VcDataset*> pyramidDs;
         std::vector<std::unique_ptr<vc::VcDataset>> pyramidOwned;
         if (wantZarr && wantPyramid && !pre_flag) {
             // Single-part: create datasets now; multi-part/resume: already created them
             if (numParts <= 1 && !resumeFlag) {
-                cv::Size zarrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
-                std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
+                std::vector<size_t> shape0 = {baseZ, size_t(outXY.height), size_t(outXY.width)};
                 createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
                                       zarrCompressor, zarrCompressionLevel, zarrSeparator);
             }
@@ -1927,7 +1912,7 @@ int main(int argc, char *argv[])
             uint32_t rowStart = 0;
             uint32_t rowEnd = 0;
             if (wantZarr) {
-                uint32_t totalRows = static_cast<uint32_t>(tilesYSrc);
+                uint32_t totalRows = static_cast<uint32_t>(tilesYDst);
                 uint32_t rowsPerPart = (totalRows + uint32_t(numParts) - 1) / uint32_t(numParts);
                 if (numParts > 1 && inlinePyramid) {
                     constexpr uint32_t kPyrAlign = 32;
@@ -1936,7 +1921,7 @@ int main(int argc, char *argv[])
                 rowStart = uint32_t(partId) * rowsPerPart;
                 rowEnd = std::min(rowStart + rowsPerPart, totalRows);
             } else {
-                uint32_t totalRows = (uint32_t(tgt_size.height) + kPrefetchBandH - 1) / kPrefetchBandH;
+                uint32_t totalRows = (uint32_t(outXY.height) + kPrefetchBandH - 1) / kPrefetchBandH;
                 uint32_t rowsPerPart = (totalRows + uint32_t(numParts) - 1) / uint32_t(numParts);
                 rowStart = uint32_t(partId) * rowsPerPart;
                 rowEnd = std::min(rowStart + rowsPerPart, totalRows);
@@ -1950,7 +1935,8 @@ int main(int argc, char *argv[])
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
                 isCompositeMode, compositeStart, compositeEnd,
-                vc::render::prefetch::samplingForRender(isCompositeMode));
+                vc::render::prefetch::samplingForRender(isCompositeMode), rotQuad, flip_axis,
+                genBlockSize(wantZarr, tgt_size, rotQuad));
 
             logPrintf(stdout, "Prefetch: %zu chunk(s) across rows %u..%u\n",
                       prefetchKeys.size(),
@@ -1975,7 +1961,7 @@ int main(int argc, char *argv[])
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
-                        dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
+                        dsOut.get(), chunks0, tilesXDst, tilesYDst,
                         pyramidDs,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
@@ -1985,7 +1971,7 @@ int main(int argc, char *argv[])
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
-                        dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
+                        dsOut.get(), chunks0, tilesXDst, tilesYDst,
                         pyramidDs,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
@@ -2004,9 +1990,9 @@ int main(int argc, char *argv[])
                                         row[c] &= 0xF0;
                                 }
                             }
-                            writeTifBand(tifWriters, quantized, bandY0, tiffTileH, uint32_t(tgt_size.height), rotQuad, flip_axis);
+                            writeTifBand(tifWriters, quantized, bandY0, tiffTileH);
                         } else {
-                            writeTifBand(tifWriters, slices, bandY0, tiffTileH, uint32_t(tgt_size.height), rotQuad, flip_axis);
+                            writeTifBand(tifWriters, slices, bandY0, tiffTileH);
                         }
                     }
                 };
@@ -2041,10 +2027,8 @@ int main(int argc, char *argv[])
 
             // --pre already writes attrs for multi-part; single-part writes here
             if (numParts <= 1) {
-                cv::Size attrXY = tgt_size;
-                if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               accum_type_str, accumOffsets.size(), outXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale);
             }
         }
