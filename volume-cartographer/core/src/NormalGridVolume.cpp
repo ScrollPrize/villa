@@ -18,8 +18,11 @@
 #include <random>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
+#include <unordered_set>
 
  namespace fs = std::filesystem;
  
@@ -202,6 +205,17 @@
          mutable std::atomic<uint64_t> fetch_failures{0};
          mutable std::mutex fetch_error_mutex;
          mutable std::string last_fetch_error;
+         // Read-ahead: when a slice has to be fetched, its neighbours on the same plane (the
+         // tracer's frontier reaches them next) are opened too, each as one plain blocking
+         // open on its own background thread. No queue: a neighbour already cached, already
+         // in flight, or over the in-flight limit is simply not started; the file cache's
+         // per-file lock makes a tracer thread that needs one of them wait for that download.
+         static constexpr int readahead_radius = 4;
+         static constexpr int readahead_limit = 16;
+         mutable std::mutex readahead_mutex;
+         mutable std::condition_variable readahead_cv;
+         mutable std::unordered_set<uint64_t> readahead_inflight;
+         mutable int readahead_running = 0;
 
          pimpl(const std::string& path, int requested_level) : base_path(path) {
             load_remote_marker();
@@ -256,6 +270,52 @@
                 output_spiral_step = metadata.value("spiral-step", 20.0);
             }
 
+        }
+
+        ~pimpl() {
+            std::unique_lock<std::mutex> lock(readahead_mutex);
+            readahead_cv.wait(lock, [&] { return readahead_running == 0; });
+        }
+
+        static uint64_t slice_key(int plane_idx, int slice_idx) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(plane_idx)) << 32) | static_cast<uint32_t>(slice_idx);
+        }
+
+        // Start background opens of the slices around (plane_idx, slice_idx) that are not cached yet.
+        void read_ahead(int plane_idx, int slice_idx) const {
+            std::error_code ec;
+            std::lock_guard<std::mutex> lock(readahead_mutex);
+            for (int distance = 1; distance <= readahead_radius; ++distance) {
+                for (const int sign : {1, -1}) {
+                    const int slice = slice_idx + sign * distance * sparse_volume;
+                    if (slice < 0 || readahead_running >= readahead_limit) continue;
+                    const uint64_t key = slice_key(plane_idx, slice);
+                    if (readahead_inflight.count(key)) continue;
+                    const std::string rel = relative_grid_path(plane_idx, slice);
+                    if (fs::exists(fs::path(base_path) / rel, ec)) continue;
+                    {
+                        std::shared_lock<std::shared_mutex> cache(mutex);
+                        if (grid_cache.count(cv::Vec2i(plane_idx, slice))) continue;  // known, present or absent
+                    }
+                    readahead_inflight.insert(key);
+                    ++readahead_running;
+                    std::thread([this, key, rel, plane_idx, slice] {
+                        try {
+                            (void)files->open(remote_url + "/" + rel);
+                        } catch (const vcr::zarr::NotFound&) {
+                            // The store does not have it: remember that, so nobody asks again.
+                            std::unique_lock<std::shared_mutex> cache(mutex);
+                            if (!grid_cache.count(cv::Vec2i(plane_idx, slice))) insert_locked(cv::Vec2i(plane_idx, slice), nullptr);
+                        } catch (const std::exception&) {
+                            // The tracer's own open reports failures.
+                        }
+                        std::lock_guard<std::mutex> done(readahead_mutex);
+                        readahead_inflight.erase(key);
+                        --readahead_running;
+                        readahead_cv.notify_all();
+                    }).detach();
+                }
+            }
         }
 
         // The cache root under which `dir` is `url`'s place, <root>/<scheme>/<host>/<path>
@@ -423,6 +483,10 @@
             std::string grid_path = (fs::path(base_path) / rel).string();
 
             std::optional<vcr::sources::EncodedFiles::Opened> pinned;
+            if (remote) {
+                std::error_code ec;
+                if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
+            }
             if (!ensure_local_file(rel, &pinned)) {
                 std::unique_lock<std::shared_mutex> lock(mutex);
                 insert_locked(key, nullptr);

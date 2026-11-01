@@ -92,6 +92,7 @@ struct Streamed {
 TEST_CASE("Streaming store: each file downloads once, absent files are remembered, old markers are ignored")
 {
     Streamed s;
+    {
     NormalGridVolume volume(s.dir.string());
     CHECK(s.fetches("metadata.json") == 1);
     CHECK(volume.outputSpiralStep() == 20.0);
@@ -124,7 +125,11 @@ TEST_CASE("Streaming store: each file downloads once, absent files are remembere
     REQUIRE(again.get_grid(0, 0) != nullptr);
     CHECK(s.fetches("metadata.json") == 1);
     CHECK(s.fetches("xy/000000.grid") == 1);
+    }  // a volume's destructor waits for its read-ahead opens
     CHECK(s.temporaries().empty());
+    // Read-ahead fetched the neighbours of the slices asked for, once each.
+    CHECK(s.fetches("xy/000002.grid") == 1);
+    CHECK(s.fetches("xy/000004.grid") == 1);
 }
 
 TEST_CASE("Streaming store: concurrent misses download in parallel, one request per file")
@@ -144,6 +149,7 @@ TEST_CASE("Streaming store: concurrent misses download in parallel, one request 
             return LoopbackHttpServer::Response{503, "downloads were serialized", {}, false};
         return std::nullopt;
     });
+    {
     NormalGridVolume volume(s.dir.string());
     std::vector<std::future<bool>> reads;
     for (int i = 0; i < 8; ++i)
@@ -151,6 +157,7 @@ TEST_CASE("Streaming store: concurrent misses download in parallel, one request 
     for (auto& read : reads) CHECK(read.get());
     for (int slice = 4; slice < 8; ++slice) CHECK(s.fetches("xy/" + gridName(slice)) == 1);
     CHECK(volume.cacheStats().fetchFailures == 0);
+    }
     CHECK(s.temporaries().empty());
 }
 
