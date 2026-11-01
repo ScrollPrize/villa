@@ -8,17 +8,8 @@
 #include <stdexcept>
 #include <vector>
 
-#include <opencv2/imgcodecs.hpp>
-
 namespace vc::core::util
 {
-namespace
-{
-
-constexpr int kTiffCompressionNone = 1;
-
-}  // namespace
-
 cv::Mat_<std::uint8_t> renderCoordsTexture(
     const cv::Mat_<cv::Vec3f>& coords,
     const vcr::grid::Level& level,
@@ -54,20 +45,6 @@ cv::Mat_<std::uint8_t> renderCoordsTexture(
               << " size=" << sampled.cols << "x" << sampled.rows
               << " covered=" << covered << "/" << sampled.total() << '\n';
     return sampled;
-}
-
-
-void writeUncompressedTextureTiff(
-    const std::filesystem::path& path, const cv::Mat& image)
-{
-    if (image.empty())
-        throw std::runtime_error("cannot write empty image: " + path.string());
-    const std::vector<int> params{
-        cv::IMWRITE_TIFF_COMPRESSION,
-        kTiffCompressionNone,
-    };
-    if (!cv::imwrite(path.string(), image, params))
-        throw std::runtime_error("failed to write image: " + path.string());
 }
 
 }  // namespace vc::core::util

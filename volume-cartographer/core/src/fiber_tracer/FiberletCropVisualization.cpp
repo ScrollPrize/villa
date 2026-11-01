@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 
+#include "vc/core/util/ImageMat.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/util/TexturedMesh.hpp"
 #include <vc_reader/grid.hpp>
@@ -100,7 +101,7 @@ void writeFiberletCropBoxVisualization(
         }
         const std::string textureName = stem + "_" + face.name + ".tif";
         const std::string materialName = "fiberlet_crop_" + std::string(face.name);
-        vc::core::util::writeUncompressedTextureTiff(
+        vc::core::util::writeTiffMat(
             directory / textureName,
             vc::core::util::renderCoordsTexture(coordinates, {ct.array.get(), ct.meta.type}, 1, "Fiberlet crop texture sampling"));
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);

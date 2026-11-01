@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <filesystem>
 
 #include <opencv2/core/mat.hpp>
 
@@ -22,8 +21,5 @@ namespace vc::core::util
     const vcr::grid::Level& level,
     int renderScale,
     const char* label);
-
-void writeUncompressedTextureTiff(
-    const std::filesystem::path& path, const cv::Mat& image);
 
 }  // namespace vc::core::util
