@@ -86,26 +86,15 @@ namespace object_store {
 // -----------------------------------------------------------------------------
 namespace viewer {
     // Navigation & Interaction
-    constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
-    constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
-    constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
     constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
     constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
-    constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
-    constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
 
-    constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
-    constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
-    constexpr int SCROLL_SPEED_DEFAULT = -1;
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
-    constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
-    constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
     // Display & Appearance
-    constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
     constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
     constexpr auto NORMAL_ARROW_LENGTH_SCALE = "viewer/normal_arrow_length_scale";
     constexpr auto NORMAL_MAX_ARROWS = "viewer/normal_max_arrows";
@@ -115,7 +104,6 @@ namespace viewer {
     constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
     constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
-    constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
     constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
     constexpr int NORMAL_ARROW_LENGTH_SCALE_DEFAULT = 100;  // Percentage (100 = 1.0x)
     constexpr int NORMAL_MAX_ARROWS_DEFAULT = 32;  // Max arrows per axis for sampling
@@ -156,10 +144,8 @@ namespace viewer {
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
 
     // Audio/UX
-    constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
     constexpr auto USERNAME = "viewer/username";
 
-    constexpr bool PLAY_SOUND_AFTER_SEG_RUN_DEFAULT = true;
     constexpr auto USERNAME_DEFAULT = "";
 
     // Viewer control group expansion states
@@ -174,18 +160,10 @@ namespace viewer {
 // Performance Settings
 // -----------------------------------------------------------------------------
 namespace perf {
-    constexpr auto PRELOADED_SLICES = "perf/preloaded_slices";
-    constexpr auto PARALLEL_PROCESSES = "perf/parallel_processes";
-    constexpr auto ITERATION_COUNT = "perf/iteration_count";
-    constexpr auto DOWNSCALE_OVERRIDE = "perf/downscale_override";
     constexpr auto INTERPOLATION_METHOD = "viewer/interpolation_method";
     constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
     constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
 
-    constexpr int PRELOADED_SLICES_DEFAULT = 200;
-    constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
-    constexpr int ITERATION_COUNT_DEFAULT = 1000;
-    constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr int INTERPOLATION_METHOD_DEFAULT = 1;  // 0 = Nearest, 1 = Trilinear
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
