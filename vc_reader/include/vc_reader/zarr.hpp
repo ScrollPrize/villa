@@ -50,6 +50,14 @@ bool isLocalZarrNode(const std::filesystem::path& directory);
 bool isLocalZarrArray(const std::filesystem::path& directory);
 // The https:// URL of an s3:// location (public buckets only), otherwise unchanged.
 std::string httpUrl(const std::string& location);
+// The s3:// location (what s3Access signs) of an S3 URL: s3://, s3+REGION://, or an
+// https://bucket.s3[.REGION].amazonaws.com URL; nullopt for any other.
+std::optional<std::string> s3Location(const std::string& url);
+// The group of a pyramid level named by its numbered key: `location`'s parent when the
+// last path segment is a non-negative integer and the parent names a Zarr group (one
+// called *.zarr, or locally one holding Zarr metadata); nullopt otherwise. A query or
+// fragment stays with the group.
+std::optional<std::string> levelGroupLocation(const std::string& location);
 
 // ---- access --------------------------------------------------------------------------
 

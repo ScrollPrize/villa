@@ -27,6 +27,24 @@ inline std::string joinLocation(const std::string& location, const std::string& 
     return location.substr(0, end) + "/" + key.substr(start) + (query == std::string::npos ? "" : location.substr(query));
 }
 
+// The location above `location`: its last path segment removed, trailing slashes ignored, a
+// query or fragment kept as joinLocation keeps it. A location with nothing above it (a bare
+// host, a path without a slash) comes back unchanged.
+inline std::string parentLocation(const std::string& location)
+{
+    const bool url = location.find("://") != std::string::npos;
+    const auto query = url ? location.find_first_of("?#") : std::string::npos;
+    std::string path = location.substr(0, query);
+    const std::string suffix = query == std::string::npos ? std::string() : location.substr(query);
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+    const auto authority = url ? path.find("://") + 3 : 0;
+    const auto slash = path.rfind('/');
+    if (slash == std::string::npos || slash < authority)
+        return path + suffix;
+    return path.substr(0, slash) + suffix;
+}
+
 struct Auth {
     std::string kind;  // "" (anonymous), "basic" or "s3"
     std::string user;  // basic: user name; s3: access key id

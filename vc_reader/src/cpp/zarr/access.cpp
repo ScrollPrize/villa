@@ -139,6 +139,43 @@ std::string httpUrl(const std::string& location)
     return location;
 }
 
+std::optional<std::string> s3Location(const std::string& url)
+{
+    if (url.starts_with("s3://"))
+        return url;
+    const auto https = httpUrl(url);
+    const auto prefix = s3::splitPrefixUrl(https);
+    if (!prefix || !https.starts_with("http"))
+        return std::nullopt;
+    const auto host = prefix->origin.substr(prefix->origin.find("://") + 3);
+    const auto s3 = host.find(".s3.");
+    if (s3 == std::string::npos || s3 == 0 || !host.ends_with(".amazonaws.com"))
+        return std::nullopt;
+    auto key = prefix->key;
+    while (!key.empty() && key.back() == '/')
+        key.pop_back();
+    return "s3://" + host.substr(0, s3) + (key.empty() ? std::string() : "/" + key);
+}
+
+std::optional<std::string> levelGroupLocation(const std::string& location)
+{
+    const bool url = location.find("://") != std::string::npos;
+    auto path = location.substr(0, url ? location.find_first_of("?#") : std::string::npos);
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+    const auto slash = path.rfind('/');
+    if (slash == std::string::npos || slash + 1 == path.size())
+        return std::nullopt;
+    const auto leaf = path.substr(slash + 1);
+    if (!std::all_of(leaf.begin(), leaf.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return std::nullopt;
+    const auto parentPath = path.substr(0, slash);
+    const bool group = parentPath.ends_with(".zarr") || (!url && isLocalZarrNode(parentPath));
+    if (!group)
+        return std::nullopt;
+    return parentLocation(location);
+}
+
 std::string Access::url(const std::string& location) const
 {
     if (kind != Kind::S3 || !location.starts_with("s3://"))

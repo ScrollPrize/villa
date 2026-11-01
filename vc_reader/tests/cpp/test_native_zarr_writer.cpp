@@ -663,6 +663,19 @@ static void joinsLocations()
     require(vcr::joinLocation("https://example.test/source.zarr", "metadata.json") ==
                 "https://example.test/source.zarr/metadata.json", "plain join");
     require(vcr::joinLocation("/data/a?b#c", "0") == "/data/a?b#c/0", "a path keeps its ? and #");
+    require(vcr::parentLocation("https://example.test/a/b.zarr/?token=x") == "https://example.test/a?token=x", "parent keeps the query");
+    require(vcr::parentLocation("https://example.test") == "https://example.test", "nothing above a host");
+    require(vcr::parentLocation("s3://bucket/k") == "s3://bucket", "bucket root");
+    require(vcr::parentLocation("/data/a/b") == "/data/a" && vcr::parentLocation("/data/a?b#c") == "/data", "paths: ? and # are plain");
+    require(vcr::zarr::s3Location("s3://b/k") == "s3://b/k", "s3 stays");
+    require(vcr::zarr::s3Location("s3+eu-west-2://b/k") == "s3://b/k", "regional spelling");
+    require(vcr::zarr::s3Location("https://b.s3.us-west-2.amazonaws.com/k/x") == "s3://b/k/x", "virtual host");
+    require(vcr::zarr::s3Location("https://b.s3.amazonaws.com") == "s3://b", "bucket only");
+    require(!vcr::zarr::s3Location("https://example.com/k") && !vcr::zarr::s3Location("/a/b"), "not S3");
+    require(vcr::zarr::levelGroupLocation("s3://b/a/x.zarr/4?sig=y") == "s3://b/a/x.zarr?sig=y", "a numbered level of a .zarr");
+    require(!vcr::zarr::levelGroupLocation("s3://b/a/x.zarr/4a") && !vcr::zarr::levelGroupLocation("s3://b/a/x.zarr") &&
+                !vcr::zarr::levelGroupLocation("s3://b/a/x/4") && !vcr::zarr::levelGroupLocation("/no/such.dir/0"),
+            "not a level: letters, no key, parent not a group");
 }
 
 static void storedChunks(const fs::path& root)
