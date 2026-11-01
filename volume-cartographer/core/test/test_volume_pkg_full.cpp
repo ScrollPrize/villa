@@ -274,7 +274,7 @@ TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
+TEST_CASE("VolumePkg matches older remote entries by resolved identity")
 {
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;

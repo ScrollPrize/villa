@@ -1,7 +1,5 @@
-// Coverage for core/src/NormalGridVolume.cpp. We don't have real .grid
-// fixtures, so the tests exercise the path that returns nullopt/nullptr
-// when grid files are absent. That still covers the cache miss path,
-// metadata access, and cacheStats/resetCacheStats.
+// Coverage for core/src/NormalGridVolume.cpp's store handling and failure paths.
+// Streaming success paths are in test_normal_grid_stream.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>

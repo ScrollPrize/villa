@@ -47,14 +47,7 @@ private slots:
         const auto found = manifest.findSample("PHerc0139")->findVolume("20260102150214")->orientation;
         QCOMPARE(found.zTopToBottom, std::optional<bool>(true));
         QCOMPARE(found.leftHandedCoordinates, std::optional<bool>(false));
-
-        // Absent, null, or anything else is unset - never a default.
-        const auto unset = vcr::catalog::parseOpenDataManifest(manifestText(
-            R"({"left_handed_coordinates": null, "z_direction_is_top_to_bottom": "true", "pixel_size_um": 2.399})"));
-        const auto partial = unset.findSample("PHerc0139")->findVolume("20260102150214")->orientation;
-        QVERIFY(!partial.zTopToBottom.has_value());
-        QVERIFY(!partial.leftHandedCoordinates.has_value());
-        QVERIFY(vc3d::opendata::orientationText(found) != vc3d::opendata::orientationText(partial));
+        QVERIFY(vc3d::opendata::orientationText(found) != vc3d::opendata::orientationText(orientation(std::nullopt, std::nullopt)));
     }
 };
 

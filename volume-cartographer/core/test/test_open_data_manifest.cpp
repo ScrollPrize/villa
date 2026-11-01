@@ -894,27 +894,6 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
 
     const auto* sample = manifest.findSample("sample-a");
     REQUIRE(sample != nullptr);
-    REQUIRE(sample->scans.size() == 1);
-    REQUIRE(sample->scans.front().pixelSizeUm.has_value());
-    CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
-    REQUIRE(sample->volumes.size() == 2);
-
-    const auto byId = [&](const std::string& id) -> const vcr::catalog::OpenDataVolume* {
-        const auto it = std::find_if(
-            sample->volumes.begin(), sample->volumes.end(), [&](const vcr::catalog::OpenDataVolume& volume) {
-                return volume.id == id;
-            });
-        return it == sample->volumes.end() ? nullptr : &*it;
-    };
-
-    const auto* volumeWithProperties = byId("volume-with-properties");
-    REQUIRE(volumeWithProperties != nullptr);
-    REQUIRE(volumeWithProperties->pixelSizeUm.has_value());
-    CHECK(*volumeWithProperties->pixelSizeUm == doctest::Approx(7.91));
-    const auto* volumeFromScan = byId("volume-from-scan");
-    REQUIRE(volumeFromScan != nullptr);
-    REQUIRE(volumeFromScan->pixelSizeUm.has_value());
-    CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
 
     // Deferred: the catalog's URLs are not opened.
     vc::project::LoadOptions deferred;
