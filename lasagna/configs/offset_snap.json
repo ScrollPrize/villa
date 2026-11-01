@@ -40,7 +40,7 @@
 				"station_n": 10.0,
 				"station_t": 10.0
 			}
-		}
+		},
 		{
 			"name": "snap",
 			"steps": 1000,
@@ -48,6 +48,7 @@
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"w_fac": {
+				"pred_dt": 0.0,
 				"ext_offset": 0.01
 			}
 		}
