@@ -1,5 +1,6 @@
 #include "SpiralWorkspace.hpp"
 
+#include <vc_reader/tifxyz.hpp>
 #include <vc_reader/zarr.hpp>
 
 #include "AxisAlignedSliceController.hpp"
@@ -833,16 +834,35 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
             const QString category = QString::fromLatin1(categoryText);
             const QString rootPath = paths.value(QString::fromLatin1(pathKey)).toString();
             if (rootPath.isEmpty()) continue;
+            // The root is one surface, or holds surfaces: tifxyz directories with their metadata,
+            // which vc_reader lists (a directory missing a coordinate file is not one; malformed
+            // metadata is an entry with an error, skipped with a warning).
             QStringList candidates;
             const QFileInfo root(rootPath);
+            std::vector<vcr::tifxyz::Entry> entries;
             if (root.isDir() && QFileInfo(QDir(rootPath).filePath(QStringLiteral("meta.json"))).isFile()) {
-                candidates.push_back(root.absoluteFilePath());
+                vcr::tifxyz::Entry entry;
+                entry.location = root.absoluteFilePath().toStdString();
+                try {
+                    entry.metadata = vcr::tifxyz::readMetadata(entry.location);
+                } catch (const std::exception& error) {
+                    entry.error = error.what();
+                }
+                entries.push_back(std::move(entry));
             } else if (root.isDir()) {
-                const QFileInfoList children = QDir(rootPath).entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const QFileInfo& child : children)
-                    if (QFileInfo(QDir(child.absoluteFilePath()).filePath(QStringLiteral("meta.json"))).isFile())
-                        candidates.push_back(child.absoluteFilePath());
+                try {
+                    entries = vcr::tifxyz::list(rootPath.toStdString(), false);
+                } catch (const std::exception& error) {
+                    result.warnings.push_back(QObject::tr("Cannot list %1: %2").arg(rootPath, QString::fromUtf8(error.what())));
+                }
+            }
+            for (const auto& entry : entries) {
+                if (!entry.error.empty()) {
+                    result.warnings.push_back(QObject::tr("Skipping %1: %2")
+                                                  .arg(QString::fromStdString(entry.location), QString::fromUtf8(entry.error.c_str())));
+                    continue;
+                }
+                candidates.push_back(QString::fromStdString(entry.location));
             }
             if (candidates.isEmpty()) {
                 result.warnings.push_back(QObject::tr("No TIFXYZ surfaces found for %1 at %2")
@@ -2000,10 +2020,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     "Spiral winding bounds do not match the winding-ID map"));
         }
 
-        QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
-        if (!metadata.open(QIODevice::ReadOnly))
+        QJsonObject meta;
+        try {
+            // The surface's metadata as vc_reader reads it; the compared fields are its extras.
+            const auto extra = vcr::tifxyz::readMetadata(surfacePath.toStdString()).extra.dump();
+            meta = QJsonDocument::fromJson(QByteArray::fromStdString(extra)).object();
+        } catch (const std::exception&) {
             return failure(QObject::tr("Spiral preview surface metadata is missing"));
-        const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
+        }
         if (meta.value(QStringLiteral("winding_id_map"))
                 != manifest.value(QStringLiteral("winding_id_map"))
             || meta.value(QStringLiteral("winding_bounds"))

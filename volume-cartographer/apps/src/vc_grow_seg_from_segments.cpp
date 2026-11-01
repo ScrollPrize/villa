@@ -2,6 +2,7 @@
 #include "TargetContext.hpp"
 #include "utils/Json.hpp"
 
+#include <vc_reader/tifxyz.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_metadata.hpp>
 
@@ -867,37 +868,29 @@ static void add_metric_meta(QuadSurface& surf, const SweepMetrics& metrics)
 static std::vector<QuadSurface*> load_source_surfaces(const std::filesystem::path& src_dir,
                                                       QuadSurface* src)
 {
+    // The tifxyz surfaces in src_dir with the auto-grow prefix, as vc_reader lists them (a
+    // directory missing a coordinate file is not one; unreadable metadata is skipped with a
+    // message); only surfaces with a bbox take part.
     std::vector<QuadSurface*> surfaces;
-    for (const auto& entry : std::filesystem::directory_iterator(src_dir)) {
-        if (!std::filesystem::is_directory(entry)) {
-            continue;
-        }
-
-        std::string name = entry.path().filename().string();
+    for (const auto& entry : vcr::tifxyz::list(src_dir.string(), false)) {
+        const std::filesystem::path location(entry.location);
+        const std::string name = location.filename().string();
         if (name.compare(0, std::strlen(kAutoGrowPrefix), kAutoGrowPrefix)) {
             continue;
         }
-
-        std::filesystem::path meta_fn = entry.path() / "meta.json";
-        if (!std::filesystem::exists(meta_fn)) {
+        if (!entry.error.empty()) {
+            std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
             continue;
         }
-
-        utils::Json meta = utils::Json::parse_file(meta_fn);
-
-        if (!meta.count("bbox")) {
-            continue;
-        }
-
-        if (meta.value("format", std::string{"NONE"}) != "tifxyz") {
+        if (!entry.metadata.bbox) {
             continue;
         }
 
         QuadSurface* sm;
-        if (src && entry.path().filename() == src->id) {
+        if (src && location.filename() == src->id) {
             sm = src;
         } else {
-            sm = new QuadSurface(entry.path(), meta);
+            sm = new QuadSurface(location);
         }
 
         surfaces.push_back(sm);
@@ -1583,14 +1576,13 @@ int main(int argc, char *argv[])
     }
 
     std::vector<QuadSurface*> surfaces;
-    std::filesystem::path meta_fn = src_path / "meta.json";
-    if (!std::filesystem::exists(meta_fn)) {
-        std::cerr << "Error: meta.json not found at " << meta_fn << std::endl;
+    try {
+        (void)vcr::tifxyz::readMetadata(src_path.string());
+    } catch (const std::exception& error) {
+        std::cerr << "Error: cannot read the surface metadata at " << src_path << ": " << error.what() << std::endl;
         return EXIT_FAILURE;
     }
-
-    utils::Json meta = utils::Json::parse_file(meta_fn);
-    QuadSurface *src = new QuadSurface(src_path, meta);
+    QuadSurface *src = new QuadSurface(src_path);
 
     surfaces = load_source_surfaces(src_dir, src);
 

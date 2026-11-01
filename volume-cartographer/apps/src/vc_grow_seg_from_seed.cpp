@@ -9,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 #include "utils/Json.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc_reader/tifxyz.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -101,32 +102,27 @@ std::string time_str()
     return oss.str();
 }
 
+// The tifxyz surfaces in tgt_dir named with the prefix: vc_reader lists the directories
+// holding one (a directory missing a coordinate file is not listed; one whose metadata
+// cannot be read is skipped with a message). Only surfaces with a bbox can be compared.
 bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec3d& origin,
                            const std::string& name_prefix, int search_effort) {
-    for (const auto& entry : std::filesystem::directory_iterator(tgt_dir)) {
-        if (!std::filesystem::is_directory(entry)) {
-            continue;
-        }
-
-        std::string name = entry.path().filename().string();
+    for (const auto& entry : vcr::tifxyz::list(tgt_dir.string(), false)) {
+        const std::string name = std::filesystem::path(entry.location).filename().string();
         if (name.compare(0, name_prefix.size(), name_prefix)) {
             continue;
         }
-
-        std::filesystem::path meta_fn = entry.path() / "meta.json";
-        if (!std::filesystem::exists(meta_fn)) {
+        if (!entry.error.empty()) {
+            std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
+            continue;
+        }
+        if (!entry.metadata.bbox) {
             continue;
         }
 
-        auto meta = utils::Json::parse_file(meta_fn);
-
-        if (!meta.count("bbox") || meta.value("format", std::string{"NONE"}) != "tifxyz") {
-            continue;
-        }
-
-        QuadSurface other(entry.path(), meta);
+        QuadSurface other(entry.location);
         if (contains(other, origin, search_effort)) {
-            std::cout << "Found overlapping segment at location: " << entry.path() << std::endl;
+            std::cout << "Found overlapping segment at location: " << entry.location << std::endl;
             return true;
         }
     }
