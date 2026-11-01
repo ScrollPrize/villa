@@ -11,6 +11,9 @@ The repo contains multiple subprojects with different languages, runtimes, and c
 
 **If you are working on a PR or issue for this repository, refer to CONTRIBUTING.md for guidelines**  
 
+For work involving papyrus structure, surface tracing, windings, or CT interpretation,
+read [SCROLL_ANATOMY.md](SCROLL_ANATOMY.md) for shared terminology and anatomical context.
+
 ---
 
 ## 1) Monorepo-wide rules

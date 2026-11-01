@@ -15,199 +15,6 @@
 
 using Json = utils::Json;
 
-// ============================================================
-// writeZarrBand
-// ============================================================
-
-template <typename T>
-void writeZarrBand(vc::VcDataset* dsOut, const std::vector<cv::Mat>& slices,
-                   uint32_t bandIdx, const std::vector<size_t>& chunks0,
-                   size_t tilesXSrc, size_t tilesYSrc,
-                   int rotQuad, int flipAxis)
-{
-    int outH = slices[0].rows, outW = slices[0].cols;
-    size_t numZ = slices.size();
-    size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
-
-    for (size_t tx = 0; tx < tilesXSrc; tx++) {
-        size_t x0s = tx * chunkX;
-        size_t dxc = std::min(chunkX, size_t(outW) - x0s);
-
-        int dstTx = int(tx), dstTy = int(bandIdx), dTX, dTY;
-        if (rotQuad >= 0 || flipAxis >= 0)
-            mapTileIndex(int(tx), int(bandIdx), int(tilesXSrc), int(tilesYSrc),
-                         std::max(rotQuad, 0), flipAxis, dstTx, dstTy, dTX, dTY);
-
-        std::vector<T> chunkBuf(chunkZ * chunkY * chunkX, T(0));
-        size_t dy_actual = std::min(chunkY, size_t(outH));
-        size_t dx_actual = std::min(chunkX, dxc);
-        for (size_t zi = 0; zi < numZ; zi++) {
-            size_t sliceOff = zi * chunkY * chunkX;
-            for (size_t yy = 0; yy < dy_actual; yy++) {
-                const T* row = slices[zi].ptr<T>(int(yy));
-                std::memcpy(&chunkBuf[sliceOff + yy * chunkX], &row[x0s], dx_actual * sizeof(T));
-            }
-        }
-        dsOut->writeChunk(0, size_t(dstTy), size_t(dstTx),
-                          chunkBuf.data(), chunkBuf.size() * sizeof(T));
-    }
-}
-
-template void writeZarrBand<uint8_t>(vc::VcDataset*, const std::vector<cv::Mat>&,
-    uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
-template void writeZarrBand<uint16_t>(vc::VcDataset*, const std::vector<cv::Mat>&,
-    uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
-
-void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
-                              const std::vector<size_t>& offset,
-                              const std::vector<size_t>& regionShape,
-                              const uint8_t* data,
-                              uint8_t fillValue)
-{
-    if (!dsOut) {
-        throw std::runtime_error("writeZarrRegionU8ByChunk requires a dataset");
-    }
-    if (offset.size() != 3 || regionShape.size() != 3) {
-        throw std::runtime_error("writeZarrRegionU8ByChunk expects 3D ZYX inputs");
-    }
-    if (dsOut->shape().size() != 3 || dsOut->defaultChunkShape().size() != 3) {
-        throw std::runtime_error("writeZarrRegionU8ByChunk requires a 3D dataset");
-    }
-    if (dsOut->getDtype() != vc::VcDtype::uint8) {
-        throw std::runtime_error("writeZarrRegionU8ByChunk only supports uint8 datasets");
-    }
-    if ((regionShape[0] > 0 || regionShape[1] > 0 || regionShape[2] > 0) && !data) {
-        throw std::runtime_error("writeZarrRegionU8ByChunk requires input data");
-    }
-
-    const auto& datasetShape = dsOut->shape();
-    const auto& chunkShape = dsOut->defaultChunkShape();
-    for (size_t d = 0; d < 3; ++d) {
-        if (offset[d] > datasetShape[d] || regionShape[d] > (datasetShape[d] - offset[d])) {
-            throw std::runtime_error("writeZarrRegionU8ByChunk region exceeds dataset bounds");
-        }
-        if (regionShape[d] == 0) {
-            return;
-        }
-    }
-
-    const size_t chunkElems = chunkShape[0] * chunkShape[1] * chunkShape[2];
-    std::vector<uint8_t> chunkBuf(chunkElems, fillValue);
-
-    const size_t chunkZ0 = offset[0] / chunkShape[0];
-    const size_t chunkY0 = offset[1] / chunkShape[1];
-    const size_t chunkX0 = offset[2] / chunkShape[2];
-    const size_t chunkZ1 = (offset[0] + regionShape[0] - 1) / chunkShape[0];
-    const size_t chunkY1 = (offset[1] + regionShape[1] - 1) / chunkShape[1];
-    const size_t chunkX1 = (offset[2] + regionShape[2] - 1) / chunkShape[2];
-
-    for (size_t cz = chunkZ0; cz <= chunkZ1; ++cz) {
-        const size_t chunkBaseZ = cz * chunkShape[0];
-        for (size_t cy = chunkY0; cy <= chunkY1; ++cy) {
-            const size_t chunkBaseY = cy * chunkShape[1];
-            for (size_t cx = chunkX0; cx <= chunkX1; ++cx) {
-                const size_t chunkBaseX = cx * chunkShape[2];
-
-                const size_t overlapZ0 = std::max(chunkBaseZ, offset[0]);
-                const size_t overlapY0 = std::max(chunkBaseY, offset[1]);
-                const size_t overlapX0 = std::max(chunkBaseX, offset[2]);
-                const size_t overlapZ1 = std::min(chunkBaseZ + chunkShape[0], offset[0] + regionShape[0]);
-                const size_t overlapY1 = std::min(chunkBaseY + chunkShape[1], offset[1] + regionShape[1]);
-                const size_t overlapX1 = std::min(chunkBaseX + chunkShape[2], offset[2] + regionShape[2]);
-
-                if (overlapZ0 >= overlapZ1 || overlapY0 >= overlapY1 || overlapX0 >= overlapX1) {
-                    continue;
-                }
-
-                std::fill(chunkBuf.begin(), chunkBuf.end(), fillValue);
-
-                const size_t copyZ = overlapZ1 - overlapZ0;
-                const size_t copyY = overlapY1 - overlapY0;
-                const size_t copyX = overlapX1 - overlapX0;
-
-                const size_t srcBaseZ = overlapZ0 - offset[0];
-                const size_t srcBaseY = overlapY0 - offset[1];
-                const size_t srcBaseX = overlapX0 - offset[2];
-                const size_t dstBaseZ = overlapZ0 - chunkBaseZ;
-                const size_t dstBaseY = overlapY0 - chunkBaseY;
-                const size_t dstBaseX = overlapX0 - chunkBaseX;
-
-                for (size_t z = 0; z < copyZ; ++z) {
-                    for (size_t y = 0; y < copyY; ++y) {
-                        const size_t srcOff =
-                            ((srcBaseZ + z) * regionShape[1] + (srcBaseY + y)) * regionShape[2] + srcBaseX;
-                        const size_t dstOff =
-                            ((dstBaseZ + z) * chunkShape[1] + (dstBaseY + y)) * chunkShape[2] + dstBaseX;
-                        std::memcpy(chunkBuf.data() + dstOff, data + srcOff, copyX);
-                    }
-                }
-
-                dsOut->writeChunk(cz, cy, cx, chunkBuf.data(), chunkBuf.size());
-            }
-        }
-    }
-}
-
-// ============================================================
-// downsampleChunk
-// ============================================================
-
-template <typename T>
-void downsampleChunk(const T* src, size_t srcZ, size_t srcY, size_t srcX,
-                     T* dst, size_t dstZ, size_t dstY, size_t dstX,
-                     size_t srcActualZ, size_t srcActualY, size_t srcActualX)
-{
-    for (size_t zz = 0; zz < dstZ; zz++)
-        for (size_t yy = 0; yy < dstY; yy++)
-            for (size_t xx = 0; xx < dstX; xx++) {
-                uint32_t sum = 0; int cnt = 0;
-                for (int d0 = 0; d0 < 2 && 2*zz+d0 < srcActualZ; d0++)
-                    for (int d1 = 0; d1 < 2 && 2*yy+d1 < srcActualY; d1++)
-                        for (int d2 = 0; d2 < 2 && 2*xx+d2 < srcActualX; d2++) {
-                            sum += src[(2*zz+d0)*srcY*srcX + (2*yy+d1)*srcX + (2*xx+d2)];
-                            cnt++;
-                        }
-                dst[zz*dstY*dstX + yy*dstX + xx] = T((sum + cnt/2) / std::max(1, cnt));
-            }
-}
-
-template void downsampleChunk<uint8_t>(const uint8_t*, size_t, size_t, size_t,
-    uint8_t*, size_t, size_t, size_t, size_t, size_t, size_t);
-template void downsampleChunk<uint16_t>(const uint16_t*, size_t, size_t, size_t,
-    uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t);
-
-// ============================================================
-// downsampleTileInto
-// ============================================================
-
-template <typename T>
-void downsampleTileInto(const T* src, size_t srcZ, size_t srcY, size_t srcX,
-                        T* dst, size_t dstZ, size_t dstY, size_t dstX,
-                        size_t srcActualZ, size_t srcActualY, size_t srcActualX,
-                        size_t dstOffY, size_t dstOffX)
-{
-    size_t halfZ = (srcActualZ + 1) / 2;
-    size_t halfY = (srcActualY + 1) / 2;
-    size_t halfX = (srcActualX + 1) / 2;
-    for (size_t zz = 0; zz < halfZ && zz < dstZ; zz++)
-        for (size_t yy = 0; yy < halfY && (dstOffY + yy) < dstY; yy++)
-            for (size_t xx = 0; xx < halfX && (dstOffX + xx) < dstX; xx++) {
-                uint32_t sum = 0; int cnt = 0;
-                for (int d0 = 0; d0 < 2 && 2*zz+d0 < srcActualZ; d0++)
-                    for (int d1 = 0; d1 < 2 && 2*yy+d1 < srcActualY; d1++)
-                        for (int d2 = 0; d2 < 2 && 2*xx+d2 < srcActualX; d2++) {
-                            sum += src[(2*zz+d0)*srcY*srcX + (2*yy+d1)*srcX + (2*xx+d2)];
-                            cnt++;
-                        }
-                dst[zz*dstY*dstX + (dstOffY+yy)*dstX + (dstOffX+xx)] = T((sum + cnt/2) / std::max(1, cnt));
-            }
-}
-
-template void downsampleTileInto<uint8_t>(const uint8_t*, size_t, size_t, size_t,
-    uint8_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
-template void downsampleTileInto<uint16_t>(const uint16_t*, size_t, size_t, size_t,
-    uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
-
 template <typename T>
 void downsampleTileIntoPreserveZ(const T* src, size_t srcZ, size_t srcY, size_t srcX,
                                 T* dst, size_t dstZ, size_t dstY, size_t dstX,
@@ -336,6 +143,93 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 }
 
 // ============================================================
+// buildMultiscales
+// ============================================================
+
+// The OME-NGFF "multiscales" attribute value.
+//
+// Always written: it is the discovery metadata for the image -- axes, the
+// ordered list of resolution levels, and each level's
+// coordinateTransformations. A reader that cannot find it does not recognise the
+// output as a multiscale image at all.
+//
+// The physical size and the level-to-level scaling are separate concerns and are
+// encoded separately:
+//
+//   * `axes[*].unit` carries the physical unit. It is written only when the
+//     physical size is known -- a unit without a measurement is the thing we must
+//     never invent.
+//   * each dataset's `scale` is a coordinate transformation. With a known size it
+//     is that size in physical units per axis. Without one it is the *relative*
+//     factor between that level and level 0, which is exactly what OME-NGFF 0.4
+//     asks for when a physical scale is unavailable:
+//
+//       "If scaling information is not available or applicable for one of the
+//        axes, the value MUST express the scaling factor between the current
+//        resolution and the first resolution for the given axis, defaulting to
+//        1.0 if there is no downsampling along the axis."
+//       -- https://ngff.openmicroscopy.org/0.4/#multiscale-md
+//
+//     So level 0 is [1, 1, 1] and is the reference; there is no absolute length
+//     anywhere in the document. A reader can still place the levels relative to
+//     each other, and cannot mistake the numbers for micrometres.
+Json buildMultiscales(double baseVoxelSize, const std::string& voxelUnit,
+                      double sliceStep, double pixelsPerVoxel)
+{
+    const bool physicalSizeKnown = std::isfinite(baseVoxelSize) && baseVoxelSize > 0.0;
+
+    Json ms;
+    ms["version"] = "0.4"; ms["name"] = "render";
+    auto makeAxis = [&](const char* name) -> Json {
+        Json ax = Json{{"name", name}, {"type", "space"}};
+        // Only a known physical size may carry a unit: see above.
+        if (physicalSizeKnown && !voxelUnit.empty()) ax["unit"] = voxelUnit;
+        return ax;
+    };
+    Json axes = Json::array();
+    axes.push_back(makeAxis("z"));
+    axes.push_back(makeAxis("y"));
+    axes.push_back(makeAxis("x"));
+    ms["axes"] = std::move(axes);
+    ms["datasets"] = Json::array();
+    // When the size is known the two axes scale independently of each other:
+    // in-plane, one output pixel spans 1/pixelsPerVoxel base voxels;
+    // through-plane, adjacent output layers sit sliceStep base voxels apart.
+    // Pyramid levels halve only YX (see createPyramidDatasets).
+    const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
+        ? pixelsPerVoxel : 1.0;
+    const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
+        ? sliceStep : 1.0;
+    for (int l = 0; l <= 5; l++) {
+        // Relative pyramid factor: levels are built by halving Y/X each step and
+        // keeping Z unchanged, so Y/X double relative to level 0 while Z stays at
+        // its level-0 spacing.
+        const double relativeYX = std::pow(2.0, l);
+        const double sYX = physicalSizeKnown ? baseVoxelSize / px * relativeYX
+                                             : relativeYX;
+        const double sZ = physicalSizeKnown ? baseVoxelSize * step : 1.0;
+        Json scale_arr = Json::array();
+        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
+        Json trans_arr = Json::array();
+        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+        Json transforms = Json::array();
+        transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
+        transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});
+        ms["datasets"].push_back(Json{
+            {"path", std::to_string(l)},
+            {"coordinateTransformations", std::move(transforms)}
+        });
+    }
+    ms["metadata"] = Json{{"downsampling_method","mean"}};
+    if (!physicalSizeKnown) {
+        // Say why the scales are unitless, in the document itself, so a reader
+        // (or a person) does not have to infer it from the missing "unit".
+        ms["metadata"]["physical_size"] = "unknown";
+    }
+    return ms;
+}
+
+// ============================================================
 // writeZarrAttrs
 // ============================================================
 
@@ -367,44 +261,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     }
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
 
-    Json ms;
-    ms["version"] = "0.4"; ms["name"] = "render";
-    auto makeAxis = [&](const char* name) -> Json {
-        Json ax = Json{{"name", name}, {"type", "space"}};
-        if (!voxelUnit.empty()) ax["unit"] = voxelUnit;
-        return ax;
-    };
-    Json axes = Json::array();
-    axes.push_back(makeAxis("z"));
-    axes.push_back(makeAxis("y"));
-    axes.push_back(makeAxis("x"));
-    ms["axes"] = std::move(axes);
-    ms["datasets"] = Json::array();
-    // The two axes scale independently of each other: in-plane, one output
-    // pixel spans 1/pixelsPerVoxel base voxels; through-plane, adjacent output
-    // layers sit sliceStep base voxels apart. Pyramid levels halve only YX.
-    const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
-        ? pixelsPerVoxel : 1.0;
-    const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
-        ? sliceStep : 1.0;
-    for (int l = 0; l <= 5; l++) {
-        const double sYX = baseVoxelSize / px * std::pow(2.0, l);
-        const double sZ = baseVoxelSize * step;
-        Json scale_arr = Json::array();
-        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
-        Json trans_arr = Json::array();
-        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
-        Json transforms = Json::array();
-        transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
-        transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});
-        ms["datasets"].push_back(Json{
-            {"path", std::to_string(l)},
-            {"coordinateTransformations", std::move(transforms)}
-        });
-    }
-    ms["metadata"] = Json{{"downsampling_method","mean"}};
     Json multiscales = Json::array();
-    multiscales.push_back(std::move(ms));
+    multiscales.push_back(buildMultiscales(baseVoxelSize, voxelUnit, sliceStep, pixelsPerVoxel));
     attrs["multiscales"] = std::move(multiscales);
 
     vc::writeZarrAttributes(outDir, attrs);

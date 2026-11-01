@@ -9,7 +9,6 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../.
 const googleJobs = [
   'validate',
   'dry-run',
-  'sync-responses',
   'reconcile-active',
   'prepare-google',
   'activate-production',
@@ -215,22 +214,6 @@ test('production dry-run immediately exercises a read-only public proposal', asy
   );
 });
 
-test('response sync is append-only, reviewer-free, and isolated from GitHub writes', async () => {
-  const production = await productionWorkflow();
-  const sync = jobBlock(production, 'sync-responses');
-
-  assert.match(sync, /^    if: inputs\.operation == 'sync-responses'$/m);
-  assert.match(sync, /^    needs: preflight$/m);
-  assert.match(sync, /^    environment: progress-prizes-production$/m);
-  assert.match(sync, /permissions:\n      contents: read\n      id-token: write/);
-  assert.match(sync, /^          operation: sync-responses$/m);
-  assert.match(sync, /^          source-cycle: \$\{\{ inputs\['source-cycle'\] \}\}$/m);
-  assert.match(sync, /^          branch: main$/m);
-  assert.match(sync, /^          target-branch: main$/m);
-  assert.doesNotMatch(sync, /activation-approval|pull-requests: write|contents: write/);
-  assert.doesNotMatch(sync, /simulated-now:|fault:|dry-run:|head-sha:|base-sha:/);
-});
-
 test('normal preparation no-ops safely outside the seven-day window', async () => {
   const production = await productionWorkflow();
   const google = jobBlock(production, 'prepare-google');
@@ -294,7 +277,7 @@ test('reconcile-active requires secret-free approval and permits only marker met
   assert.match(action, /test -z "\$BASE_SHA"/);
   assert.match(
     action,
-    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\.operation != 'sync-responses' && inputs\.operation != 'reconcile-active' && inputs\['dry-run'\] != 'true'/,
+    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\.operation != 'reconcile-active' && inputs\['dry-run'\] != 'true'/,
   );
   assert.match(action, /Authenticate marker-only reconciliation without a credential file/);
 });
@@ -350,6 +333,50 @@ test('activation gates, approves, waits, authenticates, leases, verifies, then m
   assert.match(merge, /PR_NUMBER: \$\{\{ needs\.activate-production\.outputs\['pr-number'\] \}\}/);
   assert.match(merge, /--sha "\$HEAD_SHA"/);
   assert.match(merge, /--base-sha "\$BASE_SHA"/);
+});
+
+function jobNeeds(block) {
+  const list = block.match(/^    needs:\n((?:      - [a-z0-9-]+\n)+)/m);
+  if (list) return [...list[1].matchAll(/- ([a-z0-9-]+)/g)].map((match) => match[1]);
+  const single = block.match(/^    needs: ([a-z0-9-]+)$/m);
+  return single ? [single[1]] : [];
+}
+
+test('a skipped refresh-page cannot silently skip activation downstream', async () => {
+  const source = await productionWorkflow();
+  const needs = new Map(jobNames(source).map((name) => [name, jobNeeds(jobBlock(source, name))]));
+  const downstream = new Set(['refresh-page']);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, dependencies] of needs) {
+      if (!downstream.has(name) && dependencies.some((dependency) => downstream.has(dependency))) {
+        downstream.add(name);
+        changed = true;
+      }
+    }
+  }
+  downstream.delete('refresh-page');
+
+  for (const name of ['activation-binding', 'activation-gate', 'activation-approval',
+    'activate-production', 'merge']) {
+    assert.ok(downstream.has(name), `${name} should depend on refresh-page`);
+  }
+  for (const name of downstream) {
+    const block = jobBlock(source, name);
+    // GitHub skips a job when any ancestor was skipped unless its condition
+    // opts out of the implicit success() with always() or !cancelled().
+    assert.match(block, /^    if: >-\n      (?:always\(\)|!cancelled\(\)) &&$/m, name);
+    // The failure reporter runs precisely when an upstream job did not succeed.
+    if (name === 'report-scheduled-failure') continue;
+    for (const dependency of needs.get(name)) {
+      if (dependency === 'refresh-page') continue;
+      assert.match(
+        block,
+        new RegExp(`needs\\.${dependency}\\.result == 'success'`),
+        `${name} must require ${dependency} to succeed`,
+      );
+    }
+  }
 });
 
 test('activation reuses an exact prepared commit and refreshes only stale parents', async () => {

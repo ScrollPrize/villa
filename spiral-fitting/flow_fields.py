@@ -7,18 +7,16 @@ import torch.nn.functional as F
 
 import flow_grad_smoothing
 import flow_triton
+from geom_utils import grid_sample_border
 
 
 def sample_field(normalised_zyx, field_for_grid_sample):
     # normalised_zyx :: *, zyx in [0, 1]; field_for_grid_sample :: zyx, z, y, x
     orig_shape = normalised_zyx.shape
     zyx = (normalised_zyx * 2. - 1.).view(1, -1, 1, 1, 3)
-    field_samples = F.grid_sample(
-        input=field_for_grid_sample[None],
-        grid=zyx.flip(-1),
-        align_corners=True,
-        mode='bilinear',
-        padding_mode='border',
+    field_samples = grid_sample_border(
+        field_for_grid_sample[None],
+        zyx.flip(-1),
     )  # 1, zyx, n, 1, 1
     return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
 
@@ -465,9 +463,18 @@ class CartesianFlowField(nn.Module):
         whole walk is one autograd node (see flow_triton); the eager fallback
         composes one _RK4SparseFlowIntegrate node per slab.
         """
-        if (flow_triton.direct_lr_enabled(self.direct_lr)
-                and flow_triton.rk4_triton_available(self.flows[0], self.flows[1])):
-            return self._get_direct_integrator()
+        if flow_triton.direct_lr_enabled(self.direct_lr):
+            if flow_triton.rk4_triton_available(self.flows[0], self.flows[1]):
+                return self._get_direct_integrator()
+            if flow_triton.direct_lr_requested():
+                raise RuntimeError(
+                    'FIT_SPIRAL_DIRECT_LR=1 asks for direct low-resolution sampling, which exists only in the '
+                    f'fused Triton kernel (CUDA float32 lattices; here {self.flows[0].device}, {self.flows[0].dtype}). '
+                    'Unset it, or set FIT_SPIRAL_DIRECT_LR=0, for the upsampled field.')
+            if not getattr(self, '_upsampled_noted', False):
+                self._upsampled_noted = True
+                print(f'flow field: no fused kernel on {self.flows[0].device}, using the upsampled field '
+                      '(model_flow_field_direct_lr applies only where the kernel runs)', flush=True)
         low_field, high_field, acc = self._prepare_upsampled_fields()
 
         if flow_triton.rk4_triton_available(low_field, high_field, acc):

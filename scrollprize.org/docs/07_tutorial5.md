@@ -69,7 +69,7 @@ This is where one of the core difficulties of the Herculaneum Papyri comes in: t
 
 So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
 
-Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus. Crackle is one of several surface-morphology cues that can betray ink; on other scrolls the signal is more subtle and heterogeneous, and may instead depend on fine texture, local roughness, deposits, or deformation.
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris. 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus. Crackle is one of several surface-morphology cues that can betray ink; on other scrolls the signal is more subtle and heterogeneous, and may instead depend on fine texture, local roughness, deposits, or deformation.
 
 <figure>
   <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>
@@ -113,7 +113,7 @@ Now let's train a model. The rest of this tutorial is hands-on: you will set up 
 
 ### The dataset
 
-The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris 4 (Scroll 1) — about 25 GB:
+The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris. 4 (Scroll 1) — about 25 GB:
 
 ```bash
 uvx --from huggingface_hub hf buckets sync \
@@ -480,7 +480,7 @@ The figure below shows this loop in action on PHerc. 1667: with each iteration t
 
 ### Ink detection at 9 µm: pretrained cross-scroll models
 
-Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
+Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris. 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
 
 The models live at [`scrollprize/ink_9um`](https://huggingface.co/scrollprize/ink_9um) on Hugging Face: a small local 3D stem feeding a 2D U-Net, trained twice with only the seed changed (`hybrid_3d2d-seed42/` and `hybrid_3d2d-seed43/`), with seven checkpoints each along the training trajectory (`step-010000.pth` up to `step-075000.pth`).
 
@@ -512,8 +512,7 @@ Render the geometry against the scroll's native 9.362&nbsp;µm volume with `vc_r
 
 ```bash
 vc_render_tifxyz \
-  --volume volume-cache/20250728140407.zarr \
-  --remote-url s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/ \
+  --volume s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/ \
   --segmentation ink-dataset/pherc0139/w035/w035.tifxyz \
   --zarr-output ink-dataset/pherc0139/w035/w035_9um.zarr \
   --scale 1 --group-idx 0 --num-slices 28 \
@@ -522,7 +521,7 @@ vc_render_tifxyz \
   --flip-normals
 ```
 
-* `--remote-url` takes the S3 volume; `--volume` names a local directory where fetched chunks are cached, so only the parts of the scroll your segment touches ever get downloaded. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
+* `--volume` takes the S3 volume directly and streams it; fetched chunks persist in VC3D's shared remote cache (`~/.VC3D/remote_cache` by default), so only the parts of the scroll your segment touches ever get downloaded, and a second render of the same area reuses them. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
 * `--flip-normals` reproduces the depth orientation of the published renders and the training labels; for your own segment the orientation is unknown, which is what `--direction both` at inference time is for.
 
 For w035 this takes about five minutes and writes a ~900&nbsp;MB Zarr:

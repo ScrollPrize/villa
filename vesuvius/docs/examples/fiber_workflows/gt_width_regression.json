@@ -1,0 +1,18 @@
+{
+  "fiber_gt_convergence_probe": {
+    "source": "/data/fiber-layout/gt-initialization",
+    "reference": "/data/fiber-layout/gt-winding-reference.json",
+    "output_root": "/data/fiber-layout/results/gt-width-regression",
+    "devices": "0",
+    "gpu_manager": {
+      "exclusive": false,
+      "cpu_cores": 4,
+      "vram_bytes_per_gpu": 4294967296,
+      "label": "gt-regression"
+    },
+    "trials": [
+      {"name": "control", "checkpoint": "/data/fiber-layout/gt-initialization/solution.npz", "optimize": "joint", "steps": 100},
+      {"name": "perturbed", "checkpoint": "/data/fiber-layout/gt-initialization/solution.npz", "initial_width_scale": 1.2, "optimize": "joint", "steps": 100}
+    ]
+  }
+}

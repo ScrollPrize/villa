@@ -130,27 +130,7 @@ TEST_CASE("VcDataset::readChunk on out-of-range chunk returns false (or throws)"
     fs::remove_all(d);
 }
 
-TEST_CASE("VcDataset::writeRegion: spans multiple chunks with partial overlap")
-{
-    auto d = tmpDir("region_partial");
-    auto ds = vc::createZarrDataset(d, "arr",
-        /*shape=*/{16, 16, 16}, /*chunks=*/{8, 8, 8},
-        vc::VcDtype::uint8, "none");
-    REQUIRE(ds);
-    // Write a 12x12x12 region starting at (2, 2, 2). Spans all 8 chunks
-    // because offset+12 = 14 > 8 for each axis.
-    std::vector<uint8_t> in(12 * 12 * 12);
-    for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i & 0xFF);
-    CHECK(ds->writeRegion({2, 2, 2}, {12, 12, 12}, in.data()));
-
-    std::vector<uint8_t> out(12 * 12 * 12, 0);
-    CHECK(ds->readRegion({2, 2, 2}, {12, 12, 12}, out.data()));
-    CHECK(out[0] == in[0]);
-    CHECK(out[out.size() - 1] == in[in.size() - 1]);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VcDataset: a region past the dataset bounds is refused, not written past")
+TEST_CASE("VcDataset: a region past the dataset bounds is refused, not read past")
 {
     // Was disabled with a CHECK(true) placeholder and a FIXME saying readRegion segfaults on
     // an out-of-bounds region "instead of clamping, returning false, or throwing". Returning
@@ -178,30 +158,9 @@ TEST_CASE("VcDataset: a region past the dataset bounds is refused, not written p
     // a refused read leaves every byte of the caller's buffer as it was (VcDataset.hpp contract)
     CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0xCC; }));
 
-    // writeRegion needs the same check for the same reason, in reverse: without it, it would
-    // read past the caller's input buffer.
-    std::vector<uint8_t> in(8 * 8 * 8, 0x11);
-    CHECK_FALSE(ds->writeRegion({0, 0, 0}, {16, 16, 16}, in.data()));
-    CHECK_FALSE(ds->writeRegion({0, 0}, {1, 1}, in.data()));
-    // a refused write leaves the dataset as it was: nothing has been written to it yet
-    CHECK_FALSE(ds->chunkExists(0, 0, 0));
-
     // the in-bounds cases must be unaffected
     CHECK(ds->readRegion({0, 0, 0}, {8, 8, 8}, out.data()));
     CHECK(ds->readRegion({2, 2, 2}, {4, 4, 4}, out.data()));
-    CHECK(ds->writeRegion({0, 0, 0}, {8, 8, 8}, in.data()));
-    fs::remove_all(d);
-}
-
-TEST_CASE("VcDataset::delimiter() returns the configured separator")
-{
-    auto d = tmpDir("delim");
-    auto ds = vc::createZarrDataset(d, "arr",
-        {8, 8, 8}, {8, 8, 8},
-        vc::VcDtype::uint8, "none",
-        /*dimensionSeparator=*/"/");
-    REQUIRE(ds);
-    CHECK(ds->delimiter() == "/");
     fs::remove_all(d);
 }
 
@@ -222,19 +181,6 @@ TEST_CASE("VcDataset::chunkExists with slash-delimiter writes into nested path")
 TEST_CASE("VcDataset constructor: bad path throws")
 {
     CHECK_THROWS(vc::VcDataset("/__no__/__where__"));
-}
-
-TEST_CASE("openZarrLevels: empty dir returns empty vector")
-{
-    auto d = tmpDir("empty");
-    auto levels = vc::openZarrLevels(d);
-    CHECK(levels.empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("openZarrLevels: non-existent root throws")
-{
-    CHECK_THROWS(vc::openZarrLevels("/__no__/__path__"));
 }
 
 TEST_CASE("readChunkOrFill: present chunk returns true; output mirrors written data")

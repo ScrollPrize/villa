@@ -22,13 +22,11 @@ namespace
 {
 constexpr int kServiceStartTimeoutMs = 300000; // 5 minutes for torch compilation
 constexpr int kServiceStopTimeoutMs = 500;     // 500ms then kill
-const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
 const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 
 bool isCheckpointSentinel(const QString& checkpointPath)
 {
-    const QString trimmed = checkpointPath.trimmed();
-    return trimmed == kDenseLatestSentinel || trimmed == kCopyLatestSentinel;
+    return checkpointPath.trimmed() == kCopyLatestSentinel;
 }
 
 QString normalizeExistingPath(const QString& path)
@@ -49,7 +47,7 @@ QString normalizeExistingPath(const QString& path)
 QString normalizeCheckpointValue(const QString& checkpointPath)
 {
     if (isCheckpointSentinel(checkpointPath)) {
-        return kDenseLatestSentinel;
+        return kCopyLatestSentinel;
     }
     return normalizeExistingPath(checkpointPath);
 }
@@ -219,7 +217,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
     }
 
     // Use provided Python path if specified, otherwise auto-detect
-    QString python = pythonPath.isEmpty() ? vc3d::findPythonExecutable() : pythonPath;
+    QString python = pythonPath.isEmpty() ? vc3d::pythonExecutableForServices() : pythonPath;
 
     // Set up environment with vesuvius/src in PYTHONPATH
     // trace_service.py is at vesuvius/src/vesuvius/neural_tracing/trace_service.py

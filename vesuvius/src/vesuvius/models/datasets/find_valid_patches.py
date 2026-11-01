@@ -268,6 +268,28 @@ def check_patch_chunk(
     return valid_positions
 
 
+def _resolve_resolution(array_obj, level_key):
+    """Return the array for ``level_key`` of a multiscale group, or ``None``.
+
+    A plain array has no downsampled levels, so it is returned for level 0
+    only. Returning ``None`` for any other level lets the caller fall back to
+    full resolution, as it already does for a group that lacks the level;
+    before, the full-resolution array was scanned as if it were the requested
+    level and the positions were then scaled by ``2 ** level`` (#1970).
+    """
+    key = str(level_key)
+    if hasattr(array_obj, 'shape') and hasattr(array_obj, 'dtype'):
+        if not hasattr(array_obj, 'keys'):
+            return array_obj if key == '0' else None
+    try:
+        candidate = array_obj[key]
+        if hasattr(candidate, 'shape'):
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
 def _collect_unlabeled_fg_from_image_only(
     image_array,
     vol_idx: int,
@@ -295,20 +317,6 @@ def _collect_unlabeled_fg_from_image_only(
         List of patch dictionaries with 'volume_idx', 'volume_name', 'start_pos'
     """
     unlabeled_fg_patches = []
-
-    def _resolve_resolution(array_obj, level_key):
-        """Access resolution level from a zarr group or return array directly."""
-        key = str(level_key)
-        if hasattr(array_obj, 'shape') and hasattr(array_obj, 'dtype'):
-            if not hasattr(array_obj, 'keys'):
-                return array_obj
-        try:
-            candidate = array_obj[key]
-            if hasattr(candidate, 'shape'):
-                return candidate
-        except Exception:
-            pass
-        return None
 
     # Resolve image array at appropriate resolution level
     actual_downsample_factor = downsample_factor
@@ -752,25 +760,6 @@ def find_valid_patches(
         actual_downsample_factor = downsample_factor
         actual_downsampled_patch_size = downsampled_patch_size
 
-        def _resolve_resolution(array_obj, level_key):
-            """Access resolution level from a zarr group or return array directly."""
-            key = str(level_key)
-
-            # If it's already an array (not a group), return it
-            if hasattr(array_obj, 'shape') and hasattr(array_obj, 'dtype'):
-                if not hasattr(array_obj, 'keys'):
-                    return array_obj
-
-            # Try accessing as group[level]
-            try:
-                candidate = array_obj[key]
-                if hasattr(candidate, 'shape'):
-                    return candidate
-            except Exception:
-                pass
-
-            return None
-
         logger.info(
             "Resolving downsample level %s for volume '%s'",
             valid_patch_find_resolution,
@@ -891,21 +880,26 @@ def find_valid_patches(
         should_collect_unlabeled_fg = collect_unlabeled_fg and image_array is not None
 
         # Resolve image array for unlabeled FG detection
+        # The image is sliced with the label grid's coordinates, so it has to
+        # be read at the level the labels ended up on (0 after a fallback).
         downsampled_image_array = None
         if should_collect_unlabeled_fg:
+            image_level = valid_patch_find_resolution if actual_downsample_factor == downsample_factor else 0
             try:
-                candidate = _resolve_resolution(image_array, valid_patch_find_resolution)
-                if candidate is not None:
-                    downsampled_image_array = candidate
-                else:
-                    candidate_full = _resolve_resolution(image_array, '0')
-                    downsampled_image_array = candidate_full if candidate_full is not None else image_array
+                downsampled_image_array = _resolve_resolution(image_array, image_level)
             except Exception as e:
                 logger.warning(
-                    "Error resolving image level %s for '%s': %s. Using array directly.",
-                    valid_patch_find_resolution, label_name, e,
+                    "Error resolving image level %s for '%s': %s.",
+                    image_level, label_name, e,
                 )
+            if downsampled_image_array is None and str(image_level) == '0':
                 downsampled_image_array = image_array
+            if downsampled_image_array is None:
+                logger.warning(
+                    "Image level %s unavailable for '%s'; skipping unlabeled FG collection for this volume",
+                    image_level, label_name,
+                )
+                should_collect_unlabeled_fg = False
 
         block_start = time.perf_counter()
 

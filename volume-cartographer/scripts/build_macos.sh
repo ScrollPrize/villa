@@ -81,13 +81,9 @@ brew_prefix="$(brew --prefix)"
 export HOMEBREW_PREFIX="$brew_prefix"
 required_formulae=(
   llvm
-  # As of Homebrew llvm 19+, ld64.lld no longer ships in the llvm formula;
-  # the Mach-O backend lives in a standalone `lld` keg.
-  lld
   # LLVM's Fortran frontend; lives in its own keg (Homebrew's llvm formula
   # deliberately doesn't ship flang). PaStiX enables Fortran for a tiny
-  # configure-time check; flang+lld speaks the Mach-O linker correctly
-  # whereas gfortran does not.
+  # configure-time check.
   flang
   cmake
   ninja
@@ -103,6 +99,8 @@ required_formulae=(
   curl
   nlohmann-json
   sqlite
+  # vc_object_store links OpenSSL::Crypto; keg-only, see prefix loop below.
+  openssl@3
   lapack
   # OpenBLAS provides cblas_* with the legacy ILP32 symbol names PaStiX
   # expects. Accelerate.framework's BLAS hides those symbols when linked
@@ -141,24 +139,13 @@ if (( ${#missing[@]} > 0 )); then
 fi
 
 llvm_bin="$brew_prefix/opt/llvm/bin"
-lld_bin="$brew_prefix/opt/lld/bin"
 if [[ ! -x "$llvm_bin/clang++" ]]; then
   echo "Homebrew LLVM compiler not found at $llvm_bin/clang++." >&2
   exit 1
 fi
-# Homebrew llvm 19+ ships lld in a standalone keg (`brew install lld`).
-# The preset's -fuse-ld=lld asks clang's driver for ld64.lld; we need it
-# resolvable on PATH.
-if [[ ! -x "$lld_bin/ld64.lld" ]]; then
-  echo "Homebrew LLD (ld64.lld) not found at $lld_bin/ld64.lld." >&2
-  echo "Install with: brew install lld" >&2
-  exit 1
-fi
-# Put lld_bin and llvm_bin first so clang's driver finds ld64.lld plus
-# llvm-strip / llvm-nm / llvm-install-name-tool without falling back to
-# Apple's /usr/bin/*. Order: lld_bin before llvm_bin (lld_bin only has
-# the linker binaries, doesn't shadow anything else).
-export PATH="$lld_bin:$llvm_bin:$PATH"
+# Put llvm_bin first so llvm-strip / llvm-nm / llvm-install-name-tool are found
+# without falling back to Apple's /usr/bin/*.
+export PATH="$llvm_bin:$PATH"
 
 # Homebrew LLVM's clang++ needs SDKROOT pointing at the active Xcode/CLT SDK
 # so its libc++ headers compose correctly with the C SDK headers (otherwise
@@ -191,8 +178,9 @@ fi
 
 # lapack and openblas are keg-only on macOS (Accelerate ships LAPACK but not
 # LAPACKE, which PaStiX requires; openblas would otherwise be masked by
-# Accelerate). Make both discoverable by pkg-config and cmake's find_package.
-for keg in lapack openblas; do
+# Accelerate). openssl@3 is keg-only and needed by vc_object_store. Make them
+# discoverable by pkg-config and cmake's find_package.
+for keg in lapack openblas openssl@3; do
   if [[ -d "$brew_prefix/opt/$keg" ]]; then
     export PKG_CONFIG_PATH="$brew_prefix/opt/$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
@@ -204,9 +192,7 @@ extra_cmake_args+=("-DBLA_VENDOR=OpenBLAS")
 
 # PaStiX enables Fortran at configure time even with PASTIX_WITH_FORTRAN=OFF.
 # Use LLVM's flang (from the Homebrew flang keg) so the toolchain stays
-# clang/flang + lld end-to-end; gfortran would inherit our -fuse-ld=lld
-# linker flags and ld64.lld would reject the link (gfortran doesn't pass
-# -platform_version / -arch).
+# clang/flang end-to-end.
 flang_bin="$(brew --prefix flang 2>/dev/null || true)/bin/flang"
 if [[ -x "$flang_bin" ]]; then
   export FC="$flang_bin"

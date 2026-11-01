@@ -22,8 +22,8 @@ private slots:
         request.level = 1;
         request.origin = {10, 20, 30};
         request.size = {512, 256, 128};
-        request.output = "/data/fibers.afv";
-        request.coordinateSpace = "PHerc0813/20250821151723";
+        request.output = "/data/fibers.vcobj";
+        request.volumeUuid = "20250821151723";
         request.nativeScale = 2;
         request.voxelSizeUm = 9.362;
         request.sourcePath = "s3://bucket/scroll.zarr/";
@@ -37,8 +37,8 @@ private slots:
         request.previewDirectory = "/tmp/previews";
         const QStringList expected{
             "-m", "vesuvius.afv_spline_generator", "--volume", "https://example.org/scroll.zarr", "--level", "1",
-            "--origin", "10", "20", "30", "--size", "512", "256", "128", "--output", "/data/fibers.afv",
-            "--coordinate-space", "PHerc0813/20250821151723", "--native-scale", "2", "--voxel-size", "9.362",
+            "--origin", "10", "20", "30", "--size", "512", "256", "128", "--output", "/data/fibers.vcobj",
+            "--volume-uuid", "20250821151723", "--native-scale", "2", "--voxel-size", "9.362",
             "--source-path", "s3://bucket/scroll.zarr/", "--model", "Qualzz20/afv_fiber_9um", "--threshold", "55",
             "--mirror", "--block-size", "256", "--extend", "--max-join-angle", "30", "--min-length", "0",
             "--black-distance", "8", "--preview-dir", "/tmp/previews", "--progress", "json"};
@@ -49,8 +49,8 @@ private slots:
     {
         Request request;
         request.volume = "/data/scroll.zarr";
-        request.output = "/data/fibers.afv";
-        request.coordinateSpace = "space";
+        request.output = "/data/fibers.vcobj";
+        request.volumeUuid = "space";
         const auto args = arguments(request);
         QVERIFY(!args.contains("--voxel-size"));
         QVERIFY(!args.contains("--source-path"));
@@ -72,10 +72,10 @@ private slots:
         QCOMPARE(progress->fraction, 0.25);
         QCOMPARE(parseEvent(R"({"event": "progress", "message": "", "fraction": 7})")->fraction, 1.0);
 
-        const auto done = parseEvent(R"({"event": "done", "fraction": 1.0, "output": "/data/fibers.afv", "fibers": 4783, "uuid": "u"})" "\n");
+        const auto done = parseEvent(R"({"event": "done", "fraction": 1.0, "output": "/data/fibers.vcobj", "fibers": 4783, "uuid": "u"})" "\n");
         QVERIFY(done);
         QCOMPARE(done->kind, Event::Kind::Done);
-        QCOMPARE(done->output, QString("/data/fibers.afv"));
+        QCOMPARE(done->output, QString("/data/fibers.vcobj"));
         QCOMPARE(done->fibers, qint64(4783));
 
         QCOMPARE(parseEvent(R"({"event": "error", "message": "The volume has no array 1"})")->message, QString("The volume has no array 1"));
@@ -99,10 +99,10 @@ private slots:
         QCOMPARE(block->state, QString("predicting"));
         QVERIFY(!parseEvent(R"({"event": "block", "state": "done"})"));
 
-        const auto preview = parseEvent(R"({"event": "preview", "path": "/tmp/previews/preview-0001.afv", "fibers": 12})");
+        const auto preview = parseEvent(R"({"event": "preview", "path": "/tmp/previews/preview-0001.vcobj", "fibers": 12})");
         QVERIFY(preview);
         QCOMPARE(preview->kind, Event::Kind::Preview);
-        QCOMPARE(preview->path, QString("/tmp/previews/preview-0001.afv"));
+        QCOMPARE(preview->path, QString("/tmp/previews/preview-0001.vcobj"));
         QVERIFY(!parseEvent(R"({"event": "preview"})"));
     }
 

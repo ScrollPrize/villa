@@ -1,4 +1,4 @@
-"""Generate an Automated Fiber Volume (.afv) from a zone of a CT volume.
+"""Generate a fiber object store (.vcobj) from a zone of a CT volume.
 
 The zone is processed in blocks. In each block a fiber model predicts vertical
 and horizontal fiber probabilities and smooth polylines are fitted to them
@@ -24,7 +24,7 @@ from typing import Any, Iterator, Sequence
 
 import numpy as np
 
-from .afv import Fiber, write_afv
+from .store import Fiber, write_store
 from .cleanup import TOLERANCE, ExteriorBlack, clean
 
 
@@ -48,7 +48,7 @@ class Reporter:
     JSON events have an ``event`` of ``progress`` (with ``stage``, ``message``
     and the completed ``fraction`` of the run), ``plan`` (the ``blocks``, each
     an ``origin`` and ``size`` in volume voxels), ``block`` (the ``index`` of
-    a block and its new ``state``), ``preview`` (the ``path`` of a .afv with
+    a block and its new ``state``), ``preview`` (the ``path`` of a .vcobj with
     the fibers stitched so far), ``warning``, ``done`` or ``error``.
     """
 
@@ -209,21 +209,21 @@ def load_network(folder: Path, device) -> tuple[Any, tuple[int, int, int]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vesuvius.afv_spline_generator",
-        description="Predict fibers in a zone of a CT volume and write them as an Automated Fiber Volume (.afv) for VC3D.",
+        description="Predict fibers in a zone of a CT volume and write them as a fiber object store (.vcobj) for VC3D.",
     )
     parser.add_argument("--volume", required=True, help="Zarr or OME-Zarr volume: local path, http(s):// or s3:// URL")
     parser.add_argument("--level", type=int, default=0, help="Array of an OME-Zarr group read as the volume (default: 0)")
     parser.add_argument("--origin", type=int, nargs=3, required=True, metavar=("X", "Y", "Z"), help="First voxel of the zone")
     parser.add_argument("--size", type=int, nargs=3, required=True, metavar=("X", "Y", "Z"), help="Size of the zone in voxels")
-    parser.add_argument("--output", type=Path, required=True, help="New .afv file; existing files are never replaced")
+    parser.add_argument("--output", type=Path, required=True, help="New .vcobj file; existing files are never replaced")
     parser.add_argument(
-        "--coordinate-space",
+        "--volume-uuid",
         required=True,
-        help="VC3D coordinate identity of the volume (its vc-open-data-coordinate-space tag); VC3D opens the file only on that volume",
+        help="Authoritative volume ID from metadata.json (as used by vc_object_store)",
     )
     parser.add_argument(
         "--native-scale",
-        type=int,
+        type=float,
         default=1,
         help="Native L0 voxels per voxel of the volume, 2^level of the coordinate identity (default: 1)",
     )
@@ -272,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_BLACK_DISTANCE,
         help=f"Remove fibers passing within this many voxels of the black outside the papyrus (CT value 0); 0 keeps them all (default: {DEFAULT_BLACK_DISTANCE:g})",
     )
-    parser.add_argument("--preview-dir", type=Path, help="Folder receiving a .afv of the fibers stitched so far after each block")
+    parser.add_argument("--preview-dir", type=Path, help="Folder receiving a .vcobj of the fibers stitched so far after each block")
     parser.add_argument("--device", default="auto", help="auto (default), cuda, cuda:N, mps or cpu")
     parser.add_argument("--progress", choices=("text", "json"), default="text", help="Progress as text on stderr, or JSON lines on stdout")
     return parser
@@ -285,14 +285,14 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     from .splines import extract_splines, threshold_to_u8
 
     output = args.output.expanduser().absolute()
-    if output.suffix.lower() != ".afv":
-        raise ValueError("The output must be a .afv file")
+    if output.suffix.lower() != ".vcobj":
+        raise ValueError("The output must be a .vcobj file")
     if output.exists():
         raise FileExistsError(f"{output} already exists")
     if not output.parent.is_dir():
         raise FileNotFoundError(f"The folder {output.parent} does not exist")
-    if args.native_scale < 1:
-        raise ValueError("--native-scale must be at least 1")
+    if not np.isfinite(args.native_scale) or args.native_scale <= 0:
+        raise ValueError("--native-scale must be finite and positive")
     threshold = threshold_to_u8(args.threshold)
     if args.voxel_size is not None and not args.voxel_size > 0:
         raise ValueError("--voxel-size must be positive")
@@ -327,22 +327,10 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
 
     from .extend.stitch import Stitcher
 
-    frame = {
-        "vc_open_data_coordinate_space": args.coordinate_space,
-        "vc_open_data_source_coordinate_level": 0,
-        "vc_open_data_source_coordinate_scale_factor": 1,
-    }
-    root = {"type": "vc3d_fiber_collection", "version": 1, "scale": 1, **frame, "coordinate_order": "XYZ", "coordinate_units": "voxel"}
-    if args.source_path:
-        root["vc_open_data_source_path"] = args.source_path
-    if args.voxel_size:
-        root["vc_open_data_source_original_resolution"] = args.voxel_size
-        root["voxel_size_mm"] = args.voxel_size / 1000
-    if args.native_scale == 1:
-        # Only known exactly when the volume is the native volume.
-        root["coordinate_base_shape_zyx"] = list(volume.shape)
     generator = {
         "name": "vesuvius.afv_spline_generator",
+        "source_path": args.source_path,
+        "voxel_size_um": args.voxel_size,
         **provenance,
         "mirror": mirror,
         "threshold_percent": args.threshold,
@@ -368,7 +356,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         generator["gap_model"] = gap_model.metadata.get("modelName", GAP_MODEL.name)
 
     def write(path: Path, traces: list[dict[str, Any]]) -> dict[str, Any]:
-        return write_afv(path, afv_fibers(traces, args.native_scale, args.voxel_size), frame=frame, root=root, metadata={"generator": generator})
+        return write_store(path, afv_fibers(traces, args.native_scale, args.voxel_size), coordinates={"volume_uuid": args.volume_uuid, "scale_factor": 1}, metadata={"generator": generator})
 
     names = {"V": "vertical", "H": "horizontal"}
     count = len(blocks)
@@ -416,7 +404,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                                    (np.asarray(origin), np.asarray(origin) + np.asarray(size)))
                 report.emit("block", index=index, state="stitched")
                 if args.preview_dir is not None:
-                    preview = args.preview_dir.expanduser().absolute() / f"preview-{index + 1:04d}.afv"
+                    preview = args.preview_dir.expanduser().absolute() / f"preview-{index + 1:04d}.vcobj"
                     shown = clean(stitcher.stitched(), args.max_join_angle, args.min_length)
                     write(preview, shown)
                     report.emit("preview", path=str(preview), fibers=len(shown))

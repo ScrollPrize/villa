@@ -3,11 +3,11 @@
 `vesuvius.afv_spline_generator` predicts papyrus fibers in a zone of a CT
 volume block by block, fits smooth polylines to them, stitches the blocks
 together, optionally extends the fibers across gaps, cleans them and writes
-an Automated Fiber Volume
-(`.afv`): the read-only fiber collection that VC3D displays over the volume
-(format: [`volume-cartographer/docs/fiber-collections.md`](../../volume-cartographer/docs/fiber-collections.md)).
-VC3D runs it from **Generate automated fibers…** in its **Automated Fiber
-Volume** dock; it can also be run on its own.
+a native `vc_object_store` database (`.vcobj`) with editable fiber geometry.
+VC3D runs it from **Generate automated fibers…** in its **Fibers** panel;
+it can also be run on its own. The completed store is attached to the current
+project and selected as its fiber source. Live previews use temporary read-only
+attachments and are never saved in the project.
 
 From `villa/vesuvius`, install the model extra and run, here on a 512³ zone
 of PHerc0813:
@@ -17,8 +17,8 @@ uv sync --extra models
 uv run --extra models vesuvius.afv_spline_generator \
   --volume https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr \
   --origin 3720 4776 6592 --size 512 512 512 \
-  --coordinate-space PHerc0813/20250821151723 --voxel-size 9.362 \
-  --output PHerc0813-fibers.afv
+  --volume-uuid 20250821151723 --voxel-size 9.362 \
+  --output PHerc0813-fibers.vcobj
 ```
 
 The volume is a local path or an `http(s)://` or `s3://` URL of a Zarr array
@@ -27,9 +27,9 @@ The zone is given in voxels of that array by its first voxel (`--origin`) and
 its size (`--size`), both in X Y Z order, of any size: it is read one block
 at a time.
 
-VC3D opens the file only on a volume with the same coordinate identity, the
-`vc-open-data-coordinate-space` tag of the volume, given by
-`--coordinate-space`. Points are written in native L0 voxels: when the
+`--volume-uuid` is the authoritative volume ID from `metadata.json`, the same
+ID used by the project's annotation volume. Each fiber records it in
+`meta.coordinates` with native `scale_factor: 1`. Points are written in native L0 voxels: when the
 volume is a downsampled version of the native scan, `--native-scale` is the
 number of native voxels per voxel of the volume (`2^level`). `--voxel-size`
 is the native voxel size in micrometres; it adds fiber lengths in
@@ -48,7 +48,7 @@ whose file system supports hard links.
 | `--max-join-angle` | `45` | inferred joins turning more than this many degrees are cut; `180` keeps them all |
 | `--min-length` | `100` | fibers shorter than this many voxels are removed; `0` keeps them all |
 | `--black-distance` | `16` | fibers passing within this many voxels of the black outside the papyrus are removed; `0` keeps them all |
-| `--preview-dir` | | folder where a preview `.afv` of the fibers stitched so far is written after each block |
+| `--preview-dir` | | folder where a preview `.vcobj` of the fibers stitched so far is written after each block |
 | `--source-path` | | native source volume recorded in the file |
 | `--progress` | `text` | `json` writes one event per line on stdout, as VC3D reads it: the block plan, the stage of each block, previews and progress |
 
@@ -127,3 +127,29 @@ a preview, as VC3D runs it, reading over HTTPS included: 32 s of prediction,
 30 s of polylines and 2 s of cleanup, with a peak of 4.3 GB of RAM. With
 `--extend`, it takes 6 min 18 s, 5 min of which is extension. A GPU is
 strongly recommended: predicting on the CPU is very slow.
+
+## Validation
+
+With existing model and native object-store dependencies installed, from `villa/`:
+
+```bash
+PYTHONPATH=vesuvius/src vesuvius/.venv/bin/python -m pytest vesuvius/tests/afv_spline_generator
+ninja -C volume-cartographer/build VC3D test_fiber_collection_generator
+QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build -R '^fiber_collection_generator$' --output-on-failure
+```
+
+The writer uses the native store API for geometry, summaries and spatial tiles.
+Fiber annotations (including inferred gaps) live under `meta.source`; generator
+settings live under `meta.generator`. No private AFV schema is written.
+The earlier timing above measured the original PR; it has not been remeasured
+for the object-store output.
+
+To validate the writer on existing real fiber JSONs (without model inference):
+
+```bash
+VC_FIBER_TEST_SOURCE=/path/to/fiber-jsons PYTHONPATH=vesuvius/src \
+  vesuvius/.venv/bin/python -m pytest -q -s vesuvius/tests/afv_spline_generator/test_store.py
+```
+
+This also checks native coordinates, catalog summaries, family filters and a
+volume-targeted spatial query at a coarser display level.

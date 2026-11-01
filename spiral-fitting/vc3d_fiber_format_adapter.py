@@ -33,6 +33,8 @@ def _import_vc3d_fiber_format():
         "No module named 'vc3d_fiber_format'. Searched:\n  " + searched)
 
 
-parse_vc3d_fiber_format = _import_vc3d_fiber_format().parse_vc3d_fiber_format
+_vc3d_fiber_format = _import_vc3d_fiber_format()
+parse_vc3d_fiber_format = _vc3d_fiber_format.parse_vc3d_fiber_format
+validate_fiber_uuid = _vc3d_fiber_format.validate_fiber_uuid
 
-__all__ = ["parse_vc3d_fiber_format"]
+__all__ = ["parse_vc3d_fiber_format", "validate_fiber_uuid"]

@@ -42,7 +42,7 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
     const std::array<int, 3>& shape, const std::array<int, 3>& center, double voxelSizeUm, QWidget* parent)
     : QDialog(parent), shape_(shape)
 {
-    setWindowTitle(tr("New Automated Fiber Volume"));
+    setWindowTitle(tr("New Fiber Object Store"));
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto* layout = new QVBoxLayout(this);
     auto* intro = new QLabel(
@@ -65,12 +65,12 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto start = output_->text().isEmpty() ? settings.value(kDirectoryKey, QDir::homePath()).toString() : output_->text();
         // Existing volumes are never replaced; accept() explains that.
-        auto path = QFileDialog::getSaveFileName(this, tr("New Automated Fiber Volume"), start,
-            tr("Automated Fiber Volume (*.afv)"), nullptr, QFileDialog::DontConfirmOverwrite);
+        auto path = QFileDialog::getSaveFileName(this, tr("New Fiber Object Store"), start,
+            tr("Object Store (*.vcobj)"), nullptr, QFileDialog::DontConfirmOverwrite);
         if (path.isEmpty())
             return;
-        if (QFileInfo(path).suffix().compare("afv", Qt::CaseInsensitive) != 0)
-            path += ".afv";
+        if (QFileInfo(path).suffix().compare("vcobj", Qt::CaseInsensitive) != 0)
+            path += ".vcobj";
         output_->setText(path);
     });
 
@@ -241,8 +241,8 @@ void FiberCollectionGeneratorDialog::accept()
         QMessageBox::warning(this, windowTitle(), tr("Choose where to save the new volume."));
         return;
     }
-    if (QFileInfo(path).suffix().compare("afv", Qt::CaseInsensitive) != 0)
-        path += ".afv";
+    if (QFileInfo(path).suffix().compare("vcobj", Qt::CaseInsensitive) != 0)
+        path += ".vcobj";
     const QFileInfo file(path);
     if (!file.isAbsolute() || !file.dir().exists()) {
         QMessageBox::warning(this, windowTitle(), tr("Choose a file in an existing folder."));

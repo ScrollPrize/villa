@@ -8,11 +8,7 @@ This guide shows how to discover the datasets bundled with the Vesuvius package 
 import vesuvius
 ```
 
-Accept the data sharing terms before trying to access remote assets:
-
-```bash
-vesuvius.accept_terms --yes
-```
+Remote scroll data is covered by the terms in the library README ([Data licence](../README.md#data-licence)); there is no separate acceptance step.
 
 ## Listing Available Scrolls and Segments
 

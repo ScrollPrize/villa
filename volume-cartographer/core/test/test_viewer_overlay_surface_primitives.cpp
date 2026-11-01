@@ -2,15 +2,15 @@
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
 #include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTreeWidget>
 
-#include "AtlasControlPointsDock.hpp"
 #include "ViewerManager.hpp"
-#include "overlays/AtlasControlPointsOverlayController.hpp"
-#include "overlays/AtlasOverlayController.hpp"
-#include "overlays/FiberOverlayController.hpp"
+#include "test_viewer_manager_stub.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -51,7 +51,7 @@ public:
     }
 
     std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& point) const override
+        const cv::Vec3f& point, float) const override
     {
         ++projectionCalls_;
         return SurfaceProjection{point[0], point[1], 0.0f, false};
@@ -64,7 +64,9 @@ public:
     {
         SurfaceProjectionContext context;
         context.surface = surface_.get();
-        context.patchIndexGeneration = projectionGeneration_;
+        context.surfaceEditEpoch = projectionGeneration_;
+        context.depthLo = depthLo_;
+        context.depthHi = depthHi_;
         if (auto* plane = dynamic_cast<PlaneSurface*>(surface_.get())) {
             context.planeOrigin = plane->origin();
             context.planeBasisX = plane->basisX();
@@ -77,6 +79,12 @@ public:
     int projectionCalls() const { return projectionCalls_; }
     void resetProjectionCalls() { projectionCalls_ = 0; }
     void bumpProjectionGeneration() { ++projectionGeneration_; }
+    // Displayed signed-depth band (normal offset / composite slab).
+    void setDepthBand(float lo, float hi)
+    {
+        depthLo_ = lo;
+        depthHi_ = hi;
+    }
     QPointF volumeToScene(const cv::Vec3f& point) override
     {
         return {point[0] * surfaceScale_ + surfaceOffset_.x(),
@@ -121,9 +129,7 @@ public:
     float dsScale() const override { return 1.0f; }
     float normalOffset() const override { return 0.0f; }
     int datasetScaleIndex() const override { return 0; }
-    float datasetScaleFactor() const override { return 1.0f; }
 
-    bool isShowDirectionHints() const override { return false; }
     bool isShowSurfaceNormals() const override { return false; }
     float normalArrowLengthScale() const override { return 1.0f; }
     int normalMaxArrows() const override { return 0; }
@@ -135,19 +141,15 @@ public:
     bool isPlaneCompositeEnabled() const override { return false; }
     void setCompositeRenderSettings(const CompositeRenderSettings& settings) override { compositeSettings_ = settings; }
     void setVolumeWindow(float, float) override {}
-    void setBaseColormap(const std::string&) override {}
     void setResetViewOnSurfaceChange(bool) override {}
     void setPlaneIntersectionLinesVisible(bool) override {}
-    void setShowDirectionHints(bool) override {}
     void setShowSurfaceNormals(bool) override {}
-    void setSegmentationEditActive(bool) override {}
-    void setSegmentationIntersectionDeferral(bool) override {}
     void setSegmentationCursorMirroring(bool) override {}
     void setOverlayVolume(std::shared_ptr<Volume>) override {}
     void setOverlayOpacity(float) override {}
     void setOverlayColormap(const std::string&) override {}
     void setOverlaySamplingMethod(vc::Sampling) override {}
-    void setOverlayThreshold(float) override {}
+    void setOverlayIntensityAsAlpha(bool) override {}
     void setOverlayWindow(float, float) override {}
     void setOverlayMaxDisplayedResolution(int) override {}
     void setOverlayComposite(const OverlayCompositeSettings&) override {}
@@ -155,10 +157,8 @@ public:
 
     std::optional<vc::PointRef> highlightedPoint() const override { return highlightedPoint_; }
     std::optional<vc::PointRef> selectedPoint() const override { return selectedPoint_; }
-    std::optional<uint64_t> selectedCollectionId() const override { return selectedCollection_; }
     void setHighlightedPoint(std::optional<vc::PointRef> point) { highlightedPoint_ = point; }
     void setSelectedPoint(std::optional<vc::PointRef> point) { selectedPoint_ = point; }
-    bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return false; }
     double sameWrapAnnotationPolylineOpacity() const override { return 1.0; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override { return paths_; }
@@ -181,33 +181,18 @@ public:
         overlayGroups_.erase(it);
     }
 
-    void clearAllOverlayGroups() override
-    {
-        auto keys = std::vector<std::string>{};
-        for (const auto& [key, _] : overlayGroups_) {
-            keys.push_back(key);
-        }
-        for (const auto& key : keys) {
-            clearOverlayGroup(key);
-        }
-    }
-
     std::vector<std::pair<QRectF, QColor>> selections() const override { return {}; }
     std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
     void setBBoxMode(bool) override {}
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) override { return nullptr; }
     void clearSelections() override {}
 
-    void renderIntersections(const char*, std::source_location) override {}
-    void scheduleIntersectionRender(const char*, std::source_location) override {}
-    void invalidateIntersect(const std::string& = "") override {}
+    const std::set<std::string>& intersects() const override { return intersects_; }
+    bool planeIntersectionLinesVisible() const override { return true; }
     float intersectionOpacity() const override { return 1.0f; }
     float intersectionThickness() const override { return 0.0f; }
-    int surfacePatchSamplingStride() const override { return 1; }
     void setIntersectionOpacity(float) override {}
     void setIntersectionThickness(float) override {}
-    void setHighlightedSurfaceIds(const std::vector<std::string>&) override {}
-    void setSurfacePatchSamplingStride(int) override {}
 
     bool surfaceOverlayEnabled() const override { return false; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return surfaceOverlays_; }
@@ -220,9 +205,7 @@ public:
         surfaceOverlays_ = overlays;
         ++surfaceOverlaysRevision_;
     }
-    void setSurfaceOverlapThreshold(float) override {}
 
-    const ActiveSegmentationHandle& activeSegmentationHandle() const override { return activeSegmentation_; }
     CVolumeViewerView* graphicsView() const override { return const_cast<CVolumeViewerView*>(&view_); }
     QObject* asQObject() override { return this; }
     QMetaObject::Connection connectOverlaysUpdated(QObject*, const std::function<void()>&) override { return {}; }
@@ -239,15 +222,16 @@ private:
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> surfaceOverlays_;
     std::uint64_t surfaceOverlaysRevision_{0};
-    ActiveSegmentationHandle activeSegmentation_;
     std::map<std::string, std::vector<QGraphicsItem*>> overlayGroups_;
     std::string surfName_{"fake"};
     VCCollection* pointCollection_{nullptr};
     std::optional<vc::PointRef> highlightedPoint_;
     std::optional<vc::PointRef> selectedPoint_;
-    std::optional<uint64_t> selectedCollection_;
     mutable int projectionCalls_{0};
     std::uint64_t projectionGeneration_{0};
+    std::set<std::string> intersects_;
+    float depthLo_{0.0f};
+    float depthHi_{0.0f};
 };
 
 // The points overlay batches its dots into one retained item, so per-dot radii
@@ -288,10 +272,21 @@ public:
     using ViewerOverlayControllerBase::renderPointChain;
     using ViewerOverlayControllerBase::filterPointsNearViewerSurface;
     using ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached;
+    using ViewerOverlayControllerBase::projectedPointChain;
 
 protected:
     void collectPrimitives(VolumeViewerBase*, OverlayBuilder&) override {}
 };
+
+// `surface` as a draft of a fresh store session that ViewerManager::locate reads.
+std::shared_ptr<vc::objects::ObjectStoreSession> draftSession(QuadSurface& surface)
+{
+    auto session = std::make_shared<vc::objects::ObjectStoreSession>();
+    surface.id = vc::objects::util::newUuid();
+    session->setDraft(surface.id, quad_surface_grid(surface), vc::objects::volumeCoordinates("test-volume", 1));
+    vc3d_test::setLocateSession(session, "test-volume");
+    return session;
+}
 
 } // namespace
 
@@ -640,131 +635,65 @@ private slots:
         QCOMPARE(selectedPosition, viewer.surfaceCoordsToScene(10.0f, 20.0f));
     }
 
-    void fiberStylesUseDistinctMatchingColors()
+    void depthBandDistanceIsZeroInsideTheBand()
     {
-        const QColor first = FiberOverlayController::fiberColor(1);
-        const QColor second = FiberOverlayController::fiberColor(2);
-        QVERIFY(first.isValid());
-        QVERIFY(second.isValid());
-        QVERIFY(first != second);
+        QCOMPARE(depthBandDistance(20.0f, 15.0f, 25.0f), 0.0f);
+        QCOMPARE(depthBandDistance(27.0f, 15.0f, 25.0f), 2.0f);
+        QCOMPARE(depthBandDistance(10.0f, 15.0f, 25.0f), 5.0f);
+        QCOMPARE(depthBandDistance(-3.0f, 0.0f, 0.0f), 3.0f);
 
-        const auto style = FiberOverlayController::fiberStyle(first, 25.0f);
-        QCOMPARE(style.color, first);
-        QCOMPARE(style.pointBorderColor, first);
-        QCOMPARE(style.distanceTolerance, 25.0f);
+        const cv::Vec3f coord(1.0f, 2.0f, 3.0f);
+        const cv::Vec3f normal(0.0f, 0.0f, 1.0f);
+        QCOMPARE(depthBandDistance(coord + cv::Vec3f(0, 0, 20), coord, normal, 15.0f, 25.0f),
+                 0.0f);
+        // Out-of-band depth and in-surface separation combine.
+        QVERIFY(std::abs(depthBandDistance(coord + cv::Vec3f(4, 0, 28), coord, normal,
+                                           15.0f, 25.0f) - 5.0f) < 1.0e-5f);
     }
 
-    void fiberOverlayRetainsGraphicsItemsAcrossRefreshes()
-    {
-        FakeViewer viewer;
-        viewer.graphicsView()->resize(800, 600);
-        viewer.setSurfaceSceneTransform(1.0, QPointF{});
-        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
-            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
-
-        FiberOverlayController controller;
-        controller.attachViewer(&viewer);
-        controller.setChains({
-            FiberOverlayController::Chain{1, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}},
-            FiberOverlayController::Chain{2, {{0, 2, 0}, {1, 2, 0}, {2, 2, 0}}},
-        });
-        controller.setVisible(true);
-
-        const auto initialItems = viewer.scene().items();
-        QCOMPARE(initialItems.size(), 2);
-        const std::set<QGraphicsItem*> initialSet(initialItems.begin(), initialItems.end());
-        const QRectF initialBounds = viewer.scene().itemsBoundingRect();
-
-        controller.refreshViewer(&viewer);
-        const auto refreshedItems = viewer.scene().items();
-        const std::set<QGraphicsItem*> refreshedSet(refreshedItems.begin(), refreshedItems.end());
-        QCOMPARE(refreshedItems.size(), 2);
-        QVERIFY(refreshedSet == initialSet);
-
-        // Camera changes update the retained batches in place rather than
-        // replacing their QGraphicsItems.
-        viewer.setSurfaceSceneTransform(2.0, QPointF(20.0, 30.0));
-        controller.refreshViewer(&viewer);
-        const auto movedItems = viewer.scene().items();
-        const std::set<QGraphicsItem*> movedSet(movedItems.begin(), movedItems.end());
-        QCOMPARE(movedItems.size(), 2);
-        QVERIFY(movedSet == initialSet);
-        QVERIFY(viewer.scene().itemsBoundingRect() != initialBounds);
-
-        controller.setVisible(false);
-        QCOMPARE(viewer.scene().items().size(), 0);
-    }
-
-    void fiberOverlayUsesTheSameViewerScaleForDrawingAndHitTesting()
-    {
-        FakeViewer viewer;
-        viewer.graphicsView()->resize(800, 600);
-        viewer.setSurfaceSceneTransform(10.0, QPointF{1.0, 2.0});
-        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
-            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
-
-        FiberOverlayController controller;
-        controller.attachViewer(&viewer);
-        controller.setViewerBaseToViewerFactor(&viewer, 0.25);
-        controller.setChains({
-            FiberOverlayController::Chain{7, {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}},
-        });
-        controller.setVisible(true);
-
-        QCOMPARE(controller.viewerBaseToViewerFactor(&viewer), 0.25);
-        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 11.0) < 0.75);
-        const auto hit = controller.hitTestControlPoint(
-            &viewer, QPointF{11.0, 2.0}, 1.0);
-        QVERIFY(hit.has_value());
-        QCOMPARE(hit->fiberId, uint64_t{7});
-        QCOMPARE(hit->controlPointIndex, 1);
-
-        controller.setViewerBaseToViewerFactor(&viewer, 0.5);
-        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 21.0) < 0.75);
-        const auto movedHit = controller.hitTestControlPoint(
-            &viewer, QPointF{21.0, 2.0}, 1.0);
-        QVERIFY(movedHit.has_value());
-        QCOMPARE(movedHit->controlPointIndex, 1);
-    }
-
-    void fiberOverlayUsesTheOwningWorkspacePatchIndex()
+    void pointChainFiltersAgainstTheDisplayedDepthBand()
     {
         cv::Mat_<cv::Vec3f> grid(30, 30);
         for (int row = 0; row < grid.rows; ++row) {
             for (int col = 0; col < grid.cols; ++col) {
                 grid(row, col) = cv::Vec3f(static_cast<float>(col),
-                                           static_cast<float>(row), 0.0f);
+                                           static_cast<float>(row), 50.0f);
             }
         }
-        auto spiralSurface = std::make_shared<QuadSurface>(
-            grid, cv::Vec2f(1.0f, 1.0f));
-
-        ViewerManager mainManager(nullptr, nullptr);
-        ViewerManager spiralManager(nullptr, nullptr);
-        spiralManager.surfacePatchIndex()->rebuild({spiralSurface}, 0.0f, false);
-        QVERIFY(mainManager.surfacePatchIndex()->empty());
-        QVERIFY(spiralManager.surfacePatchIndex()->containsSurface(spiralSurface));
+        auto surface = std::make_shared<QuadSurface>(grid, cv::Vec2f(1.0f, 1.0f));
+        ViewerManager manager(nullptr, nullptr);
+        const auto session = draftSession(*surface);
 
         FakeViewer viewer;
         viewer.graphicsView()->resize(800, 600);
         viewer.setSurfaceSceneTransform(1.0, QPointF{});
-        viewer.setCurrentSurface(spiralSurface);
+        viewer.setCurrentSurface(surface);
+        ChainTestController controller;
+        controller.attachViewer(&viewer, &manager);
 
-        FiberOverlayController controller;
-        controller.bindToViewerManager(&mainManager);
-        controller.attachViewer(&viewer, &spiralManager);
-        controller.setChains({
-            FiberOverlayController::Chain{
-                42, {{5, 10, 0}, {10, 10, 0}, {15, 10, 0}}},
-        });
-        controller.setVisible(true);
+        const cv::Vec3f normal = surface->normal(surface->pointer());
+        auto at = [&normal](float x, float depth) {
+            return cv::Vec3f(x, 10.0f, 50.0f) + normal * depth;
+        };
+        // Depths: nominal surface, inside the slab, just past its front,
+        // beyond tolerance, and the mirror side.
+        const std::vector<cv::Vec3f> points{
+            at(8, 0), at(10, 20), at(12, 27), at(14, 31), at(16, -20)};
+        constexpr float kTolerance = 5.0f;
 
-        QCOMPARE(viewer.scene().items().size(), 2);
-        const auto hit = controller.hitTestControlPoint(
-            &viewer, QPointF{-4.5, -4.5}, 1.0);
-        QVERIFY(hit.has_value());
-        QCOMPARE(hit->fiberId, uint64_t{42});
-        QCOMPARE(hit->controlPointIndex, 1);
+        // Normal offset 15 with a 10-layer slab in front.
+        viewer.setDepthBand(15.0f, 25.0f);
+        std::vector<float> opacities;
+        auto filtered = controller.projectedPointChain(&viewer, points, kTolerance, &opacities);
+        QCOMPARE(filtered.sourceIndices, (std::vector<std::size_t>{1, 2}));
+        QCOMPARE(opacities.size(), std::size_t{2});
+        QVERIFY(std::abs(opacities[0] - 1.0f) < 1.0e-4f);
+        QVERIFY(std::abs(opacities[1] - 0.6f) < 1.0e-3f);
+
+        // Back to the nominal surface: the cached projection is rebuilt.
+        viewer.setDepthBand(0.0f, 0.0f);
+        filtered = controller.projectedPointChain(&viewer, points, kTolerance, &opacities);
+        QCOMPARE(filtered.sourceIndices, (std::vector<std::size_t>{0}));
     }
 
     void surfacePrimitivesUseViewerSurfaceTransform()
@@ -835,214 +764,6 @@ private slots:
         QCOMPARE(pathItem->brush().color().alpha(), 115);
     }
 
-    void atlasOverlayControllerEmitsLineAndAnchorPoints()
-    {
-        FakeViewer viewer;
-
-        cv::Mat_<cv::Vec3f> points(4, 6);
-        points.setTo(cv::Vec3f(0.0f, 0.0f, 0.0f));
-        auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
-
-        vc::atlas::Atlas atlas;
-        vc::atlas::FiberMapping mapping;
-        mapping.lineAnchors.push_back({0, {}, 40.0, 1.0, 0.0});
-        mapping.lineAnchors.push_back({1, {}, 2.0, 1.0, 0.0});
-        mapping.lineAnchors.push_back({2, {}, 3.0, 2.0, 0.0});
-        mapping.lineAnchors.push_back({3, {}, 50.0, 2.0, 0.0});
-        mapping.controlAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
-        mapping.controlAnchors.push_back({1, {}, 3.0, 2.0, 0.0});
-        atlas.fibers.push_back(std::move(mapping));
-
-        vc::atlas::AtlasDisplayRange range;
-        range.baseColumns = points.cols;
-        range.unwrapCount = 1;
-
-        AtlasOverlayController controller;
-        controller.attachViewer(&viewer);
-        controller.setAtlas(atlas, surface, range);
-
-        QCOMPARE(viewer.scene().items().size(), 2);
-        const auto initialBounds = controller.surfaceBounds();
-        QVERIFY(initialBounds.has_value());
-        QVERIFY(std::isfinite(initialBounds->right()));
-
-        vc::atlas::FiberMapping previewMapping;
-        previewMapping.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
-        previewMapping.lineAnchors.push_back({1, {}, 3.0, 2.0, 0.0});
-        previewMapping.controlAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
-        vc::atlas::FiberMapping shiftedPreviewMapping = previewMapping;
-        shiftedPreviewMapping.windingOffset = 1;
-
-        controller.setSearchPreviewCandidates({
-            AtlasOverlayController::SearchPreviewCandidate{0, cv::Vec2f(2.5f, 1.5f)},
-            AtlasOverlayController::SearchPreviewCandidate{1, cv::Vec2f(3.5f, 2.5f)},
-        });
-        controller.setSearchPreviewHover(0);
-        controller.setSearchPreviewSelection({1});
-        controller.setSearchPreviewFiber({0, previewMapping});
-        controller.setSearchPreviewFiber({1, shiftedPreviewMapping});
-
-        // Saved atlas line + saved control point group + two cross markers
-        // (two line strips each) + two line-only preview mappings.
-        QCOMPARE(viewer.scene().items().size(), 8);
-
-        controller.clearSearchPreviews();
-        QCOMPARE(viewer.scene().items().size(), 2);
-
-        vc::atlas::Atlas updatedAtlas;
-        vc::atlas::FiberMapping updatedMapping;
-        updatedMapping.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
-        updatedMapping.lineAnchors.push_back({1, {}, 2.0, 2.0, 0.0});
-        updatedAtlas.fibers.push_back(std::move(updatedMapping));
-        controller.setAtlas(updatedAtlas, surface, range);
-        controller.refreshViewer(&viewer);
-
-        QCOMPARE(viewer.scene().items().size(), 1);
-    }
-
-    void atlasControlPointsOverlayEmitsLinePointsAndSelection()
-    {
-        FakeViewer viewer;
-        viewer.setSurfName("segmentation");
-        cv::Mat_<cv::Vec3f> points(4, 6);
-        points.setTo(cv::Vec3f(0.0f, 0.0f, 0.0f));
-        viewer.setCurrentSurface(std::make_shared<QuadSurface>(points, cv::Vec2f(2.0f, 3.0f)));
-
-        AtlasControlPointsOverlayController controller;
-        controller.attachViewer(&viewer);
-
-        AtlasControlPointResult a;
-        a.fiberId = QStringLiteral("fiber_a");
-        a.sourceIndex = 0;
-        a.controlIndex = 0;
-        a.valid = true;
-        a.modelH = 3.0f;
-        a.modelW = 4.0f;
-        a.snapValid = true;
-        a.snapTargetXyz = cv::Vec3f(9.0f, 8.0f, 7.0f);
-        a.snapModelH = 3.0f;
-        a.snapModelW = 5.0f;
-
-        AtlasControlPointResult b = a;
-        b.sourceIndex = 1;
-        b.controlIndex = 1;
-        b.modelH = 3.0f;
-        b.modelW = 5.0f;
-        b.snapTargetXyz = cv::Vec3f(10.0f, 8.0f, 7.0f);
-        b.snapModelW = 6.0f;
-
-        AtlasControlPointResult invalid = a;
-        invalid.controlIndex = 2;
-        invalid.valid = false;
-        invalid.snapValid = false;
-
-        controller.setResults({a, invalid});
-        QCOMPARE(viewer.scene().items().size(), 0);
-
-        controller.setOverlayEnabled(true);
-        QCOMPARE(viewer.scene().items().size(), 1);
-        const QRectF pointBounds = viewer.scene().items().front()->sceneBoundingRect();
-        QCOMPARE(pointBounds.center().x(), 11.0);
-        QVERIFY(std::abs(pointBounds.center().y() - (2.0 + (1.0 / 3.0) * 10.0)) < 1.0e-5);
-
-        controller.setResults({a, b, invalid});
-        controller.setOverlayEnabled(true);
-        QVERIFY(viewer.scene().items().size() >= 2);
-
-        controller.setSelectedPoint(QStringLiteral("fiber_a"), 1);
-        QVERIFY(viewer.scene().items().size() >= 2);
-    }
-
-    void atlasControlPointsOverlayShowsSnapTargetsOnPlaneViewers()
-    {
-        FakeViewer viewer;
-        viewer.setSurfName("xy plane");
-
-        AtlasControlPointsOverlayController controller;
-        controller.attachViewer(&viewer);
-
-        AtlasControlPointResult point;
-        point.fiberId = QStringLiteral("fiber_a");
-        point.controlIndex = 0;
-        point.valid = true;
-        point.snapValid = true;
-        point.snapTargetXyz = cv::Vec3f(9.0f, 8.0f, 7.0f);
-        point.modelH = 3.0f;
-        point.modelW = 4.0f;
-
-        controller.setResults({point});
-        controller.setOverlayEnabled(true);
-        QCOMPARE(viewer.scene().items().size(), 1);
-
-        const QRectF bounds = viewer.scene().items().front()->sceneBoundingRect();
-        QVERIFY(std::abs(bounds.center().x() - 91.0) < 0.75);
-        QVERIFY(std::abs(bounds.center().y() - 82.0) < 0.75);
-
-        controller.setSelectedPoint(QStringLiteral("fiber_a"), 0);
-        QCOMPARE(viewer.scene().items().size(), 1);
-    }
-
-    void atlasControlPointsDockLoadsGroupedRows()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString path = dir.filePath(QStringLiteral("atlas_control_points_results.json"));
-        QFile file(path);
-        QVERIFY(file.open(QIODevice::WriteOnly));
-        file.write(R"json(
-{
-  "format": "lasagna_atlas_control_points_results",
-  "version": 1,
-  "records": [
-    {
-      "fiber_id": "fiber_a",
-      "object_id": "fiber_a",
-      "source_index": 4,
-      "control_index": 0,
-      "valid": true,
-      "distance": 1.25,
-      "signed_delta": -0.5,
-      "snap_status": "valid fw",
-      "snap_valid": true,
-      "snap_direction": "fw",
-      "snap_signed_delta": 0.25,
-      "snap_target_xyz": [9, 8, 7],
-      "snap_mesh_xyz": [10, 9, 8],
-      "snap_model_h": 11,
-      "snap_model_w": 12,
-      "target_xyz": [1, 2, 3],
-      "mesh_xyz": [2, 3, 4],
-      "model_h": 7,
-      "model_w": 8
-    }
-  ]
-}
-)json");
-        file.close();
-
-        AtlasControlPointsDock dock;
-        dock.loadResults(std::filesystem::path(path.toStdString()));
-
-        QVERIFY(!dock.overlayChecked());
-        QCOMPARE(dock.results().size(), size_t{1});
-        auto* tree = dock.findChild<QTreeWidget*>(QStringLiteral("atlasControlResultsTree"));
-        QVERIFY(tree != nullptr);
-        QCOMPARE(tree->topLevelItemCount(), 1);
-        QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
-        QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("fiber_a"));
-        QCOMPARE(tree->columnCount(), 7);
-        QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QStringLiteral("yes"));
-        QCOMPARE(tree->topLevelItem(0)->child(0)->text(2), QStringLiteral("valid fw"));
-        QCOMPARE(tree->headerItem()->text(3), QStringLiteral("Snap Delta"));
-        QCOMPARE(tree->headerItem()->text(4), QStringLiteral("Snap XYZ"));
-        QCOMPARE(tree->topLevelItem(0)->child(0)->text(3), QStringLiteral("0.2500"));
-        QCOMPARE(tree->topLevelItem(0)->child(0)->text(4), QStringLiteral("9.0, 8.0, 7.0"));
-        QCOMPARE(dock.results().front().snapMeshXyz[0], 10.0f);
-        QCOMPARE(dock.results().front().snapMeshXyz[1], 9.0f);
-        QCOMPARE(dock.results().front().snapMeshXyz[2], 8.0f);
-        QCOMPARE(dock.results().front().snapModelH, 11.0f);
-        QCOMPARE(dock.results().front().snapModelW, 12.0f);
-    }
     void polylineBreakDistanceUsesMedianSpacing()
     {
         std::vector<cv::Vec3f> positions;
@@ -1221,14 +942,14 @@ private slots:
             for (int col = 0; col < points.cols; ++col) {
                 points(row, col) = cv::Vec3f(static_cast<float>(col),
                                               static_cast<float>(row),
-                                              0.0f);
+                                              50.0f);
             }
         }
         auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
         viewer.setCurrentSurface(surface);
 
         ViewerManager manager(nullptr, nullptr);
-        manager.surfacePatchIndex()->rebuild({surface}, 0.0f, false);
+        const auto session = draftSession(*surface);
         ChainTestController controller;
         controller.bindToViewerManager(&manager);
         ChainTestController::OverlayBuilder builder(&viewer);
@@ -1236,7 +957,7 @@ private slots:
         // Its nearest mesh point is on the left edge and remains useful as a
         // line endpoint, but it must not become a displayed control point.
         const std::vector<cv::Vec3f> chain = {
-            {-2.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 0.0f}};
+            {-2.0f, 20.0f, 50.0f}, {5.0f, 20.0f, 50.0f}};
         ViewerOverlayControllerBase::PointChainStyle style;
         // A wide tolerance used to accept the surface center as a good-enough
         // iterative-search seed, making this artifact distance-dependent.
@@ -1262,7 +983,7 @@ private slots:
 
         ChainTestController::OverlayBuilder realEdgePointBuilder(&viewer);
         const std::vector<cv::Vec3f> realEdgePointChain = {
-            {0.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 2.0f}};
+            {0.0f, 20.0f, 50.0f}, {5.0f, 20.0f, 52.0f}};
         controller.renderPointChain(&viewer, realEdgePointBuilder, realEdgePointChain, style);
         const auto realEdgePointPrimitives = realEdgePointBuilder.takePrimitives();
         const auto realEdgePointDots = std::count_if(

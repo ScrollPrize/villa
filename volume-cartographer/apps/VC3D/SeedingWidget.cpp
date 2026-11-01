@@ -1,14 +1,15 @@
 #include "SeedingWidget.hpp"
+#include "ToolExecutable.hpp"
+#include "VolumeCommandPath.hpp"
+#include "ObjectStoreRegions.hpp"
+#include "SurfaceCatalog.hpp"
 #include <iostream>
 #include "CState.hpp"
-#include "PythonExecutable.hpp"
 #include "ViewerManager.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QMessageBox>
-#include <QProcess>
-#include <QProcessEnvironment>
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -17,18 +18,14 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
-#include <QStandardPaths>
-#include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 
@@ -49,22 +46,6 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 namespace {
 
-// Resolve the command-line volume argument for vc_grow_seg_from_seed, mirroring
-// SegmentationCommandHandler::commandPathForVolume: a fully remote/streaming-only volume
-// has an empty Volume::path(), so pass its remote locator instead (an empty path made the
-// child fail instantly — issue #1188). Kept as a file-local helper rather than a shared
-// header, matching how this codebase already duplicates such tiny cross-file helpers.
-QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (!volume) {
-        return QString();
-    }
-    if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteLocator());
-    }
-    return QString::fromStdString(volume->path().string());
-}
-
 struct SegmentTriangleHit {
     float pathT = 0.0f;
     float distanceSq = std::numeric_limits<float>::max();
@@ -74,95 +55,6 @@ struct SegmentTriangleHit {
 float clampFloat(float v, float lo, float hi)
 {
     return std::max(lo, std::min(hi, v));
-}
-
-bool segmentTriangleIntersectionT(const cv::Vec3f& p0,
-                                  const cv::Vec3f& p1,
-                                  const std::array<cv::Vec3f, 3>& tri,
-                                  float& outT)
-{
-    constexpr float kEps = 1e-6f;
-    const cv::Vec3f dir = p1 - p0;
-    const cv::Vec3f edge1 = tri[1] - tri[0];
-    const cv::Vec3f edge2 = tri[2] - tri[0];
-    const cv::Vec3f h = dir.cross(edge2);
-    const float a = edge1.dot(h);
-    if (std::abs(a) < kEps) {
-        return false;
-    }
-
-    const float f = 1.0f / a;
-    const cv::Vec3f s = p0 - tri[0];
-    const float u = f * s.dot(h);
-    if (u < -kEps || u > 1.0f + kEps) {
-        return false;
-    }
-
-    const cv::Vec3f q = s.cross(edge1);
-    const float v = f * dir.dot(q);
-    if (v < -kEps || u + v > 1.0f + kEps) {
-        return false;
-    }
-
-    const float t = f * edge2.dot(q);
-    if (t < -kEps || t > 1.0f + kEps) {
-        return false;
-    }
-
-    outT = clampFloat(t, 0.0f, 1.0f);
-    return true;
-}
-
-float pointTriangleDistanceSq(const cv::Vec3f& p,
-                              const cv::Vec3f& a,
-                              const cv::Vec3f& b,
-                              const cv::Vec3f& c)
-{
-    const cv::Vec3f ab = b - a;
-    const cv::Vec3f ac = c - a;
-    const cv::Vec3f ap = p - a;
-    const float d1 = ab.dot(ap);
-    const float d2 = ac.dot(ap);
-    if (d1 <= 0.0f && d2 <= 0.0f) return (p - a).dot(p - a);
-
-    const cv::Vec3f bp = p - b;
-    const float d3 = ab.dot(bp);
-    const float d4 = ac.dot(bp);
-    if (d3 >= 0.0f && d4 <= d3) return (p - b).dot(p - b);
-
-    const float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-        const float v = d1 / (d1 - d3);
-        const cv::Vec3f proj = a + v * ab;
-        return (p - proj).dot(p - proj);
-    }
-
-    const cv::Vec3f cp = p - c;
-    const float d5 = ab.dot(cp);
-    const float d6 = ac.dot(cp);
-    if (d6 >= 0.0f && d5 <= d6) return (p - c).dot(p - c);
-
-    const float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-        const float w = d2 / (d2 - d6);
-        const cv::Vec3f proj = a + w * ac;
-        return (p - proj).dot(p - proj);
-    }
-
-    const float va = d3 * d6 - d5 * d4;
-    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        const cv::Vec3f proj = b + w * (c - b);
-        return (p - proj).dot(p - proj);
-    }
-
-    const cv::Vec3f n = ab.cross(ac);
-    const float n2 = n.dot(n);
-    if (n2 <= 1e-12f) {
-        return std::min({(p - a).dot(p - a), (p - b).dot(p - b), (p - c).dot(p - c)});
-    }
-    const float dist = (p - a).dot(n) / std::sqrt(n2);
-    return dist * dist;
 }
 
 SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
@@ -210,32 +102,6 @@ SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
     return {s, (c1 - c2).dot(c1 - c2), c1};
 }
 
-SegmentTriangleHit closestSegmentTriangleHit(const cv::Vec3f& p0,
-                                             const cv::Vec3f& p1,
-                                             const std::array<cv::Vec3f, 3>& tri)
-{
-    float t = 0.0f;
-    if (segmentTriangleIntersectionT(p0, p1, tri, t)) {
-        return {t, 0.0f, p0 + (p1 - p0) * t};
-    }
-
-    SegmentTriangleHit best{0.0f, pointTriangleDistanceSq(p0, tri[0], tri[1], tri[2]), p0};
-    const float endDistSq = pointTriangleDistanceSq(p1, tri[0], tri[1], tri[2]);
-    if (endDistSq < best.distanceSq) {
-        best = {1.0f, endDistSq, p1};
-    }
-
-    const std::array<std::pair<cv::Vec3f, cv::Vec3f>, 3> edges = {{
-        {tri[0], tri[1]}, {tri[1], tri[2]}, {tri[2], tri[0]}
-    }};
-    for (const auto& edge : edges) {
-        SegmentTriangleHit candidate = segmentSegmentClosestOnFirst(p0, p1, edge.first, edge.second);
-        if (candidate.distanceSq < best.distanceSq) {
-            best = candidate;
-        }
-    }
-    return best;
-}
 } // namespace
 
 
@@ -246,7 +112,6 @@ SegmentTriangleHit closestSegmentTriangleHit(const cv::Vec3f& p0,
 SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent)
     : QWidget(parent)
     , currentZSlice(0)
-    , currentMode(Mode::PointMode)
     , isDrawing(false)
     , colorIndex(0)
     , jobsRunning(false)
@@ -258,10 +123,6 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWid
     qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
 
-    _castRaysWatcher = new QFutureWatcher<void>(this);
-    connect(_castRaysWatcher, &QFutureWatcher<void>::finished,
-            this, &SeedingWidget::onCastRaysFinished);
-
     if (_point_collection) {
         connect(_point_collection, &VCCollection::collectionsAdded, this, &SeedingWidget::onCollectionsAdded);
         connect(_point_collection, &VCCollection::collectionChanged, this, &SeedingWidget::onCollectionChanged);
@@ -270,7 +131,7 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWid
     }
     
     // Automatically find the executable path
-    executablePath = findExecutablePath();
+    executablePath = vc3d::findToolExecutable(QStringLiteral("vc_grow_seg_from_seed"));
 }
 
 SeedingWidget::~SeedingWidget()
@@ -286,13 +147,14 @@ void SeedingWidget::setupUI()
     auto mainLayout = new QVBoxLayout(this);
     
     // Info label
-    infoLabel = new QLabel("Set a focus point to begin", this);
+    infoLabel = new QLabel("Turn on 'Draw paths' to draw paths in a viewer", this);
     mainLayout->addWidget(infoLabel);
     
-    // Mode toggle button
-    auto modeButton = new QPushButton("Switch to Draw Mode", this);
-    modeButton->setToolTip("Toggle between point mode and draw mode");
-    mainLayout->addWidget(modeButton);
+    // Drawing toggle
+    drawPathsButton = new QPushButton("Draw paths", this);
+    drawPathsButton->setCheckable(true);
+    drawPathsButton->setToolTip("While on, left-drag in a viewer to draw a path");
+    mainLayout->addWidget(drawPathsButton);
     
     // Collection selector
     auto collectionLayout = new QHBoxLayout();
@@ -300,29 +162,6 @@ void SeedingWidget::setupUI()
     collectionComboBox = new QComboBox(this);
     collectionLayout->addWidget(collectionComboBox);
     mainLayout->addLayout(collectionLayout);
-    
-    // Max radius control
-    maxRadiusLayout = new QHBoxLayout();
-    maxRadiusLabel = new QLabel("Max Radius (pixels):", this);
-    maxRadiusLayout->addWidget(maxRadiusLabel);
-    maxRadiusSpinBox = new QSpinBox(this);
-    maxRadiusSpinBox->setRange(50, 20000);
-    maxRadiusSpinBox->setValue(1500);
-    maxRadiusSpinBox->setSingleStep(250);
-    maxRadiusSpinBox->setToolTip("Maximum distance from center point for ray casting");
-    maxRadiusLayout->addWidget(maxRadiusSpinBox);
-    mainLayout->addLayout(maxRadiusLayout);
-    
-    // Angle step control
-    angleStepLayout = new QHBoxLayout();
-    angleStepLabel = new QLabel("Angle Step (degrees):", this);
-    angleStepLayout->addWidget(angleStepLabel);
-    angleStepSpinBox = new QDoubleSpinBox(this);
-    angleStepSpinBox->setRange(1.0, 180.0);
-    angleStepSpinBox->setValue(15.0);
-    angleStepSpinBox->setSingleStep(1.0);
-    angleStepLayout->addWidget(angleStepSpinBox);
-    mainLayout->addLayout(angleStepLayout);
     
     // Processes control
     auto processesLayout = new QHBoxLayout();
@@ -353,16 +192,6 @@ void SeedingWidget::setupUI()
     thresholdLayout->addWidget(thresholdSpinBox);
     mainLayout->addLayout(thresholdLayout);
     
-    // Window size control for peak detection
-    auto windowSizeLayout = new QHBoxLayout();
-    windowSizeLayout->addWidget(new QLabel("Peak Detection Window:", this));
-    windowSizeSpinBox = new QSpinBox(this);
-    windowSizeSpinBox->setRange(1, 10);
-    windowSizeSpinBox->setValue(7);  // Default window size
-    windowSizeSpinBox->setToolTip("Size of window for local maxima detection (larger values detect broader peaks)");
-    windowSizeLayout->addWidget(windowSizeSpinBox);
-    mainLayout->addLayout(windowSizeLayout);
-    
     // Expansion iterations control
     auto expansionLayout = new QHBoxLayout();
     expansionLayout->addWidget(new QLabel("Expansion Iterations:", this));
@@ -374,21 +203,14 @@ void SeedingWidget::setupUI()
     mainLayout->addLayout(expansionLayout);
     
     // Buttons
-    auto previewLayout = new QHBoxLayout();
-    previewRaysButton = new QPushButton("Show Preview Points", this);
-    previewRaysButton->setEnabled(true);
-    previewLayout->addWidget(previewRaysButton);
-    clearPreviewButton = new QPushButton("Clear", this);
-    previewLayout->addWidget(clearPreviewButton);
-    mainLayout->addLayout(previewLayout);
-
-    auto castLayout = new QHBoxLayout();
-    castRaysButton = new QPushButton("Cast Rays", this);
-    castRaysButton->setEnabled(false);
-    castLayout->addWidget(castRaysButton);
-    clearPeaksButton = new QPushButton("Clear", this);
-    castLayout->addWidget(clearPeaksButton);
-    mainLayout->addLayout(castLayout);
+    auto analyzeLayout = new QHBoxLayout();
+    analyzePathsButton = new QPushButton("Analyze Paths", this);
+    analyzePathsButton->setEnabled(false);
+    analyzePathsButton->setToolTip("Find intensity peaks along the drawn paths (into 'seeding_peaks')");
+    analyzeLayout->addWidget(analyzePathsButton);
+    clearPeaksButton = new QPushButton("Clear Peaks", this);
+    analyzeLayout->addWidget(clearPeaksButton);
+    mainLayout->addLayout(analyzeLayout);
     
     runSegmentationButton = new QPushButton("Run Seeding", this);
     runSegmentationButton->setEnabled(false);
@@ -402,90 +224,6 @@ void SeedingWidget::setupUI()
     resetPointsButton = new QPushButton("Reset Points", this);
     resetPointsButton->setEnabled(false);
     mainLayout->addWidget(resetPointsButton);
-
-    // Neural Trace from Scratch section
-    auto neuralTraceGroup = new QGroupBox("Neural Trace (Python)", this);
-    auto neuralLayout = new QVBoxLayout(neuralTraceGroup);
-    neuralLayout->setContentsMargins(6, 6, 6, 6);
-    neuralLayout->setSpacing(4);
-
-    // Checkpoint path
-    auto checkpointLayout = new QHBoxLayout();
-    checkpointLayout->addWidget(new QLabel("Checkpoint:", this));
-    _neuralCheckpointEdit = new QLineEdit(this);
-    _neuralCheckpointEdit->setPlaceholderText("Path to checkpoint file...");
-    _neuralCheckpointEdit->setToolTip("Path to the neural tracer model checkpoint");
-    checkpointLayout->addWidget(_neuralCheckpointEdit, 1);
-    _neuralCheckpointBrowse = new QToolButton(this);
-    _neuralCheckpointBrowse->setText("...");
-    _neuralCheckpointBrowse->setToolTip("Browse for checkpoint file");
-    checkpointLayout->addWidget(_neuralCheckpointBrowse);
-    neuralLayout->addLayout(checkpointLayout);
-
-    // Python path
-    auto pythonLayout = new QHBoxLayout();
-    pythonLayout->addWidget(new QLabel("Python:", this));
-    _neuralPythonEdit = new QLineEdit(this);
-    _neuralPythonEdit->setPlaceholderText("Path to Python (leave empty for auto-detect)...");
-    _neuralPythonEdit->setToolTip("Path to Python executable with torch installed (e.g. ~/miniconda3/bin/python)");
-    pythonLayout->addWidget(_neuralPythonEdit, 1);
-    _neuralPythonBrowse = new QToolButton(this);
-    _neuralPythonBrowse->setText("...");
-    _neuralPythonBrowse->setToolTip("Browse for Python executable");
-    pythonLayout->addWidget(_neuralPythonBrowse);
-    neuralLayout->addLayout(pythonLayout);
-
-    // Volume scale
-    auto scaleLayout = new QHBoxLayout();
-    scaleLayout->addWidget(new QLabel("Volume Scale:", this));
-    _comboNeuralVolumeScale = new QComboBox(this);
-    for (int i = 0; i <= 4; ++i) {
-        _comboNeuralVolumeScale->addItem(QString("Scale %1").arg(i), i);
-    }
-    _comboNeuralVolumeScale->setToolTip("OME-Zarr scale level to use (0 = highest resolution)");
-    scaleLayout->addWidget(_comboNeuralVolumeScale);
-    neuralLayout->addLayout(scaleLayout);
-
-    // Max size
-    auto maxSizeLayout = new QHBoxLayout();
-    maxSizeLayout->addWidget(new QLabel("Max Size:", this));
-    _spinNeuralMaxSize = new QSpinBox(this);
-    _spinNeuralMaxSize->setRange(10, 200);
-    _spinNeuralMaxSize->setValue(60);
-    _spinNeuralMaxSize->setToolTip("Maximum patch side length in vertices");
-    maxSizeLayout->addWidget(_spinNeuralMaxSize);
-    neuralLayout->addLayout(maxSizeLayout);
-
-    // Steps per crop
-    auto stepsLayout = new QHBoxLayout();
-    stepsLayout->addWidget(new QLabel("Steps/Crop:", this));
-    _spinNeuralStepsPerCrop = new QSpinBox(this);
-    _spinNeuralStepsPerCrop->setRange(1, 10);
-    _spinNeuralStepsPerCrop->setValue(1);
-    _spinNeuralStepsPerCrop->setToolTip("Number of steps to take before sampling a new crop");
-    stepsLayout->addWidget(_spinNeuralStepsPerCrop);
-    neuralLayout->addLayout(stepsLayout);
-
-    // Trace button
-    _btnNeuralTrace = new QPushButton("Run Neural Trace", this);
-    _btnNeuralTrace->setToolTip("Run neural tracing from the focus point using Python trace.py");
-    _btnNeuralTrace->setEnabled(false);
-    neuralLayout->addWidget(_btnNeuralTrace);
-
-    mainLayout->addWidget(neuralTraceGroup);
-
-    // Restore neural trace settings
-    QSettings settings;
-    _neuralCheckpointPath = settings.value("seeding/neuralCheckpointPath", "").toString();
-    _neuralCheckpointEdit->setText(_neuralCheckpointPath);
-    _neuralPythonPath = settings.value("seeding/neuralPythonPath", "").toString();
-    _neuralPythonEdit->setText(_neuralPythonPath);
-    _neuralVolumeScale = settings.value("seeding/neuralVolumeScale", 0).toInt();
-    _comboNeuralVolumeScale->setCurrentIndex(_neuralVolumeScale);
-    _neuralMaxSize = settings.value("seeding/neuralMaxSize", 60).toInt();
-    _spinNeuralMaxSize->setValue(_neuralMaxSize);
-    _neuralStepsPerCrop = settings.value("seeding/neuralStepsPerCrop", 1).toInt();
-    _spinNeuralStepsPerCrop->setValue(_neuralStepsPerCrop);
 
     // Cancel button (only visible when jobs are running)
     cancelButton = new QPushButton("Cancel", this);
@@ -506,75 +244,20 @@ void SeedingWidget::setupUI()
     progressUtil->configureProgressBar(progressDefaults);
     
     // Connect signals
-    connect(modeButton, &QPushButton::clicked, [this, modeButton]() {
-        if (currentMode == Mode::PointMode) {
-            currentMode = Mode::DrawMode;
-            modeButton->setText("Switch to Point Mode");
-            infoLabel->setText("Draw Mode: Click and drag to draw paths");
-        } else {
-            currentMode = Mode::PointMode;
-            modeButton->setText("Switch to Draw Mode");
-            infoLabel->setText("Point Mode: Set a focus point to begin");
-            // Turning off Draw Mode should also disable relative winding annotation.
-            if (labelWrapsMode) {
-                setRelWindingAnnotationMode(false);
-            }
+    connect(drawPathsButton, &QPushButton::toggled, this, [this](bool checked) {
+        setDrawEnabled(checked);
+        // Turning drawing off also ends relative winding annotation.
+        if (!checked && labelWrapsMode) {
+            setRelWindingAnnotationMode(false);
         }
-        updateModeUI();
-        displayPaths();
     });
-    connect(previewRaysButton, &QPushButton::clicked, this, &SeedingWidget::onPreviewRaysClicked);
-    connect(clearPreviewButton, &QPushButton::clicked, this, &SeedingWidget::onClearPreviewClicked);
-    connect(castRaysButton, &QPushButton::clicked, this, &SeedingWidget::onCastRaysClicked);
+    connect(analyzePathsButton, &QPushButton::clicked, this, &SeedingWidget::onAnalyzePathsClicked);
     connect(clearPeaksButton, &QPushButton::clicked, this, &SeedingWidget::onClearPeaksClicked);
     connect(runSegmentationButton, &QPushButton::clicked, this, &SeedingWidget::onRunSegmentationClicked);
     connect(expandSeedsButton, &QPushButton::clicked, this, &SeedingWidget::onExpandSeedsClicked);
     connect(resetPointsButton, &QPushButton::clicked, this, &SeedingWidget::onResetPointsClicked);
     connect(cancelButton, &QPushButton::clicked, this, &SeedingWidget::onCancelClicked);
-    // Connect neural trace signals
-    connect(_btnNeuralTrace, &QPushButton::clicked, this, &SeedingWidget::onNeuralTraceClicked);
-    connect(_neuralCheckpointBrowse, &QToolButton::clicked, this, &SeedingWidget::onNeuralCheckpointBrowseClicked);
-    connect(_neuralCheckpointEdit, &QLineEdit::textChanged, [this](const QString& text) {
-        _neuralCheckpointPath = text;
-        QSettings settings;
-        settings.setValue("seeding/neuralCheckpointPath", text);
-        updateButtonStates();
-    });
-    connect(_neuralPythonEdit, &QLineEdit::textChanged, [this](const QString& text) {
-        _neuralPythonPath = text;
-        QSettings settings;
-        settings.setValue("seeding/neuralPythonPath", text);
-    });
-    connect(_neuralPythonBrowse, &QToolButton::clicked, [this]() {
-        const QString initial = _neuralPythonPath.isEmpty() ? QDir::homePath() : QFileInfo(_neuralPythonPath).absolutePath();
-        const QString file = QFileDialog::getOpenFileName(this, "Select Python executable", initial);
-        if (!file.isEmpty()) {
-            _neuralPythonPath = file;
-            _neuralPythonEdit->setText(file);
-        }
-    });
-    connect(_comboNeuralVolumeScale, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
-        _neuralVolumeScale = index;
-        QSettings settings;
-        settings.setValue("seeding/neuralVolumeScale", index);
-    });
-    connect(_spinNeuralMaxSize, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
-        _neuralMaxSize = value;
-        QSettings settings;
-        settings.setValue("seeding/neuralMaxSize", value);
-    });
-    connect(_spinNeuralStepsPerCrop, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
-        _neuralStepsPerCrop = value;
-        QSettings settings;
-        settings.setValue("seeding/neuralStepsPerCrop", value);
-    });
 
-    // Connect parameter changes to preview update
-    connect(maxRadiusSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), 
-            this, &SeedingWidget::updateParameterPreview);
-    connect(angleStepSpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), 
-            this, &SeedingWidget::updateParameterPreview);
-    
     // Set size policy
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 }
@@ -633,13 +316,6 @@ void SeedingWidget::updateCurrentZSlice(int z)
     currentZSlice = z;
 }
 
-void SeedingWidget::onClearPreviewClicked()
-{
-    if (const auto id = _point_collection->getCollectionId("ray_preview"))
-        _point_collection->clearCollection(*id);
-    infoLabel->setText("Preview points cleared.");
-}
-
 void SeedingWidget::onClearPeaksClicked()
 {
     if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
@@ -647,332 +323,27 @@ void SeedingWidget::onClearPeaksClicked()
     infoLabel->setText("Peak points cleared.");
 }
 
-void SeedingWidget::onPreviewRaysClicked()
+void SeedingWidget::onAnalyzePathsClicked()
 {
     QString errorMessage;
-    if (!previewRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+    if (!runAnalyzePathsHeadless(&errorMessage) && !errorMessage.isEmpty()) {
         QMessageBox::warning(this, tr("Warning"), errorMessage);
     }
 }
 
-bool SeedingWidget::previewRaysHeadless(QString* errorMessage)
+void SeedingWidget::setDrawEnabled(bool enabled)
 {
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (currentMode != Mode::PointMode || !currentVolume) {
-        if (errorMessage) {
-            *errorMessage = tr("Ray preview requires Point mode and a loaded volume.");
-        }
-        return false;
+    _drawEnabled = enabled;
+    if (drawPathsButton->isChecked() != enabled) {
+        const QSignalBlocker blocker(drawPathsButton);
+        drawPathsButton->setChecked(enabled);
     }
-
-    POI* focus_poi = _state->poi("focus");
-    if (!focus_poi) {
-        if (errorMessage) {
-            *errorMessage = tr("No focus point set. Please set a focus point before previewing rays.");
-        }
-        return false;
+    if (!labelWrapsMode) {
+        infoLabel->setText(enabled ? QString("Drawing: %1 path(s); left-drag in a viewer to add one").arg(paths.size())
+                                   : QString("Turn on 'Draw paths' to draw paths in a viewer"));
     }
-
-    if (const auto id = _point_collection->getCollectionId("ray_preview"))
-        _point_collection->clearCollection(*id);
-
-    const double angleStep = angleStepSpinBox->value();
-    const int numSteps = static_cast<int>(360.0 / angleStep);
-    const int maxRadius = maxRadiusSpinBox->value();
-    const cv::Vec3f& startPoint = focus_poi->p;
-
-    std::vector<cv::Vec3f> preview_points;
-
-    const int pointsPerRay = 10;
-    for (int i = 0; i < numSteps; i++) {
-        const double angle = i * angleStep * M_PI / 180.0;
-        const cv::Vec2f rayDir(cos(angle), sin(angle));
-
-        for (int j = 1; j <= pointsPerRay; ++j) {
-            const float dist = (static_cast<float>(j) / pointsPerRay) * maxRadius;
-            cv::Vec3f pointOnRay;
-            pointOnRay[0] = startPoint[0] + dist * rayDir[0];
-            pointOnRay[1] = startPoint[1] + dist * rayDir[1];
-            pointOnRay[2] = startPoint[2];
-            preview_points.push_back(pointOnRay);
-        }
-    }
-
-    if (!preview_points.empty()) {
-        _point_collection->addPoints("ray_preview", preview_points);
-    }
-
-    infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
-    return true;
-}
-
-void SeedingWidget::onCastRaysClicked()
-{
-    QString errorMessage;
-    if (!castRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
-        QMessageBox::warning(this, tr("Warning"), errorMessage);
-    }
-}
-
-bool SeedingWidget::castRaysHeadless(QString* errorMessage)
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (!currentVolume) {
-        if (errorMessage) {
-            *errorMessage = tr("No volume loaded.");
-        }
-        return false;
-    }
-
-    _castRaysWasPointMode = (currentMode == Mode::PointMode);
-
-    if (_castRaysWasPointMode) {
-        POI* focusPoi = _state ? _state->poi("focus") : nullptr;
-        if (!focusPoi) {
-            if (errorMessage) {
-                *errorMessage = tr("No focus point set. Please set a focus point before casting rays.");
-            }
-            return false;
-        }
-    } else {
-        if (paths.empty()) {
-            if (errorMessage) {
-                *errorMessage = tr("Draw at least one path before casting rays.");
-            }
-            return false;
-        }
-    }
-
-    // Reset previous peaks
-    if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
-        _point_collection->clearCollection(*id);
-
-    // Capture all UI parameters before going to background
-    const double angleStep = angleStepSpinBox->value();
-    const int maxRadius = maxRadiusSpinBox->value();
-    const int threshold = thresholdSpinBox->value();
-    const int zSlice = currentZSlice;
-    const cv::Vec3f startPoint = _castRaysWasPointMode
-        ? _state->poi("focus")->p : cv::Vec3f(0, 0, 0);
-    const QList<PathPrimitive> pathsCopy = paths;  // snapshot for draw mode
-
-    // Disable button, show status
-    castRaysButton->setEnabled(false);
-    infoLabel->setText("Computing rays...");
-    emit sendStatusMessageAvailable("Computing rays...", 0);
-
-    // Clear previous results
-    _castRaysPeaks.clear();
-
-    // Launch background computation
-    auto future = QtConcurrent::run(
-        [this, currentVolume, angleStep, maxRadius, threshold,
-         zSlice, startPoint, pathsCopy]() {
-
-        // --- Compute distance transform ---
-        const int width = currentVolume->sliceWidth();
-        const int height = currentVolume->sliceHeight();
-
-        cv::Mat_<uint8_t> sliceData(height, width);
-        cv::Mat_<cv::Vec3f> coords(height, width);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                coords(y, x) = cv::Vec3f(x, y, zSlice);
-            }
-        }
-        currentVolume->sample(sliceData, coords, vc::SampleParams{});
-
-        cv::Mat binaryImage;
-        cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-
-        cv::Mat dt;
-        cv::distanceTransform(binaryImage, dt, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
-
-        // --- Helper lambdas ---
-        auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
-            if (dt.empty()) return 0.0f;
-            int px = std::max(0, std::min(dt.cols - 1, int(std::round(p[0]))));
-            int py = std::max(0, std::min(dt.rows - 1, int(std::round(p[1]))));
-            return dt.at<float>(py, px);
-        };
-
-        auto collectSegmentPeaks = [&](const std::vector<float>& intensities,
-                                       const std::vector<cv::Vec3f>& positions,
-                                       std::vector<cv::Vec3f>& out) {
-            bool inside = false;
-            size_t seg_start = 0;
-
-            auto addCenterOfSegment = [&](size_t s, size_t e) {
-                if (e < s || s >= positions.size() || e >= positions.size()) return;
-
-                const float distEps = 1e-4f;
-                const float intensityEps = 1e-3f;
-
-                size_t center_idx = s + (e - s) / 2;
-                size_t best_idx = center_idx;
-                float best_dt = sampleDistAt(positions[best_idx]);
-                float best_intensity = intensities[best_idx];
-
-                for (size_t k = s; k <= e; ++k) {
-                    float dtVal = sampleDistAt(positions[k]);
-                    float intensity = intensities[k];
-
-                    bool betterDistance = dtVal > best_dt + distEps;
-                    bool similarDistance = std::fabs(dtVal - best_dt) <= distEps;
-                    bool betterIntensity = intensity > best_intensity + intensityEps;
-                    bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
-
-                    if (betterDistance || (similarDistance && betterIntensity)) {
-                        best_idx = k;
-                        best_dt = dtVal;
-                        best_intensity = intensity;
-                        continue;
-                    }
-
-                    if (similarDistance && similarIntensity) {
-                        size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
-                        size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
-                        if (newOffset < currentOffset) {
-                            best_idx = k;
-                            best_dt = dtVal;
-                            best_intensity = intensity;
-                        }
-                    }
-                }
-
-                out.push_back(positions[best_idx]);
-            };
-
-            for (size_t i = 0; i < intensities.size(); ++i) {
-                bool curr_inside = intensities[i] >= threshold;
-                if (curr_inside && !inside) {
-                    inside = true;
-                    seg_start = i;
-                }
-                bool at_end = (i + 1 == intensities.size());
-                bool next_inside = at_end ? false : (intensities[i + 1] >= threshold);
-                if (inside && (!next_inside || at_end)) {
-                    size_t seg_end = i;
-                    addCenterOfSegment(seg_start, seg_end);
-                    inside = false;
-                }
-            }
-        };
-
-        // Get volume bounds
-        auto [vw, vh, vd] = currentVolume->shapeXyz();
-        float bx0 = 0, by0 = 0, bz0 = 0;
-        float bx1 = static_cast<float>(vw), by1 = static_cast<float>(vh), bz1 = static_cast<float>(vd);
-
-        if (_castRaysWasPointMode) {
-            // --- Point mode: cast rays ---
-            const int numSteps = static_cast<int>(360.0 / angleStep);
-
-            for (int i = 0; i < numSteps; i++) {
-                const double angle = i * angleStep * M_PI / 180.0;
-                const cv::Vec2f rayDir(cos(angle), sin(angle));
-
-                std::vector<float> intensities;
-                std::vector<cv::Vec3f> positions;
-
-                for (int dist = 1; dist < maxRadius; dist++) {
-                    cv::Vec3f point;
-                    point[0] = startPoint[0] + dist * rayDir[0];
-                    point[1] = startPoint[1] + dist * rayDir[1];
-                    point[2] = startPoint[2];
-
-                    if (point[0] < bx0 || point[0] >= bx1 ||
-                        point[1] < by0 || point[1] >= by1 ||
-                        point[2] < bz0 || point[2] >= bz1) {
-                        break;
-                    }
-
-                    cv::Mat_<cv::Vec3f> coord(1, 1);
-                    coord(0, 0) = point;
-                    cv::Mat_<uint8_t> intensity(1, 1);
-                    currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-                    intensities.push_back(intensity(0, 0));
-                    positions.push_back(point);
-                }
-
-                if (!intensities.empty()) {
-                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
-                }
-            }
-        } else {
-            // --- Draw mode: analyze paths ---
-            for (const auto& path : pathsCopy) {
-                if (path.points.empty()) continue;
-
-                PathPrimitive densifiedPath = path.densify(0.5f);
-
-                std::vector<float> intensities;
-                std::vector<cv::Vec3f> positions;
-
-                for (const auto& pt : densifiedPath.points) {
-                    if (pt[0] >= bx0 && pt[0] < bx1 &&
-                        pt[1] >= by0 && pt[1] < by1 &&
-                        pt[2] >= bz0 && pt[2] < bz1) {
-
-                        cv::Mat_<cv::Vec3f> coord(1, 1);
-                        coord(0, 0) = pt;
-                        cv::Mat_<uint8_t> intensity(1, 1);
-                        currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-                        intensities.push_back(intensity(0, 0));
-                        positions.push_back(pt);
-                    }
-                }
-
-                if (!intensities.empty()) {
-                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
-                }
-            }
-        }
-
-        // Also store the distance transform for potential later use
-        distanceTransform = dt;
-    });
-
-    _castRaysWatcher->setFuture(future);
-    return true;
-}
-
-void SeedingWidget::onCastRaysFinished()
-{
-    // Add collected peaks to the point collection (main thread)
-    if (!_castRaysPeaks.empty()) {
-        _point_collection->addPoints("seeding_peaks", _castRaysPeaks);
-    }
-
-    const int numPeaks = static_cast<int>(_castRaysPeaks.size());
-
-    // Enable segmentation button if we found peaks
-    runSegmentationButton->setEnabled(numPeaks > 0);
-
-    // Re-enable the cast rays button
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setEnabled(_state && _state->currentVolume() != nullptr);
-    } else {
-        castRaysButton->setEnabled(!paths.empty());
-    }
-
-    if (_castRaysWasPointMode) {
-        infoLabel->setText(QString("Found %1 peaks (shown in red). Review points then click 'Run Segmentation'.").arg(numPeaks));
-        emit sendStatusMessageAvailable(
-            QString("Cast rays and found %1 intensity peaks. Points are displayed for review.").arg(numPeaks),
-            5000);
-    } else {
-        // Draw mode post-processing
-        displayPaths();
-        infoLabel->setText(QString("Found %1 peaks along %2 paths").arg(numPeaks).arg(paths.size()));
-        emit sendStatusMessageAvailable(
-            QString("Analyzed %1 paths and found %2 intensity peaks").arg(paths.size()).arg(numPeaks),
-            5000);
-    }
-
-    _castRaysPeaks.clear();
+    updateModeUI();
+    displayPaths();
 }
 
 void SeedingWidget::computeDistanceTransform()
@@ -1006,169 +377,6 @@ void SeedingWidget::computeDistanceTransform()
     // Compute the distance transform
     cv::distanceTransform(binaryImage, distanceTransform,
                           vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
-    
-    // Normalize the distance transform for visualization if needed
-    cv::Mat distNormalized;
-    cv::normalize(distanceTransform, distNormalized, 0, 255, cv::NORM_MINMAX);
-    distNormalized.convertTo(distNormalized, CV_8UC1);
-}
-
-void SeedingWidget::castRays()
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (!currentVolume) {
-        return;
-    }
-    
-    POI* focusPoi = _state ? _state->poi("focus") : nullptr;
-    if (!focusPoi) {
-        QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
-        return;
-    }
-
-    // Cast rays at regular angle steps
-    const double angleStep = angleStepSpinBox->value();
-    const int numSteps = static_cast<int>(360.0 / angleStep);
-
-    ProgressUtil::ProgressBarOptions options;
-    options.textMode = ProgressUtil::ProgressTextMode::Percent;
-    progressUtil->startProgress(numSteps, &options);
-
-    for (int i = 0; i < numSteps; i++) {
-        // Calculate ray direction in 2D (will be used for XY plane)
-        const double angle = i * angleStep * M_PI / 180.0;
-        const cv::Vec2f rayDir(cos(angle), sin(angle));
-
-        // Find peaks along this ray in 3D
-        findPeaksAlongRay(rayDir, focusPoi->p);
-
-        // Update progress
-        progressUtil->updateProgress(i + 1);
-        QApplication::processEvents();
-    }
-
-    progressUtil->stopProgress();
-}
-
-void SeedingWidget::findPeaksAlongRay(
-    const cv::Vec2f& rayDir,
-    const cv::Vec3f& startPoint)
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (!currentVolume) {
-        return;
-    }
-    
-    const int maxRadius = maxRadiusSpinBox->value();
-    auto [width, height, depth] = currentVolume->shapeXyz();
-    float bx0 = 0, by0 = 0, bz0 = 0;
-    float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
-
-    std::vector<float> intensities;
-    std::vector<cv::Vec3f> positions;
-
-    // Get the window size from the spinbox
-    const int window = windowSizeSpinBox->value();
-
-    // Trace ray up to max radius (assuming ray is in XY plane for now)
-    for (int dist = 1; dist < maxRadius; dist++) {
-        cv::Vec3f point;
-        point[0] = startPoint[0] + dist * rayDir[0];
-        point[1] = startPoint[1] + dist * rayDir[1];
-        point[2] = startPoint[2]; // Keep Z constant for now (ray in XY plane)
-
-        // Check bounds against data region
-        if (point[0] < bx0 || point[0] >= bx1 ||
-            point[1] < by0 || point[1] >= by1 ||
-            point[2] < bz0 || point[2] >= bz1) {
-            break;
-        }
-        
-        // Read intensity at this 3D point
-        cv::Mat_<cv::Vec3f> coord(1, 1);
-        coord(0, 0) = point;
-        
-        cv::Mat_<uint8_t> intensity(1, 1);
-        currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-        // Store intensity and position
-        intensities.push_back(intensity(0, 0));
-        positions.push_back(point);
-    }
-
-    if (intensities.empty()) {
-        return;
-    }
-
-    // Place a single point at the center of each above-threshold segment
-    const int thr = thresholdSpinBox->value();
-    bool inside = false;
-    size_t seg_start = 0;
-
-    auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
-        if (distanceTransform.empty()) return 0.0f;
-        int x = std::max(0, std::min(distanceTransform.cols - 1, int(std::round(p[0]))));
-        int y = std::max(0, std::min(distanceTransform.rows - 1, int(std::round(p[1]))));
-        return distanceTransform.at<float>(y, x);
-    };
-
-    auto addCenterOfSegment = [&](size_t s, size_t e) {
-        if (e < s || s >= positions.size() || e >= positions.size()) return;
-
-        const float distEps = 1e-4f;
-        const float intensityEps = 1e-3f;
-
-        // Start with the geometric center of the segment as a reasonable default
-        size_t center_idx = s + (e - s) / 2;
-        size_t best_idx = center_idx;
-        float best_dt = sampleDistAt(positions[best_idx]);
-        float best_intensity = intensities[best_idx];
-
-        for (size_t k = s; k <= e; ++k) {
-            float dt = sampleDistAt(positions[k]);
-            float intensity = intensities[k];
-
-            bool betterDistance = dt > best_dt + distEps;
-            bool similarDistance = std::fabs(dt - best_dt) <= distEps;
-            bool betterIntensity = intensity > best_intensity + intensityEps;
-            bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
-
-            if (betterDistance || (similarDistance && betterIntensity)) {
-                best_idx = k;
-                best_dt = dt;
-                best_intensity = intensity;
-                continue;
-            }
-
-            if (similarDistance && similarIntensity) {
-                size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
-                size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
-                if (newOffset < currentOffset) {
-                    best_idx = k;
-                    best_dt = dt;
-                    best_intensity = intensity;
-                }
-            }
-        }
-
-        _point_collection->addPoint("seeding_peaks", positions[best_idx]);
-    };
-
-    for (size_t i = 0; i < intensities.size(); ++i) {
-        bool curr_inside = intensities[i] >= thr;
-        if (curr_inside && !inside) {
-            inside = true;
-            seg_start = i;
-        }
-        // If leaving a segment or at the end, close it and add center point
-        bool at_end = (i + 1 == intensities.size());
-        bool next_inside = at_end ? false : (intensities[i + 1] >= thr);
-        if (inside && (!next_inside || at_end)) {
-            size_t seg_end = i;
-            addCenterOfSegment(seg_start, seg_end);
-            inside = false;
-        }
-    }
 }
 
 void SeedingWidget::onRunSegmentationClicked()
@@ -1216,31 +424,15 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     const int totalPoints = static_cast<int>(allPoints.size());
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
 
-    // Get paths
-    std::filesystem::path pathsDir;
-    std::filesystem::path seedJsonPath;
-
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        seedJsonPath = pathsDir.parent_path() / "seed.json";
-    } else {
-        if (!fVpkg->hasVolumes()) {
-            setError(tr("No volumes in volume package."));
-            return false;
-        }
-
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        seedJsonPath = vpkgPath / "seed.json";
-
-        if (!std::filesystem::exists(pathsDir)) {
-            setError(tr("Segmentation paths directory not found in volume package."));
-            return false;
-        }
+    // New surfaces go to the object store; seed.json lives in the project directory.
+    QString storeError;
+    const auto store = batchStore(&storeError);
+    if (!store) {
+        setError(storeError);
+        return false;
     }
+    const std::filesystem::path projectDir(fVpkg->directory().string());
+    const std::filesystem::path seedJsonPath = projectDir / "seed.json";
 
     if (!std::filesystem::exists(seedJsonPath)) {
         setError(tr("seed.json not found in volume package."));
@@ -1252,9 +444,8 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         return false;
     }
 
-    // Validate before begin(); otherwise an early return leaves a phantom batch
-    // that can make a later neural trace look like a cancellable seeding job.
-    _batchVolumePath = commandPathForVolume(currentVolume);
+    // Validate before begin(); otherwise an early return leaves a phantom batch.
+    _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
                     "(no local mirror and no remote locator)."));
@@ -1266,10 +457,9 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchPoints = std::move(allPoints);
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchProcessTail.clear();
-    _batchPathsDir = pathsDir;
+    _batchStore = *store;
     _batchConfigJson = seedJsonPath;
-    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
+    _batchWorkingDir = QString::fromStdString(projectDir.string());
 
     // Update UI
     infoLabel->setText(tr("Running segmentation jobs..."));
@@ -1294,6 +484,27 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     return true;
 }
 
+void SeedingWidget::setSurfaceCatalog(SurfaceCatalog* catalog)
+{
+    _surfaceCatalog = catalog;
+    // Expansion needs stored surfaces to grow from.
+    if (_surfaceCatalog) connect(_surfaceCatalog, &SurfaceCatalog::rowsChanged, this, &SeedingWidget::updateButtonStates);
+}
+
+std::optional<SurfaceCatalog::ToolStore> SeedingWidget::batchStore(QString* error) const
+{
+    if (!_surfaceCatalog) {
+        *error = tr("Attach an object store and open a volume first.");
+        return std::nullopt;
+    }
+    try {
+        return _surfaceCatalog->toolStore();
+    } catch (const std::exception& e) {
+        *error = QString::fromUtf8(e.what());
+        return std::nullopt;
+    }
+}
+
 void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
 {
     if (pointIndex >= _batch.total() || !jobsRunning) {
@@ -1301,52 +512,38 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
     }
 
     const auto& point = _batchPoints[pointIndex];
-    QProcess* process = new QProcess(this);
-    process->setProcessChannelMode(QProcess::MergedChannels);
-    process->setWorkingDirectory(_batchWorkingDir);
-
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    if (_batchOmpThreads > 0) {
-        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
-    }
-    process->setProcessEnvironment(env);
-
     const QStringList toolArgs = QStringList()
-                  << _batchVolumePath
-                  << QString::fromStdString(_batchPathsDir.string())
-                  << QString::fromStdString(_batchConfigJson.string())
+                  << QStringLiteral("-v") << _batchVolumePath
+                  << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
+                  << QStringLiteral("--tag") << QStringLiteral("paths")
+                  << QStringLiteral("--seed")
                   << QString::number(point.p[0])
                   << QString::number(point.p[1])
                   << QString::number(point.p[2]);
 
-    std::cout << "Starting seeding job " << pointIndex << ": "
-              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
-              << std::endl;
-
-    launchBatchProcess(process, pointIndex, toolArgs);
+    std::cout << "Starting seeding job " << pointIndex << std::endl;
+    launchBatchProcess(pointIndex, toolArgs);
 }
 
-void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int exitCode,
-                                               QProcess::ExitStatus exitStatus, bool failedToStart)
+void SeedingWidget::handleBatchProcessFinished(vc3d::ToolProcess* run, int index,
+                                               const vc3d::ToolProcess::Result& result)
 {
     if (!jobsRunning) {
         return;
     }
 
     const bool isExpand = (_batch.kind() == QLatin1String("expand"));
-    const bool crashed = (exitStatus != QProcess::NormalExit);
 
-    // Aggregate the outcome, deduping on the stable child index — not the QProcess*
-    // itself, since process->deleteLater() below frees each finished child mid-batch and
-    // a later QProcess can be allocated at the same address, misreading as already-terminal.
+    // Aggregate the outcome, deduping on the stable child index — not the run
+    // itself, since run->deleteLater() below frees each finished child mid-batch and
+    // a later one can be allocated at the same address, misreading as already-terminal.
     const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
                                    : tr("Segmentation for point %1").arg(index);
-    if (!_batch.recordTerminal(index, failedToStart, crashed, exitCode,
-                               _batchProcessTail.value(process), label)) {
+    if (!_batch.recordTerminal(index, result.failedToStart, result.crashed, result.exitCode, result.tail, label)) {
         return;
     }
 
-    const bool failed = failedToStart || crashed || exitCode != 0;
+    const bool failed = !result.ok;
     if (failed) {
         std::cerr << _batch.failureMessages().constLast().toStdString() << std::endl;
     } else {
@@ -1358,10 +555,8 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     progressUtil->updateProgress(_batch.completed());
     emit seedingBatchProgressChanged(_batch.kind(), _batch.completed(), _batch.total());
 
-    // Remove from running list (QPointer handles null checking)
-    runningProcesses.removeOne(process);
-    _batchProcessTail.remove(process);
-    process->deleteLater();
+    runningProcesses.removeOne(run);
+    run->deleteLater();
 
     // Continue the remaining batch after an individual failure unless canceled.
     if (_batchNextIndex < _batch.total() && jobsRunning && !_batch.cancelRequested()) {
@@ -1379,11 +574,9 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
 
 void SeedingWidget::finalizeSeedingBatch()
 {
-    // Common terminal teardown for a run/expand batch OR a cancel of any seeding-widget
-    // process batch. A neural trace shares jobsRunning/runningProcesses/cancelButton but
-    // leaves the tracker kind empty, so the batch-finished signal (and seeding-specific
-    // wording) are only emitted for a real run/expand batch. Idempotent: cancel + the
-    // last child completion can both reach here.
+    // Common terminal teardown for a run/expand batch or its cancel. The
+    // batch-finished signal is only emitted for a started batch (non-empty kind).
+    // Idempotent: cancel + the last child completion can both reach here.
     if (_batch.finalized()) {
         return;
     }
@@ -1426,7 +619,6 @@ void SeedingWidget::finalizeSeedingBatch()
     // (_batch retains its finalized outcome for idempotency; begin() resets it.)
     _batchPoints.clear();
     _batchPoints.shrink_to_fit();
-    _batchProcessTail.clear();
 
     if (!kind.isEmpty()) {
         emit seedingBatchFinished(kind, success, canceled, completed, total, message);
@@ -1439,120 +631,29 @@ void SeedingWidget::onResetPointsClicked()
     if (_point_collection) {
         if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
             _point_collection->clearCollection(*id);
-        if (const auto id = _point_collection->getCollectionId("seeding_seeds"))
-            _point_collection->clearCollection(*id);
     }
     
     // Clear paths
     paths.clear();
     
     // Reset UI
-    castRaysButton->setEnabled(false);
+    analyzePathsButton->setEnabled(false);
     runSegmentationButton->setEnabled(false);
     expandSeedsButton->setEnabled(false);
     resetPointsButton->setEnabled(false);
-    infoLabel->setText("Click 'Cast Rays' to begin");
+    infoLabel->setText("Draw paths, then click 'Analyze Paths'");
     
-    // Redraw to clear points and paths
-    updatePointsDisplay();
+    // Redraw to clear paths
     displayPaths();
-}
-
-QString SeedingWidget::findExecutablePath()
-{
-    // vc_grow_seg_from_seed should be in the same directory as the VC3D application
-    QString execPath = QCoreApplication::applicationDirPath() + "/vc_grow_seg_from_seed";
-#ifdef Q_OS_WIN
-    execPath += QStringLiteral(".exe");
-#endif
-
-    QFileInfo fileInfo(execPath);
-    if (fileInfo.exists() && fileInfo.isExecutable()) {
-        return fileInfo.absoluteFilePath();
-    }
-    
-    // If not found, return empty string
-    return QString();
-}
-
-void SeedingWidget::updateParameterPreview()
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto focus_points = _point_collection->getPoints("focus");
-    if (focus_points.empty() || !currentVolume) {
-        return;
-    }
-    auto& center_point = focus_points[0].p;
-
-    // Clear previous preview points
-    if (const auto id = _point_collection->getCollectionId("seeding_preview"))
-        _point_collection->clearCollection(*id);
-    
-    // Get parameters
-    const double angleStep = angleStepSpinBox->value();
-    const int numRays = static_cast<int>(360.0 / angleStep);
-    const int maxRadius = maxRadiusSpinBox->value();
-    
-    // Add points along the radius circle
-    for (int i = 0; i < numRays; ++i) {
-        const double angle = i * angleStep * M_PI / 180.0;
-        const cv::Vec2f rayDir(cos(angle), sin(angle));
-        
-        // Add points along the radius circle
-        float x = center_point[0] + maxRadius * rayDir[0];
-        float y = center_point[1] + maxRadius * rayDir[1];
-        
-        _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
-        
-        // Add intermediate points for better visualization
-        for (int r = maxRadius / 4; r < maxRadius; r += maxRadius / 4) {
-            x = center_point[0] + r * rayDir[0];
-            y = center_point[1] + r * rayDir[1];
-            
-            _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
-        }
-    }
-    
-    // Update info label
-    infoLabel->setText(QString("Seed at (%1, %2, %3) | Preview: %4 rays, radius %5px")
-                           .arg(center_point[0])
-                           .arg(center_point[1])
-                           .arg(center_point[2])
-                           .arg(numRays)
-                           .arg(maxRadius));
 }
 
 void SeedingWidget::updateModeUI()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setText("Cast Rays");
-        resetPointsButton->setText("Reset Points");
-
-        // Show radius and angle controls in point mode
-        maxRadiusLabel->setVisible(true);
-        maxRadiusSpinBox->setVisible(true);
-        angleStepLabel->setVisible(true);
-        angleStepSpinBox->setVisible(true);
-
-        // Enable/disable based on state
-        castRaysButton->setEnabled(currentVolume != nullptr);
-        resetPointsButton->setEnabled(true);
-    } else { // DrawMode
-        castRaysButton->setText("Analyze Paths");
-        resetPointsButton->setText("Clear All Paths");
-
-        // Hide radius and angle controls in draw mode
-        maxRadiusLabel->setVisible(false);
-        maxRadiusSpinBox->setVisible(false);
-        angleStepLabel->setVisible(false);
-        angleStepSpinBox->setVisible(false);
-
-        // Enable/disable based on paths
-        bool hasPaths = !paths.empty();
-        castRaysButton->setEnabled(hasPaths && currentVolume != nullptr);
-        resetPointsButton->setEnabled(hasPaths);
-    }
+    const bool hasPaths = !paths.empty();
+    resetPointsButton->setText(_drawEnabled ? "Clear All Paths" : "Reset Points");
+    analyzePathsButton->setEnabled(hasPaths && currentVolume != nullptr);
+    resetPointsButton->setEnabled(hasPaths || !_point_collection->getPoints("seeding_peaks").empty());
 }
 
 void SeedingWidget::analyzePaths()
@@ -1611,7 +712,7 @@ bool SeedingWidget::runAnalyzePathsHeadless(QString* errorMessage, int* pathsAna
         return false;
     }
     if (paths.empty()) {
-        if (errorMessage) *errorMessage = tr("No paths to analyze. Draw paths in Draw mode first.");
+        if (errorMessage) *errorMessage = tr("No paths to analyze. Draw paths first.");
         return false;
     }
 
@@ -1800,7 +901,7 @@ void SeedingWidget::finalizePath()
     displayPaths();
     
     // Update info
-    infoLabel->setText(QString("Draw Mode: %1 path(s)").arg(paths.size()));
+    infoLabel->setText(QString("Drawing: %1 path(s)").arg(paths.size()));
 }
 
 void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
@@ -1928,43 +1029,6 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
     }
 }
 
-std::vector<std::shared_ptr<QuadSurface>> SeedingWidget::relWindingPatchSurfaces() const
-{
-    std::vector<std::shared_ptr<QuadSurface>> surfaces;
-    std::unordered_set<QuadSurface*> seen;
-    auto addSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
-        if (!surface || seen.find(surface.get()) != seen.end()) {
-            return;
-        }
-        seen.insert(surface.get());
-        surfaces.push_back(surface);
-    };
-
-    auto package = _state ? _state->vpkg() : nullptr;
-    if (package) {
-        auto ids = package->getLoadedSurfaceIDs();
-        std::sort(ids.begin(), ids.end());
-        for (const auto& id : ids) {
-            addSurface(package->getSurface(id));
-        }
-    }
-
-    if (!surfaces.empty() || !_state) {
-        return surfaces;
-    }
-
-    auto names = _state->surfaceNames();
-    std::sort(names.begin(), names.end());
-    for (const auto& name : names) {
-        if (name == "segmentation" || name == "line-surface" || name == "line-side-slice" ||
-            name.rfind("line_annotation_slice_", 0) == 0) {
-            continue;
-        }
-        addSurface(std::dynamic_pointer_cast<QuadSurface>(_state->surface(name)));
-    }
-    return surfaces;
-}
-
 int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimitive& path,
                                                                const std::string& collectionName)
 {
@@ -1977,28 +1041,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         return 0;
     }
 
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
-    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
-    if ((!patchIndex || patchIndex->empty()) && (!editPatchIndex || editPatchIndex->empty())) {
-        return 0;
-    }
-
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> targetSurfaces;
-    for (const auto& surface : relWindingPatchSurfaces()) {
-        if (!surface) {
-            continue;
-        }
-        if ((patchIndex && patchIndex->containsSurface(surface)) ||
-            (editPatchIndex && editPatchIndex->containsSurface(surface))) {
-            targetSurfaces.insert(surface);
-        }
-    }
-    if (targetSurfaces.empty()) {
-        return 0;
-    }
-
     struct PathHit {
-        SurfacePatchIndex::SurfacePtr surface;
+        std::string surface;
         float pathDistance = 0.0f;
         float distanceSq = std::numeric_limits<float>::max();
         cv::Vec3f point{0, 0, 0};
@@ -2034,19 +1078,33 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                       std::max(1, static_cast<int>(std::ceil(maxX - minX + roiPad * 2.0f))),
                       std::max(1, static_cast<int>(std::ceil(maxY - minY + roiPad * 2.0f)))};
 
-    std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
-    auto appendIntersections = [&](SurfacePatchIndex* index) {
-        if (!index || index->empty()) {
-            return;
+    // Where surfaces cross the drawing plane around the path, from the object
+    // store (the surface being edited through its draft).
+    std::map<std::string, std::vector<std::array<cv::Vec3f, 2>>> intersections;
+    if (_surfaceCatalog && _surfaceCatalog->volume()) {
+        auto corner = [&](float x, float y) {
+            const cv::Vec3f p = plane->coord({0, 0, 0}, {x, y, 0.0f});
+            return vc::fibers::Point{p[0], p[1], p[2]};
+        };
+        const auto region = vc3d::store::viewRegion(corner(planeRoi.x, planeRoi.y),
+                                                    corner(planeRoi.x + planeRoi.width, planeRoi.y),
+                                                    corner(planeRoi.x, planeRoi.y + planeRoi.height), 1.0);
+        if (region) {
+            try {
+                const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
+                                                              _surfaceCatalog->voxels(),
+                                                              vc3d::store::regionSlice(*region), {});
+                for (const auto& run : crossings.runs) {
+                    auto& out = intersections[run.objectUuid];
+                    for (size_t i = 1; i < run.points.size(); ++i)
+                        out.push_back({cv::Vec3f(run.points[i - 1][0], run.points[i - 1][1], run.points[i - 1][2]),
+                                       cv::Vec3f(run.points[i][0], run.points[i][1], run.points[i][2])});
+                }
+            } catch (const std::exception& error) {
+                Logger()->warn("Relative winding surface query failed: {}", error.what());
+            }
         }
-        auto partial = index->computePlaneIntersections(*plane, planeRoi, targetSurfaces);
-        for (auto& [surface, segments] : partial) {
-            auto& out = intersections[surface];
-            out.insert(out.end(), segments.begin(), segments.end());
-        }
-    };
-    appendIntersections(patchIndex);
-    appendIntersections(editPatchIndex);
+    }
     if (intersections.empty()) {
         return 0;
     }
@@ -2063,8 +1121,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
 
         for (const auto& [surface, segments] : intersections) {
             for (const auto& segment : segments) {
-                const cv::Vec3f aProj = plane->project(segment.world[0], 1.0f, 1.0f);
-                const cv::Vec3f bProj = plane->project(segment.world[1], 1.0f, 1.0f);
+                const cv::Vec3f aProj = plane->project(segment[0], 1.0f, 1.0f);
+                const cv::Vec3f bProj = plane->project(segment[1], 1.0f, 1.0f);
                 if (!std::isfinite(aProj[0]) || !std::isfinite(aProj[1]) ||
                     !std::isfinite(bProj[0]) || !std::isfinite(bProj[1])) {
                     continue;
@@ -2092,9 +1150,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         if (a.pathDistance != b.pathDistance) {
             return a.pathDistance < b.pathDistance;
         }
-        const std::string aId = a.surface ? a.surface->id : std::string();
-        const std::string bId = b.surface ? b.surface->id : std::string();
-        return aId < bId;
+        return a.surface < b.surface;
     });
 
     const float mergeDistance = std::max(1e-3f, tolerance);
@@ -2135,14 +1191,12 @@ void SeedingWidget::setRelWindingAnnotationMode(bool active)
 
     labelWrapsMode = active;
     if (labelWrapsMode) {
-        currentMode = Mode::DrawMode;
         infoLabel->setText("Rel winding annotation: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
+        setDrawEnabled(true);
     } else {
-        // Revert to default UI language; keep currentMode as-is
-        infoLabel->setText("Point Mode: Set a focus point to begin");
+        // Revert to the default text; drawing stays as it is.
+        setDrawEnabled(_drawEnabled);
     }
-    updateModeUI();
-    displayPaths();
     emit relWindingAnnotationModeChanged(labelWrapsMode);
 }
 
@@ -2182,66 +1236,28 @@ void SeedingWidget::displayPaths()
     // Send peaks as red points (they should still be displayed as individual points)
 }
 
-void SeedingWidget::updatePointsDisplay()
-{
-    // Send both analysis results (red) and user points (blue) for display
-}
-
-void SeedingWidget::updateInfoLabel()
-{
-    QString infoText;
-    
-    if (currentMode == Mode::PointMode) {
-        auto focus_points = _point_collection->getPoints("focus");
-        if (!focus_points.empty()) {
-            auto& p = focus_points[0].p;
-            infoText = QString("Seed: (%1, %2, %3) | Analysis: %4 pts | User: %5 pts")
-                           .arg(p[0])
-                           .arg(p[1])
-                           .arg(p[2])
-                           .arg(_point_collection->getPoints("seeding_peaks").size())
-                           .arg(_point_collection->getPoints("seeding_seeds").size());
-        } else {
-            infoText = "Point Mode: Set a focus point to begin";
-        }
-    } else {
-        infoText = QString("Draw Mode: %1 paths drawn").arg(paths.size());
-    }
-    infoLabel->setText(infoText);
-}
-
 void SeedingWidget::updateButtonStates()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto fVpkg = _state ? _state->vpkg() : nullptr;
 
-    // Enable segmentation if we have any points (analysis results OR user points)
-    bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty() || !_point_collection->getPoints("seeding_seeds").empty();
+    // Enable segmentation once the analysis found peaks
+    bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty();
     runSegmentationButton->setEnabled(hasAnyPoints && currentVolume != nullptr);
 
-    // Enable expansion if we have a volume AND at least one segmentation
-    bool hasSegmentations = fVpkg && fVpkg->hasSegmentations();
-    expandSeedsButton->setEnabled(currentVolume != nullptr && hasSegmentations);
+    // Enable expansion if we have a volume AND at least one stored surface
+    const bool hasSurfaces = _surfaceCatalog && !_surfaceCatalog->rows().empty();
+    expandSeedsButton->setEnabled(currentVolume != nullptr && hasSurfaces);
 
     // Enable reset if we have any points or paths
     bool hasAnyData = hasAnyPoints || !paths.empty();
     resetPointsButton->setEnabled(hasAnyData);
 
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setEnabled(currentVolume != nullptr);
-    } else {
-        castRaysButton->setEnabled(!paths.empty());
-    }
-
-    // Enable neural trace if we have volume, checkpoint, and focus point
-    bool hasFocus = _state && _state->poi("focus") != nullptr;
-    bool hasCheckpoint = !_neuralCheckpointPath.isEmpty() && QFile::exists(_neuralCheckpointPath);
-    _btnNeuralTrace->setEnabled(currentVolume != nullptr && hasFocus && hasCheckpoint && !jobsRunning);
+    analyzePathsButton->setEnabled(!paths.empty() && currentVolume != nullptr);
 }
 
 void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || button != Qt::LeftButton) {
+    if (!_drawEnabled || button != Qt::LeftButton) {
         return;
     }
 
@@ -2251,7 +1267,7 @@ void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::Mous
 
 void SeedingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || !isDrawing || !(buttons & Qt::LeftButton)) {
+    if (!_drawEnabled || !isDrawing || !(buttons & Qt::LeftButton)) {
         return;
     }
     
@@ -2260,7 +1276,7 @@ void SeedingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Q
 
 void SeedingWidget::onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || button != Qt::LeftButton || !isDrawing) {
+    if (!_drawEnabled || button != Qt::LeftButton || !isDrawing) {
         return;
     }
 
@@ -2307,31 +1323,16 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     const int expansionIterations = expansionIterationsSpinBox->value();
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
 
-    // Get paths
-    std::filesystem::path pathsDir;
-    std::filesystem::path expandJsonPath;
-
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        expandJsonPath = pathsDir.parent_path() / "expand.json";
-    } else {
-        if (!fVpkg->hasVolumes()) {
-            setError(tr("No volumes in volume package."));
-            return false;
-        }
-
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        expandJsonPath = vpkgPath / "expand.json";
-
-        if (!std::filesystem::exists(pathsDir)) {
-            setError(tr("Segmentation paths directory not found in volume package."));
-            return false;
-        }
+    // Expansion grows from the volume's stored surfaces into new ones;
+    // expand.json lives in the project directory.
+    QString storeError;
+    const auto store = batchStore(&storeError);
+    if (!store) {
+        setError(storeError);
+        return false;
     }
+    const std::filesystem::path projectDir(fVpkg->directory().string());
+    const std::filesystem::path expandJsonPath = projectDir / "expand.json";
 
     if (!std::filesystem::exists(expandJsonPath)) {
         setError(tr("expand.json not found in volume package."));
@@ -2339,7 +1340,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     }
 
     // Validate before begin() so an early return cannot leave a phantom batch.
-    _batchVolumePath = commandPathForVolume(currentVolume);
+    _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
                     "(no local mirror and no remote locator)."));
@@ -2351,10 +1352,9 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchPoints.clear();
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchProcessTail.clear();
-    _batchPathsDir = pathsDir;
+    _batchStore = *store;
     _batchConfigJson = expandJsonPath;
-    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
+    _batchWorkingDir = QString::fromStdString(projectDir.string());
 
     // Update UI
     infoLabel->setText(tr("Running expansion jobs..."));
@@ -2386,83 +1386,40 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
         return;
     }
 
-    QProcess* process = new QProcess(this);
-    process->setProcessChannelMode(QProcess::MergedChannels);
-    process->setWorkingDirectory(_batchWorkingDir);
-
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    if (_batchOmpThreads > 0) {
-        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
-    }
-    process->setProcessEnvironment(env);
-
     const QStringList toolArgs = QStringList()
-                  << _batchVolumePath
-                  << QString::fromStdString(_batchPathsDir.string())
-                  << QString::fromStdString(_batchConfigJson.string());
+                  << QStringLiteral("-v") << _batchVolumePath
+                  << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
+                  << QStringLiteral("--tag") << QStringLiteral("paths");
 
-    std::cout << "Starting expansion job " << iterationIndex << ": "
-              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
-              << std::endl;
-
-    launchBatchProcess(process, iterationIndex, toolArgs);
+    std::cout << "Starting expansion job " << iterationIndex << std::endl;
+    launchBatchProcess(iterationIndex, toolArgs);
 }
 
 
-void SeedingWidget::launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs)
+void SeedingWidget::launchBatchProcess(int index, const QStringList& toolArgs)
 {
-    // Drain merged child output continuously so the QProcess buffer never grows
-    // unbounded; retain a bounded per-child tail for terminal failure diagnostics.
-    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
-        const QByteArray chunk = process->readAllStandardOutput();
-        QString& tail = _batchProcessTail[process];
-        tail += QString::fromLocal8Bit(chunk);
-        constexpr int kTailMax = 2048;
-        if (tail.size() > kTailMax)
-            tail = tail.right(kTailMax);
-    });
-
-    // finished() carries the exit code/status; errorOccurred(FailedToStart) never
-    // emits finished(), so route it through the same completion path (once) so a
-    // missing nice/ionice/tool fails the batch instead of stranding it.
-    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-        [this, process, index](int exitCode, QProcess::ExitStatus exitStatus) {
-            handleBatchProcessFinished(process, index, exitCode, exitStatus, /*failedToStart=*/false);
-        });
-    connect(process, &QProcess::errorOccurred, this,
-        [this, process, index](QProcess::ProcessError err) {
-            if (err == QProcess::FailedToStart)
-                handleBatchProcessFinished(process, index, /*exitCode=*/-1,
-                                           QProcess::CrashExit, /*failedToStart=*/true);
-        });
-
-    // Track before start() so synchronous FailedToStart is handled as part of
-    // this batch.
-    runningProcesses.append(QPointer<QProcess>(process));
-
-    // Resolve the priority wrappers: nice/ionice may be absent (macOS has no
-    // ionice at all). Fall back to launching vc_grow_seg_from_seed directly.
-    // FailedToStart is handled on every path by the connection above.
-#if defined(Q_OS_UNIX)
-    const QString nicePath = QStandardPaths::findExecutable(QStringLiteral("nice"));
-#if defined(Q_OS_LINUX)
-    const QString ionicePath = QStandardPaths::findExecutable(QStringLiteral("ionice"));
-#else
-    const QString ionicePath;
-#endif
-    if (!nicePath.isEmpty()) {
-        QStringList args;
-        args << QStringLiteral("-n") << QStringLiteral("19");
-        if (!ionicePath.isEmpty())
-            args << ionicePath << QStringLiteral("-c") << QStringLiteral("3");
-        args << executablePath << toolArgs;
-        process->start(nicePath, args);
-    } else {
-        process->start(executablePath, toolArgs);
+    auto* run = new vc3d::ToolProcess(this);
+    connect(run, &vc3d::ToolProcess::finished, this,
+            [this, run, index](const vc3d::ToolProcess::Result& result) { handleBatchProcessFinished(run, index, result); });
+    // Tracked before start() so a failed start is handled as part of this batch.
+    runningProcesses.append(QPointer<vc3d::ToolProcess>(run));
+    vc3d::ToolProcess::Launch launch;
+    launch.tool = executablePath;
+    launch.args = toolArgs;
+    launch.ompThreads = _batchOmpThreads;
+    launch.workingDirectory = _batchWorkingDir;
+    launch.store = QString::fromStdString(_batchStore.store.string());
+    launch.volume = QString::fromStdString(_batchStore.volume.volume);
+    launch.voxelScale = _batchStore.volume.scale;
+    launch.lowPriority = true;
+    if (!run->start(launch)) {
+        vc3d::ToolProcess::Result failed;
+        failed.failedToStart = true;
+        failed.error = run->error();
+        handleBatchProcessFinished(run, index, failed);
+        return;
     }
-#else
-    process->start(executablePath, toolArgs);
-#endif
+    std::cout << "  " << run->command().toStdString() << std::endl;
 }
 
 void SeedingWidget::cancelSeedingBatchHeadless()
@@ -2475,28 +1432,11 @@ void SeedingWidget::cancelSeedingBatchHeadless()
     jobsRunning = false;
     _batch.requestCancel();
 
-    // using qpointer here to avoid dangling pointers
-    for (const QPointer<QProcess>& processPtr : runningProcesses) {
-        if (processPtr) {
-            QProcess* process = processPtr.data();
-
-            // Disconnect all signals to prevent callbacks after cancellation
-            process->disconnect();
-
-            // Terminate the process if it's still running
-            if (process->state() != QProcess::NotRunning) {
-                process->terminate();
-                // Give it a chance to terminate gracefully (bounded, ~1s)
-                if (!process->waitForFinished(1000)) {
-                    // Force kill if it didn't terminate
-                    process->kill();
-                    process->waitForFinished(1000);
-                }
-            }
-
-            // Schedule deletion
-            process->deleteLater();
-        }
+    // No callbacks after cancellation; deleting a run kills its process (bounded wait).
+    for (const QPointer<vc3d::ToolProcess>& run : runningProcesses) {
+        if (!run) continue;
+        run->disconnect(this);
+        delete run.data();
     }
     runningProcesses.clear();
 
@@ -2515,193 +1455,4 @@ void SeedingWidget::onSurfacesLoaded()
 {
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
-}
-
-QString SeedingWidget::findNeuralTracePyPath()
-{
-    QString appDir = QCoreApplication::applicationDirPath();
-    QStringList searchPaths = {
-        // Development paths
-        QDir(appDir).filePath("../../vesuvius/src/vesuvius/neural_tracing/trace.py"),
-        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/neural_tracing/trace.py"),
-        // Installed paths
-        QDir(appDir).filePath("../share/vesuvius/neural_tracing/trace.py"),
-        // Environment variable
-        qEnvironmentVariable("NEURAL_TRACE_PY_PATH"),
-    };
-
-    for (const QString& path : searchPaths) {
-        if (!path.isEmpty() && QFile::exists(path)) {
-            return QFileInfo(path).absoluteFilePath();
-        }
-    }
-
-    return QString();
-}
-
-void SeedingWidget::onNeuralCheckpointBrowseClicked()
-{
-    QString startDir = _neuralCheckpointPath.isEmpty()
-        ? QDir::homePath()
-        : QFileInfo(_neuralCheckpointPath).absolutePath();
-
-    QString path = QFileDialog::getOpenFileName(
-        this,
-        tr("Select Neural Tracer Checkpoint"),
-        startDir,
-        tr("Checkpoint Files (*.pt *.pth *.ckpt);;All Files (*)")
-    );
-
-    if (!path.isEmpty()) {
-        _neuralCheckpointEdit->setText(path);
-    }
-}
-
-void SeedingWidget::onNeuralTraceClicked()
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto fVpkg = _state ? _state->vpkg() : nullptr;
-
-    // Validate prerequisites
-    if (!currentVolume) {
-        QMessageBox::warning(this, "Error", "No volume selected.");
-        return;
-    }
-
-    POI* focusPoi = _state ? _state->poi("focus") : nullptr;
-    if (!focusPoi) {
-        QMessageBox::warning(this, "Error", "No focus point set. Please set a focus point first.");
-        return;
-    }
-
-    if (_neuralCheckpointPath.isEmpty() || !QFile::exists(_neuralCheckpointPath)) {
-        QMessageBox::warning(this, "Error", "Please select a valid checkpoint file.");
-        return;
-    }
-
-    QString tracePyPath = findNeuralTracePyPath();
-    if (tracePyPath.isEmpty()) {
-        QMessageBox::warning(this, "Error",
-            "Could not find trace.py. Set NEURAL_TRACE_PY_PATH environment variable.");
-        return;
-    }
-
-    // Get volume zarr path. trace.py declares --volume_zarr as
-    // click.Path(exists=True), so it needs a directory that exists on this
-    // filesystem and cannot take a remote locator. A streaming-only volume has
-    // an empty path(), and forwarding that gets the child killed in argument
-    // parsing, which reaches the user only as "Neural trace failed (exit code
-    // 2)". NeuralTraceServiceManager already screens the same argument before
-    // starting the trace service; this is the equivalent screen for the
-    // one-shot path.
-    std::filesystem::path volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        QMessageBox::warning(this, "Error",
-            "Neural tracing needs a local volume: trace.py reads the zarr from "
-            "disk and cannot stream from a remote volume.");
-        return;
-    }
-    QString volumeZarr = QString::fromStdString(volumePath.string());
-
-    // Get output path (paths directory in the volume package)
-    std::filesystem::path pathsDir;
-    if (fVpkg && fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-    } else if (fVpkg && fVpkg->hasVolumes()) {
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-    } else {
-        QMessageBox::warning(this, "Error", "Could not determine output directory.");
-        return;
-    }
-
-    QString outPath = QString::fromStdString(pathsDir.string());
-
-    // Get focus point coordinates (trace.py expects XYZ)
-    const cv::Vec3f& p = focusPoi->p;
-    int startX = static_cast<int>(p[0]);
-    int startY = static_cast<int>(p[1]);
-    int startZ = static_cast<int>(p[2]);
-
-    // Find Python executable - use custom path if specified, otherwise auto-detect
-    QString python = _neuralPythonPath.isEmpty() ? vc3d::findPythonExecutable() : _neuralPythonPath;
-
-    // Build arguments
-    QStringList args = {
-        tracePyPath,
-        "--checkpoint_path", _neuralCheckpointPath,
-        "--out_path", outPath,
-        "--start_xyz", QString::number(startX), QString::number(startY), QString::number(startZ),
-        "--volume_zarr", volumeZarr,
-        "--volume_scale", QString::number(_neuralVolumeScale),
-        "--steps_per_crop", QString::number(_neuralStepsPerCrop),
-        "--max_size", QString::number(_neuralMaxSize),
-        "--save_partial"
-    };
-
-    // Update UI
-    infoLabel->setText("Running neural trace...");
-    _btnNeuralTrace->setEnabled(false);
-    // A neural trace shares the batch teardown but has no seeding batch of its own.
-    _batch.reset();
-    jobsRunning = true;
-    cancelButton->setVisible(true);
-
-    // Create process
-    QProcess* process = new QProcess(this);
-    process->setProcessChannelMode(QProcess::MergedChannels);
-    process->setWorkingDirectory(outPath);
-
-    // Connect finished signal
-    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-        [this, process](int exitCode, QProcess::ExitStatus exitStatus) {
-            jobsRunning = false;
-            cancelButton->setVisible(false);
-            runningProcesses.removeOne(process);
-            process->deleteLater();
-
-            if (exitStatus == QProcess::CrashExit) {
-                infoLabel->setText("Neural trace crashed.");
-                emit sendStatusMessageAvailable("Neural trace process crashed", 5000);
-            } else if (exitCode != 0) {
-                infoLabel->setText(QString("Neural trace failed (exit code %1)").arg(exitCode));
-                emit sendStatusMessageAvailable(QString("Neural trace failed with exit code %1").arg(exitCode), 5000);
-            } else {
-                infoLabel->setText("Neural trace completed successfully.");
-                emit sendStatusMessageAvailable("Neural trace completed successfully", 5000);
-            }
-
-            updateButtonStates();
-        });
-
-    // Connect output signal for logging
-    connect(process, &QProcess::readyReadStandardOutput, [process]() {
-        QString output = QString::fromUtf8(process->readAllStandardOutput());
-        std::cout << "[neural-trace] " << output.toStdString();
-    });
-
-    // Log command and start
-    std::cout << "Starting neural trace: " << python.toStdString();
-    for (const QString& arg : args) {
-        std::cout << " " << arg.toStdString();
-    }
-    std::cout << std::endl;
-
-    process->start(python, args);
-    runningProcesses.append(QPointer<QProcess>(process));
-
-    if (!process->waitForStarted(5000)) {
-        QMessageBox::warning(this, "Error", "Failed to start neural trace process.");
-        jobsRunning = false;
-        cancelButton->setVisible(false);
-        runningProcesses.removeOne(process);
-        process->deleteLater();
-        updateButtonStates();
-        return;
-    }
-
-    emit sendStatusMessageAvailable(QString("Neural trace started from (%1, %2, %3)").arg(startX).arg(startY).arg(startZ), 5000);
 }

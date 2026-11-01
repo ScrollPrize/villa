@@ -1,17 +1,28 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
-#include "OpenDataSegmentCache.hpp"
+
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 class VolumePkg;
 
 namespace vc3d::opendata {
+
+// The stage of opening a sample: "resolving-volumes", then "project-ready".
+struct OpenDataSampleDownloadProgress {
+    std::string status;
+};
+
+using OpenDataSampleProgressCallback =
+    std::function<void(const OpenDataSampleDownloadProgress&)>;
 
 struct OpenDataSampleProjectResult {
     int supportedVolumes = 0;
@@ -20,21 +31,34 @@ struct OpenDataSampleProjectResult {
     int failedVolumes = 0;
     int attachedLasagnaDatasets = 0;
     int attachedNormalGrids = 0;
-    int supportedTifxyzSegments = 0;
-    int cachedTifxyzSegments = 0;
-    int attachedSegmentEntries = 0;
-    int skippedTifxyzSegments = 0;
-    int failedTifxyzSegments = 0;
-    int transformedTifxyzSegments = 0;
-    int failedTransformedTifxyzSegments = 0;
     std::string preferredVolumeId;
     std::vector<std::string> messages;
 };
 
-// selection optionally restricts attached volumes and derived
-// representations; nullptr attaches everything.
+// A project of a sample at a chosen path (instead of the sample's own).
+struct OpenDataNewProject {
+    std::filesystem::path path;
+    std::string name;
+};
+
+// The sample's own project: <projects>/open_data/<sample>.vcproj.
+[[nodiscard]] std::filesystem::path sampleProjectPath(const std::filesystem::path& projectsDirectory,
+                                                      const vcr::catalog::OpenDataSample& sample);
+// Create a project file and separate store for the sample.
+void createSampleProjectFiles(const std::filesystem::path& path, const vcr::catalog::OpenDataSample& sample,
+                              const std::string& name, const vc::objects::OpenOptions& options);
+// The Open Data sample recorded in a project file.
+[[nodiscard]] std::optional<std::string> openDataProjectSample(const VolumePkg& project);
+
+// Populate the project file and the attached sample store with catalog
+// surfaces, volumes, normal grids and Lasagna datasets,
+// as `selection` restricts them (nullptr: everything); resources already there
+// stay as they are. Returns the opened, resolved project.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
-    const OpenDataSample& sample,
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const std::filesystem::path& projectPath,
+    const vc::objects::AttachmentIdentity& project,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut = nullptr,
     const OpenDataSampleProgressCallback& progressCallback = {},
@@ -42,14 +66,7 @@ struct OpenDataSampleProjectResult {
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const OpenDataResourceSelection* selection = nullptr);
-
-void attachOpenDataSampleSegments(
-    VolumePkg& pkg,
-    const OpenDataSample& sample,
-    const std::filesystem::path& remoteCacheRoot,
-    OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback = {});
 
 } // namespace vc3d::opendata

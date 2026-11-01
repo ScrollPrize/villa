@@ -3,7 +3,6 @@ row 0. Previews are exported from a synthetic spiral through the identity
 transform, so each vertex's radius and z say where it belongs."""
 import json
 import math
-from unittest import mock
 
 import click
 import numpy as np
@@ -15,7 +14,6 @@ from fit_session import ScrollSpecError, parse_scroll_spec
 from lasagna_publish import _raw_run_diff_rgba
 from loss_maps import LossMapRecorder, capture_loss_maps, record_loss_samples
 from render_ink import concat_meshes
-from sample_spiral import get_spiral_yxs
 import spiral_helpers
 from surface_orientation import GridLayout, export_metadata, spiral_outward_sense_for
 from tifxyz import save_tifxyz
@@ -33,14 +31,12 @@ class IdentityTransform:
 def export_preview(path, z_direction_is_top_to_bottom):
     cfg = {"shell_outer_winding_idx": WINDINGS[-1], "output_step_size": STEP,
            "model_flow_bounds_z_margin": 0}
-    with mock.patch.object(spiral_helpers, "get_spiral_yxs",
-                           lambda *a, **k: get_spiral_yxs(*a, **k, device="cpu")):
-        return spiral_helpers.save_combined_preview(
-            IdentityTransform(), torch.tensor(DR), [], [], path, cfg,
-            z_begin=0, z_end=Z_END, voxel_size_um=9.6,
-            get_or_build_unattached_pcl_flat=lambda *_: None,
-            surface_id="surface",
-            z_direction_is_top_to_bottom=z_direction_is_top_to_bottom)
+    return spiral_helpers.save_combined_preview(
+        IdentityTransform(), torch.tensor(DR), [], [], path, cfg,
+        z_begin=0, z_end=Z_END, voxel_size_um=9.6,
+        get_or_build_unattached_pcl_flat=lambda *_: None,
+        surface_id="surface",
+        z_direction_is_top_to_bottom=z_direction_is_top_to_bottom)
 
 
 def read_zyx(surface):

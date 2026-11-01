@@ -41,7 +41,6 @@ public:
 signals:
     void profileChanged(const QString& profileId);
     void textChanged();
-    void userProfilesChanged();
 
 private:
     void applyProfile(const QString& profileId, bool fromUi);

@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from satisfaction_metrics import (
@@ -151,3 +152,30 @@ def test_90k_one_quad_patches_use_point_chunks_not_patch_calls():
     assert transform.forward_calls == expected
     assert transform.inverse_calls == expected
     assert evaluation.profiles.keys() == {'strict', 'splicing'}
+
+
+@pytest.mark.parametrize('device', [
+    'cpu', pytest.param('mps', marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason='needs MPS'))])
+def test_satisfied_fractions_are_compared_in_float64(monkeypatch, device):
+    # 1 + 1e-9 is 1.0 in float32, so a float32 comparison calls this fully
+    # satisfied one-quad patch satisfied, and float64 does not. On the CPU
+    # the float32 precision cap stands in for MPS, which has no float64.
+    import devices
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '32')
+    devices.max_precision_bits.cache_clear()
+    patch = patch_from_centres([[spiral_point(.2, 3)]])
+
+    def strict(fraction):
+        monkeypatch.setitem(metrics_config, 'satisfied_patch_quad_fraction', fraction)
+        monkeypatch.setitem(metrics_config, 'boundary_satisfied_patch_quad_fraction', fraction)
+        profile = evaluate_patch_satisfaction_packed(
+            CountingIdentityTransform(), torch.tensor(10.0, device=device), [patch],
+            _ListPatchAtlas([patch], torch.device(device)), -1, 1,
+            include_splicing=False).profiles['strict']
+        return bool(profile.satisfied_patches.item()), bool(profile.boundary_satisfied_patches.item())
+    try:
+        assert strict(1.0) == (True, True)
+        assert strict(1 + 1e-9) == (False, False)
+    finally:
+        devices.max_precision_bits.cache_clear()

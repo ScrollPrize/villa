@@ -19,6 +19,7 @@
 #include <lz4.h>
 #include <zlib.h>
 #include <utils/c3d_codec.hpp>
+#include <utils/volcomp_codec.hpp>
 
 #include "vc/core/util/CacheCompression.hpp"
 
@@ -38,7 +39,7 @@ std::vector<std::byte> bloscCompressForTest(
 // Compressor configuration (parsed from .zarray JSON)
 // ============================================================================
 
-enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d, Delta3d };
+enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d, Delta3d, Volcomp };
 
 struct CompressorConfig {
     CompressorId id = CompressorId::None;
@@ -52,6 +53,9 @@ struct CompressorConfig {
     int level = 3;
     // c3d target compression ratio (> 1.0). Default 50 ≈ 40 dB on scroll CT.
     float c3d_target_ratio = 50.0f;
+    // volcomp quantiser step: 0 = lossless, 1..255 = lossy DCT.
+    // Default 8 ≈ 40 dB / ~40x on scroll CT.
+    float volcomp_q = 8.0f;
 };
 
 namespace {
@@ -117,6 +121,9 @@ void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> 
                                         output.size(), /*nthreads=*/1);
     if (rc < 0) {
         throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
+    }
+    if (static_cast<size_t>(rc) != output.size()) {
+        throw std::runtime_error("blosc_decompress_ctx returned unexpected byte count");
     }
 }
 
@@ -247,6 +254,19 @@ std::vector<std::byte> c3dCompress(std::span<const std::byte> input,
     return utils::c3d_encode(input, p);
 }
 
+std::vector<std::byte> volcompDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    return utils::volcomp_decode(input, outputSize);
+}
+
+std::vector<std::byte> volcompCompress(std::span<const std::byte> input,
+                                       const CompressorConfig& cfg)
+{
+    utils::VolcompCodecParams p;
+    p.q = cfg.volcomp_q;
+    return utils::volcomp_encode(input, p);
+}
+
 void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     z_stream stream{};
@@ -263,6 +283,9 @@ void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> o
     inflateEnd(&stream);
     if (rc != Z_STREAM_END && rc != Z_OK) {
         throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
+    }
+    if (rc != Z_STREAM_END || stream.total_out != output.size()) {
+        throw std::runtime_error("gzip inflate returned unexpected byte count or incomplete stream");
     }
 }
 
@@ -290,6 +313,8 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
         return gzipDecompress(input, outputSize);
     case CompressorId::C3d:
         return c3dDecompress(input, outputSize);
+    case CompressorId::Volcomp:
+        return volcompDecompress(input, outputSize);
     case CompressorId::Delta3d: {
         auto decoded = vc::cacheDecompress(input, outputSize);
         if (!decoded) {
@@ -331,6 +356,9 @@ bool decompressBytesInto(const CompressorConfig& cfg,
         return true;
     case CompressorId::C3d:
         return false;
+    case CompressorId::Volcomp:
+        utils::volcomp_decode_into(input, output);
+        return true;
     case CompressorId::Delta3d:
         if (!vc::cacheDecompressInto(input, output)) {
             throw std::runtime_error(
@@ -357,10 +385,12 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return gzipCompress(input, cfg);
     case CompressorId::C3d:
         return c3dCompress(input, cfg);
+    case CompressorId::Volcomp:
+        return volcompCompress(input, cfg);
     case CompressorId::Delta3d:
         // Encoding needs the chunk shape, which this byte-oriented layer
-        // does not have. Volumes are written in this format by
-        // scripts/recompress_zarr.py (or the chunk-cache writer).
+        // does not have. Volumes are written in this format by the
+        // chunk-cache writer.
         throw std::runtime_error(
             "writing delta3d zarr chunks is not supported here");
     }
@@ -407,6 +437,11 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
             cfg.level = meta.compression_level > 0 ? meta.compression_level : 5;
         } else if (meta.compressor_id == "c3d") {
             cfg.id = CompressorId::C3d;
+        } else if (meta.compressor_id == "volcomp") {
+            cfg.id = CompressorId::Volcomp;
+            // q=0 is volcomp's lossless mode: honour it rather than falling
+            // back to the lossy default when rewriting such an array.
+            if (meta.codec_q) cfg.volcomp_q = *meta.codec_q;
         } else if (vc::isDelta3dCodecName(meta.compressor_id)) {
             cfg.id = CompressorId::Delta3d;
         } else {
@@ -432,6 +467,14 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
                     && cc.configuration->contains("target_ratio")) {
                     cfg.c3d_target_ratio = cc.configuration->value(
                         "target_ratio", cfg.c3d_target_ratio);
+                }
+                return true;
+            }
+            if (cc.name == "volcomp") {
+                cfg.id = CompressorId::Volcomp;
+                if (cc.configuration && cc.configuration->is_object()
+                    && cc.configuration->contains("q")) {
+                    cfg.volcomp_q = cc.configuration->value("q", cfg.volcomp_q);
                 }
                 return true;
             }
@@ -474,13 +517,14 @@ utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize)
 {
     utils::ZarrArray::CodecRegistry reg;
     for (const char* name :
-         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d",
+         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d", "volcomp",
           vc::kDelta3dCodecName, vc::kVcz1CodecName}) {
         CompressorConfig cfg;
         if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
         else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
         else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
         else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
+        else if (std::string(name) == "volcomp") cfg.id = CompressorId::Volcomp;
         else if (vc::isDelta3dCodecName(name))
             cfg.id = CompressorId::Delta3d;
         else                                   cfg.id = CompressorId::Gzip;
@@ -526,23 +570,33 @@ struct VcDataset::Impl {
     void open(const std::filesystem::path& path) {
         fsPath = path;
         // Remote volumes stage source metadata as .zarray files, then store
-        // the local c3d disk cache beside it as zarr.json. openZarrLevels()
-        // only selects directories with .zarray, so prefer that source
+        // the local c3d disk cache beside it as zarr.json. Prefer that source
         // metadata here when both files exist; otherwise a reopened remote
         // cache would rebuild the HTTP source from the local cache metadata.
         if (std::filesystem::exists(path / ".zarray")) {
             auto meta = utils::detail::parse_zarray(readTextFile(path / ".zarray"));
             auto registry = buildZarrCodecRegistry(/*dtypeSize guess*/1);
             utils::ZarrArray::Codec codec;
-            if (!meta.compressor_id.empty()) {
+            if (meta.compressor_id == "volcomp") {
+                // The registry entry carries the default q; writes must use
+                // the q recorded in the metadata (decoding reads it from
+                // each chunk header and needs no parameter).
+                codec = codecFromConfig(compressorFromMeta(meta, 1));
+            } else if (!meta.compressor_id.empty()) {
                 auto it = registry.find(meta.compressor_id);
                 if (it != registry.end()) codec = it->second;
             }
             zarrArray_ = std::make_unique<utils::ZarrArray>(
                 utils::ZarrArray::open_with_metadata(path, std::move(meta), std::move(codec)));
         } else {
-            zarrArray_ = std::make_unique<utils::ZarrArray>(
-                utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1)));
+            auto arr = utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1));
+            if (utils::is_canonical_volcomp(arr.metadata())) {
+                // Same as above for v3: pick up configuration.q for writes.
+                auto meta = arr.metadata();
+                auto codec = codecFromConfig(compressorFromMeta(meta, 1));
+                arr = utils::ZarrArray::open_with_metadata(path, std::move(meta), std::move(codec));
+            }
+            zarrArray_ = std::make_unique<utils::ZarrArray>(std::move(arr));
         }
         const auto& meta = zarrArray_->metadata();
 
@@ -612,7 +666,6 @@ size_t VcDataset::defaultChunkSize() const { return impl_->chunkSize_; }
 VcDtype VcDataset::getDtype() const { return impl_->dtype_; }
 size_t VcDataset::dtypeSize() const { return impl_->dtypeSize_; }
 const std::filesystem::path& VcDataset::path() const { return impl_->fsPath; }
-const std::string& VcDataset::delimiter() const { return impl_->delimiter_; }
 
 void VcDataset::decompress(std::span<const uint8_t> compressed,
                             void* output, size_t nElements) const
@@ -666,6 +719,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             break;
         }
 
+        case CompressorId::Volcomp:
         case CompressorId::Delta3d: {
             auto out = std::span<std::byte>(
                 reinterpret_cast<std::byte*>(output), outBytes);
@@ -876,181 +930,9 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
     return iterChunks(0);
 }
 
-bool VcDataset::writeRegion(const std::vector<size_t>& offset,
-                             const std::vector<size_t>& regionShape,
-                             const void* data)
-{
-    for (size_t d = 0; d < regionShape.size(); ++d) {
-        if (regionShape[d] == 0) return true;
-    }
-    // Refuse a region that does not lie inside the dataset, as readRegion does (the bounds
-    // contract in VcDataset.hpp). Checked with subtraction so offset + extent cannot overflow.
-    const auto& dsShape = impl_->shape_;
-    if (offset.size() != dsShape.size() || regionShape.size() != dsShape.size()) return false;
-    for (size_t d = 0; d < dsShape.size(); ++d) {
-        if (offset[d] > dsShape[d] || regionShape[d] > dsShape[d] - offset[d]) return false;
-    }
-
-    const size_t ndim = offset.size();
-    const auto& chunkShape = impl_->chunkShape_;
-    const size_t elemSize = impl_->dtypeSize_;
-    const auto* inBytes = static_cast<const uint8_t*>(data);
-
-    size_t chunkElems = 1;
-    for (size_t d = 0; d < ndim; ++d) chunkElems *= chunkShape[d];
-
-    std::vector<size_t> chunkStart(ndim), chunkEnd(ndim);
-    for (size_t d = 0; d < ndim; ++d) {
-        chunkStart[d] = offset[d] / chunkShape[d];
-        chunkEnd[d] = (offset[d] + regionShape[d] - 1) / chunkShape[d];
-    }
-
-    std::vector<size_t> regionStrides(ndim);
-    regionStrides[ndim - 1] = elemSize;
-    for (int d = static_cast<int>(ndim) - 2; d >= 0; --d)
-        regionStrides[d] = regionStrides[d + 1] * regionShape[d + 1];
-
-    std::vector<size_t> chunkStrides(ndim);
-    chunkStrides[ndim - 1] = elemSize;
-    for (int d = static_cast<int>(ndim) - 2; d >= 0; --d)
-        chunkStrides[d] = chunkStrides[d + 1] * chunkShape[d + 1];
-
-    std::vector<uint8_t> chunkBuf(chunkElems * elemSize);
-
-    std::vector<size_t> ci(ndim);
-    std::function<bool(size_t)> iterChunks = [&](size_t dim) -> bool {
-        if (dim == ndim) {
-            std::array<size_t, 3> indices;
-            for (size_t d = 0; d < ndim && d < 3; ++d) indices[d] = ci[d];
-            auto idxSpan = std::span<const size_t>(indices.data(), ndim);
-
-            // Check if we're writing a full chunk
-            bool fullChunk = true;
-            for (size_t d = 0; d < ndim; ++d) {
-                size_t chunkGlobalStart = ci[d] * chunkShape[d];
-                if (chunkGlobalStart < offset[d] ||
-                    chunkGlobalStart + chunkShape[d] > offset[d] + regionShape[d]) {
-                    fullChunk = false;
-                    break;
-                }
-            }
-
-            // If partial, read existing chunk first
-            if (!fullChunk) {
-                auto existing = impl_->zarrArray_->read_chunk(idxSpan);
-                if (existing && existing->size() >= chunkElems * elemSize) {
-                    std::memcpy(chunkBuf.data(), existing->data(), chunkElems * elemSize);
-                } else {
-                    std::memset(chunkBuf.data(), 0, chunkElems * elemSize);
-                }
-            }
-
-            // Compute overlap
-            std::vector<size_t> copyStart(ndim), copySize(ndim);
-            for (size_t d = 0; d < ndim; ++d) {
-                size_t chunkGlobalStart = ci[d] * chunkShape[d];
-                size_t chunkGlobalEnd = chunkGlobalStart + chunkShape[d];
-                size_t regStart = offset[d];
-                size_t regEnd = offset[d] + regionShape[d];
-                copyStart[d] = std::max(chunkGlobalStart, regStart);
-                copySize[d] = std::min(chunkGlobalEnd, regEnd) - copyStart[d];
-            }
-
-            // Copy from input to chunk buffer
-            std::vector<size_t> pos(ndim, 0);
-            std::function<void(size_t)> copyLoop = [&](size_t d) {
-                if (d == ndim - 1) {
-                    size_t srcOff = 0, dstOff = 0;
-                    for (size_t dd = 0; dd < ndim; ++dd) {
-                        size_t regLocal = copyStart[dd] + pos[dd] - offset[dd];
-                        size_t chunkLocal = copyStart[dd] + pos[dd] - ci[dd] * chunkShape[dd];
-                        srcOff += regLocal * regionStrides[dd];
-                        dstOff += chunkLocal * chunkStrides[dd];
-                    }
-                    std::memcpy(chunkBuf.data() + dstOff, inBytes + srcOff, copySize[d] * elemSize);
-                    return;
-                }
-                for (size_t i = 0; i < copySize[d]; ++i) {
-                    pos[d] = i;
-                    copyLoop(d + 1);
-                }
-            };
-
-            copyLoop(0);
-
-            // Write the chunk
-            auto byteSpan = std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(chunkBuf.data()),
-                chunkElems * elemSize);
-            impl_->zarrArray_->write_chunk(idxSpan, byteSpan);
-            return true;
-        }
-        for (ci[dim] = chunkStart[dim]; ci[dim] <= chunkEnd[dim]; ++ci[dim]) {
-            if (!iterChunks(dim + 1)) return false;
-        }
-        return true;
-    };
-    return iterChunks(0);
-}
-
 // ============================================================================
 // Factory functions
 // ============================================================================
-
-std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
-    const std::filesystem::path& zarrRoot)
-{
-    std::vector<std::string> levelNames;
-
-    // Prefer OME-Zarr .zattrs multiscales metadata for level discovery.
-    auto zattrs = readZarrAttributes(zarrRoot);
-    bool gotFromAttrs = false;
-    if (zattrs.contains("multiscales") && zattrs["multiscales"].is_array()
-        && zattrs["multiscales"].size() > 0) {
-        auto ms0 = zattrs["multiscales"][0];
-        if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
-            for (const auto& ds : ms0["datasets"]) {
-                if (ds.contains("path")) {
-                    std::string p = ds["path"].get_string();
-                    // Verify the array actually exists on disk
-                    if (std::filesystem::exists(zarrRoot / p / ".zarray")) {
-                        levelNames.push_back(std::move(p));
-                    }
-                }
-            }
-            gotFromAttrs = !levelNames.empty();
-        }
-    }
-
-    // Fallback: scan subdirectories for .zarray (legacy / non-OME zarrs).
-    if (!gotFromAttrs) {
-        for (auto& entry : std::filesystem::directory_iterator(zarrRoot)) {
-            if (!entry.is_directory()) continue;
-            auto p = entry.path();
-            if (std::filesystem::exists(p / ".zarray")) {
-                levelNames.push_back(p.filename().string());
-            }
-        }
-        // Sort numerically where possible, lexicographically otherwise.
-        std::sort(levelNames.begin(), levelNames.end(),
-                  [](const std::string& a, const std::string& b) {
-                      int ia = 0, ib = 0;
-                      bool aNum = false, bNum = false;
-                      try { ia = std::stoi(a); aNum = true; } catch (...) {}
-                      try { ib = std::stoi(b); bNum = true; } catch (...) {}
-                      if (aNum && bNum) return ia < ib;
-                      if (aNum != bNum) return aNum;
-                      return a < b;
-                  });
-    }
-
-    std::vector<std::unique_ptr<VcDataset>> result;
-    result.reserve(levelNames.size());
-    for (auto& name : levelNames) {
-        result.push_back(std::make_unique<VcDataset>(zarrRoot / name));
-    }
-    return result;
-}
 
 utils::Json readZarrAttributes(const std::filesystem::path& groupPath)
 {
@@ -1099,6 +981,15 @@ std::unique_ptr<VcDataset> createZarrDataset(
         // Default level 3 (blosc/zstd) preserves prior behaviour; an explicit
         // compressionLevel > 0 overrides it.
         meta.compression_level = compressionLevel > 0 ? compressionLevel : 3;
+        if (compressor == "volcomp") {
+            // volcomp's atom is a 128^3 u8 chunk; its "level" is the quantiser step q.
+            if (dtype != VcDtype::uint8 || chunks.size() != 3 ||
+                chunks[0] != 128 || chunks[1] != 128 || chunks[2] != 128) {
+                throw std::runtime_error(
+                    "createZarrDataset: volcomp requires uint8 data and 128^3 chunks");
+            }
+            meta.codec_q = compressionLevel > 0 ? static_cast<float>(compressionLevel) : 8.0f;
+        }
     }
 
     // ZarrArray::create writes the .zarray file for us.

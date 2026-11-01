@@ -50,8 +50,28 @@ class RenderLoggingTests(unittest.TestCase):
         self.assert_logged_error(["--num-parts", "0"], "need 0 <= part-id < num-parts")
         self.assertTrue(self.log.read_text().startswith("earlier run\n"))
 
+    def test_invalid_surface_interpolation_is_rejected(self):
+        # Validated in the same place as --accum-type: after --segmentation is
+        # checked, but before the volume is opened.
+        seg = ["-s", str(self.root / "absent.tifxyz")]
+        self.assert_logged_error(
+            seg + ["--surface-interpolation", "bogus"],
+            "invalid --surface-interpolation",
+        )
+
+    def test_valid_surface_interpolation_values_are_accepted(self):
+        # These get past flag parsing and fail later, on the absent volume.
+        seg = ["-s", str(self.root / "absent.tifxyz")]
+        for value in ("linear", "smooth", "bicubic", "SMOOTH"):
+            with self.subTest(value=value):
+                result = self.run_renderer(
+                    seg + ["--surface-interpolation", value], logged=False
+                )
+                self.assertNotIn("invalid --surface-interpolation", result.stderr)
+                self.assertIn("Error opening local zarr:", result.stderr)
+
     def test_missing_segmentation_preserves_error(self):
-        self.assert_logged_error([], "--segmentation required")
+        self.assert_logged_error([], "give --segmentation, or --store with one --surface")
 
     def test_caught_volume_error_preserves_diagnostic(self):
         self.assert_logged_error(

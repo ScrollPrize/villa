@@ -153,6 +153,17 @@ export default function ScrollDetailPage(props) {
       : "";
   const segments = scroll.n_segments;
   const segmentsTxt = segments != null ? Number(segments).toLocaleString() : "—";
+  const preds = scroll.predictions || [];
+  const predsTxt = [
+    preds.filter((p) => p.purpose === "surface-prediction").length
+      ? `${preds.filter((p) => p.purpose === "surface-prediction").length} surface`
+      : null,
+    preds.filter((p) => p.purpose === "ink-detection-3d").length
+      ? `${preds.filter((p) => p.purpose === "ink-detection-3d").length} 3D-ink`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   // Furthest pipeline stage reached.
   const reachedStages = STAGES.filter((s) => stageReached(stages, s.key));
@@ -333,6 +344,12 @@ export default function ScrollDetailPage(props) {
                 <dd>{scroll.n_scans}</dd>
                 <dt>Volumes</dt>
                 <dd>{scroll.n_volumes}</dd>
+                {predsTxt ? (
+                  <React.Fragment>
+                    <dt>Predictions</dt>
+                    <dd>{predsTxt}</dd>
+                  </React.Fragment>
+                ) : null}
               </dl>
 
               {/* Pipeline stepper */}

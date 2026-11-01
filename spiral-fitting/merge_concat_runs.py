@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+import uuid
 
 import cv2
 import numpy as np
@@ -68,7 +69,7 @@ def invalid_mask(pts):
 
 def resample_to(pts, target_hw):
     """Linear-resample (H,W,3) points to target (H,W), re-masking invalid regions
-    with -1 (same approach as scripts/repair_tifxyz_spacing.py:resample_points)."""
+    with -1."""
     th, tw = target_hw
     if pts.shape[:2] == (th, tw):
         out = pts.copy()
@@ -76,10 +77,9 @@ def resample_to(pts, target_hw):
         out[inv] = -1.0
         return out, ~inv
     out = cv2.resize(pts, (tw, th), interpolation=cv2.INTER_LINEAR)
-    inv = invalid_mask(pts).astype(np.uint8) * 255
-    inv_r = cv2.resize(inv, (tw, th), interpolation=cv2.INTER_NEAREST)
-    inv_r = cv2.dilate(inv_r, np.ones((3, 3), np.uint8), iterations=1)
-    bad = inv_r > 0
+    inv_r = cv2.resize(invalid_mask(pts).astype(np.float32), (tw, th), interpolation=cv2.INTER_LINEAR)
+    bad = cv2.dilate((inv_r > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1) > 0
+    bad |= ~np.isfinite(out).all(axis=-1)
     out[bad] = -1.0
     return out, ~bad
 
@@ -109,10 +109,10 @@ def meta_of(winding_dir):
         return json.load(f)
 
 
-def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_metadata):
+def save_tifxyz(pts, out_winding_dir, step_size, voxel_um, source, layout_metadata=None):
     """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
     `pts` is (H,W,3) in x,y,z order with -1 for invalid, in the layout
-    `layout_metadata` records."""
+    `layout_metadata` records. A new surface receives a fresh random UUID."""
     os.makedirs(out_winding_dir, exist_ok=True)
     tifffile.imwrite(os.path.join(out_winding_dir, "x.tif"), pts[..., 0].astype(np.float32))
     tifffile.imwrite(os.path.join(out_winding_dir, "y.tif"), pts[..., 1].astype(np.float32))
@@ -137,7 +137,7 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_
         "area_cm2": area_vx2 * voxel_um ** 2 / 1.0e8 if voxel_um else None,
         "format": "tifxyz",
         "type": "seg",
-        "uuid": uuid,
+        "uuid": str(uuid.uuid4()),
         "source": source,
     }
     if layout_metadata is not None:
@@ -227,7 +227,7 @@ def main():
         merged[~np.isfinite(merged).all(axis=-1)] = -1.0
         merged = merged.astype(np.float32)
 
-        area = save_tifxyz(merged, os.path.join(args.out, w), w, step_size, voxel_um,
+        area = save_tifxyz(merged, os.path.join(args.out, w), step_size, voxel_um,
                            f"merge_concat_runs {args.method} of {len(wdirs)} runs",
                            ref_layout)
         n_pts = int((merged[..., 0] != -1).sum())

@@ -47,7 +47,7 @@ import JsonLd from '@site/src/components/JsonLd';
 </figure>
 
 
-**Code is on Github: [Luke](https://github.com/lukeboi/scroll-first-letters), [Youssef](https://github.com/younader/Vesuvius-First-Letters).**
+**Code is on Github: [Luke](https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters), [Youssef](https://github.com/younader/Vesuvius-First-Letters).**
 
 The Herculaneum papyri, ancient scrolls housed in the library of a private villa near Pompeii, were buried and carbonized by the eruption of Vesuvius in 79 AD. For almost 2,000 years, this lone surviving library from antiquity was buried underground under 20 meters of volcanic mud. In the 1700s, they were excavated, and while they were in some ways preserved by the eruption, they were so fragile that they would turn to dust if mishandled. How do you read a scroll you can’t open? For hundreds of years, this question went unanswered.
 
@@ -160,7 +160,7 @@ Indeed, the word held up to scrutiny. “Porphyras” is an exciting word: it me
 
 If you’re trying to find these letters in the image, keep in mind that our modern characters look a little bit different. The letters in this ancient script look more like this: ΠΟΡΦΥΡΑϹ. Note that texts from this time didn’t use spaces, making it harder to determine word boundaries.
 
-Luke’s First Letters Prize submission is available now on <a href="https://github.com/lukeboi/scroll-first-letters">GitHub</a>.
+Luke’s First Letters Prize submission is available now on <a href="https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters">GitHub</a>.
 
 <figure>
   <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.webp" alt="Animated reaction of Luke celebrating when told he won the prize." />
@@ -224,7 +224,7 @@ The segmentation team and contestants continue to make progress, and a few days 
 
 <figure>
   <img src="/img/firstletters/youssef-new.webp" alt="Youssef's latest image showing four and a half columns of scroll text separated by margins." />
-  <figcaption className="mt-0">Youssef’s <a target="_blank" href="/img/firstletters/youssef-new.webp">latest image</a> (<a target="_blank" href="/img/firstletters/composite_fullsize.webp">variant</a>), from segments <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20230929220924/">20230929220924</a> and <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20231005123333/">20231005123333</a>.</figcaption>
+  <figcaption className="mt-0">Youssef’s <a target="_blank" href="/img/firstletters/youssef-new.webp">latest image</a> (<a target="_blank" href="/img/firstletters/composite_fullsize.webp">variant</a>), from segments <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20230929220924_superseded/">20230929220924</a> and <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20231005123333_superseded/">20231005123333</a>.</figcaption>
 </figure>
 
 In this image you can clearly see four and a half columns of text, separated by margins. Many more letters are now visible, though not all are immediately legible. Our papyrological team is working hard to further investigate this result, and we’ll have updates on this soon.
@@ -237,4 +237,4 @@ Will you be the one unlocking the knowledge in hundreds of scrolls — doubling 
 
 The race is on.
 
-**Code is on Github: [Luke](https://github.com/lukeboi/scroll-first-letters), [Youssef](https://github.com/younader/Vesuvius-First-Letters).**
+**Code is on Github: [Luke](https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters), [Youssef](https://github.com/younader/Vesuvius-First-Letters).**

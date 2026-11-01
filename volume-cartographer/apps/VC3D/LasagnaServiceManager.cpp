@@ -1,5 +1,6 @@
 #include "LasagnaServiceManager.hpp"
-#include "PythonExecutable.hpp"
+#include "ObjectStoreRegions.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -8,7 +9,6 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QFutureWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -19,10 +19,8 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QSysInfo>
-#include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QUrl>
-#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <filesystem>
@@ -84,283 +82,6 @@ void logTransferTiming(const char* label, qint64 bytes, double seconds)
               << " (" << rate << " MiB/s)" << std::endl;
 }
 
-QString stripTifxyzSuffix(const QString& name)
-{
-    return name.endsWith(QStringLiteral(".tifxyz"))
-        ? name.left(name.size() - 7)
-        : name;
-}
-
-QString stripVersionSuffix(const QString& base)
-{
-    const int pos = base.lastIndexOf(QStringLiteral("_v"));
-    if (pos < 0 || pos + 2 >= base.size()) {
-        return base;
-    }
-    for (int i = pos + 2; i < base.size(); ++i) {
-        if (!base[i].isDigit()) {
-            return base;
-        }
-    }
-    return base.left(pos);
-}
-
-QString objectRefKey(const QJsonObject& ref)
-{
-    return ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
-        + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
-        + ref[QStringLiteral("hash")].toString();
-}
-
-QString md5Ref(const QByteArray& bytes)
-{
-    return QStringLiteral("md5:%1").arg(QString::fromLatin1(
-        QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
-}
-
-QString md5DigestRef(const QByteArray& digest)
-{
-    return QStringLiteral("md5:%1").arg(QString::fromLatin1(digest.toHex()));
-}
-
-QByteArray jsonString(const QString& value)
-{
-    QByteArray encoded =
-        QJsonDocument(QJsonArray{value}).toJson(QJsonDocument::Compact);
-    return encoded.mid(1, encoded.size() - 2);
-}
-
-void writeUploadBytes(QIODevice& output, const QByteArray& bytes)
-{
-    if (output.write(bytes) != bytes.size()) {
-        throw std::runtime_error("Cannot write temporary artifact upload");
-    }
-}
-
-QString writeBase64File(QIODevice& output, const QString& path)
-{
-    QFile input(path);
-    if (!input.open(QIODevice::ReadOnly)) {
-        throw std::runtime_error(
-            QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
-    }
-
-    constexpr qint64 kChunkBytes = 3 * 1024 * 1024;
-    QCryptographicHash hash(QCryptographicHash::Md5);
-    while (!input.atEnd()) {
-        const QByteArray chunk = input.read(kChunkBytes);
-        if (chunk.isEmpty() && input.error() != QFileDevice::NoError) {
-            throw std::runtime_error(
-                QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
-        }
-        hash.addData(chunk);
-        writeUploadBytes(output, chunk.toBase64());
-    }
-    return md5DigestRef(hash.result());
-}
-
-std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
-    const QJsonObject& upload)
-{
-    auto body = std::make_shared<QTemporaryFile>(
-        QDir::temp().filePath(QStringLiteral("vc3d-lasagna-upload-XXXXXX.json")));
-    body->setAutoRemove(true);
-    if (!body->open()) {
-        throw std::runtime_error("Cannot create temporary artifact upload");
-    }
-
-    if (upload.contains(QStringLiteral("data"))
-        || upload.contains(QStringLiteral("files"))) {
-        writeUploadBytes(
-            *body, QJsonDocument(upload).toJson(QJsonDocument::Compact));
-        body->seek(0);
-        return body;
-    }
-
-    const QJsonObject ref = upload[QStringLiteral("object")].toObject();
-    const QString payload = upload[QStringLiteral("_local_payload")].toString();
-    const QString localPath = upload[QStringLiteral("_local_path")].toString();
-    if (ref.isEmpty()) {
-        throw std::runtime_error("Artifact upload is missing its object reference");
-    }
-
-    writeUploadBytes(
-        *body,
-        QByteArrayLiteral("{\"object\":")
-            + QJsonDocument(ref).toJson(QJsonDocument::Compact));
-
-    if (payload.isEmpty() || localPath.isEmpty()) {
-        throw std::runtime_error("Artifact upload is missing its local payload");
-    }
-
-    if (payload == QStringLiteral("file")) {
-        writeUploadBytes(*body, QByteArrayLiteral(",\"data\":\""));
-        const QString actualHash = writeBase64File(*body, localPath);
-        if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(
-                QStringLiteral("Artifact file hash mismatch for %1: declared %2 actual %3")
-                    .arg(ref[QStringLiteral("name")].toString(),
-                         ref[QStringLiteral("hash")].toString(), actualHash)
-                    .toStdString());
-        }
-        writeUploadBytes(*body, QByteArrayLiteral("\"}"));
-        body->seek(0);
-        return body;
-    }
-
-    if (payload == QStringLiteral("directory")) {
-        namespace fs = std::filesystem;
-        const fs::path root(localPath.toStdString());
-        std::vector<fs::path> files;
-        std::error_code ec;
-        for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-            if (entry.is_regular_file()) {
-                files.push_back(entry.path());
-            }
-        }
-        if (ec) {
-            throw std::runtime_error(QStringLiteral("Cannot scan artifact directory: %1").arg(localPath).toStdString());
-        }
-        std::sort(files.begin(), files.end());
-
-        QByteArray manifest;
-        writeUploadBytes(*body, QByteArrayLiteral(",\"files\":{"));
-        bool first = true;
-        for (const auto& path : files) {
-            const auto relPath = fs::relative(path, root, ec);
-            if (ec) {
-                throw std::runtime_error(
-                    QStringLiteral("Cannot compute artifact relative path: %1")
-                        .arg(QString::fromStdString(path.string()))
-                        .toStdString());
-            }
-            const QString rel = QString::fromStdString(relPath.generic_string());
-            if (!first) writeUploadBytes(*body, QByteArrayLiteral(","));
-            first = false;
-            writeUploadBytes(*body, jsonString(rel) + QByteArrayLiteral(":\""));
-            const QString fileHash = writeBase64File(
-                *body, QString::fromStdString(path.string()));
-            writeUploadBytes(*body, QByteArrayLiteral("\""));
-            manifest.append(rel.toUtf8());
-            manifest.append('\t');
-            manifest.append(fileHash.toUtf8());
-            manifest.append('\n');
-        }
-        const QString actualHash = md5Ref(manifest);
-        if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(
-                QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
-                    .arg(ref[QStringLiteral("name")].toString(),
-                         ref[QStringLiteral("hash")].toString(), actualHash)
-                    .toStdString());
-        }
-        writeUploadBytes(*body, QByteArrayLiteral("}}"));
-        body->seek(0);
-        return body;
-    }
-
-    throw std::runtime_error(
-        QStringLiteral("Unknown local artifact payload kind: %1")
-            .arg(payload).toStdString());
-}
-
-void appendObjectRefIfNew(QJsonArray& refs, QSet<QString>& refKeys, const QJsonObject& ref)
-{
-    if (ref.isEmpty() ||
-        !ref.contains(QStringLiteral("type")) ||
-        !ref.contains(QStringLiteral("name")) ||
-        !ref.contains(QStringLiteral("hash"))) {
-        return;
-    }
-    const QString key = objectRefKey(ref);
-    if (refKeys.contains(key)) {
-        return;
-    }
-    refs.append(ref);
-    refKeys.insert(key);
-}
-
-void collectObjectRefs(QJsonArray& refs, QSet<QString>& refKeys, const QJsonValue& value)
-{
-    if (value.isArray()) {
-        for (const QJsonValue& child : value.toArray()) {
-            collectObjectRefs(refs, refKeys, child);
-        }
-        return;
-    }
-    if (!value.isObject()) {
-        return;
-    }
-    const QJsonObject obj = value.toObject();
-    appendObjectRefIfNew(refs, refKeys, obj);
-    for (const QJsonValue& child : obj) {
-        collectObjectRefs(refs, refKeys, child);
-    }
-}
-
-QString uniqueSegmentName(const QString& targetDir, const QString& requestedName)
-{
-    const QString suffix = QStringLiteral(".tifxyz");
-    const QString requested = requestedName.endsWith(suffix)
-        ? requestedName
-        : requestedName + suffix;
-    const QDir dir(targetDir);
-    if (!dir.exists(requested)) {
-        return requested;
-    }
-
-    const QString root = stripVersionSuffix(stripTifxyzSuffix(requested));
-    const QString prefix = root + QStringLiteral("_v");
-    int maxVersion = 0;
-    const QFileInfoList entries = dir.entryInfoList(QStringList{QStringLiteral("*.tifxyz")},
-                                                    QDir::Dirs | QDir::NoDotAndDotDot);
-    for (const QFileInfo& entry : entries) {
-        const QString name = entry.fileName();
-        if (!name.startsWith(prefix) || !name.endsWith(suffix)) {
-            continue;
-        }
-        const QString digits = name.mid(prefix.size(), name.size() - prefix.size() - suffix.size());
-        if (digits.isEmpty()) {
-            continue;
-        }
-        bool ok = false;
-        const int version = digits.toInt(&ok);
-        if (ok) {
-            maxVersion = std::max(maxVersion, version);
-        }
-    }
-
-    QString candidate;
-    int version = maxVersion + 1;
-    do {
-        candidate = QStringLiteral("%1_v%2%3")
-            .arg(root)
-            .arg(version++, 3, 10, QLatin1Char('0'))
-            .arg(suffix);
-    } while (dir.exists(candidate));
-    return candidate;
-}
-
-void updateTifxyzMetadataIdentity(const QString& tifxyzDir, const QString& name)
-{
-    QFile metaFile(QDir(tifxyzDir).filePath(QStringLiteral("meta.json")));
-    if (!metaFile.open(QIODevice::ReadOnly)) {
-        return;
-    }
-    QJsonDocument doc = QJsonDocument::fromJson(metaFile.readAll());
-    metaFile.close();
-    if (!doc.isObject()) {
-        return;
-    }
-    QJsonObject root = doc.object();
-    root[QStringLiteral("uuid")] = name;
-    root[QStringLiteral("name")] = name;
-    if (!metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        return;
-    }
-    metaFile.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-}
-
 QNetworkRequest fitServiceRequest(const QUrl& url)
 {
     QNetworkRequest req(url);
@@ -374,88 +95,40 @@ bool isTransportError(const QNetworkReply* reply)
         && !reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).isValid();
 }
 
-struct ResultsPlacementResult
+QString findPythonExecutable()
 {
-    bool ok{false};
-    QString error;
-    QString targetDir;
-    QStringList placedNames;
-    QStringList warnings;
-};
+    QStringList candidates;
 
-ResultsPlacementResult placeResultsArchive(const QByteArray& data,
-                                           const QString& targetDir,
-                                           const QString& expectedOutputName = QString())
-{
-    ResultsPlacementResult result;
-    result.targetDir = targetDir;
-
-    QDir().mkpath(targetDir);
-    QTemporaryDir unpackDir(QDir(targetDir).filePath(QStringLiteral(".lasagna_unpack_XXXXXX")));
-    if (!unpackDir.isValid()) {
-        result.error = QObject::tr("Cannot create temporary unpack directory in %1").arg(targetDir);
-        return result;
+    QString envPython = qEnvironmentVariable("PYTHON_EXECUTABLE");
+    if (!envPython.isEmpty()) {
+        candidates.append(envPython);
     }
 
-    QString tarPath = QDir(unpackDir.path()).filePath(QStringLiteral(".lasagna_results.tar.gz"));
-    QFile tarFile(tarPath);
-    if (!tarFile.open(QIODevice::WriteOnly)) {
-        result.error = QObject::tr("Cannot write temp file: %1").arg(tarPath);
-        return result;
-    }
-    tarFile.write(data);
-    tarFile.close();
-
-    QProcess tar;
-    tar.setWorkingDirectory(unpackDir.path());
-    tar.start(QStringLiteral("tar"), {QStringLiteral("xzf"), tarPath});
-    if (!tar.waitForFinished(30000)) {
-        QFile::remove(tarPath);
-        result.error = QObject::tr("tar extraction timed out");
-        return result;
-    }
-    QFile::remove(tarPath);
-
-    if (tar.exitCode() != 0) {
-        QString err = QString::fromUtf8(tar.readAllStandardError());
-        result.error = QObject::tr("tar extraction failed: %1").arg(err);
-        return result;
+    QString condaPrefix = qEnvironmentVariable("CONDA_PREFIX");
+    if (!condaPrefix.isEmpty()) {
+        candidates.append(QDir(condaPrefix).filePath("bin/python"));
+        candidates.append(QDir(condaPrefix).filePath("bin/python3"));
     }
 
-    QDir unpackRoot(unpackDir.path());
-    const QFileInfoList children = unpackRoot.entryInfoList(
-        QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot);
-    const QString expectedName = expectedOutputName.trimmed();
-    const bool useExpectedName = !expectedName.isEmpty() && children.size() == 1;
-    for (const QFileInfo& child : children) {
-        if (child.fileName() == QStringLiteral(".lasagna_results.tar.gz")) {
-            continue;
+    QString home = QDir::homePath();
+    candidates.append(QDir(home).filePath("miniconda3/bin/python"));
+    candidates.append(QDir(home).filePath("miniconda3/bin/python3"));
+    candidates.append(QDir(home).filePath("anaconda3/bin/python"));
+    candidates.append(QDir(home).filePath("anaconda3/bin/python3"));
+
+    candidates.append("python3");
+    candidates.append("python");
+    candidates.append("/usr/bin/python3");
+    candidates.append("/usr/local/bin/python3");
+
+    for (const QString& candidate : candidates) {
+        QProcess test;
+        test.start(candidate, {"--version"});
+        if (test.waitForFinished(1000) && test.exitCode() == 0) {
+            return candidate;
         }
-        const QString finalName = uniqueSegmentName(
-            targetDir,
-            useExpectedName ? expectedName : child.fileName());
-        const QString finalPath = QDir(targetDir).filePath(finalName);
-        if (QFileInfo::exists(finalPath)) {
-            result.error = QObject::tr("Refusing to overwrite existing segment: %1").arg(finalPath);
-            return result;
-        }
-        if (child.isDir() && finalName.endsWith(QStringLiteral(".tifxyz"))) {
-            updateTifxyzMetadataIdentity(child.absoluteFilePath(), finalName);
-            if (finalName != child.fileName()) {
-                result.warnings << QObject::tr(
-                    "Lasagna result name collision: requested %1, placed as %2.")
-                    .arg(child.fileName(), finalName);
-            }
-        }
-        if (!QDir().rename(child.absoluteFilePath(), finalPath)) {
-            result.error = QObject::tr("Cannot place downloaded result: %1").arg(finalPath);
-            return result;
-        }
-        result.placedNames << finalName;
     }
-
-    result.ok = true;
-    return result;
+    return "python3";
 }
 
 QString findLasagnaServiceScript()
@@ -576,7 +249,6 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
     }
 
     ++_requestGeneration;
-    clearLocalUploadJobs();
     _isExternal = true;
     _host = host;
     _port = port;
@@ -621,6 +293,8 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
             return;
         }
 
+        _serviceStoreUuid = QJsonDocument::fromJson(reply->readAll()).object()
+                                .value(QStringLiteral("store_uuid")).toString();
         _serviceReady = true;
         _pollTimer->start();
         emit statusMessage(tr("Connected to external service on %1:%2").arg(_host).arg(_port));
@@ -633,7 +307,6 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
                                          const QString& dataDirectory)
 {
     ++_requestGeneration;
-    clearLocalUploadJobs();
     _lastError.clear();
     _serviceReady = false;
     _port = 0;
@@ -664,6 +337,12 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
         return false;
     }
     _dataDirectory = dataDirectoryInfo.absoluteFilePath();
+    if (_storePath.isEmpty()) {
+        _lastError = tr("Lasagna needs an attached object store.");
+        emit serviceError(_lastError);
+        return false;
+    }
+    _serviceStorePath = _storePath;
 
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -719,12 +398,14 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     }
     _process->setProcessEnvironment(env);
 
-    QString python = pythonPath.isEmpty() ? vc3d::findPythonExecutable() : pythonPath;
+    QString python = pythonPath.isEmpty() ? findPythonExecutable() : pythonPath;
 
     // Port 0 = auto-select
     QStringList args = {
         scriptPath, QStringLiteral("--port"), QStringLiteral("0"),
-        QStringLiteral("--data-dir"), _dataDirectory
+        QStringLiteral("--data-dir"), _dataDirectory,
+        // The service writes into this process's store file; its session syncs it.
+        QStringLiteral("--store"), _serviceStorePath, QStringLiteral("--shared-store")
     };
 
     emit statusMessage(tr("Starting lasagna service..."));
@@ -799,13 +480,13 @@ void LasagnaServiceManager::stopService()
     ++_requestGeneration;
     _pollTimer->stop();
     _statusRequestInFlight = false;
-    clearLocalUploadJobs();
 
     if (_isExternal) {
         // External mode: just reset state, don't terminate any process
         _serviceReady = false;
         _optimizationRunning = false;
         _isExternal = false;
+        _serviceStoreUuid.clear();
         _dataDirectory.clear();
         _host = QStringLiteral("127.0.0.1");
         _port = 0;
@@ -813,8 +494,6 @@ void LasagnaServiceManager::stopService()
         _submittedJobIds.clear();
         _startedJobIds.clear();
         _completedJobIds.clear();
-        _jobOutputDirs.clear();
-        _jobOutputNames.clear();
         _lastJobs = QJsonArray();
         _lastQueueGeneration = -1;
         _fetchedQueueGeneration = -1;
@@ -874,8 +553,6 @@ void LasagnaServiceManager::stopService()
     _submittedJobIds.clear();
     _startedJobIds.clear();
     _completedJobIds.clear();
-    _jobOutputDirs.clear();
-    _jobOutputNames.clear();
     _lastJobs = QJsonArray();
     _lastQueueGeneration = -1;
     _fetchedQueueGeneration = -1;
@@ -904,342 +581,6 @@ QString LasagnaServiceManager::findConfigFile(const QString& fileName)
                                   .filePath(QStringLiteral("configs/%1").arg(fileName));
     return QFileInfo(candidate).isFile() ? QFileInfo(candidate).absoluteFilePath()
                                          : QString{};
-}
-
-QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(
-    const QString& tifxyzDirectory)
-{
-    namespace fs = std::filesystem;
-    const fs::path root(tifxyzDirectory.toStdString());
-    std::error_code ec;
-    if (!fs::is_directory(root, ec)) {
-        return {};
-    }
-
-    std::vector<fs::path> files;
-    for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-        if (entry.is_regular_file()) {
-            files.push_back(entry.path());
-        }
-    }
-    if (ec || files.empty()) {
-        return {};
-    }
-    std::sort(files.begin(), files.end());
-
-    QByteArray manifest;
-    for (const auto& path : files) {
-        QFile file(QString::fromStdString(path.string()));
-        if (!file.open(QIODevice::ReadOnly)) {
-            return {};
-        }
-        const QByteArray bytes = file.readAll();
-        const fs::path relative = fs::relative(path, root, ec);
-        if (ec) {
-            return {};
-        }
-        manifest.append(QString::fromStdString(relative.generic_string()).toUtf8());
-        manifest.append('\t');
-        manifest.append(md5Ref(bytes).toUtf8());
-        manifest.append('\n');
-    }
-
-    QJsonObject ref;
-    ref[QStringLiteral("type")] = QStringLiteral("tifxyz_segment");
-    ref[QStringLiteral("name")] = QFileInfo(tifxyzDirectory).fileName();
-    ref[QStringLiteral("hash")] = md5Ref(manifest);
-
-    QJsonObject upload;
-    upload[QStringLiteral("object")] = ref;
-    upload[QStringLiteral("_local_payload")] = QStringLiteral("directory");
-    upload[QStringLiteral("_local_path")] = QFileInfo(tifxyzDirectory).absoluteFilePath();
-    return upload;
-}
-
-void LasagnaServiceManager::rankLaplaceSnapPairs(
-    const QJsonObject& request,
-    std::function<void(const QJsonObject&)> onSuccess,
-    std::function<void(const QString&)> onError,
-    std::function<void(int, const QJsonObject&)> onPartialResult)
-{
-    if (!isRunning()) {
-        const QString msg = tr("Lasagna service is not running.");
-        if (onError) {
-            onError(msg);
-        }
-        return;
-    }
-
-    QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));
-    QNetworkRequest req = fitServiceRequest(url);
-    req.setRawHeader(kVc3dSourceHeader, localSourceName().toUtf8());
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    const quint64 generation = _requestGeneration;
-    QJsonObject jobRequest = request;
-    jobRequest[QStringLiteral("job_type")] = QStringLiteral("laplace_rank");
-    jobRequest[QStringLiteral("config_name")] = QStringLiteral("Atlas snap rank");
-    const QByteArray body = QJsonDocument(jobRequest).toJson(QJsonDocument::Compact);
-    const int jobCount = request.value(QStringLiteral("jobs")).toArray().size();
-    auto timer = std::make_shared<QElapsedTimer>();
-    timer->start();
-    std::cout << "[lasagna] queued laplace rank request:"
-              << " jobs=" << jobCount
-              << " bytes=" << body.size()
-              << " url=" << url.toString().toStdString()
-              << std::endl;
-    QNetworkReply* reply = _nam->post(req, body);
-    connect(reply, &QNetworkReply::finished, this,
-            [this,
-             reply,
-             generation,
-             timer,
-             jobCount,
-             onSuccess = std::move(onSuccess),
-             onError = std::move(onError),
-             onPartialResult = std::move(onPartialResult)]() mutable {
-        if (generation != _requestGeneration) {
-            reply->deleteLater();
-            return;
-        }
-        const QByteArray bytes = reply->readAll();
-        const QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
-        std::cout << "[lasagna] queued laplace rank submit response:"
-                  << " elapsed=" << elapsedSeconds(*timer) << "s";
-        if (status.isValid()) {
-            std::cout << " http=" << status.toInt();
-        } else {
-            std::cout << " http=<none>";
-        }
-        std::cout << " error=" << reply->error()
-                  << " bytes=" << bytes.size()
-                  << std::endl;
-        reply->deleteLater();
-
-        auto fail = [this, onError](const QString& msg) {
-            _lastError = msg;
-            std::cerr << "[lasagna] queued laplace rank error: "
-                      << msg.toStdString() << std::endl;
-            if (onError) {
-                onError(msg);
-            }
-        };
-
-        if (isTransportError(reply)) {
-            fail(tr("Laplace rank submit failed: %1").arg(reply->errorString()));
-            return;
-        }
-        if (!validateApiVersion(reply, tr("Laplace rank submit"))) {
-            if (onError) {
-                onError(_lastError);
-            }
-            return;
-        }
-
-        QJsonParseError parseError;
-        const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
-        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-            fail(tr("Laplace rank submit returned malformed JSON at byte %1: %2")
-                     .arg(parseError.offset)
-                     .arg(parseError.errorString()));
-            return;
-        }
-        const QJsonObject obj = doc.object();
-        if (reply->error() != QNetworkReply::NoError ||
-            obj.contains(QStringLiteral("error"))) {
-            const QString serviceError = obj[QStringLiteral("error")].toString(reply->errorString());
-            const QString code = obj[QStringLiteral("code")].toString();
-            fail(code.isEmpty()
-                     ? tr("Laplace rank submit failed: %1").arg(serviceError)
-                     : tr("Laplace rank submit failed (%1): %2").arg(code, serviceError));
-            return;
-        }
-        const QString jobId = obj[QStringLiteral("job_id")].toString();
-        if (jobId.isEmpty()) {
-            fail(tr("Laplace rank submit returned no job id"));
-            return;
-        }
-
-        _submittedJobIds.insert(jobId);
-        _activeJobId = jobId;
-        _optimizationRunning = true;
-        _pollTimer->start();
-        emit jobStarted(jobId);
-        emit optimizationStarted();
-        fetchJobs();
-
-        struct RankPollState
-        {
-            QString jobId;
-            int afterSeq{0};
-            int expectedResults{0};
-            int receivedResults{0};
-            QJsonArray results;
-            QSet<int> seenIndices;
-            int finishedPollsWaitingForEvents{0};
-            bool done{false};
-        };
-        auto state = std::make_shared<RankPollState>();
-        state->jobId = jobId;
-        state->expectedResults = jobCount;
-        for (int i = 0; i < jobCount; ++i) {
-            state->results.append(QJsonValue());
-        }
-
-        auto* pollTimer = new QTimer(this);
-        pollTimer->setInterval(kPollIntervalMs);
-        auto poll = std::make_shared<std::function<void()>>();
-        auto finishWithError = std::make_shared<std::function<void(const QString&)>>();
-        *finishWithError = [this, pollTimer, state, fail](const QString& msg) {
-            if (state->done) {
-                return;
-            }
-            state->done = true;
-            pollTimer->stop();
-            pollTimer->deleteLater();
-            _completedJobIds.insert(state->jobId);
-            fail(msg);
-        };
-        *poll = [this,
-                 generation,
-                 state,
-                 pollTimer,
-                 poll,
-                 finishWithError,
-                 onSuccess,
-                 onPartialResult]() {
-            if (state->done || generation != _requestGeneration) {
-                return;
-            }
-            QUrl eventsUrl(QStringLiteral("%1/jobs/%2/events?after=%3")
-                               .arg(baseUrl(), state->jobId)
-                               .arg(state->afterSeq));
-            QNetworkRequest eventsReq = fitServiceRequest(eventsUrl);
-            QNetworkReply* eventsReply = _nam->get(eventsReq);
-            connect(eventsReply, &QNetworkReply::finished, this,
-                    [this,
-                     eventsReply,
-                     generation,
-                     state,
-                     pollTimer,
-                     finishWithError,
-                     onSuccess,
-                     onPartialResult]() {
-                if (state->done || generation != _requestGeneration) {
-                    eventsReply->deleteLater();
-                    return;
-                }
-                const QByteArray eventBytes = eventsReply->readAll();
-                if (isTransportError(eventsReply) ||
-                    !validateApiVersion(eventsReply, tr("Laplace rank events")) ||
-                    eventsReply->error() != QNetworkReply::NoError) {
-                    const QString msg = tr("Laplace rank event poll failed: %1")
-                                            .arg(eventsReply->errorString());
-                    eventsReply->deleteLater();
-                    (*finishWithError)(msg);
-                    return;
-                }
-                QJsonParseError eventParseError;
-                const QJsonDocument eventDoc = QJsonDocument::fromJson(eventBytes, &eventParseError);
-                eventsReply->deleteLater();
-                if (eventParseError.error != QJsonParseError::NoError || !eventDoc.isObject()) {
-                    (*finishWithError)(tr("Laplace rank events returned malformed JSON"));
-                    return;
-                }
-                const QJsonObject eventRoot = eventDoc.object();
-                const QJsonArray events = eventRoot[QStringLiteral("events")].toArray();
-                for (const QJsonValue& value : events) {
-                    const QJsonObject event = value.toObject();
-                    state->afterSeq = std::max(state->afterSeq, event[QStringLiteral("seq")].toInt());
-                    if (event[QStringLiteral("type")].toString() != QStringLiteral("laplace_rank_result")) {
-                        continue;
-                    }
-                    const int index = event[QStringLiteral("index")].toInt(-1);
-                    if (index < 0 || index >= state->expectedResults) {
-                        continue;
-                    }
-                    if (!state->seenIndices.contains(index)) {
-                        state->seenIndices.insert(index);
-                        ++state->receivedResults;
-                    }
-                    const QJsonValue resultValue = event[QStringLiteral("result")];
-                    state->results.replace(index, resultValue);
-                    if (onPartialResult) {
-                        onPartialResult(index, resultValue.toObject());
-                    }
-                }
-
-                QUrl statusUrl(QStringLiteral("%1/jobs/%2").arg(baseUrl(), state->jobId));
-                QNetworkRequest statusReq = fitServiceRequest(statusUrl);
-                QNetworkReply* statusReply = _nam->get(statusReq);
-                connect(statusReply, &QNetworkReply::finished, this,
-                        [this, statusReply, generation, state, pollTimer, finishWithError, onSuccess]() {
-                    if (state->done || generation != _requestGeneration) {
-                        statusReply->deleteLater();
-                        return;
-                    }
-                    const QByteArray statusBytes = statusReply->readAll();
-                    if (isTransportError(statusReply) ||
-                        !validateApiVersion(statusReply, tr("Laplace rank status")) ||
-                        statusReply->error() != QNetworkReply::NoError) {
-                        const QString msg = tr("Laplace rank status poll failed: %1")
-                                                .arg(statusReply->errorString());
-                        statusReply->deleteLater();
-                        (*finishWithError)(msg);
-                        return;
-                    }
-                    QJsonParseError statusParseError;
-                    const QJsonDocument statusDoc = QJsonDocument::fromJson(statusBytes, &statusParseError);
-                    statusReply->deleteLater();
-                    if (statusParseError.error != QJsonParseError::NoError || !statusDoc.isObject()) {
-                        (*finishWithError)(tr("Laplace rank status returned malformed JSON"));
-                        return;
-                    }
-                    const QJsonObject statusObj = statusDoc.object();
-                    updateCachedJobFromStatus(statusObj);
-                    const QString stateText = statusObj[QStringLiteral("state")].toString();
-                    if (stateText == QStringLiteral("finished")) {
-                        if (state->receivedResults != state->expectedResults) {
-                            ++state->finishedPollsWaitingForEvents;
-                            std::cerr << "[lasagna] queued laplace rank finished but waiting for events:"
-                                      << " received=" << state->receivedResults
-                                      << " expected=" << state->expectedResults
-                                      << " poll=" << state->finishedPollsWaitingForEvents
-                                      << std::endl;
-                            if (state->finishedPollsWaitingForEvents < 10) {
-                                return;
-                            }
-                            (*finishWithError)(
-                                tr("Laplace rank finished with %1/%2 result events after waiting")
-                                    .arg(state->receivedResults)
-                                    .arg(state->expectedResults));
-                            return;
-                        }
-                        state->done = true;
-                        pollTimer->stop();
-                        pollTimer->deleteLater();
-                        _completedJobIds.insert(state->jobId);
-                        QJsonObject response;
-                        response[QStringLiteral("results")] = state->results;
-                        if (onSuccess) {
-                            onSuccess(response);
-                        }
-                    } else if (stateText == QStringLiteral("error") ||
-                               stateText == QStringLiteral("cancelled")) {
-                        QString msg = statusObj[QStringLiteral("error")].toString();
-                        if (msg.isEmpty()) {
-                            msg = stateText == QStringLiteral("cancelled")
-                                ? tr("Laplace rank cancelled")
-                                : tr("Laplace rank failed");
-                        }
-                        (*finishWithError)(msg);
-                    }
-                });
-            });
-        };
-        connect(pollTimer, &QTimer::timeout, this, [poll]() { (*poll)(); });
-        (*poll)();
-        pollTimer->start();
-    });
 }
 
 bool LasagnaServiceManager::validateApiVersion(QNetworkReply* reply, const QString& context)
@@ -1283,7 +624,6 @@ void LasagnaServiceManager::handleProcessFinished(int exitCode, QProcess::ExitSt
     _jobsRequestInFlight = false;
     _jobsRequestPending = false;
     _activeJobId.clear();
-    clearLocalUploadJobs();
     emit serviceStopped();
 }
 
@@ -1343,50 +683,6 @@ void LasagnaServiceManager::handleReadyReadStderr()
 // HTTP communication
 // ---------------------------------------------------------------------------
 
-void LasagnaServiceManager::upsertLocalUploadJob(const QJsonObject& job)
-{
-    const QString jobId = job[QStringLiteral("job_id")].toString();
-    if (jobId.isEmpty()) {
-        return;
-    }
-    if (!_localUploadJobs.contains(jobId)) {
-        _localUploadOrder.append(jobId);
-    }
-    _localUploadJobs.insert(jobId, job);
-    emitJobsUpdatedOverlay();
-}
-
-void LasagnaServiceManager::updateLocalUploadJob(const QString& jobId, const QJsonObject& updates)
-{
-    if (!_localUploadJobs.contains(jobId)) {
-        return;
-    }
-    QJsonObject job = _localUploadJobs.value(jobId);
-    for (auto it = updates.constBegin(); it != updates.constEnd(); ++it) {
-        job[it.key()] = it.value();
-    }
-    _localUploadJobs.insert(jobId, job);
-    emitJobsUpdatedOverlay();
-
-    if (job[QStringLiteral("state")].toString() == QStringLiteral("upload")) {
-        emit artifactUploadProgress(jobId,
-                                    job[QStringLiteral("upload_current")].toInt(),
-                                    job[QStringLiteral("upload_total")].toInt(),
-                                    job[QStringLiteral("upload_progress")].toDouble(),
-                                    job[QStringLiteral("upload_label")].toString());
-    }
-}
-
-void LasagnaServiceManager::removeLocalUploadJob(const QString& jobId)
-{
-    if (!_localUploadJobs.remove(jobId)) {
-        return;
-    }
-    _localUploadOrder.removeAll(jobId);
-    _cancelledLocalUploadJobs.remove(jobId);
-    emitJobsUpdatedOverlay();
-}
-
 void LasagnaServiceManager::updateCachedJobFromStatus(const QJsonObject& status)
 {
     const QString state = status[QStringLiteral("state")].toString();
@@ -1436,440 +732,14 @@ void LasagnaServiceManager::updateCachedJobFromStatus(const QJsonObject& status)
         return;
     }
     _lastJobs = updated;
-    emitJobsUpdatedOverlay();
+    emit jobsUpdated(_lastJobs);
 }
 
-QJsonArray LasagnaServiceManager::jobsWithLocalUploads(const QJsonArray& serviceJobs) const
-{
-    QJsonArray jobs;
-    for (const QString& jobId : _localUploadOrder) {
-        if (_localUploadJobs.contains(jobId)) {
-            jobs.append(_localUploadJobs.value(jobId));
-        }
-    }
-    for (const QJsonValue& value : serviceJobs) {
-        jobs.append(value);
-    }
-    return jobs;
-}
-
-void LasagnaServiceManager::emitJobsUpdatedOverlay()
-{
-    emit jobsUpdated(jobsWithLocalUploads(_lastJobs));
-}
-
-void LasagnaServiceManager::clearLocalUploadJobs()
-{
-    if (_activeArtifactReply) {
-        _activeArtifactReply->abort();
-        _activeArtifactReply = nullptr;
-    }
-    _activeArtifactReplyJobId.clear();
-    _artifactUploadQueue.clear();
-    _hasActiveArtifactUpload = false;
-    _activeArtifactUpload = ArtifactUploadJob{};
-    _cancelledLocalUploadJobs.clear();
-    _localUploadJobs.clear();
-    _localUploadOrder.clear();
-    emitJobsUpdatedOverlay();
-}
-
-void LasagnaServiceManager::finishActiveArtifactUpload()
-{
-    if (!_hasActiveArtifactUpload) {
-        return;
-    }
-    _activeArtifactReply = nullptr;
-    _activeArtifactReplyJobId.clear();
-    _cancelledLocalUploadJobs.remove(_activeArtifactUpload.jobId);
-    _activeArtifactUpload = ArtifactUploadJob{};
-    _hasActiveArtifactUpload = false;
-}
-
-bool LasagnaServiceManager::cancelLocalUploadJob(const QString& jobId)
-{
-    if (!_localUploadJobs.contains(jobId)) {
-        return false;
-    }
-
-    for (int i = 0; i < _artifactUploadQueue.size(); ++i) {
-        if (_artifactUploadQueue[i].jobId == jobId) {
-            _artifactUploadQueue.removeAt(i);
-            updateLocalUploadJob(jobId, {
-                {QStringLiteral("state"), QStringLiteral("cancelled")},
-                {QStringLiteral("error"), tr("Artifact upload cancelled")},
-            });
-            return true;
-        }
-    }
-
-    if (_hasActiveArtifactUpload && _activeArtifactUpload.jobId == jobId) {
-        _cancelledLocalUploadJobs.insert(jobId);
-        updateLocalUploadJob(jobId, {
-            {QStringLiteral("state"), QStringLiteral("cancelled")},
-            {QStringLiteral("error"), tr("Artifact upload cancelled")},
-        });
-        if (_activeArtifactReply) {
-            _activeArtifactReply->abort();
-        } else {
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-        }
-        return true;
-    }
-
-    updateLocalUploadJob(jobId, {
-        {QStringLiteral("state"), QStringLiteral("cancelled")},
-        {QStringLiteral("error"), tr("Artifact upload cancelled")},
-    });
-    return true;
-}
-
-void LasagnaServiceManager::enqueueArtifactUpload(const QJsonObject& requestConfig,
-                                                  const QJsonArray& objects,
-                                                  const QString& localOutputDir,
-                                                  const QString& source)
-{
-    const QString localJobId = QStringLiteral("vc3d-upload-%1").arg(_nextLocalUploadId++);
-    QJsonObject localJob;
-    localJob[QStringLiteral("job_id")] = localJobId;
-    localJob[QStringLiteral("source")] = source;
-    localJob[QStringLiteral("config_name")] = requestConfig[QStringLiteral("config_name")].toString();
-    localJob[QStringLiteral("output_name")] = requestConfig[QStringLiteral("output_name")].toString();
-    localJob[QStringLiteral("state")] = QStringLiteral("upload");
-    localJob[QStringLiteral("upload_state")] = QStringLiteral("queued");
-    localJob[QStringLiteral("upload_label")] = tr("Waiting to upload artifacts");
-    localJob[QStringLiteral("upload_current")] = 0;
-    localJob[QStringLiteral("upload_total")] = 0;
-    localJob[QStringLiteral("upload_progress")] = 0.0;
-    localJob[QStringLiteral("submitted_at")] = static_cast<double>(QDateTime::currentSecsSinceEpoch());
-    upsertLocalUploadJob(localJob);
-
-    _artifactUploadQueue.append(ArtifactUploadJob{
-        localJobId,
-        requestConfig,
-        objects,
-        localOutputDir,
-        source,
-    });
-    emit statusMessage(tr("Queued Lasagna artifact upload for %1")
-                           .arg(localJob[QStringLiteral("output_name")].toString()));
-    processNextArtifactUpload();
-}
-
-void LasagnaServiceManager::processNextArtifactUpload()
-{
-    if (_hasActiveArtifactUpload || _artifactUploadQueue.isEmpty()) {
-        return;
-    }
-    _activeArtifactUpload = _artifactUploadQueue.takeFirst();
-    _hasActiveArtifactUpload = true;
-    const QString localJobId = _activeArtifactUpload.jobId;
-    const QJsonObject requestConfig = _activeArtifactUpload.requestConfig;
-    const QJsonArray objects = _activeArtifactUpload.objects;
-    const QString localOutputDir = _activeArtifactUpload.localOutputDir;
-    const QString source = _activeArtifactUpload.source;
-
-    updateLocalUploadJob(localJobId, {
-        {QStringLiteral("upload_state"), QStringLiteral("checking")},
-        {QStringLiteral("upload_label"), tr("Checking remote artifacts")},
-        {QStringLiteral("upload_current"), 0},
-        {QStringLiteral("upload_total"), 0},
-        {QStringLiteral("upload_progress"), 0.0},
-    });
-    emit statusMessage(tr("Checking Lasagna artifacts..."));
-
-    QJsonArray refs;
-    QSet<QString> refKeys;
-    const QJsonObject jobSpec = requestConfig[QStringLiteral("job_spec")].toObject();
-    appendObjectRefIfNew(refs, refKeys, jobSpec[QStringLiteral("model")].toObject());
-    appendObjectRefIfNew(refs, refKeys, jobSpec[QStringLiteral("atlas")].toObject());
-    collectObjectRefs(refs, refKeys, jobSpec[QStringLiteral("object_refs")]);
-    collectObjectRefs(refs, refKeys,
-                      jobSpec[QStringLiteral("config")].toObject()[QStringLiteral("atlas")]);
-    for (const QJsonValue& value : jobSpec[QStringLiteral("linked_surfaces")].toArray()) {
-        appendObjectRefIfNew(refs, refKeys, value.toObject());
-    }
-    for (const QJsonValue& value : objects) {
-        const QJsonObject upload = value.toObject();
-        appendObjectRefIfNew(refs, refKeys, upload[QStringLiteral("object")].toObject());
-    }
-
-    QJsonObject queryBody;
-    queryBody[QStringLiteral("objects")] = refs;
-    QUrl queryUrl(QStringLiteral("%1/objects/query").arg(baseUrl()));
-    QNetworkRequest queryReq = fitServiceRequest(queryUrl);
-    queryReq.setRawHeader(kVc3dSourceHeader, source.toUtf8());
-    queryReq.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    const quint64 generation = _requestGeneration;
-    QNetworkReply* queryReply = _nam->post(
-        queryReq, QJsonDocument(queryBody).toJson(QJsonDocument::Compact));
-    _activeArtifactReply = queryReply;
-    _activeArtifactReplyJobId = localJobId;
-    connect(queryReply, &QNetworkReply::finished, this,
-            [this, queryReply, localJobId, objects, requestConfig, localOutputDir, source, generation]() {
-        if (generation != _requestGeneration) {
-            queryReply->deleteLater();
-            return;
-        }
-        _activeArtifactReply = nullptr;
-        _activeArtifactReplyJobId.clear();
-        queryReply->deleteLater();
-
-        if (_cancelledLocalUploadJobs.contains(localJobId)) {
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        if (isTransportError(queryReply)) {
-            const QString msg = tr("Artifact query failed: %1").arg(queryReply->errorString());
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), msg},
-            });
-            emit optimizationError(msg);
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        if (!validateApiVersion(queryReply, tr("Artifact query"))) {
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), _lastError},
-            });
-            emit optimizationError(_lastError);
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        if (queryReply->error() != QNetworkReply::NoError) {
-            const QString msg = tr("Artifact query failed: %1").arg(queryReply->errorString());
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), msg},
-            });
-            emit optimizationError(msg);
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        const QJsonObject response = QJsonDocument::fromJson(queryReply->readAll()).object();
-        if (response.contains(QStringLiteral("error"))) {
-            const QString msg = response[QStringLiteral("error")].toString();
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), msg},
-            });
-            emit optimizationError(msg);
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        QSet<QString> missing;
-        for (const QJsonValue& value : response[QStringLiteral("missing")].toArray()) {
-            missing.insert(objectRefKey(value.toObject()));
-        }
-        auto uploads = std::make_shared<QJsonArray>();
-        QSet<QString> uploadable;
-        for (const QJsonValue& value : objects) {
-            const QJsonObject ref = value.toObject()[QStringLiteral("object")].toObject();
-            if (!ref.isEmpty()) {
-                uploadable.insert(objectRefKey(ref));
-            }
-        }
-        QStringList unresolved;
-        for (const QString& key : std::as_const(missing)) {
-            if (!uploadable.contains(key)) {
-                const QStringList parts = key.split(QLatin1Char('\n'));
-                unresolved.append(parts.size() >= 3
-                    ? QStringLiteral("%1 %2 %3").arg(parts[0], parts[1], parts[2])
-                    : key);
-            }
-        }
-        if (!unresolved.isEmpty()) {
-            const QString msg = tr("Missing Lasagna artifact(s) with no local upload source: %1")
-                .arg(unresolved.join(QStringLiteral("; ")));
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), msg},
-            });
-            emit optimizationError(msg);
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-            return;
-        }
-        for (const QJsonValue& value : objects) {
-            const QJsonObject upload = value.toObject();
-            if (missing.contains(objectRefKey(upload[QStringLiteral("object")].toObject()))) {
-                uploads->append(upload);
-            }
-        }
-
-        updateLocalUploadJob(localJobId, {
-            {QStringLiteral("upload_state"), QStringLiteral("uploading")},
-            {QStringLiteral("upload_label"),
-             uploads->isEmpty() ? tr("Artifacts already available") : tr("Uploading artifacts")},
-            {QStringLiteral("upload_current"), 0},
-            {QStringLiteral("upload_total"), uploads->size()},
-            {QStringLiteral("upload_progress"), uploads->isEmpty() ? 1.0 : 0.0},
-        });
-
-        auto index = std::make_shared<int>(0);
-        auto uploadNext = std::make_shared<std::function<void()>>();
-        *uploadNext = [this, uploads, index, localJobId, requestConfig, localOutputDir, source,
-                       generation, uploadNext]() {
-            if (generation != _requestGeneration) {
-                return;
-            }
-            if (_cancelledLocalUploadJobs.contains(localJobId)) {
-                finishActiveArtifactUpload();
-                processNextArtifactUpload();
-                return;
-            }
-            if (*index >= uploads->size()) {
-                updateLocalUploadJob(localJobId, {
-                    {QStringLiteral("upload_state"), QStringLiteral("submitting")},
-                    {QStringLiteral("upload_label"), tr("Submitting job")},
-                    {QStringLiteral("upload_current"), uploads->size()},
-                    {QStringLiteral("upload_total"), uploads->size()},
-                    {QStringLiteral("upload_progress"), 1.0},
-                });
-                postOptimizationRequest(requestConfig, localOutputDir, localJobId);
-                return;
-            }
-
-            const QJsonObject uploadSource = uploads->at(*index).toObject();
-            const QJsonObject ref = uploadSource[QStringLiteral("object")].toObject();
-            const QString label = ref[QStringLiteral("name")].toString().isEmpty()
-                ? tr("Uploading artifact %1 of %2").arg(*index + 1).arg(uploads->size())
-                : tr("Uploading %1").arg(ref[QStringLiteral("name")].toString());
-            updateLocalUploadJob(localJobId, {
-                {QStringLiteral("upload_label"), label},
-                {QStringLiteral("upload_current"), *index + 1},
-                {QStringLiteral("upload_total"), uploads->size()},
-                {QStringLiteral("upload_progress"),
-                 uploads->isEmpty() ? 1.0 : static_cast<double>(*index) / uploads->size()},
-            });
-
-            QUrl url(QStringLiteral("%1/objects").arg(baseUrl()));
-            QNetworkRequest req = fitServiceRequest(url);
-            req.setRawHeader(kVc3dSourceHeader, source.toUtf8());
-            req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-            std::shared_ptr<QTemporaryFile> uploadBody;
-            try {
-                uploadBody = materializeLocalArtifactUpload(uploadSource);
-            } catch (const std::exception& ex) {
-                const QString msg = tr("Artifact packing failed: %1").arg(QString::fromStdString(ex.what()));
-                updateLocalUploadJob(localJobId, {
-                    {QStringLiteral("state"), QStringLiteral("error")},
-                    {QStringLiteral("error"), msg},
-                });
-                emit optimizationError(msg);
-                finishActiveArtifactUpload();
-                processNextArtifactUpload();
-                return;
-            }
-            req.setHeader(QNetworkRequest::ContentLengthHeader,
-                          uploadBody->size());
-            QNetworkReply* reply = _nam->post(req, uploadBody.get());
-            _activeArtifactReply = reply;
-            _activeArtifactReplyJobId = localJobId;
-            auto lastProgressPermille = std::make_shared<int>(-1);
-            connect(reply, &QNetworkReply::uploadProgress,
-                    this,
-                    [this, localJobId, uploads, index, lastProgressPermille]
-                    (qint64 bytesSent, qint64 bytesTotal) {
-                if (bytesTotal <= 0 || uploads->isEmpty()
-                    || _cancelledLocalUploadJobs.contains(localJobId)) {
-                    return;
-                }
-                const double objectProgress = std::clamp(
-                    static_cast<double>(bytesSent) / static_cast<double>(bytesTotal), 0.0, 1.0);
-                const double progress = (static_cast<double>(*index) + objectProgress)
-                    / static_cast<double>(uploads->size());
-                const int permille = static_cast<int>(progress * 1000.0);
-                if (permille == *lastProgressPermille) return;
-                *lastProgressPermille = permille;
-                updateLocalUploadJob(localJobId, {
-                    {QStringLiteral("upload_progress"), progress},
-                });
-            });
-            connect(reply, &QNetworkReply::finished, this,
-                    [this, reply, uploads, index, localJobId, generation,
-                     uploadNext, uploadBody]() {
-                if (generation != _requestGeneration) {
-                    reply->deleteLater();
-                    return;
-                }
-                _activeArtifactReply = nullptr;
-                _activeArtifactReplyJobId.clear();
-                reply->deleteLater();
-
-                if (_cancelledLocalUploadJobs.contains(localJobId)) {
-                    finishActiveArtifactUpload();
-                    processNextArtifactUpload();
-                    return;
-                }
-                if (isTransportError(reply)) {
-                    const QString msg = tr("Artifact upload failed: %1").arg(reply->errorString());
-                    updateLocalUploadJob(localJobId, {
-                        {QStringLiteral("state"), QStringLiteral("error")},
-                        {QStringLiteral("error"), msg},
-                    });
-                    emit optimizationError(msg);
-                    finishActiveArtifactUpload();
-                    processNextArtifactUpload();
-                    return;
-                }
-                if (!validateApiVersion(reply, tr("Artifact upload"))) {
-                    updateLocalUploadJob(localJobId, {
-                        {QStringLiteral("state"), QStringLiteral("error")},
-                        {QStringLiteral("error"), _lastError},
-                    });
-                    emit optimizationError(_lastError);
-                    finishActiveArtifactUpload();
-                    processNextArtifactUpload();
-                    return;
-                }
-                if (reply->error() != QNetworkReply::NoError) {
-                    const QString msg = tr("Artifact upload failed: %1").arg(reply->errorString());
-                    updateLocalUploadJob(localJobId, {
-                        {QStringLiteral("state"), QStringLiteral("error")},
-                        {QStringLiteral("error"), msg},
-                    });
-                    emit optimizationError(msg);
-                    finishActiveArtifactUpload();
-                    processNextArtifactUpload();
-                    return;
-                }
-                const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
-                if (response.contains(QStringLiteral("error"))) {
-                    const QString msg = response[QStringLiteral("error")].toString();
-                    updateLocalUploadJob(localJobId, {
-                        {QStringLiteral("state"), QStringLiteral("error")},
-                        {QStringLiteral("error"), msg},
-                    });
-                    emit optimizationError(msg);
-                    finishActiveArtifactUpload();
-                    processNextArtifactUpload();
-                    return;
-                }
-                ++(*index);
-                (*uploadNext)();
-            });
-        };
-        (*uploadNext)();
-    });
-}
-
-void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestConfig,
-                                                    const QString& localOutputDir,
-                                                    const QString& localUploadJobId)
+void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestConfig)
 {
     const QString source = requestConfig[QStringLiteral("source")].toString().trimmed().isEmpty()
         ? localSourceName()
         : requestConfig[QStringLiteral("source")].toString();
-    _localOutputDir = localOutputDir;
 
     QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
@@ -1878,17 +748,12 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
 
     QByteArray body = QJsonDocument(requestConfig).toJson(QJsonDocument::Compact);
     const qint64 bodyBytes = body.size();
-    const QString requestedOutputName = requestConfig[QStringLiteral("output_name")].toString().trimmed();
 
     std::cout << "[lasagna] sending queued optimize request: "
               << bytesToMiB(bodyBytes) << " MiB" << std::endl;
 
     const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->post(req, body);
-    if (!localUploadJobId.isEmpty()) {
-        _activeArtifactReply = reply;
-        _activeArtifactReplyJobId = localUploadJobId;
-    }
     auto sendTimer = std::make_shared<QElapsedTimer>();
     auto uploadLogged = std::make_shared<bool>(false);
     sendTimer->start();
@@ -1905,20 +770,10 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
         }
     });
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, sendTimer, uploadLogged, bodyBytes, generation, localUploadJobId, requestedOutputName]() {
+            [this, reply, sendTimer, uploadLogged, bodyBytes, generation]() {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
-        }
-        if (!localUploadJobId.isEmpty()) {
-            _activeArtifactReply = nullptr;
-            _activeArtifactReplyJobId.clear();
-            if (_cancelledLocalUploadJobs.contains(localUploadJobId)) {
-                reply->deleteLater();
-                finishActiveArtifactUpload();
-                processNextArtifactUpload();
-                return;
-            }
         }
         if (!*uploadLogged) {
             *uploadLogged = true;
@@ -1935,27 +790,23 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
         std::cout << " error=" << reply->error()
                   << " bytes_available=" << reply->bytesAvailable()
                   << std::endl;
-        if (!requestedOutputName.isEmpty()) {
-            reply->setProperty("vc3d_requested_output_name", requestedOutputName);
-        }
-        handleOptimizeReply(reply, localUploadJobId);
-        if (!localUploadJobId.isEmpty()) {
-            finishActiveArtifactUpload();
-            processNextArtifactUpload();
-        }
+        handleOptimizeReply(reply);
     });
 }
 
-void LasagnaServiceManager::startOptimization(const QJsonObject& config,
-                                              const QString& localOutputDir)
+void LasagnaServiceManager::startOptimization(const QJsonObject& config)
 {
     if (!isRunning()) {
         emit optimizationError(tr("Lasagna service is not running"));
         return;
     }
+    if (const QString error = storeError(); !error.isEmpty()) {
+        emit optimizationError(error);
+        return;
+    }
 
-    _localOutputDir = localOutputDir;
     QJsonObject requestConfig = config;
+    requestConfig[QStringLiteral("store_uuid")] = QString::fromStdString(_storeAttachment->storeUuid);
     QString source = requestConfig.contains(QStringLiteral("source"))
         ? requestConfig[QStringLiteral("source")].toString()
         : localSourceName();
@@ -1967,24 +818,83 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
         requestConfig[QStringLiteral("source")] = source;
     }
 
-    const QJsonArray objects = requestConfig[QStringLiteral("_objects")].toArray();
-    requestConfig.remove(QStringLiteral("_objects"));
-    if (!objects.isEmpty()) {
-        enqueueArtifactUpload(requestConfig, objects, localOutputDir, source);
+    // The job reads the surfaces' current revisions from the store: an
+    // external service sees them once this replica has pushed its edits.
+    afterStoreSync([this, requestConfig]() { postOptimizationRequest(requestConfig); });
+}
+
+QString LasagnaServiceManager::storeError() const
+{
+    if (_storeSession.expired() || !_storeAttachment) {
+        return tr("Lasagna needs an attached object store.");
+    }
+    if (_isExternal && _serviceStoreUuid != QString::fromStdString(_storeAttachment->storeUuid)) {
+        return _serviceStoreUuid.isEmpty()
+            ? tr("The Lasagna service at %1:%2 has no object store; start it with --store on a replica of "
+                 "this hub.").arg(_host).arg(_port)
+            : tr("The Lasagna service at %1:%2 works on store %3, not the attached store; attach the same "
+                 "hosted store.").arg(_host).arg(_port).arg(_serviceStoreUuid);
+    }
+    return {};
+}
+
+void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
+{
+    const auto session = _storeSession.lock();
+    if (!_isExternal || !session || !session->hubStatus(*_storeAttachment)) {
+        then();
         return;
     }
+    // The remote service reads the hub: wait off the GUI thread for a sync started now.
+    const quint64 generation = _requestGeneration;
+    vc3d::store::background<std::optional<vc::objects::HubSessionStatus>>(this,
+        [session, attachment = *_storeAttachment] { return session->syncHubAndWait(attachment, std::chrono::seconds(60)); },
+        [this, generation, then](vc3d::store::Outcome<std::optional<vc::objects::HubSessionStatus>> result) {
+            if (generation != _requestGeneration || !_storeAttachment) return;
+            const auto& status = result.value;
+            QString error;
+            if (!result.error.isEmpty())
+                error = tr("The object store did not sync with its hub: %1").arg(result.error);
+            else if (!status)
+                error = tr("The object store was detached.");
+            else if (!status->conflicts.empty())
+                error = tr("Resolve the object store's hub conflicts before running Lasagna.");
+            else if (!status->error.empty())
+                error = tr("The object store did not sync with its hub: %1").arg(QString::fromStdString(status->error));
+            if (error.isEmpty())
+                then();
+            else
+                emit optimizationError(error);
+        });
+}
 
-    postOptimizationRequest(requestConfig, localOutputDir);
+void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
+                                           std::optional<vc::objects::AttachmentIdentity> attachment)
+{
+    _storeSession = session;
+    _storeAttachment = attachment;
+    _storePath.clear();
+    if (session && _storeAttachment) _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
+    // The internal service works on one store file; restart it on the next job.
+    if (_process && !_isExternal && _serviceStorePath != _storePath) {
+        stopService();
+    }
+}
+
+std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
+{
+    const auto session = _storeSession.lock();
+    if (!session || !_storeAttachment) {
+        return std::nullopt;
+    }
+    const auto model = session->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
+    std::error_code ec;
+    return std::filesystem::is_regular_file(model, ec) ? std::optional(model) : std::nullopt;
 }
 
 void LasagnaServiceManager::stopOptimization()
 {
     if (!isRunning()) return;
-
-    if (_hasActiveArtifactUpload) {
-        cancelLocalUploadJob(_activeArtifactUpload.jobId);
-        return;
-    }
 
     if (!_activeJobId.isEmpty()) {
         cancelJob(_activeJobId);
@@ -2012,9 +922,6 @@ void LasagnaServiceManager::stopOptimization()
 
 void LasagnaServiceManager::cancelJob(const QString& jobId)
 {
-    if (cancelLocalUploadJob(jobId)) {
-        return;
-    }
     if (!isRunning() || jobId.isEmpty()) return;
     QUrl url(QStringLiteral("%1/jobs/%2/cancel").arg(baseUrl(), jobId));
     QNetworkRequest req = fitServiceRequest(url);
@@ -2069,6 +976,11 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
 {
     if (!isRunning()) {
         emit visExportError(tr("Lasagna service is not running"));
+        return;
+    }
+    // The service reads the model from the surface's artifact directory.
+    if (const QString error = storeError(); !error.isEmpty()) {
+        emit visExportError(error);
         return;
     }
 
@@ -2152,33 +1064,21 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
     });
 }
 
-void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply,
-                                                const QString& localUploadJobId)
+void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
 {
     reply->deleteLater();
-    auto failLocalUpload = [this, &localUploadJobId](const QString& msg) {
-        if (!localUploadJobId.isEmpty() && _localUploadJobs.contains(localUploadJobId)) {
-            updateLocalUploadJob(localUploadJobId, {
-                {QStringLiteral("state"), QStringLiteral("error")},
-                {QStringLiteral("error"), msg},
-            });
-        }
-    };
 
     if (isTransportError(reply)) {
         QString msg = tr("Failed to start optimization: %1").arg(reply->errorString());
-        failLocalUpload(msg);
         emit optimizationError(msg);
         return;
     }
     if (!validateApiVersion(reply, tr("Submit optimization"))) {
-        failLocalUpload(_lastError);
         emit optimizationError(_lastError);
         return;
     }
     if (reply->error() != QNetworkReply::NoError) {
         QString msg = tr("Failed to start optimization: %1").arg(reply->errorString());
-        failLocalUpload(msg);
         emit optimizationError(msg);
         return;
     }
@@ -2188,7 +1088,6 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply,
 
     if (obj.contains("error")) {
         const QString msg = obj["error"].toString();
-        failLocalUpload(msg);
         emit optimizationError(msg);
         return;
     }
@@ -2198,18 +1097,9 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply,
         _lastQueueGeneration = static_cast<qint64>(obj[QStringLiteral("queue_generation")].toDouble());
     }
     if (!jobId.isEmpty()) {
-        if (!localUploadJobId.isEmpty()) {
-            removeLocalUploadJob(localUploadJobId);
-        }
         _activeJobId = jobId;
         _submittedJobIds.insert(jobId);
         _startedJobIds.insert(jobId);
-        _jobOutputDirs.insert(jobId, _localOutputDir);
-        QString outputName = reply->property("vc3d_requested_output_name").toString().trimmed();
-        if (outputName.isEmpty()) {
-            outputName = obj[QStringLiteral("output_name")].toString().trimmed();
-        }
-        _jobOutputNames.insert(jobId, outputName);
         QJsonObject optimisticJob;
         optimisticJob[QStringLiteral("job_id")] = jobId;
         optimisticJob[QStringLiteral("sequence")] = obj[QStringLiteral("sequence")].toInt();
@@ -2222,15 +1112,11 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply,
         QJsonArray optimisticJobs = _lastJobs;
         optimisticJobs.append(optimisticJob);
         _lastJobs = optimisticJobs;
-        emitJobsUpdatedOverlay();
+        emit jobsUpdated(_lastJobs);
         emit jobStarted(jobId);
         emit statusMessage(tr("Lasagna job %1 queued at position %2")
                                .arg(jobId)
                                .arg(obj[QStringLiteral("queue_position")].toInt()));
-    } else if (!localUploadJobId.isEmpty()) {
-        const QString msg = tr("Failed to start optimization: missing job id in response");
-        failLocalUpload(msg);
-        emit optimizationError(msg);
     }
     _optimizationRunning = true;
     _pollTimer->start();
@@ -2318,7 +1204,7 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
         _lastQueueGeneration = _fetchedQueueGeneration;
     }
     _lastJobs = jobs;
-    emitJobsUpdatedOverlay();
+    emit jobsUpdated(_lastJobs);
 
     bool anyTrackedActive = false;
     for (const QJsonValue& value : jobs) {
@@ -2348,14 +1234,16 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
             anyTrackedActive = true;
         } else if (state == QStringLiteral("finished") && !_completedJobIds.contains(jobId)) {
             _completedJobIds.insert(jobId);
-            const QString localOutputDir = _jobOutputDirs.value(jobId);
-            if (!localOutputDir.isEmpty()) {
-                downloadResults(jobId, localOutputDir);
-            } else {
-                const QString outputDir = obj[QStringLiteral("output_dir")].toString();
-                emit jobFinished(jobId, outputDir);
-                emit optimizationFinished(outputDir);
+            QStringList surfaces;
+            for (const QJsonValue& surface : obj[QStringLiteral("output_surfaces")].toArray()) {
+                surfaces.append(surface.toString());
             }
+            // An external service pushed them to the hub: pull them now.
+            if (const auto session = _storeSession.lock(); _isExternal && session && _storeAttachment) {
+                session->syncHub(*_storeAttachment);
+            }
+            emit jobFinished(jobId, surfaces);
+            emit optimizationFinished(surfaces);
         } else if ((state == QStringLiteral("error") || state == QStringLiteral("cancelled"))
                    && !_completedJobIds.contains(jobId)) {
             _completedJobIds.insert(jobId);
@@ -2422,96 +1310,6 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
         emit optimizationProgress(stage, step, totalSteps, loss,
                                   stageProgress, overallProgress, stageName);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Results download
-// ---------------------------------------------------------------------------
-
-void LasagnaServiceManager::downloadResults(const QString& jobId,
-                                            const QString& outputDir)
-{
-    emit statusMessage(tr("Downloading results from external service..."));
-
-    const QString targetDir = outputDir.isEmpty() ? _localOutputDir : outputDir;
-    const QString expectedOutputName = _jobOutputNames.value(jobId);
-    QUrl url(jobId.isEmpty()
-        ? QStringLiteral("%1/results").arg(baseUrl())
-        : QStringLiteral("%1/jobs/%2/results").arg(baseUrl(), jobId));
-    QNetworkRequest req = fitServiceRequest(url);
-
-    const quint64 generation = _requestGeneration;
-    QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, expectedOutputName, generation]() {
-        if (generation != _requestGeneration) {
-            reply->deleteLater();
-            return;
-        }
-        reply->deleteLater();
-
-        if (isTransportError(reply)) {
-            const QString msg = tr("Failed to download results: %1").arg(reply->errorString());
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
-        if (!validateApiVersion(reply, tr("Download results"))) {
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, _lastError);
-            }
-            emit optimizationError(_lastError);
-            return;
-        }
-        if (reply->error() != QNetworkReply::NoError) {
-            const QString msg = tr("Failed to download results: %1").arg(reply->errorString());
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
-
-        QByteArray data = reply->readAll();
-        std::cout << "[lasagna] downloaded results archive ("
-                  << data.size() << " bytes)" << std::endl;
-
-        emit statusMessage(tr("Unpacking results from external service..."));
-
-        auto* watcher = new QFutureWatcher<ResultsPlacementResult>(this);
-        connect(watcher, &QFutureWatcher<ResultsPlacementResult>::finished,
-                this, [this, watcher, jobId]() {
-            watcher->deleteLater();
-            const ResultsPlacementResult result = watcher->result();
-            if (!result.ok) {
-                if (!jobId.isEmpty()) {
-                    emit jobError(jobId, result.error);
-                }
-                emit optimizationError(result.error);
-                return;
-            }
-
-            std::cout << "[lasagna] results unpacked to "
-                      << result.targetDir.toStdString();
-            if (!result.placedNames.isEmpty()) {
-                std::cout << " as " << result.placedNames.join(QStringLiteral(", ")).toStdString();
-            }
-            std::cout << std::endl;
-            for (const QString& warning : result.warnings) {
-                std::cerr << "[lasagna] " << warning.toStdString() << std::endl;
-                emit statusMessage(warning);
-            }
-            emit resultsPlaced(result.targetDir, result.placedNames);
-            if (!jobId.isEmpty()) {
-                emit jobFinished(jobId, result.targetDir);
-            }
-            emit optimizationFinished(result.targetDir);
-        });
-        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir, expectedOutputName]() {
-            return placeResultsArchive(data, targetDir, expectedOutputName);
-        }));
-    });
 }
 
 // ---------------------------------------------------------------------------

@@ -21,13 +21,15 @@
 // this set is now empty; the mechanism stays for any future embargo.
 const EMBARGOED = new Set([]);
 
-function uniqSortedNums(arr) {
-  return [...new Set(arr.filter((v) => v !== null && v !== undefined))].sort(
-    (a, b) => a - b
-  );
-}
 function uniqStrings(arr) {
   return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))].sort();
+}
+
+function webknossosDatasets(progress) {
+  const p = progress || {};
+  return (Array.isArray(p.wk) ? p.wk : [])
+    .filter((d) => d && d.url)
+    .map((d) => ({ name: d.name ?? null, url: d.url }));
 }
 
 // Pull {px, energy, loc, name} out of a single scan record. The public
@@ -106,8 +108,6 @@ function deriveFacts(sample) {
     n_volumes: Object.keys(volumes).length,
     n_segments: Object.keys(segments).length,
     min_px: pxVals.length ? Math.min(...pxVals) : null,
-    energies: uniqSortedNums(scanList.map((s) => s.energy)),
-    locations: uniqStrings(scanList.map((s) => s.loc)),
     scans: scanList,
     licenses,
     ctVolumes,
@@ -464,7 +464,7 @@ function normalizeStages(stages) {
 }
 
 // Human-readable inventory label: "PHerc0172" -> "PHerc. 172",
-// "PHerc0175A" -> "PHerc. 175A", "PHercParis4" -> "PHerc. Paris 4".
+// "PHerc0175A" -> "PHerc. 175A", "PHercParis4" -> "PHerc. Paris. 4".
 // Non-PHerc ids pass through unchanged; routes/URLs keep the raw id.
 function phercLabel(id) {
   const m = /^PHerc(.+)$/.exec(id || "");
@@ -473,7 +473,7 @@ function phercLabel(id) {
   const letters = /^([A-Za-z]+)(.*)$/.exec(rest);
   if (letters) {
     const tail = letters[2] ? ` ${letters[2].replace(/^0+(?=\d)/, "")}` : "";
-    return `PHerc. ${letters[1]}${tail}`;
+    return `PHerc. ${letters[1]}${letters[1] === "Paris" ? "." : ""}${tail}`;
   }
   return `PHerc. ${rest.replace(/^0+(?=\d)/, "")}`;
 }
@@ -497,7 +497,7 @@ function curatedFields(overlayScroll, id) {
     progress: o.progress ?? null,
     stages: normalizeStages(o.stages ? { ...o.stages } : null),
     readings,
-    // Per-scroll legal/access terms (e.g. the PHerc. Paris 4 publication
+    // Per-scroll legal/access terms (e.g. the PHerc. Paris. 4 publication
     // reservation) rendered as a notice panel on the detail page.
     legalNotice: o.legalNotice ?? null,
     // License name -> which of this scroll's data that license covers
@@ -624,8 +624,6 @@ function buildIndex(samples, opts) {
       n_volumes: facts ? facts.n_volumes : 0,
       n_segments: facts ? facts.n_segments : 0,
       min_px: facts ? facts.min_px : null,
-      energies: facts ? facts.energies : [],
-      locations: facts ? facts.locations : [],
       scans: facts ? facts.scans : [],
       hasS3: !!facts,
       licenses: facts ? facts.licenses : [],
@@ -668,4 +666,9 @@ function buildIndex(samples, opts) {
   };
 }
 
-module.exports = { buildIndex, EMBARGOED, stageRank };
+module.exports = {
+  buildIndex,
+  EMBARGOED,
+  stageRank,
+  webknossosDatasets,
+};

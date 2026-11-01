@@ -18,7 +18,7 @@ QStringList arguments(const Request& request)
     };
     QStringList args{"-m", kModule, "--volume", request.volume, "--level", QString::number(request.level)};
     args << "--origin" << numbers(request.origin) << "--size" << numbers(request.size);
-    args << "--output" << request.output << "--coordinate-space" << request.coordinateSpace;
+    args << "--output" << request.output << "--volume-uuid" << request.volumeUuid;
     args << "--native-scale" << QString::number(request.nativeScale);
     auto decimal = [](double value) { return QString::number(value, 'g', QLocale::FloatingPointShortest); };
     if (request.voxelSizeUm > 0)

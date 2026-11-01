@@ -24,5 +24,3 @@ def endpoints(curves):
                   np.dot(v[1], v[2]) >= np.cos(np.deg2rad(15)))
             tips.append(q[0]); tangents.append(v[1]); reliable.append(ok)
     return np.asarray(tips), np.asarray(tangents), np.asarray(reliable)
-
-

@@ -552,8 +552,8 @@ private slots:
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
         std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
-        fibers[0].links.push_back({1, fibers[1].id, 1, false, true, true});
-        fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true});
+        fibers[0].links.push_back({1, fibers[1].id, 1, false, true});
+        fibers[1].links.push_back({1, fibers[0].id, 1, false, false});
         const GlobalResult result =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
         QCOMPARE(result.links.size(), std::size_t(1));
@@ -564,21 +564,7 @@ private slots:
         const GlobalPlacedFiber* v = findFiber(result, 901);
         QVERIFY(v != nullptr);
         QVERIFY(!v->meta.linked);
-        // At the layout API, an unspecified ordinary kind does not disagree
-        // with the adjacent ref. Change only this field to exercise its
-        // effect on both the solver output and the verification input digest.
-        std::vector<InputFiber> implicitKind = fibers;
-        implicitKind[1].links.front().adjacentExplicit = false;
-        const GlobalResult fine =
-            vc3d::fiber_map::buildGlobalLayout(implicitKind, umbilicus, defaultParams());
-        QCOMPARE(fine.links.size(), std::size_t(1));
-        QVERIFY(!fine.links.front().adjacentDisagrees);
-        QVERIFY(fine.links.front().adjacent);
-        QVERIFY(!fine.links.front().suspect);
-        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(result) ==
-                  vc3d::fiber_map::digestGlobalResult(fine)));
-        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams()) ==
-                  vc3d::fiber_map::digestGlobalInputs(implicitKind, umbilicus, defaultParams())));
+
     }
 
     // A pair that is not one H and one V has no inside: the link is an
@@ -1372,6 +1358,53 @@ private slots:
         // A distance no positive radius can reach has no position.
         QVERIFY(std::isnan(vc3d::fiber_map::sheetXForDistanceVx(model, -1e12)));
 
+        // The scaling the scene is drawn with agrees with the sheet distance
+        // wherever the modelled radius is positive, continues at the map's
+        // own scale below that floor, and inverts everywhere.
+        const double xFloor = -(model.radius0Vx / model.pitchVx) * circumference;
+        for (double x : {-0.5 * circumference, 0.0, 0.3 * circumference,
+                         2.7 * circumference}) {
+            QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceMonotoneVx(model, x) -
+                             vc3d::fiber_map::sheetDistanceVx(model, x)) < 1e-6);
+        }
+        const double distanceFloor = vc3d::fiber_map::sheetDistanceVx(model, xFloor);
+        for (double below : {1.0, 3.0 * circumference}) {
+            const double x = xFloor - below;
+            const double distance = vc3d::fiber_map::sheetDistanceMonotoneVx(model, x);
+            QVERIFY2(std::abs(distance - (distanceFloor - below)) < 1e-6,
+                     qPrintable(QString::number(distance)));
+            QVERIFY2(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance) -
+                              x) < 1e-6,
+                     qPrintable(QString::number(distance)));
+        }
+        QCOMPARE(vc3d::fiber_map::sheetDomainFloorXVx(model), xFloor);
+        // At the floor and one ulp either side the round trip lands on the
+        // floor to rounding (the quadratic is flat there, so no better).
+        for (double distance : {std::nextafter(distanceFloor, -1e300), distanceFloor,
+                                std::nextafter(distanceFloor, 1e300)}) {
+            const double back = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance);
+            QVERIFY2(std::abs(back - xFloor) < 1e-6 * std::abs(xFloor),
+                     qPrintable(QStringLiteral("%1 -> %2").arg(distance, 0, 'g', 17).arg(back)));
+        }
+        // Hand-built degenerate models map as the identity, floorless.
+        for (const vc3d::fiber_map::SheetModel degenerate :
+             {vc3d::fiber_map::SheetModel{0.0, 4000.0, 300.0},
+              vc3d::fiber_map::SheetModel{4000.0, 0.0, 300.0},
+              vc3d::fiber_map::SheetModel{4000.0, -1.0, 300.0}}) {
+            QVERIFY(std::isinf(vc3d::fiber_map::sheetDomainFloorXVx(degenerate)));
+            QCOMPARE(vc3d::fiber_map::sheetDistanceMonotoneVx(degenerate, 123.5), 123.5);
+            QCOMPARE(vc3d::fiber_map::sheetXForDistanceMonotoneVx(degenerate, 123.5), 123.5);
+        }
+        double previous = -std::numeric_limits<double>::infinity();
+        for (int step = -40; step <= 60; ++step) {
+            const double x = xFloor + 0.1 * static_cast<double>(step) * circumference;
+            const double distance = vc3d::fiber_map::sheetDistanceMonotoneVx(model, x);
+            QVERIFY(distance > previous);
+            QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance) -
+                             x) < 1e-6 * std::max(1.0, std::abs(x)));
+            previous = distance;
+        }
+
         // A vanishingly small positive pitch must not lose the answer to
         // cancellation: the inverse tends smoothly to the linear case.
         {
@@ -1425,6 +1458,10 @@ private slots:
         const double x = 0.37 * kTwoPi * result.rRefVx;
         QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceVx(model, x) - x) < 1e-9);
         QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceVx(model, x) - x) < 1e-9);
+        // So the scene is drawn at the map's own scale, floorless.
+        QVERIFY(std::isinf(vc3d::fiber_map::sheetDomainFloorXVx(model)));
+        QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceMonotoneVx(model, x) - x) < 1e-9);
+        QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, x) - x) < 1e-9);
     }
 
     // Equal labels tie-break by fileName, never by the runtime id: swapping
@@ -2169,6 +2206,76 @@ private slots:
             GlobalResult tweaked = freshLinked;
             tweaked.unresolvedIntersectionCount += 1;
             QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+    }
+
+    // The automatic-link mark reaches the placed link combined over the
+    // pair's two refs under its invariant (pending, ordinary) and the
+    // human-outranks rule: automatic only when every pending ref says so (a
+    // plain pending reciprocal - a side an older VC3D re-saved - makes the
+    // pair a plain pending link, as the loader's downgrade does); an auto
+    // mark on an adjacent ref is dropped; the drawn arclengths and the mark
+    // are in the output digest.
+    void autoLinkMarkSurvivesDedupUnderItsInvariant()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        {
+            std::vector<InputFiber> fibers = adjacentPair(4000.0, 0.0, 0.3 * kTwoPi, 'V');
+            fibers[0].links.clear();
+            fibers[1].links.clear();
+            fibers[0].links.push_back({1, fibers[1].id, 1, true, false, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, true, false, false});
+            const GlobalResult mixed =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(mixed.links.size(), std::size_t{1});
+            QVERIFY(mixed.links.front().pending);
+            QVERIFY(!mixed.links.front().autoLink);
+            fibers[1].links.front().autoLink = true;
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.links.size(), std::size_t{1});
+            QVERIFY(result.links.front().pending);
+            QVERIFY(result.links.front().autoLink);
+            for (const GlobalPlacedFiber& placed : result.fibers) {
+                for (const auto& run : placed.fiber.runs) {
+                    QCOMPARE(run.arclengths.size(), run.points.size());
+                }
+                QCOMPARE(placed.fiber.controlArclength.size(), placed.fiber.controlPoints.size());
+            }
+            const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(result);
+            GlobalResult tweaked = result;
+            tweaked.links.front().autoLink = false;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+            tweaked = result;
+            tweaked.fibers.front().fiber.runs.front().arclengths.front() += 1.0;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+            tweaked = result;
+            tweaked.fibers.front().fiber.offsetRad += 0.5;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
+            fibers[0].links.clear();
+            fibers[1].links.clear();
+            fibers[0].links.push_back({1, fibers[1].id, 1, true, true, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, true, true, true});
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.links.size(), std::size_t{1});
+            QVERIFY(result.links.front().adjacent);
+            QVERIFY(!result.links.front().autoLink);
+        }
+        {
+            std::vector<InputFiber> fibers = adjacentPair(4000.0, 0.0, 0.3 * kTwoPi, 'V');
+            fibers[0].links.clear();
+            fibers[1].links.clear();
+            fibers[0].links.push_back({1, fibers[1].id, 1, false, false, true});
+            fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true});
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.links.size(), std::size_t{1});
+            QVERIFY(!result.links.front().pending);
+            QVERIFY(!result.links.front().autoLink);
         }
     }
 };

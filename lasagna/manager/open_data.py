@@ -18,12 +18,15 @@ except ImportError:  # pragma: no cover - monorepo package import mode.
     from lasagna.inference_provenance import validate_portable_bundle
 
 from .config import ManagerConfig
+from .fiberlets import (
+    resolve_bundle_relative, validate_published_fiberlet_dataset,
+)
 from .runs import atomic_json, resolve_run, utc_now
 from .snapshots import SnapshotRecord, index_snapshots
 
 
 SUPPORTED_LICENSE = "CC BY-NC 4.0"
-SUPPORTED_ARTIFACTS = {"fiber3d-prediction", "lasagna"}
+SUPPORTED_ARTIFACTS = {"fiber3d-prediction", "lasagna", "fiberlets"}
 INCOMPLETE_MARKER = "_INCOMPLETE"
 _RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
 
@@ -39,10 +42,10 @@ class UploadPlan:
     run_dir: Path
     bundle_dir: Path
     provenance: dict[str, Any]
-    model_id: str
+    model_id: str | None
     bucket: str
     prefix: str
-    files: tuple[str, ...]
+    files: tuple[str, ...] | None
 
 
 class S3ObjectStore:
@@ -81,6 +84,16 @@ class S3ObjectStore:
             ]
             subprocess.run(command, check=True)
 
+    def put_tree(self, prefix: str, bundle: Path) -> None:
+        """Stream a sparse tree directly; rclone owns bounded traversal."""
+        destination = f":s3:{self.bucket}/{prefix.strip('/')}/"
+        subprocess.run([
+            "rclone", "copy", str(bundle), destination,
+            *self.rclone_params,
+            "--exclude", INCOMPLETE_MARKER,
+            "--exclude", f"**/{INCOMPLETE_MARKER}",
+        ], check=True)
+
     def put_bytes(self, key: str, value: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=value)
 
@@ -106,12 +119,12 @@ def _bundle_files(bundle: Path) -> tuple[str, ...]:
     return tuple(files)
 
 
-def _parse_staging(value: str, run_uuid: str) -> tuple[str, str]:
+def _parse_staging(value: str, run_uuid: str, namespace: str = "inference") -> tuple[str, str]:
     parsed = urlparse(value)
     if parsed.scheme != "s3" or not parsed.netloc:
         raise ValueError("upload_staging_s3 must be an s3://bucket[/prefix] URL")
     root = parsed.path.strip("/")
-    prefix = "/".join(part for part in (root, "inference", run_uuid) if part)
+    prefix = "/".join(part for part in (root, namespace, run_uuid) if part)
     return parsed.netloc, prefix
 
 
@@ -131,7 +144,7 @@ def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> Snapshot
     if not verified:
         raise ValueError("no configured snapshot matches inference model.sha256")
     normalized = {
-        (record.backend, record.run, record.model_creation_utc)
+        (record.backend, record.run, record.model_creation_utc, record.model_identifier)
         for record in verified
     }
     if len(normalized) != 1:
@@ -142,6 +155,8 @@ def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> Snapshot
     if expected_checkpoint and not named:
         raise ValueError("inference model.checkpoint does not match any byte-identical snapshot copy")
     chosen = sorted(named or verified, key=lambda record: record.path)[0]
+    if model.get("model_identifier") is not None and model["model_identifier"] != chosen.model_identifier:
+        raise ValueError("inference model.model_identifier conflicts with trusted snapshot metadata")
     if expected_run and str(expected_run) != chosen.run:
         raise ValueError("inference model.run does not match the hashed snapshot")
     expected_snapshot = f"{chosen.run}/snapshots/{chosen.checkpoint}"
@@ -197,10 +212,21 @@ def validate_inference(
     selector: str,
 ) -> UploadPlan:
     run_dir, record = resolve_run(config, selector)
-    if record.get("status") != "completed" or record.get("lifecycle", {}).get("inference") != "completed":
-        raise ValueError(f"inference {record.get('run_name', selector)!r} is not completed")
+    phase = str(record.get("active_lifecycle_phase") or "inference")
+    if record.get("status") != "completed" or record.get("lifecycle", {}).get(phase) != "completed":
+        raise ValueError(f"run {record.get('run_name', selector)!r} is not completed")
     bundle = run_dir / str(record.get("artifacts", {}).get("root", "artifacts"))
-    provenance = validate_portable_bundle(bundle)
+    artifact_root = Path(str(record.get("artifacts", {}).get("root", "artifacts")))
+    provenance_relative = Path(str(
+        record.get("artifacts", {}).get("provenance", "artifacts/inference.json")
+    ))
+    try:
+        provenance_name = provenance_relative.relative_to(artifact_root)
+    except ValueError as error:
+        raise ValueError("portable provenance must be inside the artifact bundle") from error
+    provenance = validate_portable_bundle(
+        bundle, provenance_name=provenance_name.as_posix(),
+    )
     if provenance.get("artifact_kind") not in SUPPORTED_ARTIFACTS:
         raise ValueError(
             f"unsupported inference artifact {provenance.get('artifact_kind')!r}; "
@@ -212,16 +238,58 @@ def validate_inference(
     license_value = source.get("license") if isinstance(source.get("license"), dict) else {}
     if license_value.get("name") != SUPPORTED_LICENSE:
         raise ValueError(f"publication requires source license {SUPPORTED_LICENSE!r}")
-    resolved_model = resolve_model_id(config, provenance)
-    bucket, prefix = _parse_staging(config.upload_staging_s3, str(record["run_uuid"]))
-    files = _bundle_files(bundle)
-    if not files:
-        raise ValueError("portable artifact bundle is empty")
+    is_fiberlet = provenance.get("artifact_kind") == "fiberlets"
+    resolved_model = None if is_fiberlet else resolve_model_id(config, provenance)
+    bucket, prefix = _parse_staging(
+        config.upload_staging_s3,
+        str(record["run_uuid"]),
+        "fiberlets" if is_fiberlet else "inference",
+    )
+    if is_fiberlet:
+        entries = [
+            entry for entry in provenance.get("artifacts", ())
+            if isinstance(entry, dict) and entry.get("kind") == "fiberlet-zarr"
+        ]
+        if len(entries) != 1 or not isinstance(entries[0].get("path"), str):
+            raise ValueError(
+                "Fiberlet provenance must record exactly one dataset path"
+            )
+        relative = str(entries[0]["path"])
+        expected = resolve_bundle_relative(
+            bundle, relative, label="Fiberlet provenance dataset path",
+        )
+        artifact_root = Path(str(record["artifacts"].get("root", "artifacts")))
+        dataset_record = Path(str(record["artifacts"].get("dataset", "")))
+        try:
+            recorded_relative = dataset_record.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise ValueError(
+                "recorded Fiberlet dataset must be inside the artifact bundle"
+            ) from error
+        if recorded_relative != Path(relative).as_posix():
+            raise ValueError(
+                "Fiberlet provenance dataset path differs from the durable run record"
+            )
+        validate_published_fiberlet_dataset(expected)
+        metadata_hash = str(entries[0].get("metadata_sha256") or "").lower()
+        if metadata_hash != hashlib.sha256(
+            (expected / ".zattrs").read_bytes()
+        ).hexdigest():
+            raise ValueError(
+                "Fiberlet root metadata differs from portable provenance"
+            )
+        if (bundle / INCOMPLETE_MARKER).exists():
+            raise ValueError(f"reserved upload filename in bundle: {INCOMPLETE_MARKER}")
+        files = None
+    else:
+        files = _bundle_files(bundle)
+        if not files:
+            raise ValueError("portable artifact bundle is empty")
     return UploadPlan(
         run_dir=run_dir,
         bundle_dir=bundle,
         provenance=provenance,
-        model_id=str(resolved_model),
+        model_id=str(resolved_model) if resolved_model is not None else None,
         bucket=bucket,
         prefix=prefix,
         files=files,
@@ -239,8 +307,18 @@ def stage_upload(plan: UploadPlan, store: ObjectStore) -> str:
     """Upload through rclone, with a marker guarding manager-side commit."""
     marker_key = _key(plan, INCOMPLETE_MARKER)
     store.put_bytes(marker_key, b"")
+    tree_put = getattr(store, "put_tree", None)
     bulk_put = getattr(store, "put_files", None)
-    if callable(bulk_put):
+    if plan.files is None and callable(tree_put):
+        tree_put(plan.prefix, plan.bundle_dir)
+    elif plan.files is None:
+        for path in plan.bundle_dir.rglob("*"):
+            if path.is_file():
+                relative = path.relative_to(plan.bundle_dir).as_posix()
+                if Path(relative).name == INCOMPLETE_MARKER:
+                    raise ValueError(f"reserved upload filename in bundle: {relative}")
+                store.put_file(_key(plan, relative), path)
+    elif callable(bulk_put):
         bulk_put(plan.prefix, plan.bundle_dir, plan.files)
     else:
         for relative in plan.files:
@@ -249,7 +327,7 @@ def stage_upload(plan: UploadPlan, store: ObjectStore) -> str:
     return f"s3://{plan.bucket}/{plan.prefix}/"
 
 
-def _load_atlas_api(config: ManagerConfig):
+def _load_atlas_api(config: ManagerConfig, artifact_kind: str):
     atlas = config.resolved_path("atlas_dir", required=True)
     assert atlas is not None
     source = atlas / "vesuvius-atlas-py" / "src"
@@ -258,6 +336,9 @@ def _load_atlas_api(config: ManagerConfig):
     import sys
     sys.path.insert(0, str(source))
     try:
+        if artifact_kind == "fiberlets":
+            module = importlib.import_module("vesuvius_atlas.fiberlet_bundle")
+            return module.validate_fiberlet_bundle_for_atlas, module.ingest_fiberlet_bundle
         module = importlib.import_module("vesuvius_atlas.inference_bundle")
         return module.validate_inference_bundle_for_atlas, module.ingest_inference_bundle
     finally:
@@ -277,13 +358,16 @@ def upload_inference(
 ) -> dict[str, Any]:
     plan = validate_inference(config, selector)
     if validator is None or ingester is None:
-        atlas_validator, atlas_ingester = _load_atlas_api(config)
+        atlas_validator, atlas_ingester = _load_atlas_api(
+            config, str(plan.provenance["artifact_kind"]),
+        )
         validator = validator or atlas_validator
         ingester = ingester or atlas_ingester
     atlas_dir = config.resolved_path("atlas_dir", required=True)
-    atlas_preflight = validator(
-        atlas_dir=atlas_dir, bundle_dir=plan.bundle_dir, model_id=plan.model_id,
-    )
+    atlas_kwargs = {"atlas_dir": atlas_dir, "bundle_dir": plan.bundle_dir}
+    if plan.model_id is not None:
+        atlas_kwargs["model_id"] = plan.model_id
+    atlas_preflight = validator(**atlas_kwargs)
     record_path = plan.run_dir / "metadata.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     lifecycle = record.setdefault("lifecycle", {})
@@ -304,12 +388,14 @@ def upload_inference(
         }
         lifecycle["atlas_ingest"] = "ingesting"
         atomic_json(record_path, record)
-        result = ingester(
-            atlas_dir=atlas_dir,
-            bundle_dir=plan.bundle_dir,
-            staging_url=staging_url,
-            model_id=plan.model_id,
-        )
+        ingest_kwargs = {
+            "atlas_dir": atlas_dir,
+            "bundle_dir": plan.bundle_dir,
+            "staging_url": staging_url,
+        }
+        if plan.model_id is not None:
+            ingest_kwargs["model_id"] = plan.model_id
+        result = ingester(**ingest_kwargs)
         lifecycle["atlas_ingest"] = "completed"
         record["atlas"] = result
         record["atlas_preflight"] = atlas_preflight
@@ -335,9 +421,12 @@ def validate_atlas_inference(
 ) -> tuple[UploadPlan, dict[str, Any]]:
     plan = validate_inference(config, selector)
     if validator is None:
-        validator, _ingester = _load_atlas_api(config)
+        validator, _ingester = _load_atlas_api(
+            config, str(plan.provenance["artifact_kind"]),
+        )
     atlas_dir = config.resolved_path("atlas_dir", required=True)
-    result = validator(
-        atlas_dir=atlas_dir, bundle_dir=plan.bundle_dir, model_id=plan.model_id,
-    )
+    kwargs = {"atlas_dir": atlas_dir, "bundle_dir": plan.bundle_dir}
+    if plan.model_id is not None:
+        kwargs["model_id"] = plan.model_id
+    result = validator(**kwargs)
     return plan, result

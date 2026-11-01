@@ -21,6 +21,10 @@ public:
         uint64_t decodedPathEvictions = 0;
         size_t decodedPathEntries = 0;
         size_t decodedPathBytes = 0;
+        // Bucket indices a mapped store has decoded so far. They are kept for
+        // the store's lifetime, so both numbers only grow.
+        size_t bucketIndexEntries = 0;
+        size_t bucketIndexBytes = 0;
     };
 
     struct QueryScratch {
@@ -41,6 +45,13 @@ public:
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const;
     cv::Size size() const;
     size_t get_memory_usage() const;
+    // Bytes this store is charged by the byte-budgeted cache in
+    // NormalGridVolume: the size of the .grid file it maps, plus what it has
+    // put on the heap -- the polylines it has decoded, the bucket indices it
+    // has decoded and, for v1/v2 files, its bucket descriptors. Both caches
+    // grow as the store is used; each keeps a running byte count, so for a
+    // mapped store this is O(1).
+    size_t residentBytes() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
     CacheStats cacheStats() const;

@@ -12,9 +12,9 @@ class QLabel;
 class QLineEdit;
 class QSpinBox;
 
-// Options of a new Automated Fiber Volume: output file, zone of the current
+// Options of a new fiber object store: output file, zone of the current
 // volume and its blocks, model, extension and cleanup, and Python. The caller
-// adds the volume and its coordinate identity to the request. Choices are
+// adds the volume and its volume binding to the request. Choices are
 // remembered.
 class FiberCollectionGeneratorDialog : public QDialog
 {

@@ -24,6 +24,7 @@ test('CLI parser rejects unknown, repeated, and valueless options', () => {
     options: { file: 'page.md' },
   });
   assert.throws(() => parseCliArgs(['unknown']), /Command/);
+  assert.throws(() => parseCliArgs(['sync-responses', '--source-cycle', '2026-08']), /Command/);
   assert.throws(() => parseCliArgs(['validate', '--wat']), /Unknown option/);
   assert.throws(() => parseCliArgs(['validate', '--file']), /requires a value/);
   assert.throws(() => parseCliArgs(['validate', '--file=a', '--file=b']), /only once/);

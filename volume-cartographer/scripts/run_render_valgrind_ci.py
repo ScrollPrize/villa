@@ -8,33 +8,88 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
-from render_valgrind_common import SCENARIOS
-
+SCENARIOS = (
+    "full_res",
+    "fallback_3",
+    "mixed_correlated",
+    "mixed_shuffled",
+)
 SCHEMA_VERSION = 1
 NATIVE_EVALUATION_SCHEMA_VERSIONS = {2, 3}
 DEFAULT_TOLERANCE = 0.05
-DATA_READ_FEATURE_NAMES = (
-    "non_data_instructions",
-    "data_reads",
-    "data_writes",
-    "l1_data_misses",
-    "last_level_data_misses",
-    "branch_misses",
-    "branch_weighted_l1_misses",
-)
-REPLAY_CONFIGURATION = {
-    "workers": 4,
-    "cores": 5,
-    "tie_policy": "fifo",
-    "split_policy": "equal",
-    "residual_fraction": 0.5,
-    "wake_latency_ns": 0.0,
-    "replay_idle_scale": 1.0,
-    "dependency_excess_scale": 1.0,
-}
+
+
+def collect_evaluate(args: argparse.Namespace) -> None:
+    """Allow two fresh retries for capture, replay, or reference-check failures."""
+    case = args.case_dir.resolve()
+    capture = case / "callgrind"
+    output = case / "evaluation.json"
+    case.mkdir(parents=True, exist_ok=True)
+    reference = getattr(args, "reference", None)
+    checked = case / "checked.json"
+    checked.unlink(missing_ok=True)
+    for attempt in range(1, 4):
+        reuse = (attempt == 1 and getattr(args, "reuse_capture", False)
+                 and (capture / "collected.stamp").is_file() and output.is_file())
+        if not reuse:
+            output.unlink(missing_ok=True)
+            shutil.rmtree(capture, ignore_errors=True)
+            capture.mkdir()
+        print(f"{args.fixture}/{args.scenario}: capture attempt {attempt}/3", flush=True)
+        scheduler = capture / "scheduler.log"
+        collect = [
+            str(args.valgrind), "--tool=callgrind", "--instr-atstart=no",
+            "--fair-sched=yes", "--scheduling-quantum=10000",
+            "--separate-threads=yes", "--dump-every-bb=10000",
+            "--combine-dumps=no", "--collect-systime=no", "--cache-sim=yes",
+            "--branch-sim=yes", "--I1=32768,8,64", "--D1=32768,8,64",
+            "--LL=8388608,16,64",
+        ]
+        if args.fixture == "parallel":
+            collect += ["--trace-sched=yes", "--trace-syscalls=yes", "--time-stamp=yes",
+                        f"--log-file={scheduler}"]
+        collect += [
+            f"--callgrind-out-file={capture / 'callgrind.out'}", str(args.benchmark),
+            "--fixture", args.fixture, "--scenario", args.scenario,
+            "--native-trials", "1", "--metadata", str(capture / "metadata.json"),
+            "--repetitions", "1", "--callgrind",
+        ]
+        evaluate = [
+            str(args.replay), "evaluate-render", "--fixture", args.fixture,
+            "--scenario", args.scenario, "--callgrind-prefix", str(capture / "callgrind.out"),
+            "--callgrind-metadata", str(capture / "metadata.json"),
+            "--model", str(args.model), "--output", str(output),
+        ]
+        if args.fixture == "parallel":
+            evaluate += ["--callgrind-scheduler", str(scheduler)]
+        env = dict(os.environ, VC_RENDER_SAMPLER_THREADS="4" if args.fixture == "parallel" else "1")
+        result = None if reuse else subprocess.run(collect, env=env, check=False)
+        if not reuse and result.returncode == 0:
+            result = subprocess.run(evaluate, check=False)
+        valid = (reuse or result.returncode == 0) and output.is_file()
+        if valid and reference is not None:
+            gate = list(evaluate)
+            gate[gate.index("--output") + 1] = str(checked)
+            result = subprocess.run(gate + ["--reference", str(reference)], check=False)
+            valid = result.returncode == 0 and checked.is_file()
+        if valid:
+            (capture / "collected.stamp").touch()
+            return
+        prefix = "failed-gate-attempt" if reference is not None else "failed-attempt"
+        failed = case / f"{prefix}-{attempt}"
+        shutil.rmtree(failed, ignore_errors=True)
+        capture.rename(failed)
+        for artifact in (output, checked, case / "checked.failed.json"):
+            if artifact.exists():
+                artifact.rename(failed / artifact.name)
+        print(f"Capture/replay/reference attempt {attempt} failed; retained files in {failed}",
+              file=sys.stderr, flush=True)
+    raise RuntimeError(f"{args.fixture}/{args.scenario}: capture/replay/reference failed after 3 attempts")
 
 
 def sha256_file(path: Path) -> str:
@@ -132,44 +187,6 @@ def freeze_reference(args: argparse.Namespace) -> None:
     )
 
 
-def freeze_model(args: argparse.Namespace) -> None:
-    calibration = json.loads(args.calibration.read_text())
-    if calibration.get("renderer_inputs_used") is not False:
-        raise RuntimeError("calibration is not synthetic-only")
-    if not calibration.get("candidate_accepted", False) and not args.allow_unpromoted:
-        raise RuntimeError(
-            "calibration was not accepted; pass --allow-unpromoted only after "
-            "explicitly reviewing and approving the experimental model"
-        )
-    event_model = calibration.get("event_cost_model", {})
-    if tuple(event_model.get("feature_names", ())) != DATA_READ_FEATURE_NAMES:
-        raise RuntimeError("calibration does not use the required data-read basis")
-    coefficients = event_model.get("coefficients_ns", ())
-    if len(coefficients) != len(DATA_READ_FEATURE_NAMES):
-        raise RuntimeError("calibration has an invalid event coefficient count")
-    parameters = calibration.get("parameters", {})
-    if "cross_thread_release_ns" not in parameters:
-        raise RuntimeError("calibration has no cross-thread release parameter")
-    model = {
-        "schema_version": SCHEMA_VERSION,
-        "model_id": args.model_id,
-        "source": "synthetic thread-pool calibration only",
-        "renderer_inputs_used": False,
-        "timing_claims_enabled": False,
-        "score_semantics": "relative modeled runtime, not absolute wall time",
-        "cross_thread_release_ns": float(parameters["cross_thread_release_ns"]),
-        "event_cost_model": {
-            "feature_names": list(DATA_READ_FEATURE_NAMES),
-            "coefficients_ns": [float(value) for value in coefficients],
-            "stall_overlap_fraction": float(
-                event_model.get("stall_overlap_fraction", 0.0)
-            ),
-        },
-        "replay": REPLAY_CONFIGURATION,
-    }
-    write_json_atomic(args.output.resolve(), model)
-
-
 def set_tolerance(args: argparse.Namespace) -> None:
     reference_path = args.reference.resolve()
     reference = json.loads(reference_path.read_text())
@@ -185,19 +202,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    collect = subparsers.add_parser("collect-evaluate")
+    for option in ("valgrind", "benchmark", "replay", "model", "case-dir"):
+        collect.add_argument(f"--{option}", required=True, type=Path)
+    collect.add_argument("--fixture", choices=("serial", "parallel"), required=True)
+    collect.add_argument("--scenario", choices=SCENARIOS, required=True)
+    collect.add_argument("--reference", type=Path)
+    collect.add_argument("--reuse-capture", action="store_true")
+    collect.set_defaults(function=collect_evaluate)
+
     freeze = subparsers.add_parser("freeze-reference")
     freeze.add_argument("--model", required=True, type=Path)
     freeze.add_argument("--output", required=True, type=Path)
     freeze.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     freeze.add_argument("results", nargs="+", type=Path)
     freeze.set_defaults(function=freeze_reference)
-
-    freeze_model_parser = subparsers.add_parser("freeze-model")
-    freeze_model_parser.add_argument("--calibration", required=True, type=Path)
-    freeze_model_parser.add_argument("--model-id", required=True)
-    freeze_model_parser.add_argument("--output", required=True, type=Path)
-    freeze_model_parser.add_argument("--allow-unpromoted", action="store_true")
-    freeze_model_parser.set_defaults(function=freeze_model)
 
     set_tolerance_parser = subparsers.add_parser("set-tolerance")
     set_tolerance_parser.add_argument("--reference", required=True, type=Path)

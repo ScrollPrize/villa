@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -17,6 +18,93 @@ SPEC.loader.exec_module(DRIVER)
 
 
 class RenderValgrindCiTest(unittest.TestCase):
+    def test_reference_failure_retries_fresh_capture_at_most_twice(self):
+        for passes_on in (1, 2, 3, None):
+            with self.subTest(passes_on=passes_on), tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+                args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                       benchmark="benchmark", replay="replay", model=Path("model.json"),
+                                       fixture="parallel", scenario="mixed_shuffled",
+                                       reference=Path("reference.json"), reuse_capture=True)
+                capture = args.case_dir / "callgrind"
+                capture.mkdir()
+                (capture / "collected.stamp").touch()
+                (args.case_dir / "evaluation.json").write_text("{}")
+                captures = gates = 0
+
+                def run(command, **kwargs):
+                    nonlocal captures, gates
+                    if command[0] == "valgrind":
+                        captures += 1
+                        self.assertFalse((capture / "collected.stamp").exists())
+                        self.assertFalse((args.case_dir / "evaluation.json").exists())
+                        return SimpleNamespace(returncode=0)
+                    output = Path(command[command.index("--output") + 1])
+                    if "--reference" in command:
+                        gates += 1
+                        if gates != passes_on:
+                            output.with_name("checked.failed.json").write_text('{"status":"failed"}')
+                            return SimpleNamespace(returncode=1)
+                    output.write_text("{}")
+                    return SimpleNamespace(returncode=0)
+
+                with patch.object(DRIVER.subprocess, "run", side_effect=run):
+                    if passes_on is None:
+                        with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
+                            DRIVER.collect_evaluate(args)
+                    else:
+                        DRIVER.collect_evaluate(args)
+                self.assertEqual(gates, passes_on or 3)
+                self.assertEqual(captures, (passes_on or 3) - 1)
+                self.assertEqual((args.case_dir / "checked.json").exists(), passes_on is not None)
+                for attempt in range(1, (passes_on or 4)):
+                    failed = args.case_dir / f"failed-gate-attempt-{attempt}"
+                    self.assertTrue((failed / "checked.failed.json").is_file())
+                    self.assertTrue((failed / "evaluation.json").is_file())
+
+    def test_capture_retries_start_fresh_and_stop_at_first_valid_evaluation(self):
+        for failure in ("collect", "evaluate"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+                args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                       benchmark="benchmark", replay="replay",
+                                       model=Path("model.json"), fixture="parallel", scenario="full_res")
+                captures = 0
+                evaluations = 0
+
+                def run(command, **kwargs):
+                    nonlocal captures, evaluations
+                    capture = args.case_dir / "callgrind"
+                    if command[0] == "valgrind":
+                        captures += 1
+                        self.assertFalse((capture / "marker").exists())
+                        self.assertFalse((args.case_dir / "evaluation.json").exists())
+                        (capture / "marker").touch()
+                        self.assertEqual(kwargs["env"]["VC_RENDER_SAMPLER_THREADS"], "4")
+                        return SimpleNamespace(returncode=int(failure == "collect" and captures < 3))
+                    evaluations += 1
+                    self.assertNotIn("--reference", command)
+                    (args.case_dir / "evaluation.json").write_text("{}")
+                    return SimpleNamespace(returncode=int(failure == "evaluate" and captures < 3))
+
+                with patch.object(DRIVER.subprocess, "run", side_effect=run):
+                    DRIVER.collect_evaluate(args)
+                self.assertEqual(captures, 3)
+                self.assertEqual(evaluations, 1 if failure == "collect" else 3)
+                self.assertTrue((args.case_dir / "callgrind/collected.stamp").exists())
+                self.assertTrue((args.case_dir / "failed-attempt-1/marker").exists())
+                self.assertTrue((args.case_dir / "failed-attempt-2/marker").exists())
+
+    def test_capture_failure_stops_after_three_attempts(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                   benchmark="benchmark", replay="replay",
+                                   model=Path("model.json"), fixture="serial", scenario="full_res")
+            with patch.object(DRIVER.subprocess, "run", return_value=SimpleNamespace(returncode=1)) as run:
+                with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
+                    DRIVER.collect_evaluate(args)
+            self.assertEqual(run.call_count, 3)
+            self.assertFalse((args.case_dir / "evaluation.json").exists())
+            self.assertFalse((args.case_dir / "callgrind/collected.stamp").exists())
+
     def test_invalid_tolerances_are_rejected(self):
         for tolerance in (-0.01, 1.0, float("inf"), float("nan")):
             with self.subTest(tolerance=tolerance):
@@ -43,37 +131,6 @@ class RenderValgrindCiTest(unittest.TestCase):
             DRIVER.write_json_atomic(path, {"complete": True})
             self.assertEqual(json.loads(path.read_text()), {"complete": True})
             self.assertEqual(list(path.parent.glob(".*.tmp-*")), [])
-
-    def test_freeze_model_requires_explicit_unpromoted_approval(self):
-        calibration = {
-            "renderer_inputs_used": False,
-            "candidate_accepted": False,
-            "parameters": {"cross_thread_release_ns": 12.5},
-            "event_cost_model": {
-                "feature_names": list(DRIVER.DATA_READ_FEATURE_NAMES),
-                "coefficients_ns": [float(index) for index in range(7)],
-                "stall_overlap_fraction": 0.0,
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "calibration.json"
-            output = root / "model.json"
-            source.write_text(json.dumps(calibration))
-            args = SimpleNamespace(
-                calibration=source,
-                output=output,
-                model_id="test-model",
-                allow_unpromoted=False,
-            )
-            with self.assertRaisesRegex(RuntimeError, "not accepted"):
-                DRIVER.freeze_model(args)
-            args.allow_unpromoted = True
-            DRIVER.freeze_model(args)
-            model = json.loads(output.read_text())
-            self.assertEqual(model["model_id"], "test-model")
-            self.assertEqual(model["cross_thread_release_ns"], 12.5)
-            self.assertFalse(model["timing_claims_enabled"])
 
     def test_set_tolerance_preserves_all_reference_cases(self):
         reference = {

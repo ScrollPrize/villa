@@ -35,18 +35,20 @@ Run the following command to perform segmentation:
 ```
 python segment.py --root_dir <folder_path>
 ```
-### Command for Fixing predictions
-Run the following command to perform segmentation:
+`segment.py` writes `<orientation>/Masks/<image>_mask.png` palette masks with one label per object found on the first frame, ordered darkest first. Besides the scroll these include the background, the turntable, fiducial markers and dust, and the scroll is not necessarily label 1.
+
+### Command for Scroll-Only Masks
+Run the following command to write binary scroll masks for reconstruction:
 
 ```
-python cc-fix.py <folder_path>
+python scroll-mask.py <folder_path>
 ```
-### Command for creating applying Mask
-Run the following command to perform segmentation:
 
-```
-python mask-applier.py --root_dir <folder_path>
-```
+For each orientation folder it picks the scroll label as the one present in every frame, never touching the image border, whose centroid moves least across the turntable rotation (markers orbit the axis). It then writes `<orientation>/ScrollMasks/<image>_mask.png` with the largest connected component of that label as 255 and everything else as 0. Folders where the pick is ambiguous, or the scroll appears split across labels, are reported as `FAIL` and skipped; inspect their masks before rerunning with `--force`. Check the printed label, area and motion for every folder, and review overlays of the written masks.
+
+The synthetic checks for this step run with `python tests/test_scroll_mask.py`.
+
+`cc-fix.py` and `mask-applier.py` assume the scroll is label 1 (and the ruler label 2), which held for earlier ruler-calibrated captures but not for turntable captures with ArUco markers; use them only after confirming those label semantics.
 
 ### Afterwards
 After these steps, one should run PGSRecon or OpenMVG + OpenMVS

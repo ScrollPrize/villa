@@ -11,7 +11,7 @@
 
 // Runs of `python -m vesuvius.afv_spline_generator`, which predicts fibers in a
 // zone of CT block by block, stitches them into long fibers and writes them as
-// an Automated Fiber Volume.
+// a fiber object store.
 namespace vc3d::fibergen
 {
 
@@ -31,8 +31,8 @@ struct Request {
     std::array<int, 3> origin{};
     std::array<int, 3> size{};
     QString output;
-    QString coordinateSpace;
-    std::uint64_t nativeScale = 1;
+    QString volumeUuid;
+    double nativeScale = 1.0;
     // Native voxel size in micrometres; 0 when unknown.
     double voxelSizeUm = 0.0;
     QString sourcePath;
@@ -48,7 +48,7 @@ struct Request {
     // papyrus, are removed; 0 keeps them. Voxels of the volume.
     double minLength = kDefaultMinLength;
     double blackDistance = kDefaultBlackDistance;
-    // Receives a .afv of the fibers stitched so far after each block; empty for none.
+    // Receives a .vcobj of the fibers stitched so far after each block; empty for none.
     QString previewDirectory;
 };
 
@@ -78,7 +78,7 @@ struct Event {
     // stitching, stitched, extending or done).
     int index = -1;
     QString state;
-    // Preview: a .afv of the fibers stitched so far.
+    // Preview: a .vcobj of the fibers stitched so far.
     QString path;
     // Done only.
     QString output;

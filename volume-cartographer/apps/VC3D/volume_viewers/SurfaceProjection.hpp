@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 #include <opencv2/core.hpp>
@@ -22,12 +23,39 @@ class Surface;
 // signed offset along the surface normal. `applyVolumetricW` records whether
 // the normal offset participates in the scene mapping (it does for quad
 // surfaces under the volumetric camera, never for plane surfaces).
+// `distance` is how far the point lies from the depth band the view
+// displays (see depthBandDistance()).
 struct SurfaceProjection {
     float u{0.0f};
     float v{0.0f};
     float w{0.0f};
     bool applyVolumetricW{false};
+    float distance{0.0f};
 };
+
+// A view displays the signed depths [depthLo, depthHi] along the surface
+// normal: the normal offset, widened to the slab while compositing. These
+// measure a point's distance from that band; zero inside it.
+
+// For a point at signed depth `w`.
+inline float depthBandDistance(float w, float depthLo, float depthHi)
+{
+    return std::max({depthLo - w, w - depthHi, 0.0f});
+}
+
+// For a point over surface position `coord` with unit normal `normal`
+// (typically the nominal surface point nearest `point`); the in-surface
+// component of the separation counts in full.
+inline float depthBandDistance(const cv::Vec3f& point,
+                               const cv::Vec3f& coord,
+                               const cv::Vec3f& normal,
+                               float depthLo,
+                               float depthHi)
+{
+    const float w = (point - coord).dot(normal);
+    const float bandW = std::clamp(w, depthLo, depthHi);
+    return static_cast<float>(cv::norm(point - (coord + normal * bandW)));
+}
 
 // The inputs, other than the point itself, that a viewer's projection depends
 // on. A cache of projections stays valid exactly as long as this compares
@@ -35,7 +63,8 @@ struct SurfaceProjection {
 // cannot drift out of sync with the viewer.
 struct SurfaceProjectionContext {
     const Surface* surface{nullptr};
-    std::uint64_t patchIndexGeneration{0};
+    // Bumped by every edit of the viewer's surface.
+    std::uint64_t surfaceEditEpoch{0};
     float depthLo{0.0f};
     float depthHi{0.0f};
     // A plane can be moved while keeping the same Surface pointer, so its
@@ -47,7 +76,7 @@ struct SurfaceProjectionContext {
     bool operator==(const SurfaceProjectionContext& other) const
     {
         return surface == other.surface &&
-               patchIndexGeneration == other.patchIndexGeneration &&
+               surfaceEditEpoch == other.surfaceEditEpoch &&
                depthLo == other.depthLo &&
                depthHi == other.depthHi &&
                planeOrigin == other.planeOrigin &&

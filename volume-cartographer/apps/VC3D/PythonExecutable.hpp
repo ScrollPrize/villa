@@ -2,12 +2,13 @@
 
 #include <QString>
 
-namespace vc3d
-{
+namespace vc3d {
 
-// The first Python that runs among PYTHON_EXECUTABLE, the active conda
-// environment, ~/miniconda3, ~/anaconda3 and the system Python; "python3" if
-// none does. Each candidate is tried with a one-second timeout.
-QString findPythonExecutable();
+// The Python interpreter for services VC3D starts: `preferred` when set, else
+// the environment VC3D was started from - the active virtualenv
+// ($VIRTUAL_ENV/bin/python), the active conda env ($CONDA_PREFIX/bin/python),
+// then python3 / python on PATH. Virtualenv paths are kept as given (not
+// canonicalized), so the venv's site-packages stay in effect.
+QString pythonExecutableForServices(const QString& preferred = {});
 
 }  // namespace vc3d

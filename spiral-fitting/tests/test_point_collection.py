@@ -28,6 +28,7 @@ class LoadPointCollectionTests(unittest.TestCase):
             "vc_pointcollections_json_version": "1",
             "collections": {
                 "0": {
+                    "uuid": "0f8fad5b-d9cb-469f-a165-70867728950e",
                     "name": "col-a",
                     "points": {
                         "0": {"p": [1.0, 2.0, 3.0], "wind_a": 1.5},
@@ -46,6 +47,7 @@ class LoadPointCollectionTests(unittest.TestCase):
         self.assertEqual(list(loaded.keys()), [0])
         collection = loaded[0]
         self.assertEqual(collection["name"], "col-a")
+        self.assertEqual(collection["uuid"], "0f8fad5b-d9cb-469f-a165-70867728950e")
         self.assertEqual(collection["points"][0]["p"], [1.0, 2.0, 3.0])
         self.assertEqual(collection["points"][0]["winding_annotation"], 1.5)
         # Absent winding annotations become NaN, not None.

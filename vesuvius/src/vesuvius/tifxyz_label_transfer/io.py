@@ -16,7 +16,7 @@ from numpy.typing import NDArray
 from PIL import Image
 import tifffile
 
-from .core import Surface
+from .core import Surface, close_memmap
 
 
 def _read_tiff(path: Path) -> NDArray:
@@ -234,8 +234,14 @@ class TemporaryRaster:
         self.array[:] = fill_value
 
     def close(self) -> None:
+        # Every read of this raster happens before its owner calls close(), so
+        # ending the mapping here is safe. Dropping the reference alone leaves
+        # the file mapped on Windows, where the unlink below then fails; close
+        # the mapping explicitly first.
         self.array.flush()
+        mapping = self.array
         del self.array
+        close_memmap(mapping)
         self.path.unlink(missing_ok=True)
 
     def __enter__(self) -> "TemporaryRaster":

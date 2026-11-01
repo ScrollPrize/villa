@@ -1,5 +1,5 @@
 import json
-import sqlite3
+from vc_object_store import ObjectStore
 
 import numpy as np
 import pytest
@@ -39,7 +39,7 @@ def run(monkeypatch, capsys, volume, output, *extra):
         "--origin", "4", "10", "8",
         "--size", "88", "40", "30",
         "--output", str(output),
-        "--coordinate-space", "PHercTest/20250101000000",
+        "--volume-uuid", "20250101000000",
         "--native-scale", "2",
         "--voxel-size", "4.5",
         "--device", "cpu",
@@ -51,7 +51,7 @@ def run(monkeypatch, capsys, volume, output, *extra):
 
 
 def test_generates_a_volume_in_native_coordinates(monkeypatch, capsys, volume, tmp_path):
-    output = tmp_path / "fibers.afv"
+    output = tmp_path / "fibers.vcobj"
     code, events = run(monkeypatch, capsys, volume, output)
     assert code == 0
     done = events[-1]
@@ -59,26 +59,27 @@ def test_generates_a_volume_in_native_coordinates(monkeypatch, capsys, volume, t
     fractions = [e["fraction"] for e in events if e["event"] == "progress"]
     assert fractions == sorted(fractions) and {e["stage"] for e in events if e["event"] == "progress"} == set(cli.Reporter.STAGES)
 
-    db = sqlite3.connect(output)
-    metadata = {key: json.loads(value) for key, value in db.execute("SELECT key, value FROM metadata")}
-    assert metadata["frame"]["vc_open_data_coordinate_space"] == "PHercTest/20250101000000"
-    assert metadata["root"]["vc_open_data_source_original_resolution"] == 4.5
-    # The native shape is not known exactly from a downsampled volume.
-    assert "coordinate_base_shape_zyx" not in metadata["root"]
-    assert metadata["generator"]["origin_xyz"] == [4, 10, 8] and metadata["generator"]["mirror"] is False
-    assert metadata["generator"]["extend"] is False and "gap_model" not in metadata["generator"]
-    assert metadata["generator"]["max_join_angle_degrees"] == 45 and metadata["generator"]["min_length_voxels"] == 32
-    family, length, annotation = db.execute("SELECT family, length, annotation FROM fibers").fetchone()
-    points = np.concatenate([np.frombuffer(blob, "<f8").reshape(-1, 3) for (blob,) in db.execute("SELECT points FROM blocks ORDER BY first_segment")])
+    with ObjectStore.open(str(output), read_only=True) as db:
+        row, = db.objects_by_kind("fiber")
+        metadata = row["meta"]
+        assert metadata["coordinates"] == {"volume_uuid": "20250101000000", "scale_factor": 1}
+        assert metadata["generator"]["voxel_size_um"] == 4.5
+        assert metadata["generator"]["origin_xyz"] == [4, 10, 8] and metadata["generator"]["mirror"] is False
+        assert metadata["generator"]["extend"] is False and "gap_model" not in metadata["generator"]
+        assert metadata["generator"]["max_join_angle_degrees"] == 45 and metadata["generator"]["min_length_voxels"] == 32
+        family, length = row["fiber"]["family"], row["fiber"]["length"]
+        annotation = metadata["source"]
+        with db.geometry_snapshot() as snapshot:
+            points = snapshot.fiber(row["uuid"]).line_points_array().copy()
     assert family == "V"
     # The fiber spans x in [10, 80) at y=30, z=20 of the volume, twice that in native voxels.
     assert np.abs(points[:, 1:] - [60, 40]).max() < 1
     assert 2 * 10 <= points[:, 0].min() < 2 * 14 and 2 * 76 < points[:, 0].max() <= 2 * 80
-    assert json.loads(annotation)["length_mm"] == pytest.approx(length * 0.0045)
+    assert annotation["length_mm"] == pytest.approx(length * 0.0045)
 
 
 def test_blocks_are_stitched_and_previewed(monkeypatch, capsys, volume, tmp_path):
-    output = tmp_path / "fibers.afv"
+    output = tmp_path / "fibers.vcobj"
     previews = tmp_path / "previews"
     previews.mkdir()
     code, events = run(monkeypatch, capsys, volume, output, "--block-size", "48", "--preview-dir", str(previews))
@@ -89,18 +90,20 @@ def test_blocks_are_stitched_and_previewed(monkeypatch, capsys, volume, tmp_path
         states = [e["state"] for e in events if e["event"] == "block" and e["index"] == index]
         assert states[:5] == ["reading", "predicting", "splines", "stitching", "stitched"] and states[-1] == "done"
     shown = [e for e in events if e["event"] == "preview"]
-    assert [e["path"] for e in shown] == [str(previews / "preview-0001.afv"), str(previews / "preview-0002.afv")]
+    assert [e["path"] for e in shown] == [str(previews / "preview-0001.vcobj"), str(previews / "preview-0002.vcobj")]
     assert all(e["fibers"] == 1 for e in shown)
     # Both blocks see the fiber; it is written once.
     assert events[-1]["fibers"] == 1
 
 
 def test_fibers_are_extended_only_when_asked(monkeypatch, capsys, volume, tmp_path):
-    code, events = run(monkeypatch, capsys, volume, tmp_path / "fibers.afv", "--block-size", "48", "--extend")
+    code, events = run(monkeypatch, capsys, volume, tmp_path / "fibers.vcobj", "--block-size", "48", "--extend")
     assert code == 0 and events[-1]["fibers"] == 1
     assert "extending" in {e["state"] for e in events if e["event"] == "block"}
-    metadata = {key: json.loads(value) for key, value in sqlite3.connect(tmp_path / "fibers.afv").execute("SELECT key, value FROM metadata")}
-    assert metadata["generator"]["extend"] is True and metadata["generator"]["gap_model"]
+    with ObjectStore.open(str(tmp_path / "fibers.vcobj"), read_only=True) as db:
+        row, = db.objects_by_kind("fiber")
+        assert row["meta"]["generator"]["extend"] is True and row["meta"]["generator"]["gap_model"]
+
 
 
 def test_zone_is_cut_into_blocks():
@@ -121,13 +124,13 @@ def test_region_reader_matches_the_volume(volume, tmp_path, spilled):
 
 
 def test_reports_errors_as_json_and_writes_nothing(monkeypatch, capsys, volume, tmp_path):
-    output = tmp_path / "fibers.afv"
+    output = tmp_path / "fibers.vcobj"
     code, events = run(monkeypatch, capsys, volume, output, "--level", "1")
     assert code == 1 and events[-1] == {"event": "error", "message": "The volume has no array 1"}
     assert not output.exists()
 
 
-REQUIRED = ["--volume", "v.zarr", "--origin", "0", "0", "0", "--size", "1", "1", "1", "--output", "f.afv", "--coordinate-space", "S/1"]
+REQUIRED = ["--volume", "v.zarr", "--origin", "0", "0", "0", "--size", "1", "1", "1", "--output", "f.vcobj", "--volume-uuid", "S/1"]
 
 
 @pytest.mark.parametrize("flag, mirror", [((), False), (("--mirror",), True), (("--no-mirror",), False)])

@@ -40,7 +40,6 @@ const OUTPUT_STATUSES = new Set([
   'archived',
   'planned',
   'prepared',
-  'synced',
   'valid',
   'waiting',
 ]);
@@ -418,7 +417,6 @@ function collaboratorPermissions(command, env) {
     'validate',
     'bootstrap',
     'prepare',
-    'sync-responses',
     'activate',
     'reconcile-active',
     'verify',
@@ -533,16 +531,6 @@ export async function runAutomationCli(argv, {
     parseCycle(sourceCycle);
     result = await rollover.validate({
       sourceFormId: requiredEnv(env, AUTOMATION_ENV.SOURCE_FORM_ID),
-      sourceCycle,
-      collaboratorPermissions: collaborators,
-    });
-  } else if (command === 'sync-responses') {
-    const sourceCycle = requireOption(options, 'source-cycle');
-    parseCycle(sourceCycle);
-    result = await rollover.syncResponses({
-      sourceFormId: runtime.environment === 'production'
-        ? requiredEnv(env, AUTOMATION_ENV.SOURCE_FORM_ID)
-        : undefined,
       sourceCycle,
       collaboratorPermissions: collaborators,
     });
