@@ -1226,6 +1226,24 @@ def get_flow_field_high_res_lr_scale(cfg, iteration):
     return min(1., float(initial) + fraction * (float(final) - float(initial)))
 
 
+def get_unattached_pcl_weight_scale(cfg, iteration):
+    """Multiplier on both unattached-strip loss weights at an iteration.
+
+    1 until loss_weight_unattached_pcl_ramp_start_step, then linear to
+    loss_weight_unattached_pcl_scale_final over
+    loss_weight_unattached_pcl_ramp_steps steps, and the final scale after.
+    """
+    final = float(cfg['loss_weight_unattached_pcl_scale_final'])
+    start_step = int(cfg['loss_weight_unattached_pcl_ramp_start_step'])
+    ramp_steps = max(1, int(cfg['loss_weight_unattached_pcl_ramp_steps']))
+    iteration = int(iteration)
+    if iteration <= start_step:
+        return 1.
+    if iteration >= start_step + ramp_steps:
+        return final
+    return 1. + (final - 1.) * (iteration - start_step) / ramp_steps
+
+
 def get_flow_field_low_res_lr_scale(cfg):
     """Relative optimizer LR for the low-resolution flow lattice."""
     value = cfg.get('model_flow_field_low_res_lr_scale')
@@ -5203,9 +5221,14 @@ class FitContext:
             log_metrics.update(min_spacing_metrics)
             del min_spacing_loss, min_spacing_metrics
 
+        unattached_weight_scale = get_unattached_pcl_weight_scale(
+            self.config, iteration)
+        unattached_radius_weight = (
+            self.config['loss_weight_unattached_pcl_radius'] * unattached_weight_scale)
+        unattached_dt_weight = (
+            self.config['loss_weight_unattached_pcl_dt'] * unattached_weight_scale)
         if (
-            (self.config['loss_weight_unattached_pcl_radius'] > 0
-             or self.config['loss_weight_unattached_pcl_dt'] > 0)
+            (unattached_radius_weight > 0 or unattached_dt_weight > 0)
             and self.unattached_pcl_strips
         ):
             unattached_loss_values = get_unattached_pcl_strip_losses(
@@ -5224,8 +5247,8 @@ class FitContext:
                 cfg=self.config,
             )
             backward_family({
-                'unattached_pcl_radius': unattached_loss_values[0] * self.config['loss_weight_unattached_pcl_radius'],
-                'unattached_pcl_dt': unattached_loss_values[1] * self.config['loss_weight_unattached_pcl_dt'],
+                'unattached_pcl_radius': unattached_loss_values[0] * unattached_radius_weight,
+                'unattached_pcl_dt': unattached_loss_values[1] * unattached_dt_weight,
             })
             del unattached_loss_values
 
