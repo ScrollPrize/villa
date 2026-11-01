@@ -156,7 +156,7 @@ With a supported NVIDIA GPU (Linux x86-64, compute capability ≥ 8.0) this uses
 .venv/bin/python build_track_crossings.py /path/to/dataset/tracks/<name>.dbm
 ```
 
-If the database isn't named `tracks/2um_ds2_ps256_surf_v2.dbm`, or there is more than one in `tracks/`, set `"paths": {"tracks_dbm": "tracks/<name>.dbm"}` in `spiral-scroll.json`. Tracks are off by default; enable them with `input_use_tracks` (see [the fit configuration](#the-fit-configuration)). The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#extracting-surface-tracks) has GPU requirements and timings.
+Fits read tracks only from the object store: ingest the database there (see [the inputs](#the-inputs)); its filename doesn't matter. Tracks are off by default; enable them with `input_use_tracks` (see [the fit configuration](#the-fit-configuration)). The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#extracting-surface-tracks) has GPU requirements and timings.
 
 ##### Graph patches
 
@@ -185,7 +185,7 @@ aws s3 ls --no-sign-request \
     s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260801084232-L1/
 ```
 
-Pass the manifest's HTTPS URL to `fiber_direction_samples.py`, from `villa/spiral-fitting`. It downloads only the chunks that intersect the z range and writes the samples into the dataset:
+Pass the manifest's HTTPS URL to `fiber_direction_samples.py`, from `villa/spiral-fitting`. It downloads only the chunks that intersect the z range and writes the samples to the file you name (then name that file as `fiber_directions` in the [input manifest](#the-inputs)):
 
 ```bash
 .venv/bin/python fiber_direction_samples.py \
@@ -221,7 +221,7 @@ Then serve the prediction folder over HTTP (e.g. `python3 -m http.server` in `/p
 
 ##### Winding inference
 
-`winding_inference/` is a compact store of winding crossings predicted by a neural winding model along rays through the scroll. It drives the default dense-spacing mode (`dense_spacing_mode: "winding_model"`), so **a dataset without it fails validation under the default settings**. To fit without it, set `"dense_spacing_mode": "grad_mag"` (which uses the gradient-magnitude volume instead) or `"input_use_winding_inference": false`.
+`winding_inference/` is a compact store of winding crossings predicted by a neural winding model along rays through the scroll. It drives the default dense-spacing mode (`dense_spacing_mode: "winding_model"`), so **a fit whose input manifest names no `winding_inference` is refused under the default settings**. To fit without it, set `"dense_spacing_mode": "grad_mag"` (which uses the gradient-magnitude volume instead) or `"input_use_winding_inference": false`.
 
 Generating it takes a winding model and an existing spiral fit, since the rays are seeded on that fit's windings — so a first fit in `grad_mag` mode is the usual starting point. A trained model is published as [`scrollprize/winding_model_9um`](https://huggingface.co/scrollprize/winding_model_9um):
 
@@ -244,7 +244,7 @@ python infer_winding_volume.py \
 
 The reference zarr's scale-0 grid defines the output coordinates, so use the volume the fit runs on. `--z-range` and `--winding-range` default to the fitted checkpoint's ranges. It also needs the scroll's `umbilicus.json` (`--umbilicus`, or found from the checkpoint's dataset). The cache is large — about 150 GB for all of PHerc. Paris 4.
 
-**2. Export the compact store** into the dataset:
+**2. Export the compact store** (and name its directory as `winding_inference` in the [input manifest](#the-inputs)):
 
 ```bash
 python export_spiral_supervision.py winding_native_phase.zarr \
@@ -255,24 +255,34 @@ The export is restartable, refuses to overwrite an existing store, and `--valida
 
 #### Configure
 
-Two separate things configure a run: **where the data is** — given on the command line, plus one file inside the dataset — and **how to fit it**, a flat set of named settings.
+Two separate things configure a run: **where the data is** — an object store and an input manifest, both named on the command line — and **how to fit it**, a flat set of named settings.
 
-##### The dataset
+##### The inputs
 
-`fit_spiral.py` takes a `--dataset` root and resolves the conventional layout underneath it: `umbilicus.json`, `verified_patches/`, `fibers/`, `fiber_directions.npz`, `outer_shell/`, `tracks/`, `winding_inference/`, the `lasagna_inputs/*.ome.zarr` volumes, and the point-collection documents `abs_winding.json`, `relative_windings.json`, `same_windings.json` and `drawn_control_points.json`. A download of the published dataset is already in that layout, so there are no paths to edit.
+Nothing is discovered from a directory layout: every input is named explicitly.
 
-You also need to provide a **`spiral-scroll.json`** in the dataset root, recording the physical facts of the scroll:
+- **Geometry** — patches, point collections (`abs_winding.json`, `relative_windings.json`, `same_windings.json`), fibers, tracks and the outer shell — is read only from an **object store** (`--object-store scroll.vcobj`). Import the downloaded files into one once with `vc_object_ingest`, as described under [One-time dataset ingest](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#one-time-dataset-ingest); the outer shell is the store surface tagged `spiral-outer-shell`. Every ingested object declares the reference volume its coordinates are in (`--volume-uuid`).
+- **Everything else** is named in a JSON **input manifest** (`--inputs spiral-inputs.json`). Relative paths resolve against the manifest's own directory, so the files can be called anything and live anywhere:
 
 ```json
 {
   "schema_version": 1,
-  "name": "PHercParis4",
-  "voxel_size_um": 9.6,
-  "spiral_outward_sense": "CW"
+  "volume_uuid": "<the --volume-uuid you ingested the store with>",
+  "scroll": {
+    "name": "PHercParis4",
+    "voxel_size_um": 9.6,
+    "spiral_outward_sense": "CW"
+  },
+  "umbilicus": {"path": "umbilicus.json"},
+  "lasagna": {"manifest": "lasagna_inputs/<name>.lasagna.json"},
+  "fiber_directions": "fiber_directions.npz",
+  "winding_inference": "winding_inference"
 }
 ```
 
-`name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), the fit volume's `base_shape_zyx`, and `lasagna_scale`, the lasagna arrays' downsampling relative to the fit volume. When both the scroll file and the lasagna manifest state a `base_shape_zyx`, the fit derives the scale itself (the two grids must cover the same aligned volume extent) and a stated `lasagna_scale` only cross-checks it; otherwise `lasagna_scale` is required, so read it off the arrays' own `.zattrs` rather than copying another scroll's value. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
+`volume_uuid`, `scroll` and `umbilicus` are required; `volume_uuid` must be the volume the selected store objects declare, or the fit is refused. `name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral (alternatively state the volume's catalog flags `z_direction_is_top_to_bottom` and `left_handed_coordinates`, which decide it). The scroll block can also carry the fit volume's `base_shape_zyx`, `num_windings` (a default for the winding-count settings), and `lasagna_scale`, the lasagna arrays' downsampling relative to the fit volume. When both the scroll block and the lasagna manifest state a `base_shape_zyx`, the fit derives the scale itself (the two grids must cover the same aligned volume extent) and a stated `lasagna_scale` only cross-checks it; otherwise `lasagna_scale` is required, so read it off the arrays' own `.zattrs` rather than copying another scroll's value.
+
+`lasagna`, `fiber_directions` and `winding_inference` are optional, but a configuration whose losses read one refuses to start without it, listing every missing input. `lasagna.manifest` must be a local file; if it is a local copy of a remote Lasagna dataset, add `"original_url": "<its https URL>"` so the fit shares that dataset's prepared cache (nothing is downloaded). An optional `scroll_zarr` names the CT volume for visualization and may be a URL. Older `spiral-scroll.json` files are not read: move their facts into the `scroll` block, and the `--dataset`, `--scroll-spec` and `--lasagna-url` flags are refused. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
 
 
 #### Running the fit
@@ -309,11 +319,11 @@ The configuration dock for the most part should be used top-to-bottom, and all f
 In **Spiral Service**, choose a connection:
 
 <div className="mb-4 max-w-[720px] mx-auto">
-  <img src="/img/tutorials/spiral-workspace/spiral-service-section.webp" alt="Spiral Service panel showing connection profiles, endpoint, SSH host, dataset, output, and cache fields." className="w-[100%]" />
+  <img src="/img/tutorials/spiral-workspace/spiral-service-section.webp" alt="Spiral Service panel showing connection profiles, endpoint, SSH host, output, and cache fields." className="w-[100%]" />
   <figcaption className="mt-[-6px]">Connection profiles and service paths in the Spiral Service panel.</figcaption>
 </div>
 
-- **Local:** set **Dataset** and **Output**, then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. Keep Output outside the dataset directory.
+- **Local:** set **Output** (and optionally **Winding inference**, the directory of a winding-inference store, needed only for winding-model supervision), then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. The service has no dataset: the scroll's facts, umbilicus, Lasagna and fiber-inference datasets come from the open VC3D project, and geometry from the service's object store.
 - **Remote (SSH):** start the service on the GPU machine using the command below, then click **+SSH** in VC3D. Enter `[user@]host` (an SSH-config alias also works) and port `8765`, then **Connect**. Use SSH keys or an agent; if the host is new, connect once with `ssh user@host` in a terminal to accept its host key. VC3D creates the tunnel and retrieves the API key automatically.
 - **Remote (LAN):** start the same service with `--bind 0.0.0.0`, then click **+LAN**. Set **Endpoint** to `http://HOST:8765` and paste the API key printed by the service. Direct HTTP is unencrypted; use it on a trusted network, or use SSH.
 
@@ -321,11 +331,12 @@ For either remote connection, run this on the GPU host from `villa/spiral-fittin
 
 ```bash
 uv run python spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
+    --object-store /data/scrolls/s1.vcobj --output /data/spiral-output/s1 \
+    --winding-inference /data/scrolls/s1/winding_inference \
     --gpus 0 --session-name my-fit
 ```
 
-Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. If you mount the remote dataset locally, set **Local dataset path** to its matching root to enable verified patch overlays.
+`--winding-inference` is optional; VC3D shows whether winding-model supervision can run, and changing it means restarting the service. Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. A remote service needs its own replica of the same object-store hub VC3D uses; see the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) for the hub options.
 
 ###### Configuring and running the initial fit 
 
@@ -378,11 +389,11 @@ When fitting a spiral using the spiral workspace, you can add constraints to a r
   <figcaption className="mt-[-6px]">A flattened spiral preview with a painted patch and point annotations.</figcaption>
 </div>
 
-Use **Add/Apply changes** to submit ready drafts to the fit, including while it is running. **Commit** persists the selected changes into the dataset; applying alone does not. For existing inputs, enable **Show original dataset inputs**, then right-click an entry and choose **Edit**. Patch and fiber editors save working copies; use Add/Apply afterward. **Remove** stages a removal, **Restore** reverses it before Commit, and committing the removal deletes the managed dataset entry.
+Use **Add/Apply changes** to submit ready drafts to the fit, including while it is running. **Commit** persists the selected changes into the object store; applying alone does not. For existing inputs, enable **Show original store inputs**, then right-click an entry and choose **Edit**. Patch and fiber editors save working copies; use Add/Apply afterward. **Remove** stages a removal, **Restore** reverses it before Commit, and committing the removal deletes the object from the store.
 
 <div className="mb-4 max-w-[720px] mx-auto">
   <img src="/img/tutorials/spiral-workspace/pending-and-committed-inputs.webp" alt="Input list showing drawing changes and the Add/Apply changes, Commit, and Remove buttons." className="w-[100%]" />
-  <figcaption className="mt-[-6px]">Drawing changes in the input list: Apply updates the fit; Commit writes them into the dataset.</figcaption>
+  <figcaption className="mt-[-6px]">Drawing changes in the input list: Apply updates the fit; Commit writes them into the object store.</figcaption>
 </div>
 
 ##### Preview intervals and rendering
@@ -393,9 +404,9 @@ A preview is also requested when a connected run finishes or is stopped. Exporti
 
 ##### Where files live
 
-Generated files live on the **service machine**, under its Output root; the example above uses `/data/spiral-output/s1/my-fit/`. This holds fit run directories, previews, uploads, and checkpoints, including `checkpoint_autosave.ckpt`. For local services, an empty Output field uses a per-dataset directory in VC3D's application-data folder; set it explicitly for an easy-to-find location. The derived cache defaults to `~/.cache/vc3d/spiral`.
+Generated files live on the **service machine**, under its Output root; the example above uses `/data/spiral-output/s1/my-fit/`. This holds fit run directories, previews, uploads, and checkpoints, including `checkpoint_autosave.ckpt`. For local services, an empty Output field uses a directory per object store in VC3D's application-data folder; set it explicitly for an easy-to-find location. The derived cache defaults to `~/.cache/vc3d/spiral`.
 
-**Checkpoint → Save on Service** saves remotely; **Download…** copies a checkpoint to your computer. VC3D also caches downloaded display artifacts locally. Only **Commit** writes your annotation changes back into the dataset. See the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#internet-flow-ssh-attach) for connection and storage details.
+**Checkpoint → Save on Service** saves remotely; **Download…** copies a checkpoint to your computer. VC3D also caches downloaded display artifacts locally. Only **Commit** writes your annotation changes back into the object store. See the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#internet-flow-ssh-attach) for connection and storage details.
 
 ##### Improving the fit "interactively" 
 
@@ -421,13 +432,14 @@ Everything else — the fitted z-range, which inputs participate, loss weights, 
 
 ```bash
 FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 10500, "z_end": 11500, "optimizer_num_training_steps": 10000}' \
-    python fit_spiral.py --dataset ./spiral_datasets/phercparis4
+    python fit_spiral.py --inputs spiral-inputs.json --object-store phercparis4.vcobj \
+        --object-store-author "$USER"
 ```
 
 The settings you are most likely to touch:
 
 - `z_begin`, `z_end` — the slice range (in full-resolution voxels) to fit; the defaults, 4,000 and 17,000, span the whole written region of Scroll 1. **Consider starting with a small range**: fitting all of it needs a lot of GPU memory and time, and a ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so the other hyperparameters don't need retuning when you change it.
-- **`input_use_*` — whether an input that is present is actually used.** Each optional input source has its own toggle, independent of whether its file is there: `input_use_verified_patches`, `input_use_tracks`, `input_use_fibers`, `input_use_fiber_directions`, `input_use_normals`, `input_use_gradient_magnitude`, `input_use_winding_inference`, `input_use_outer_shell`, plus one per annotation role — `input_use_pcl_absolute`, `input_use_pcl_relative`, `input_use_pcl_same_winding`, `input_use_pcl_drawn_control_points`.Note that `input_use_tracks` defaults to `false`, so a dataset that includes a tracks DBM will not use it unless you turn it on:
+- **`input_use_*` — whether an input that is present is actually used.** Each optional input source has its own toggle, independent of whether its file is there: `input_use_verified_patches`, `input_use_tracks`, `input_use_fibers`, `input_use_fiber_directions`, `input_use_normals`, `input_use_gradient_magnitude`, `input_use_winding_inference`, `input_use_outer_shell`, plus one per annotation role — `input_use_pcl_absolute`, `input_use_pcl_relative`, `input_use_pcl_same_winding`, `input_use_pcl_drawn_control_points`.Note that `input_use_tracks` defaults to `false`, so a store that holds tracks will not use them unless you turn it on:
 
   ```
   FIT_SPIRAL_CONFIG_OVERRIDES='{"input_use_tracks": true, ...}'
@@ -446,17 +458,18 @@ A few environment variables control the run itself rather than the fit:
 | `FIT_SPIRAL_RESUME_PATH` / `FIT_SPIRAL_RESUME_STEP` | Resume from a checkpoint |
 | `WANDB_MODE` | Set to `online` to log losses and visualizations to Weights & Biases (default `disabled`) |
 
-The cache of preprocessed inputs — which speeds up subsequent runs a lot — defaults to `~/.cache/vc3d/spiral`, shared across datasets since its entries are content-addressed; `--cache DIR` (or `FIT_SPIRAL_CACHE_DIR`) moves it elsewhere.
+The cache of preprocessed inputs — which speeds up subsequent runs a lot — defaults to `~/.cache/vc3d/spiral`, shared across scrolls since its entries are content-addressed; `--cache DIR` (or `FIT_SPIRAL_CACHE_DIR`) moves it elsewhere.
 
 #### Fit
 
 ```bash
-python fit_spiral.py --dataset ./spiral_datasets/phercparis4
+python fit_spiral.py --inputs spiral-inputs.json --object-store phercparis4.vcobj \
+    --object-store-author "$USER"
 ```
 
-That's it — the script loads the inputs (caching the expensive preprocessing), then runs 30,000 optimization steps, printing the loss breakdown every 200 steps. Multi-GPU is supported via `torchrun --nproc-per-node=N fit_spiral.py --dataset ...`, which splits each step's work across GPUs.
+That's it — the script loads the inputs (caching the expensive preprocessing), then runs 30,000 optimization steps, printing the loss breakdown every 200 steps. Multi-GPU is supported via `torchrun --nproc-per-node=N fit_spiral.py --inputs ... --object-store ...`, which splits each step's work across GPUs.
 
-To run the whole pipeline in one command — fit, then render ink, then score it — use [`runners/run_single.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/runners/run_single.py) instead. It takes the same `--dataset`, plus an `--ink-volume`, and accepts the same configuration overrides as a `--config` JSON file; `runners/run_sweep.py` runs a whole folder of such configs concurrently across GPUs.
+To run the whole pipeline in one command — fit, then render ink, then score it — use [`runners/run_single.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/runners/run_single.py) instead. It takes the same `--inputs` and `--object-store`, plus an `--ink-volume`, and accepts the same configuration overrides as a `--config` JSON file; `runners/run_sweep.py` runs a whole folder of such configs concurrently across GPUs.
 
 When it finishes, you get a self-contained run folder:
 
