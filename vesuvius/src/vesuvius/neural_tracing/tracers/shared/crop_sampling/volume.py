@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 import numcodecs
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.shared.io import atomic_write
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write, lock_exclusive
 from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire
 
 _VCZ1_REGISTERED = False
@@ -252,8 +252,15 @@ class RemoteChunkedArray(ChunkedArray):
             dtype=np.dtype(array.dtype).str,fill_value=np.asarray(getattr(array,'metadata',array).fill_value or 0).item(),
             compressor=None,filters=None,order='C',
             dimension_separator=getattr(getattr(array,'metadata',array),'dimension_separator','.'))
-        atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
-        atomic_write(local/'.zarray',json.dumps(metadata).encode())
+        # One publisher at a time, and only once: on Windows os.replace cannot overwrite a .zarray another process has open.
+        lock_path = Path(local)/'.locks'/'.zarray'
+        lock_path.parent.mkdir(parents=True,exist_ok=True)
+        with lock_path.open('a+b') as lock:
+            lock_exclusive(lock)
+            if (Path(local)/'.zarray').exists():
+                return
+            atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
+            atomic_write(local/'.zarray',json.dumps(metadata).encode())
 
     def _open(self):
         import zarr
@@ -268,15 +275,14 @@ class RemoteChunkedArray(ChunkedArray):
             return cached
         if self.cache_only:
             raise FileNotFoundError(f'Remote CT chunk is not prefetched: {self.path}/{key}')
-        # POSIX advisory locks work on both supported platforms (Linux/macOS).
+        # Advisory file locks (flock on Linux/macOS, msvcrt on Windows: shared/io.py).
         # Separate file handles serialize threads as well as loader processes.
         # Cached reads avoid the lock. A reader waits for a chunk another reader is
         # fetching, without downloading it twice.
-        import fcntl
         lock_path = chunk_lock_path(self.path, key)
         lock_path.parent.mkdir(exist_ok=True)
         with lock_path.open('a+b') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+            lock_exclusive(lock)
             cached = super()._load(key)
             if cached is not None:
                 return cached
@@ -349,7 +355,14 @@ def open_ct_array(spec, cache_bytes, *, cache_only=False):
         if os.environ.get('VESUVIUS_CT_READER') == 'vc3d':
             if cache_only:
                 raise ValueError('VC3D CT reader does not support cache-only prefetch mode')
-            return Vc3dChunkedArray(spec.ct_zarr, spec.ct_level, cache_bytes)
+            try:
+                return Vc3dChunkedArray(spec.ct_zarr, spec.ct_level, cache_bytes)
+            except ModuleNotFoundError as error:
+                # VC3D builds without Python bindings (the Windows release) cannot share the viewer's cache.
+                if error.name not in ('vc', 'vc.volume'):
+                    raise
+                print('VC3D bindings not found; reading CT through the remote cache', flush=True)
+                print(f'CT chunk cache: {spec.cache_dir}', flush=True)
         return RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, cache_bytes, cache_only=cache_only)
     return ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), cache_bytes)
 

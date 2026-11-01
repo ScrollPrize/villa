@@ -1,10 +1,17 @@
-"""Atomic file output and JSON with numpy values."""
+"""Atomic file output, advisory file locks and JSON with numpy values."""
 from __future__ import annotations
+import errno
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import numpy as np
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl
+    fcntl = None
+    import msvcrt
 
 
 def atomic_write(path, data):
@@ -21,6 +28,28 @@ def atomic_write(path, data):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def lock_exclusive(handle, *, blocking=True):
+    """Take an exclusive advisory lock on the open file ``handle``, held until the handle closes: ``flock`` on
+    Linux/macOS, a one-byte ``msvcrt`` lock on Windows (polled, since ``LK_LOCK`` gives up after ~10 s). Separate
+    handles exclude each other in one process as across processes. With ``blocking=False`` a lock held through another
+    handle raises ``BlockingIOError`` on every platform."""
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return
+    handle.seek(0)
+    while True:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as error:
+            # Only contention is retried: anything else (a bad descriptor) would spin here forever.
+            if error.errno not in (errno.EACCES, errno.EDEADLK):
+                raise
+            if not blocking:
+                raise BlockingIOError(errno.EAGAIN, 'file lock is held through another handle') from None
+        time.sleep(.01)
 
 
 def jsonable(x):
