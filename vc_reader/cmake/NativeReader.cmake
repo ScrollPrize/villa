@@ -6,7 +6,7 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 find_package(SQLite3 3.24 REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
-    find_package(vc_delta3d CONFIG QUIET)
+    find_package(vc_delta3d 0.3 CONFIG QUIET)
 endif()
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -15,8 +15,9 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP ON CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 103b502ad784df14c876100d87f601c0b6c46888) # v0.2.0
-    FetchContent_MakeAvailable(vc_delta3d)
+        GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d) # ScrollPrize/vc-delta3d#7
+    include("${CMAKE_CURRENT_LIST_DIR}/FetchDelta3D.cmake")
+    vc_fetch_delta3d()
 endif()
 if(TARGET vc_delta3d)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)

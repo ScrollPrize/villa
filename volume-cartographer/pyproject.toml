@@ -14,7 +14,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy",
     "numcodecs>=0.15.1,<0.17",
-    "vc-delta3d>=0.2.0,<0.3",
+    "vc-delta3d @ git+https://github.com/ScrollPrize/vc-delta3d.git@45339743b450ff707d21fb742dc1b3b2bf99306d",
 ]
 license = { file = "LICENSE" }
 
