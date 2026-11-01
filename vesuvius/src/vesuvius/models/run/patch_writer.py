@@ -7,7 +7,7 @@ class BoundedPatchWriter:
     """Thread-pooled writer with a bounded in-flight queue.
 
     Wraps a ThreadPoolExecutor so the producer (inference loop) blocks once
-    ``max_workers * 2`` write tasks are pending. This prevents the executor's
+    ``max_inflight`` (default ``max_workers * 2``) write tasks are pending. This prevents the executor's
     internal queue from growing unbounded and pinning a float16 patch per
     pending task in host RAM when the sink (e.g. S3) is slower than the GPU.
 
@@ -17,12 +17,12 @@ class BoundedPatchWriter:
     """
 
     def __init__(self, output_store, max_workers, *, pbar=None,
-                 on_progress=None, stall_report_interval=5.0):
+                 on_progress=None, stall_report_interval=5.0, max_inflight=None):
         self._store = output_store
         self._pbar = pbar
         self._on_progress = on_progress
         self._max_workers = max_workers
-        self._max_inflight = max_workers * 2
+        self._max_inflight = max_inflight if max_inflight is not None else max_workers * 2
         self._inflight = threading.BoundedSemaphore(self._max_inflight)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
