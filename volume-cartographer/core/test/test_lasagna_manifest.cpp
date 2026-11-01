@@ -223,7 +223,7 @@ TEST_CASE("LasagnaDataset recognizes a validated remote cache marker")
         })";
     }
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    CHECK(dataset.manifest().remoteBaseUrl == "https://example.test/lasagna");
+    CHECK(dataset.manifest().remoteSourceBaseLocation == "https://example.test/lasagna");
     CHECK(dataset.manifest().remoteCacheRoot == vc::settings::remoteCachePath());
 
     {
@@ -384,18 +384,14 @@ TEST_CASE("LasagnaDataset rejects a malformed remote manifest source")
     fs::remove_all(dir);
 }
 
-TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
-{
-    const auto dir = makeTmpDir("remote-manifest-cache");
-    int fetches = 0;
-    vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = dir;
-    options.remoteAuth.kind = "s3";
-    options.remoteAuth.user = "test-access";
-    options.remoteAuth.secret = "test-secret";
-    options.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
-        ++fetches;
-        return R"({
+// A signed loopback bucket holding one manifest, reached through AWS_ENDPOINT_URL.
+struct SignedManifestBucket {
+    fs::path dir;
+    vc::test::LoopbackHttpServer server;
+    explicit SignedManifestBucket(const std::string& tag) : dir(makeTmpDir(tag))
+    {
+        fs::create_directories(dir / "bucket" / "artifact");
+        std::ofstream(dir / "bucket" / "artifact" / "fiber.lasagna.json") << R"({
           "version": 2,
           "groups": {
             "pred": {
@@ -405,30 +401,70 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
             }
           }
         })";
-    };
+        server.serveBucket("bucket", dir / "bucket", true);
+        setenv("AWS_ENDPOINT_URL", server.url().c_str(), 1);
+    }
+    ~SignedManifestBucket()
+    {
+        unsetenv("AWS_ENDPOINT_URL");
+        fs::remove_all(dir);
+    }
+    std::size_t fetches() const { return server.requestCount("/bucket/artifact/fiber.lasagna.json"); }
+    vc::lasagna::LasagnaDatasetOpenOptions options() const
+    {
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.remoteCacheRoot = dir / "cache";
+        options.remoteAuth = vcr::Auth{"s3", "test-access", "test-secret", "", "us-east-1"};
+        return options;
+    }
+};
 
-    const std::string location =
-        "s3+eu-west-2://bucket/artifact/fiber.lasagna.json";
+TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
+{
+    SignedManifestBucket bucket("remote-manifest-cache");
+    auto options = bucket.options();
+    const std::string location = "s3://bucket/artifact/fiber.lasagna.json";
     const auto first = vc::lasagna::LasagnaDataset::openLocation(location, options);
     const auto second = vc::lasagna::LasagnaDataset::openLocation(location, options);
 
-    CHECK(fetches == 1);
+    CHECK(bucket.fetches() == 1);
+    for (const auto& request : bucket.server.requests()) CHECK(request.signedV4());
     CHECK(first.manifest().manifestIsRemote);
     CHECK(first.manifest().manifestLocation == location);
     REQUIRE(first.manifest().groups.size() == 1);
-    CHECK(first.manifest().groups.front().sourceLocation ==
-          "s3+eu-west-2://bucket/artifact/pred.zarr");
+    CHECK(first.manifest().groups.front().sourceLocation == "s3://bucket/artifact/pred.zarr");
     CHECK(first.manifest().groups.front().remoteAuth.user == "test-access");
-    CHECK(first.manifest().groups.front().remoteCacheRoot ==
-          fs::absolute(dir).lexically_normal());
-    CHECK(first.manifest().manifestPath ==
-          vcr::zarr::decodedCachePath(fs::absolute(dir).lexically_normal(), location));
+    const auto root = fs::absolute(bucket.dir / "cache").lexically_normal();
+    CHECK(first.manifest().groups.front().remoteCacheRoot == root);
+    CHECK(first.manifest().manifestPath == vcr::zarr::decodedCachePath(root, location));
     CHECK(second.manifest().manifestPath == first.manifest().manifestPath);
     options.refreshManifest = true;
     (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
-    CHECK(fetches == 2);
+    CHECK(bucket.fetches() == 2);
     CHECK(fs::is_regular_file(first.manifest().manifestPath));
-    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset reads remote manifests under VC's cache settings")
+{
+    // Settings from this process's VC3D_CONFIG_DIR reach the first Lasagna read, before any
+    // CT volume: a free-space floor nothing can satisfy stops caching, reports it and deletes
+    // nothing cached; lifting it lets the read through.
+    SignedManifestBucket bucket("remote-manifest-settings");
+    const auto config = bucket.dir / "config";
+    fs::create_directories(config);
+    setenv("VC3D_CONFIG_DIR", config.c_str(), 1);
+    std::ofstream(config / "VC3D.ini") << "[perf]\nremote_cache_min_free_gib=1000000000\n";
+    const auto options = bucket.options();
+    const std::string location = "s3://bucket/artifact/fiber.lasagna.json";
+    CHECK_THROWS_WITH_AS(vc::lasagna::LasagnaDataset::openLocation(location, options),
+                         doctest::Contains("nothing cached was removed"), vcr::zarr::LowDiskSpace);
+    const auto root = fs::absolute(bucket.dir / "cache").lexically_normal();
+    CHECK_FALSE(fs::exists(vcr::zarr::decodedCachePath(root, location)));
+    std::ofstream(config / "VC3D.ini", std::ios::trunc) << "[perf]\nremote_cache_min_free_gib=0\n";
+    const auto dataset = vc::lasagna::LasagnaDataset::openLocation(location, options);
+    CHECK(dataset.manifest().groups.size() == 1);
+    CHECK(fs::is_regular_file(dataset.manifest().manifestPath));
+    unsetenv("VC3D_CONFIG_DIR");
 }
 
 TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
@@ -465,25 +501,63 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
     fs::remove_all(dir);
 }
 
-TEST_CASE("LasagnaDataset refreshes a corrupt cached manifest once")
+TEST_CASE("LasagnaDataset trusts a cached manifest until an explicit refresh")
 {
-    const auto dir = makeTmpDir("remote-manifest-corrupt");
-    int fetches = 0;
-    vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = dir;
-    options.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
-        ++fetches;
-        return R"({"version":2,"groups":{}})";
-    };
-    const std::string location = "https://example.test/data/test.lasagna.json";
+    SignedManifestBucket bucket("remote-manifest-corrupt");
+    auto options = bucket.options();
+    const std::string location = "s3://bucket/artifact/fiber.lasagna.json";
     const auto initial = vc::lasagna::LasagnaDataset::openLocation(location, options);
     {
         std::ofstream(initial.manifest().manifestPath, std::ios::trunc) <<
             std::string(fs::file_size(initial.manifest().manifestPath), 'x');
     }
+    // A corrupt cached copy is an error, not a reason to download again on its own.
+    CHECK_THROWS(vc::lasagna::LasagnaDataset::openLocation(location, options));
+    CHECK(bucket.fetches() == 1);
+    options.refreshManifest = true;
     const auto recovered = vc::lasagna::LasagnaDataset::openLocation(location, options);
-    CHECK(fetches == 2);
+    CHECK(bucket.fetches() == 2);
     CHECK(recovered.manifest().version == 2);
+}
+
+TEST_CASE("LasagnaDataset keeps a signed location's query for requests, not for names")
+{
+    const auto dir = makeTmpDir("signed-query");
+    vc::test::LoopbackHttpServer server;
+    const std::string base = server.url();
+    server.setHandler([base](const vc::test::LoopbackHttpServer::Request& request)
+                          -> std::optional<vc::test::LoopbackHttpServer::Response> {
+        const auto sig = request.query.find("sig");
+        if (sig == request.query.end() || sig->second != "secret")
+            return vc::test::LoopbackHttpServer::Response{403, "unsigned", {}, false};
+        if (request.path != "/art/data.lasagna.json")
+            return vc::test::LoopbackHttpServer::Response{404, "", {}, false};
+        return vc::test::LoopbackHttpServer::Response{200,
+            R"({"version":2,"groups":{"nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]},)"
+            R"("ny":{"zarr":")" + base + R"(/other/ny.ome.zarr/4?sig=secret","scaledown":4,"channels":["ny"]}}})",
+            {}, false};
+    });
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = dir;
+    const std::string location = base + "/art/data.lasagna.json?sig=secret";
+    const auto dataset = vc::lasagna::LasagnaDataset::openLocation(location, options);
+    REQUIRE(server.requests().size() == 1);
+    CHECK(server.requests().front().query.at("sig") == "secret");
+    // The identity and the cache name carry no credential; requests and group locations do.
+    CHECK(dataset.manifest().manifestLocation == base + "/art/data.lasagna.json");
+    CHECK(dataset.manifest().manifestPath == vcr::zarr::decodedCachePath(fs::absolute(dir).lexically_normal(), location));
+    CHECK(dataset.manifest().manifestPath.string().find("sig=") == std::string::npos);
+    CHECK(dataset.manifest().remoteSourceBaseLocation == base + "/art?sig=secret");
+    REQUIRE(dataset.manifest().groups.size() == 2);
+    CHECK(dataset.manifest().groups[0].sourceLocation == base + "/art/nx.ome.zarr/4?sig=secret");
+    CHECK(dataset.manifest().groups[1].sourceLocation == base + "/other/ny.ome.zarr/4?sig=secret");
+    // Cached: no request. Refreshed: one more, signed.
+    (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
+    CHECK(server.requests().size() == 1);
+    options.refreshManifest = true;
+    (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
+    CHECK(server.requests().size() == 2);
+    CHECK(server.requests().back().query.at("sig") == "secret");
     fs::remove_all(dir);
 }
 

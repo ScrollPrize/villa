@@ -1,6 +1,5 @@
 #pragma once
 
-#include <optional>
 #include <string>
 
 namespace vc {
@@ -20,13 +19,6 @@ struct RemoteVolumeSpec {
     bool hasBaseScaleSelector = false;
     bool useAwsSigv4 = false;
 };
-
-// The URL requests for a location go to, with no slash ending its path; an existing
-// query is kept. ssh:// becomes sftp://.
-std::string normalizedRemoteUrl(const std::string& location);
-
-// The s3:// location (what vcr::zarr::s3Access signs) of an S3 URL; nullopt for any other.
-std::optional<std::string> s3Location(const std::string& url);
 
 // Parse #vc-base-scale=N before URL/S3 resolution. Unknown, duplicate, or
 // malformed selectors throw std::invalid_argument. N is restricted to 0..5;

@@ -1,6 +1,4 @@
 #include "vc/core/util/RemoteUrl.hpp"
-#include <vc_reader/native/reader_types.hpp>
-#include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
 
@@ -77,30 +75,6 @@ int parseBaseScaleSelector(std::string_view fragment)
 
 } // namespace
 
-std::string normalizedRemoteUrl(const std::string& location)
-{
-    return trimTrailingPathSlashes(vcr::sftp::isSftpUrl(location) ? vcr::sftp::parseUrl(location).str()
-                                                                  : vcr::zarr::httpUrl(location));
-}
-
-std::optional<std::string> s3Location(const std::string& url)
-{
-    if (url.starts_with("s3://"))
-        return url;
-    const auto https = vcr::zarr::httpUrl(url);
-    const auto prefix = vcr::s3::splitPrefixUrl(https);
-    if (!prefix || !https.starts_with("http"))
-        return std::nullopt;
-    const auto host = prefix->origin.substr(prefix->origin.find("://") + 3);
-    const auto s3 = host.find(".s3.");
-    if (s3 == std::string::npos || s3 == 0 || !host.ends_with(".amazonaws.com"))
-        return std::nullopt;
-    auto key = prefix->key;
-    while (!key.empty() && key.back() == '/')
-        key.pop_back();
-    return "s3://" + host.substr(0, s3) + (key.empty() ? std::string() : "/" + key);
-}
-
 RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
 {
     const auto fragmentPos = input.find('#');
@@ -111,20 +85,17 @@ RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input)
         ? 0
         : parseBaseScaleSelector(std::string_view(input).substr(fragmentPos + 1));
 
-    std::string sourceUrl = normalizedRemoteUrl(sourceInput);
-    while (!sourceUrl.empty() && sourceUrl.back() == '/') {
-        sourceUrl.pop_back();
-    }
-
+    // The URL requests go to: ssh:// as sftp://, public s3:// as https://, no slash ending the path.
     RemoteVolumeSpec spec;
-    spec.sourceUrl = std::move(sourceUrl);
+    spec.sourceUrl = trimTrailingPathSlashes(vcr::sftp::isSftpUrl(sourceInput) ? vcr::sftp::parseUrl(sourceInput).str()
+                                                                               : vcr::zarr::httpUrl(sourceInput));
     spec.baseScaleLevel = baseScaleLevel;
     spec.hasBaseScaleSelector = fragmentPos != std::string::npos;
     spec.portableLocator = spec.sourceUrl;
     if (baseScaleLevel > 0) {
         spec.portableLocator += "#vc-base-scale=" + std::to_string(baseScaleLevel);
     }
-    spec.useAwsSigv4 = s3Location(spec.sourceUrl).has_value();
+    spec.useAwsSigv4 = vcr::zarr::s3Location(spec.sourceUrl).has_value();
     return spec;
 }
 

@@ -59,11 +59,9 @@ struct LasagnaDatasetManifest {
     std::optional<std::filesystem::path> initShellDir;
     std::vector<LasagnaChannelGroup> groups;
 
-    // Set by LasagnaDataset::open when the manifest is accompanied by the
-    // VC read-through-cache marker, or by LasagnaDataset::openLocation for a
-    // direct remote manifest.
-    std::string remoteBaseUrl;
-    // Original marker or manifest origin used to form readable project paths.
+    // Where the manifest's relative groups live: the marker's artifact URL (LasagnaDataset::open
+    // with the VC read-through-cache marker) or the remote manifest's parent (openLocation), as
+    // requests use it, a signed query included. Empty for a plain local manifest.
     std::string remoteSourceBaseLocation;
     std::filesystem::path remoteCacheRoot;
     // A cached public catalog marker sets this false so later group opens do

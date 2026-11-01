@@ -6,16 +6,6 @@
 #include <string>
 
 
-TEST_CASE("S3 URLs name their s3:// location")
-{
-    CHECK(vc::s3Location("s3://b/k") == "s3://b/k");
-    CHECK(vc::s3Location("s3+eu-west-2://b/k") == "s3://b/k");
-    CHECK(vc::s3Location("https://b.s3.us-west-2.amazonaws.com/k/x") == "s3://b/k/x");
-    CHECK(vc::s3Location("https://b.s3.amazonaws.com") == "s3://b");
-    CHECK_FALSE(vc::s3Location("https://example.com/k"));
-    CHECK_FALSE(vc::s3Location("/a/b"));
-}
-
 TEST_CASE("remote volume selector is parsed and canonicalized")
 {
     const auto spec = vc::parseRemoteVolumeSpec(
@@ -55,11 +45,10 @@ TEST_CASE("selector parsing rejects malformed fragments")
 
 TEST_CASE("fragment-free remote volume specs retain existing resolution")
 {
-    const std::string input = "https://example.test/source.zarr?token=x/";
+    const std::string input = "https://example.test/source.zarr/?token=x/";
     const auto spec = vc::parseRemoteVolumeSpec(input);
-    // This is the legacy NewFromUrl behavior: resolve first, then trim any
-    // slash at the very end of the resulting byte string.
-    CHECK(spec.sourceUrl == "https://example.test/source.zarr?token=x");
+    // Slashes ending the path go; a query's bytes (a signed token) stay as they are.
+    CHECK(spec.sourceUrl == "https://example.test/source.zarr?token=x/");
     CHECK(spec.portableLocator == spec.sourceUrl);
     CHECK(spec.baseScaleLevel == 0);
 }

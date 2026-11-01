@@ -473,17 +473,16 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     const auto root = std::filesystem::temp_directory_path() /
         ("vc_open_data_remote_manual_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
-    const std::string location =
-        "https://example.test/manual/data.lasagna.json";
-    int fetches = 0;
+    vc::test::LoopbackHttpServer server;
+    const auto served = root / "served";
+    std::filesystem::create_directories(served / "manual");
+    writeFile(served / "manual" / "data.lasagna.json", R"({"version":2,"groups":{
+        "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
+    }})");
+    server.serveDirectory(served);
+    const std::string location = server.url() + "/manual/data.lasagna.json";
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     openOptions.remoteCacheRoot = root;
-    openOptions.manifestReader = [&](const std::string&, const std::string&) -> std::optional<std::string> {
-        ++fetches;
-        return R"({"version":2,"groups":{
-            "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
-        }})";
-    };
     const auto cached = vc::lasagna::LasagnaDataset::openLocation(
         location, openOptions);
 
@@ -513,11 +512,13 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     REQUIRE(metricsDataset->manifest().groups.size() == 1);
     const auto& channel = metricsDataset->manifest().groups.front();
     CHECK(channel.isRemote());
-    CHECK(channel.sourceLocation == "https://example.test/manual/nx.ome.zarr/4");
+    CHECK(channel.sourceLocation == server.url() + "/manual/nx.ome.zarr/4");
     CHECK(metricsDataset->manifest().workingToBaseScale == resolved->workingToBaseScale);
-    CHECK(fetches == 1);
-    qputenv("VC3D_CONFIG_DIR", previousConfigDir);
-    std::filesystem::remove_all(root);
+    CHECK(server.requestCount("/manual/data.lasagna.json") == 1);
+    if (previousConfigDir.isNull()) qunsetenv("VC3D_CONFIG_DIR");
+    else qputenv("VC3D_CONFIG_DIR", previousConfigDir);
+    // resolveLasagnaForView pinned the process-wide remote cache root to
+    // `root`; it stays so later cases in this process keep a writable root.
 }
 
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")

@@ -487,6 +487,7 @@ vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fi
 
 vc_add_test(NAME test_remote_url)
 vc_add_test(NAME test_loopback_http_server)
+vc_add_test(NAME test_remote_cache_settings)
 
 vc_add_test(NAME test_logging)
 

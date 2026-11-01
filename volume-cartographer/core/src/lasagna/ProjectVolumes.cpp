@@ -5,7 +5,6 @@
 #include <vc_reader/zarr.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -25,63 +24,14 @@ void addUniqueTag(std::vector<std::string>& tags, std::string tag)
         tags.push_back(std::move(tag));
 }
 
-bool isDigits(std::string_view value)
-{
-    return !value.empty() &&
-        std::all_of(value.begin(), value.end(), [](unsigned char c) {
-            return std::isdigit(c) != 0;
-        });
-}
-
-bool isLocalZarrRoot(const std::filesystem::path& path)
-{
-    return path.extension() == ".zarr" || vcr::zarr::isLocalZarrNode(path);
-}
-
-std::filesystem::path localAttachmentRoot(const LasagnaChannelGroup& group)
-{
-    std::filesystem::path path = group.zarrPath.empty()
-        ? std::filesystem::path(lasagnaGroupSourceLocation(group))
-        : group.zarrPath;
-    path = std::filesystem::absolute(path).lexically_normal();
-    if (isDigits(path.filename().string())) {
-        const auto parent = path.parent_path();
-        if (!parent.empty() && isLocalZarrRoot(parent))
-            return parent;
-    }
-    return path;
-}
-
-std::string remoteAttachmentRoot(std::string location)
-{
-    const auto fragment = location.find('#');
-    const auto query = location.find('?');
-    const auto suffixStart = std::min(
-        fragment == std::string::npos ? location.size() : fragment,
-        query == std::string::npos ? location.size() : query);
-    std::string path = location.substr(0, suffixStart);
-    const std::string suffix = location.substr(suffixStart);
-
-    while (!path.empty() && path.back() == '/')
-        path.pop_back();
-    const auto slash = path.rfind('/');
-    if (slash == std::string::npos)
-        return location;
-
-    const auto leaf = path.substr(slash + 1);
-    const auto parent = path.substr(0, slash);
-    if (isDigits(leaf) && parent.size() >= 5 &&
-        parent.compare(parent.size() - 5, 5, ".zarr") == 0) {
-        return parent + suffix;
-    }
-    return location;
-}
-
+// The volume a group attaches as: its array's group when the array is a numbered
+// pyramid level, otherwise the array itself.
 std::string attachmentLocationForGroup(const LasagnaChannelGroup& group)
 {
-    if (group.isRemote())
-        return remoteAttachmentRoot(lasagnaGroupSourceLocation(group));
-    return localAttachmentRoot(group).string();
+    const std::string location = group.isRemote() || group.zarrPath.empty()
+        ? lasagnaGroupSourceLocation(group)
+        : std::filesystem::absolute(group.zarrPath).lexically_normal().string();
+    return vcr::zarr::levelGroupLocation(location).value_or(location);
 }
 
 std::shared_ptr<Volume> openRegularVolumeForGroup(

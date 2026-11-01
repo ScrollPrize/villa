@@ -22,7 +22,9 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include "vc_reader/source_reader.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 
 namespace vc3d::opendata {
 namespace {
@@ -231,7 +233,15 @@ CachedLasagna cacheLasagna(
     } else {
         const auto manifestUrl = discoverManifestUrl(artifactUrl);
         relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
-        vc::lasagna::downloadLasagnaManifest(manifestUrl, finalDir / relativeName);
+        // Fetched by vc_reader's file cache to its place under the root, which is finalDir.
+        vcr::sources::EncodedFiles files([cacheRoot](const std::string& location) {
+            auto options = vc::settings::remoteOpenOptions(cacheRoot);
+            options.access = vcr::zarr::resolveAccess(location, vcr::zarr::AuthMode::Anonymous);
+            return options;
+        });
+        (void)files.open(manifestUrl);
+        if (!std::filesystem::is_regular_file(finalDir / relativeName))
+            throw std::runtime_error("Lasagna manifest did not cache at " + (finalDir / relativeName).string());
     }
     const auto manifest = finalDir / relativeName;
     nlohmann::json marker{

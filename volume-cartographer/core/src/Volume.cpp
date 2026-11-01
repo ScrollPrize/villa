@@ -120,7 +120,7 @@ bool paddedShapeOK(long long actual, long long expected, int padMultiple)
 // The signed form of an S3 URL.
 std::string signedS3Location(const std::string& url)
 {
-    auto location = vc::s3Location(url);
+    auto location = vcr::zarr::s3Location(url);
     if (!location)
         throw std::runtime_error("signed requests need an S3 virtual-host URL: " + url);
     return std::move(*location);
@@ -368,13 +368,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // Recognized S3 sources are tried anonymously, then with the given or
     // discovered credentials only when anonymous access fails.
     const auto openLevels = [&](const vcr::Auth& requestAuth) {
-        vcr::zarr::OpenOptions options;
+        // VC's cache root, byte limit, floor and parallelism apply from the first metadata read.
+        auto options = vc::settings::remoteOpenOptions(vc::settings::remoteCachePath());
         std::string location = remoteUrl;
         if (!requestAuth.kind.empty()) {
             location = signedS3Location(remoteUrl);
             options.access = vcr::zarr::s3Access(location, requestAuth);
         }
-        options.cacheDirs = {vc::settings::remoteCachePath().string()};
         return std::pair{vcr::zarr::pyramidLevels(location, options), options};
     };
     decltype(openLevels(auth)) opened;
