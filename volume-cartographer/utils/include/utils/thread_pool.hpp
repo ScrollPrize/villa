@@ -16,6 +16,8 @@
 #include <utility>
 #include <algorithm>
 
+#include "utils/process_shutdown.hpp"
+
 namespace utils {
 
 // ---------------------------------------------------------------------------
@@ -42,6 +44,13 @@ public:
     }
 
     ~ThreadPool() {
+        // A pool that lives in a static of a DLL is destroyed while the process
+        // exits, after the OS has terminated its workers: joining them would
+        // wait forever under the loader lock (#1686). Let the jthreads go.
+        if (process_shutdown_in_progress()) {
+            detach_workers();
+            return;
+        }
         // Serialize the stop transition with the worker wait predicate. Without
         // holding mu_, request_stop() + notify_all() can land between a worker's
         // predicate check and its wait, leaving the jthread join blocked.
@@ -172,6 +181,12 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
 private:
+    void detach_workers() noexcept {
+        for (auto& w : workers_)
+            if (w.joinable())
+                w.detach();
+    }
+
     void worker_loop(std::stop_token stop) {
         while (!stop.stop_requested()) {
             std::function<void()> task;
@@ -189,7 +204,17 @@ private:
                 active_.fetch_add(1, std::memory_order_acq_rel);
             }
             task();
-            active_.fetch_sub(1, std::memory_order_release);
+            {
+                // Under mu_: wait_idle() reads active_ in its predicate under
+                // this mutex, then releases it atomically as it parks. A
+                // decrement and notify outside the lock can land in between,
+                // after the predicate saw active_ == 1 and before the waiter
+                // parked, and that notification is lost: wait_idle() then sleeps
+                // on an idle pool (#1686, seen on Windows within a few hundred
+                // batches).
+                std::lock_guard lk(mu_);
+                active_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             idle_cv_.notify_all();
         }
     }
@@ -232,6 +257,11 @@ public:
     }
 
     ~PriorityThreadPool() {
+        // See ~ThreadPool: no join of workers the exiting process already killed.
+        if (process_shutdown_in_progress()) {
+            detach_workers();
+            return;
+        }
         // Keep the stop transition under the same mutex used by worker waits so
         // a shutdown notification cannot be lost before a worker actually waits.
         {
@@ -315,6 +345,12 @@ private:
         }
     };
 
+    void detach_workers() noexcept {
+        for (auto& w : workers_)
+            if (w.joinable())
+                w.detach();
+    }
+
     void worker_loop(std::stop_token stop) {
         while (!stop.stop_requested()) {
             std::function<void()> task;
@@ -350,7 +386,17 @@ private:
                 active_.fetch_add(1, std::memory_order_acq_rel);
             }
             task();
-            active_.fetch_sub(1, std::memory_order_release);
+            {
+                // Under mu_: wait_idle() reads active_ in its predicate under
+                // this mutex, then releases it atomically as it parks. A
+                // decrement and notify outside the lock can land in between,
+                // after the predicate saw active_ == 1 and before the waiter
+                // parked, and that notification is lost: wait_idle() then sleeps
+                // on an idle pool (#1686, seen on Windows within a few hundred
+                // batches).
+                std::lock_guard lk(mu_);
+                active_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             idle_cv_.notify_all();
         }
     }

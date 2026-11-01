@@ -1,4 +1,5 @@
-add_library(utils src/zarr.cpp src/Json.cpp src/aws_auth.cpp src/http_fetch.cpp src/sftp_fetch.cpp)
+add_library(utils src/zarr.cpp src/Json.cpp src/aws_auth.cpp src/http_fetch.cpp src/sftp_fetch.cpp
+    src/process_shutdown.cpp)
 # SFTP protocol client shared with the object store's hosted hubs.
 target_link_libraries(utils PRIVATE vc_object_store::vc_sftp)
 target_include_directories(utils PUBLIC
