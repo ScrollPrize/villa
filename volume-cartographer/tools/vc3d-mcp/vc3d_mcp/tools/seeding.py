@@ -1,4 +1,4 @@
-"""Seeding widget tools (rays, run/expand batches, path analysis)."""
+"""Seeding widget tools (run/expand batches, path analysis)."""
 
 from __future__ import annotations
 
@@ -17,24 +17,9 @@ async def vc3d_seeding_set_winding_annotation_mode(active: bool) -> dict[str, An
 
 
 @mcp.tool()
-async def vc3d_seeding_preview_rays() -> dict[str, Any]:
-    """Seeding: preview the radial rays from the current focus point (requires a
-    focus POI). Fire-and-forget; returns {"requested": true}."""
-    return await _call("seeding.preview_rays", {})
-
-
-@mcp.tool()
-async def vc3d_seeding_cast_rays() -> dict[str, Any]:
-    """Seeding: cast rays and detect intensity peaks (runs asynchronously in a
-    background thread; requires a focus POI in point mode). Returns
-    {"requested": true}."""
-    return await _call("seeding.cast_rays", {})
-
-
-@mcp.tool()
 async def vc3d_seeding_reset_points() -> dict[str, Any]:
-    """Seeding: clear collected peaks/seeds and reset the widget. Returns
-    {"reset": true}."""
+    """Seeding: clear collected peaks and drawn paths and reset the widget.
+    Returns {"reset": true}."""
     return await _call("seeding.reset_points", {})
 
 
@@ -50,7 +35,7 @@ async def vc3d_seeding_run(
     Preconditions the bridge validates: a volume package + current volume are
     loaded; the Seeding widget's source-collection combo has a non-empty
     selection with points (populate it first, e.g. vc3d_commit_points into a
-    collection, or the widget's Cast Rays flow); seed.json and a segmentation
+    collection, or vc3d_seeding_analyze_paths); seed.json and a segmentation
     paths directory exist in the package; vc_grow_seg_from_seed is on disk next
     to VC3D.
 
@@ -115,10 +100,10 @@ async def vc3d_seeding_cancel() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_seeding_analyze_paths() -> dict[str, Any]:
-    """Seeding: analyze intensity peaks along the paths drawn in the widget's
-    Draw mode, collecting seed candidates into the "seeding_peaks" collection.
-    Synchronous in-process compute (NOT a job) -- returns once analysis
-    completes. Requires paths to have been drawn first (Draw mode); with no
+    """Seeding: analyze intensity peaks along the paths drawn in the widget
+    (with "Draw paths" on), collecting seed candidates into the
+    "seeding_peaks" collection. Synchronous in-process compute (NOT a job) --
+    returns once analysis completes. Requires paths to have been drawn first; with no
     paths this fails -32007 (data.kind:"path"). Returns {"analyzed": true,
     "paths": <count>, "peaks": <count>}.
 

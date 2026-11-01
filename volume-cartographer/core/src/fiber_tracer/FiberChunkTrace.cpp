@@ -1,17 +1,21 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
+#include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <opencv2/core.hpp>
+#include <zstd.h>
 
 namespace vc::fiber_tracer {
 std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig&,const FiberChunkWait&);
 void runFiberChunkGpu(FiberChunkPaths&,const FiberPredictionSource&,const vc::lasagna::NormalSampler&,
     const FiberTraceConfig&,const FiberChunkTraceConfig&,double,const std::vector<nlohmann::json>&,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>&,const FiberChunkWait&);
+    const std::shared_ptr<vc::render::PinnedChunkRegion>&,const FiberChunkWait&,
+    const detail::FiberChunkTensor*);
 namespace {
 using Json=nlohmann::json;
 constexpr double pi=3.14159265358979323846;
@@ -35,8 +39,11 @@ cv::Vec3d vec(const Json& p) {
 }
 int validate(const FiberChunkTraceConfig& c,double scale) {
     if(c.gpuDevices<0 || c.gpuDevices>256 || (!c.gpuLibrary.empty() && c.gpuDevices==0) ||
-       c.onlineRefineIterations<0 || c.onlineRefineIterations>16 ||
-       c.onlineRefineWindow<0 || c.onlineRefineWindow>160)
+       c.onlineRefineIterations<0 || c.onlineRefineIterations>64 ||
+       c.onlineRefineWindow<0 || c.onlineRefineWindow>160 ||
+       (c.onlineRefineMode!="legacy"&&c.onlineRefineMode!="analytic") ||
+       (c.beamCommitMode!="shared_prefix"&&c.beamCommitMode!="rolling") ||
+       c.gpuBatchHalves<1||c.gpuBatchHalves>65536||c.gpuBatchMemoryMiB<1||c.gpuBatchMemoryMiB>65536)
         throw std::invalid_argument("invalid GPU/refinement limits");
     for(double v:{c.onlineRefineEpsilonBase,c.onlineRefineStepBase,c.onlineRefineCapBase})
         if(!std::isfinite(v)||v<=0)throw std::invalid_argument("refinement distances must be positive and finite");
@@ -241,6 +248,72 @@ FiberChunkSeedFit refineFiberChunkSeed(const FiberPredictionSource& source,const
     return winner;
 }
 
+std::vector<FiberChunkSeedFit> findFiberChunkSeeds(const FiberPredictionSource& samplesSource,
+    const vc::lasagna::NormalSampler& samplesNormals,const FiberPredictionSource& refinementSource,
+    FiberChunkPaths& bounds,const FiberChunkTraceConfig& c,double scale,bool requireWidth,
+    const FiberChunkParallelFor& parallelFor)
+{
+    const int side=validate(c,scale);
+    auto* tensor=const_cast<detail::FiberChunkTensor*>(dynamic_cast<const detail::FiberChunkTensor*>(&samplesSource));
+    auto idx=[&](int x,int y,int z){return (size_t(z)*side+y)*side+x;};
+    auto point=[&](int x,int y,int z){return bounds.lo+cv::Vec3d(x,y,z)*c.gridBase;};
+    std::vector<float> presence;
+    if(tensor)bounds.timings["seed_grid"]=tensor->seedGrid(bounds.lo,scale,c.gridBase,side,c.seedPresence,presence);
+    else presence.resize(size_t(side)*side*side);
+    for(int z=0;!tensor && z<side;++z) {
+        std::vector<cv::Vec3d> points,dirs(size_t(side)*side,cv::Vec3d(1,0,0));
+        points.reserve(dirs.size());
+        for(int y=0;y<side;++y) for(int x=0;x<side;++x) points.push_back(point(x,y,z)/scale);
+        std::vector<FiberPredictionSample> samples;
+        samplesSource.sampleBatch(points,dirs,1,samples);
+        if(samples.size()!=points.size()) throw std::runtime_error("chunk prediction batch mismatch");
+        for(size_t i=0;i<samples.size();++i) {auto p=best(samples[i]);presence[size_t(z)*side*side+i]=p.valid?p.presence:0;}
+    }
+    const int r=std::lround(c.nmsBase/c.gridBase);
+    std::vector<std::array<int,3>> candidates;
+    for(int z=r;z<side-r;++z) for(int y=r;y<side-r;++y) for(int x=r;x<side-r;++x) {
+        const float p=presence[idx(x,y,z)];if(p<c.seedPresence) continue;
+        bool peak=true;
+        for(int dz=-r;dz<=r&&peak;++dz) for(int dy=-r;dy<=r&&peak;++dy) for(int dx=-r;dx<=r;++dx)
+            if(presence[idx(x+dx,y+dy,z+dz)]>p) {peak=false;break;}
+        if(peak) candidates.push_back({x,y,z});
+    }
+    std::stable_sort(candidates.begin(),candidates.end(),[&](auto a,auto b){return presence[idx(a[0],a[1],a[2])]>presence[idx(b[0],b[1],b[2])];});
+    std::vector<bool> suppressed(presence.size());
+    std::vector<std::array<int,3>> selected;
+    for(const auto& v:candidates) {
+        if(suppressed[idx(v[0],v[1],v[2])]) continue;
+        ++bounds.maxima;
+        for(int dz=-r;dz<=r;++dz) for(int dy=-r;dy<=r;++dy) for(int dx=-r;dx<=r;++dx)
+            suppressed[idx(v[0]+dx,v[1]+dy,v[2]+dz)]=true;
+        selected.push_back(v);
+    }
+    std::vector<FiberChunkSeedFit> seeds(selected.size());
+    const auto process=[&](size_t i) {
+        const auto& v=selected[i];
+        auto p=point(v[0],v[1],v[2]);
+        const auto o=best(samplesSource.sample(p/scale,{1,0,0}));
+        auto d=unit(cv::Vec3d(o.direction));
+        if(!o.valid||cv::norm(d)<.5||!tubeSeed(samplesSource,samplesNormals,p,d,bounds,c,scale)) return;
+        double width=0;
+        if(requireWidth) {
+            std::vector<float> w;samplesSource.sampleWidths({cv::Vec3f(p/scale)},w);
+            if(w.size()!=1||!std::isfinite(w[0])||w[0]<=0) return;
+            width=w[0];
+        }
+        seeds[i]={p,d,width,o.presence};
+        if(c.refineSeed) {
+            const auto fit=refineFiberChunkSeed(refinementSource,p,d,bounds,c,scale);
+            if(fit.score>=0) {seeds[i]=fit;seeds[i].score=o.presence;}
+        }
+    };
+    if(parallelFor&&samplesSource.supportsConcurrentSampling()&&samplesNormals.supportsConcurrentSampling())
+        parallelFor(selected.size(),process);
+    else for(size_t i=0;i<selected.size();++i)process(i);
+    seeds.erase(std::remove_if(seeds.begin(),seeds.end(),[](const auto& s){return s.score<0;}),seeds.end());
+    return seeds;
+}
+
 std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& key,
     const FiberPredictionSource& source,const FiberTraceConfig& trace,
     const vc::lasagna::NormalSampler& normals,const FiberChunkTraceConfig& c,double scale,
@@ -248,8 +321,15 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
 {
     const int side=validate(c,scale);
     validateFiberTraceConfig(trace);
+    if(trace.replayReverseDelaySteps>0 || trace.replayReverseConvergenceMinBase>0)
+        throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
+    if(trace.replayPresenceIgnoreWidth || trace.widthHardRelativeTolerance>0)
+        throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
     if(c.onlineRefineIterations && c.gpuLibrary.empty())
         throw std::invalid_argument("online refinement requires GPU backend");
+    if(c.beamCommitMode=="rolling" && (c.gpuLibrary.empty() ||
+       (c.onlineRefineIterations && c.onlineRefineMode!="analytic")))
+        throw std::invalid_argument("rolling beam commits require GPU backend and analytic refinement when enabled");
     if(!c.gpuLibrary.empty() && (c.refineSeed || trace.embeddingWeight>0 ||
         trace.initialWidthMean!=0 || trace.widthReferenceMean!=0 || trace.widthRelativeTolerance<=0 ||
         trace.lazyLookahead || trace.coneAngleStepDegrees<=0))
@@ -281,8 +361,26 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
     if(!finite(out->lo)||!finite(out->hi)) throw std::invalid_argument("chunk bounds overflow");
     auto cfg=trace;cfg.profile=nullptr;cfg.parallelThreads=1;cfg.traceToBaseScale=scale;
     cfg.pinnedRegion=nullptr;cfg.committedBounds.reset();
+    std::unique_ptr<detail::FiberChunkTensor> tensor;
+    const auto loadStart=std::chrono::steady_clock::now();
+    // GPU construction has a single aligned native source. Keep generic CPU /
+    // synthetic sources on their existing sampling contract.
+    if(!c.gpuLibrary.empty()) {
+        const auto* field=dynamic_cast<const FiberPredictionField*>(&source);
+        const auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normals);
+        if(!field||!normalField)throw std::invalid_argument("GPU chunks require native prediction/normal sources");
+        if(c.refineSeed || cfg.embeddingWeight>0)
+            throw std::invalid_argument("GPU chunks do not support embeddings or seed fitting");
+        const double margin=trace.stepVoxels*std::max(1,trace.beamLookaheadSteps)+
+            (c.onlineRefineIterations?(c.onlineRefineCapBase+c.onlineRefineEpsilonBase)/scale:0);
+        tensor=std::make_unique<detail::FiberChunkTensor>(*field,*normalField,
+            out->lo/scale-cv::Vec3d::all(margin),out->hi/scale+cv::Vec3d::all(margin),true,c.channelHints,c.workerCacheBytes);
+    }
+    out->timings["roi_load_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-loadStart).count();
+    const FiberPredictionSource& samplesSource=tensor?static_cast<const FiberPredictionSource&>(*tensor):source;
+    const vc::lasagna::NormalSampler& samplesNormals=tensor?static_cast<const vc::lasagna::NormalSampler&>(*tensor):normals;
     std::shared_ptr<vc::render::PinnedChunkRegion> pinned;
-    if(c.pinSamplingRegion) {
+    if(c.pinSamplingRegion && !tensor) {
         const auto* field=dynamic_cast<const FiberPredictionField*>(&source);
         const auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normals);
         if(field&&normalField) {
@@ -294,57 +392,18 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
             pinned->seal();cfg.pinnedRegion=pinned.get();
         }
     }
-    auto idx=[&](int x,int y,int z){return (size_t(z)*side+y)*side+x;};
-    auto point=[&](int x,int y,int z){return out->lo+cv::Vec3d(x,y,z)*c.gridBase;};
-    std::vector<float> presence(size_t(side)*side*side);
-    for(int z=0;z<side;++z) {
-        std::vector<cv::Vec3d> points,dirs(size_t(side)*side,cv::Vec3d(1,0,0));
-        points.reserve(dirs.size());
-        for(int y=0;y<side;++y) for(int x=0;x<side;++x) points.push_back(point(x,y,z)/scale);
-        std::vector<FiberPredictionSample> samples;
-        source.sampleBatch(points,dirs,1,samples);
-        if(samples.size()!=points.size()) throw std::runtime_error("chunk prediction batch mismatch");
-        for(size_t i=0;i<samples.size();++i) {auto p=best(samples[i]);presence[size_t(z)*side*side+i]=p.valid?p.presence:0;}
-    }
-    const int r=std::lround(c.nmsBase/c.gridBase);
-    std::vector<std::array<int,3>> candidates;
-    for(int z=r;z<side-r;++z) for(int y=r;y<side-r;++y) for(int x=r;x<side-r;++x) {
-        const float p=presence[idx(x,y,z)];if(p<c.seedPresence) continue;
-        bool peak=true;
-        for(int dz=-r;dz<=r&&peak;++dz) for(int dy=-r;dy<=r&&peak;++dy) for(int dx=-r;dx<=r;++dx)
-            if(presence[idx(x+dx,y+dy,z+dz)]>p) {peak=false;break;}
-        if(peak) candidates.push_back({x,y,z});
-    }
-    std::stable_sort(candidates.begin(),candidates.end(),[&](auto a,auto b){return presence[idx(a[0],a[1],a[2])]>presence[idx(b[0],b[1],b[2])];});
-    std::vector<bool> suppressed(presence.size());
-    std::vector<std::array<int,3>> selected;
-    for(const auto& v:candidates) {
-        if(suppressed[idx(v[0],v[1],v[2])]) continue;
-        ++out->maxima;
-        for(int dz=-r;dz<=r;++dz) for(int dy=-r;dy<=r;++dy) for(int dx=-r;dx<=r;++dx)
-            suppressed[idx(v[0]+dx,v[1]+dy,v[2]+dz)]=true;
-        selected.push_back(v);
-    }
+    const auto seedStart=std::chrono::steady_clock::now();
+    auto seeds=findFiberChunkSeeds(samplesSource,samplesNormals,source,*out,c,scale,
+        cfg.widthRelativeTolerance>0,parallelFor);
     struct SeedResult {bool accepted=false;std::vector<cv::Vec3d> line;std::array<std::string,2> reasons;};
-    std::vector<SeedResult> results(selected.size());
-    std::vector<Json> gpuSeeds(c.gpuLibrary.empty()?0:selected.size());
+    std::vector<SeedResult> results(seeds.size());
+    std::vector<Json> gpuSeeds(c.gpuLibrary.empty()?0:seeds.size());
     const auto process=[&](size_t i) {
-        const auto& v=selected[i];auto& result=results[i];
-        auto p=point(v[0],v[1],v[2]);const auto o=best(source.sample(p/scale,{1,0,0}));
-        auto d=unit(cv::Vec3d(o.direction));
-        if(!o.valid||cv::norm(d)<.5||!tubeSeed(source,normals,p,d,*out,c,scale)) return;
-        if(cfg.widthRelativeTolerance>0) {
-            std::vector<float> w;source.sampleWidths({cv::Vec3f(p/scale)},w);
-            if(w.size()!=1||!std::isfinite(w[0])||w[0]<=0) return;
-        }
+        const auto& seed=seeds[i];auto& result=results[i];
+        auto p=seed.point;auto d=seed.direction;
         result.accepted=true;
         auto seedCfg=cfg;
-        if(c.refineSeed) {
-            const auto fit=refineFiberChunkSeed(source,p,d,*out,c,scale);
-            if(fit.score>=0) {
-                p=fit.point;d=fit.direction;seedCfg.initialWidthMean=fit.width;
-            }
-        }
+        if(c.refineSeed) seedCfg.initialWidthMean=seed.width;
         if(!c.gpuLibrary.empty()) {
             gpuSeeds[i]={{"seed",xyz(p/scale)},{"direction",xyz(d)}};
             return;
@@ -356,20 +415,32 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
         for(size_t j=1;j<fw.points.size();++j) result.line.push_back(fw.points[j]*scale);
         result.reasons={bw.reason,fw.reason};
     };
-    if(parallelFor&&source.supportsConcurrentSampling()&&normals.supportsConcurrentSampling()) parallelFor(selected.size(),process);
-    else for(size_t i=0;i<selected.size();++i) process(i);
+    if(parallelFor&&source.supportsConcurrentSampling()&&normals.supportsConcurrentSampling()) parallelFor(seeds.size(),process);
+    else for(size_t i=0;i<seeds.size();++i) process(i);
     for(auto& result:results) {
         out->seeds+=result.accepted;
         if(result.line.size()>=2) {out->lines.push_back(std::move(result.line));out->endReasons.push_back(result.reasons);}
     }
-    if(!c.gpuLibrary.empty())runFiberChunkGpu(*out,source,normals,cfg,c,scale,gpuSeeds,pinned,wait);
+    out->timings["seed_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-seedStart).count();
+    if(!c.gpuLibrary.empty()) {
+        if(out->seeds)runFiberChunkGpu(*out,source,normals,cfg,c,scale,gpuSeeds,pinned,wait,tensor.get());
+        else {
+            out->timings["gpu_device"]=-1;out->timings["gpu_kernel_seconds"]=0.;
+            out->timings["gpu_seconds"]=0.;out->timings["total_seconds"]=0.;
+            out->timings["gpu_pack_seconds"]=0.;
+        }
+    }
     out->timings["construction_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
     return out;
 }
 
 namespace {
 Json specification(const FiberChunkTraceConfig& c,const FiberTraceConfig& t,double scale,const std::string& identity) {
-    return {{"version",1},{"source_identity",identity},{"trace_to_base",scale},
+    if(t.replayReverseDelaySteps>0 || t.replayReverseConvergenceMinBase>0)
+        throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
+    if(t.replayPresenceIgnoreWidth || t.widthHardRelativeTolerance>0)
+        throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
+    Json result={{"version",1},{"source_identity",identity},{"trace_to_base",scale},
         {"chunk",{{"core",c.coreBase},{"halo",c.haloBase},{"grid",c.gridBase},{"seed_presence",c.seedPresence},
           {"nms",c.nmsBase},{"tube_half",c.tubeHalfBase},{"tube_step",c.tubeStepBase},{"tube_presence",c.tubePresence},
           {"tube_turn",c.tubeTurnDegrees},{"tube_total",c.tubeTotalDegrees},{"rim_drop",c.rimDrop},
@@ -391,6 +462,9 @@ Json specification(const FiberChunkTraceConfig& c,const FiberTraceConfig& t,doub
           {"embedding_window",t.embeddingHistoryWindowBaseVoxels},{"embedding_count",t.embeddingHistoryCount},
           {"embedding_falloff",t.embeddingHistoryFalloff},{"embedding_mode",t.embeddingReferenceMode},
           {"presence_cutoff",t.replayPresenceCutoff},{"presence_modulated",t.replayPresenceModulated}}}};
+    if(c.onlineRefineIterations&&c.onlineRefineMode!="legacy")result["chunk"]["online_refinement"]["mode"]=c.onlineRefineMode;
+    if(c.beamCommitMode!="shared_prefix")result["chunk"]["beam_commit_mode"]=c.beamCommitMode;
+    return result;
 }
 std::shared_ptr<FiberChunkPaths> parseChunk(const Json& j) {
     auto chunk=std::make_shared<FiberChunkPaths>();
@@ -406,13 +480,25 @@ std::shared_ptr<FiberChunkPaths> parseChunk(const Json& j) {
     }
     if(chunk->endReasons.size()!=chunk->lines.size()||chunk->seeds>chunk->maxima||chunk->lines.size()>chunk->seeds)
         throw std::runtime_error("inconsistent cached chunk counts");
+    if(j.contains("conflict_annotation")) {
+        chunk->conflictAnnotation=j.at("conflict_annotation");
+        chunk->conflictFlags=j.at("conflict_flags").get<std::vector<bool>>();
+        if(!chunk->conflictAnnotation.is_object() || chunk->conflictFlags.size()!=chunk->lines.size())
+            throw std::runtime_error("invalid cached conflict annotation");
+        std::vector<bool> expected(chunk->lines.size(),false);
+        for(const auto& id:chunk->conflictAnnotation.at("report").at("rejected")) {
+            const auto i=id.get<size_t>();
+            if(i>=expected.size())throw std::runtime_error("invalid cached conflict path ID");
+            expected[i]=true;
+        }
+        if(expected!=chunk->conflictFlags)throw std::runtime_error("inconsistent cached conflict flags");
+    } else if(j.contains("conflict_flags"))throw std::runtime_error("conflict flags lack provenance");
     return chunk;
 }
-Json readChunk(const std::filesystem::path& path) {
-    std::ifstream input(path);
-    if(!input) throw std::runtime_error("cannot read chunk paths: "+path.string());
-    return Json::parse(input);
-}
+using detail::readFiberPacked;
+using detail::writeFiberPacked;
+Json readChunk(const std::filesystem::path& path) {return readFiberPacked(path);}
+void writeChunk(const std::filesystem::path& path,const Json& document) {writeFiberPacked(path,document);}
 }
 
 nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
@@ -434,6 +520,7 @@ nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
         {"join_minimum_base",c.joinMinimumBase},
         {"join_width_weight",c.joinWidthWeight},
         {"pin_sampling_region",c.pinSamplingRegion},
+        {"channel_hints",c.channelHints},{"worker_cache_bytes",c.workerCacheBytes},
         {"max_grid_samples",c.maxGridSamples},
         {"initial_alignment_power",c.initialAlignmentPower},
         {"initial_normal_radius_base",c.initialNormalRadiusBase},
@@ -452,6 +539,8 @@ nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
         {"gpu_devices",c.gpuDevices},
         {"online_refine_iterations",c.onlineRefineIterations},
         {"online_refine_window",c.onlineRefineWindow},
+        {"online_refine_mode",c.onlineRefineMode},{"gpu_batch_halves",c.gpuBatchHalves},{"gpu_batch_memory_mib",c.gpuBatchMemoryMiB},
+        {"beam_commit_mode",c.beamCommitMode},
         {"online_refine_epsilon_base",c.onlineRefineEpsilonBase},
         {"online_refine_step_base",c.onlineRefineStepBase},
         {"online_refine_cap_base",c.onlineRefineCapBase}};
@@ -459,6 +548,13 @@ nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
 FiberChunkTraceConfig fiberChunkConfigFromJson(const Json& j) {
     if(!j.is_object())throw std::invalid_argument("chunk config must be an object");
     FiberChunkTraceConfig c;auto defaults=fiberChunkConfigJson(c);
+    if(j.contains("channel_hints"))j.at("channel_hints").get_to(c.channelHints);
+    if(j.contains("worker_cache_bytes")){
+        if(!j.at("worker_cache_bytes").is_number_unsigned() &&
+           (!j.at("worker_cache_bytes").is_number_integer() || j.at("worker_cache_bytes").get<int64_t>()<0))
+            throw std::invalid_argument("worker_cache_bytes must be nonnegative integer");
+        j.at("worker_cache_bytes").get_to(c.workerCacheBytes);
+    }
     for(const auto& [key,value]:j.items())if(!defaults.contains(key))throw std::invalid_argument("unknown chunk option: "+key);
     if(j.contains("core_base"))j.at("core_base").get_to(c.coreBase);
     if(j.contains("halo_base"))j.at("halo_base").get_to(c.haloBase);
@@ -494,6 +590,10 @@ FiberChunkTraceConfig fiberChunkConfigFromJson(const Json& j) {
     if(j.contains("seed_movement_base"))j.at("seed_movement_base").get_to(c.seedMovementBase);
     if(j.contains("gpu_library"))j.at("gpu_library").get_to(c.gpuLibrary);
     if(j.contains("gpu_devices"))j.at("gpu_devices").get_to(c.gpuDevices);
+    if(j.contains("online_refine_mode"))j.at("online_refine_mode").get_to(c.onlineRefineMode);
+    if(j.contains("beam_commit_mode"))j.at("beam_commit_mode").get_to(c.beamCommitMode);
+    if(j.contains("gpu_batch_halves"))j.at("gpu_batch_halves").get_to(c.gpuBatchHalves);
+    if(j.contains("gpu_batch_memory_mib"))j.at("gpu_batch_memory_mib").get_to(c.gpuBatchMemoryMiB);
     if(j.contains("online_refine_iterations"))j.at("online_refine_iterations").get_to(c.onlineRefineIterations);
     if(j.contains("online_refine_window"))j.at("online_refine_window").get_to(c.onlineRefineWindow);
     if(j.contains("online_refine_epsilon_base"))j.at("online_refine_epsilon_base").get_to(c.onlineRefineEpsilonBase);
@@ -507,6 +607,76 @@ Json fiberChunkCacheSpecification(const FiberChunkTraceConfig& c,const FiberTrac
     return specification(c,t,scale,identity);
 }
 std::shared_ptr<FiberChunkPaths> loadFiberChunkPaths(const std::filesystem::path& path) {return parseChunk(readChunk(path));}
+
+std::shared_ptr<FiberChunkPaths> prepareFiberChunkPaths(const std::array<int,3>& key,
+    const FiberPredictionSource& source,const FiberTraceConfig& trace,
+    const vc::lasagna::NormalSampler& normals,const FiberChunkTraceConfig& config,double scale,
+    const std::filesystem::path& output,const std::string& identity,std::string& outcome,
+    const FiberChunkParallelFor& parallelFor,const FiberChunkWait& wait,bool readOnly)
+{
+    validate(config,scale);validateFiberTraceConfig(trace);
+    if(output.empty()||identity.empty())throw std::invalid_argument("chunk output and source identity required");
+    const auto spec=specification(config,trace,scale,identity);
+    const auto stem=std::to_string(key[0])+"_"+std::to_string(key[1])+"_"+std::to_string(key[2]);
+    const auto path=output/(stem+".msgpack.zst"),legacy=output/(stem+".json");
+    std::shared_ptr<FiberChunkPaths> chunk;
+    Json document;
+    bool write=false;
+    if(std::filesystem::exists(path)||std::filesystem::exists(legacy)) {
+        document=readChunk(std::filesystem::exists(path)?path:legacy);
+        auto saved=document.at("specification");
+        if(!saved["chunk"].contains("refine_seed"))saved["chunk"]["refine_seed"]=false;
+        if(!saved["chunk"].contains("seed_movement"))saved["chunk"]["seed_movement"]=0;
+        if(!saved["chunk"].contains("backend"))saved["chunk"]["backend"]="cpu";
+        if(!saved["chunk"].contains("online_refinement"))saved["chunk"]["online_refinement"]=
+            {{"iterations",0},{"window",0},{"epsilon",.25},{"step",1.},{"cap",8.}};
+        if(saved!=spec) {
+            std::string changed;
+            for(const auto& difference:Json::diff(saved,spec))changed+=" "+difference.at("path").get<std::string>();
+            throw std::runtime_error("cached chunk prediction identity or configuration mismatch: "+path.string()+"; changed:"+changed);
+        }
+        chunk=parseChunk(document);
+        if(chunk->key!=key)throw std::runtime_error("cached chunk key mismatch");
+        for(int a=0;a<3;++a)
+            if(chunk->lo[a]!=key[a]*config.coreBase-config.haloBase ||
+               chunk->hi[a]!=(key[a]+1)*config.coreBase+config.haloBase)
+                throw std::runtime_error("cached chunk bounds mismatch");
+        outcome="reused";
+    } else {
+        if(config.cacheOnly||readOnly)throw std::runtime_error("cache-only chunk missing: "+path.string());
+        chunk=buildFiberChunkPaths(key,source,trace,normals,config,scale,parallelFor,wait);
+        Json lines=Json::array();
+        for(const auto& line:chunk->lines){Json points=Json::array();for(const auto& p:line)points.push_back(xyz(p));lines.push_back(points);}
+        document={{"key",key},{"lo",xyz(chunk->lo)},{"hi",xyz(chunk->hi)},
+            {"maxima",chunk->maxima},{"seeds",chunk->seeds},{"lines",lines},{"end_reasons",chunk->endReasons},
+            {"specification",spec},{"timings",chunk->timings}};
+        write=true;outcome="built";
+    }
+    if(config.conflictNormalBase>0) {
+        // Algorithm constants are explicit so changing either implementation or
+        // tuning cannot silently reuse old decisions. Source includes normals.
+        const Json filterSpec={{"version",1},{"algorithm","chunk-conflict-v1"},{"source_identity",identity},
+            {"trace_to_base",scale},{"normal",config.conflictNormalBase},{"tangent",config.conflictTangentBase},
+            {"agreement",config.conflictAgreementBase},{"separation",config.conflictSeparationBase},
+            {"sample_base",8},{"angle_degrees",25},{"interior_base",16},{"max_projection_jump_base",32}};
+        if(chunk->conflictAnnotation.is_null() || chunk->conflictAnnotation.value("specification",Json{})!=filterSpec) {
+            if(readOnly)throw std::runtime_error("stale conflict annotation in read-only chunk: "+path.string());
+            auto report=inspectFiberChunkConflicts(*chunk,config,normals,scale,parallelFor,
+                dynamic_cast<const FiberPredictionField*>(&source)?&source:nullptr);
+            chunk->conflictFlags.assign(chunk->lines.size(),false);
+            for(const auto& i:report.at("rejected"))chunk->conflictFlags[i.get<size_t>()]=true;
+            chunk->conflictAnnotation={{"specification",filterSpec},{"report",report}};
+            chunk->timings["conflict_filter"]=report;
+            document["conflict_flags"]=chunk->conflictFlags;
+            document["conflict_annotation"]=chunk->conflictAnnotation;
+            document["timings"]=chunk->timings;
+            if(!write)outcome="annotated";
+            write=true;
+        }
+    }
+    if(write){std::filesystem::create_directories(output);writeChunk(path,document);}
+    return chunk;
+}
 
 FiberChunkTraceCache::FiberChunkTraceCache(FiberChunkTraceConfig c,std::filesystem::path output,std::string identity)
     :config_(c),output_(std::move(output)),identity_(std::move(identity))
@@ -543,33 +713,8 @@ std::shared_ptr<const FiberChunkPaths> FiberChunkTraceCache::get(const std::arra
         return future.get();
     }
     try {
-        const auto path=output_/(std::to_string(key[0])+"_"+std::to_string(key[1])+"_"+std::to_string(key[2])+".json");
-        std::shared_ptr<FiberChunkPaths> chunk;
-        if(std::filesystem::exists(path)) {
-            const auto j=readChunk(path);
-            auto saved=j.at("specification");
-            // Original main v1 caches predate opt-in seed refinement.
-            if(!saved["chunk"].contains("refine_seed")) saved["chunk"]["refine_seed"]=false;
-            if(!saved["chunk"].contains("seed_movement")) saved["chunk"]["seed_movement"]=0;
-            if(!saved["chunk"].contains("backend"))saved["chunk"]["backend"]="cpu";
-            if(!saved["chunk"].contains("online_refinement"))saved["chunk"]["online_refinement"]=
-                {{"iterations",0},{"window",0},{"epsilon",.25},{"step",1.},{"cap",8.}};
-            if(saved!=spec) throw std::runtime_error("cached chunk prediction identity or configuration mismatch");
-            chunk=parseChunk(j);
-            if(chunk->key!=key) throw std::runtime_error("cached chunk key mismatch");
-        } else {
-            if(config_.cacheOnly) throw std::runtime_error("cache-only chunk missing: "+path.string());
-            chunk=buildFiberChunkPaths(key,source,trace,normals,config_,scale,parallelFor,wait);
-            Json lines=Json::array();
-            for(const auto& line:chunk->lines) {Json points=Json::array();for(const auto& p:line) points.push_back(xyz(p));lines.push_back(points);}
-            std::filesystem::create_directories(output_);
-            vc::core::util::atomicWriteString(path,Json{{"key",key},{"lo",xyz(chunk->lo)},{"hi",xyz(chunk->hi)},
-                {"maxima",chunk->maxima},{"seeds",chunk->seeds},{"lines",lines},{"end_reasons",chunk->endReasons},
-                {"specification",spec},{"timings",chunk->timings}}.dump()+"\n");
-        }
-        if(config_.conflictNormalBase>0)
-            chunk->timings["conflict_filter"]=filterFiberChunkConflicts(*chunk,config_,normals,scale,parallelFor,
-                dynamic_cast<const FiberPredictionField*>(&source)?&source:nullptr);
+        std::string outcome;
+        auto chunk=prepareFiberChunkPaths(key,source,trace,normals,config_,scale,output_,identity_,outcome,parallelFor,wait);
         promise->set_value(chunk);return chunk;
     } catch(...) {
         promise->set_exception(std::current_exception());
@@ -578,16 +723,36 @@ std::shared_ptr<const FiberChunkPaths> FiberChunkTraceCache::get(const std::arra
     }
 }
 
-FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
+void validateFiberChunkConflictAnnotation(const FiberChunkPaths& chunk,const FiberChunkTraceConfig& c) {
+    if(c.conflictNormalBase>0) {
+        if(chunk.conflictAnnotation.is_null() || chunk.conflictFlags.size()!=chunk.lines.size())
+            throw std::invalid_argument("conflict matching requires prepared current annotations");
+        const auto& s=chunk.conflictAnnotation.at("specification");
+        if(s.value("version",0)!=1 || s.value("algorithm",std::string{})!="chunk-conflict-v1" ||
+           s.at("normal")!=c.conflictNormalBase || s.at("tangent")!=c.conflictTangentBase ||
+           s.at("agreement")!=c.conflictAgreementBase || s.at("separation")!=c.conflictSeparationBase)
+            throw std::invalid_argument("stale conflict annotation; prepare chunk with current filter settings");
+    }
+}
+
+std::vector<FiberChunkMatch> findFiberChunkMatches(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
     const cv::Vec3d& initialDirection,const FiberChunkTraceConfig& c,bool initial,
     const FiberChunkInitialRegion* region,
-    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance)
+    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance,
+    const std::vector<size_t>* candidateLines,FiberChunkMatchPurpose purpose)
 {
     validate(c,1);
-    FiberChunkMatch bestMatch;
-    if(history.empty()) return bestMatch;
+    std::vector<FiberChunkMatch> matches;
+    validateFiberChunkConflictAnnotation(chunk,c);
+    if(history.empty()) return matches;
     for(const auto& p:history) if(!finite(p)) throw std::invalid_argument("nonfinite chunk history");
-    for(const auto& line:chunk.lines) for(const auto& p:line)
+    const size_t count=candidateLines?candidateLines->size():chunk.lines.size();
+    const auto lineId=[&](size_t i){
+        const auto id=candidateLines?candidateLines->at(i):i;
+        if(id>=chunk.lines.size())throw std::invalid_argument("candidate path ID outside chunk");
+        return id;
+    };
+    for(size_t index=0;index<count;++index)for(const auto& p:chunk.lines[lineId(index)])
         if(!finite(p)) throw std::invalid_argument("nonfinite chunk path");
     if(initial) {
         if(!region||!finite(region->center)) throw std::invalid_argument("initial chunk match requires an ellipse");
@@ -601,7 +766,9 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
         throw std::invalid_argument("width-aware join requires widths and positive tolerance");
     const auto dir=!initial&&history.size()>1?unit(history.back()-history[history.size()-2]):unit(initialDirection);
     if(!finite(dir)||cv::norm(dir)<.5) throw std::invalid_argument("invalid chunk match direction");
-    for(size_t i=0;i<chunk.lines.size();++i) for(bool reverse:{false,true}) {
+    for(size_t index=0;index<count;++index) for(bool reverse:{false,true}) {
+        const auto i=lineId(index);
+        if(c.conflictNormalBase>0 && i<chunk.conflictFlags.size() && chunk.conflictFlags[i])continue;
         auto line=chunk.lines[i];if(line.size()<2) continue;
         if(reverse) std::reverse(line.begin(),line.end());
         const auto end=project(line,initial?region->center:history.back(),dir,std::cos(c.joinAngleDegrees*pi/180),
@@ -624,13 +791,19 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             const auto delta=end.point-region->center;
             initialScore=std::exp(-.5*delta.dot(region->metric*delta))*alignment/initialSamples;
         }
-        if(!initial&&(end.distance>c.joinDistanceBase||geometry.length()-end.arc<16)) continue;
+        const double remaining=purpose==FiberChunkMatchPurpose::Continuation?16:0;
+        if(!initial&&(end.distance>c.joinDistanceBase||geometry.length()-end.arc<remaining)) continue;
         double overlap=0,error=end.distance,angle=1-end.tangent.dot(dir),lastArc=end.arc;
         size_t matched=1;
+        std::vector<std::pair<double,double>> overlapArcs;
         std::vector<cv::Vec3d> widthPoints;
         if(!initial&&c.joinWidthWeight) widthPoints={history.back(),end.point};
-        for(size_t j=history.size()-1;!initial&&j>0&&overlap<2*c.haloBase;--j) {
-            if(!inside(history[j-1],chunk.lo,chunk.hi)) break;
+        const double maximumOverlap=purpose==FiberChunkMatchPurpose::FullEquivalence?
+            std::numeric_limits<double>::infinity():2*c.haloBase;
+        for(size_t j=history.size()-1;!initial&&j>0&&overlap<maximumOverlap;--j) {
+            // Terminal relation differs from continuation only in target runway.
+            // Complete-path proof must additionally examine all canonical geometry.
+            if(purpose!=FiberChunkMatchPurpose::FullEquivalence&&!inside(history[j-1],chunk.lo,chunk.hi)) break;
             const auto tangent=unit(history[j]-history[j-1]);
             const double step=cv::norm(history[j]-history[j-1]);
             const int subdivisions=std::max(1,int(std::ceil(step/4)));
@@ -639,8 +812,14 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
                 const auto point=history[j]+(history[j-1]-history[j])*(double(n)/subdivisions);
                 const auto p=project(line,point,tangent,std::cos(c.joinAngleDegrees*pi/180),
                     std::max(0.,lastArc-2*step/subdivisions),lastArc);
-                if(p.distance>c.joinDistanceBase||p.arc>=lastArc) {valid=false;break;}
+                // Whole-path proof may examine a slightly longer duplicate's
+                // tail against the fixed target endpoint. It must still pass
+                // every geometric/width gate; interior plateaus never qualify.
+                const bool endpointClamp=purpose==FiberChunkMatchPurpose::FullEquivalence&&
+                    p.arc==lastArc&&(p.arc==0||p.arc==geometry.length());
+                if(p.distance>c.joinDistanceBase||(p.arc>=lastArc&&!endpointClamp)) {valid=false;break;}
                 lastArc=p.arc;overlap+=step/subdivisions;error+=p.distance;
+                overlapArcs.emplace_back(overlap,lastArc);
                 if(c.joinWidthWeight) {widthPoints.push_back(point);widthPoints.push_back(p.point);}
                 angle+=1-p.tangent.dot(tangent);++matched;
             }
@@ -654,8 +833,13 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             if(values.size()!=widthPoints.size()) throw std::runtime_error("chunk join width sample count mismatch");
             compatibility=0;
             for(size_t k=0;k<values.size();k+=2) {
-                if(!std::isfinite(values[k])||!std::isfinite(values[k+1])||values[k]<=0||values[k+1]<=0) continue;
-                compatibility+=fiberWidthPresenceScale(values[k+1],values[k],widthTolerance,true);
+                if(!std::isfinite(values[k])||!std::isfinite(values[k+1])||values[k]<=0||values[k+1]<=0) {
+                    if(purpose==FiberChunkMatchPurpose::FullEquivalence){compatibility=0;break;}
+                    continue;
+                }
+                const double weight=fiberWidthPresenceScale(values[k+1],values[k],widthTolerance,true);
+                if(purpose==FiberChunkMatchPurpose::FullEquivalence&&weight<=0){compatibility=0;break;}
+                compatibility+=weight;
             }
             compatibility/=values.size()/2;
             if(compatibility<=0) continue;
@@ -665,17 +849,38 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             c.joinWeights[0]*std::min(1.,overlap/(2*c.haloBase))+c.joinWeights[1]*compatibility-
             c.joinWeights[2]*std::pow(error/c.joinDistanceBase,2)-
             c.joinWeights[3]*angle/(1-std::cos(c.joinAngleDegrees*pi/180)):weighted;
-        if(initial&&c.initialAlignmentPower>0) {
-            if(!bestMatch.valid||initialScore>bestMatch.initialScore||
-               (initialScore==bestMatch.initialScore&&error<bestMatch.error)) {
-                bestMatch={i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted};
-                bestMatch.initialScore=initialScore;bestMatch.initialSamples=initialSamples;
-            }
-            continue;
+        FiberChunkMatch match{i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted,joint};
+        match.initialScore=initialScore;match.initialSamples=initialSamples;
+        match.overlapBeginArc=lastArc;match.overlapArcs=std::move(overlapArcs);
+        matches.push_back(std::move(match));
+    }
+    return matches;
+}
+
+FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
+    const cv::Vec3d& initialDirection,const FiberChunkTraceConfig& c,bool initial,
+    const FiberChunkInitialRegion* region,
+    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance,
+    const vc::lasagna::NormalSampler* normals,double normalScale)
+{
+    FiberChunkMatch bestMatch;std::set<size_t> qualified;
+    for(auto& match:findFiberChunkMatches(chunk,history,initialDirection,c,initial,region,widths,widthTolerance)){
+        qualified.insert(match.line);
+        const bool better=initial&&c.initialAlignmentPower>0?
+            (match.initialScore>bestMatch.initialScore||(match.initialScore==bestMatch.initialScore&&match.error<bestMatch.error)):
+            (match.jointScore>bestMatch.jointScore||(match.jointScore==bestMatch.jointScore&&
+             (match.error<bestMatch.error||(match.error==bestMatch.error&&match.angleError<bestMatch.angleError))));
+        if(!bestMatch.valid||better)bestMatch=std::move(match);
+    }
+    if(!initial&&qualified.size()>1&&c.conflictNormalBase>0) {
+        if(!normals)throw std::invalid_argument("ambiguous boundary matching requires tracing normals");
+        FiberChunkPaths alternatives;alternatives.key=chunk.key;
+        alternatives.lines.push_back(history);
+        for(auto id:qualified)alternatives.lines.push_back(chunk.lines[id]);
+        const auto report=inspectFiberChunkConflicts(alternatives,c,*normals,normalScale);
+        if(!report.at("rejected").empty()||report.at("invalid_normal_samples").get<size_t>()) {
+            bestMatch.valid=false;bestMatch.ambiguous=true;
         }
-        if(!bestMatch.valid||joint>bestMatch.jointScore||(joint==bestMatch.jointScore&&
-            (error<bestMatch.error||(error==bestMatch.error&&angle<bestMatch.angleError))))
-            bestMatch={i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted,joint};
     }
     return bestMatch;
 }

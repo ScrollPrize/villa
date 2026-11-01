@@ -607,19 +607,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         if (referenceNormalMode == "baked" && tracingNormalMode != "fiber")
             throw std::invalid_argument("baked reference normals require fiber tracing normals");
         if (tracingNormalMode == "fiber") {
-            auto normalManifest = source.predictionManifest;
-            normalManifest.groups.clear();
-            for (const auto* channel : {"nx", "ny", "grad_mag"}) {
-                const auto name = std::string("sheet_") + channel;
-                const auto* group = source.predictionManifest.groupForChannel(name);
-                if (!group) throw std::invalid_argument("missing predicted normal channel " + name);
-                auto alias = *group;
-                alias.name = channel;
-                alias.channels = {channel};
-                normalManifest.groups.push_back(std::move(alias));
-            }
-            normalManifest.raw["grad_mag_encode_scale"] = 1.0;
-            normalManifest.raw["grad_mag_factor"] = 1.0;
+            auto normalManifest = vc::lasagna::fiberNormalManifest(source.predictionManifest);
             vc::lasagna::LasagnaDataset normalDataset(std::move(normalManifest));
             vc::lasagna::validateLasagnaNormalDatasetStructure(normalDataset);
             source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normalDataset);

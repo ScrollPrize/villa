@@ -13,6 +13,7 @@ constexpr const char* kUsage =
     "  init STORE                      turn a local store into a hub (no other connections),\n"
     "                                  then copy it onto the network share\n"
     "  clone HUB REPLICA               copy a hub into a new local replica\n"
+    "  enable-ssh-locking HUB          opt in to process locks; stop all clients first\n"
     "  sync REPLICA [--pull|--push]    pull hub changes, then push local ones\n"
     "  status REPLICA                  pending changes, conflicts and leases (no hub contact)\n"
     "  lease acquire|renew|release REPLICA UUID... [--seconds N]\n"
@@ -82,6 +83,10 @@ try {
         need(2);
         initHub(positional[1], author);
         std::cout << "initialized hub " << positional[1] << "; copy it onto the share before cloning\n";
+    } else if (command == "enable-ssh-locking") {
+        need(2);
+        enableHubProcessLocking(positional[1]);
+        std::cout << "enabled SSH process locking; all clients must use updated SSH hub access\n";
     } else if (command == "clone") {
         need(3);
         if (author.empty()) throw std::runtime_error("specify --author");

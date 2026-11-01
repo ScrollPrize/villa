@@ -34,8 +34,9 @@ public:
     // One listed fiber: its record (name, tags, typed summary, metadata) and links.
     struct CatalogRow {
         vc::objects::ObjectRecord record;
-        // Stored units -> volume voxels; unset for a fiber not bound to the volume.
-        std::optional<double> toVolume;
+        // Stored coordinates -> volume voxels (by scale or a registration);
+        // unset for a fiber not bound to the volume.
+        std::optional<vc::objects::VolumeAffine> mapping;
         int links = 0;
         int pendingLinks = 0;
         // Fibers connected through links, this one included.
@@ -51,7 +52,6 @@ public:
     [[nodiscard]] const FiberDisplayOptions& options() const { return options_; }
     void setOptions(const FiberDisplayOptions& options);
     void setLineAnnotationActive(bool active);
-    void openCollection(const QString& path, const QString& author);
     void firstPage();
     void nextPage();
     // A listed fiber was clicked: select it, focusing the main views while
@@ -59,6 +59,7 @@ public:
     void activateFiber(int64_t id);
     void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
     void navigate(int index);
+    void clearSelection();
     void showInLineAnnotation(int64_t id);
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
@@ -69,6 +70,7 @@ public:
     void detachViewer(VolumeViewerBase* viewer) override;
 
 signals:
+    void optionsChanged();
     void catalogChanged(std::vector<FiberCollectionController::CatalogRow> rows, bool morePages);
     void statusChanged(bool attached, const QString& text);
     void selectionChanged(const FiberCollectionController::Selection& selection);
@@ -102,11 +104,10 @@ private:
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
     int64_t pendingAnnotation_{};
-    double nativeToViewer_{1.0};
     double nativeVoxelMm_{1.0};
     int64_t selected_{0};
     std::optional<vc::objects::PinnedObject> selectedPin_;
-    std::optional<double> selectedToVolume_;
+    bool selectedBound_{false};
     Selection selection_;
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};

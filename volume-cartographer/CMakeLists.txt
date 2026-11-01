@@ -57,8 +57,6 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_RUN_RENDER_BENCHMARKS
        "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
-option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
-option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
 # practical Windows build — default it off there.
 if(WIN32)
@@ -74,23 +72,10 @@ option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
 option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
-option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
 set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
     "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
-
-if(VC_ENABLE_ECL_MAXFLOW)
-    include(CheckLanguage)
-    check_language(CUDA)
-    if(NOT CMAKE_CUDA_COMPILER)
-        message(FATAL_ERROR "VC_ENABLE_ECL_MAXFLOW=ON requires a CUDA compiler")
-    endif()
-    enable_language(CUDA)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
-        set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures for ECL-MaxFlow" FORCE)
-    endif()
-endif()
 
 set(VC_QUICKBUILD_OPT_LEVEL "1" CACHE STRING
     "Optimization level used by QuickBuild (0, 1, 2, or 3)")
@@ -148,8 +133,8 @@ endif()
 # Skip building app executables (vc_*, VC3D) when generating coverage:
 # the apps add ~3 GB of debug+coverage-instrumented binaries to the
 # build dir and aren't exercised by the unit tests, so they only inflate
-# the build without contributing coverage data. The static libs the
-# tests need (e.g. vc_merge_grid) are still built unconditionally.
+# the build without contributing coverage data. The libraries the
+# tests need are still built unconditionally.
 # Override with -DVC_BUILD_APPS=ON if you need the apps in a coverage
 # build (e.g. for end-to-end tests that spawn the binaries).
 if(VC_ENABLE_COVERAGE)
@@ -157,7 +142,6 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
-option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
@@ -200,9 +184,6 @@ set(VC_VERSION_STRING "${GIT_SHA1_SHORT}-${GIT_COMMIT_DATE}")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(VC_DEAD_CODE_REPORT)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-endif()
 if(VC_BUILD_PYTHON)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -258,8 +239,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_lto -flto=thin)
     if(APPLE)
         set(_link "")
-        # ld64.lld (the LLVM Mach-O linker the macOS preset selects via
-        # -fuse-ld=lld) mishandles C++ exception unwind info for our large
+        # ld64.lld (the LLVM Mach-O linker, selected with -fuse-ld=lld; the
+        # macOS preset no longer passes it) mishandles C++ exception unwind info for our large
         # ThinLTO binaries: a `throw` that should be caught by an enclosing
         # handler instead unwinds past every handler into std::terminate
         # (SIGABRT). The failure is in how lld lays out the unwind tables —
@@ -272,14 +253,13 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         # covered SHARED_LIBRARY targets only. With Homebrew clang/lld 22.1.8
         # the same corruption appears *within* the VC3D executable: opening a
         # volume-less project made resolveLasagnaForVolume's std::runtime_error
-        # bypass the `catch (...)` in CWindow::updateAtlasFiberDocks and abort
-        # the app. Relinking only the executables with Apple's ld — same
+        # bypass a `catch (...)` in CWindow and abort the app. Relinking only the executables with Apple's ld — same
         # objects, same dylibs — turns that back into the intended handled
         # error, so executables need the workaround too.
         #
         # -fuse-ld= with an empty value selects the driver default (Apple ld).
-        # A later -fuse-ld= (empty) on the link line overrides the preset's
-        # earlier -fuse-ld=lld; clang honors the last one. Applied via
+        # A later -fuse-ld= (empty) on the link line overrides an earlier
+        # -fuse-ld=lld passed in the linker flags; clang honors the last one. Applied via
         # add_link_options so it is idempotent across reconfigures.
         if(CMAKE_EXE_LINKER_FLAGS MATCHES "lld" OR CMAKE_SHARED_LINKER_FLAGS MATCHES "lld")
             add_link_options(-fuse-ld=)
@@ -485,39 +465,8 @@ if(VC_WERROR)
     endif()
 endif()
 
-if(VC_PROFILE_COMPILE)
-    if(MSVC)
-        # MSVC has no stable per-TU timing flag; leave compile profiling to the
-        # GCC/Clang builds.
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        add_compile_options(-ftime-trace -ftime-trace-granularity=200)
-    else()
-        add_compile_options(-ftime-report)
-    endif()
-endif()
-
-if(VC_DEAD_CODE_REPORT AND NOT MSVC)
-    add_compile_options(
-        -Wunused -Wunused-function -Wunused-variable -Wunused-parameter
-        -Wunused-value -Wunused-result
-        -Wunused-but-set-variable -Wunused-but-set-parameter
-        -Wunused-local-typedef
-        -Wunused-macros
-        -Wunreachable-code
-    )
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        add_compile_options(
-            -Wunused-template
-            -Wunused-member-function
-            -Wunused-private-field
-            -Wunreachable-code-aggressive
-        )
-    endif()
-    add_link_options(-Wl,--print-gc-sections)
-endif()
-
 # ---- Dependencies -----------------------------------------------------------
-if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
+if(VC_BUILD_APPS OR VC_TESTING)
     find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTORCC ON)
@@ -526,7 +475,7 @@ if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
     find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 endif()
 # Ceres is required unconditionally: core/CMakeLists.txt always builds
-# vc_inpaint, vc_lasagna, vc_atlas and vc_tracer, all of which link
+# vc_inpaint, vc_lasagna, vc_fiber_tracer and vc_tracer, all of which link
 # Ceres::ceres (vc_lasagna is also pulled into the Python bindings via
 # vc_lasagna_amgx).
 find_package(Ceres REQUIRED)
@@ -546,7 +495,7 @@ endif()
 # absolute dylib path so it never degrades into a bare, unresolvable -l flag.
 if(APPLE)
     set(_vc_opencv_modules
-        core imgproc imgcodecs video videoio flann ximgproc)
+        core imgproc imgcodecs flann ximgproc)
     if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
         list(APPEND _vc_opencv_modules calib geometry)
     else()
@@ -755,16 +704,11 @@ endif()
 # ---- Subdirectories ---------------------------------------------------------
 include_directories(core/include)
 
-add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
 add_subdirectory(libs/volcomp)
-# igl::core is needed by flatboi (SLIM) and by apps/vc_obj_uv_lift; fetch it
-# here — before the sanitizer flags below — so both consumers see the target
-# even when flatboi is off (Windows).
-if(VC_BUILD_FLATBOI OR VC_BUILD_APPS)
-    include(cmake/FetchLibigl.cmake)
-endif()
+# flatboi (SLIM) needs igl::core; fetch it here, before the sanitizer flags below.
 if(VC_BUILD_FLATBOI)
+    include(cmake/FetchLibigl.cmake)
     add_subdirectory(libs/flatboi)
 endif()
 
@@ -866,15 +810,12 @@ if(VC_TESTING)
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces
         test_lasagna_normal_sampler
-        test_atlas
-        test_fiber_intersections
+        test_fiber_side_strip_intersections
         test_chunked_tensor_meta
         test_growth_config
         test_growth_helpers
         test_surf_tracker_data
-        test_neural_tracer_connection
-        bench_lasagna_line_edit
-        bench_fiber_intersections)
+        test_neural_tracer_connection)
 
     function(vc_register_test_target target)
         if(NOT TARGET ${target})
@@ -974,11 +915,17 @@ if(VC_TESTING)
         DEPENDS ${_vc_test_targets}
         VERBATIM
         USES_TERMINAL)
+    if(TARGET test_slim_assembly)
+        add_dependencies(check test_slim_assembly)
+    endif()
 
     if(VC_ENABLE_COVERAGE)
         find_program(LLVM_PROFDATA NAMES llvm-profdata REQUIRED)
         find_program(LLVM_COV NAMES llvm-cov REQUIRED)
         get_property(_vc_coverage_targets GLOBAL PROPERTY VC_CTEST_TARGETS)
+        if(TARGET test_slim_assembly)
+            list(APPEND _vc_coverage_targets test_slim_assembly)
+        endif()
         string(REPLACE ";" "," _vc_test_targets_csv "${_vc_coverage_targets}")
         add_custom_target(coverage-report
             COMMAND ${CMAKE_COMMAND}

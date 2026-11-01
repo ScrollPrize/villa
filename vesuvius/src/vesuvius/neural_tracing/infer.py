@@ -4,8 +4,6 @@ import time
 import queue
 import threading
 import zarr
-import cupy as cp
-from cucim.skimage.measure import label as cucim_label, regionprops_table
 import torch
 import accelerate
 from accelerate.utils import TorchDynamoPlugin
@@ -420,6 +418,14 @@ class Inference:
         return probs, min_corner_zyxs
 
     def get_blob_coordinates(self, heatmap, min_corner_zyx, threshold=0.5, min_size=8, connectivity=26):
+
+        try:
+            import cupy as cp
+            from cucim.skimage.measure import label as cucim_label, regionprops_table
+        except ImportError as error:  # cuCIM ships Linux wheels only (pyproject.toml); copy requests never get here
+            raise ImportError(
+                "heatmap blob detection needs cupy and cuCIM (CUDA, Linux wheels only); copy requests do not use them"
+            ) from error
 
         binary_gpu = cp.asarray(heatmap > threshold)
 

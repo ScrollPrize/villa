@@ -5,8 +5,13 @@
 #include "internal/RecordSql.hpp"
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "internal/TransformedLength.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "geometry/ArrayLayout.hpp"
+#include "spatial/SurfaceTiles.hpp"
+#include <map>
 #include <exception>
 #include <set>
 
@@ -27,18 +32,21 @@ const char* regionStopName(RegionStop reason)
 }
 namespace {
 using Point = std::array<double, 3>;
-// Polyline geometry kinds: their typed summary table and coordinate arrays in
+// Region geometry kinds: their typed summary table and coordinate arrays in
 // precedence order (the first nonempty array is intersected, else the last).
-struct PolylineKind {
+// Polyline kinds clip segments to the slab; surfaces intersect its mid-plane.
+struct RegionKind {
     const char* table;
     std::vector<std::string> arrays;
     const char* dtype;
     int64_t stride;
+    bool surface = false;
 };
-PolylineKind polylineKind(const std::string& kind)
+RegionKind regionKind(const std::string& kind)
 {
     if (kind == "fiber") return {"fibers", {"line_points", "control_points"}, "<f8", 24};
     if (kind == "track") return {"tracks", {"points"}, "<i4", 12};
+    if (kind == "surface") return {"surfaces", {"points"}, "<f4", 12, true};
     throw std::invalid_argument("geometry region does not support kind: " + kind);
 }
 struct RequestScope {
@@ -70,7 +78,9 @@ Point project(const RegionSlice& view, const Point& point) {
         for (int j = 0; j < 3; ++j) p[i] += (point[j] - view.origin[j]) * axes[i][j];
     return p;
 }
-Bounds worldBounds(const RegionSlice& view) {
+}
+
+Bounds detail::slabBounds(const RegionSlice& view) {
     validateBounds(view.localBounds);
     const std::array<Point, 3> axes{view.u, view.v, view.normal};
     for (double x : view.origin) if (!std::isfinite(x)) throw std::invalid_argument("slice origin must be finite");
@@ -100,39 +110,43 @@ Bounds worldBounds(const RegionSlice& view) {
     validateBounds(bounds);
     return bounds;
 }
-}
 
 RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& view,
-    const RegionOptions& options, const RegionCancel& cancel) const
+    const RegionOptions& requested, const RegionCancel& cancel) const
 {
+    auto options=requested;
+    if(options.volume&&!options.transforms)options.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (options.volume) {
         // One bounded query per declared frame, merged in UUID order with the
         // selected object first; the object limit applies to the merge.
         if (options.coordinates) throw std::invalid_argument("volume and coordinates filters are exclusive");
+        if (!std::isfinite(options.targetScale) || options.targetScale <= 0)
+            throw std::invalid_argument("region target scale must be finite and positive");
         RegionResult merged;
         std::optional<RegionStop> stopped;
         bool limited = false;
-        for (const auto& frame : volumeFrames(db, *options.volume, options.kind, false)) {
+        for (const auto& frame : volumeFrames(db, *options.volume, options.kind, false, options.transforms.get())) {
             if (merged.stats.outputBytes >= options.outputByteBudget) { stopped = RegionStop::OutputBudget; break; }
             auto sub = options;
             sub.volume.reset();
             sub.coordinates = frame.coordinates;
             sub.outputByteBudget = options.outputByteBudget - merged.stats.outputBytes;
-            sub.minLength = options.minLength > 0 ? lowestStoredAtLeast(options.minLength, frame.toVolume) : 0.0;
-            RegionSlice stored = view;
-            for (auto& coordinate : stored.origin) coordinate /= frame.toVolume;
-            for (auto& bound : stored.localBounds) bound /= frame.toVolume;
-            auto part = geometryRegion(txn, stored, sub, cancel);
+            sub.minLength = options.minLength;
+            sub.toTarget=VolumeAffine::scale(options.targetScale)*frame.mapping;
+            sub.processingByteBudget=options.processingByteBudget-std::min(options.processingByteBudget,merged.stats.processingBytes);
+            sub.candidateWorkBudget=options.candidateWorkBudget-std::min(options.candidateWorkBudget,merged.stats.candidateWork);
+            sub.sqlStepBudget=options.sqlStepBudget-std::min(options.sqlStepBudget,merged.stats.sqlSteps);
+            auto part = geometryRegion(txn, view, sub, cancel);
             for (auto field : {&RegionStats::outputBytes, &RegionStats::processingBytes, &RegionStats::payloadBytes,
                                &RegionStats::verifiedBytes, &RegionStats::metadataBytes, &RegionStats::reconstructedBytes,
                                &RegionStats::cacheBytes, &RegionStats::candidateWork, &RegionStats::candidateVisits,
                                &RegionStats::segmentTests, &RegionStats::sqlSteps})
                 merged.stats.*field += part.stats.*field;
             for (auto& run : part.runs) {
-                for (auto& point : run.points) for (auto& coordinate : point) coordinate *= frame.toVolume;
                 merged.runs.push_back(std::move(run));
             }
+            merged.remote.insert(merged.remote.end(), part.remote.begin(), part.remote.end());
             if (part.stop == RegionStop::ObjectLimit) limited = true;
             else if (!part.complete()) { stopped = part.stop; break; }
         }
@@ -153,21 +167,81 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             objects.insert(uuid);
         }
         merged.runs.resize(kept);
+        std::sort(merged.remote.begin(), merged.remote.end());
+        merged.remote.erase(std::unique(merged.remote.begin(), merged.remote.end()), merged.remote.end());
         merged.intersectingObjects = objects.size();
         merged.stop = stopped ? *stopped : limited ? RegionStop::ObjectLimit : RegionStop::Exhausted;
         return merged;
     }
-    const auto kind = polylineKind(options.kind);
-    const auto bounds = worldBounds(view);
+    const auto kind = regionKind(options.kind);
+    const auto targetBounds = slabBounds(view);
+    const auto bounds = options.toTarget ? transformBounds(targetBounds, options.toTarget->inverse()) : targetBounds;
     if (!std::isfinite(options.minLength) || options.minLength < 0 || options.minPoints < 2)
         throw std::invalid_argument("geometry region requires nonnegative finite length and minPoints >= 2");
+    if (kind.surface && (options.family || options.minLength > 0))
+        throw std::invalid_argument("surface regions have no family or length filter");
     std::optional<std::string> selected;
     if (options.maximumObjects && options.selected) selected = formatUuid(parseUuid(*options.selected));
     RegionResult result;
     ReadRequest request{options, result, cancel};
     RequestScope scope(db, request);
+    // A surface's runs are its exact triangle mesh cut by the slab's mid-plane
+    // (SurfaceCut), clipped to u/v.
+    // Every surface tile in the slab, by object in row/column order: one R-tree
+    // search per query instead of scanning each surface's tiles.
+    struct Tile { int64_t row, column, rows, columns; Bounds box; };
+    std::optional<std::map<int64_t, std::vector<Tile>>> surfaceTiles;
+    auto tilesOf = [&](int64_t id) -> const std::vector<Tile>& {
+        if (!surfaceTiles) {
+            surfaceTiles.emplace();
+            Statement tiles(db, "SELECT b.object_id,b.row_start,b.col_start,b.row_count,b.col_count,"
+                "b.min_x,b.min_y,b.min_z,b.max_x,b.max_y,b.max_z FROM spatial_regions_rtree r "
+                "CROSS JOIN spatial_regions b ON b.id=r.id WHERE b.array_name='points' AND " + spatialOverlapSql() +
+                " ORDER BY b.object_id,b.row_start,b.col_start");
+            for (int i = 0; i < 6; ++i) tiles.bind(i + 1, bounds[i]);
+            while (tiles.row()) {
+                Tile tile{tiles.i64(1), tiles.i64(2), tiles.i64(3), tiles.i64(4), {}};
+                for (int i = 0; i < 6; ++i) tile.box[i] = tiles.f64(5 + i);
+                (*surfaceTiles)[tiles.i64(0)].push_back(tile);
+            }
+        }
+        static const std::vector<Tile> none;
+        const auto found = surfaceTiles->find(id);
+        return found == surfaceTiles->end() ? none : found->second;
+    };
+    auto processSurface = [&](const std::string& uuid, int64_t id, const std::string& revision) {
+        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
+        RetainedGeometryReader retained(db, revision);
+        auto& reader = *retained;
+        const auto& arrays = reader.manifest().at("arrays");
+        const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
+        if (arrays.at("points").at("dtype") != kind.dtype) throw std::runtime_error("surface coordinates must be <f4");
+        SurfaceCut cut(view, options.toTarget, shape.at(1));
+        for (const auto& [row0, col0, rows, cols, box] : tilesOf(id)) {
+            requestWork(&RegionStats::candidateVisits);
+            if (rows < 2 || cols < 2 || !cut.reaches(box)) continue;
+            const auto tile = surfaceTile(impl_->options.surfaceTiles.get(), revision, reader, row0, col0, rows, cols);
+            result.stats.segmentTests += cut.add(*tile, row0, col0, rows, cols);
+        }
+        bool hit = false;
+        cut.pieces([&](int64_t segment, bool continues, const auto& start, const auto& end) {
+            // Each point is XYZ and its grid position.
+            const uint64_t added = continues ? 40 : 80;
+            if (added > options.outputByteBudget - result.stats.outputBytes) request.stop(RegionStop::OutputBudget);
+            if (!continues) result.runs.push_back({uuid, revision, "points", "", segment, {start.point}, {start.grid}});
+            result.runs.back().points.push_back(end.point);
+            result.runs.back().grid.push_back(end.grid);
+            result.stats.outputBytes += added;
+            if (!hit) { hit = true; ++result.intersectingObjects; }
+        });
+        if (hit && options.maximumObjects && result.intersectingObjects == options.maximumObjects)
+            request.stop(RegionStop::ObjectLimit);
+    };
     auto process = [&](const std::string& uuid, int64_t id, const std::string& revision, const std::string& family) {
-        GeometryReader reader(db, revision);
+        if (kind.surface) return processSurface(uuid, id, revision);
+        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
+        RetainedGeometryReader retained(db, revision);
+        auto& reader = *retained;
         const auto& arrays = reader.manifest().at("arrays");
         std::string name = kind.arrays.back();
         for (const auto& candidate : kind.arrays)
@@ -191,7 +265,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                     Point p;
                     if (kind.stride == 24) copyScalars<double>(source,p);
                     else { std::array<int32_t,3> q; copyScalars<int32_t>(source,q); for(int k=0;k<3;++k)p[k]=q[k]; }
-                    return p;
+                    return options.toTarget?options.toTarget->apply(p):p;
                 };
                 Point a=point(0), pa=project(view,a);
                 for (int64_t i=0;i<count;++i) {
@@ -258,11 +332,13 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             const std::string from = selectedOnly
                 ? "objects o CROSS JOIN spatial_regions b ON b.object_id=o.id AND b.array_name='' CROSS JOIN spatial_regions_rtree r ON r.id=b.id "
                 : "spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id ";
-            std::string sql="SELECT o.uuid,o.id,h.revision_uuid,COALESCE(f.family,'') FROM " + from +
+            // Surfaces have no family or length summary; their filters are rejected above.
+            const std::string family = kind.surface ? "''" : "COALESCE(f.family,'')";
+            std::string sql="SELECT o.uuid,o.id,h.revision_uuid," + family + " FROM " + from +
                 "JOIN geometry_heads h ON h.object_uuid=o.uuid LEFT JOIN " + std::string(kind.table) + " f ON f.object_id=o.id "
                 "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind=?12 AND b.array_name='' "
                 "AND COALESCE(l.retired,0)=0 AND "+spatialOverlapSql()+
-                " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR COALESCE(f.family,'')=?8)";
+                (kind.surface ? std::string() : " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR "+family+"=?8)");
             if(includedIds)sql+=" AND o.id IN (SELECT value FROM json_each(?10))";
             if(options.coordinates)sql+=coordinateFilterSql("o", "?11");
             if(selectedOnly)sql+=" AND o.uuid=?9";
@@ -273,7 +349,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             if(!selectedOnly)sql+=" ORDER BY o.uuid";
             Statement candidates(db,sql);
             for(int i=0;i<6;++i)candidates.bind(i+1,bounds[i]);
-            candidates.bind(7,options.minLength);
+            candidates.bind(7,options.toTarget?0.:options.minLength);
             if(options.family)candidates.bind(8,*options.family);else candidates.bindNull(8);
             if(selected)candidates.bind(9,parseUuid(*selected));
             if(includedIds)candidates.bind(10,*includedIds);
@@ -286,6 +362,11 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         };
         if(selected)query(true);
         query(false);
+        if (kind.surface) {
+            result.remote = remoteSurfacesIn(db, bounds, includedIds, options.coordinates);
+            if (!result.remote.empty() && impl_->options.remoteGeometryReached)
+                impl_->options.remoteGeometryReached(result.remote);
+        }
     } catch (...) {
         auto error=scope.error ? scope.error : std::current_exception();
         try { std::rethrow_exception(error); } catch (const ReadStopped&) {} // real failures still propagate

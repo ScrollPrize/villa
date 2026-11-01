@@ -77,11 +77,11 @@ Targets represent what the model predicts (e.g., ink detection, damage segmentat
 ```python
 targets = {
     "ink": {
-        "out_channels": 1,
-        "activation": "sigmoid",
+        "out_channels": 2,
+        "activation": "none",
         "losses": [
             {
-                "name": "SoftDiceLoss",
+                "name": "nnUNet_DC_and_CE_loss",
                 "weight": 1.0,
                 "kwargs": {}
             }
@@ -331,8 +331,8 @@ Additional behaviour:
 Auxiliary tasks let you add side objectives that are derived from a primary “source” target (e.g., distance transform or surface normals of a binary mask). They use the shared encoder with separate decoders and integrate into the same multi-task loss.
 
 - Configuration: Add an `auxiliary_tasks` block to your YAML. Each entry must specify:
-  - `type`: One of `distance_transform`, `surface_normals`.
-  - Also supported: `structure_tensor` for supervising tensor components.
+  - `type`: One of `distance_transform`, `surface_normals`,
+    `structure_tensor`, `inplane_direction`, or `nearest_component`.
   - `source_target`: The primary target name to derive from (e.g., `ink`, `surface`).
   - `losses`: List of losses and weights for the auxiliary head.
   - `loss_weight`: Optional overall weight for the task.
@@ -416,16 +416,29 @@ auxiliary_tasks:
 How it works in code:
 - Config injection: `ConfigManager` reads `auxiliary_tasks` and calls a small factory to append derived targets into `mgr.targets` with `auxiliary_task: true` and a reference to `source_target`.
 - Dataset loading: Datasets only load label volumes for primary targets. Auxiliary targets do not require separate label files and are not looked up on disk.
+- Trainer generation: When `auxiliary_tasks` are configured, the default
+  `--trainer base` path selects `AuxiliaryTrainer`. It derives every configured
+  auxiliary tensor from the source-target patch before the forward pass.
 - Loss computation: During training, losses are computed per key present in the batch label dict. The helper `compute_auxiliary_loss` passes `source_pred=outputs[source_target]` to losses that accept it. This enables:
   - Self-consistency/regularization losses that don’t need explicit GT (e.g., `NormalSmoothnessLoss` using only predicted normals with optional masking from `source_pred`).
-  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the dataset-provided tensors for aux targets.
+  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the trainer-generated tensors for aux targets.
   - Tip: If you use `SignedDistanceLoss`, set `distance_type: signed` (default). For `inside`/`outside` distances, use regression losses like `MaskedMSELoss` or `WeightedSmoothL1Loss`.
   - For deep supervision, auxiliary targets default to `ds_interpolation: linear`, mapping to bilinear (2D) or trilinear (3D) in downsampling to preserve regression continuity.
 
 Important notes and current behavior:
-- The dataset now auto-generates ground-truth tensors for `distance_transform` (signed DT) and `surface_normals` per patch from the `source_target` labels, so related losses work out of the box.
+- The auxiliary trainer generates ground-truth tensors for every supported task
+  per patch from the `source_target` labels. CLI selections other than
+  `--trainer base` reject configurations containing auxiliary targets instead
+  of silently training zero-loss heads.
+- Auxiliary target generation currently requires the default dataset-side
+  augmentation path (`tr_config.augment_on_device: false`) so vector and tensor
+  targets are derived after geometric augmentation.
+- Direct Python callers must instantiate `AuxiliaryTrainer` explicitly and
+  keep `mgr.augment_on_device = False`. Automatic trainer selection and the
+  augmentation guard belong to the CLI; constructing `BaseTrainer` directly
+  does not generate auxiliary targets or enforce these CLI checks.
 - Auxiliary losses that are self-supervised or use only predictions (e.g., `NormalSmoothnessLoss`) also work and can be masked using `source_pred` passed through `compute_auxiliary_loss`.
-- If you prefer, you can still precompute and store auxiliary labels on disk using the same naming convention; the dataset will ignore them unless you wire them explicitly.
+- Precomputed auxiliary labels are not loaded by the standard dataset path.
 
 This design allows mixing fully supervised targets with auxiliary/self-supervised regularizers and keeps disk I/O simple by deriving common auxiliary targets on the fly.
 

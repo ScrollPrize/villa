@@ -225,6 +225,18 @@ def _tuple3(value: Any, *, name: str) -> tuple[int, int, int]:
     return result
 
 
+DatasetSplit = Literal["train", "validation"]
+
+
+def _dataset_split(value: Any, *, index: int) -> DatasetSplit:
+    split = str(value).strip().lower()
+    if split not in {"train", "validation"}:
+        raise ValueError(
+            f"datasets[{index}].split must be 'train' or 'validation', got {value!r}"
+        )
+    return split  # type: ignore[return-value]
+
+
 def _string_mapping(value: Any, *, name: str) -> Mapping[str, str]:
     if value is None:
         return _FrozenMapping()
@@ -536,6 +548,7 @@ class DatasetSource:
     sampling_representation_keys: Mapping[str, str] = field(
         default_factory=_FrozenMapping
     )
+    split: DatasetSplit = "train"
 
     @classmethod
     def from_mapping(cls, value: Any, *, index: int) -> "DatasetSource":
@@ -575,6 +588,7 @@ class DatasetSource:
                 value.get("sampling_representation_keys"),
                 name=f"datasets[{index}].sampling_representation_keys",
             ),
+            split=_dataset_split(value.get("split", "train"), index=index),
         )
 
 
@@ -688,6 +702,17 @@ class InkDataConfig:
             DatasetSource.from_mapping(value, index=index)
             for index, value in enumerate(unlabeled_value)
         )
+        for index, source in enumerate(unlabeled):
+            if source.split != "train":
+                raise ValueError(
+                    f"unlabeled_datasets[{index}].split must be 'train': "
+                    "unlabeled patches have no labels to validate on"
+                )
+        if mode != "flat" and any(source.split == "validation" for source in datasets):
+            raise ValueError(
+                "datasets[].split='validation' is implemented for mode 'flat' only, "
+                f"got mode {mode!r}"
+            )
         selected = unlabeled if discovery == "unlabeled" else datasets
         if not selected:
             raise ValueError(

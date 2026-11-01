@@ -45,8 +45,8 @@ Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader&
 bool directional(const Json& value) {return annotationDirectional(value);}
 GeometryData snapshotData(GeometryReader& reader) {
     const auto& m=reader.manifest();
-    GeometryData data; data.kind=m.at("kind"); data.formatVersion=m.at("format_version");
-    data.coordinateSystem=m.at("coordinate_system"); data.attributes=m.at("attributes").dump();
+    GeometryData data; data.kind=m.at("kind").get<std::string>(); data.formatVersion=m.at("format_version");
+    data.coordinateSystem=m.at("coordinate_system").get<std::string>(); data.attributes=m.at("attributes").dump();
     for(const auto& [name,a]:m.at("arrays").items())
         data.arrays.push_back({name,a.at("dtype"),a.at("shape"),reader.read(name,0)});
     return data;
@@ -71,7 +71,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
         if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-        if (current->kind=="patch" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
+        if (current->kind=="surface" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         auto data=snapshotData(reader);
@@ -186,7 +186,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
         if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-        if (current->kind!="patch") throw std::invalid_argument("surface resize requires a patch");
+        if (current->kind!="surface") throw std::invalid_argument("surface resize requires a surface");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         if (resize.rows<0 || resize.columns<0) throw std::invalid_argument("negative surface shape");
         const auto origin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
@@ -200,9 +200,19 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
         for (const auto& fill:resize.fill) if (!fills.emplace(fill.name,fill).second) throw std::invalid_argument("duplicate fill channel");
         if (fills.size()!=manifest.at("arrays").size()) throw std::invalid_argument("explicit fill required for every surface array");
         auto data=snapshotData(reader);
+        const auto grid=manifest.at("arrays").at("points").at("shape").get<std::vector<int64_t>>();
         for (auto& a:data.arrays) {
             const auto shape=a.shape;
-            auto newShape=shape; newShape[0]=resize.rows; newShape[1]=resize.columns;
+            // Channels finer than the grid resize by the same grid rectangle.
+            const auto [ry,rx]=surfaceChannelResolution(a.name,shape,grid);
+            if ((ry>1 && resize.rows==0) || (rx>1 && resize.columns==0))
+                throw std::invalid_argument("surface resize cannot empty a grid axis carrying finer channels");
+            auto scaled=[](int64_t value,int64_t factor) {
+                if (value>INT64_MAX/factor || value<INT64_MIN/factor) throw std::overflow_error("surface channel shape overflow");
+                return value*factor;
+            };
+            const auto row=scaled(resize.row,ry), column=scaled(resize.column,rx), rows=scaled(resize.rows,ry), columns=scaled(resize.columns,rx);
+            auto newShape=shape; newShape[0]=rows; newShape[1]=columns;
             const auto length=geometryByteLength(a.dtype,newShape), pixel=surfacePixelBytes(a.dtype,shape);
             const auto found=fills.find(a.name);
             if(found==fills.end())throw std::invalid_argument("missing surface fill");
@@ -210,10 +220,10 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
             if(fill.dtype!=a.dtype||fill.shape!=fillShape||int64_t(fill.bytes.size())!=pixel)throw std::invalid_argument("surface fill must be one pixel of matching dtype/components");
             std::vector<uint8_t> bytes(length);
             for(int64_t i=0;i<length;i+=pixel)std::memcpy(bytes.data()+i,fill.bytes.data(),pixel);
-            const auto top=std::max<int64_t>(0,resize.row),left=std::max<int64_t>(0,resize.column);
-            const auto bottom=std::min(shape[0],resize.row+resize.rows),right=std::min(shape[1],resize.column+resize.columns);
+            const auto top=std::max<int64_t>(0,row),left=std::max<int64_t>(0,column);
+            const auto bottom=std::min(shape[0],row+rows),right=std::min(shape[1],column+columns);
             if(top<bottom&&left<right)for(auto r=top;r<bottom;++r)
-                std::memcpy(bytes.data()+((r-resize.row)*resize.columns+left-resize.column)*pixel,
+                std::memcpy(bytes.data()+((r-row)*columns+left-column)*pixel,
                     a.bytes.data()+(r*shape[1]+left)*pixel,(right-left)*pixel);
             a.shape=std::move(newShape); a.bytes=std::move(bytes);
         }

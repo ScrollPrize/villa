@@ -110,7 +110,7 @@ To preload a project during auto-launch:
 ```sh
 ./tools/vc3d-mcp/run.sh \
   --launch /path/to/VC3D \
-  --volpkg /data/example.volpkg
+  --project /data/example.vcproj
 ```
 
 The PowerShell launcher accepts the same arguments:
@@ -118,7 +118,7 @@ The PowerShell launcher accepts the same arguments:
 ```powershell
 .\tools\vc3d-mcp\run.ps1 `
   --launch C:\path\to\VC3D.exe `
-  --volpkg D:\data\example.volpkg
+  --project D:\data\example.vcproj
 ```
 
 To start VC3D yourself:
@@ -219,9 +219,9 @@ Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 
 - project creation, attached volumes, and the Open Data catalog;
 - viewer navigation, screenshots, render settings, and volume overlays;
-- segment loading, growth, editing, masks, refinement, and review;
+- segment loading, growth, editing, refinement, and review;
 - points, tags, winding annotations, seeding, and push/pull;
-- fiber annotation, Atlas search, and Lasagna workflows;
+- fiber annotation and Lasagna workflows;
 - tracing, flattening, rendering, jobs, progress, and cancellation.
 
 The MCP client displays each installed tool with its current description and

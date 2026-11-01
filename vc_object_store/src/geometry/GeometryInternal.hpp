@@ -117,9 +117,9 @@ inline void copyGeometryChunk(const GeometryLayout& layout, int64_t index,
                         bytes.data() + row * w * layout.pixelBytes, w * layout.pixelBytes);
     }
 }
-inline void validatePatchTileSize(int64_t size) {
+inline void validateSurfaceTileSize(int64_t size) {
     if (size != 0 && size != 32 && size != 64 && size != 128)
-        throw std::invalid_argument("patch tile size must be 0 (linear), 32, 64, or 128");
+        throw std::invalid_argument("surface tile size must be 0 (linear), 32, 64, or 128");
 }
 inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChunks = true)
 {
@@ -134,7 +134,7 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChun
             (shape.size() != 2 && shape.size() != 3))
             throw std::runtime_error("geometry: unsupported storage layout");
         result.tile = storage.at("tile_size").get<int64_t>();
-        validatePatchTileSize(result.tile);
+        validateSurfaceTileSize(result.tile);
         if (!result.tile) throw std::runtime_error("geometry: invalid tiled layout");
         result.rows = shape[0]; result.cols = shape[1];
         result.pixelBytes = surfacePixelBytes(array.at("dtype"), shape);
@@ -171,7 +171,8 @@ void forEachGeometryChunk(const GeometryArray& array, int64_t tile, Visit&& visi
 inline nlohmann::json geometrySchema(const GeometryData& data)
 {
     using Json = nlohmann::json;
-    if (data.kind != "patch" && data.kind != "fiber" && data.kind != "point_collection" && data.kind != "track")
+    if (data.kind != "surface" && data.kind != "fiber" && data.kind != "point_collection" && data.kind != "track" &&
+        data.kind != "umbilicus")
         throw std::invalid_argument("geometry: unsupported object kind " + data.kind);
     if (data.formatVersion != 1 || data.coordinateSystem != "source_xyz")
         throw std::invalid_argument("geometry: unsupported format version or coordinate system");
@@ -191,14 +192,14 @@ inline nlohmann::json geometrySchema(const GeometryData& data)
         if (a.at("dtype") != dtype || shape.size() != rank || (xyz && shape.back() != 3))
             throw std::invalid_argument(std::string("geometry: invalid layout for ") + name);
     };
-    if (data.kind == "patch") {
+    if (data.kind == "surface") {
         require("points", "<f4", 3, true);
         for (const auto& array : data.arrays) validateSurfaceChannel(array, arrays.at("points").at("shape").get<std::vector<int64_t>>());
         if (!attributes.contains("scale") || !attributes.at("scale").is_array() || attributes.at("scale").size() != 2)
-            throw std::invalid_argument("geometry: patch attributes require two-axis scale");
+            throw std::invalid_argument("geometry: surface attributes require two-axis scale");
         for (const auto& value : attributes.at("scale"))
             if (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0)
-                throw std::invalid_argument("geometry: patch scale must be finite and positive");
+                throw std::invalid_argument("geometry: surface scale must be finite and positive");
     }
     if (data.kind == "fiber") {
         require("control_points", "<f8", 2, true);
@@ -208,6 +209,7 @@ inline nlohmann::json geometrySchema(const GeometryData& data)
             throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
     }
     if (data.kind == "track") require("points", "<i4", 2, true);
+    if (data.kind == "umbilicus") require("points", "<f8", 2, true);
     if (data.kind == "point_collection") {
         require("points", "<f8", 2, true);
         require("point_ids", "<i8", 1, false);
@@ -217,14 +219,14 @@ inline nlohmann::json geometrySchema(const GeometryData& data)
     return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},
         {"attributes", attributes}, {"arrays", arrays}};
 }
-inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTileSize = GeometryStorageOptions{}.patchTileSize)
+inline nlohmann::json geometryManifest(const GeometryData& data, int64_t surfaceTileSize = GeometryStorageOptions{}.surfaceTileSize)
 {
-    validatePatchTileSize(patchTileSize);
+    validateSurfaceTileSize(surfaceTileSize);
     auto manifest = geometrySchema(data);
     auto& arrays = manifest["arrays"];
     for (const auto& array : data.arrays) {
         auto& descriptor = arrays[array.name];
-        const auto tile = data.kind == "patch" ? patchTileSize : 0;
+        const auto tile = data.kind == "surface" ? surfaceTileSize : 0;
         if (tile) descriptor["storage"] = {{"version", 1}, {"layout", "tiles"}, {"tile_size", tile}};
         forEachGeometryChunk(array, tile, [&](int64_t, std::span<const uint8_t> bytes) {
             descriptor["chunks"].push_back(geometryPayloadHash(array.name, bytes));

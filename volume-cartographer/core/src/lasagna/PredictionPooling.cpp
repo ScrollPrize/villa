@@ -273,8 +273,4 @@ public:
 std::shared_ptr<utils::Store> openPooledPredictionStore(const std::filesystem::path& path) {
     return std::make_shared<PooledStore>(path);
 }
-PredictionPoolingStats predictionPoolingStats() {
-    std::lock_guard lock(cache.mutex);
-    return {computations.load(),hits.load(),readNs.load(),poolNs.load(),cache.bytes};
-}
 }

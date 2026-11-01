@@ -1,106 +1,100 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
-class VolumePkg;
-namespace vc::project { struct Entry; }
 namespace vc::lasagna { struct LasagnaDatasetManifest; }
 
 namespace vc3d::opendata {
-
-inline constexpr std::string_view kLasagnaArtifactType = "lasagna";
-inline constexpr std::string_view kOpenDataLasagnaEntryTag = "vc-open-data-lasagna";
-inline constexpr std::string_view kOpenDataLasagnaArtifactTagPrefix =
-    "vc-open-data-lasagna-artifact:";
-inline constexpr std::string_view kOpenDataLasagnaModelTagPrefix =
-    "vc-open-data-lasagna-model-id:";
-
-struct OpenDataLasagnaInfo {
-    std::string sampleId;
-    std::string volumeId;
-    std::size_t artifactIndex = 0;
-    std::string artifactUrl;
-    std::string modelId;
-    int sourceCoordinateLevel = 0;
-    bool levelWasExplicit = false;
-    bool lasagnaVersionPresent = false;
-    std::optional<int> lasagnaVersion;
-    bool sourceToBasePresent = false;
-    std::optional<double> sourceToBase;
-    std::optional<std::array<std::size_t, 3>> baseShapeZYX;
-};
-
-struct ResolvedOpenDataLasagna {
-    std::filesystem::path manifestPath;
-    std::string sourceManifestLocation;
-    double workingToBaseScale = 1.0;
-    std::string coordinateSpace;
-    std::string artifactUrl;
-    bool manifestBacked = false;
-};
 
 enum class OpenDataLasagnaDatasetKind {
     Normal,
     FiberInference,
 };
 
+// The volume's attachable Lasagna artifacts, by index: classified as Lasagna,
+// with a URL and parameters.level; one per published dataset.
+[[nodiscard]] std::vector<std::size_t> lasagnaArtifacts(const vcr::catalog::OpenDataVolume& volume);
+
 // Validates the catalog metadata against the authoritative inner manifest and
 // classifies the dataset by its channel schema. Catalog creation_info is
 // optional; when present, its values must agree with the inner manifest.
 [[nodiscard]] OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
-    const OpenDataLasagnaInfo& info,
+    const vcr::catalog::OpenDataVolume& volume,
+    const vcr::catalog::OpenDataArtifact& artifact,
     const vc::lasagna::LasagnaDatasetManifest& manifest);
 
 // Returns the public manifest URL for a catalogue-backed entry and the stored
 // project location for an ordinary entry.
 [[nodiscard]] std::string lasagnaSourceManifestLocation(
-    const vc::project::Entry& entry);
+    const VolumePkg& pkg, const vc::project::Entry& entry);
 
-// Resolve the single root manifest in a public catalogue artifact directory.
-[[nodiscard]] std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl);
+// A sample's Lasagna, cached and validated against the catalog with its
+// volumes opened, ready to attach. Preparing does the network work and
+// touches no project.
+struct OpenDataLasagnaPreparation {
+    struct Dataset {
+        std::string manifest;  // the cached manifest: the entry's location
+        bool fiberInference = false;
+        std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
+    };
+    std::string sampleId;
+    std::vector<std::string> artifactUrls;  // every artifact prepared or tried
+    std::vector<Dataset> datasets;
+    std::vector<std::string> messages;      // artifacts skipped or failed
+};
 
-[[nodiscard]] std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
-    const std::string& sampleId,
-    const OpenDataVolume& volume);
-
-[[nodiscard]] std::filesystem::path lasagnaCacheDir(
+// selection optionally restricts the volumes and representations prepared;
+// nullptr prepares everything. Data chunks stay lazy (the core read-through
+// store persists them).
+[[nodiscard]] OpenDataLasagnaPreparation prepareOpenDataLasagna(
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataLasagnaInfo& info);
+    const OpenDataResourceSelection* selection = nullptr);
 
-// Download and validate the small dataset manifest and Zarr descriptors. Data
-// chunks remain lazy and are persisted by the core read-through store.
-[[nodiscard]] std::filesystem::path prepareOpenDataLasagna(
-    const OpenDataLasagnaInfo& info,
-    const std::filesystem::path& remoteCacheRoot,
-    std::string* errorOut = nullptr);
-
-// selection optionally restricts attached volumes and representations;
-// nullptr attaches everything.
+// Attaches the prepared datasets and removes the project's other cached copies
+// of the same artifacts (superseded or failed downloads). Returns the number
+// attached; failures are appended to messages.
 int attachOpenDataLasagna(VolumePkg& pkg,
-                          const OpenDataSample& sample,
-                          const std::filesystem::path& remoteCacheRoot,
-                          std::vector<std::string>* messages = nullptr,
-                          const OpenDataResourceSelection* selection = nullptr);
+                          const OpenDataLasagnaPreparation& preparation,
+                          std::vector<std::string>* messages = nullptr);
+
+struct ResolvedOpenDataLasagna {
+    std::filesystem::path manifestPath;
+    std::string sourceManifestLocation;
+    double workingToBaseScale = 1.0;
+    std::string artifactUrl;
+    bool manifestBacked = false;
+};
+
+// Immutable resolver inputs for background rendering; no live project access.
+struct LasagnaResolutionSnapshot {
+    std::filesystem::path projectPath;
+    std::vector<vc::project::Entry> entries;
+    std::string manualLocation;
+    std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
+    std::optional<vcr::catalog::OpenDataVolumeView> view;
+    std::optional<std::array<int, 3>> workingShape;
+};
+[[nodiscard]] LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg&, const std::string& volumeId);
+[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResolutionSnapshot&);
 
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,
     const std::string& loadedVolumeId);
 
-// Public for non-GUI consumers and deterministic pairing tests. The tags must
-// describe one catalog coordinate identity; no affine or cross-volume pairing
-// is attempted.
-[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateTags(
+// The same for what the active volume shows in the catalog (nullopt: the
+// project's manual selection), checked against its shape when given. No
+// affine or cross-volume pairing is attempted.
+[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags);
-
-[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateShape(
-    const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags,
-    const std::array<int, 3>& workingShapeZYX);
+    const std::optional<vcr::catalog::OpenDataVolumeView>& view,
+    const std::optional<std::array<int, 3>>& workingShapeZYX = std::nullopt);
 
 } // namespace vc3d::opendata

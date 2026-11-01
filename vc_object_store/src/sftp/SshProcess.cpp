@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
@@ -30,6 +31,52 @@ namespace vc::sftp {
 namespace detail {
 namespace {
 constexpr size_t kDiagnosticBytes = 8192;
+// One drain reads at most this much, so a chatty stderr cannot keep callers from
+// their timeout checks; only the last kDiagnosticBytes are kept anyway.
+constexpr size_t kDrainBytes = 4 * kDiagnosticBytes;
+
+#ifndef _WIN32
+std::string controlPath()
+{
+    // Keep the socket path short enough for macOS too. mkdtemp creates mode
+    // 0700, so only this user can connect to the authenticated transport.
+    struct Directory {
+        std::string path = "/tmp/vc-ssh-XXXXXX";
+        Directory() {
+            if (!mkdtemp(path.data())) throw std::runtime_error("SFTP: cannot create SSH control directory");
+        }
+        ~Directory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    };
+    static Directory directory;
+    return directory.path + "/%C";
+}
+#endif
+
+std::string shellQuote(const std::string& text)
+{
+    std::string quoted = "'";
+    for (const char c : text) quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return quoted + "'";
+}
+
+std::string lockedServerCommand(const Options& options)
+{
+    if (options.processLifetime.count() <= 0)
+        throw std::invalid_argument("SFTP process lifetime must be positive");
+    // No user-supplied text is interpreted as shell syntax. All descriptors
+    // for the database and its journal belong to this one locked process.
+    return "lock=" + shellQuote(options.processLock) + "; "
+        "test -f \"$lock\" && test ! -L \"$lock\" || { "
+        "echo 'hub: enable SSH process locking with vc_object_hub enable-ssh-locking HUB first' >&2; exit 1; }; "
+        "command -v flock >/dev/null && command -v timeout >/dev/null || { "
+        "echo 'hub: server needs flock and timeout (Linux util-linux/coreutils)' >&2; exit 1; }; "
+        "server=; for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server "
+        "/usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do "
+        "if test -x \"$p\"; then server=$p; break; fi; done; "
+        "test -n \"$server\" || { echo 'hub: external OpenSSH sftp-server not found' >&2; exit 1; }; "
+        "exec timeout --kill-after=5s " + std::to_string(options.processLifetime.count()) +
+        "s flock --exclusive --timeout 60 --no-fork \"$lock\" \"$server\"";
+}
 
 std::vector<std::string> sshArguments(const Url& url, const Options& options, bool interactive)
 {
@@ -38,7 +85,12 @@ std::vector<std::string> sshArguments(const Url& url, const Options& options, bo
         "-oConnectTimeout=" + std::to_string(options.connectTimeout.count())};
     if (!url.user.empty()) args.insert(args.end(), {"-l", url.user});
     if (url.port) args.insert(args.end(), {"-p", std::to_string(*url.port)});
-    args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+#ifndef _WIN32
+    if (options.shareConnection)
+        args.insert(args.end(), {"-oControlMaster=auto", "-oControlPersist=no", "-oControlPath=" + controlPath()});
+#endif
+    if (options.processLock.empty()) args.insert(args.end(), {"-s", "--", url.host, "sftp"});
+    else args.insert(args.end(), {"--", url.host, lockedServerCommand(options)});
     return args;
 }
 
@@ -53,13 +105,6 @@ void keepTail(std::string& tail, const char* data, size_t size)
 // asks the same question so reconnecting does not ask the user again.
 std::mutex answersMutex;
 std::map<std::pair<std::string, std::string>, std::string> rememberedAnswers;
-
-std::string shellQuote(const std::string& text)
-{
-    std::string quoted = "'";
-    for (const char c : text) quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
-    return quoted + "'";
-}
 
 // ssh runs a generated helper as SSH_ASKPASS. The helper writes the prompt kind
 // and text to one FIFO and prints the answer it reads from another; both live in
@@ -207,16 +252,37 @@ std::wstring quoteArgument(const std::wstring& argument)
 }
 }  // namespace
 
+// ssh's standard input. Anonymous pipes cannot be written asynchronously, so a
+// stalled ssh would block WriteFile with no way to run `check`; our end of this
+// named pipe is overlapped instead, and the child's end is an ordinary handle.
+static bool createInputPipe(HANDLE& child, HANDLE& parent, SECURITY_ATTRIBUTES& inherit)
+{
+    static std::atomic<unsigned> serial{0};
+    const auto name = L"\\\\.\\pipe\\vc-ssh-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(serial.fetch_add(1));
+    parent = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                              PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
+    if (parent == INVALID_HANDLE_VALUE) { parent = nullptr; return false; }
+    child = CreateFileW(name.c_str(), GENERIC_READ, 0, &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (child == INVALID_HANDLE_VALUE) { child = nullptr; CloseHandle(parent); parent = nullptr; return false; }
+    return true;
+}
+
 struct SshProcess::Impl {
     HANDLE process = nullptr, input = nullptr, output = nullptr, errors = nullptr;
+    HANDLE written = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // completes overlapped input writes
     std::string tail;
+    ~Impl() { if (written) CloseHandle(written); }
     void drainErrors()
     {
         char buffer[4096];
-        for (DWORD available = 0; errors && PeekNamedPipe(errors, nullptr, 0, nullptr, &available, nullptr) && available;) {
+        DWORD available = 0;
+        for (size_t drained = 0; drained < kDrainBytes && errors &&
+             PeekNamedPipe(errors, nullptr, 0, nullptr, &available, nullptr) && available;) {
             DWORD n = 0;
             if (!ReadFile(errors, buffer, std::min<DWORD>(available, sizeof buffer), &n, nullptr) || !n) break;
             keepTail(tail, buffer, n);
+            drained += n;
         }
     }
 };
@@ -230,9 +296,12 @@ SshProcess::SshProcess(const Url& destination, const Options& options, Authentic
         command += (command.empty() ? L"" : L" ") + quoteArgument(widen(argument));
     SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE childInput = nullptr, childOutput = nullptr, childErrors = nullptr;
-    if (!CreatePipe(&childInput, &impl_->input, &inherit, 0) || !CreatePipe(&impl_->output, &childOutput, &inherit, 0) ||
-        !CreatePipe(&impl_->errors, &childErrors, &inherit, 0))
+    if (!impl_->written || !createInputPipe(childInput, impl_->input, inherit) ||
+        !CreatePipe(&impl_->output, &childOutput, &inherit, 0) || !CreatePipe(&impl_->errors, &childErrors, &inherit, 0)) {
+        for (auto handle : {childInput, childOutput, childErrors, impl_->input, impl_->output, impl_->errors})
+            if (handle) CloseHandle(handle);
         throw std::runtime_error("Cannot create pipes for OpenSSH ssh");
+    }
     for (auto handle : {impl_->input, impl_->output, impl_->errors}) SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOW startup{};
     startup.cb = sizeof startup;
@@ -245,8 +314,9 @@ SshProcess::SshProcess(const Url& destination, const Options& options, Authentic
                                         &startup, &info);
     for (auto handle : {childInput, childOutput, childErrors}) CloseHandle(handle);
     if (!started) {
+        const auto error = GetLastError();
         for (auto handle : {impl_->input, impl_->output, impl_->errors}) CloseHandle(handle);
-        throw std::runtime_error("Cannot start OpenSSH ssh (error " + std::to_string(GetLastError()) + ")");
+        throw std::runtime_error("Cannot start OpenSSH ssh (error " + std::to_string(error) + ")");
     }
     CloseHandle(info.hThread);
     impl_->process = info.hProcess;
@@ -263,8 +333,27 @@ void SshProcess::write(std::span<const std::byte> data, const std::function<void
 {
     for (size_t done = 0; done < data.size();) {
         check();
+        OVERLAPPED pending{};
+        pending.hEvent = impl_->written;
+        ResetEvent(impl_->written);
         DWORD n = 0;
-        if (!WriteFile(impl_->input, data.data() + done, DWORD(std::min<size_t>(data.size() - done, 1 << 20)), &n, nullptr))
+        if (!WriteFile(impl_->input, data.data() + done, DWORD(std::min<size_t>(data.size() - done, 1 << 20)), nullptr,
+                       &pending)) {
+            if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("SSH write failed: " + diagnostics());
+            // Wait as the POSIX path does: `check` every 100 ms, and it may throw.
+            while (WaitForSingleObject(impl_->written, 100) == WAIT_TIMEOUT) {
+                try {
+                    impl_->drainErrors();
+                    check();
+                } catch (...) {
+                    // The kernel still owns `pending` and the buffer until the write ends.
+                    CancelIoEx(impl_->input, &pending);
+                    GetOverlappedResult(impl_->input, &pending, &n, TRUE);
+                    throw;
+                }
+            }
+        }
+        if (!GetOverlappedResult(impl_->input, &pending, &n, TRUE))
             throw std::runtime_error("SSH write failed: " + diagnostics());
         done += n;
     }
@@ -290,6 +379,11 @@ size_t SshProcess::read(std::span<std::byte> out, std::chrono::milliseconds wait
 }
 
 bool SshProcess::prompting() const { return false; }
+bool SshProcess::closed() const
+{
+    DWORD status = 0;
+    return !GetExitCodeProcess(impl_->process, &status) || status != STILL_ACTIVE;
+}
 void SshProcess::authenticated() {}
 std::string SshProcess::diagnostics()
 {
@@ -305,9 +399,9 @@ struct SshProcess::Impl {
     void drainErrors()
     {
         char buffer[4096];
-        while (errors >= 0) {
+        for (size_t drained = 0; errors >= 0 && drained < kDrainBytes;) {
             const auto n = ::read(errors, buffer, sizeof buffer);
-            if (n > 0) { keepTail(tail, buffer, size_t(n)); continue; }
+            if (n > 0) { keepTail(tail, buffer, size_t(n)); drained += size_t(n); continue; }
             if (n == 0) { ::close(errors); errors = -1; }
             break;
         }
@@ -441,6 +535,14 @@ size_t SshProcess::read(std::span<std::byte> out, std::chrono::milliseconds wait
 }
 
 bool SshProcess::prompting() const { return impl_->askpass && impl_->askpass->active(); }
+bool SshProcess::closed() const
+{
+    pollfd ready{impl_->stream, POLLIN, 0};
+    if (poll(&ready, 1, 0) <= 0) return false;
+    if (ready.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+    char byte;
+    return (ready.revents & POLLIN) && ::recv(impl_->stream, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
 void SshProcess::authenticated() { impl_->askpass.reset(); }
 std::string SshProcess::diagnostics()
 {
