@@ -36,6 +36,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `USE_ZARR_COMPRESSION` | Enable zarr compression | `false` |
 | `COMPILE` | Enable torch.compile | `1` |
 | `COMPILE_MODE` | torch.compile mode | `reduce-overhead` |
+| `PAD_LAST_BATCH` | Zero-pad the final partial batch to `BATCH_SIZE` so torch.compile and cudnn see one shape (avoids a recompile; tiles in that batch may change at fp16 noise level) | `false` |
 
 **Inference Configuration Notes:**
 - `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)

@@ -136,6 +136,9 @@ void ViewerCompositePanel::setViewerManagers(
     _managerConnections.clear();
     _viewerManagers = std::move(unique);
     for (auto* manager : _viewerManagers) {
+        _managerConnections.push_back(connect(manager, &ViewerManager::volumetricModeRequested, this, [this](bool enabled) {
+            if (_uiRefs.compositeMode) _uiRefs.compositeMode->setCurrentIndex(enabled ? 4 : 0);
+        }));
         _managerConnections.push_back(connect(
             manager, &ViewerManager::baseViewerCreated,
             this, &ViewerCompositePanel::applyInitialSettingsToViewer));

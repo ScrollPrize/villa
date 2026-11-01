@@ -18,7 +18,7 @@
 #include <bit>
 #include <filesystem>
 
-#include "vc/core/util/MemMap.hpp"
+#include <vc_object_store/MemMap.hpp>
 
 namespace vc::core::util {
 
@@ -50,7 +50,7 @@ inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
 }
 
 struct MmappedData {
-    vc::memmap::MappedFileRO map;
+    vc::objects::memmap::MappedFileRO map;
     const void* data = nullptr;
     size_t size = 0;
 };
@@ -232,6 +232,10 @@ public:
         return bounds_.size();
     }
 
+    size_t mapped_bytes() const {
+        return mmapped_data_ ? mmapped_data_->size : 0;
+    }
+
     size_t get_memory_usage() const {
         size_t grid_memory = grid_.capacity() * sizeof(std::vector<int>);
         for (const auto& cell : grid_) {
@@ -239,7 +243,13 @@ public:
         }
         size_t storage_memory = 0;
         if (read_only_) {
-            storage_memory = seglist_cache_bytes_.load(std::memory_order_relaxed);
+            // Everything a mapped store keeps on the heap: decoded polylines
+            // (bounded per store), decoded bucket indices (kept for the
+            // store's lifetime) and the v1/v2 bucket descriptors read at load.
+            storage_memory = seglist_cache_bytes_.load(std::memory_order_relaxed)
+                           + bucket_cache_bytes_.load(std::memory_order_relaxed)
+                           + grid_bucket_descriptors_.capacity()
+                                 * sizeof(std::pair<size_t, size_t>);
         } else {
             storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
             for (const auto& seg : storage_) {
@@ -294,6 +304,11 @@ public:
         stats.decodedPathMisses = decoded_path_misses_.load(std::memory_order_relaxed);
         stats.decodedPathEvictions = decoded_path_evictions_.load(std::memory_order_relaxed);
         stats.decodedPathBytes = seglist_cache_bytes_.load(std::memory_order_relaxed);
+        stats.bucketIndexBytes = bucket_cache_bytes_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(bucket_mutex_);
+            stats.bucketIndexEntries = grid_offsets_.size();
+        }
         std::lock_guard<std::mutex> lock(seglist_mutex_);
         stats.decodedPathEntries = seglist_cache_.size();
         return stats;
@@ -587,19 +602,6 @@ public:
     utils::Json meta_;
 
 private:
-    char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
-        uint32_t num_indices = be32(bucket.size());
-        memcpy(current, &num_indices, sizeof(num_indices));
-        current += sizeof(num_indices);
-        for (int handle : bucket) {
-            uint32_t offset = path_offsets.at(handle);
-            uint32_t net_offset = be32(offset);
-            memcpy(current, &net_offset, sizeof(net_offset));
-            current += sizeof(net_offset);
-        }
-        return current;
-    }
-
     char* write_seglist(char* current, const LineSegList& seglist) const {
         cv::Point start = seglist.start_point();
         uint32_t start_x = be32(start.x);
@@ -835,8 +837,11 @@ private:
             // Another thread created it. Use the existing one.
             return it->second;
         } else {
-            // We are the first. Insert our loaded bucket.
+            // We are the first. Insert our loaded bucket, and count it: the
+            // entry stays until the store is destroyed.
             grid_offsets_.emplace(index, bucket_ptr);
+            bucket_cache_bytes_.fetch_add(bucket_cache_entry_bytes(*bucket_ptr),
+                                          std::memory_order_relaxed);
             return bucket_ptr;
         }
     }
@@ -877,6 +882,21 @@ private:
     mutable std::mutex seglist_mutex_;
     mutable std::unordered_map<size_t, SegCacheEntry> seglist_cache_;
     mutable std::atomic<size_t> seglist_cache_bytes_{0};
+    // Running heap charge of grid_offsets_, so residentBytes() can include it
+    // without walking the map. A cached bucket costs a fixed part -- the map
+    // node, the block make_shared allocates for the vector, and its share of
+    // the hash table -- plus, if it holds any, its offsets (8 bytes each: the
+    // file stores them as u32, the vector as size_t) in one more heap block.
+    // Measured with glibc malloc on x86-64: 106.7 bytes per empty bucket over
+    // 261,632 of them (48 for the node, 48 for the make_shared block, the
+    // rest the table); 112 also covers a table that has just doubled.
+    static constexpr size_t kBucketCacheEntryOverhead = 112;
+    static constexpr size_t kHeapBlockOverhead = 16;
+    static size_t bucket_cache_entry_bytes(const std::vector<size_t>& offsets) {
+        const size_t n = offsets.capacity();
+        return kBucketCacheEntryOverhead + (n ? n * sizeof(size_t) + kHeapBlockOverhead : 0);
+    }
+    mutable std::atomic<size_t> bucket_cache_bytes_{0};
     mutable std::atomic<uint64_t> decoded_path_hits_{0};
     mutable std::atomic<uint64_t> decoded_path_misses_{0};
     mutable std::atomic<uint64_t> decoded_path_evictions_{0};
@@ -930,6 +950,10 @@ cv::Size GridStore::size() const {
 
 size_t GridStore::get_memory_usage() const {
     return pimpl_->get_memory_usage();
+}
+
+size_t GridStore::residentBytes() const {
+    return pimpl_->mapped_bytes() + pimpl_->get_memory_usage();
 }
 
 size_t GridStore::numSegments() const {

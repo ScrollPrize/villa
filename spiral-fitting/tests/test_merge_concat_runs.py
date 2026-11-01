@@ -34,7 +34,7 @@ class MergeConcatRunsTests(unittest.TestCase):
         points = _points()
         with tempfile.TemporaryDirectory() as temporary:
             merge_concat_runs.save_tifxyz(
-                points, temporary, "w000", 20.0, 7.91, "test")
+                points, temporary, 20.0, 7.91, "test")
             bbox = _meta(temporary)["bbox"]
 
         valid = points[np.any(points != -1, axis=-1)]
@@ -50,7 +50,7 @@ class MergeConcatRunsTests(unittest.TestCase):
             merge_path = os.path.join(temporary, "merge")
             reference_path = os.path.join(temporary, "reference")
             merge_concat_runs.save_tifxyz(
-                points, merge_path, "w000", 20.0, 7.91, "test")
+                points, merge_path, 20.0, 7.91, "test")
             tifxyz.save_tifxyz(
                 points[..., ::-1], reference_path, "w000", 20.0, 7.91, "test")
             merge_meta = _meta(merge_path)
@@ -66,7 +66,7 @@ class MergeConcatRunsTests(unittest.TestCase):
         points = np.full((6, 5, 3), -1.0, dtype=np.float32)
         with tempfile.TemporaryDirectory() as temporary:
             merge_concat_runs.save_tifxyz(
-                points, temporary, "w000", 20.0, 7.91, "test")
+                points, temporary, 20.0, 7.91, "test")
             metadata = _meta(temporary)
 
         self.assertEqual(
@@ -74,3 +74,24 @@ class MergeConcatRunsTests(unittest.TestCase):
             [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
         )
         self.assertEqual(metadata["area_vx2"], 0)
+
+
+def test_writers_preserve_layout_and_assign_distinct_uuids(tmp_path):
+    from uuid import UUID
+    from surface_orientation import METADATA_KEY
+
+    points = _points()
+    layout = {'test_layout': 'preserved'}
+    merged = tmp_path / 'merged'
+    reference = tmp_path / 'reference'
+    merge_concat_runs.save_tifxyz(
+        points, merged, 20.0, 7.91, 'test', layout_metadata=layout)
+    tifxyz.save_tifxyz(
+        points[..., ::-1], reference, 'w000', 20.0, 7.91, 'test',
+        layout_metadata=layout)
+    first = _meta(merged)
+    second = _meta(reference / 'w000')
+    assert str(UUID(first['uuid'])) == first['uuid']
+    assert str(UUID(second['uuid'])) == second['uuid']
+    assert first['uuid'] != second['uuid']
+    assert first[METADATA_KEY] == second[METADATA_KEY] == layout

@@ -651,6 +651,66 @@ def test_written_tifxyz_records_its_area(tmp_path):
     assert meta['area_vx2'] == pytest.approx(11*200.) and meta['area_cm2'] == pytest.approx(11*200.*100/1e8)
 
 
+def test_written_tifxyz_uuid_is_fresh_and_stable_on_overwrite(tmp_path):
+    import uuid as uuid_mod
+
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
+    r, c = np.meshgrid(np.arange(5), np.arange(4), indexing='ij')
+    rows = np.stack([np.full(r.shape, 7.), 10.*c, 20.*r], -1).astype(np.float32)
+    keep = np.ones(r.shape, bool)
+
+    def meta_uuid(out):
+        return json.loads((out/'meta.json').read_text())['uuid']
+
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10.)
+    write_surface(tmp_path/'b'/'up', rows, keep, 20., 10.)
+    first, other = meta_uuid(tmp_path/'a'/'up'), meta_uuid(tmp_path/'b'/'up')
+    # A real identity, not the directory name shared by both roots.
+    assert uuid_mod.UUID(first) and first != 'up' and first != other
+    # Re-tracing into the same directory keeps that identity.
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10., overwrite=True)
+    assert meta_uuid(tmp_path/'a'/'up') == first
+
+
+def test_written_tifxyz_mmap_layout(tmp_path):
+    """``mmap_layout``: each band uncompressed in one strip (what VC3D maps without rewriting), same values."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
+    r, c = np.meshgrid(np.arange(40), np.arange(25), indexing='ij')
+    rows = np.stack([np.full(r.shape, 7.25), 10.*c+.1, 20.*r+.3], -1).astype(np.float32)
+    keep = np.ones(r.shape, bool)
+    keep[3, 4] = False
+    write_surface(tmp_path/'tiled', rows, keep, 20., 10.)
+    write_surface(tmp_path/'mmap', rows, keep, 20., 10., mmap_layout=True)
+    for band, axis in zip('xyz', range(3)):
+        with tifffile.TiffFile(tmp_path/'mmap'/f'{band}.tif') as tif:
+            page = tif.pages[0]
+            assert not page.is_tiled and page.compression == 1 and len(page.dataoffsets) == 1
+            assert tif.byteorder == '<' and page.dtype == np.float32
+            assert np.array_equal(page.asarray(), np.where(keep, rows[..., axis], -1))
+        assert tifffile.TiffFile(tmp_path/'tiled'/f'{band}.tif').pages[0].is_tiled  # the default is unchanged
+    assert not tifffile.TiffFile(tmp_path/'mmap'/'mask.tif').pages[0].is_tiled
+
+
+def test_trace_area_uses_the_voxel_size_of_the_traced_volume(tmp_path, monkeypatch):
+    """--volume of an 8.64 um scan: area_cm2 at its meta.json voxelsize (or --voxel-size), not the checkpoint's 9.6."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing import inference
+    rows = np.stack([np.stack([np.full(13, 5.), np.arange(13.)*10, np.full(13, 20.*t)], -1) for t in range(4)])
+    monkeypatch.setattr(inference, 'load_checkpoint', lambda path, device: (None, C.load(None, []), None))
+    monkeypatch.setattr(inference, 'trace', lambda *a, **k: (rows, np.ones(rows.shape[:2])))
+    (tmp_path/'m.pt').touch()
+    (tmp_path/'seed.json').write_text(json.dumps(dict(points=[[5, 0, 0], [5, 120, 0]], direction=[0, 0, 1])))
+    cases = (('meta', dict(voxelsize=8.64), [], 8.64), ('flag', {}, ['--voxel-size', '7.91'], 7.91),
+             ('none', None, [], 9.6))  # no voxel size known: the checkpoint's data.voxel_size_um, as before
+    for name, volume_meta, extra, um in cases:
+        (tmp_path/name).mkdir()
+        if volume_meta is not None:
+            (tmp_path/name/'meta.json').write_text(json.dumps(volume_meta))
+        inference.main(['--checkpoint', str(tmp_path/'m.pt'), '--volume', str(tmp_path/name), '--seed-json',
+                        str(tmp_path/'seed.json'), '--out', str(tmp_path/'out'/name), '--device', 'cpu', *extra])
+        meta = json.loads((tmp_path/'out'/name/'meta.json').read_text())
+        assert meta['voxel_size_um'] == um and meta['area_cm2'] == pytest.approx(meta['area_vx2']*um**2/1e8)
+
+
 def test_fiber_seed_directions_follow_the_tensor_normal():
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
@@ -682,7 +742,7 @@ def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
 
     class Fibers:
         def __init__(self, x):
-            self.catalog = [(7,)]
+            self.catalog = [dict(id='00000000-0000-4000-8000-000000000007', name='f7', family='H')]
             self.x = x
 
         def geometry(self, i):
@@ -697,6 +757,7 @@ def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
         assert bool(runs) == matches, x
         if runs:
             assert runs[0]['patch'] == 'p0' and runs[0]['end']-runs[0]['start'] >= 240 and abs(runs[0]['offset']-(x-100)) < 1e-3
+            assert runs[0]['fiber'] == 'fiber:00000000-0000-4000-8000-000000000007'
 
 
 def test_rotated_window_matches_axis_window_and_follows_a_diagonal(tmp_path):
@@ -852,8 +913,8 @@ def test_fiber_pool_region_and_episode_instances(tmp_path):
     from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
     mod = _script('build_fiber_pool')
     fibers = [('json:a', 0, *mod.resample(np.array([[100., 100., 100.], [100., 400., 100.]]), 5.)),
-              ('afv:7', 1, *mod.resample(np.array([[110., 200., 0.], [110., 200., 300.]]), 5.)),
-              ('afv:8', 0, *mod.resample(np.array([[900., 900., 900.], [900., 1000., 900.]]), 5.))]
+              ('fiber:00000000-0000-4000-8000-000000000007', 1, *mod.resample(np.array([[110., 200., 0.], [110., 200., 300.]]), 5.)),
+              ('fiber:00000000-0000-4000-8000-000000000008', 0, *mod.resample(np.array([[900., 900., 900.], [900., 1000., 900.]]), 5.))]
     pts = np.concatenate([f[2] for f in fibers]).astype(np.float32)
     keys = mod.cell_key(pts)
     order = np.argsort(keys, kind='stable')
@@ -871,8 +932,8 @@ def test_fiber_pool_region_and_episode_instances(tmp_path):
     got = episode_fibers(pool, [0., 0., 0.], [300., 500., 300.], 'json:a', lambda arc: arc <= 150.)
     seed = got['instance'] == 0
     assert seed.any() and got['points'][seed][:, 1].max() <= 250.+1e-3  # the seed fiber, cut 150 vx along it
-    assert set(got['instance'].tolist()) == {0, 1} and (got['family'][got['instance'] == 1] == 1).all()  # afv:7 only
-    assert np.all(got['points'] <= 500.)  # afv:8 is outside the box
+    assert set(got['instance'].tolist()) == {0, 1} and (got['family'][got['instance'] == 1] == 1).all()  # fiber ...07 only
+    assert np.all(got['points'] <= 500.)  # fiber ...08 is outside the box
 
 
 def test_fiber_tokens_reach_the_model_and_padding_is_inert():

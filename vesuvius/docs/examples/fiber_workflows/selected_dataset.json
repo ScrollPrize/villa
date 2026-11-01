@@ -1,0 +1,9 @@
+{
+  "fiber_selected_dataset_eval": {
+    "dataset": "/data/fiber-layout/selected",
+    "base_config": "/configs/fiber-layout/base.json",
+    "gt_root": "/data/fiber-layout/gt",
+    "output_root": "/data/fiber-layout/results/free",
+    "devices": "0"
+  }
+}

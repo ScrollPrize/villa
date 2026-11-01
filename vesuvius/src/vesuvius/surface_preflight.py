@@ -705,7 +705,9 @@ def inspect_pair(
         metadata, scale = _read_metadata(surface_path)
         report["surface"].update(
             {
-                "uuid": str(metadata.get("uuid", surface_path.name)),
+                # Report the identity on disk; a missing uuid is reported
+                # as None, never synthesized from the directory name.
+                "uuid": str(metadata["uuid"]) if metadata.get("uuid") else None,
                 "scale_xy": list(scale),
                 "meta_sha256": _sha256(surface_path / "meta.json"),
             }

@@ -26,7 +26,7 @@ full-scroll tifxyz (concat/wLLL-HHH), which is then flattened with the lasagna f
 flattener (../lasagna/fit.py, config flatten_fast_nofilter.json plus a generated
 overlay that points external_surfaces at the concat) rather than flatboi. The flattened
 tifxyz is written as a top-level mesh at concat/wLLL-HHH_flat (meta.json + x/y/z.tif),
-trimmed to its valid-cell bounding box with vc_tifxyz_trim (dropping the flatten's invalid
+trimmed in place to its valid-cell bounding box (dropping the flatten's invalid
 output-margin border, unless --no-full-scroll-trim), and ink-rendered. The rendered ink
 strip is chopped (no downsampling) into fixed-width jpg tiles ink/wLLL-HHH_flat.NNN.jpg of
 at most --max-strip-width px each.
@@ -39,6 +39,7 @@ import json
 import glob
 import shutil
 import subprocess
+import uuid
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -164,94 +165,48 @@ def clean_concat_zyxs(zyxs, erode_cells, keep_largest):
     return int(removed.sum())
 
 
-def flatten_mesh(concat_path, tifxyz2obj_bin, flatboi_bin, obj2tifxyz_bin, uv_lift_bin,
-                 iters, energy, tol, inpaint, keep, flatboi_env):
+def flatten_mesh(concat_path, flatboi_bin, iters, energy, tol, inpaint, keep, flatboi_env):
     """SLIM-flatten a concatenated tifxyz mesh and return the path to a new
     flattened tifxyz mesh (a sibling `<name>_flat` folder).
 
-    Mirrors VC3D's SLIM-flatten pipeline (SegmentationCommandHandler). With keep >= 100
-    (no decimation) the mesh is flattened at full resolution:
-      1. vc_tifxyz2obj <mesh> <obj>             -> OBJ with grid UVs
-      2. flatboi <obj> <iters> <energy> [--tol] -> writes <stem>_flatboi.obj alongside
-      3. vc_obj2tifxyz <flatObj> <out> --tifxyz-source=<mesh>
-
-    With keep < 100, flatboi runs on a decimated (coarse) mesh — smaller meshes are
-    less likely to diverge (NaN energy) — and its UVs are lifted back onto the full-res
-    mesh before conversion, matching VC3D's decimating branch:
-      1. vc_tifxyz2obj <mesh> <coarse.obj> --keep=<p>  -> coarse OBJ with grid UVs
-      2. vc_tifxyz2obj <mesh> <fine.obj>               -> full-res OBJ (lift target)
-      3. flatboi <coarse.obj> ...                      -> <coarse>_flatboi.obj
-      4. vc_obj_uv_lift <coarse.obj> <coarse_flatboi.obj> <fine.obj> <lifted.obj>
-      5. vc_obj2tifxyz <lifted.obj> <out> --tifxyz-source=<mesh>
+    flatboi flattens the tifxyz directly (the same pipeline as VC3D's SLIM flatten):
+    it meshes the grid, runs SLIM and rasterizes the flattened mesh at the input's
+    sampling density. With keep < 100 SLIM runs on a decimated grid — smaller meshes
+    are less likely to diverge (NaN energy) — and the UVs are lifted back onto the
+    full-resolution grid. --inpaint fills isolated invalid cells so the concat's
+    padding/holes don't break SLIM's boundary loop.
 
     flatboi_env is a dict of env overrides (PASTIX/OPENBLAS threads, coretype) that
     is layered onto the current environment for the flatboi step only.
     """
     concat_dir = os.path.dirname(concat_path)
     name = os.path.basename(concat_path)
-    decimating = keep < 100.0
-    obj_path = os.path.join(concat_dir, name + ('_coarse.obj' if decimating else '.obj'))
-    flat_obj = os.path.join(concat_dir, name + ('_coarse_flatboi.obj' if decimating else '_flatboi.obj'))
     flat_path = os.path.join(concat_dir, name + '_flat')
 
-    # 1. tifxyz -> obj (grid UVs). --inpaint fills isolated invalid cells so the
-    #    concat's padding/holes don't break flatboi's boundary loop. --keep decimates
-    #    the mesh flatboi sees (a smaller mesh is less prone to SLIM divergence).
-    to_obj_args = [tifxyz2obj_bin, concat_path, obj_path]
-    if decimating:
-        to_obj_args.append(f'--keep={keep:.4f}')
+    # flatboi refuses to overwrite its output.
+    if os.path.exists(flat_path):
+        shutil.rmtree(flat_path)
+    flatboi_args = [flatboi_bin, concat_path, f'--output={flat_path}', str(iters), energy]
+    if keep < 100.0:
+        flatboi_args.append(f'--keep={keep:.4f}')
     if inpaint:
-        to_obj_args.append('--inpaint')
-    subprocess.run(to_obj_args, check=True, capture_output=True, text=True)
-
-    # 1b. When decimating, also emit the full-res OBJ that the flattened coarse UVs
-    #     get lifted onto (so the flattened tifxyz keeps full input resolution).
-    fine_obj = os.path.join(concat_dir, name + '.obj')
-    if decimating:
-        fine_args = [tifxyz2obj_bin, concat_path, fine_obj]
-        if inpaint:
-            fine_args.append('--inpaint')
-        subprocess.run(fine_args, check=True, capture_output=True, text=True)
-
-    # 2. flatboi (SLIM). Writes <stem>_flatboi.obj next to the input obj.
-    flatboi_args = [flatboi_bin, obj_path, str(iters), energy]
+        flatboi_args.append('--inpaint')
     if tol and tol > 0:
         flatboi_args.append(f'--tol={tol:g}')
     env = os.environ.copy()
     env.update(flatboi_env)
     subprocess.run(flatboi_args, check=True, capture_output=True, text=True, env=env)
-
-    # 3. When decimating, lift the flattened coarse UVs onto the full-res mesh
-    #    (grid-space lift via the grid UVs vc_tifxyz2obj wrote into each OBJ).
-    if decimating:
-        lifted_obj = os.path.join(concat_dir, name + '_lifted.obj')
-        subprocess.run(
-            [uv_lift_bin, obj_path, flat_obj, fine_obj, lifted_obj],
-            check=True, capture_output=True, text=True,
-        )
-        src_obj = lifted_obj
-    else:
-        src_obj = flat_obj
-
-    # 4. flattened obj -> tifxyz. vc_obj2tifxyz requires the target NOT to exist;
-    #    --tifxyz-source sizes the output grid to the input sampling density.
-    if os.path.exists(flat_path):
-        shutil.rmtree(flat_path)
-    subprocess.run([
-        obj2tifxyz_bin, src_obj, flat_path,
-        f'--tifxyz-source={concat_path}',
-    ], check=True, capture_output=True, text=True)
-
     return flat_path
 
 
 def set_tifxyz_id(tifxyz_path, new_id):
-    """Rewrite a tifxyz meta.json's uuid/name to new_id. lasagna's fit2tifxyz stamps them
-    with the output folder name (`flatten.tifxyz`); we want the winding-range id instead."""
+    """Stamp a freshly produced tifxyz as a new surface: meta.json `name` becomes new_id
+    (the winding-range folder name, replacing lasagna's scratch `flatten.tifxyz`) and
+    `uuid` a fresh random identity, never derived from the name."""
     meta_path = os.path.join(tifxyz_path, 'meta.json')
     with open(meta_path, 'r') as f:
         meta = json.load(f)
-    meta['uuid'] = new_id
+    meta['uuid'] = str(uuid.uuid4())
     meta['name'] = new_id
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
@@ -330,6 +285,49 @@ def lasagna_flatten(concat_path, flat_path, lasagna_dir, lasagna_config, lasagna
     if os.path.exists(overlay_path):
         os.remove(overlay_path)
     return flat_abs
+
+
+def trim_tifxyz_to_valid(tifxyz_path):
+    """Crop a tifxyz in place to the bounding box of its valid cells (x != -1).
+
+    x/y/z.tif and every sibling .tif channel whose size is an integer multiple
+    of the grid are cropped in lockstep (other channels are left as they are);
+    meta.json keeps its identity and gets a recomputed bbox. Returns the
+    (old_hw, new_hw) grid shapes, or None when there is nothing to keep.
+    """
+    axes = {a: np.array(Image.open(os.path.join(tifxyz_path, f'{a}.tif')), dtype=np.float32)
+            for a in 'xyz'}
+    valid = axes['x'] != -1
+    if not valid.any():
+        return None
+    rows = np.flatnonzero(valid.any(axis=1))
+    cols = np.flatnonzero(valid.any(axis=0))
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    h, w = valid.shape
+    if (r0, r1, c0, c1) == (0, h, 0, w):
+        return (h, w), (h, w)
+
+    for name in sorted(os.listdir(tifxyz_path)):
+        stem, ext = os.path.splitext(name)
+        if ext != '.tif':
+            continue
+        path = os.path.join(tifxyz_path, name)
+        data = axes[stem] if stem in axes else np.array(Image.open(path))
+        ch, cw = data.shape[:2]
+        if ch % h or cw % w:
+            print(f'{name}: {cw}x{ch} is not a multiple of the {w}x{h} grid, left untrimmed')
+            continue
+        sy, sx = ch // h, cw // w
+        Image.fromarray(np.ascontiguousarray(data[r0 * sy:r1 * sy, c0 * sx:c1 * sx])).save(path)
+
+    meta_path = os.path.join(tifxyz_path, 'meta.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
+    xyz = np.stack([axes[a][r0:r1, c0:c1] for a in 'xyz'], axis=-1)[valid[r0:r1, c0:c1]]
+    meta['bbox'] = [xyz.min(axis=0).tolist(), xyz.max(axis=0).tolist()]
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=4)
+    return (h, w), (int(r1 - r0), int(c1 - c0))
 
 
 def max_composite(tif_paths):
@@ -417,14 +415,11 @@ def publish_render_tifs(per_mesh_ink, tif_paths):
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
 @click.option('--flatten/--no-flatten', default=True, show_default=True, help='SLIM-flatten each concatenated mesh before rendering')
 @click.option('--flatboi-bin', default='flatboi', show_default=True, help='Path to the flatboi binary')
-@click.option('--tifxyz2obj-bin', default='vc_tifxyz2obj', show_default=True, help='Path to the vc_tifxyz2obj binary')
-@click.option('--obj2tifxyz-bin', default='vc_obj2tifxyz', show_default=True, help='Path to the vc_obj2tifxyz binary')
-@click.option('--uv-lift-bin', default='vc_obj_uv_lift', show_default=True, help='Path to the vc_obj_uv_lift binary (used only when --flatten-keep < 100)')
 @click.option('--flatten-keep', type=float, default=6.25, show_default=True, help='Percent of points to keep when decimating the mesh flatboi flattens; <100 decimates (smaller mesh is less prone to SLIM divergence). Quantized to a per-axis stride, so kept fraction ~= 1/round(1/sqrt(keep/100))^2 (e.g. any keep<100 => stride>=2 => <=25%)')
 @click.option('--flatten-iters', type=int, default=50, show_default=True, help='flatboi SLIM iterations')
 @click.option('--flatten-energy', default='symmetric_dirichlet', show_default=True, help='flatboi energy (symmetric_dirichlet or conformal)')
 @click.option('--flatten-tol', type=float, default=0.0, show_default=True, help='flatboi relative-energy early-stop tolerance (0 disables)')
-@click.option('--flatten-inpaint/--no-flatten-inpaint', default=False, show_default=True, help='Inpaint invalid cells during tifxyz->obj. OFF by default (2026-07-18): inpainted cells render as real surface and inflate ink area; the erode+largest-component cleanup below is the SLIM-safety mechanism instead')
+@click.option('--flatten-inpaint/--no-flatten-inpaint', default=False, show_default=True, help='Inpaint invalid cells before flatboi flattens. OFF by default (2026-07-18): inpainted cells render as real surface and inflate ink area; the erode+largest-component cleanup below is the SLIM-safety mechanism instead')
 @click.option('--pre-erode', type=int, default=3, show_default=True, help='Erode each per-strip (--strips) concat valid mask by this many grid cells before flatboi flattening (0 disables). Not applied to the full-scroll lasagna concat')
 @click.option('--keep-largest/--no-keep-largest', default=True, show_default=True, help='Keep only the largest 4-connected valid component of each per-strip (--strips) concat before flatboi flattening (removes dust/fragments). Not applied to the full-scroll lasagna concat')
 @click.option('--flatboi-threads', type=int, default=32, show_default=True, help='Shared value for PASTIX_NUM_THREADS and OPENBLAS_NUM_THREADS passed to flatboi')
@@ -432,19 +427,18 @@ def publish_render_tifs(per_mesh_ink, tif_paths):
 @click.option('--strips/--no-strips', default=False, show_default=True, help='Build the per-winding-range strip concats (concat/wLLL-HHH), flatboi-flatten them (per --flatten), and ink-render them. Off by default: only the full-scroll concat is rendered')
 @click.option('--full-scroll/--no-full-scroll', default=True, show_default=True, help='Concatenate ALL windings into one full-scroll mesh, flatten it with the lasagna forward flattener (not flatboi), and ink-render it')
 @click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
-@click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands) with vc_tifxyz_trim')
+@click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands)')
 @click.option('--fail-on-empty/--no-fail-on-empty', default=True, show_default=True, help='Fail (exit 1) if any rendered strip is entirely zero, which almost always means the mesh does not intersect --volume (wrong frame/resolution; see --scale-segmentation, --scale, --group-idx). --no-fail-on-empty restores writing the black strip with a warning')
-@click.option('--tifxyz-trim-bin', default='vc_tifxyz_trim', show_default=True, help='Path to the vc_tifxyz_trim binary (crops a tifxyz to its valid-cell bbox in place)')
 @click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
 def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentation, group_idx, num_slices, num_processes,
-         flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
+         flatten, flatboi_bin, flatten_keep,
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
          openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
-         fail_on_empty, tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+         fail_on_empty, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -523,7 +517,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
 
         def flatten_one(name, concat_path):
             return name, flatten_mesh(
-                concat_path, tifxyz2obj_bin, flatboi_bin, obj2tifxyz_bin, uv_lift_bin,
+                concat_path, flatboi_bin,
                 flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, flatten_keep,
                 flatboi_env,
             )
@@ -570,13 +564,6 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
         print(f'Lasagna-flattening full-scroll concat via {l_fit} (config {l_cfg})')
         flat_name = full_name + '_flat'
         flat_dest = os.path.join(concat_dir, flat_name)
-        # If the trim bin wasn't given explicitly, look for it next to --vc-render-bin
-        # (both live in build/bin), so callers passing a full vc-render path get it free.
-        trim_bin = tifxyz_trim_bin
-        if trim_bin == 'vc_tifxyz_trim' and os.sep in vc_render_bin:
-            sibling = os.path.join(os.path.dirname(vc_render_bin), 'vc_tifxyz_trim')
-            if os.path.exists(sibling):
-                trim_bin = sibling
         try:
             flat_path = lasagna_flatten(full_concat, flat_dest, l_dir, l_cfg, l_fit, lasagna_device)
             print(f'lasagna-flattened {full_name} -> {flat_path}')
@@ -586,15 +573,13 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
             flat_path = None
         if flat_path is not None:
             # The flatten pads its output with an invalid-cell margin that renders as black
-            # bands; trim the flattened tifxyz to its valid-cell bbox in place (VC3D tool).
-            # A trim failure is non-fatal: fall back to rendering the untrimmed flatten.
+            # bands; trim the flattened tifxyz to its valid-cell bbox in place.
             if full_scroll_trim:
-                try:
-                    subprocess.run([trim_bin, flat_path], check=True)
-                    print(f'trimmed {flat_name} to valid bbox')
-                except subprocess.CalledProcessError as e:
-                    print(f'{flat_name}: WARNING vc_tifxyz_trim failed ({e.cmd[0]} exit '
-                          f'{e.returncode}), rendering untrimmed')
+                shapes = trim_tifxyz_to_valid(flat_path)
+                if shapes is None:
+                    print(f'{flat_name}: WARNING no valid cells, rendering untrimmed')
+                else:
+                    print(f'trimmed {flat_name} to valid bbox {shapes[0]} -> {shapes[1]}')
             full_items.append((flat_name, flat_path))
 
     render_items = chunks + full_items

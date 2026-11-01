@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, crop_local_grid
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.fast_sample import sample_scalar_crop
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
 
@@ -44,7 +44,6 @@ def unique_crop_indices(items):
 
 
 def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
-    grid = _grid_flat(crop)
     sources = unique_crop_indices(items)
     unique = [j for j, source in enumerate(sources) if j == source]
     raw, starts = read_tight_blocks([items[j] for j in unique], vol, crop, pool)
@@ -59,7 +58,7 @@ def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
         j = unique[k]
         item = items[j]
         sample_scalar_crop(raw[k], starts[k], item['pos']*scale, item['frame']*scale,
-                           grid, result[j])
+                           crop, result[j])
         if normalize:
             normalize_ct(result[j, 0], vol.spec.ct_normalization)
     # Rows are independent and the Numba kernel releases the GIL, so a pool only
@@ -73,16 +72,6 @@ def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
         if j != source:
             result[j] = result[source]
     return torch.from_numpy(result)
-
-
-_GRID_CACHE: dict = {}
-
-
-def _grid_flat(crop: CropSpec) -> np.ndarray:
-    g = _GRID_CACHE.get(crop)
-    if g is None:
-        g = _GRID_CACHE[crop] = crop_local_grid(crop).reshape(-1, 3).astype(np.float64)
-    return g
 
 
 _CORNER_CACHE: dict = {}

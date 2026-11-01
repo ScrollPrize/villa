@@ -4,12 +4,9 @@ version = "0.1.0"
 description = "Code and helpers to fit a canonical archimedean spiral to deformed scrolls"
 requires-python = ">=3.14"
 dependencies = [
-    "brook-cu12>=0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "click>=8.4.2",
     "connected-components-3d>=4.0.0",
     "crackle-codec>=0.42.0",
-    "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "einops>=0.8.2",
     "imageio>=2.37.3",
     "kimimaro[all]>=5.8.1; sys_platform != 'linux' or platform_machine != 'x86_64'",
@@ -36,10 +33,13 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",
+    # Monorepo-only C++ package (resolved via [tool.uv.sources]): surfaces, fibers
+    # and point collections are read and written through the object store.
+    "vc-object-store",
     # PyTorch ships no triton wheel for Windows; this community build stands in
     # for the triton 3.6 that torch 2.11 pins elsewhere.
     "triton-windows>=3.6,<3.7; sys_platform == 'win32'",
-    "vc-delta3d>=0.1.0,<0.2",
+    "vc-delta3d>=0.2.0,<0.3",
     "wandb>=0.28.0",
     "zarr>=3.2.1",
 ]
@@ -51,8 +51,20 @@ cpu = ["kimimaro[all]>=5.8.1"]
 
 [dependency-groups]
 dev = ["pytest>=9.1.1"]
+# NVIDIA-only GPU backend of extract_surface_tracks.py. Installed by a plain
+# `uv sync` (see default-groups). `--no-group cuda` skips it, but torch still comes from
+# the cu128 index in [tool.uv.sources]; on ROCm use the README recipe ("Creating the Spiral Python environment").
+cuda = [
+    "brook-cu12>=0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+default-groups = ["dev", "cuda"]
 
 [tool.uv.sources]
+vc-object-store = { path = "../vc_object_store", editable = true }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
