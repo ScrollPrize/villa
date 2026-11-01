@@ -120,8 +120,8 @@ public:
     // AxisAlignedSliceController, so the render/mapping paths here must treat
     // the compositor azimuth as 0 (the gizmo still owns the value).
     void setVolumetricAzimuthInSurface(bool on) { _volumetricAzimuthInSurface = on; }
-    bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
-    bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
+    bool isCompositeEnabled() const override { return _compositeSettings.enabled; }
+    bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled; }
 
     void setVolumeWindow(float low, float high) override;
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
@@ -410,7 +410,6 @@ private:
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
-    bool streamingCompositeUnsupported() const;
     // Sync the volumetric camera gizmo's visibility/state with the current
     // composite settings and surface type.
     void updateCameraGizmo();

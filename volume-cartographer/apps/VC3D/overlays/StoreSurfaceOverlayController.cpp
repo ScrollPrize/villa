@@ -451,7 +451,7 @@ StoreSurfaceOverlayController::LineStyle StoreSurfaceOverlayController::lineStyl
         if (segViewer->isCompositeEnabled()) {
             const auto& cs = segViewer->compositeRenderSettings();
             const float step = cs.reverseDirection ? -1.0f : 1.0f;
-            style.volumetric = cs.params.method == "volumetric";
+            style.volumetric = cs.params.volumetric;
             style.offsets = {offset + float(std::max(0, cs.layersFront)) * step,
                              offset - float(std::max(0, cs.layersBehind)) * step};
         } else if (std::abs(offset) > 1e-3f) {

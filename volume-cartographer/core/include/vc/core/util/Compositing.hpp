@@ -1,31 +1,17 @@
 #pragma once
 
+#include <vc_reader/composite.hpp>
+
 #include <string>
 #include <vector>
 #include <cstdint>
 
-// Parameters for multi-layer compositing
+// Parameters for multi-layer compositing: the reduction of the sampled layers
+// (vcr::composite), unless `volumetric`, the GUI's perspective volumetric mode, which
+// composites its own layer stack with the camera below.
 struct CompositeParams {
-    // Compositing method: "mean", "max", "min", "alpha", "beerLambert",
-    // "volumetric" (GUI-only perspective volumetric mode; ignored by the
-    // shared composite dispatch)
-    std::string method = "mean";
-
-    // Alpha compositing parameters
-    float alphaMin = 0.0f;
-    float alphaMax = 1.0f;
-    float alphaOpacity = 1.0f;
-    float alphaCutoff = 1.0f;
-
-    // Beer-Lambert parameters (volume rendering with emission + absorption)
-    float blExtinction = 1.5f;        // Absorption coefficient (higher = more opaque)
-    float blEmission = 1.5f;          // Emission scale (higher = brighter)
-    float blAmbient = 0.1f;           // Ambient light (background illumination)
-
-    // Pre-processing
-    uint8_t isoCutoff = 0;           // Highpass filter: layers whose value is below
-                                     // this are dropped from the stack, not zeroed,
-                                     // so they leave the mean/max/min denominator
+    vcr::composite::Options options;
+    bool volumetric = false;
 
     // Volumetric mode camera + transfer function (GUI viewer only; unused by
     // the CLI/scalar methods). Turntable model: camAzimuthDeg spins the patch
@@ -52,6 +38,46 @@ struct CompositeParams {
 
     bool operator==(const CompositeParams&) const = default;
 };
+
+// The persisted and bridge names of a composite method: "mean", "max", "min", "median",
+// "alpha", "beerLambert" (vcr::composite reductions) and "volumetric".
+inline std::string compositeMethodName(const CompositeParams& params)
+{
+    using Method = vcr::composite::Method;
+    if (params.volumetric) return "volumetric";
+    switch (params.options.method) {
+    case Method::Mean: return "mean";
+    case Method::Max: return "max";
+    case Method::Min: return "min";
+    case Method::Median: return "median";
+    case Method::MinAbs: return "minAbs";
+    case Method::Alpha: return "alpha";
+    case Method::BeerLambert: return "beerLambert";
+    }
+    return "mean";
+}
+
+// Sets the method a name stands for; false, leaving `params` as they were, for an unknown name.
+inline bool setCompositeMethod(CompositeParams& params, const std::string& name)
+{
+    using Method = vcr::composite::Method;
+    if (name == "volumetric") {
+        params.volumetric = true;
+        return true;
+    }
+    Method method;
+    if (name == "mean") method = Method::Mean;
+    else if (name == "max") method = Method::Max;
+    else if (name == "min") method = Method::Min;
+    else if (name == "median") method = Method::Median;
+    else if (name == "minAbs") method = Method::MinAbs;
+    else if (name == "alpha") method = Method::Alpha;
+    else if (name == "beerLambert") method = Method::BeerLambert;
+    else return false;
+    params.volumetric = false;
+    params.options.method = method;
+    return true;
+}
 
 // Consolidated rendering settings for composite mode (Qt-free)
 struct CompositeRenderSettings {

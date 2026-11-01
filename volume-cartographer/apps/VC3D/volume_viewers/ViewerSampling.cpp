@@ -211,29 +211,9 @@ void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart)
 
 std::optional<vcr::composite::Options> compositeOptions(const CompositeParams& params)
 {
-    using Method = vcr::composite::Method;
-    vcr::composite::Options options;
-    if (params.method == "mean")
-        options.method = Method::Mean;
-    else if (params.method == "max")
-        options.method = Method::Max;
-    else if (params.method == "min")
-        options.method = Method::Min;
-    else if (params.method == "alpha")
-        options.method = Method::Alpha;
-    else if (params.method == "beerLambert")
-        options.method = Method::BeerLambert;
-    else
+    if (params.volumetric)
         return std::nullopt;
-    options.isoCutoff = float(params.isoCutoff);
-    options.alphaMin = params.alphaMin;
-    options.alphaMax = params.alphaMax;
-    options.alphaOpacity = params.alphaOpacity;
-    options.alphaCutoff = params.alphaCutoff;
-    options.extinction = params.blExtinction;
-    options.emission = params.blEmission;
-    options.ambient = params.blAmbient;
-    return options;
+    return params.options;
 }
 
 void toDisplay(const vcr::grid::Result& result, int layer, uint8_t* values, uint8_t* coverage)

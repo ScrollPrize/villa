@@ -81,12 +81,6 @@ constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
 constexpr float kFocusProjectionThreshold = 4.0f;
 
-bool isSupportedStreamingCompositeMethod(const std::string& method)
-{
-    return method == "mean" || method == "max" || method == "min" ||
-           method == "alpha" || method == "volumetric";
-}
-
 bool finiteVec2(const cv::Vec2f& v)
 {
     return std::isfinite(v[0]) && std::isfinite(v[1]);
@@ -1224,11 +1218,6 @@ void CChunkedVolumeViewer::markInteractiveMotion(double)
     // the handler). The old interactive-preview + settle-timer fast path is gone.
 }
 
-bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
-{
-    return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method);
-}
-
 void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSettings& s)
 {
     if (_closing)
@@ -1236,11 +1225,14 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
     // The slice-plane owner folds this view's azimuth into the plane itself,
     // so it must hear about anything that changes the effective camera —
     // including method/enable flips that implicitly zero it.
+    const bool methodChanged =
+        _compositeSettings.params.volumetric != s.params.volumetric ||
+        _compositeSettings.params.options.method != s.params.options.method;
     const bool cameraChanged =
         _compositeSettings.params.camAzimuthDeg != s.params.camAzimuthDeg ||
         _compositeSettings.params.camTiltDeg != s.params.camTiltDeg ||
         _compositeSettings.params.camPerspective != s.params.camPerspective ||
-        _compositeSettings.params.method != s.params.method ||
+        methodChanged ||
         _compositeSettings.planeEnabled != s.planeEnabled ||
         _compositeSettings.enabled != s.enabled;
     // Plane viewers draw the flattened viewer's slab bounds as dashed
@@ -1250,7 +1242,7 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
         _compositeSettings.layersFront != s.layersFront ||
         _compositeSettings.layersBehind != s.layersBehind ||
         _compositeSettings.reverseDirection != s.reverseDirection ||
-        _compositeSettings.params.method != s.params.method;
+        methodChanged;
     _compositeSettings = s;
     updateCameraGizmo();
     if (cameraChanged)
@@ -1263,7 +1255,7 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
 bool CChunkedVolumeViewer::volumetricCameraActive() const
 {
     auto surf = _surfWeak.lock();
-    if (!surf || _compositeSettings.params.method != "volumetric")
+    if (!surf || !_compositeSettings.params.volumetric)
         return false;
     // Plane (slice) views gate on the per-plane composite toggle, the
     // flattened view on the main one — matching the render dispatch.
@@ -1455,10 +1447,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         return result;
     }
 
-    auto streamingCompositeUnsupported = [&]() {
-        return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method);
-    };
-    const bool volumetricMethod = ctx.compositeSettings.params.method == "volumetric";
+    const bool volumetricMethod = ctx.compositeSettings.params.volumetric;
 
     // Volumetric mode: composite a sampled layer stack front-to-back along
     // tilted view rays with a transfer function. Output is an already-
@@ -1500,8 +1489,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto dir = vc3d::volumetric::viewDirection(cam);
         const float segLen = 1.0f / std::max(dir[2], 1e-3f);
         const auto opacityLut = vc3d::volumetric::buildOpacityLut(
-            cs.params.alphaMin, cs.params.alphaMax, cs.params.alphaOpacity,
-            cs.params.tfGamma, cs.params.isoCutoff, segLen);
+            cs.params.options.alphaMin, cs.params.options.alphaMax, cs.params.options.alphaOpacity,
+            cs.params.tfGamma, uint8_t(std::clamp(cs.params.options.isoCutoff, 0.0f, 255.0f)), segLen);
 
         // W scaling exaggerates the relief: the layer planes spread apart
         // along the normal before the rotated render (the in-plane content
@@ -1567,7 +1556,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                             vc3d::fallbackLevelCountForViewport(*ctx.levels, ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale),
                             ctx.samplingMethod, {zBase}, std::nullopt};
     const auto& cs = ctx.compositeSettings;
-    const bool baseComposite = (planeView ? cs.planeEnabled : cs.enabled) && !streamingCompositeUnsupported();
+    const bool baseComposite = planeView ? cs.planeEnabled : cs.enabled;
     const int front = planeView ? cs.planeLayersFront : cs.layersFront;
     const int behind = planeView ? cs.planeLayersBehind : cs.layersBehind;
     const float zStep = (planeView ? cs.planeReverseDirection : cs.reverseDirection) ? -1.0f : 1.0f;
@@ -1618,7 +1607,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             (oc.layersFront > 0 || oc.layersBehind > 0)) {
             // Keep "front" pointing the same physical direction as the primary composite.
             CompositeParams overlayParams;
-            overlayParams.method = oc.method;
+            setCompositeMethod(overlayParams, oc.method);
             overlay.offsets = layerOffsets(oc.layersFront, oc.layersBehind, cs.reverseDirection ? -1.0f : 1.0f);
             overlay.composite = vc3d::compositeOptions(overlayParams);
         }
@@ -4008,9 +3997,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
         statsItems << viewerLabel;
     statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);
 
-    if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        statsItems << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
-    } else if (volumetricCameraActive()) {
+    if (volumetricCameraActive()) {
         QString volumetric = QString("composite volumetric az %1 tilt %2")
                                  .arg(_compositeSettings.params.camAzimuthDeg, 0, 'f', 0)
                                  .arg(_compositeSettings.params.camTiltDeg, 0, 'f', 0);
@@ -4023,7 +4010,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
             volumetric += QString(" w×%1").arg(_compositeSettings.params.wScale, 0, 'f', 1);
         statsItems << volumetric;
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        statsItems << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite %1").arg(QString::fromStdString(compositeMethodName(_compositeSettings.params)));
     }
 
     const bool showStats = !property("vc_hide_status_stats").toBool();

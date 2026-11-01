@@ -285,7 +285,7 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
 
     // Max of the layers z = 5, 6, 7 (the surface normal is +-z).
     CompositeParams params;
-    params.method = "max";
+    REQUIRE(setCompositeMethod(params, "max"));
     what.offsets = {-1.0f, 0.0f, 1.0f};
     what.composite = vc3d::compositeOptions(params);
     REQUIRE(what.composite);
@@ -296,8 +296,10 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     REQUIRE(r.values.size() == 30 * 30);
     const float expected = float(std::max({f.at0(5, 10, 10), f.at0(6, 10, 10), f.at0(7, 10, 10)}));
     CHECK(r.values[9 * 30 + 9] == expected);
-    params.method = "volumetric";
+    REQUIRE(setCompositeMethod(params, "volumetric"));
     CHECK_FALSE(vc3d::compositeOptions(params));
+    CHECK_FALSE(setCompositeMethod(params, "nothing"));
+    CHECK(compositeMethodName(params) == "volumetric");
 }
 
 TEST_CASE("a zoomed-out frame takes resident finer data and does not read its own level")

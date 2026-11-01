@@ -108,8 +108,7 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
 // caches. `afterPart` runs after each part that had reads; returning false stops.
 void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart);
 
-// The composite reduction of a viewer composite method, or nullopt when the method
-// is not a vcr::composite reduction (e.g. "volumetric").
+// The composite reduction of viewer composite parameters, or nullopt for the volumetric mode.
 std::optional<vcr::composite::Options> compositeOptions(const CompositeParams& params);
 
 // Layer `layer` of a result as 8-bit display values and coverage (pixels with a value).

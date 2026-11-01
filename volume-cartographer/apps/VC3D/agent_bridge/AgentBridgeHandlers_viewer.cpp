@@ -352,7 +352,7 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
         const auto& settings = segmentation->compositeRenderSettings();
         QJsonObject composite;
         composite["enabled"] = settings.enabled;
-        composite["method"] = QString::fromStdString(settings.params.method);
+        composite["method"] = QString::fromStdString(compositeMethodName(settings.params));
         composite["layersFront"] = settings.layersFront;
         composite["layersBehind"] = settings.layersBehind;
         o["composite"] = composite;
@@ -523,7 +523,7 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         auto settings = compositeViewer->compositeRenderSettings();
         settings.enabled = composite.value("enabled").toBool(settings.enabled);
         if (composite.contains("method"))
-            settings.params.method = composite.value("method").toString().toStdString();
+            (void)setCompositeMethod(settings.params, composite.value("method").toString().toStdString());
         settings.layersFront = std::max(0, composite.value("layersFront").toInt(settings.layersFront));
         settings.layersBehind = std::max(0, composite.value("layersBehind").toInt(settings.layersBehind));
         compositeViewer->setCompositeRenderSettings(settings);

@@ -539,7 +539,7 @@ float AxisAlignedSliceController::volumetricAzimuthDeg(const std::string& surfac
             continue;
         }
         const auto& s = viewer->compositeRenderSettings();
-        if (s.planeEnabled && s.params.method == "volumetric") {
+        if (s.planeEnabled && s.params.volumetric) {
             return s.params.camAzimuthDeg;
         }
         return 0.0f;
