@@ -448,7 +448,7 @@ int main(int argc, char *argv[])
                   << "  in store mode the surface is refined in place, or into a new surface named --name; with"
                   << " --volume-uuid it is read in that volume's voxels (the zarr's) through the store's view of it"
                   << std::endl;
-        return EXIT_SUCCESS;
+        return EXIT_FAILURE;
     }
 
     const std::filesystem::path vol_path = args[0];
