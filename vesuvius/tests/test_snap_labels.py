@@ -145,6 +145,44 @@ def test_two_bands_about_as_near_abstain(tmp_path):
     assert r["report"]["abstained"]["ambiguous or off the profile"] == 81
 
 
+@pytest.mark.parametrize("recto_sign", [1.0, -1.0])
+def test_min_gap_abstains_and_keeps_close_vertices_in_place(recto_sign):
+    t = np.arange(-16.0, 16.125, 0.25)
+    profile = np.full(t.shape, 20.0)
+    for lo, hi in ((-10.5, -4.5), (-3.0, 3.0), (7.0, 13.0)):
+        profile += 90.0 * (np.tanh((t - lo) * 3.0) - np.tanh((t - hi) * 3.0))
+    sm = ProfileSampler(np.tile(profile, (81, 1)), W=9)
+    rr, cc = np.meshgrid(np.arange(9), np.arange(9), indexing="ij")
+    xs, ys, zs = (2.0 * cc).astype(np.float32), (2.0 * rr).astype(np.float32), np.zeros((9, 9), np.float32)
+    valid = np.ones(xs.shape, bool)
+    r = F.snap_face(xs, ys, zs, valid, sm, recto_sign=recto_sign,
+                    opts=dict(F.FACE_SNAP_PER_VERTEX, min_gap=2.0, sigma=1.0),
+                    face_opts={"sigma": 1.0})
+    gaps = np.stack([r["detail"]["gap_recto"], r["detail"]["gap_verso"]])
+    close = np.any(np.isfinite(gaps) & (gaps < 2.0), axis=0)
+    assert close.any()
+    variable_side = r["detail"]["gap_recto"] if recto_sign > 0 else r["detail"]["gap_verso"]
+    assert (variable_side < 2.0).all()
+    assert (r["detail"]["reason"][close] == 10).all()
+    assert not r["apply"][close].any()
+    for got, original in zip((r["xs"], r["ys"], r["zs"]), (xs, ys, zs)):
+        np.testing.assert_array_equal(got[close], original[close])
+    assert r["report"]["abstained"]["touching neighbor"] == int(close.sum())
+
+
+def test_min_gap_cli_is_opt_in():
+    parser = cli.build_parser()
+    base = ["label.tifxyz", "--volume", "scan.zarr", "--out", "out", "--recto-sign", "1"]
+    assert parser.parse_args(base).min_gap is None
+    assert parser.parse_args(base + ["--min-gap", "2"]).min_gap == 2.0
+
+
+@pytest.mark.parametrize("min_gap", [0.0, -1.0, float("inf"), float("nan")])
+def test_min_gap_must_be_finite_and_positive(min_gap):
+    with pytest.raises(F.SnapError, match="min_gap must be a finite positive number"):
+        F.snap_face(*small_mesh(22.0), None, recto_sign=1, opts={"min_gap": min_gap})
+
+
 def test_far_band_tangent_normal_and_bad_target(tmp_path):
     sm = sampler_of(tmp_path, band((48, 40, 40), [(30, 35)]), "far.zarr")
     m = small_mesh(22.0)                                         # 7.5 voxels from the band: past max_move 4

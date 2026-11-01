@@ -4,7 +4,7 @@ every vertex where it could not.
     vesuvius.snap_labels LABEL.tifxyz --volume SCAN.zarr --out OUT
         (--umbilicus UMB.json | --axis-point X Y Z --axis-dir X Y Z | --recto-sign 1|-1)
         [--level 0] [--target recto|mid|verso] [--merged] [--max-move 4] [--face-sigma 1]
-        [--half 12] [--fallback-half H] [--min-contrast C]
+        [--half 12] [--fallback-half H] [--min-contrast C] [--min-gap N]
         [--no-label] [--label-level 0] [--ignore-halo 4] [--label-step 0.5]
         [--review-min 4] [--review-max 500] [--self-check] [--json]
 
@@ -48,6 +48,8 @@ def build_parser():
     s.add_argument("--min-contrast", type=float,
                    help="contrast floor in CT units (default: a quarter of the mesh's 1st to 99th percentile range; "
                         "0 turns it off)")
+    s.add_argument("--min-gap", type=float,
+                   help="abstain when either adjacent-band gap is below this many voxels (off by default)")
     s.add_argument("--no-label", action="store_true", help="skip the OME-Zarr surface label")
     s.add_argument("--label-level", type=int, default=0, help="the image level the label array matches")
     s.add_argument("--ignore-halo", type=float, help="ignore band along the normal, level-0 voxels (default max-move)")
@@ -91,7 +93,8 @@ def run_snap(args):
     vol = Volume(args.volume)
     sampler = Sampler(vol, level=args.level)
     extra = {k: float(v) for k, v in (("max_move", args.max_move), ("half", args.half),
-                                      ("fallback_half", args.fallback_half), ("min_contrast", args.min_contrast))
+                                      ("fallback_half", args.fallback_half), ("min_contrast", args.min_contrast),
+                                      ("min_gap", args.min_gap))
              if v is not None} or None
     res = L.label_snap(xs, ys, zs, valid, sampler, axis=axis, recto_sign=args.recto_sign, target=args.target,
                        merged=bool(args.merged), face_sigma=args.face_sigma, extra_opts=extra)

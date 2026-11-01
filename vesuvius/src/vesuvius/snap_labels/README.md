@@ -22,6 +22,11 @@ over 1.8 times the mesh's 25th percentile band thickness, which is how two sheet
 An abstaining vertex may still move by an offset filled in from measured neighbors; nothing at that vertex vouches
 for it, so it is flagged.
 
+The optional --min-gap N rule abstains when either measured gap from the chosen band to a neighboring band is less
+than N voxels. It marks the reason as "touching neighbor", leaves the vertex at its input coordinates, and excludes
+its offset from filling and smoothing. The option is off by default. It changes coverage, and has not been shown to
+increase the share of vertices within 1 voxel of a true face.
+
 `--half 16 --fallback-half 12 --min-contrast 0` reads the same face on a +-16 voxel window, and again on +-12 where
 +-16 abstains, with no contrast floor (`face.FACE_SNAP_WINDOW16`). The level comes from the window's 10th and 90th
 percentiles, so where a vertex sits deep in a thick band a +-12 window can hold too little gap and the face lands
