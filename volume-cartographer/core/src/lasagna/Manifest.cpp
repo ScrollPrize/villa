@@ -1,5 +1,7 @@
 #include "vc/lasagna/Manifest.hpp"
 
+#include <vc_reader/zarr_write.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -218,14 +220,18 @@ std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
+    // A compact manifest is the "lasagna" attribute of a Zarr group.
     const bool compact = std::filesystem::is_directory(manifestPath);
-    std::ifstream input(compact ? manifestPath / ".zattrs" : manifestPath);
-    if (!input) {
-        throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
-    }
-
     nlohmann::json root;
-    input >> root;
+    if (compact) {
+        root = vcr::zarr::readAttributes(manifestPath);
+    } else {
+        std::ifstream input(manifestPath);
+        if (!input) {
+            throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
+        }
+        input >> root;
+    }
     if (compact) {
         root = root.at("lasagna");
         if (root.at("version") != 3)

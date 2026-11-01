@@ -1,5 +1,6 @@
 #include "vc/lasagna/PredictionPooling.hpp"
 #include <vc_reader/computed.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include <opencv2/core.hpp>
 #include <Eigen/Eigenvalues>
 #include <nlohmann/json.hpp>
@@ -206,7 +207,9 @@ vcr::zarr::OpenedArray openPooledPredictionArray(
     }
     vcr::zarr::OpenedArray opened;
     opened.location=path.string();
-    opened.meta=vcr::zarr::parseArrayMeta(readJson(path/".zarray"));
+    const auto zarray=vcr::zarr::Store(path).read(".zarray");
+    if(!zarray) throw std::runtime_error("no .zarray at "+path.string());
+    opened.meta=vcr::zarr::parseArrayMeta(nlohmann::json::parse(*zarray));
     const auto& meta=opened.meta;
     if(meta.dtype!=(channel==3?"<f4":"|u1"))
         throw std::runtime_error("native pooled view dtype mismatch");
