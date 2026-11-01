@@ -154,7 +154,10 @@ def _windowed(v):
 
 
 def match_point(fixed: Scan, moving: Scan, T, p_moving, *, half=32, search=16):
-    """Level-0 fixed point matching level-0 moving point p_moving, and the peak strength."""
+    """Match the moving cube nearest to level-0 point p_moving.
+
+    Returns the level-0 moving point actually matched (the cube centre), the level-0 fixed
+    point it maps to, and the peak strength."""
     lf, lm = fixed.level_near(FINE_UM), moving.level_near(FINE_UM)
     F, M = fixed.array(lf), moving.array(lm)
     s = (moving.um * 2**lm) / (fixed.um * 2**lf)
@@ -182,7 +185,7 @@ def match_point(fixed: Scan, moving: Scan, T, p_moving, *, half=32, search=16):
     i = np.unravel_index(cc.argmax(), cc.shape)
     d = (np.array(i) + n // 2) % n - n // 2 + _subpixel(cc, i)
     p_fixed = lo + o + (a.shape[0] - 1) / 2 + d
-    return to_level0(p_fixed, lf), float(cc.max() / (cc.std() + 1e-9))
+    return to_level0(c - 0.5, lm), to_level0(p_fixed, lf), float(cc.max() / (cc.std() + 1e-9))
 
 
 def sample_points(moving: Scan):
@@ -212,14 +215,13 @@ def register(fixed: Scan, moving: Scan, *, min_peak=10.0):
     trial = points[::6]
     T = max(
         coarse_candidates(fixed, moving),
-        key=lambda T0: np.median([(m or (None, 0.0))[1] for m in (match_point(fixed, moving, T0, p) for p in trial)]),
+        key=lambda T0: np.median([(m or (None, None, 0.0))[2] for m in (match_point(fixed, moving, T0, p) for p in trial)]),
     )
     for n_pass in (1, 2):
-        rows = [(p, match_point(fixed, moving, T, p)) for p in points]
-        rows = [(p, m) for p, m in rows if m is not None]
-        P = np.array([p for p, _ in rows])
-        Q = np.array([m[0] for _, m in rows])
-        peaks = np.array([m[1] for _, m in rows])
+        rows = [m for m in (match_point(fixed, moving, T, p) for p in points) if m is not None]
+        P = np.array([m[0] for m in rows])
+        Q = np.array([m[1] for m in rows])
+        peaks = np.array([m[2] for m in rows])
         T, idx, res = robust_affine(P, Q, peaks > min_peak)
         print(f"pass {n_pass}: {len(rows)} matches, {len(idx)} inliers, median residual "
               f"{np.median(res[idx]):.2f} fixed voxels (p90 {np.percentile(res[idx], 90):.2f})", flush=True)
