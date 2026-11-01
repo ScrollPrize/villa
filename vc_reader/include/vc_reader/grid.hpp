@@ -21,6 +21,9 @@
 namespace vcr {
 class Array;
 }
+namespace vcr::reader_cuda {
+class Reader;
+}
 
 namespace vcr::grid {
 
@@ -114,6 +117,9 @@ struct Level {
     ElementType type;
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
     std::optional<std::array<double, 9>> linear;
+    // The level's CUDA reader (uint8 3-D CT), when a request may sample it on the GPU;
+    // null samples on the CPU. Builds without CUDA have none.
+    reader_cuda::Reader* cuda = nullptr;
 };
 
 // A level placed by a row-major 3x4 map, index (ZYX) = linear * p (XYZ) + offset: the
@@ -150,8 +156,16 @@ struct Result {
     // layers; kMissing when a layer with a point was in no level (whatever the others
     // got); kNone when no layer had a point.
     std::vector<std::int8_t> level;
+    // What a GPU pass failed with, when the request was sampled on the CPU instead
+    // (see sample); empty otherwise.
+    std::string cudaFailure;
 };
 
+// Samples a request, on the GPU when every level has a CUDA reader (one device
+// between them), otherwise on the CPU. A GPU pass that fails (device memory, a request
+// over the readers' brick budget, a device error) gives the readers' bricks back
+// (Reader::clear), samples on the CPU and names the failure in Result::cudaFailure.
+// Invalid requests throw either way.
 Result sample(const Surface& surface, const Raster& raster, const Request& request);
 Result sample(const Plane& plane, const Request& request);
 
@@ -162,8 +176,9 @@ namespace vcr::reader_cuda {
 class Reader;
 }
 namespace vcr::grid::cuda {
-// The same requests sampled on a GPU: readers[i] is the CUDA reader (uint8 3-D CT)
-// of request.levels[i].array, and every sample reads its level's resident bricks.
+// The same requests sampled on a GPU alone (grid::sample dispatches to these and falls
+// back): readers[i] is the CUDA reader (uint8 3-D CT) of request.levels[i].array
+// (Level::cuda is ignored), and every sample reads its level's resident bricks.
 // Cache-only requests read those alone; blocking ones first make the bricks the
 // first level lacks resident (from the array), then sample again. A surface's
 // positions and normals are resampled on the CPU and uploaded.

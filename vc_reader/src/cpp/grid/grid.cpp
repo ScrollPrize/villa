@@ -522,7 +522,10 @@ std::array<float, 3> centreOf(const Plane& plane)
 
 }  // namespace
 
-Result sample(const Surface& surface, const Raster& raster, const Request& request)
+namespace {
+
+// The CPU tile loop.
+Result sampleHost(const Surface& surface, const Raster& raster, const Request& request)
 {
     checkRequest(request, raster.width, raster.height);
     const auto& impl = SurfaceAccess::of(surface);
@@ -532,7 +535,7 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     }, centre.data());
 }
 
-Result sample(const Plane& plane, const Request& request)
+Result sampleHost(const Plane& plane, const Request& request)
 {
     const auto centre = centreOf(plane);
     return sampleRaster(plane.width, plane.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
@@ -547,6 +550,8 @@ Result sample(const Plane& plane, const Request& request)
             }
     }, centre.data());
 }
+
+}  // namespace
 
 }  // namespace vcr::grid
 
@@ -727,3 +732,56 @@ Result sample(const Plane& plane, const Request& request, const std::vector<read
 
 }  // namespace vcr::grid::cuda
 #endif
+
+namespace vcr::grid {
+
+namespace {
+
+// Samples on the GPU when every level has a CUDA reader, falling back to the CPU
+// when a GPU pass fails; otherwise on the CPU.
+template <class Host, class Device>
+Result dispatch(const Request& request, Host&& host, Device&& device)
+{
+#ifdef VC_READER_CUDA
+    std::vector<reader_cuda::Reader*> readers;
+    for (const auto& L : request.levels)
+        if (L.cuda)
+            readers.push_back(L.cuda);
+    if (!readers.empty() && readers.size() == request.levels.size()) {
+        std::string failure;
+        try {
+            return device(readers);
+        } catch (const std::exception& e) {
+            failure = e.what();
+        }
+        std::sort(readers.begin(), readers.end());
+        readers.erase(std::unique(readers.begin(), readers.end()), readers.end());
+        for (auto* reader : readers)
+            reader->clear();
+        Result result = host();
+        result.cudaFailure = failure.empty() ? "GPU pass failed" : failure;
+        return result;
+    }
+#else
+    (void)device;
+#endif
+    return host();
+}
+
+}  // namespace
+
+Result sample(const Surface& surface, const Raster& raster, const Request& request)
+{
+    checkRequest(request, raster.width, raster.height);
+    return dispatch(request, [&] { return sampleHost(surface, raster, request); },
+                    [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(surface, raster, request, readers); });
+}
+
+Result sample(const Plane& plane, const Request& request)
+{
+    checkRequest(request, plane.width, plane.height);
+    return dispatch(request, [&] { return sampleHost(plane, request); },
+                    [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(plane, request, readers); });
+}
+
+}  // namespace vcr::grid

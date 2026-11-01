@@ -169,6 +169,38 @@ int main()
                 require(r.values[q] == 200.0f, "coarse level value");
             }
         require(fromCoarse > 1000, "pixels inside the volume come from the coarse level");
+
+        // grid::sample dispatches: levels with readers sample on the GPU; a GPU pass that
+        // fails (here: no brick fits the reader's budget) samples on the CPU, names the
+        // failure and gives the bricks back.
+        {
+            vcr::grid::Request request;
+            request.levels = {L0};
+            request.order = 1;
+            const auto cpu = vcr::grid::sample(plane, request);
+            require(cpu.cudaFailure.empty(), "a CPU request reports no GPU failure");
+            auto dispatched = store(path / "dispatched", 128, 64);
+            vcr::reader_cuda::Reader dispatchedGpu(*dispatched, 64 << 20, 0);
+            request.levels = {{dispatched.get(), u8, L0.scale, L0.offset, std::nullopt, &dispatchedGpu}};
+            const auto gpu = vcr::grid::sample(plane, request);
+            require(gpu.cudaFailure.empty(), "a GPU request that succeeds reports no failure");
+            compare(cpu, gpu, 0.0f, "dispatched plane");
+            request.cachedOnly = true;
+            compare(cpu, vcr::grid::cuda::sample(plane, request, {&dispatchedGpu}), 0.0f, "the dispatched pass made bricks resident");
+            request.cachedOnly = false;
+            // Readers on only some levels: the CPU.
+            request.levels = {{dispatched.get(), u8, L0.scale, L0.offset, std::nullopt, &dispatchedGpu}, L1};
+            compare(vcr::grid::sample(plane, request), vcr::grid::cuda::sample(plane, request, {&dispatchedGpu, &coarseGpu}), 0.0f,
+                    "mixed levels");
+            require(vcr::grid::sample(plane, request).cudaFailure.empty(), "mixed levels sample on the CPU without a failure");
+
+            vcr::reader_cuda::Reader tooSmall(*dispatched, 1, 0);
+            request.levels = {{dispatched.get(), u8, L0.scale, L0.offset, std::nullopt, &tooSmall}};
+            const auto fallen = vcr::grid::sample(plane, request);
+            require(!fallen.cudaFailure.empty(), "a failed GPU pass is named");
+            compare(cpu, fallen, 0.0f, "fallen back to the CPU");
+            std::cout << "GPU failure fell back to the CPU: " << fallen.cudaFailure << '\n';
+        }
         std::cout << "Native CUDA grid sampling passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
