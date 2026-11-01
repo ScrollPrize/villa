@@ -520,6 +520,8 @@ vc_add_test(NAME test_quadsurface_final)
 
 vc_add_test(NAME test_quadsurface_components)
 
+vc_add_test(NAME test_remote_cache_policy_first_open)
+
 vc_add_test(NAME test_volume_local)
 
 vc_add_test(NAME test_volume_pkg)

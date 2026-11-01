@@ -12,6 +12,7 @@
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -365,3 +366,42 @@ TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads l
     }
 }
 #endif
+
+TEST_CASE("the background read stops when told to, and volumetric views have no reduction")
+{
+    Fixture f;
+    OpenedVolumes opened(64 << 20);
+    const auto levels = openLevels(opened, *f.volume);
+    const vc3d::ViewerSample what{levels, 0, 1, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    vc3d::ViewerLoad load;
+    vc3d::sampleCached(planeAt(5), what, &load);
+    REQUIRE(load.coarse.size() == 1);
+    REQUIRE(load.target.size() == 1);
+
+    int parts = 0;
+    vc3d::loadPending(load, [&] { ++parts; return false; });
+    CHECK(parts == 1);
+    vc3d::ViewerLoad remaining;
+    vc3d::sampleCached(planeAt(5), what, &remaining);
+    CHECK(remaining.target.size() == 1);  // only the coarse part was read
+    CHECK(remaining.coarse.empty());
+
+    CompositeParams params;
+    REQUIRE(setCompositeMethod(params, "max"));
+    CHECK(vc3d::compositeOptions(params));
+    params.volumetric = true;
+    CHECK_FALSE(vc3d::compositeOptions(params));
+}
+
+TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer is asked for")
+{
+    vcr::grid::Result composite;
+    composite.width = 2;
+    composite.height = 1;
+    composite.values = {10.0f, std::numeric_limits<float>::quiet_NaN()};
+    uint8_t values[2] = {}, coverage[2] = {};
+    vc3d::toDisplay(composite, 3, values, coverage);
+    CHECK(values[0] == 10);
+    CHECK(coverage[0] != 0);
+    CHECK(coverage[1] == 0);
+}

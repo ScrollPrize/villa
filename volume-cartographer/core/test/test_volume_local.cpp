@@ -114,3 +114,19 @@ TEST_CASE("Volume: base dimensions and level shapes follow the pyramid's placeme
     CHECK(v->shape() == std::array<int, 3>{9, 12, 15});
     fs::remove_all(d);
 }
+
+TEST_CASE("Volume: metadata.json's scan is flattened, and a shape that disagrees with it throws")
+{
+    auto d = tmpDir("sidecar");
+    vcr::zarr::Writer::create(d / "0", {.shape = {4, 6, 8}, .chunks = {4, 6, 8}, .compressor = ""});
+    writeTextFile(d / "metadata.json",
+                  R"({"scan": {"type": "vol", "uuid": "from-scan", "width": 8, "height": 6, "slices": 4}})");
+    const auto v = Volume::New(d);
+    CHECK(v->id() == "from-scan");
+    CHECK(v->shape() == std::array<int, 3>{4, 6, 8});
+
+    fs::remove(d / "metadata.json");
+    writeTextFile(d / "meta.json", R"({"type": "vol", "uuid": "wrong", "width": 800, "height": 6, "slices": 4})");
+    CHECK_THROWS_WITH_AS(Volume::New(d), doctest::Contains("does not match"), std::runtime_error);
+    fs::remove_all(d);
+}

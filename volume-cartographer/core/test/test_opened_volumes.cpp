@@ -103,3 +103,23 @@ TEST_CASE("OpenedVolumes describes each working base of one source, sharing the 
     }
     fs::remove_all(dir);
 }
+
+TEST_CASE("OpenedVolumes gives only uint8 CT a GPU reader, and a listed level that is gone throws")
+{
+    const auto dir = fs::temp_directory_path() /
+                     ("vc-opened-volumes-levels-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const vcr::zarr::CreateOptions wide{.shape = {16, 16, 16}, .chunks = {8, 8, 8}, .dtype = "<u2", .compressor = ""};
+    vcr::zarr::Writer::create(dir / "0", wide);
+    vcr::zarr::createPyramidLevels(dir, wide, {.levels = 1});
+    vcr::zarr::createGroup(dir, nlohmann::json{{"multiscales", nlohmann::json::array({vcr::zarr::omeMultiscales({.levels = 1})})}});
+    const auto volume = Volume::New(dir);
+    {
+        OpenedVolumes opened(64 << 20, 64 << 20);
+        CHECK(opened.pyramid(*volume).dtype == "<u2");
+        CHECK_FALSE(opened.level(*volume, 0).cuda);
+    }
+    fs::remove(dir / "1" / ".zarray");
+    OpenedVolumes opened(64 << 20);
+    CHECK_THROWS(opened.pyramid(*volume));
+    fs::remove_all(dir);
+}
