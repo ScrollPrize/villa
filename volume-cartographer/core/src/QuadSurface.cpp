@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ImageMat.hpp"
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
@@ -244,41 +245,6 @@ vcr::sources::TiffOptions tiffOptions(float dpi)
     vcr::sources::TiffOptions options;
     if (dpi > 0) options.pixelUm = 25400.0 / dpi;
     return options;
-}
-
-const char* tiffDtype(int depth)
-{
-    switch (depth) {
-    case CV_8U: return "|u1";
-    case CV_8S: return "|i1";
-    case CV_16U: return "<u2";
-    case CV_16S: return "<i2";
-    case CV_32S: return "<i4";
-    case CV_32F: return "<f4";
-    case CV_64F: return "<f8";
-    }
-    return nullptr;
-}
-
-// A channel file's first page with OpenCV's colour order: TIFFs store RGB(A),
-// channel Mats hold BGR(A). Empty when its samples have no OpenCV depth.
-cv::Mat readChannelFile(const std::filesystem::path& path)
-{
-    const auto block = vcr::sources::readImagePage(path.string(), 0);
-    if (block.shape.size() < 2 || block.shape.size() > 3)
-        return {};
-    const int channels = block.shape.size() == 3 ? int(block.shape[2]) : 1;
-    for (const int depth : {CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F}) {
-        if (block.dtype != tiffDtype(depth) || channels > CV_CN_MAX)
-            continue;
-        const cv::Mat stored(int(block.shape[0]), int(block.shape[1]), CV_MAKETYPE(depth, channels), block.data.get());
-        cv::Mat image;
-        if (channels == 3) cv::cvtColor(stored, image, cv::COLOR_RGB2BGR);
-        else if (channels == 4) cv::cvtColor(stored, image, cv::COLOR_RGBA2BGRA);
-        else image = stored.clone();
-        return image;
-    }
-    return {};
 }
 
 void normalizeMaskChannel(cv::Mat& mask)
@@ -848,7 +814,7 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
                 try {
-                    channel = readChannelFile(channel_path);
+                    channel = vc::core::util::readImageMat(channel_path);
                 } catch (const std::exception& error) {
                     Logger()->warn("cannot read channel {}: {}", channel_path.string(), error.what());
                 }
@@ -1340,17 +1306,12 @@ void QuadSurface::invalidateMask()
 // show (e.g. the two-component uv), which are LZW.
 void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat)
 {
-    const char* dtype = tiffDtype(mat.depth());
-    if (mat.empty() || !dtype)
+    if (mat.empty())
         throw std::runtime_error("unsupported image for channel " + name);
-    cv::Mat stored;
-    if (mat.channels() == 3) cv::cvtColor(mat, stored, cv::COLOR_BGR2RGB);
-    else if (mat.channels() == 4) cv::cvtColor(mat, stored, cv::COLOR_BGRA2RGBA);
-    else stored = mat.isContinuous() ? mat : mat.clone();
     auto options = tiffOptions(dpi_);
     if (mat.channels() == 2 || mat.channels() > 4)
         options.compression = "lzw";
-    vcr::sources::writeTiff(dir / (name + ".tif"), stored.data, dtype, stored.rows, stored.cols, stored.channels(), options);
+    vc::core::util::writeTiffMat(dir / (name + ".tif"), mat, options);
 }
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
