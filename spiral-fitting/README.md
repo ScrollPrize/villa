@@ -1167,6 +1167,53 @@ its stored vertical/horizontal tag and rebuilds the strip bundle and DT target
 caches, so no fit rebuild is needed. VC3D's spiral panel exposes them as a
 checkbox and a voxel distance next to the fibers path.
 
+## Relative windings in a box from the surface prediction and Lasagna
+
+`relative_windings_box` writes a `relative_windings.json` (the `relative` PCL
+role) around one point of a scroll that has a surface prediction, such as m7,
+and a Lasagna run. Run it from `spiral-fitting/`:
+
+```sh
+uv run python -m relative_windings_box --prediction M7.zarr \
+    --grad-mag LASAGNA.lasagna.json --base-affine BASE.json \
+    --umbilicus UMB.json --point X,Y,Z --out RUN
+```
+
+It draws `--seeds` seeds (default 200) on the prediction in a cube of `--box`
+voxels (default 512) centered on `--point`, walks from each seed along the
+sheet normal to the next sheet in both directions, and counts windings outward
+from the umbilicus. It then integrates grad_mag along every step and cuts each
+step that reads as more than one sheet (the median over seven parallel rays
+times 0.765, cut above 1.0).
+
+`--split-rule` picks the cut: v2 (default) cuts at gm_x above 1.0, v1 at 0.95,
+and `none` keeps every step. With `none`, `flags.json` marks the steps the v2
+cut would remove (a `windlabel-check-split-step` collection) without changing
+any winding. Every run's `export.json` (and the `--json` summary) also reports
+the run's `gm_x` median and p90 and the share above 1.0, so the cut can be
+judged per scroll before switching it on: the cut was tested on PHerc0172,
+PHerc1667 and PHerc0139, but on PHerc Paris 4 its gm_x sits at a median of
+about 0.9, close to the threshold.
+
+Inputs: the prediction (binary, sheet above 127, read at level 0) and the
+grad_mag, as zarr v2 or v3, local or anonymous https; `--grad-mag` takes a
+Lasagna manifest or the grad_mag OME-Zarr. `--base-affine` is a JSON 3 x 4
+matrix from prediction voxels to the Lasagna base grid (default `identity`).
+`--umbilicus` is the umbilicus JSON in prediction voxels; without it the tool
+refuses. `--point` is x,y,z in prediction voxels.
+
+Outputs in `RUN`: `relative_windings.json` (one collection per piece of two or
+more crossings, `wind_a` counting up outward, `winding_is_absolute` false),
+`flags.json` (cut steps and chain ends to check, as point collections for
+VC3D; with `--split-rule none` also the kept steps the v2 cut would remove),
+and `chains.json`, `features.json`, `split.json` and `export.json` with the
+chains, the grad_mag value of each step and the run summary. Exit code 0
+means both point collection files passed their checks.
+
+Limits: it reads a prediction and a Lasagna run but computes neither, fits
+nothing, and follows the predictions where they disagree with hand tracing.
+Tests: `tests/test_relative_windings_box.py`.
+
 ## Point-to-patch linking
 
 Every point of every point collection (regular PCLs and fibers) is attached to
