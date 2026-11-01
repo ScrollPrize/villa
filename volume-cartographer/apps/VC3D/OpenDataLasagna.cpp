@@ -175,23 +175,6 @@ std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumeP
     }
 }
 
-std::filesystem::path lasagnaCacheDir(const std::filesystem::path& remoteCacheRoot,
-                                      const std::string& sampleId,
-                                      const vcr::catalog::OpenDataVolume& volume,
-                                      const vcr::catalog::OpenDataArtifact& artifact)
-{
-    std::ostringstream identity;
-    identity << artifact.url() << '\n' << artifact.modelId.value_or(std::string{}) << '\n'
-             << artifact.lasagnaVersion.value_or(-1) << '\n'
-             << std::setprecision(17) << artifact.sourceToBase.value_or(-1.0);
-    if (volume.shapeZYX) {
-        for (const auto extent : *volume.shapeZYX) identity << '\n' << extent;
-    }
-    return remoteCacheRoot / "open_data" / "lasagna" /
-           vcr::catalog::safePathComponent(sampleId) / vcr::catalog::safePathComponent(volume.id) /
-           cacheKey(identity.str());
-}
-
 struct CachedLasagna {
     std::filesystem::path manifest;
     vc::lasagna::LasagnaDataset dataset;
@@ -212,7 +195,7 @@ CachedLasagna cacheLasagna(
     const auto modelId = artifact.modelId.value_or(std::string{});
     const int level = *artifact.sourceCoordinateLevel;
     const auto cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
-    const auto finalDir = lasagnaCacheDir(cacheRoot, sampleId, volume, artifact);
+    const auto finalDir = vcr::zarr::decodedCachePath(cacheRoot, artifactUrl);
     const auto markerPath = finalDir / vc::lasagna::kLasagnaRemoteMarker;
     if (std::filesystem::is_regular_file(markerPath)) {
         auto marker = nlohmann::json::parse(std::ifstream(markerPath));
@@ -241,10 +224,21 @@ CachedLasagna cacheLasagna(
         }
     }
 
-    const auto manifestUrl = discoverManifestUrl(artifactUrl);
-    const auto relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
+    // A manifest already cached beside its arrays needs no request.
+    std::vector<std::filesystem::path> present;
+    std::error_code listError;
+    for (const auto& file : std::filesystem::directory_iterator(finalDir, listError))
+        if (file.path().filename().string().ends_with(".lasagna.json"))
+            present.push_back(file.path());
+    std::string relativeName;
+    if (present.size() == 1) {
+        relativeName = present.front().filename().string();
+    } else {
+        const auto manifestUrl = discoverManifestUrl(artifactUrl);
+        relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
+        vc::lasagna::downloadLasagnaManifest(manifestUrl, finalDir / relativeName);
+    }
     const auto manifest = finalDir / relativeName;
-    vc::lasagna::downloadLasagnaManifest(manifestUrl, manifest);
     nlohmann::json marker{
         {"version", 1},
         {"anonymous", true},

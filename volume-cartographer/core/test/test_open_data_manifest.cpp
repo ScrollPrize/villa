@@ -1,6 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <vc_reader/zarr.hpp>
+#include "vc/core/util/NormalGridVolume.hpp"
+
 #include "OpenDataManifest.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
@@ -709,7 +712,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(infos[1].sourceCoordinateLevel == 2);
     CHECK(infos[1].artifactIndex == 1);
 
-    // Each level streams from its own cache entry.
+    // Each store streams from its own cache entry.
     const auto root = std::filesystem::temp_directory_path() /
         ("vc_open_data_normal_grids_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
@@ -717,8 +720,17 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
     const auto entries = pkg->normalGridEntries();
     REQUIRE(entries.size() == 2);
-    CHECK(entries[0].location.find("L0-") != std::string::npos);
-    CHECK(entries[1].location.find("L2-") != std::string::npos);
+    // At the URL's own place under the root, nothing beside it.
+    CHECK(entries[0].location == vcr::zarr::decodedCachePath(root, infos[0].url).string());
+    CHECK(entries[1].location == vcr::zarr::decodedCachePath(root, infos[1].url).string());
+
+    // A store attached from another cache directory gives way to this one.
+    const auto other = root / "normal_grids" / "old";
+    REQUIRE(vc::core::util::writeNormalGridsRemoteMarker(other, infos[0].url));
+    pkg->addNormalGridEntry(other.string());
+    REQUIRE(pkg->normalGridEntries().size() == 3);
+    CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
+    CHECK(pkg->normalGridEntries().size() == 2);
     std::filesystem::remove_all(root);
 }
 

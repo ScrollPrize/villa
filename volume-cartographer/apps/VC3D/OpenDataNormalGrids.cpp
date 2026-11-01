@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <vc_reader/s3_listing.hpp>
+#include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -129,17 +130,10 @@ void publishDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
-// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>/L<level>-<url hash>
-std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
-                                          const std::string& sampleId,
-                                          const std::string& volumeId,
-                                          int sourceCoordinateLevel,
-                                          std::string_view url)
+// Where the store's URL caches under the root, as every vc_reader cache does.
+std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot, const std::string& url)
 {
-    return remoteCacheRoot / "normal_grids" /
-           vcr::catalog::safePathComponent(sampleId.empty() ? "sample" : sampleId) /
-           vcr::catalog::safePathComponent(volumeId.empty() ? "volume" : volumeId) /
-           ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
+    return vcr::zarr::decodedCachePath(remoteCacheRoot, url);
 }
 
 constexpr const char* kCompleteMarker = "normal-grids-complete.json";
@@ -218,8 +212,7 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     if (remoteCacheRoot.empty() || info.url.empty()) {
         return false;
     }
-    const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
-                                         info.sourceCoordinateLevel, info.url);
+    const auto dir = normalGridsCacheDir(remoteCacheRoot, info.url);
     if (!vc::core::util::writeNormalGridsRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
@@ -227,6 +220,15 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     // addNormalGridEntry dedups by location; either way the entry ends up
     // attached. The marker's URL names its catalog dataset (normalGridsCatalogView).
     pkg.addNormalGridEntry(dir.string());
+    // The same store attached from another cache directory goes.
+    std::vector<std::string> stale;
+    for (const auto& entry : pkg.normalGridEntries()) {
+        if (entry.location != dir.string() && !vcr::zarr::isRemote(entry.location) &&
+            vc::core::util::normalGridsRemoteUrl(
+                vc::project::resolveLocalPath(entry.location, pkg.path().parent_path())) == info.url)
+            stale.push_back(entry.location);
+    }
+    for (const auto& location : stale) pkg.removeEntry(location);
     return true;
 }
 
@@ -272,9 +274,7 @@ NormalGridsCacheState normalGridsCacheState(
     }
     state.complete = true;
     for (const auto& artifact : artifacts) {
-        const auto dir = normalGridsCacheDir(remoteCacheRoot, sampleId, volume.id,
-                                             artifact.sourceCoordinateLevel,
-                                             artifact.url);
+        const auto dir = normalGridsCacheDir(remoteCacheRoot, artifact.url);
         std::error_code ec;
         bool artifactComplete = false;
         const auto completeMarker = dir / kCompleteMarker;
@@ -324,8 +324,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    const auto finalDir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
-                                              info.sourceCoordinateLevel, info.url);
+    const auto finalDir = normalGridsCacheDir(remoteCacheRoot, info.url);
     std::error_code completeEc;
     if (std::filesystem::is_regular_file(finalDir / kCompleteMarker, completeEc)) {
         return finalDir;

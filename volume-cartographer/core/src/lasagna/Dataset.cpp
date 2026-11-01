@@ -1,6 +1,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/PredictionPooling.hpp"
 
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <algorithm>
@@ -199,7 +200,8 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
     }
     manifest.remoteBaseUrl = vc::normalizedRemoteUrl(url);
     manifest.remoteSourceBaseLocation = sourceName(url);
-    manifest.remoteCacheRoot = manifest.baseDirectory;
+    // Its arrays cache under the shared root, not beside the manifest.
+    manifest.remoteCacheRoot = vc::settings::remoteCachePath();
     manifest.discoverAwsCredentials =
         !marker.value("anonymous", false);
 }

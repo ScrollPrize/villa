@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/Manifest.hpp"
@@ -219,7 +220,7 @@ TEST_CASE("LasagnaDataset recognizes a validated remote cache marker")
     }
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     CHECK(dataset.manifest().remoteBaseUrl == "https://example.test/lasagna");
-    CHECK(dataset.manifest().remoteCacheRoot == dir);
+    CHECK(dataset.manifest().remoteCacheRoot == vc::settings::remoteCachePath());
 
     {
         std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
@@ -262,7 +263,7 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
     REQUIRE(dataset.manifest().groups.size() == 1);
     const auto& group = dataset.manifest().groups.front();
     CHECK(group.isRemote());
-    CHECK(group.remoteCacheRoot == dir);
+    CHECK(group.remoteCacheRoot == vc::settings::remoteCachePath());
     CHECK(group.sourceLocation ==
           "s3://bucket/path/artifact/pred.zarr");
     CHECK_FALSE(dataset.manifest().discoverAwsCredentials);
