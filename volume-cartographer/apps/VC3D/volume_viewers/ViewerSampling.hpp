@@ -24,15 +24,17 @@ namespace vc3d {
 // shared OpenedVolumes. Index: working level; an absent level has no array.
 struct ViewerLevels {
     std::vector<OpenedVolumes::Level> levels;
-    // Set by a failed GPU frame: these levels render on the CPU from then on. Device bricks
-    // never load after a failure, so a cached-only GPU frame would stay empty.
+    // Set by a failed GPU frame: these levels render on the CPU from then on (gridLevel
+    // gives vcr::grid no reader). Device bricks never load after a failure, so a
+    // cached-only GPU frame would stay empty.
     std::shared_ptr<std::atomic_bool> gpuFailed = std::make_shared<std::atomic_bool>(false);
 
     int count() const { return static_cast<int>(levels.size()); }
     bool has(int level) const;
     // Working level-0 voxels one index of `level` spans, per axis (ZYX).
     std::array<double, 3> voxelExtent(int level) const;
-    // `level` for vcr::grid: working level-0 XYZ points to its indices.
+    // `level` for vcr::grid: working level-0 XYZ points to its indices, with its CUDA
+    // reader unless a GPU frame has failed.
     vcr::grid::Level gridLevel(int level) const;
     // The relative size of one working level-0 voxel along X, Y, Z, finest axis 1.
     std::array<float, 3> vertexSpacing() const;
@@ -64,7 +66,8 @@ struct ViewerGeometry {
 
     int width() const { return plane ? plane->width : raster.width; }
     int height() const { return plane ? plane->height : raster.height; }
-    // On the GPU when every requested level of `levels` has a CUDA reader.
+    // vcr::grid::sample (on the GPU when every requested level has a reader), noting a
+    // failed GPU frame in `levels`.
     vcr::grid::Result sample(const vcr::grid::Request& request, const ViewerLevels& levels) const;
 };
 

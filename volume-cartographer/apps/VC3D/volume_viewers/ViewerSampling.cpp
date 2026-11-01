@@ -1,9 +1,5 @@
 #include "ViewerSampling.hpp"
 
-#ifdef VC_READER_CUDA
-#include <vc_reader/native/reader_cuda/reader.hpp>
-#endif
-
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -51,7 +47,8 @@ vcr::grid::Level ViewerLevels::gridLevel(int level) const
 {
     const auto& l = levels[std::size_t(level)];
     const auto map = l.array->placement.indexMapFrom(l.working);
-    return {l.array->array.get(), l.array->meta.type, map.scale, map.offset};
+    return {l.array->array.get(), l.array->meta.type, map.scale, map.offset, std::nullopt,
+            gpuFailed->load() ? nullptr : l.cuda.get()};
 }
 
 ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume)
@@ -132,30 +129,13 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
 
 vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const
 {
-#ifdef VC_READER_CUDA
-    std::vector<vcr::reader_cuda::Reader*> readers;
-    for (const auto& wanted : request.levels)
-        for (const auto& level : levels.levels)
-            if (level.array && level.array->array.get() == wanted.array && level.cuda)
-                readers.push_back(level.cuda.get());
-    if (!levels.gpuFailed->load() && !readers.empty() && readers.size() == request.levels.size()) {
-        try {
-            return plane ? vcr::grid::cuda::sample(*plane, request, readers)
-                         : vcr::grid::cuda::sample(*surface, raster, request, readers);
-        } catch (const std::exception& e) {
-            // Device memory, a frame over the brick budget or a device failure, as when many
-            // volumes fill the card: give these levels' bricks back and render on the CPU. The
-            // backend is ours to choose; the frame must still appear.
-            if (!levels.gpuFailed->exchange(true))
-                Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", e.what());
-            for (auto* reader : readers)
-                reader->clear();
-        }
-    }
-#else
-    (void)levels;
-#endif
-    return plane ? vcr::grid::sample(*plane, request) : vcr::grid::sample(*surface, raster, request);
+    auto result = plane ? vcr::grid::sample(*plane, request) : vcr::grid::sample(*surface, raster, request);
+    // Device memory, a frame over the brick budget or a device failure, as when many
+    // volumes fill the card: vc_reader rendered the frame on the CPU and gave the bricks
+    // back; these levels stay on the CPU, since their bricks never load after a failure.
+    if (!result.cudaFailure.empty() && !levels.gpuFailed->exchange(true))
+        Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", result.cudaFailure);
+    return result;
 }
 
 vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSample& what, ViewerLoad* load)
