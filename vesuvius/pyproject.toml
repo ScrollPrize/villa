@@ -228,6 +228,8 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 "vesuvius.surface_preflight" = "vesuvius.surface_preflight:main"
+"vesuvius.label_topology_audit" = "vesuvius.image_proc.run.label_topology_audit:main"
+"vesuvius.surface_placement_audit" = "vesuvius.image_proc.run.surface_placement_audit:main"
 
 [tool.setuptools]
 include-package-data = true

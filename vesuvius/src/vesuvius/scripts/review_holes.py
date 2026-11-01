@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Review the holes that ``vesuvius.label_topology_audit --batch`` located, worst crop first.
+
+For each hole the script shows three orthogonal CT slices (label green, hole red), asks
+for a verdict, and records it. Verdicts: ``f`` fill (label gap), ``c`` cut (real gap or a
+pocket between two sheets: do not fill), ``u`` unclear, ``s`` skip, ``q`` quit. The run is
+resumable: holes already in ``verdicts.csv`` are not asked again.
+
+Writes under ``--out``:
+  verdicts.csv   crop,center_zyx,voxels,interior,verdict   (every call)
+  veto.csv       crop,center_zyx                           (CUT rows, for ``fix_holes.py --veto``)
+  fix_in/<crop>/<crop>_surf.tif + hole_mask.tif            (reviewed crops, ``fix_holes.py --in-dir`` layout)
+  fix_in/<crop>/<crop>_img.tif + holes.json, fix_in/order.txt (CT, hole list and rank order for hole_viewer.py)
+
+``--stage-only`` stages the top crops without asking anything, for reviewing in
+``hole_viewer.py --root-dir OUT/fix_in`` (its Review panel writes the same two CSVs).
+
+``--export-training DIR`` turns ``verdicts.csv`` into training examples: one ``.npz``
+per verdict with the CT, label and hole-mask cube around the hole and the verdict,
+plus ``index.csv`` and ``provenance.json`` (inputs, reviewer, time). The cubes are
+``--half`` voxels on a side. ``--predictions DIR`` adds the surface model's output
+(``DIR/<crop>.tif``) as a ``pred`` cube, so each example holds what the model drew, what
+the label says, and what the reviewer called.
+
+Next step after a review session (from ``vesuvius/``)::
+
+  python src/vesuvius/scripts/fix_holes.py --in-dir OUT/fix_in --veto OUT/veto.csv \\
+      --ignore-value 2 --method close --closing-kernel 2
+"""
+import argparse
+import csv
+import getpass
+import json
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import tifffile
+
+VERDICTS = {"f": "FILL", "c": "CUT", "u": "UNCLEAR"}
+FIELDS = ["crop", "center_zyx", "voxels", "interior", "verdict"]
+
+
+def ranked_crops(audit: Path) -> List[str]:
+    """Crop names in ``ranked.csv`` order (worst first)."""
+    with open(audit / "ranked.csv", newline="") as fh:
+        return [r["crop"] for r in csv.DictReader(fh)]
+
+
+def crop_holes(audit: Path, crop: str) -> List[dict]:
+    """Located holes of one crop: interior first, then largest first."""
+    holes = json.loads((audit / f"{crop}.json").read_text()).get("holes", [])
+    return sorted(holes, key=lambda h: (not h.get("interior", False), -h["voxels"]))
+
+
+def load_verdicts(path: Path) -> Dict[Tuple[str, str], dict]:
+    if not path.exists():
+        return {}
+    with open(path, newline="") as fh:
+        return {(r["crop"], r["center_zyx"]): r for r in csv.DictReader(fh)}
+
+
+def write_outputs(out: Path, verdicts: Dict[Tuple[str, str], dict]) -> None:
+    rows = list(verdicts.values())
+    with open(out / "verdicts.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    with open(out / "veto.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["crop", "center_zyx"])
+        for r in rows:
+            if r["verdict"] == "CUT":
+                w.writerow([r["crop"], r["center_zyx"]])
+
+
+def stage_crop(data: Path, audit: Path, out: Path, crop: str) -> Path:
+    """Copy label + hole mask into the ``fix_holes.py --in-dir`` layout."""
+    d = out / "fix_in" / crop
+    d.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(data / "labels" / f"{crop}.tif", d / f"{crop}_surf.tif")
+    mask = audit / f"{crop}.hole_mask.tif"
+    if not mask.exists():
+        sys.exit(f"{mask} missing: rerun the audit with --hole-masks")
+    shutil.copyfile(mask, d / "hole_mask.tif")
+    img = data / "images" / f"{crop}.tif"
+    if img.exists():
+        shutil.copyfile(img, d / f"{crop}_img.tif")
+    (d / "holes.json").write_text(json.dumps(crop_holes(audit, crop)))
+    order = out / "fix_in" / "order.txt"
+    seen = order.read_text().split() if order.exists() else []
+    if crop not in seen:
+        order.write_text("\n".join(seen + [crop]) + "\n")
+    return d
+
+
+def stage_ranked(data: Path, audit: Path, out: Path, limit: Optional[int] = None) -> List[str]:
+    """Stage the top ``limit`` crops of ranked.csv that have located holes, in rank order."""
+    staged = []
+    for crop in ranked_crops(audit)[:limit]:
+        if crop_holes(audit, crop):
+            stage_crop(data, audit, out, crop)
+            staged.append(crop)
+    return staged
+
+
+def _cube(arr: np.ndarray, center, half: int) -> np.ndarray:
+    """``2*half`` cube around ``center``, zero-padded where it leaves the array."""
+    out = np.zeros((2 * half,) * 3, arr.dtype)
+    lo = [int(c) - half for c in center]
+    src = tuple(slice(max(l, 0), min(l + 2 * half, n)) for l, n in zip(lo, arr.shape))
+    dst = tuple(slice(s.start - l, s.stop - l) for s, l in zip(src, lo))
+    out[dst] = arr[src]
+    return out
+
+
+def write_trainer_pair(dest: Path, stem: str, ct: np.ndarray, label: np.ndarray, target: str) -> None:
+    """Write one example in the villa trainer layout: ``images/<stem>.tif`` and ``labels/<stem>_<target>.tif``."""
+    (dest / "images").mkdir(parents=True, exist_ok=True)
+    (dest / "labels").mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(dest / "images" / f"{stem}.tif", ct)
+    tifffile.imwrite(dest / "labels" / f"{stem}_{target}.tif", label)
+
+
+def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16,
+                    predictions: Optional[Path] = None, reviewer: str = "",
+                    target: str = "surface", ignore_value: int = 2) -> List[dict]:
+    """Write one ``.npz`` (ct, label, mask, center_zyx, verdict, pred with ``predictions``)
+    per verdict, plus ``index.csv`` and ``provenance.json``, and the same cubes in the
+    layout the villa trainer reads (``docs/data_formatting.md``): ``images/<id>.tif`` (CT)
+    and ``labels/<id>_<target>.tif`` (the label with the verdict applied: a FILL hole set
+    to 1, a CUT hole left 0, an UNCLEAR hole set to ``ignore_value``).
+
+    This is the labelled set a FILL/CUT model would train on: the reviewer's call with the
+    CT it was made from, and the surface model's own output there when ``predictions`` holds
+    ``<crop>.tif`` per crop. Nothing is trained here; the export only keeps the pairs.
+    """
+    rows = list(load_verdicts(out / "verdicts.csv").values())
+    dest.mkdir(parents=True, exist_ok=True)
+    index, cache = [], {}
+    for i, r in enumerate(rows):
+        crop = r["crop"]
+        if crop not in cache:
+            vols = {"ct": tifffile.imread(data / "images" / f"{crop}.tif"),
+                    "label": tifffile.imread(data / "labels" / f"{crop}.tif"),
+                    "mask": tifffile.imread(audit / f"{crop}.hole_mask.tif")}
+            if predictions is not None:
+                vols["pred"] = tifffile.imread(predictions / f"{crop}.tif")
+            cache[crop] = vols
+        center = json.loads(r["center_zyx"])
+        stem = f"{crop}_{i:04d}"
+        cubes = {k: _cube(v, center, half) for k, v in cache[crop].items()}
+        np.savez_compressed(dest / f"{stem}.npz", center_zyx=np.array(center), verdict=r["verdict"], **cubes)
+        corrected = cubes["label"].copy()
+        hole = cubes["mask"] > 0
+        if r["verdict"] == "FILL":
+            corrected[hole] = 1
+        elif r["verdict"] != "CUT":
+            corrected[hole] = ignore_value
+        write_trainer_pair(dest, stem, cubes["ct"], corrected, target)
+        index.append({"file": f"{stem}.npz", **r})
+    with open(dest / "index.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["file", *FIELDS])
+        w.writeheader()
+        w.writerows(index)
+    prov = {"data": str(data), "audit": str(audit), "verdicts": str(out / "verdicts.csv"),
+            "predictions": str(predictions) if predictions else None, "cube": 2 * half,
+            "target": target, "ignore_value": ignore_value,
+            "reviewer": reviewer, "n": len(index),
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    (dest / "provenance.json").write_text(json.dumps(prov, indent=1))
+    return index
+
+
+def render_hole(data: Path, audit: Path, crop: str, hole: dict, png: Path, half: int) -> Path:
+    from vesuvius.image_proc.run.label_topology_audit import hole_tiles
+
+    img = tifffile.imread(data / "images" / f"{crop}.tif").astype(np.float32)
+    lab = tifffile.imread(data / "labels" / f"{crop}.tif")
+    mask = tifffile.imread(audit / f"{crop}.hole_mask.tif").astype(bool)
+    png.parent.mkdir(parents=True, exist_ok=True)
+    hole_tiles(img, lab, [hole], mask, png, half=half, limit=1)
+    return png
+
+
+def ask_terminal(png: Path, prompt: str) -> str:
+    """Show the tile in a matplotlib window and read one key from the terminal."""
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    if matplotlib.get_backend().lower() == "agg":
+        print(f"no display backend: open {png} yourself", file=sys.stderr)
+    else:
+        plt.close("all")
+        fig = plt.figure(figsize=(7.5, 2.8))
+        plt.imshow(plt.imread(png))
+        plt.axis("off")
+        if fig.canvas.manager is not None:
+            fig.canvas.manager.set_window_title(prompt)
+        plt.show(block=False)
+        plt.pause(0.1)
+    while True:
+        k = input(f"{prompt}  [f]ill [c]ut [u]nclear [s]kip [q]uit > ").strip().lower()
+        if k in ("f", "c", "u", "s", "q"):
+            return k
+
+
+def review(data: Path, audit: Path, out: Path, ask: Callable[[Path, str], str],
+           limit: Optional[int] = None, half: int = 32) -> Dict[Tuple[str, str], dict]:
+    out.mkdir(parents=True, exist_ok=True)
+    verdicts = load_verdicts(out / "verdicts.csv")
+    crops = ranked_crops(audit)[:limit]
+    for rank, crop in enumerate(crops, 1):
+        holes = crop_holes(audit, crop)
+        if not holes:
+            continue
+        touched = False
+        for i, h in enumerate(holes, 1):
+            key = (crop, json.dumps(h["center_zyx"]))
+            if key in verdicts:
+                continue
+            tag = "interior" if h.get("interior") else "crop face"
+            prompt = f"#{rank} {crop} hole {i}/{len(holes)} zyx {h['center_zyx']} {h['voxels']} vox {tag}"
+            png = render_hole(data, audit, crop, h, out / "tiles" / f"{crop}_{i:02d}.png", half)
+            k = ask(png, prompt)
+            if k == "q":
+                if touched:
+                    stage_crop(data, audit, out, crop)
+                write_outputs(out, verdicts)
+                return verdicts
+            if k == "s":
+                continue
+            verdicts[key] = {"crop": crop, "center_zyx": key[1], "voxels": h["voxels"],
+                             "interior": int(bool(h.get("interior"))), "verdict": VERDICTS[k]}
+            touched = True
+            write_outputs(out, verdicts)
+        if touched:
+            stage_crop(data, audit, out, crop)
+    write_outputs(out, verdicts)
+    return verdicts
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", type=Path, required=True, help="the --batch directory (labels/, images/)")
+    ap.add_argument("--audit", type=Path, required=True,
+                    help="audit output directory (needs --batch run with --hole-masks)")
+    ap.add_argument("--out", type=Path, required=True, help="where verdicts.csv, veto.csv, tiles/, fix_in/ go")
+    ap.add_argument("--limit", type=int, default=None, help="review only the top N crops of ranked.csv")
+    ap.add_argument("--half", type=int, default=32, help="half-width of each slice in voxels")
+    ap.add_argument("--stage-only", action="store_true",
+                    help="stage the top crops into OUT/fix_in for hole_viewer.py and ask nothing")
+    ap.add_argument("--export-training", type=Path, metavar="DIR",
+                    help="write OUT/verdicts.csv as training cubes (.npz + index.csv, plus images/ and labels/ in the trainer layout) into DIR and ask nothing")
+    ap.add_argument("--predictions", type=Path, metavar="DIR",
+                    help="with --export-training: surface model output per crop (DIR/<crop>.tif), stored as pred")
+    ap.add_argument("--reviewer", default=getpass.getuser(), help="who made the calls (provenance)")
+    ap.add_argument("--target", default="surface",
+                    help="with --export-training: target name in labels/<id>_<target>.tif (trainer layout)")
+    ap.add_argument("--ignore-value", type=int, default=2,
+                    help="with --export-training: label value written into UNCLEAR holes")
+    a = ap.parse_args(argv)
+    if not (a.audit / "ranked.csv").exists():
+        ap.error(f"{a.audit}/ranked.csv missing: run vesuvius.label_topology_audit --batch first")
+    if a.export_training:
+        n = export_training(a.data, a.audit, a.out, a.export_training, max(a.half // 2, 8),
+                            a.predictions, a.reviewer, a.target, a.ignore_value)
+        print(f"exported {len(n)} verdict cubes to {a.export_training}")
+        return
+    if a.stage_only:
+        staged = stage_ranked(a.data, a.audit, a.out, a.limit)
+        print(f"staged {len(staged)} crops in {a.out / 'fix_in'}; open with "
+              f"hole_viewer.py --root-dir {a.out / 'fix_in'} --suffix1 _surf.tif")
+        return
+    v = review(a.data, a.audit, a.out, ask_terminal, a.limit, a.half)
+    n = {k: sum(1 for r in v.values() if r["verdict"] == k) for k in VERDICTS.values()}
+    print(f"{len(v)} verdicts ({n}); veto list: {a.out / 'veto.csv'}; staged crops: {a.out / 'fix_in'}")
+
+
+if __name__ == "__main__":
+    main()
