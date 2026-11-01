@@ -38,6 +38,19 @@
 #include <opencv2/imgcodecs.hpp>
 
 namespace {
+
+// The texture source as the artifacts record it: the level's map from base coordinates
+// (XYZ scale and offset, as before the placement replaced them).
+nlohmann::json textureSourceJson(const vc::fiber_tracer::FiberReplayStripTextureSource& source)
+{
+    std::array<double, 3> scale{}, offset{};
+    for (int axis = 0; axis < 3; ++axis) {
+        scale[axis] = 1.0 / source.placement.scale[2 - axis];
+        offset[axis] = -source.placement.offset[2 - axis] / source.placement.scale[2 - axis];
+    }
+    return {{"locator", source.locator}, {"shape_zyx", source.shapeZYX},
+            {"scale_from_base_xyz", scale}, {"offset_from_base_xyz", offset}};
+}
 using namespace vc::fiber_tracer;
 using Json = nlohmann::json;
 
@@ -438,10 +451,7 @@ void writeRenderedOverview(const std::filesystem::path& output,
     metadata["rows"] = {"reference_top", "reference_side", "traced_top", "traced_side"};
     metadata["reference_color"] = "yellow";
     metadata["trace_and_failure_color"] = "cyan";
-    metadata["texture_source"] = {{"locator", overview.textureSource.locator},
-        {"shape_zyx", overview.textureSource.shapeZYX},
-        {"scale_from_base_xyz", overview.textureSource.scaleFromBaseXYZ},
-        {"offset_from_base_xyz", overview.textureSource.offsetFromBaseXYZ}};
+    metadata["texture_source"] = textureSourceJson(overview.textureSource);
     metadata["render_scale"] = overview.renderScale;
     metadata["component_gap_columns"] = overview.fiberletComponentGapColumns;
     metadata["components"] = Json::array();
@@ -674,7 +684,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     vcr::zarr::openPyramidLevel(location, working, ctOptions));
                 if (base->meta.shape.size() != 3 || base->meta.type.kind != 'u' || base->meta.type.itemsize != 1)
                     throw std::invalid_argument("render CT base volume requires uint8 level zero");
-                source.renderSource = {source.renderCt, {}, {1, 1, 1}, {0, 0, 0}};
+                source.renderSource = {source.renderCt, {}, {}};
                 for (size_t axis = 0; axis < 3; ++axis)
                     source.renderSource.shapeZYX[axis] = int(base->meta.shape[axis]);
                 source.renderLevel = base;
@@ -1125,10 +1135,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             throw std::runtime_error("failed writing inspection image");
 
                     inspection.metadata.update({{"case_index", index}, {"provenance", provenance},
-                        {"texture_source", {{"locator", source.renderSource.locator},
-                            {"shape_zyx", source.renderSource.shapeZYX},
-                            {"scale_from_base_xyz", source.renderSource.scaleFromBaseXYZ},
-                            {"offset_from_base_xyz", source.renderSource.offsetFromBaseXYZ}}}});
+                        {"texture_source", textureSourceJson(source.renderSource)}});
                     // Renderer arcs are crop-local; recover positions on the original annotation.
                     const double originalBegin = item.selection.at("original_arcs_base")[0];
                     for (const char* key : {"restarts", "cross_sections"}) for (auto& entry : inspection.metadata[key]) {

@@ -91,12 +91,13 @@ void writeFiberletCropBoxVisualization(
     const auto mtlName = stem + ".mtl";
     std::string mtl;
     for (const auto& face : boxFaces(minimumBaseXYZ, maximumBaseXYZ)) {
-        const int columns = textureDimension(cv::norm(face.uExtent), source.scaleFromBaseXYZ[face.uAxis], maximumTextureDimension);
-        const int rows = textureDimension(cv::norm(face.vExtent), source.scaleFromBaseXYZ[face.vAxis], maximumTextureDimension);
+        // Level voxels per base voxel along a face axis: 1 / the level's scale.
+        const int columns = textureDimension(cv::norm(face.uExtent), 1.0 / source.placement.scale[2 - face.uAxis], maximumTextureDimension);
+        const int rows = textureDimension(cv::norm(face.vExtent), 1.0 / source.placement.scale[2 - face.vAxis], maximumTextureDimension);
         auto coordinates = coordinateGrid(face, columns, rows);
         for (auto& point : coordinates) {
-            for (std::size_t axis = 0; axis < 3; ++axis) {
-                point[axis] = static_cast<float>(static_cast<double>(point[axis]) * source.scaleFromBaseXYZ[axis] + source.offsetFromBaseXYZ[axis]);
+            for (int axis = 0; axis < 3; ++axis) {
+                point[axis] = static_cast<float>(source.fromBase(axis, static_cast<double>(point[axis])));
             }
         }
         const std::string textureName = stem + "_" + face.name + ".tif";

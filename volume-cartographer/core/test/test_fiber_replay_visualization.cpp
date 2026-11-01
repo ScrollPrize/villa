@@ -118,8 +118,10 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     const auto source = validateFiberReplayStripCtVolume(ct);
     CHECK(source.locator == (directory / "ct/1").string());
     CHECK(source.shapeZYX == std::array<int,3>{4,4,4});
-    CHECK(source.scaleFromBaseXYZ == std::array<double,3>{0.5,0.5,0.5});
-    CHECK(source.offsetFromBaseXYZ == std::array<double,3>{1,1,1});
+    // Level 1 is placed at base = 2 * index - 2: level index = base / 2 + 1.
+    CHECK(source.placement.scale == std::array<double,3>{2,2,2});
+    CHECK(source.placement.offset == std::array<double,3>{-2,-2,-2});
+    CHECK(source.fromBase(0, 4.0) == 3.0);
     CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
         {0,0,0}, {1,1,1}, directory / "box", 1));
     CHECK_THROWS(writeFiberletCropBoxVisualization(ct,
@@ -147,8 +149,9 @@ TEST_CASE("presence strip reverses the declared source transform before sampling
             return result;
         }
     } predictions;
+    // Base = scale * index + offset per ZYX axis; before, XYZ scale {0.25, 0.5, 0.125}, offset {1, -2, 3}.
     vc::fiber_tracer::FiberReplayStripTextureSource source{
-        "synthetic-presence", {32, 32, 32}, {0.25, 0.5, 0.125}, {1, -2, 3}};
+        "synthetic-presence", {32, 32, 32}, {{8, 2, 4}, {-24, 4, -4}}};
     cv::Mat_<cv::Vec3f> coords(2, 2, cv::Vec3f{5, 6, 7});
     const auto image = vc::fiber_tracer::renderFiberReplayPresenceTexture(coords, 2, source, 2, predictions);
     CHECK(image.rows == 4);
@@ -174,7 +177,7 @@ TEST_CASE("combined inspection aligns modalities and uses the true transverse ac
     segment.tracePointsBase = reference;
     segment.matches = {{1, 8, 8, reference.back()}};
     replay.segments = {segment};
-    FiberReplayStripTextureSource source{"synthetic", {32, 32, 32}, {1, 1, 1}, {0, 0, 0}};
+    FiberReplayStripTextureSource source{"synthetic", {32, 32, 32}, {}};
     const auto renderer = [](const cv::Mat_<cv::Vec3f>& coords, int scale) {
         return cv::Mat_<uint8_t>(coords.rows * scale, coords.cols * scale, uint8_t(70));
     };
@@ -251,7 +254,7 @@ TEST_CASE("inspection uses replay ellipse factor for transverse frames and metad
     segment.tracePointsBase = points;
     segment.matches = {{1,200,200,points.back()}};
     replay.segments = {segment};
-    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {1,1,1}, {0,0,0}};
+    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {}};
     const auto renderer = [](const cv::Mat_<cv::Vec3f>& coords, int scale) {
         return cv::Mat_<uint8_t>(coords.rows * scale, coords.cols * scale, uint8_t(70));
     };
@@ -288,7 +291,7 @@ TEST_CASE("restart labels appear on both assembled traced strip views")
     failure.referenceArcBase = 100;
     failure.referenceArcFraction = 0.5;
     replay.failures.push_back(failure);
-    FiberReplayStripTextureSource source{"synthetic", {256, 256, 256}, {1, 1, 1}, {0, 0, 0}};
+    FiberReplayStripTextureSource source{"synthetic", {256, 256, 256}, {}};
     const auto renderer = [](const cv::Mat_<cv::Vec3f>& c, int scale) {
         return cv::Mat_<uint8_t>(c.rows * scale, c.cols * scale, uint8_t(70));
     };
@@ -343,7 +346,7 @@ TEST_CASE("curved inspection aligns restart sections to both actual traced marke
         replay.failures[0].referenceArcBase = 0;
         replay.failures[0].referenceArcFraction = 0;
     }
-    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {1,1,1}, {0,0,0}};
+    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {}};
     const auto render = [](const cv::Mat_<cv::Vec3f>& c, int scale) {
         return cv::Mat_<uint8_t>(c.rows * scale, c.cols * scale, uint8_t(70));
     };
@@ -573,11 +576,9 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
         vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 2.0, 4, ct);
     CHECK(overview.renderScale == 8);
     CHECK(overview.markerWidthPixels == 3);
-    CHECK(overview.textureSource.scaleFromBaseXYZ ==
-          std::array<double, 3>{0.5, 0.5, 0.5});
+    CHECK(overview.textureSource.placement.scale == std::array<double, 3>{2, 2, 2});
     // A scale-only level is block-reduced: its voxel 0 is centred at base 0.5.
-    CHECK(overview.textureSource.offsetFromBaseXYZ ==
-          std::array<double, 3>{-0.25, -0.25, -0.25});
+    CHECK(overview.textureSource.placement.offset == std::array<double, 3>{0.5, 0.5, 0.5});
     const int expectedHeight = static_cast<int>((vc::lasagna::kLineViewCrossSampleCount - 1) *
         vc::lasagna::kLineViewCrossRowSpacingBaseVoxels * 0.5 + 1) * overview.renderScale;
     CHECK(overview.referenceTopShapeYX == std::array<int, 2>{expectedHeight, 72});

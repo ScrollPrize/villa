@@ -51,11 +51,8 @@ cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
 {
     cv::Mat_<cv::Vec3f> groupPoints = basePoints.clone();
     for (auto& point : groupPoints) {
-        for (size_t axis = 0; axis < 3; ++axis) {
-            point[axis] = static_cast<float>(
-                static_cast<double>(point[axis]) *
-                    source.scaleFromBaseXYZ[axis] +
-                source.offsetFromBaseXYZ[axis]);
+        for (int axis = 0; axis < 3; ++axis) {
+            point[axis] = static_cast<float>(source.fromBase(axis, static_cast<double>(point[axis])));
         }
     }
 
@@ -706,10 +703,10 @@ void validateTextureSource(const FiberReplayStripTextureSource& source)
             source.shapeZYX.begin(), source.shapeZYX.end(),
             [](int value) { return value <= 0; }) ||
         std::any_of(
-            source.scaleFromBaseXYZ.begin(), source.scaleFromBaseXYZ.end(),
+            source.placement.scale.begin(), source.placement.scale.end(),
             [](double value) { return !std::isfinite(value) || value <= 0.0; }) ||
         std::any_of(
-            source.offsetFromBaseXYZ.begin(), source.offsetFromBaseXYZ.end(),
+            source.placement.offset.begin(), source.placement.offset.end(),
             [](double value) { return !std::isfinite(value); })) {
         throw std::invalid_argument(
             "replay strip CT source metadata is invalid");
@@ -1045,13 +1042,9 @@ FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
         throw std::invalid_argument("replay strip CT volume must be a 3-D array");
     if (ct.meta.type.kind != 'u' || ct.meta.type.itemsize != 1)
         throw std::invalid_argument("replay strip CT volume must use uint8 voxels");
-    const auto fromBase = ct.placement.indexMapFrom({});
-    FiberReplayStripTextureSource source{ct.location, {}, {}, {}};
-    for (size_t axis = 0; axis < 3; ++axis) {
+    FiberReplayStripTextureSource source{ct.location, {}, ct.placement};
+    for (size_t axis = 0; axis < 3; ++axis)
         source.shapeZYX[axis] = static_cast<int>(ct.meta.shape[axis]);
-        source.scaleFromBaseXYZ[axis] = fromBase.scale[2 - axis];
-        source.offsetFromBaseXYZ[axis] = fromBase.offset[2 - axis];
-    }
     validateTextureSource(source);
     return source;
 }
@@ -1375,8 +1368,7 @@ cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
         std::vector<cv::Vec3d> points(count), directions(count, cv::Vec3d{1, 0, 0});
         for (size_t i = 0; i < count; ++i)
             for (int axis = 0; axis < 3; ++axis)
-                points[i][axis] = (coords.ptr<cv::Vec3f>()[begin + i][axis] -
-                    source.offsetFromBaseXYZ[axis]) / source.scaleFromBaseXYZ[axis] / workingToBaseScale;
+                points[i][axis] = source.toBase(axis, coords.ptr<cv::Vec3f>()[begin + i][axis]) / workingToBaseScale;
         std::vector<FiberPredictionSample> samples;
         predictions.sampleBatch(points, directions, 1, samples);
         if (samples.size() != count) throw std::runtime_error("invalid presence sample count");
@@ -1688,7 +1680,7 @@ FiberReplayInspection renderFiberReplayInspection(
                         const auto base = sample.pointBase + frame.horizontal * (frame.horizontalRadius * (2.0 * x / (w - 1) - 1))
                             + frame.vertical * (frame.verticalRadius * (2.0 * y / (h - 1) - 1));
                         for (int a = 0; a < 3; ++a)
-                            coords(y, x)[a] = float(base[a] * source.scaleFromBaseXYZ[a] + source.offsetFromBaseXYZ[a]);
+                            coords(y, x)[a] = float(source.fromBase(a, base[a]));
                     }
                     const auto label = station.failure
                         ? "R" + std::to_string(station.failure->index) + (station.role == "breakoff" ? "-" : "+")

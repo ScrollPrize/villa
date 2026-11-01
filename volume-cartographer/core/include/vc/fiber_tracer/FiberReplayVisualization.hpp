@@ -1,5 +1,6 @@
 #pragma once
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include <functional>
@@ -13,11 +14,15 @@ namespace vc::fiber_tracer {
 [[nodiscard]] FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json&);
 void writeFiberReplayTraceArtifacts(const std::filesystem::path&, const std::vector<cv::Vec3d>&,
     const FiberReplayTraceResult&, double normalThresholdBaseVoxels, const nlohmann::json& provenance);
+// The CT level textures are sampled from: its shape and where its indices sit relative to
+// base (level-0) coordinates (vcr::zarr::LevelPlacement, ZYX: base = scale * index + offset).
 struct FiberReplayStripTextureSource {
     std::string locator;
     std::array<int, 3> shapeZYX{};
-    std::array<double, 3> scaleFromBaseXYZ{};
-    std::array<double, 3> offsetFromBaseXYZ{};
+    vcr::zarr::LevelPlacement placement;
+    // Level index of a base coordinate along an XYZ axis, and back.
+    double fromBase(int xyzAxis, double base) const { return placement.fromLevel0(2 - xyzAxis, base); }
+    double toBase(int xyzAxis, double index) const { return placement.toLevel0(2 - xyzAxis, index); }
 };
 struct FiberReplayOverviewPanel {
     double progressFractionBegin = 0.0;
