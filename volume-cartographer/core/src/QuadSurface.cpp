@@ -553,10 +553,12 @@ cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) cons
     const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
-    if (!loc_valid_xy(*_points, {p[0], p[1]}))
+    const float xy[2] = {p[0], p[1]};
+    cv::Vec3f point;
+    pointSurface()->pointsAt(xy, 1, point.val, nullptr);
+    if (!std::isfinite(point[0]))
         return {-1,-1,-1};
-
-    return at_int((*_points), {p[0],p[1]});
+    return point;
 }
 
 cv::Vec3f QuadSurface::loc(const cv::Vec3f &ptr, const cv::Vec3f &offset)
@@ -730,7 +732,10 @@ cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
     ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
-    return grid_normal((*_points), p);
+    const float xy[2] = {p[0], p[1]};
+    cv::Vec3f point, normal;
+    pointSurface()->pointsAt(xy, 1, point.val, normal.val);
+    return normal;
 }
 
 cv::Vec3f QuadSurface::gridNormal(int row, int col) const
@@ -742,14 +747,27 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
         return {NAN, NAN, NAN};
 
-    // Recompute on every call instead of caching the full grid (~48 MB
-    // per surface). grid_normal() is cheap (bilinear tangents + cross).
-    if ((*_points)(row, col)[0] == -1.f) {
-        return {NAN, NAN, NAN};
+    const float xy[2] = {static_cast<float>(col), static_cast<float>(row)};
+    cv::Vec3f point, normal;
+    pointSurface()->pointsAt(xy, 1, point.val, normal.val);
+    return normal;
+}
+
+std::shared_ptr<const vcr::grid::Surface> QuadSurface::pointSurface() const
+{
+    const_cast<QuadSurface*>(this)->ensureLoaded();
+    std::lock_guard<std::mutex> lock(_cacheMutex);
+    if (!_pointSurface) {
+        std::vector<std::uint8_t> valid;
+        _pointSurface = std::make_shared<const vcr::grid::Surface>(gridVertices(valid, _points.get()), gridOptions());
     }
-    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col),
-                                           static_cast<float>(row),
-                                           0.0f));
+    return _pointSurface;
+}
+
+void QuadSurface::dropPointSurface() const
+{
+    std::lock_guard<std::mutex> lock(_cacheMutex);
+    _pointSurface.reset();
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
@@ -887,6 +905,7 @@ void QuadSurface::writeValidMask()
 
 void QuadSurface::invalidateCache()
 {
+    dropPointSurface();
     if (_points) {
         _bounds = {0, 0, _points->cols - 1, _points->rows - 1};
         _center = surfaceCenterFor(*_points, _scale);

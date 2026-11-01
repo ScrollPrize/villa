@@ -1,6 +1,8 @@
 // QuadSurface: multi-component surface, writeValidMask with non-empty image, save with bbox in meta.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <chrono>
+#include <cstdlib>
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -162,3 +164,72 @@ TEST_CASE("bbox stored in meta is read back via (path, json) ctor")
     fs::remove_all(root);
 }
 
+
+TEST_CASE("coord and normal follow edits made through the points, in place or replacing them")
+{
+    cv::Mat_<cv::Vec3f> points(8, 8);
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c) points(r, c) = cv::Vec3f(float(c), float(r), 5.f);
+    QuadSurface surface(points, {1.f, 1.f});
+    const auto at = [&](float c, float r) {
+        const cv::Vec3f surfacePoint(float(c) - surface.center()[0], float(r) - surface.center()[1], 0.f);
+        return std::pair{surface.coord(surface.pointer(), surfacePoint), surface.normal(surface.pointer(), surfacePoint)};
+    };
+    CHECK(at(3.5f, 3.5f).first == cv::Vec3f(3.5f, 3.5f, 5.f));
+    CHECK(std::abs(at(3.5f, 3.5f).second[2]) == doctest::Approx(1.f));
+
+    // Geometry edited in place.
+    for (int r = 3; r <= 4; ++r)
+        for (int c = 3; c <= 4; ++c) (*surface.rawPointsPtr())(r, c)[2] = 9.f;
+    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+
+    // Valid to invalid: no point, no normal; a patch away is untouched.
+    (*surface.rawPointsPtr())(3, 3) = cv::Vec3f(-1.f, -1.f, -1.f);
+    CHECK(at(3.5f, 3.5f).first == cv::Vec3f(-1.f, -1.f, -1.f));
+    CHECK_FALSE(std::isfinite(at(3.5f, 3.5f).second[0]));
+    CHECK(at(5.5f, 5.5f).first[2] == doctest::Approx(5.f));
+
+    // Invalid to valid, as an undo does.
+    (*surface.rawPointsPtr())(3, 3) = cv::Vec3f(3.f, 3.f, 9.f);
+    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+
+    // A piece boundary set later stops interpolation across it.
+    surface.setComponents({{0, 4}, {4, 8}});
+    CHECK(at(3.5f, 3.5f).first == cv::Vec3f(-1.f, -1.f, -1.f));
+    surface.setComponents({});
+    CHECK(at(3.5f, 3.5f).first[2] == doctest::Approx(9.f));
+
+    // Replaced, with a new size.
+    cv::Mat_<cv::Vec3f> smaller(4, 4);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) smaller(r, c) = cv::Vec3f(float(c), float(r), 7.f);
+    smaller.copyTo(*surface.rawPointsPtr());
+    surface.invalidateCache();
+    const auto replaced = at(1.5f, 1.5f).first;
+    CHECK(replaced == cv::Vec3f(1.5f, 1.5f, 7.f));
+}
+
+TEST_CASE("coord and normal cost, set VC_BENCH_POINT_SURFACE to print")
+{
+    if (!std::getenv("VC_BENCH_POINT_SURFACE")) return;
+    cv::Mat_<cv::Vec3f> points(2000, 2000);
+    for (int r = 0; r < 2000; ++r)
+        for (int c = 0; c < 2000; ++c) points(r, c) = cv::Vec3f(float(c), float(r), 5.f + float((r + c) % 7));
+    QuadSurface surface(points, {1.f, 1.f});
+    using Clock = std::chrono::steady_clock;
+    const auto microseconds = [](auto from) { return std::chrono::duration<double, std::micro>(Clock::now() - from).count(); };
+    (void)surface.coord(surface.pointer(), {0, 0, 0});
+    auto start = Clock::now();
+    float sum = 0;
+    for (int i = 0; i < 100000; ++i) sum += surface.coord(surface.pointer(), {float(i % 1000), 3.5f, 0})[2];
+    MESSAGE("coord: " << microseconds(start) / 100000 << " us per point " << sum);
+    start = Clock::now();
+    for (int i = 0; i < 100000; ++i) sum += surface.normal(surface.pointer(), {float(i % 1000), 3.5f, 0})[2];
+    MESSAGE("normal: " << microseconds(start) / 100000 << " us per point " << sum);
+    start = Clock::now();
+    for (int i = 0; i < 20; ++i) {
+        (*surface.rawPointsPtr())(5, 5)[2] += 1;
+        sum += surface.coord(surface.pointer(), {3.5f, 3.5f, 0})[2];
+    }
+    MESSAGE("coord after an edit, 2000x2000: " << microseconds(start) / 20 << " us " << sum);
+}

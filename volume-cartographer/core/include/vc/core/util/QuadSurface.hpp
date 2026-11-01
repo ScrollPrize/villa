@@ -397,10 +397,14 @@ public:
     void setComponents(std::vector<std::pair<int, int>> components)
     {
         _components = std::move(components);
+        dropPointSurface();
     }
 
-    virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
-    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
+    // The non-const accessors hand out the points to be edited, so they drop the
+    // vcr::grid::Surface that coord() and normal() use; it is rebuilt on the next call.
+    // Fetch the pointer again for each edit rather than keeping it across calls to them.
+    virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); dropPointSurface(); return *_points; }
+    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); dropPointSurface(); return _points.get(); }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
 
     // Grid iteration helpers
@@ -443,6 +447,10 @@ public:
     void writeValidMask();
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
+    // What coord(), normal() and gridNormal() evaluate; built on first use.
+    mutable std::shared_ptr<const vcr::grid::Surface> _pointSurface;
+    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> pointSurface() const;
+    void dropPointSurface() const;
     // Guards the validity mask's lazy construction and invalidation.
     mutable std::mutex _cacheMutex;
     cv::Vec2f _scale;
