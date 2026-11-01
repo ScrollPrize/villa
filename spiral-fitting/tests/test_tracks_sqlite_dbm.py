@@ -1,5 +1,5 @@
 import dbm
-import importlib.util
+import os
 import pickle
 import sqlite3
 from pathlib import Path
@@ -24,6 +24,7 @@ def write_sqlite_dbm(path, items):
     # Same single-table layout as CPython's Lib/dbm/sqlite3.py, written with
     # plain sqlite3 so the fixture also builds on Python < 3.13.
     connection = sqlite3.connect(path)
+    connection.execute('PRAGMA journal_mode = wal')  # like every store dbm.sqlite3 writes
     connection.execute('CREATE TABLE IF NOT EXISTS Dict (key BLOB UNIQUE NOT NULL, value BLOB NOT NULL)')
     connection.executemany('REPLACE INTO Dict (key, value) VALUES (CAST(? AS BLOB), CAST(? AS BLOB))', items)
     connection.commit()
@@ -56,14 +57,71 @@ class SQLiteTrackDBMTests(unittest.TestCase):
             self.assertEqual(len(loaded), 2)
             self.assertEqual(sorted(len(track) for track in loaded), [21, 21])
 
-    @unittest.skipUnless(importlib.util.find_spec('dbm.sqlite3'), 'needs dbm.sqlite3 (Python >= 3.13)')
-    def test_native_dbm_path_is_unchanged(self):
+    def test_sqlite_store_is_read_without_writing_beside_it(self):
+        # A reader of a WAL store otherwise creates -wal and -shm files next to it.
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
-            self.assertEqual(dbm.whichdb(str(path)), 'dbm.sqlite3')
-            with tracks.open_tracks_dbm(path) as database:
-                self.assertNotIsInstance(database, tracks._SQLiteTrackDBM)
-                self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+            with mock.patch.object(tracks.dbm, 'whichdb', return_value=''):
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+            self.assertEqual(sorted(os.listdir(temporary)), ['tracks.dbm'])
+
+    @unittest.skipIf(os.name != 'posix' or os.geteuid() == 0, 'needs a directory this user cannot write')
+    def test_sqlite_store_opens_in_a_read_only_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            os.chmod(temporary, 0o500)
+            try:
+                with mock.patch.object(tracks.dbm, 'whichdb', return_value=''):
+                    with tracks.open_tracks_dbm(path) as database:
+                        self.assertEqual(len(database), 2)
+            finally:
+                os.chmod(temporary, 0o700)
+
+    def test_recognized_sqlite_store_uses_the_read_only_reader(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            with (mock.patch.object(tracks.dbm, 'whichdb', return_value='dbm.sqlite3'),
+                  mock.patch.object(tracks.dbm, 'open', side_effect=AssertionError('native SQLite reader used'))):
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertIsInstance(database, tracks._SQLiteTrackDBM)
+                    self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+
+    def test_committed_wal_pages_are_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('PRAGMA wal_autocheckpoint = 0')
+                writer.execute('INSERT INTO Dict VALUES (?, ?)', (b'new', b'committed in WAL'))
+                writer.commit()
+                self.assertTrue(Path(str(path) + '-wal').exists())
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertEqual(database[b'new'], b'committed in WAL')
+                    self.assertEqual(len(database), 3)
+            finally:
+                writer.close()
+
+    def test_symlinked_store_keeps_committed_wal_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            alias = Path(temporary) / 'alias.dbm'
+            try:
+                alias.symlink_to(path)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f'file symlinks are unavailable: {exc}')
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('PRAGMA wal_autocheckpoint = 0')
+                writer.execute('INSERT INTO Dict VALUES (?, ?)', (b'new', b'committed in WAL'))
+                writer.commit()
+                self.assertTrue(Path(str(path) + '-wal').exists())
+                self.assertFalse(Path(str(alias) + '-wal').exists())
+                with tracks.open_tracks_dbm(alias) as database:
+                    self.assertEqual(database[b'new'], b'committed in WAL')
+                    self.assertEqual(len(database), 3)
+            finally:
+                writer.close()
 
 
 if __name__ == '__main__':

@@ -1,23 +1,27 @@
 #pragma once
 
 #include "VCSettings.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 
 #include <QDir>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QString>
 
 namespace vc3d {
 
+// Where VC3D keeps the projects it makes for the user (Open Data samples' among them).
+inline QString projectsDirectory()
+{
+    const auto directory = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+                               .filePath(QStringLiteral("projects"));
+    QDir().mkpath(directory);
+    return directory;
+}
+
 inline QString defaultNewProjectDirectory(QSettings& settings)
 {
-    const auto autosaveFile = VolumePkg::autosaveFile();
-    if (!autosaveFile.empty()) {
-        const auto directory = QString::fromStdString(autosaveFile.parent_path().string());
-        QDir().mkpath(directory);
-        if (!directory.isEmpty()) return directory;
-    }
-    return settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    const auto chosen = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    return chosen.isEmpty() ? projectsDirectory() : chosen;
 }
 
 } // namespace vc3d

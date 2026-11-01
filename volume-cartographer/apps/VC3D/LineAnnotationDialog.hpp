@@ -30,6 +30,7 @@ class QGraphicsPathItem;
 class QGraphicsRectItem;
 class QGraphicsSimpleTextItem;
 class QLabel;
+class QPushButton;
 class QPlainTextEdit;
 class QMdiArea;
 class QMdiSubWindow;
@@ -40,7 +41,6 @@ class QHBoxLayout;
 class QMenu;
 class QResizeEvent;
 class QTimer;
-class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
 class QSpinBox;
@@ -91,6 +91,10 @@ public:
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
+        // Unreviewed automatic pending links: the automatic palette (cyan,
+        // pink same-H/V), solid like the other link states.
+        QGraphicsPathItem* autoPendingBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvAutoPendingBranchControlPoints = nullptr;
         // Hollow yellow rings of kollesis-tagged points, drawn over whichever
         // fill (link state) the point keeps; an unlinked tagged point has no
         // fill at all.
@@ -122,10 +126,6 @@ public:
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,
                                   const CChunkedVolumeViewer::CameraState& camera);
-    bool setGeneratedRows(
-        const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
-        const CChunkedVolumeViewer::CameraState& camera,
-        const std::map<std::string, GeneratedOverlay>& overlays = {});
     // Takes the views by value: the caller hands its (large - all line
     // points, normals, branch polylines, strip map) struct over instead of
     // this dialog copying it a second time.
@@ -153,11 +153,15 @@ public:
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
-        std::function<QString(uint64_t)> fiberDisplayNameForId = {});
+        std::function<QString(uint64_t)> fiberDisplayNameForId = {},
+        uint64_t currentFiberId = 0);
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
     int extrapolationDistanceVx() const;
+    // Applied value of the "Break extrapolation" menu row (base voxels): the
+    // straight ray past a lone break point or a kollesis termination.
+    int breakExtrapolationDistanceVx() const;
     int maxControlPointExtrapolationDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
@@ -168,8 +172,6 @@ public:
         std::vector<std::pair<std::string, std::string>> options,
         const std::string& selectedLocation);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
-    void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
-    void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
     void setGeneratedBranchOverlayData(
         std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
         std::vector<std::vector<cv::Vec3f>> branchLinePoints,
@@ -182,9 +184,8 @@ public:
     void setGeneratedSideStripIntersectionProgress(const QString& stage,
                                                    size_t completed,
                                                    size_t total);
-    void setGeneratedSideStripIntersectionResult(size_t markerCount);
+    void setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers = 0);
     void setGeneratedSideStripIntersectionError();
-    void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     // blockInput=true covers the panes with the input-swallowing overlay
@@ -215,17 +216,20 @@ public:
                       const std::vector<std::string>& activeTags,
                       bool enabled);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    // A stored fiber opens read-only with an Enable editing button (disabled
+    // when canEdit is false); the fiber settings are locked meanwhile.
+    void setReadOnly(bool readOnly, bool canEdit = true);
     // Menu texts and the Fiber model combo label from the fiber-follow settings.
     void updateFiberFollowMenu();
     void setModelOnlySession(bool enabled);
     void setWorkspaceEmbedded(bool embedded);
-    bool workspaceEmbedded() const { return _workspaceEmbedded; }
     // Programmatic twin of the "current cut follows strip mouse" toggle.
     void setCutFollowEnabled(bool enabled);
     bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 
 signals:
     void volumeOverlayToggleRequested();
+    void editingRequested();
     void fiberWidthChanged(double baseVoxels);
     void controlDisplayAngleChanged(size_t controlIndex, double degrees);
     void controlDirectionChanged(size_t controlIndex, cv::Vec3f direction);
@@ -281,6 +285,14 @@ signals:
                                              size_t secondControlPointIndex,
                                              bool enabled);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
+    // "Link <current> and <other>" on a fiber-intersection X: the marker's
+    // fiber and point (viewer volume grid), the anchor on the open fiber's
+    // drawn line and the line revision it was computed on.
+    void generatedNearbyFiberLinkRequested(const std::string& surfaceName,
+                                           uint64_t fiberId,
+                                           cv::Vec3f intersectionPoint,
+                                           double anchorLinePosition,
+                                           uint64_t anchorLineRevision);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,
                                               uint64_t branchFiberId,
@@ -300,8 +312,6 @@ signals:
     void generatedControlPointBreakChangeRequested(const std::string& surfaceName,
                                                    size_t controlPointIndex,
                                                    bool enabled);
-    void generatedPredSnapPointRequested(const std::string& surfaceName,
-                                         cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();
@@ -316,6 +326,7 @@ signals:
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
     void extrapolationDistanceChanged(int distanceVx);
+    void breakExtrapolationDistanceChanged(int distanceVx);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -349,13 +360,23 @@ private:
     void applyLinkedCursorMirroringToPanes();
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
-    void setGeneratedOverlay(const std::string& surfaceName,
-                             CChunkedVolumeViewer* viewer,
-                             const GeneratedOverlay& overlay);
-    void applyGeneratedOverlay(const std::string& surfaceName,
-                               CChunkedVolumeViewer* viewer,
-                               const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
+    // The position of the open fiber's DRAWN line nearest a scene point of
+    // this pane, with the line revision it was computed on: a strip's centre
+    // row (the point's column), the side cut's windowed projection (the
+    // nearest drawn, non-tail segment), the current cut's one visible pass
+    // (the cut position). nullopt while the pane shows a held frame or when
+    // nothing of the line is drawn near the point.
+    std::optional<std::pair<double, uint64_t>> nearestVisibleLinePosition(
+        CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
+    // The side cut's overlay as updateGeneratedDynamicOverlaysFast draws it
+    // (the cross-slice overlay, the line windowed to half a wrap, the tail
+    // range from the plane-near controls), without the cursor marker; one
+    // builder for the refresh and for nearestVisibleLinePosition.
+    GeneratedOverlay sideCutOverlayFor(
+        const GeneratedViews& views,
+        const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+        double linePosition) const;
     // Coalesced entry point for the mouse-follow path: stores the latest line position and
     // applies it at most once per ~render tick via _lineUpdateTimer, so a burst of mouse-move
     // events collapses into a single (potentially O(N)) plane/overlay rebuild instead of one
@@ -367,7 +388,6 @@ private:
     void setCurrentLinePosition(double position,
                                 bool updateCurrentCutOverlay = true,
                                 bool forceApply = false);
-    void cancelControlPointPreviewAnimation();
     // Left/Right arrow panning between control points. One velocity integrator
     // (generatedArrowPanStep) drives it: a tap brakes into the first control
     // point ahead, a hold cruises through the intermediate ones and lands on the
@@ -399,7 +419,6 @@ private:
     void centerStripsOnLinePosition(double linePosition, bool includeVertical);
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
-    void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
     // Ctrl+Shift+wheel in the current cut: slide the cut plane straight along
     // its normal by the arclength the marker advances, WITHOUT re-posing it on
@@ -452,8 +471,6 @@ private:
     std::string applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
-    void clearControlPointContextPreview(const std::string& surfaceName,
-                                         CChunkedVolumeViewer* viewer);
     // Hover highlight of the strip target (control point or span) that a
     // Ctrl+right-click at the mouse would open the menu for.
     // `redraw` skips the unchanged-target shortcut: the static markers were
@@ -472,7 +489,6 @@ private:
     // The generated views' controls or position map changed: the index is
     // stale and so is any glow drawn from it.
     void invalidateStripContextIndex();
-    bool lineGeometryInFlight() const;
     vc3d::line_annotation::GeneratedOverviewGateState overviewGateState() const;
     // Returns the request's token; retirePendingPlacement(token) after the
     // synchronous request returns drops the entry if no publish consumed it.
@@ -495,7 +511,6 @@ private:
         const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
         uint64_t newLineRevision,
         double oldPosition) const;
-    GeneratedOverlay staticStripOverlay() const;
     GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
                                    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
                                    double linePosition,
@@ -514,9 +529,6 @@ private:
     cv::Vec3f interpolatedLineNormal(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
     bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const;
-    QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
-                                     QuadSurface* surface,
-                                     double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     bool handleKeyRelease(QKeyEvent* event);
     // Pushes line length, control dots, and the current-position marker to the
@@ -621,12 +633,16 @@ private:
     void updateFiberWidthCursor(CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint);
     void refreshFiberWidthCursors();
     QSpinBox* _extrapolationDistanceSpin = nullptr;
+    QSpinBox* _breakExtrapolationDistanceSpin = nullptr;
     // Values committed via the menu rows' Apply buttons; the spinboxes hold
     // uncommitted edits until then (and revert when the menu reopens).
     int _appliedInitialCenterlineLengthVx = 0;
     int _appliedExtrapolationDistanceVx = 0;
+    int _appliedBreakExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
+    QPushButton* _enableEditingButton = nullptr;
+    bool _readOnly = false;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
     QWidget* _fiberTraceStatus = nullptr;
@@ -821,7 +837,6 @@ private:
     // freshly built panes.
     QTimer* _linkedCursorMirrorTimer = nullptr;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
-    QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     // Arrow-key pan integrator. _arrowPanDirection is the travel direction and
     // stays set while a released tap coasts into its target; _arrowPanKeyHeld
     // only tracks the key. _arrowPanMinimumTarget is the first control point the
