@@ -3805,6 +3805,23 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool readCornerBoxWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::array<int64_t, 3>& originXYZ,
+        const std::array<int64_t, 3>& shapeXYZ,
+        double latticeSpacing,
+        std::vector<uint8_t>& interleaved) const
+    {
+        std::vector<const vc::lasagna::LasagnaChannelBinding*> bindings;
+        if (!groupedCornerBindingsWithNormals(normalSampler, bindings))
+            return false;
+        const double spacing = bindings.front()->spacing;
+        if (!(std::abs(latticeSpacing - spacing) <= 1e-9 * std::max(1.0, std::abs(spacing))))
+            throw std::runtime_error("corner box lattice spacing differs from the channels' grid");
+        vc::lasagna::readLasagnaChannelBox(bindings, originXYZ, shapeXYZ, interleaved);
+        return true;
+    }
+
     [[nodiscard]] bool visitCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,
@@ -4260,6 +4277,16 @@ bool FiberPredictionField::sampleCornerBatchWithNormals(
     FiberTraceProfile* profile) const
 {
     return impl_->sampleCornerBatchWithNormals(normalSampler, volumePoints, cornerScratch, profile);
+}
+
+bool FiberPredictionField::readCornerBoxWithNormals(
+    const vc::lasagna::LasagnaNormalSampler& normalSampler,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    double latticeSpacing,
+    std::vector<uint8_t>& interleaved) const
+{
+    return impl_->readCornerBoxWithNormals(normalSampler, originXYZ, shapeXYZ, latticeSpacing, interleaved);
 }
 
 bool FiberPredictionField::visitCornerBatchWithNormals(

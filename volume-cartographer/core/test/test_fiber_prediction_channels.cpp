@@ -7,6 +7,7 @@
 #include <vc_reader/zarr_write.hpp>
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -187,6 +188,48 @@ TEST_CASE("auxiliary scoring preserves the fused normal corner path") {
     CHECK(profile.predictionCornerSeconds>0);
     // One acknowledgement per chunk read: presence, nx, ny, two embeddings, width.
     CHECK(gateCalls==6);
+}
+
+TEST_CASE("a corner box holds the corner batch's first corners, read region by region") {
+    Fixture fixture;
+    const int n = 32;
+    std::mt19937_64 random(7);
+    const auto cube = [&](const std::string& name, bool nonzero) {
+        std::vector<uint8_t> values(size_t(n) * n * n);
+        for (auto& v : values) v = uint8_t(nonzero ? 1 + random() % 255 : random() % 256);
+        fs::remove_all(fixture.path / name);
+        auto writer = vcr::zarr::Writer::create(fixture.path / name, {.shape={n,n,n}, .chunks={16,16,16},
+                                                                      .dtype="|u1", .compressor=""});
+        writer.writeRegion({0,0,0}, {n,n,n}, values.data());
+        fixture.groups[name] = {{"zarr", name}, {"scaledown", 0}, {"channels", {name}}};
+    };
+    for (const char* name : {"presence", "nx", "ny", "grad_mag"}) cube(name, name == std::string("grad_mag"));
+    const auto dataset = fixture.dataset();
+    FiberPredictionField field(dataset);
+    vc::lasagna::LasagnaNormalSampler normals(dataset);
+    const std::array<int64_t, 3> origin{3, 5, 2}, shape{24, 20, 28};
+    std::vector<cv::Vec3f> points;
+    for (int64_t z = 0; z < shape[2]; ++z) for (int64_t y = 0; y < shape[1]; ++y) for (int64_t x = 0; x < shape[0]; ++x)
+        points.emplace_back(float(origin[0] + x), float(origin[1] + y), float(origin[2] + z));
+    const auto start = std::chrono::steady_clock::now();
+    vc::lasagna::LasagnaCornerBatch corners;
+    REQUIRE(field.sampleCornerBatchWithNormals(normals, points, &corners, nullptr));
+    const auto cornersMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const auto boxStart = std::chrono::steady_clock::now();
+    std::vector<uint8_t> box;
+    REQUIRE(field.readCornerBoxWithNormals(normals, origin, shape, 1.0, box));
+    const auto boxMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - boxStart).count();
+    MESSAGE(points.size() << " voxels x 6 channels: corner batch " << cornersMs << " ms, box read " << boxMs << " ms");
+    REQUIRE(corners.values.size() == 6);
+    REQUIRE(box.size() == points.size() * 6);
+    bool same = true;
+    for (size_t i = 0; i < points.size() && same; ++i) {
+        same = corners.valid[i] != 0;
+        for (size_t c = 0; c < 6 && same; ++c) same = box[i * 6 + c] == corners.values[c][i][0];
+    }
+    CHECK(same);
+    CHECK_THROWS(field.readCornerBoxWithNormals(normals, origin, shape, 2.0, box));  // another lattice
+    CHECK_THROWS(field.readCornerBoxWithNormals(normals, {20, 0, 0}, {16, 4, 4}, 1.0, box));  // leaves the grid
 }
 
 TEST_CASE("readiness gates exactly the chunks a read touches") {

@@ -110,26 +110,25 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             origin[a]=int(std::floor((out->lo[a]/scale-margin)/spacing));
             shape[a]=int(std::ceil((out->hi[a]/scale+margin)/spacing))-origin[a]+1;
         }
+        // The six channels over the box in one region read each, [z][y][x][channel]; the
+        // lattice is the channels' own grid, so a spacing or bounds mismatch throws.
         std::vector<unsigned char> byteValues;std::vector<float> widthValues;
-        byteValues.reserve(size_t(shape[0])*shape[1]*shape[2]*6);
+        try {
+            if(!field->readCornerBoxWithNormals(*normalField,{origin[0],origin[1],origin[2]},{shape[0],shape[1],shape[2]},spacing,byteValues))
+                throw std::runtime_error("GPU fixture requires aligned native corner grids");
+        } catch(const std::out_of_range&) {
+            throw std::runtime_error("GPU fixture lattice outside volume");
+        }
+        if(byteValues.size()!=size_t(shape[0])*shape[1]*shape[2]*6)
+            throw std::runtime_error("GPU fixture expects six channels");
+        // Widths keep their rule: interpolated per lattice point, zero-presence corners excluded.
         widthValues.reserve(size_t(shape[0])*shape[1]*shape[2]);
-        {
-
         for(int z=0;z<shape[2];++z) {
             std::vector<cv::Vec3f> points;
             for(int y=0;y<shape[1];++y) for(int x=0;x<shape[0];++x)
                 points.emplace_back((origin[0]+x)*spacing,(origin[1]+y)*spacing,(origin[2]+z)*spacing);
-            vc::lasagna::LasagnaCornerBatch corners;
-            if(!field->sampleCornerBatchWithNormals(*normalField,points,&corners,nullptr))
-                throw std::runtime_error("GPU fixture requires aligned native corner grids");
             std::vector<float> widths;field->sampleWidths(points,widths);
-            for(size_t i=0;i<points.size();++i) {
-                if(!corners.valid[i] || cv::norm(corners.fractionsXYZ[i])>1e-6)
-                    throw std::runtime_error("GPU fixture lattice mismatch/outside volume");
-                for(int channel=0;channel<6;++channel) byteValues.push_back(corners.values[channel][i][0]);
-            }
             widthValues.insert(widthValues.end(),widths.begin(),widths.end());
-        }
         }
         Json seeds=Json::array();for(const auto& seed:gpuSeeds) if(!seed.is_null()) seeds.push_back(seed);
         Json meta={{"seeds",seeds},{"origin",origin},{"shape_xyz",shape},{"spacing",spacing},

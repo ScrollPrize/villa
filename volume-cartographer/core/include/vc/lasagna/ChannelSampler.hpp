@@ -80,6 +80,16 @@ struct LasagnaCornerBatch {
     std::vector<uint8_t> valid;
 };
 
+// The values of `bindings` (which share one sampling grid) at every voxel of the box
+// [originXYZ, originXYZ + shapeXYZ) of that grid, interleaved as [z][y][x][binding]
+// bytes (a float32 channel as its byte values): one region read per binding. Throws when
+// the box leaves the grid.
+void readLasagnaChannelBox(
+    const std::vector<const LasagnaChannelBinding*>& bindings,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& interleaved);
+
 using LasagnaCornerPointVisitor = void (*)(
     void* context,
     size_t pointIndex,

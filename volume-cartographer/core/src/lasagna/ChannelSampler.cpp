@@ -455,6 +455,49 @@ void sampleLasagnaChannelCornerBatch(
     }
 }
 
+void readLasagnaChannelBox(
+    const std::vector<const LasagnaChannelBinding*>& bindings,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& interleaved)
+{
+    interleaved.clear();
+    if (bindings.empty())
+        return;
+    for (const auto* binding : bindings) {
+        if (binding == nullptr || !sameLasagnaSamplingGrid(*bindings.front(), *binding))
+            throw std::invalid_argument("grouped box reads must share one spatial grid");
+    }
+    for (int axis = 0; axis < 3; ++axis)
+        if (originXYZ[axis] < 0 || shapeXYZ[axis] <= 0 ||
+            originXYZ[axis] + shapeXYZ[axis] > int64_t(bindings.front()->shapeZYX[2 - axis]))
+            throw std::out_of_range("Lasagna channel box leaves the sampling grid");
+    const size_t voxels = size_t(shapeXYZ[0]) * size_t(shapeXYZ[1]) * size_t(shapeXYZ[2]);
+    interleaved.resize(voxels * bindings.size());
+    std::vector<uint8_t> bytes;
+    std::vector<float> floats;
+    for (size_t b = 0; b < bindings.size(); ++b) {
+        const auto& binding = *bindings[b];
+        vcr::Index start{originXYZ[2], originXYZ[1], originXYZ[0]};
+        vcr::Index size{shapeXYZ[2], shapeXYZ[1], shapeXYZ[0]};
+        if (binding.packed) {
+            start.insert(start.begin(), int64_t(binding.channelIndex));
+            size.insert(size.begin(), 1);
+        }
+        if (binding.float32) {
+            floats.resize(voxels);
+            binding.array->read_many({start}, {size}, {reinterpret_cast<uint8_t*>(floats.data())}, vcr::Array::Bounds::Strict);
+            for (size_t i = 0; i < voxels; ++i)
+                interleaved[i * bindings.size() + b] = byteValue(floats[i]);
+        } else {
+            bytes.resize(voxels);
+            binding.array->read_many({start}, {size}, {bytes.data()}, vcr::Array::Bounds::Strict);
+            for (size_t i = 0; i < voxels; ++i)
+                interleaved[i * bindings.size() + b] = bytes[i];
+        }
+    }
+}
+
 void visitLasagnaChannelCorners(
     const std::vector<const LasagnaChannelBinding*>& bindings,
     const std::vector<cv::Vec3f>& volumePoints,

@@ -407,6 +407,16 @@ public:
         void* visitorContext,
         vc::lasagna::LasagnaCornerPointVisitor visitor,
         FiberTraceProfile* profile) const;
+    // The same channels at every voxel of a box of the shared sampling grid, interleaved
+    // as [z][y][x][channel] bytes, in one region read per channel; `latticeSpacing` is the
+    // working-unit spacing the caller laid its lattice at and must be the grid's. False
+    // when the channels do not share one grid.
+    [[nodiscard]] bool readCornerBoxWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::array<int64_t, 3>& originXYZ,
+        const std::array<int64_t, 3>& shapeXYZ,
+        double latticeSpacing,
+        std::vector<uint8_t>& interleaved) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
