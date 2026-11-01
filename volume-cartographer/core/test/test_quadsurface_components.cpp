@@ -111,25 +111,7 @@ TEST_CASE("components-meta ranges are clamped to the grid and empty ones ignored
     fs::remove_all(root);
 }
 
-TEST_CASE("writeValidMask with a non-empty image writes a multi-page TIFF")
-{
-    auto root = tmpDir("vmask_multi");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(8, 8), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.ensureLoaded();
-    qs.path = segDir;
-    cv::Mat extra(8, 8, CV_8UC1, cv::Scalar(99));
-    qs.writeValidMask(extra);
-    // Multi-page mask.tif should exist.
-    CHECK(fs::exists(segDir / "mask.tif"));
-    fs::remove_all(root);
-}
-
-TEST_CASE("writeValidMask with empty image writes a single-page TIFF")
+TEST_CASE("writeValidMask writes a single-page TIFF")
 {
     auto root = tmpDir("vmask_single");
     auto segDir = root / "seg";

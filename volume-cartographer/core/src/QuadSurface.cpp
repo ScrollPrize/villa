@@ -13,7 +13,6 @@
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/imgcodecs.hpp>
 
 #include <array>
 #include <cstdlib>
@@ -918,25 +917,16 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     return mask;
 }
 
-void QuadSurface::writeValidMask(const cv::Mat& img)
+void QuadSurface::writeValidMask()
 {
     if (path.empty()) {
         return;
     }
     std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
-    std::filesystem::path maskPath = path / "mask.tif";
-    cv::Mat_<uint8_t> mask = validMask();
-
-    if (img.empty()) {
-        const cv::Mat stored = mask.isContinuous() ? cv::Mat(mask) : mask.clone();
-        auto options = tiffOptions(dpi_);
-        options.compression = "lzw";
-        options.tile = std::array<int, 2>{1024, 1024};
-        vcr::sources::writeTiff(maskPath, stored.data, "|u1", stored.rows, stored.cols, 1, options);
-    } else {
-        std::vector<cv::Mat> layers = {mask, img};
-        cv::imwritemulti(maskPath.string(), layers);
-    }
+    auto options = tiffOptions(dpi_);
+    options.compression = "lzw";
+    options.tile = std::array<int, 2>{1024, 1024};
+    vc::core::util::writeTiffMat(path / "mask.tif", validMask(), options);
 }
 
 void QuadSurface::invalidateCache()

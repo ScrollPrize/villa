@@ -440,7 +440,7 @@ public:
     cv::Mat_<uint8_t> validMask() const;
 
     // Write validity mask to path/mask.tif. If img is provided, writes multi-layer TIFF.
-    void writeValidMask(const cv::Mat& img = cv::Mat());
+    void writeValidMask();
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
     // Guards the validity mask's lazy construction and invalidation.

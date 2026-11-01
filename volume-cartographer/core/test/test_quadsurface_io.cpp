@@ -134,19 +134,3 @@ TEST_CASE("channel files round trip at their stored depth and colour order")
     REQUIRE(readGenerations.type() == CV_16UC1);
     CHECK(readGenerations.at<uint16_t>(3, 3) == 4000);
 }
-
-TEST_CASE("a mask with an image page reads its first page")
-{
-    TmpSegDir t;
-    auto pts = grid();
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.save(t.segDir.string());
-    QuadSurface loaded(t.segDir);
-    cv::Mat image(16, 16, CV_8UC1, cv::Scalar(77));
-    loaded.writeValidMask(image);
-    QuadSurface reader(t.segDir);
-    const cv::Mat mask = reader.channel("mask", SURF_CHANNEL_NORESIZE);
-    REQUIRE(mask.type() == CV_8UC1);
-    REQUIRE(mask.rows == 16);
-    CHECK(mask.at<uint8_t>(3, 3) == 255);
-}
