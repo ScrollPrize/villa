@@ -295,6 +295,17 @@ std::optional<fs::path> vc3dCacheRoot()
     const char* configured = std::getenv("VC3D_CONFIG_DIR");
     const char* home = std::getenv("HOME");
     const fs::path configDir = configured && *configured ? fs::path(configured) : fs::path(home ? home : "") / ".VC3D";
+    // VC3D's precedence: cache.json (an explicit host override, used whether or not the
+    // directory exists yet: VC3D creates it), then VC3D.ini's remote_cache_dir, then a
+    // provisioned mount, then ~/.VC3D/remote_cache, the last three only where they exist.
+    if (const auto config = readJson(configDir / "cache.json")) {
+        if (!config->is_object() || config->value("version", 0) != 1)
+            throw std::invalid_argument("unsupported VC3D cache configuration version in " + (configDir / "cache.json").string());
+        const fs::path root(config->at("root").get<std::string>());
+        if (root.empty() || !root.is_absolute())
+            throw std::invalid_argument("VC3D global cache root must be absolute: " + (configDir / "cache.json").string());
+        return root.lexically_normal();
+    }
     std::vector<fs::path> candidates;
     std::ifstream ini(configDir / "VC3D.ini");
     std::string line, section;

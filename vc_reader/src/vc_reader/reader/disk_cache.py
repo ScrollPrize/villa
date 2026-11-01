@@ -37,11 +37,13 @@ vc3d_volume_id = _reader.vc3d_volume_id
 
 
 def vc3d_cache_root() -> Path | None:
-    """VC3D's remote cache root, resolved the way VC3D resolves it; None if it does not exist.
+    """VC3D's remote cache root, resolved the way VC3D resolves it.
 
-    ``[viewer] remote_cache_dir`` in ``$VC3D_CONFIG_DIR/VC3D.ini`` (default
-    ``~/.VC3D/VC3D.ini``), else ``/volpkgs/remote_cache``,
-    ``/ephemeral/remote_cache``, ``~/.VC3D/remote_cache``.
+    ``{"version": 1, "root": "/absolute/path"}`` in ``$VC3D_CONFIG_DIR/cache.json``
+    (default ``~/.VC3D/cache.json``; malformed raises), created or not; else the first
+    that exists of ``[viewer] remote_cache_dir`` in ``VC3D.ini`` beside it,
+    ``/volpkgs/remote_cache``, ``/ephemeral/remote_cache`` and ``~/.VC3D/remote_cache``;
+    None when none does.
     """
     root = _reader.vc3d_cache_root()
     return Path(root) if root is not None else None

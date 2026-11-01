@@ -126,7 +126,9 @@ MetadataReader metadataReader(const Access& access, int connections = 4);
 
 // VC3D's cache directory name for a remote volume: <last path part>-<fnv1a64 hex>.
 std::string vc3dVolumeId(std::string url);
-// VC3D's remote cache root as VC3D resolves it; nullopt if it does not exist.
+// VC3D's remote cache root as VC3D resolves it: $VC3D_CONFIG_DIR/cache.json (default
+// ~/.VC3D/cache.json; throws when malformed), else VC3D.ini's remote_cache_dir, a
+// provisioned mount or ~/.VC3D/remote_cache where one exists; nullopt otherwise.
 std::optional<std::filesystem::path> vc3dCacheRoot();
 // A new VC3D cache directory for a volume (opened through OpenOptions::vc3dVolumeDir),
 // storing chunks as Delta3D when asked. An existing directory keeps its format.

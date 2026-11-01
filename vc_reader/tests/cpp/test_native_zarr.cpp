@@ -519,6 +519,28 @@ void remote(const fs::path& root, const std::vector<uint16_t>& v)
 }
 }  // namespace
 
+// vc3dCacheRoot resolves as VC3D does: cache.json first, then the INI, then what exists.
+void vc3dRoot(const fs::path& root)
+{
+    const auto config = root / "vc3d-config";
+    fs::create_directories(config);
+    setenv("VC3D_CONFIG_DIR", config.c_str(), 1);
+    struct Unset { ~Unset() { unsetenv("VC3D_CONFIG_DIR"); } } unset;
+    const auto iniRoot = root / "ini-cache";
+    fs::create_directories(iniRoot);
+    write_text(config / "VC3D.ini", "[viewer]\nremote_cache_dir=" + iniRoot.string() + "\n");
+    require(vcr::zarr::vc3dCacheRoot() == iniRoot, "the INI's remote_cache_dir");
+    const auto configured = root / "configured-cache" / "not-created";
+    write_text(config / "cache.json", "{\"version\":1,\"root\":\"" + configured.string() + "\"}");
+    require(vcr::zarr::vc3dCacheRoot() == configured.lexically_normal(), "cache.json beats the INI, created or not");
+    write_text(config / "cache.json", "{\"version\":2,\"root\":\"" + configured.string() + "\"}");
+    must_fail([] { vcr::zarr::vc3dCacheRoot(); }, "an unsupported cache.json version");
+    write_text(config / "cache.json", "{\"version\":1,\"root\":\"relative\"}");
+    must_fail([] { vcr::zarr::vc3dCacheRoot(); }, "a relative cache.json root");
+    fs::remove(config / "cache.json");
+    require(vcr::zarr::vc3dCacheRoot() == iniRoot, "without cache.json the INI again");
+}
+
 int main(int argc, char** argv)
 {
     if (const int status = sftp_fixture::run_as_ssh(argc, argv); status >= 0)
@@ -539,6 +561,7 @@ int main(int argc, char** argv)
         metadata();
         localShards(root);
         local(root, v);
+        vc3dRoot(root);
         sparseLevels(root);
         levelPlacement(root);
         if (!sftp_fixture::install(root)) {
