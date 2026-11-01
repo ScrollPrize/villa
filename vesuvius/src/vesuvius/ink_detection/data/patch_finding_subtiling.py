@@ -118,9 +118,11 @@ def find_segment_patches(
     tile_size = size if finding.tile_size is None else finding.tile_size
     default_stride = int(size * finding.overlap)
     stride = default_stride if finding.stride is None else finding.stride
+    supervision_plane = np.asarray(supervision[surface])
+    inklabels_plane = np.asarray(inklabels[surface])
     _, xyxys, _ = build_patch_index(
-        inklabels[surface],
-        supervision[surface],
+        inklabels_plane,
+        supervision_plane,
         size=size,
         tile_size=tile_size,
         stride=stride,
@@ -138,8 +140,7 @@ def find_segment_patches(
             int(y1) + patch_size[1],
             int(x1) + patch_size[2],
         )
-        supervision_patch = supervision[
-            surface,
+        supervision_patch = supervision_plane[
             int(y1) : int(y1) + patch_size[1],
             int(x1) : int(x1) + patch_size[2],
         ]
@@ -165,8 +166,7 @@ def find_segment_patches(
                     supervision_mask_override=segment.validation_mask,
                 )
             )
-        label_patch = inklabels[
-            surface,
+        label_patch = inklabels_plane[
             int(y1) : int(y1) + patch_size[1],
             int(x1) : int(x1) + patch_size[2],
         ]
