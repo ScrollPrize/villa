@@ -23,16 +23,19 @@ function(vc_spiral_module target source output_name)
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc_spiral"
     )
     target_compile_features(${target} PRIVATE cxx_std_23)
+    if(OpenMP_CXX_FOUND)
+        # On MSVC, FindOpenMP selects /openmp: the OpenMP 2.0 runtime, vcomp.
+        # The kernels use only 2.0 constructs (parallel for, +, || and the
+        # by-hand min/max in resample_tracks), so they build and run in
+        # parallel there too, and vcomp coexists with the libiomp5md that
+        # torch's Windows wheels load. /openmp:llvm is deliberately not used:
+        # it brings a second Intel-style runtime (OMP Error #15 at import)
+        # and miscompiled atomic capture on MSVC 14.44 (#1633).
+        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     if(MSVC)
-        # No OpenMP here: MSVC's 2.0 mode rejects the atomic capture and
-        # min/max constructs these kernels use, and /openmp:llvm links a
-        # second OpenMP runtime beside the libiomp5md that torch's Windows
-        # wheels load, which aborts at import (OMP Error #15). The kernels
-        # build serial, the documented no-OpenMP fallback.
         # MSVC's <cmath> only defines M_PI behind this macro.
         target_compile_definitions(${target} PRIVATE _USE_MATH_DEFINES)
-    elseif(OpenMP_CXX_FOUND)
-        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
     endif()
     install(TARGETS ${target}
         LIBRARY DESTINATION vc_spiral
