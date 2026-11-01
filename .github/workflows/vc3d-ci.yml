@@ -9,6 +9,8 @@ on:
     branches: [main]
     paths:
       - 'volume-cartographer/**'
+      - 'vc_object_store/**'
+      - 'vc_reader/**'
       - '.github/workflows/vc3d-ci.yml'
 
 permissions:
@@ -40,19 +42,27 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
             vc:
               - 'volume-cartographer/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
               - '.github/workflows/vc3d-macos.yml'
             test_core:
@@ -65,6 +75,8 @@ jobs:
               - 'volume-cartographer/apps/VC3D/**'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             test_specialized:
               - 'volume-cartographer/CMakeLists.txt'
@@ -76,6 +88,8 @@ jobs:
               - 'volume-cartographer/apps/VC3D/**'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             vc3d:
               - 'volume-cartographer/CMakeLists.txt'
@@ -87,6 +101,8 @@ jobs:
               - 'volume-cartographer/apps/VC3D/**'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             cli:
               - 'volume-cartographer/CMakeLists.txt'
@@ -97,10 +113,11 @@ jobs:
               - 'volume-cartographer/core/**'
               - 'volume-cartographer/apps/CMakeLists.txt'
               - 'volume-cartographer/apps/src/**'
-              - 'volume-cartographer/apps/diffusion/**'
-              - 'volume-cartographer/apps/VC3D/FiberSliceGeometry.*'
+              - 'volume-cartographer/apps/VC3D/FiberLineGeometry.*'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
               - '.github/workflows/vc3d-ci.yml'
             flatboi:
               - 'volume-cartographer/CMakeLists.txt'
@@ -145,19 +162,25 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -173,7 +196,7 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+            -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-core --target vc_test_core --parallel 4
           ctest --test-dir build/ci-fast-core --output-on-failure \
             --parallel 4 -L '^vc-core$'
@@ -201,19 +224,25 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -228,7 +257,7 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+            -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-specialized --target vc_test_specialized --parallel 4
           ctest --test-dir build/ci-fast-specialized --output-on-failure \
             --parallel 4 -L '^vc-specialized$'
@@ -252,19 +281,25 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       # Keep this until the next published dependency image includes the
       # valgrind entry in scripts/install_build_deps.sh.
       - name: Install Valgrind profiler
@@ -281,7 +316,7 @@ jobs:
             -DCMAKE_Fortran_COMPILER=flang \
             -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
             -DVC_RUN_RENDER_BENCHMARKS=ON \
-            -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
+            -DVC_BUILD_APPS=OFF \
             -DVC_BUILD_FLATBOI=OFF
       - name: Verify fixture and native parallel execution
         working-directory: volume-cartographer
@@ -331,19 +366,25 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -357,11 +398,15 @@ jobs:
             -DCMAKE_Fortran_COMPILER=flang \
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
-            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
-            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+            -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
+            -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
           QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
             --vc3d build/ci-fast-vc3d/bin/VC3D
+          # VC_TESTING compiles VC3D's --test-object-store entry point; the
+          # test shards build without apps, so the controller test runs here.
+          ctest --test-dir build/ci-fast-vc3d --output-on-failure \
+            -R '^object_store_vc3d_controller$'
           sccache --show-stats
 
   cli-compile:
@@ -386,19 +431,25 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -413,7 +464,7 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
-            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+            -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-cli --target vc_cli_all --parallel 4
           sccache --show-stats
       - name: Test renderer file-log cleanup
@@ -451,23 +502,29 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
+      - name: Install SQLite and OpenSSL headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
-      - name: Compile Flatboi and PaStiX
+      - name: Build and test Flatboi and PaStiX
         working-directory: volume-cartographer
         run: |
           sccache --zero-stats
@@ -478,8 +535,9 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=OFF -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=ON
-          cmake --build build/ci-fast-flatboi --target flatboi --parallel 4
+            -DVC_BUILD_FLATBOI=ON \
+            -DFLATBOI_BUILD_SLIM_TESTS=ON
+          ninja -C build/ci-fast-flatboi flatboi check_slim_assembly -j4
           sccache --show-stats
 
   mcp-test:
@@ -495,13 +553,19 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -525,11 +589,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
+      AGENTS_AGENT_MODE: '1'
+      AGENTS_ALLOW_INSTALL: '1'
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-native-v1
     strategy:
       fail-fast: false
       matrix:
@@ -541,50 +607,27 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         with:
-          sparse-checkout: volume-cartographer
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
       - name: Retry checkout Villa
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         timeout-minutes: 2
         with:
-          sparse-checkout: volume-cartographer
-
-      - name: Checkout VC3D dependencies
-        id: checkout_deps
-        uses: actions/checkout@v4
-        timeout-minutes: 2
-        continue-on-error: true
-        with:
-          repository: ScrollPrize/vc3d-deps
-          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
-          path: vc3d-deps
-      - name: Retry checkout VC3D dependencies
-        if: steps.checkout_deps.outcome == 'failure'
-        uses: actions/checkout@v4
-        timeout-minutes: 2
-        with:
-          repository: ScrollPrize/vc3d-deps
-          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
-          path: vc3d-deps
-
-      - uses: oras-project/setup-oras@v1
-
-      - name: Restore prebuilt Homebrew dependencies
-        env:
-          GHCR_TOKEN: ${{ github.token }}
-        run: |
-          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
-          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
-          "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
-            "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
+          sparse-checkout: |
+            volume-cartographer
+            vc_object_store
+            vc_reader
 
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
 
-      - name: Configure + build
-        run: volume-cartographer/scripts/build_macos.sh --sccache
+      - name: Install Homebrew dependencies + build
+        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache
 
       - uses: actions/setup-python@v5
         with:

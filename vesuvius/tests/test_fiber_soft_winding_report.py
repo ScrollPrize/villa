@@ -20,7 +20,7 @@ def test_stats_signed_vs_absolute():
 def test_saved_report_orientation_gauge_and_losses(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_soft_winding_report import run
     root=tmp_path/'solve';root.mkdir()
-    identity=dict(source_id=np.array([1,2]),start=np.zeros(2),end=np.ones(2),family=np.array([0,1]))
+    identity=dict(source_id=np.array(['00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002']),start=np.zeros(2),end=np.ones(2),family=np.array([0,1]))
     d=dict(identity,i=np.array([0,1]),j=np.array([1,0]),ds_a=np.zeros(2),ds_b=np.zeros(2),
            sign=np.array([1.,-1.]),distance=np.array([.5,.5]),parallel=np.zeros(2,dtype=bool))
     np.savez(root/'tensors.npz',**d)

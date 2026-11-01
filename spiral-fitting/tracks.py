@@ -23,6 +23,7 @@ from tqdm import tqdm
 import prefetch
 from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
 from spiral_progress import progress_or_null
+from service_http import sha256_file
 from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
@@ -38,6 +39,7 @@ TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
 TRACK_STORE_MAGIC = b'VCTRK01\0'
+_DB_DIGEST_MEMO = {}
 
 
 def _load_native_track_crossings():
@@ -207,7 +209,7 @@ def _is_sqlite_dbm(path):
 
 
 class _SQLiteTrackDBM:
-    """Read-only view of a dbm.sqlite3 store for interpreters without dbm.sqlite3.
+    """Read-only view of a dbm.sqlite3 store, independent of interpreter version.
 
     Uses the same single-table schema as CPython's Lib/dbm/sqlite3.py
     (``Dict(key BLOB, value BLOB)``) and only the read operations the track
@@ -216,7 +218,14 @@ class _SQLiteTrackDBM:
 
     def __init__(self, path):
         import sqlite3
-        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        # Complete, checkpointed stores need no reader-created sidecars. An
+        # existing WAL may hold committed pages, so retain normal SQLite
+        # locking and WAL reads while it is present.
+        # SQLite opens a symlink's target; check that target's WAL as well.
+        path = Path(path).resolve()
+        uri = path.as_uri() + '?mode=ro'
+        if not Path(str(path) + '-wal').exists():
+            uri += '&immutable=1'
         self._connection = sqlite3.connect(uri, uri=True)
 
     def keys(self):
@@ -245,9 +254,9 @@ class _SQLiteTrackDBM:
 
 
 def open_tracks_dbm(path):
-    """Open a tracks DBM read-only, including SQLite-backed stores on Python < 3.13."""
+    """Open a tracks DBM read-only, including SQLite-backed stores on every Python version."""
     text = os.fspath(path)
-    if not dbm.whichdb(text) and _is_sqlite_dbm(text):
+    if _is_sqlite_dbm(text):
         return _SQLiteTrackDBM(text)
     return dbm.open(text, 'r')
 
@@ -320,6 +329,49 @@ def _db_signatures_match(stored, expected):
     except (TypeError, ValueError):
         return False                        # malformed metadata (e.g. null entries): treat as stale
     return True
+
+
+def _tracks_db_digest(path, signature):
+    """Hash the backing files listed in a ``(name, size, mtime_ns)`` signature.
+
+    Returns ``{name: 'sha256:<hex>'}``, or ``None`` if a file no longer has
+    the size and mtime recorded in ``signature`` once it has been read. Each
+    file is hashed at most once per process for a given path, size and mtime.
+    """
+    folder = Path(normalize_tracks_dbm_path(path)).parent
+    digests = {}
+    for name, size, mtime_ns in signature:
+        file_path = folder / name
+        key = (os.fspath(file_path.resolve()), int(size), int(mtime_ns))
+        if key not in _DB_DIGEST_MEMO:
+            digest = sha256_file(file_path)
+            stat = file_path.stat()
+            if (stat.st_size, stat.st_mtime_ns) != key[1:]:
+                return None
+            _DB_DIGEST_MEMO[key] = 'sha256:' + digest
+        digests[name] = _DB_DIGEST_MEMO[key]
+    return digests
+
+
+def _db_contents_match(stored, stored_digest, path, expected):
+    """Whether a DBM that fails ``_db_signatures_match`` still has the same bytes.
+
+    Copies and downloads that stamp a new mtime (``cp``, ``curl`` without
+    ``-R``, Python ``requests``) fail the mtime check although the files are
+    identical. When the sidecar recorded content digests, names and sizes must
+    match and every backing file must hash the same. Size alone is not enough:
+    SQLite-backed DBMs (``dbm.sqlite3``, Python >= 3.14) rarely change size
+    when edited. Sidecars without digests keep the mtime rule.
+    """
+    if stored_digest is None or not isinstance(stored, list):
+        return False
+    try:
+        if [[str(name), int(size)] for name, size, _mtime in stored] != [
+                [name, size] for name, size, _mtime in expected]:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _tracks_db_digest(path, expected) == stored_digest
 
 
 def track_store_path(path):
@@ -439,9 +491,11 @@ def write_packed_track_store(
                 track_count, point_count, 0, 0, 0, 0))
             stream.flush()
             os.fsync(stream.fileno())
+        signature = _tracks_db_signature(logical)
         metadata = {
             'version': TRACK_STORE_VERSION,
-            'source_db_signature': [list(item) for item in _tracks_db_signature(logical)],
+            'source_db_signature': [list(item) for item in signature],
+            'source_db_digest': _tracks_db_digest(logical, signature),
             'track_count': track_count,
             'point_count': point_count,
         }
@@ -480,7 +534,10 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             raise ValueError('source DBM changed after the packed store was written')
         result = native.load(
             os.fspath(store),
@@ -513,7 +570,10 @@ def _packed_store_if_current(path):
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
@@ -1685,6 +1745,7 @@ def write_track_crossing_cache(
     metadata = {
         'version': TRACK_CROSSING_CACHE_VERSION,
         'db_signature': [list(item) for item in signature],
+        'db_digest': _tracks_db_digest(path, signature),
         'angle_degrees': 30.0,
         'tangent_radius_voxels': 12.0,
         'cluster_local_index_radius': 4,
@@ -1732,7 +1793,10 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
             expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            if not _db_signatures_match(metadata.get('db_signature'), expected_signature):
+            stored_signature = metadata.get('db_signature')
+            if not (_db_signatures_match(stored_signature, expected_signature)
+                    or _db_contents_match(stored_signature, metadata.get('db_digest'),
+                                          path, expected_signature)):
                 raise ValueError('tracks DBM has changed since the cache was built')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])

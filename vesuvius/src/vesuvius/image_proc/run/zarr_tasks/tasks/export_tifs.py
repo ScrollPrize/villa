@@ -284,6 +284,31 @@ class ExportTifsTask(ZarrTask):
         """Create output directories and set up global state."""
         global _zarr_path, _zarr2_path, _resolution
 
+        # Open zarr to get dimensions
+        store = zarr.open(self.config.input_zarr, mode="r")
+        data = store[self.config.resolution]
+
+        if data.ndim != 3:
+            raise ValueError(f"export-tifs requires a 3D input array, got shape {data.shape}")
+        self._shape = data.shape
+
+        # Parse bounding box if provided
+        if self.config.bbox is not None:
+            self._bbox_bounds = _parse_bbox(self.config.bbox, self._shape)
+
+        if self.config.zarr2_path is not None:
+            data2 = zarr.open(self.config.zarr2_path, mode="r")[self.config.resolution]
+            if data2.ndim != 3:
+                raise ValueError(f"export-tifs requires a 3D second array, got shape {data2.shape}")
+            ends = (tuple(end for _, end in self._bbox_bounds)
+                    if self._bbox_bounds is not None else self._shape)
+            if any(end > size for end, size in zip(ends, data2.shape)):
+                raise ValueError(
+                    f"Second zarr shape {data2.shape} does not cover requested export "
+                    f"bounds ending at {ends} at resolution '{self.config.resolution}'. "
+                    "Choose a bounding box covered by both arrays."
+                )
+
         # Create output directories
         output_dir = Path(self.config.output_zarr)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -295,16 +320,6 @@ class ExportTifsTask(ZarrTask):
         if self.config.bg_dir is not None:
             bg_dir = Path(self.config.bg_dir)
             bg_dir.mkdir(parents=True, exist_ok=True)
-
-        # Open zarr to get dimensions
-        store = zarr.open(self.config.input_zarr, mode="r")
-        data = store[self.config.resolution]
-
-        self._shape = data.shape[:3]
-
-        # Parse bounding box if provided
-        if self.config.bbox is not None:
-            self._bbox_bounds = _parse_bbox(self.config.bbox, self._shape)
 
         print(f"Data shape at resolution '{self.config.resolution}': {data.shape}")
         print(f"Chunk size: {self.config.chunk_size}")

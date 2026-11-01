@@ -116,7 +116,7 @@ def run(settings):
     from .fiber_uv_arc_phase import event_arc_points,event_signed_arcs
     from .fiber_gt_constraint_score import run as cross_run
     from .fiber_workflows import run as dispatch
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines,write_afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume,fibers_digest,read_polylines,write_fibers
     import torch
     started=time.monotonic();root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     base=json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
@@ -130,13 +130,14 @@ def run(settings):
     def gt_points(ids,arcs):
         return uv.geometry_points(gd,gu,gv,gb,gs['widths'],ids,event_signed_arcs(gd,ids,arcs))
     paths=[Path(settings[k]) for k in ('base_config','parent_config','extract_template','orient_template')]
-    paths += [Path(parent_cfg[k]) for k in ('tensor_cache','afv','database','stage1','hv_solution','h_direction_solution','v_direction_solution')]
-    paths += [gtroot/'uv_whole/config.json',gtroot/'uv_whole/solution.npz',Path(gcfg['tensor_cache']),Path(gcfg['afv'])]
+    paths += [Path(parent_cfg[k]) for k in ('tensor_cache','database','stage1','hv_solution','h_direction_solution','v_direction_solution')]
+    paths += [gtroot/'uv_whole/config.json',gtroot/'uv_whole/solution.npz',Path(gcfg['tensor_cache'])]
     paths += [Path(settings['reference'])/(c+'.tif') for c in 'xyz']+[Path(settings['reference'])/'meta.json']
     paths += [Path(__file__),Path(soft.__file__),Path(ref.__file__)]
     from . import fiber_implicit_winding as density, fiber_gt_constraint_score as cross_module
     paths += [Path(density.__file__),Path(cross_module.__file__)]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
+                   fibers=fibers_digest(parent_cfg['fibers']),gt_fibers=fibers_digest(gcfg['fibers']))
     stamp=root/'inputs.json'
     if stamp.exists() and json.loads(stamp.read_text())!=signature:raise ValueError('Changed dataset inputs; use a new output directory')
     atomic_write(stamp,signature,durable=False)
@@ -157,8 +158,8 @@ def run(settings):
         radius=max(float(np.linalg.norm(surf.xyz[r+dr,c+dc]-surf.centers[cells],axis=1).max()) for dr,dc in ((0,0),(0,1),(1,0),(1,1)))
         zlo,zhi=np.array(settings['z_range'])+[-settings.get('z_halo',1000),settings.get('z_halo',1000)]
         threshold=settings.get('surface_distance',200)+settings.get('sample_spacing',64)/2
-        print('selection: reading full AFV curves',flush=True)
-        curves=read_afv_polylines(parent_cfg['afv']);seeds=[];batch=[];owners=[];seen=0
+        print('selection: reading full source curves',flush=True)
+        curves=read_polylines(parent_cfg['fibers']);seeds=[];batch=[];owners=[];seen=0
         def flush():
             if not batch:return
             xyz=np.concatenate(batch);ids=np.concatenate(owners)
@@ -173,12 +174,12 @@ def run(settings):
             if not len(points):continue
             batch.append(points);owners.append(np.full(len(points),row['id']));seen+=len(points)
             if sum(map(len,batch))>=65536:flush();print(f'selection: {seen} samples, {len(set(seeds))} sources',flush=True)
-        flush();seeds=np.unique(seeds).astype(int)
+        flush();seeds=np.unique(np.asarray(seeds,dtype=str))
         eligible=np.intersect1d(seeds,parent['source_id']);excluded=np.setdiff1d(seeds,parent['source_id'])
         sources=one_hop(parent,eligible)
         selection=dict(seed_sources=seeds.tolist(),eligible_seed_sources=eligible.tolist(),
             earlier_stage_excluded_sources=excluded.tolist(),candidate_sources=sources.tolist(),
-            afv_sources=len(curves),sample_count=seen,distance_with_sampling_padding=threshold)
+            store_sources=len(curves),sample_count=seen,distance_with_sampling_padding=threshold)
         atomic_write(selection_path,selection,durable=False)
         del curves
     selection=json.loads(selection_path.read_text());print(json.dumps({k:len(v) if isinstance(v,list) else v for k,v in selection.items()}),flush=True)
@@ -231,10 +232,10 @@ def run(settings):
         _,lp=hypotheses(torch.as_tensor(st),config['winding_sigma'])
         confidence=(lp.exp().amax(1)*torch.as_tensor(st[:,3]).sigmoid()).numpy()
     connected=anchored_mask(d,owner,st[:,3]>=0);records=[];groups={'selected':set(),'uncertain':set(selection['earlier_stage_excluded_sources']),'context':set()}
-    all_ids=np.unique(np.r_[d['source_id'],selection['earlier_stage_excluded_sources']])
-    curves=read_afv_polylines(config['afv'],all_ids)
+    all_ids=np.unique(np.r_[d['source_id'],np.asarray(selection['earlier_stage_excluded_sources'],dtype=str)])
+    curves=read_polylines(config['fibers'],all_ids)
     for row,xyz in curves:
-        sid=int(row['id']);pieces=np.flatnonzero(d['source_id']==sid);arc,points=curve_samples(xyz,settings.get('sample_spacing',64))
+        sid=row['id'];pieces=np.flatnonzero(d['source_id']==sid);arc,points=curve_samples(xyz,settings.get('sample_spacing',64))
         items=[];has_target=False;uncertain=not len(pieces)
         for p in pieces:
             s=np.unique(np.r_[d['start'][p],arc[(arc>d['start'][p])&(arc<d['end'][p])],d['end'][p]])
@@ -253,9 +254,9 @@ def run(settings):
         records.append(dict(source_id=sid,category=category,pieces=items,has_uncertain_pieces=uncertain))
     for name,ids in groups.items():
         if not ids:continue
-        path=root/(name+'.afv')
-        if not path.exists():write_afv(config['afv'],path,[(r,x) for r,x in curves if r['id'] in ids],dict(source='reference_anchored_dataset',category=name))
-        saved=read_afv_polylines(path)
+        path=root/(name+'.vcobj')
+        if not path.exists():write_fibers(path,[(r,x) for r,x in curves if r['id'] in ids],volume=fiber_volume(config['fibers']))
+        saved=read_polylines(path)
         original={r['id']:xyz for r,xyz in curves if r['id'] in ids}
         if set(r['id'] for r,_ in saved)!=ids:raise ValueError('Export source IDs differ')
         for row,xyz in saved:
@@ -290,7 +291,7 @@ def run(settings):
         constraint_filter=filter_stats,reference_metrics=residuals,
         recovered_sources=len(comparison['recovered_sources']),
         old_sources_not_selected=len(comparison['old_sources_not_selected']),
-        outputs={k:dict(sources=len(v),path=str(root/(k+'.afv'))) for k,v in groups.items()},
+        outputs={k:dict(sources=len(v),path=str(root/(k+'.vcobj'))) for k,v in groups.items()},
         solve=json.loads((root/'solve/summary.json').read_text())['final'],seconds=time.monotonic()-started,
         interpretation='Model-assisted selection with manual GT supervision; not independent GT')
     atomic_write(root/'summary.json',result,durable=False);print(json.dumps(result),flush=True);return result

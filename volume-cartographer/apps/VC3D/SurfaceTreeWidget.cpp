@@ -3,20 +3,6 @@
 #include <QObject>
 #include <QApplication>
 
-SurfaceTreeWidgetItem* SurfaceTreeWidget::findItemForSurface(std::string id)
-{
-    QTreeWidgetItemIterator it(this);
-    while (*it) {
-        if (id == (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString()) {
-            return static_cast<SurfaceTreeWidgetItem*>(*it);
-        }
-
-        ++it;
-    }
-
-    return nullptr;
-}
-
 void SurfaceTreeWidgetItem::updateItemIcon(bool approved, bool defective)
 {
     if (approved) {        

@@ -1,7 +1,7 @@
 #pragma once
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "geometry/GeometrySnapshot.hpp"
-#include "spatial/PatchGrid.hpp"
+#include "spatial/SurfaceGrid.hpp"
 #include <map>
 #include <memory>
 
@@ -14,6 +14,8 @@ public:
     std::vector<objects::ObjectRecord> select(const std::string& kind,
         const std::vector<std::string>& uuids = {});
     objects::detail::GeometrySnapshot load(const objects::ObjectRecord& object);
+    std::string pointAnnotations(const objects::GeometryRevision& revision, const std::string& array) const
+    { return db_.geometryPointAnnotations(read_, revision.uuid, array); }
     void validate(const objects::WriteTxn& txn) const;
 private:
     objects::ObjectStore& db_;
@@ -25,5 +27,5 @@ DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeom
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
     const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
-std::shared_ptr<PatchGrid> patchSurface(const objects::detail::GeometrySnapshot& geometry);
+std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot& geometry);
 } // namespace vc::object_links::detail

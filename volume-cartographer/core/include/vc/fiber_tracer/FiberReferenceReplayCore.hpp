@@ -50,6 +50,12 @@ struct FiberReplayTraceResult {
     // [rejected-window begin, detection arc, next seed/end arc], base voxels.
     std::vector<std::array<double, 3>> filteredStops;
     size_t reverseChecks = 0;
+    // Optional delayed checks: checkpoint index, history count, reverse travel,
+    // converged, terminal, elapsed seconds. Empty preserves legacy JSON output.
+    std::vector<std::array<double,6>> reverseDiagnostics;
+    size_t reverseStopTailChecks = 0;
+    size_t reverseStopTailPassed = 0;
+    size_t reverseStopTailHistoryOnly = 0;
     double tangentialThresholdFactor = 4.0;
     double referenceBeginArcBase = 0.0;
     double referenceEndArcBase = 0.0;
@@ -69,6 +75,14 @@ using ReplaySegmentRunner = std::function<std::string(
     const PolylineArcSample&, double remainingBase, int maximumSteps,
     const ReplayPointObserver&, const FiberTraceProgressCallback&)>;
 
+struct ReplayReverseCheck {
+    bool passed = false;
+    double travelled = 0;
+    bool converged = false;
+    size_t historyCount = 0;
+    double seconds = 0;
+};
+
 struct ReplayConsistencyPolicy {
     // Current and previous committed base points; false filters this point.
     std::function<bool(const cv::Vec3d&, const cv::Vec3d&)> acceptPoint;
@@ -78,6 +92,10 @@ struct ReplayConsistencyPolicy {
     bool seedAllStarts = false;
     // Check actual forward geometry, not GT. Can use verifyFiberReverseSpan.
     std::function<bool(const std::vector<cv::Vec3d>&)> verify;
+    size_t delaySteps = 0;
+    // Full current forward segment, checkpoint index, previously checked index,
+    // terminal. Receives actual future geometry, never GT.
+    std::function<ReplayReverseCheck(const std::vector<cv::Vec3d>&,size_t,size_t,bool)> verifyCheckpoint;
     // Prediction-derived seed with corresponding reference arc; null ends search.
     std::function<std::optional<PolylineArcSample>(double)> nextSeed;
 };

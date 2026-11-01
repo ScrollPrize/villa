@@ -713,7 +713,9 @@ Metadata is stored in `preprocess_params` with keys: `scaledown` (OME-Zarr level
 #### Memory considerations
 
 The active accumulator is a rolling z band backed by separate numpy memmap files
-per logical accumulator channel. Completed z bands are normalized, written as
+per logical accumulator channel, with chunk-major bricks inside each file.
+This keeps each chunk's memory pages close together even for wide volumes.
+Completed z bands are normalized, written as
 full OME-Zarr chunks, and discarded before the next bands are processed. Input
 tiles are read lazily from the zarr — the full crop is never loaded into RAM.
 
@@ -724,7 +726,8 @@ workers use fixed shared-memory input/result slots. Completed input arrays are
 copied into shared memory only when a GPU queue and both slot types are
 available, then released. Worker results can finish out of order, but they are
 accumulated in the same canonical order as serial inference; only the
-coordinator writes Zarr or advances the rolling Z ring. The conservative input
+coordinator advances the rolling Z ring after publication workers acknowledge
+their writes. The conservative input
 memory bound is the read-ahead window times one padded tile, plus TensorStore's
 cache and the shared-memory slots. `--input-reader python-zarr` retains the old
 threaded reader for comparison.
@@ -741,11 +744,16 @@ from FP32 CUDA conversion; CPU execution preserves the historical conversion.
 Output flushing also overlaps inference. One enlarged but still fixed-depth
 mmap ring retains at most one finalized interval while the following Z row is
 accumulated into disjoint slots. Persistent spawn-process workers reopen that
-frozen interval read-only and normalize/finalize/write distinct output chunks
+frozen interval read/write and consume/clear/normalize/finalize/write distinct output chunks
 in parallel, without copying a band through IPC. Their task/result queues are
 bounded and each worker allocates at most one chunk's temporary arrays. At the
-next flush frontier the coordinator waits if needed, clears/releases the whole
-completed interval, and submits the next. `--flush-workers` defaults to the
+next flush frontier the coordinator defers further band advancement if needed,
+but continues polling manager allocations and worker results. Clearing belongs
+to the chunk's flush worker, not a serial coordinator loop; ring slots are
+released only after successful publication. A failed worker aborts the run;
+resume uses the atomically published chunks, never partially cleared scratch.
+Normal encoding is cache-blocked without changing its arithmetic or encoding.
+`--flush-workers` defaults to the
 available CPU count capped at 64; zero restores synchronous flushing and the
 smaller immediate-release ring for A/B measurements. Final status reports
 workers, chunks, aggregate worker time, and coordinator wait.
