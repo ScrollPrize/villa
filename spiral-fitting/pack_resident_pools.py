@@ -38,14 +38,11 @@ from pathlib import Path
 
 import numpy as np
 
+from fit_session import lasagna_sidecar_path
+
 RESPOOL_FORMAT_VERSION = 2
 
-
-def sidecar_path(zarr_path: str, group: str, *, pair: bool = False) -> str:
-    """Canonical sidecar directory for a store; the pair suffix marks the
-    two-channel nx+ny pool that lives next to the nx zarr."""
-    suffix = f'.respool_g{group}' + ('_pair' if pair else '')
-    return str(zarr_path).rstrip('/') + suffix
+sidecar_path = lasagna_sidecar_path
 
 
 def _read_zarray_meta(array_dir: Path) -> dict:
