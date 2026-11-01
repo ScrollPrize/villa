@@ -51,8 +51,6 @@ inline float clamp01(float v) {
     return std::max(0.0f, std::min(1.0f, v));
 }
 
-static constexpr char kCacheMagic[8] = {'V', 'C', 'S', 'P', 'I', 'D', 'X', '2'};
-static constexpr std::uint32_t kCacheVersion = 1;
 
 std::string normalized_surface_path(const QuadSurface* surface)
 {

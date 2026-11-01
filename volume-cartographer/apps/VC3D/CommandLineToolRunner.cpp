@@ -53,11 +53,6 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
     _explicitVolumePath = !_volumePath.isEmpty();
 }
 
-void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
-{
-    _remoteVolumeUrl = url.trimmed();
-}
-
 void CommandLineToolRunner::setStore(const QString& storePath, double voxelScale)
 {
     _storePath = storePath;
@@ -406,9 +401,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
-            if (!_remoteVolumeUrl.isEmpty()) {
-                args << "--remote-url" << _remoteVolumeUrl;
-            }
             if (_useRenderVoxelSize) {
                 args << "--voxel-size" << QString::number(_renderVoxelSizeUm, 'g', 17)
                      << "--voxel-unit" << "micrometer";

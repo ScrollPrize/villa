@@ -291,9 +291,7 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
 - `-v` takes the URL itself, and nothing is written under a local directory.
-  `--remote-url` is a deprecated alias for the same locator: alone it fills
-  `-v`, next to an equal `-v` it warns, next to a different one it is an
-  error. Since #1657 the renderer opens the remote volume the same way the
+  Since #1657 the renderer opens the remote volume the same way the
   tracer does, so the chunks it fetches persist in the shared remote cache
   (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
   `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the volume's

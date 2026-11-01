@@ -122,8 +122,6 @@ TEST_CASE("LasagnaDatasetManifest parses channel groups from canonical Lasagna J
     CHECK(*pred->channelIndex("ny") == 3);
     REQUIRE(manifest.groupForChannel("grad_mag") != nullptr);
     CHECK(manifest.hasNormalSource());
-    CHECK(manifest.normalSourceKind == vc::lasagna::NormalSourceKind::DenseZarr);
-    CHECK(manifest.normalSourceKey == "groups.grad_mag_nx_ny");
     CHECK(manifest.raw.contains("grad_mag_encode_scale"));
 
     fs::remove_all(dir);
@@ -140,7 +138,6 @@ TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
     vc::lasagna::LasagnaDataset dataset(std::move(manifest));
 
     CHECK_FALSE(dataset.hasNormalSource());
-    CHECK_THROWS_AS(dataset.normalSourcePath(), std::runtime_error);
 }
 
 TEST_CASE("LasagnaDatasetManifest finds complete fiber prediction channel sets")
@@ -574,8 +571,6 @@ TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
     })");
 
     CHECK_FALSE(manifest.hasNormalSource());
-    CHECK(manifest.normalSourceKind == vc::lasagna::NormalSourceKind::None);
-    CHECK(manifest.normalSourceKey.empty());
 }
 
 TEST_CASE("NormalSampler interface supports framework tests without Qt")

@@ -404,7 +404,7 @@ TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources"
         }
         txn.commit();
     }
-    std::ofstream(f.dir / "params.json") << R"({"generations": 3, "use_cuda": false})";
+    std::ofstream(f.dir / "params.json") << R"({"generations": 3})";
     const auto output = run(tool("VC_GROW_SEG_FROM_SEGMENTS_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
                             "\" --params \"" + (f.dir / "params.json").string() + "\" --store \"" + f.store.string() +
                             "\" --surface " + uuidA + " --source-tag source --tag trace", f.dir / "store.log");

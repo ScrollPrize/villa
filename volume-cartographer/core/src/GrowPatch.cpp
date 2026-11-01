@@ -912,15 +912,6 @@ static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     return successful_points;
 }
 
-// global CUDA to allow use to set to false globally
-// in the case they have cuda avail, but do not want to use it
-static bool g_use_cuda = true;
-
-// Expose a simple toggle for CUDA usage so tools can honor JSON settings
-void set_space_tracing_use_cuda(bool enable) {
-    g_use_cuda = enable;
-}
-
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
@@ -1831,27 +1822,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     if (parallel)
         options.num_threads = omp_get_max_threads();
-
-//    if (problem.NumParameterBlocks() > 1) {
-//        options.use_inner_iterations = true;
-//    }
-// // NOTE currently CPU seems always faster (40x , AMD 5800H vs RTX 3080 mobile, even a 5090 would probably be slower?)
-// #ifdef VC_USE_CUDA_SPARSE
-//     // Check if Ceres was actually built with CUDA sparse support
-//     if (g_use_cuda) {
-//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-//             options.linear_solver_type = ceres::SPARSE_SCHUR;
-//             // options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-//
-//             // if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-//                 options.use_mixed_precision_solves = true;
-//             // }
-//         } else {
-//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-//         }
-//     }
-// #endif
 
     ceres::Solver::Summary summary;
 

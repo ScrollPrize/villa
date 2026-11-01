@@ -7,7 +7,6 @@ std::filesystem::path cachedOpenDataManifestPath();
 // nullptr before it has been fetched.
 std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog();
 // A short stable name for a cache keyed by `identity` (16 hex digits of FNV-1a).
-[[nodiscard]] std::string cacheKey(std::string_view identity);
 // Optional subset of a sample's resources to attach. Each axis is independent:
 // an absent sub-field means "no filter on that axis". A raw source volume is
 // governed by `volumeIds` and optional `rawVolumeIds`; a derived representation (normal grids /

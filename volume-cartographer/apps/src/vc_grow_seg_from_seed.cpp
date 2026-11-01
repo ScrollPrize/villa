@@ -309,12 +309,6 @@ static int run_main(int argc, char *argv[])
         params = Json::parse_file(params_path);
     }
 
-    // Honor optional CUDA toggle from params (default true)
-    if (params.contains("use_cuda")) {
-        set_space_tracing_use_cuda(params.value("use_cuda", true));
-    } else {
-        set_space_tracing_use_cuda(true);
-    }
 
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = vcr::zarr::isRemote(volume_arg);

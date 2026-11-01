@@ -1137,12 +1137,6 @@ int main(int argc, char *argv[])
     if (cli_max_width > 0) {
         params["max_width"] = cli_max_width;
     }
-    // Honor optional CUDA toggle from params (default true)
-    if (params.contains("use_cuda")) {
-        set_space_tracing_use_cuda(params.value("use_cuda", true));
-    } else {
-        set_space_tracing_use_cuda(true);
-    }
     // Store mode: debug snapshots go to a scratch directory that becomes part of
     // the first output's artifacts; sources are the selected stored surfaces.
     std::optional<StoreSurfaces> store;

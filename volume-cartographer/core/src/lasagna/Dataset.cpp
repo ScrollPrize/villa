@@ -283,14 +283,6 @@ bool LasagnaDataset::hasNormalSource() const noexcept
     return manifest_.hasNormalSource();
 }
 
-const std::filesystem::path& LasagnaDataset::normalSourcePath() const
-{
-    if (!manifest_.normalPath.has_value()) {
-        throw std::runtime_error("Lasagna dataset manifest has no normal source path");
-    }
-    return *manifest_.normalPath;
-}
-
 vcr::zarr::OpenedArray openLasagnaGroupArray(
     const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache)
 {

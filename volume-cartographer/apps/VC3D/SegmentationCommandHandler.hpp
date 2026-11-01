@@ -328,7 +328,6 @@ private:
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
     // The tool reads volume `volumeId`: a remote one with its locator and auth.
-    void configureCommandRunnerForVolume(const std::string& volumeId);
 
     /**
      * Fixed resume-local tracer params before caller overrides.

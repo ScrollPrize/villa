@@ -47,7 +47,6 @@ public:
 
     [[nodiscard]] const LasagnaDatasetManifest& manifest() const noexcept;
     [[nodiscard]] bool hasNormalSource() const noexcept;
-    [[nodiscard]] const std::filesystem::path& normalSourcePath() const;
 
 private:
     LasagnaDatasetManifest manifest_;

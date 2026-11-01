@@ -214,11 +214,6 @@ Rect3D expand_rect(const Rect3D& a, const cv::Vec3f& p);
 
 ### CUDA Control
 
-```cpp
-// Enable/disable CUDA for space tracing operations
-void set_space_tracing_use_cuda(bool enable);
-```
-
 ---
 
 ## PlaneSurface

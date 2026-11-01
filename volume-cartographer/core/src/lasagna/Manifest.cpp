@@ -304,24 +304,7 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     }
     manifest.groups = parseGroups(root, manifest.baseDirectory);
 
-    if (manifest.hasNormalSource()) {
-        manifest.normalPath = manifest.manifestPath;
-        manifest.normalSourceKind = NormalSourceKind::DenseZarr;
-        manifest.normalSourceKey = "groups.grad_mag_nx_ny";
-    }
-
     return manifest;
-}
-
-std::string toString(NormalSourceKind kind)
-{
-    switch (kind) {
-    case NormalSourceKind::None:
-        return "none";
-    case NormalSourceKind::DenseZarr:
-        return "dense_zarr";
-    }
-    return "unknown";
 }
 
 bool lasagnaChannelShapeCompatible(

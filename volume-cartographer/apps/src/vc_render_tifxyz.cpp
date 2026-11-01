@@ -815,7 +815,6 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
-        ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -962,17 +961,6 @@ int main(int argc, char *argv[])
     }
 
     std::string volumeSource = parsed.count("volume") ? parsed["volume"].as<std::string>() : "";
-    if (parsed.count("remote-url")) {
-        const std::string remoteUrlArg = parsed["remote-url"].as<std::string>();
-        if (volumeSource.empty()) {
-            volumeSource = remoteUrlArg;
-        } else if (volumeSource != remoteUrlArg) {
-            logPrintf(stderr, "Error: --volume (%s) and --remote-url (%s) name different sources; --remote-url is deprecated, pass the remote URL as --volume\n",
-                      volumeSource.c_str(), remoteUrlArg.c_str());
-            return EXIT_FAILURE;
-        }
-        logPrintf(stderr, "Warning: --remote-url is deprecated, pass the remote URL as --volume\n");
-    }
     if (volumeSource.empty()) { logPrintf(stderr, "Error: --volume required\n"); return EXIT_FAILURE; }
     std::filesystem::path vol_path = volumeSource;
     const std::string remoteUrl = vcr::zarr::isRemote(volumeSource) ? volumeSource : std::string{};

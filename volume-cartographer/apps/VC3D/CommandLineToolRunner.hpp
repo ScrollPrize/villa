@@ -69,7 +69,6 @@ public:
     };
 
     void setVolumePath(const QString& path);
-    void setRemoteVolumeUrl(const QString& url);
     // Tools read and write surfaces in this object store (the attached store's
     // file; a hosted replica's local file, which tools sync themselves), in the
     // voxels of their volume at `voxelScale` of its own (--voxel-scale).
@@ -199,7 +198,6 @@ private:
     QDialog* _consoleDialog;
     
     QString _volumePath;
-    QString _remoteVolumeUrl;
     QString _storePath;
     double _voxelScale = 1;
     QString _surfaceUuid;

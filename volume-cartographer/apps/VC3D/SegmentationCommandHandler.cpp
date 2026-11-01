@@ -638,22 +638,6 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     return options;
 }
 
-void SegmentationCommandHandler::configureCommandRunnerForVolume(const std::string& volumeId)
-{
-    if (!_cmdRunner) {
-        return;
-    }
-    _cmdRunner->setRemoteVolumeUrl(QString());
-    if (!_state || !_state->vpkg() || !_state->vpkg()->hasVolume(volumeId)) {
-        return;
-    }
-    const auto volume = _state->vpkg()->volume(volumeId);
-    if (!volume->isRemote()) {
-        return;
-    }
-    _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
-}
-
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 {
     const auto stored = requireStoredSurface(segmentId, false, true);
@@ -1002,7 +986,6 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     }
 
     _cmdRunner->setVolumePath(volumePath);
-    configureCommandRunnerForVolume(renderVolume->id());
 
     // Read in the render volume's voxels: those of the volume it is kept in, at its level.
     const auto renderTarget = vc::project::annotationVolume(_state->vpkg().get(), *renderVolume);
@@ -1219,7 +1202,6 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
     paramsFile->flush();
 
-    configureCommandRunnerForVolume(dlg.selectedVolumeId().toStdString());
     _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
                                       dlg.selectedVolumeId(), outputTag, QString());
@@ -1426,7 +1408,6 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                                       selectedVolumeId,
                                       QStringLiteral("paths"),
                                       QStringLiteral("local"));
-    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
@@ -1578,7 +1559,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
          << QString::number(seedPoint.y(), 'g', 10)
          << QString::number(seedPoint.z(), 'g', 10);
 
-    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();

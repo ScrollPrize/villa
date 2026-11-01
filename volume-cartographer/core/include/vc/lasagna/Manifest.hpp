@@ -14,11 +14,6 @@
 
 namespace vc::lasagna {
 
-enum class NormalSourceKind {
-    None,
-    DenseZarr,
-};
-
 struct LasagnaChannelGroup {
     std::string name;
     // Original manifest-relative Zarr key. This remains authoritative for
@@ -67,12 +62,6 @@ struct LasagnaDatasetManifest {
     // not accidentally inherit invalid credentials from the host machine.
     bool discoverAwsCredentials = true;
 
-    // Backward-compatible summary for old callers: a Lasagna dataset's
-    // normal source is its manifest when nx/ny channels are present.
-    std::optional<std::filesystem::path> normalPath;
-    NormalSourceKind normalSourceKind = NormalSourceKind::None;
-    std::string normalSourceKey;
-
     nlohmann::json raw = nlohmann::json::object();
 
     [[nodiscard]] bool hasNormalSource() const noexcept;
@@ -104,6 +93,5 @@ struct LasagnaDatasetManifest {
     const std::array<std::size_t, 3>& toShapeZYX,
     int maximumAbsoluteLevel = 30);
 
-[[nodiscard]] std::string toString(NormalSourceKind kind);
 
 } // namespace vc::lasagna

@@ -573,7 +573,6 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
-void set_space_tracing_use_cuda(bool enable);
 
 // Surface containment tests
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
