@@ -257,15 +257,16 @@ inline void bind(nb::module_& m)
             out.append(nb::make_tuple(e.location, e.metadata.uuid, nb::make_tuple(e.metadata.scale[0], e.metadata.scale[1]), e.metadata.bbox, e.metadata.area, fromJson(e.metadata.extra), e.error));
         return out;
     }, "folder"_a, "recursive"_a, "z_range"_a, "options"_a);
-    m.def("_tifxyz_write", [](const std::filesystem::path& path, Surface& surface, const std::string& compression, std::optional<int> tile, bool mask, bool overwrite) {
+    m.def("_tifxyz_write", [](const std::filesystem::path& path, Surface& surface, const std::string& compression, std::optional<int> tile, bool mask, bool overwrite, std::optional<double> pixelUm) {
         WriteOptions options;
         options.compression = compression;
         options.tile = tile;
         options.mask = mask;
         options.overwrite = overwrite;
+        options.pixelUm = pixelUm;
         nb::gil_scoped_release release;
         write(path, surface, options);
-    }, "path"_a, "surface"_a, "compression"_a, "tile"_a, "mask"_a, "overwrite"_a);
+    }, "path"_a, "surface"_a, "compression"_a, "tile"_a, "mask"_a, "overwrite"_a, "pixel_um"_a = nb::none());
 }
 
 }  // namespace vcr::tifxyz::python

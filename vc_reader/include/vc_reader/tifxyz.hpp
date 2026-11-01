@@ -146,6 +146,7 @@ struct WriteOptions {
     std::optional<int> tile = 1024;  // none: each image is one strip
     bool mask = true;  // write mask.tif (255 valid, 0 invalid)
     bool overwrite = false;
+    std::optional<double> pixelUm;  // the TIFFs' resolution tags (micrometres per pixel); none without
 };
 // Writes the directory through a temporary beside it. An existing `path` raises unless
 // `overwrite`, which replaces the whole directory. Metadata carries the extent of the valid

@@ -396,6 +396,7 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
     try {
         sources::TiffOptions tiff;
         tiff.compression = options.compression;
+        tiff.pixelUm = options.pixelUm;
         if (options.tile) tiff.tile = std::array<int, 2>{*options.tile, *options.tile};
         const auto rows = surface.rows(), cols = surface.cols();
         const auto cells = std::size_t(rows) * std::size_t(cols);

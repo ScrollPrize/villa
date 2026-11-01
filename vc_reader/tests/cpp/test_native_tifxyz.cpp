@@ -60,6 +60,20 @@ int main()
             CHECK(back.metadata().bbox);
             CHECK((*back.metadata().bbox)[3] == 108.0);
             CHECK((back.fullShape() == std::array<std::int64_t, 2>{800, 1000}));
+            // The resolution tags: written when asked, so the pixel size survives a rewrite.
+            {
+                auto withDpi = plane(4, 5, 0.5, "");
+                tifxyz::WriteOptions dpi = options;
+                dpi.pixelUm = 12.7;  // 2000 dpi
+                tifxyz::write(path.string() + "_dpi", withDpi, dpi);
+                const auto files = std::make_shared<sources::EncodedFiles>(sources::defaultOptions());
+                sources::ImageFile tagged(path.string() + "_dpi/x.tif", std::nullopt, {}, std::nullopt, files);
+                CHECK(tagged.storageUnits() == std::optional<std::string>("micrometer"));
+                CHECK(tagged.storageFromArray().has_value());
+                CHECK(tagged.storageFromArray() && std::abs(tagged.storageFromArray()->forward(0, 0) - 12.7) < 1e-6);
+                sources::ImageFile untagged(path.string() + "/x.tif", std::nullopt, {}, std::nullopt, files);
+                CHECK(!untagged.storageFromArray().has_value());
+            }
         }
     // Existing directories need overwrite, which replaces them.
     {
