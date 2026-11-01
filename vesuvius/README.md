@@ -35,7 +35,6 @@ _this package is in active development_
 | `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
 | `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
 | `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
-| `vesuvius.zarr_tasks`         | `image_proc.run.zarr_tasks.__main__` | runs a Zarr processing task (threshold, scale, transpose, recompress, ...); `--list-tasks` lists them |
 
 
 
