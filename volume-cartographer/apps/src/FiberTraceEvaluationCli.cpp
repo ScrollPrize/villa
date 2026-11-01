@@ -925,7 +925,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("visualization-resume case selection is stale or duplicated");
             }
         } else {
-            // Select across sources deterministically. The shared chunk caches
+            // Select across sources deterministically. The shared memory caches
             // support concurrent readers and every selected direction may
             // issue demand independently.
             for (size_t rank = 0; resumeRenderCases.size() < resumeRenderLimit; ++rank) {
@@ -1104,7 +1104,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             readinessProfile, traceProfile).dump(2) + "\n", vcr::zarr::Durability::Fsync);
                 if (renderThisCase) {
                     // Render directly from this completed replay. Volume,
-                    // prediction and normal chunk caches are concurrent; all
+                    // prediction and normal memory caches are concurrent; all
                     // selected directions may render and request data together.
                     const auto& predictions = livePredictions ? *livePredictions : *source.predictions;
                     // Coordinates stay in the bound source lattice; renderGridLevel maps

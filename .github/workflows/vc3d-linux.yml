@@ -146,7 +146,7 @@ jobs:
           if echo "$out" | grep -q "CRASH REPORT"; then
             echo "::error::VC3D crashed during GUI startup"; exit 1
           fi
-          if ! echo "$out" | grep -qiE "Axis-aligned slices|chunk cache budget"; then
+          if ! echo "$out" | grep -qiE "Axis-aligned slices|memory cache budget"; then
             echo "::error::VC3D GUI did not reach expected startup markers"; exit 1
           fi
           echo "VC3D GUI init OK"

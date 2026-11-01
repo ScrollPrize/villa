@@ -188,7 +188,7 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
     _height = metadata_["height"].get_int();
     _slices = metadata_["slices"].get_int();
 
-    zarrOpen();
+    resolveLevelShapes();
 }
 
 Volume::Volume(std::filesystem::path path, RemoteConstructTag) : path_(std::move(path)) {}
@@ -238,7 +238,7 @@ std::string Volume::name() const
     return metadata_["name"].get_string();
 }
 
-void Volume::zarrOpen()
+void Volume::resolveLevelShapes()
 {
     if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
         return;

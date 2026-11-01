@@ -766,7 +766,7 @@ static std::optional<double> explicitMicrometerPerVoxel(double value,
 //      with the volume actually being streamed.
 //   2. the local store document, for a run with no Volume open.
 //
-// The opened volume comes first because --volume is often a chunk cache for a
+// The opened volume comes first because --volume is often a local cache of a
 // remote source rather than the store itself; where such a cache mirrors the
 // store's metadata it may be stale, and it is the streamed volume, not the cache
 // directory, that is being rendered. Consulting the cache first would let a stale
@@ -814,7 +814,7 @@ int main(int argc, char *argv[])
     optional.add_options()
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
-        ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
+        ("cache-gb", po::value<size_t>()->default_value(16), "Memory cache size in GB")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")

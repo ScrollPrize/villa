@@ -69,7 +69,7 @@ void printUsage(const char* argv0)
         << "  --cumulative-smoothness-tangent-weight N cumulative tangent smoothing weight [2]\n"
         << "  --max-step-factor N             max steps as factor of CP span [3]\n"
         << "  --error-threshold-base-voxels N restart threshold at target plane [20]\n"
-        << "  --cache-gib N                   per-channel chunk-cache budget [8]\n"
+        << "  --cache-gib N                   per-channel memory-cache budget [8]\n"
         << "  --quiet                         suppress progress line\n";
 }
 

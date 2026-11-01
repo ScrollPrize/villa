@@ -366,7 +366,7 @@ private:
         float overlayWindowHigh = 255.0f;
         bool overlayIntensityAsAlpha = false;
         OverlayCompositeSettings overlayComposite;
-        std::uint64_t chunkContentEpoch = 0;
+        std::uint64_t loadedDataEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
         // Effective launch-time bounds. Null for disabled bounds and for view
         // types outside the supported plane/annotation scope.
@@ -390,7 +390,7 @@ private:
     void updateDisplayedFramebufferMapping();
     static bool renderJobsEquivalentForDisplay(const PendingRenderJob& a,
                                                const PendingRenderJob& b);
-    // Everything of renderJobsEquivalentForDisplay except the chunk-content
+    // Everything of renderJobsEquivalentForDisplay except the loaded-data
     // epoch and gen-cache dirtiness: true when two jobs sample the same
     // pixels from the same source, so one frame's data can stand in for
     // missing chunks in the other.
@@ -501,7 +501,7 @@ private:
     // transient cache miss never blanks an already-shown region.
     std::shared_ptr<RenderResult> _lastRenderResult;
     std::uint64_t _renderRequestSerial = 0;
-    std::uint64_t _chunkContentEpoch = 0;
+    std::uint64_t _loadedDataEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _surfaceEditEpoch = 0;
     std::uint64_t _renderSerial = 0;

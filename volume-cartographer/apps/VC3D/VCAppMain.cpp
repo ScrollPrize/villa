@@ -212,7 +212,7 @@ auto main(int argc, char* argv[]) -> int
         fn();
 #endif
 
-    omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool, IOPool); OMP threads just spin-wait
+    omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool); OMP threads just spin-wait
     cv::setNumThreads(1);
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
@@ -292,10 +292,9 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption cacheSizeOption(
         "cache-size",
-        QString("Set the chunk cache size in gigabytes (default: %1 GB).")
-            .arg(CHUNK_CACHE_SIZE_GB),
-        "GB",
-        QString::number(CHUNK_CACHE_SIZE_GB));
+        QString("Set the memory cache size in gigabytes (default: the RAM cache setting, %1 GB if unset).")
+            .arg(vc3d::settings::perf::RAM_CACHE_SIZE_GB_DEFAULT),
+        "GB");
     parser.addOption(cacheSizeOption);
 
     QCommandLineOption volumePackageOption(
@@ -347,8 +346,8 @@ auto main(int argc, char* argv[]) -> int
         Volume::skipShapeCheck = true;
     }
 
-    // RAM cache size: CLI flag > QSettings > CMake default
-    size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB;
+    // RAM cache size: CLI flag > settings > default
+    size_t cacheSizeGB = 0;
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);

@@ -484,7 +484,7 @@ int main(int argc, char *argv[])
               << " [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
     std::cout << "chunk shape shape "
               << "[" << chunk_shape[0] << ", " << chunk_shape[1] << ", " << chunk_shape[2] << "]" << std::endl;
-    std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
+    std::cout << "memory cache size (bytes) " << cfg.cache_bytes << std::endl;
 
     DSReader reader{*opened, base, cfg.reader_scale};
 

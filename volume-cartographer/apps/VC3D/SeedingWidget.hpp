@@ -192,8 +192,8 @@ private:
     int _batchOmpThreads{0};
     SeedingBatchTracker _batch;
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
-    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored
-    // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
+    // Resolved vc_grow_seg_from_seed volume argument: local zarr path, or the remote
+    // locator for a remote volume (issue #1188). QString,
     // not filesystem::path, since a remote locator is a URL.
     QString _batchVolumePath;
     SurfaceCatalog::ToolStore _batchStore;  // the children's store contract (new surfaces are tagged "paths")

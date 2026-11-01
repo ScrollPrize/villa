@@ -817,7 +817,7 @@ void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
         snapshot = captureNavigation();
     }
 
-    // CState handles cache budget and volume ID resolution, and emits volumeChanged
+    // CState resolves the volume ID and emits volumeChanged
     _state->setCurrentVolume(std::move(volume));
 
     resetFocusForVolumeChange(!hadVolume, transformedFocusPoint, transformedFocusNormal);

@@ -459,7 +459,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
-                    "(no local mirror and no remote locator)."));
+                    "(no local path and no remote locator)."));
         return false;
     }
 
@@ -1342,7 +1342,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
-                    "(no local mirror and no remote locator)."));
+                    "(no local path and no remote locator)."));
         return false;
     }
 

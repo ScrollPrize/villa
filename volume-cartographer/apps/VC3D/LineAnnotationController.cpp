@@ -5909,7 +5909,7 @@ LineAnnotationController::applyGeometricControlPointEdit(
     // Purely geometric prepare: provisional display geometry only, in
     // microseconds and with NO GUI-thread chunk sampling - the freeze this
     // used to cause was up to four synchronous Ceres solves, and a residual
-    // one was the splice resampling normals through the chunk cache.
+    // one was the splice resampling normals through the volume reads.
     // Provisional normals are re-indexed/interpolated from the previous model
     // instead; the fiber-mode re-optimization the caller runs afterwards
     // rebuilds the dirty spans properly (per-span rollouts, native traces,

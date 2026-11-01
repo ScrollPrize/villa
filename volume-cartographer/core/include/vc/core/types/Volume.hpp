@@ -32,7 +32,7 @@ public:
     static std::shared_ptr<Volume> New(std::filesystem::path path,
                                        const utils::Json& metadata);
 
-    // Create a Volume backed by a remote zarr store over HTTP. Access is
+    // Create a Volume backed by a remote zarr store. Access is
     // vcr::zarr::resolveAccess: public Open Data is read anonymously; another
     // s3:// bucket (or S3 virtual-host URL) is signed with the AWS credentials of
     // the environment and ~/.aws when there are any and discoverAwsCredentials is
@@ -88,7 +88,8 @@ protected:
     int _height{0};
     int _slices{0};
 
-    void zarrOpen();
+    // Lists the local levels, fills in missing dimensions and checks the shapes.
+    void resolveLevelShapes();
 
     void loadMetadata();
 

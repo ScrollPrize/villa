@@ -1638,7 +1638,7 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     surf->id   = path.filename().string();
     surf->meta = metadata;
 
-    // Register extra channels lazily (left as OpenCV-based on-demand load).
+    // Register extra channels; each loads on first use.
     if (!requestedRegion) {
         for (const auto& entry : std::filesystem::directory_iterator(path)) {
             if (entry.path().extension() == ".tif") {

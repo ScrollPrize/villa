@@ -22,8 +22,7 @@ namespace utils {
 // ThreadPool
 //
 // Basic thread pool using std::jthread with cooperative shutdown via
-// stop_token.  Extracted from VC3D's IOPool / RenderPool patterns.
-// Replaces Qt QThreadPool for fire-and-forget and future-based submission.
+// stop_token, for fire-and-forget and future-based submission.
 // ---------------------------------------------------------------------------
 class ThreadPool final {
 public:

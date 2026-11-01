@@ -247,8 +247,7 @@ private:
     VolumeViewerBase* _activeViewer{nullptr};
     VolumeClickInterceptor _volumeClickInterceptor;
     SurfacePicker _surfacePicker;
-    // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
-    // submit immediately, while deferred intersections/status are serviced here.
+    // Refreshes the viewers' status every 5 s.
     QTimer* _statusClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};

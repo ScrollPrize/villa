@@ -51,8 +51,8 @@ struct OpenDataLasagnaPreparation {
 };
 
 // selection optionally restricts the volumes and representations prepared;
-// nullptr prepares everything. Data chunks stay lazy (the core read-through
-// store persists them).
+// nullptr prepares everything. Data chunks stay lazy (vc_reader's file cache
+// persists them).
 [[nodiscard]] OpenDataLasagnaPreparation prepareOpenDataLasagna(
     const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,

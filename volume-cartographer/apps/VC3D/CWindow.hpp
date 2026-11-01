@@ -127,7 +127,7 @@ public:
         VolumeNotFound,
     };
 
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
+    explicit CWindow(size_t cacheSizeGB);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -319,7 +319,6 @@ private:
 
     bool can_change_volume_();
 
-    size_t _cacheSizeBytes = 0;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

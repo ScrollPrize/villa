@@ -54,10 +54,6 @@ namespace {
 
 constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
-// Non-interactive chunk-ready coalescing. Chunks for one viewpoint trickle in
-// over many milliseconds; the default 16ms render debounce re-renders the whole
-// frame per chunk (~9-11x per viewpoint). Debounce chunk-ready re-renders on a
-// longer window so a burst collapses into ~1 render once chunks stop arriving.
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
@@ -609,7 +605,7 @@ void CChunkedVolumeViewer::startPendingLoad()
             QMetaObject::invokeMethod(qApp, [guard]() {
                 if (!guard || guard->_closing)
                     return;
-                ++guard->_chunkContentEpoch;
+                ++guard->_loadedDataEpoch;
                 guard->submitRender("volume data loaded");
             }, Qt::QueuedConnection);
         };
@@ -1152,7 +1148,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
     int level = vc3d::sourceLevelForView(*_levels, _scale, lodZoomBias);
-    // The surface renderer resamples volume chunks straight into the
+    // The surface renderer resamples volume data straight into the
     // framebuffer and benefits from one finer source level.
     if (preferSurfaceResolution && level < _levels->count() - 1)
         level -= kSurfaceResolutionLevelBias;
@@ -1744,7 +1740,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayWindowHigh = _overlayWindowHigh;
     job.overlayIntensityAsAlpha = _overlayIntensityAsAlpha;
     job.overlayComposite = _overlayComposite;
-    job.chunkContentEpoch = _chunkContentEpoch;
+    job.loadedDataEpoch = _loadedDataEpoch;
     job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
     // Focus bounds are in volume base coordinates for every view, including
     // segment QuadSurfaces. Mask the generated coordinates, not UVs;
@@ -1783,7 +1779,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
         return !lhs || (lhs->low == rhs->low && lhs->high == rhs->high);
     };
     return renderJobsSameGeometry(a, b) &&
-           a.chunkContentEpoch == b.chunkContentEpoch &&
+           a.loadedDataEpoch == b.loadedDataEpoch &&
            a.geometryDirty == b.geometryDirty &&
            boundsEqual(a.focusBoundsBase, b.focusBoundsBase);
 }

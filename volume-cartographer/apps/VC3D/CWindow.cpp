@@ -817,10 +817,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+    std::cout << "memory cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _state = new CState(this, nullptr, _cacheSizeBytes);
+    _state = new CState(this, nullptr, cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
