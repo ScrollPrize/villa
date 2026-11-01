@@ -667,6 +667,17 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
+# vc_objrefine's opt-in offset report: the summary (header-only under
+# apps/src, shared with the tool) always, and the binary's end-to-end
+# contract when the apps are built.
+vc_add_test(NAME test_objrefine_offset_report)
+
+if(TARGET vc_objrefine)
+    vc_add_test(NAME test_objrefine_offset_report_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_OBJREFINE_BIN="$<TARGET_FILE:vc_objrefine>")
+    add_dependencies(test_objrefine_offset_report_cli vc_objrefine)
+endif()
 
 if(TARGET vc_gen_normalgrids)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
