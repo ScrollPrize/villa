@@ -30,13 +30,52 @@ class Fiber3DCanvasTest : public QObject
         for (int y = int(60 * ratio); y < image.height() - int(30 * ratio); ++y)
             for (int x = 0; x < image.width(); ++x) {
                 const auto c = image.pixelColor(x, y);
-                if (c.red() > 100 && c.red() == c.green() && c.green() == c.blue())
+                // Translucent CT blends with the slightly blue background.
+                if (c.red() > 100 && std::abs(c.red()-c.green()) <= 3 && std::abs(c.green()-c.blue()) <= 3)
                     ++count;
             }
         return count;
     }
 
 private slots:
+    void ctSlicesRenderWithoutARibbon_data()
+    {
+        QTest::addColumn<bool>("volumetric");
+        QTest::newRow("single-slice") << false;
+        QTest::newRow("volumetric-slab") << true;
+    }
+    void ctSlicesRenderWithoutARibbon()
+    {
+        QFETCH(bool, volumetric);
+        Fiber3DCanvas canvas;
+        canvas.resize(480, 360);
+        canvas.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        if (!canvas.isValid())
+            QSKIP("OpenGL 3.3 widget unavailable");
+        auto scene = line("fiber");
+        canvas.setScene(scene);
+        QTRY_VERIFY(canvas.scene() == scene && !canvas.isPreparing());
+        canvas.fitAll();
+        const int without = grayPixels(canvas.grabFramebuffer());
+        auto image = std::make_shared<slices::Image>();
+        image->plane = {0, {-20,-12,0}, {40,0,0}, {0,24,0}, 2, 2};
+        image->tile.width = image->tile.height = 2;
+        image->tile.pixels = {180,255,180,255,180,255,180,255};
+        if (volumetric) {
+            auto& slab = image->slab.emplace();
+            slab.origin = {-20,-12,-4};
+            slab.right = {40,0,0}; slab.down = {0,24,0}; slab.through = {0,0,8};
+            slab.width = slab.height = 2; slab.depth = 8;
+            for (int i=0; i<32; ++i) {
+                slab.pixels.push_back(180); slab.pixels.push_back(255);
+            }
+        }
+        canvas.setCTSlices({image});
+        QTRY_VERIFY(grayPixels(canvas.grabFramebuffer()) > without + 1000);
+        canvas.setCTSlices({});
+        QTRY_COMPARE(grayPixels(canvas.grabFramebuffer()), without);
+    }
     void pinnedFiberKeepsPaletteAndDisplaysRibbon()
     {
         Fiber3DCanvas canvas;

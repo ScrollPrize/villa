@@ -40,7 +40,7 @@ struct Fiber3DRibbonControls::Impl {
     FiberCollectionController* automated;
     Fiber3DCanvas* canvas;
     QToolButton* button;
-    QSpinBox *width, *rotation;
+    QSpinBox* width;
     QLabel* status;
     QTimer debounce, refresh;
     std::shared_ptr<vc::render::ChunkCache> cache;
@@ -94,9 +94,6 @@ struct Fiber3DRibbonControls::Impl {
         };
         width = row(q->tr("Width"), "fibers3DRibbonWidth", 1, 512, 32, q->tr(" vx"));
         width->setToolTip(q->tr("Full ribbon width, centered on the fiber, in active CT voxels"));
-        rotation = row(q->tr("Rotation"), "fibers3DRibbonRotation", -180, 180, 0, QString::fromUtf8("°"));
-        rotation->setToolTip(
-            q->tr("Rotation is available only without Lasagna normals. With Lasagna, this is the Line Annotation surface."));
         status = new QLabel(q);
         status->setWordWrap(true);
         status->setTextFormat(Qt::PlainText);
@@ -125,12 +122,11 @@ struct Fiber3DRibbonControls::Impl {
             button->setEnabled(enabled || (fiber() && state->currentVolume()));
             request();
         });
-        for (auto* spin : {width, rotation})
-            QObject::connect(spin, &QSpinBox::valueChanged, q, [this, spin] {
-                QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
-                prefs.setValue(QStringLiteral("fibers3d/") + spin->objectName(), spin->value());
-                request();
-            });
+        QObject::connect(width, &QSpinBox::valueChanged, q, [this] {
+            QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
+            prefs.setValue(QStringLiteral("fibers3d/") + width->objectName(), width->value());
+            request();
+        });
         canvas->setCTWindow(viewers->volumeWindowLow(), viewers->volumeWindowHigh());
         QObject::connect(viewers, &ViewerManager::volumeWindowChanged, canvas, &Fiber3DCanvas::setCTWindow);
         QObject::connect(&watcher, &QFutureWatcher<Result>::finished, q, [this] {
@@ -197,19 +193,11 @@ struct Fiber3DRibbonControls::Impl {
         if (!button->isChecked())
             return;
         canvas->setCTRibbon(image);
-        const bool manual = !canonicalSurface && image->sampledNormals == 0;
-        rotation->setEnabled(manual);
-        q->findChild<QSlider*>(QStringLiteral("fibers3DRibbonRotationSlider"))->setEnabled(manual);
-        if (!manual && rotation->value() != 0) {
-            QSignalBlocker blocked(rotation);
-            rotation->setValue(0);
-            q->findChild<QSlider*>(QStringLiteral("fibers3DRibbonRotationSlider"))->setValue(0);
-        }
         QString text;
         if (canonicalSurface)
             text = q->tr("Line Annotation surface · synchronized");
         else if (!image->sampledNormals)
-            text = q->tr("No Lasagna normals · adjust rotation");
+            text = q->tr("Display frame · no Lasagna normals");
         else
             text = q->tr("Line Annotation surface · Lasagna");
         if (!warning.isEmpty())
@@ -250,12 +238,12 @@ struct Fiber3DRibbonControls::Impl {
             image.reset();
             warning.clear();
         }
-        if (image && image->widthVoxels == width->value() && image->rotationDegrees == rotation->value() && image->level == requestedLevel) {
+        if (image && image->widthVoxels == width->value() && image->level == requestedLevel) {
             present();
             if (image->complete)
                 return;
         }
-        if (image && image->key == key && image->widthVoxels == width->value() && image->rotationDegrees == rotation->value())
+        if (image && image->key == key && image->widthVoxels == width->value())
             present();  // Retain the previous zoom's image while finer data arrive.
         else
             status->setText(q->tr("Loading CT ribbon…"));
@@ -281,7 +269,7 @@ struct Fiber3DRibbonControls::Impl {
         const auto surfaceFactory = canonicalSurface;
         const auto previousWarning = warning;
         const auto centerReference = annotations->displayCenterReference();
-        const int w = width->value(), angle = rotation->value(), level = requestedLevel;
+        const int w = width->value(), level = requestedLevel;
         chunksReady->store(false);
         opendata::LasagnaResolutionSnapshot normalSource;
         if (const auto pkg = state->vpkg())
@@ -333,7 +321,7 @@ struct Fiber3DRibbonControls::Impl {
                     result.frames = std::make_shared<ribbon::Frames>(ribbon::makeFrames(complete, clip, {}, token.get(), model, centerReference));
                 }
                 result.image = ribbon::sampleProgressive(
-                    *result.frames, *volume, w, (surfaceFactory || result.frames->sampledNormals) ? 0 : angle, level, token.get());
+                    *result.frames, *volume, w, 0, level, token.get());
                 result.image->key = selected.key;
             } catch (const std::exception& e) {
                 result.error = QString::fromUtf8(e.what());

@@ -1031,6 +1031,7 @@ void Fiber3DPanel::setLineAnnotationPosition(double position)
                      : QString()));
     d->selection->setToolTip(tr("Distance from the first stored point, measured along the fiber."));
     d->canvas->setLinePosition(vc3d::line_annotation::finiteGeneratedPoint(p) ? std::optional<Point>{{p[0], p[1], p[2]}} : std::nullopt);
+    d->sliceControls->setCenter(vc3d::line_annotation::finiteGeneratedPoint(p) ? std::optional<Point>{{p[0], p[1], p[2]}} : std::nullopt);
 }
 
 void Fiber3DPanel::clearLineAnnotation()
@@ -1045,6 +1046,7 @@ void Fiber3DPanel::clearLineAnnotation()
     d->selectedKey.clear();
     d->canvas->clear();
     d->canvas->setLinePosition({});
+    d->sliceControls->setCenter({});
     d->updateSelection();
 }
 

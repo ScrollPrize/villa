@@ -51,6 +51,7 @@ struct Fiber3DSliceControls::Impl {
     std::shared_ptr<Volume> volume;
     std::vector<slices::Plane> requested;
     slices::Images cache;
+    std::optional<Point> center;
     bool busy = false, pending = false;
 
     Impl(Fiber3DSliceControls* widget, CState* s, ViewerManager* vm, Fiber3DCanvas* c, QToolButton* b)
@@ -79,7 +80,16 @@ struct Fiber3DSliceControls::Impl {
             q->tr("Use Volumetric mode from Composite View. Layer thickness and material settings are shared; the 3D camera controls the viewing angle."));
         row->addWidget(volumetric);
         QObject::connect(volumetric, &QCheckBox::toggled, q, [this](bool on) {
-            emit viewers->volumetricModeRequested(on);
+            const auto linked = linkedViewers();
+            for (auto* manager : ViewerManager::allManagers()) {
+                const auto& owned = manager->baseViewers();
+                if (std::any_of(linked.begin(), linked.end(), [&](auto* view) {
+                        return view && std::find(owned.begin(), owned.end(), view) != owned.end();
+                    })) {
+                    manager->setCompositeMethod(on ? "volumetric" : "max");
+                    emit manager->volumetricModeRequested(on);
+                }
+            }
             refresh();
         });
         row->addSpacing(8);
@@ -164,24 +174,36 @@ struct Fiber3DSliceControls::Impl {
         if (button->isChecked() && q->isVisible())
             q->resume();
     }
+    std::array<VolumeViewerBase*, 3> linkedViewers() const
+    {
+        std::array<VolumeViewerBase*, 3> linked{};
+        auto find = [&](ViewerManager* manager) {
+            for (auto* viewer : manager->baseViewers())
+                for (int i = 0; i < 3; ++i)
+                    if (!linked[i] && viewer->surfName() == names[i] && viewer->currentVolume() == state->currentVolume())
+                        linked[i] = viewer;
+        };
+        find(viewers);
+        // Line Annotation owns a separate manager with generated cuts, not
+        // the main workspace's named CT planes and Composite View settings.
+        for (auto* manager : ViewerManager::allManagers())
+            find(manager);
+        return linked;
+    }
     std::vector<slices::Plane> snapshot()
     {
         std::vector<slices::Plane> planes;
+        const auto linkedViews = linkedViewers();
         for (int i = 0; i < 3; ++i) {
             if (!axes[i]->isChecked())
                 continue;
             auto plane = std::dynamic_pointer_cast<PlaneSurface>(state->surface(names[i]));
             if (!plane)
                 continue;
-            VolumeViewerBase* linked = nullptr;
-            for (auto* viewer : viewers->baseViewers())
-                if (viewer->surfName() == names[i] && viewer->currentVolume() == volume) {
-                    linked = viewer;
-                    break;
-                }
+            auto* linked = linkedViews[i];
             cv::Vec3f a, b, d;
             auto* view = linked ? linked->graphicsView() : nullptr;
-            if (view && view->isVisible() && view->viewport()->width() > 1 && view->viewport()->height() > 1) {
+            if (!center && view && view->isVisible() && view->viewport()->width() > 1 && view->viewport()->height() > 1) {
                 const auto size = view->viewport()->size();
                 const auto offset = plane->normal({}, {}) * linked->normalOffset();
                 // Perspective maps the viewport to a trapezoid. Bound all
@@ -203,14 +225,16 @@ struct Fiber3DSliceControls::Impl {
             } else {
                 // A hidden CT pane has no useful viewport; keep its actual
                 // plane and show a bounded patch around the shared focus.
-                auto center = plane->origin();
-                if (const auto* focus = state->poi("focus")) {
+                auto position = plane->origin();
+                if (center)
+                    position = cv::Vec3f(float((*center)[0]), float((*center)[1]), float((*center)[2]));
+                else if (const auto* focus = state->poi("focus")) {
                     const auto n = plane->normal({}, {});
-                    center = focus->p - n * (focus->p - center).dot(n);
+                    position = focus->p - n * (focus->p - position).dot(n);
                 }
-                if (linked)
-                    center += plane->normal({}, {}) * linked->normalOffset();
-                a = center - plane->basisX() * 512 - plane->basisY() * 512;
+                if (linked && !center)
+                    position += plane->normal({}, {}) * linked->normalOffset();
+                a = position - plane->basisX() * 512 - plane->basisY() * 512;
                 b = a + plane->basisX() * 1024;
                 d = a + plane->basisY() * 1024;
             }
@@ -280,12 +304,12 @@ struct Fiber3DSliceControls::Impl {
         }
         std::array<CompositeParams, 3> transfer;
         bool volumeMode = false;
-        for (auto* linked : viewers->baseViewers())
-            for (int i = 0; i < 3; ++i)
-                if (linked->surfName() == names[i]) {
-                    transfer[i] = linked->compositeRenderSettings().params;
-                    volumeMode = volumeMode || transfer[i].method == "volumetric";
-                }
+        const auto linked = linkedViewers();
+        for (int i = 0; i < 3; ++i)
+            if (linked[i]) {
+                transfer[i] = linked[i]->compositeRenderSettings().params;
+                volumeMode = volumeMode || transfer[i].method == "volumetric";
+            }
         {
             const QSignalBlocker blocker(volumetric);
             volumetric->setChecked(volumeMode);
@@ -366,5 +390,12 @@ void Fiber3DSliceControls::resume()
         d->poll.start();
         d->refresh();
     }
+}
+void Fiber3DSliceControls::setCenter(std::optional<Point> center)
+{
+    if (d->center == center)
+        return;
+    d->center = center;
+    d->refresh();
 }
 }  // namespace vc3d::fibers3d

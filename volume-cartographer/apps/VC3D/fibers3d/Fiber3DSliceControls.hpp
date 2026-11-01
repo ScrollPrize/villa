@@ -1,5 +1,6 @@
 #pragma once
 #include <QWidget>
+#include "Fiber3DScene.hpp"
 #include <memory>
 
 class CState;
@@ -15,6 +16,8 @@ public:
     ~Fiber3DSliceControls() override;
     void resume();
     void cancel();
+    // Annotation slices follow the live point instead of the main CT focus.
+    void setCenter(std::optional<Point> center);
 
 private:
     struct Impl;

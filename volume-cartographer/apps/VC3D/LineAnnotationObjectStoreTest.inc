@@ -8,6 +8,10 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include "support/TestZarrVolume.hpp"
+#include "fibers3d/Fiber3DCanvas.hpp"
+#include "fibers3d/Fiber3DSliceControls.hpp"
+#include <QCheckBox>
+#include <QToolButton>
 // Built only with VC_TESTING. Runs the actual controller publication path.
 namespace {
 // Open a store as the state's project, as VC3D opens one.
@@ -113,6 +117,60 @@ int runObjectStoreControllerTests()
             const auto binding = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 4)}};
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
             require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
+        }
+        {
+            // Annotation has its own viewer manager, but its CT controls must
+            // find the main CT settings and place slices at the live fiber.
+            using namespace vc3d::fibers3d;
+            QTemporaryDir dir;
+            vc::test::ZarrVolumeSpec spec;
+            spec.shapeZYX = {32,32,32}; spec.chunkShapeZYX = {32,32,32};
+            auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", spec);
+            CState state;
+            state.setCurrentVolume(volume);
+            ViewerManager mainViews(&state, state.pointCollection());
+            ViewerManager annotationViews(&state, state.pointCollection());
+            QWidget host;
+            host.resize(480, 360);
+            const std::array<std::string,3> names{"xy plane", "seg xz", "seg yz"};
+            const std::array<cv::Vec3f,3> normals{{{0,0,1}, {0,1,0}, {1,0,0}}};
+            for (int i=0; i<3; ++i) {
+                state.setSurface(names[i], std::make_shared<PlaneSurface>(cv::Vec3f{0,0,0}, normals[i]));
+                auto* viewer = mainViews.createViewerInWidget(names[i], &host);
+                auto settings = viewer->compositeRenderSettings();
+                settings.params.method = "max";
+                settings.planeLayersFront = 3; settings.planeLayersBehind = 2;
+                viewer->setCompositeRenderSettings(settings);
+                dynamic_cast<QWidget*>(viewer)->hide();
+            }
+            auto* canvas = new Fiber3DCanvas(&host);
+            canvas->hide(); // Sampling and control wiring do not require a GL context.
+            auto* toggle = new QToolButton(&host);
+            auto* controls = new Fiber3DSliceControls(&state, &annotationViews, canvas, toggle, &host);
+            controls->setCenter(Point{16,18,20});
+            host.show();
+            toggle->setChecked(true);
+            auto settle = [&](const std::function<bool()>& done) {
+                QElapsedTimer timer; timer.start();
+                while (!done() && timer.elapsed()<15000) { QApplication::processEvents(); QThread::msleep(5); }
+                require(done(), "annotation CT slice controls settle");
+            };
+            settle([&] { return !canvas->ctSlices().empty() && !canvas->ctSlices().front()->preview; });
+            for (const auto& image : canvas->ctSlices()) {
+                for (int axis=0; axis<3; ++axis)
+                    require(std::abs(image->plane.origin[axis]+.5*image->plane.right[axis]+.5*image->plane.down[axis]-Point{16,18,20}[axis])<1e-5,
+                            "annotation CT slices pass through the live fiber point, not the global plane origin");
+            }
+            auto* volumetric = controls->findChild<QCheckBox*>("fibers3DSliceVolumetric");
+            volumetric->setChecked(true);
+            settle([&] { return !canvas->ctSlices().empty() && canvas->ctSlices().front()->slab && !canvas->ctSlices().front()->preview; });
+            require(volumetric->isChecked(), "annotation volumetric toggle stays enabled without a Composite View panel");
+            require(canvas->ctSlices().front()->plane.front == 3 && canvas->ctSlices().front()->plane.behind == 2,
+                    "annotation volumetric CT uses the linked main-view thickness");
+            volumetric->setChecked(false);
+            settle([&] { return !canvas->ctSlices().empty() && !canvas->ctSlices().front()->slab && !canvas->ctSlices().front()->preview; });
+            controls->cancel();
+            require(canvas->ctSlices().empty(), "closing CT controls removes their images");
         }
         {
             // The umbilicus is the store's, bound to a volume; its frame was set when stored.
