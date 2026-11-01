@@ -797,6 +797,27 @@ if(VC_TESTING)
             set(_label vc-core)
         endif()
         set_property(TEST ${test_name} APPEND PROPERTY LABELS ${_label})
+        # Each test gets its own VC3D configuration, home and XDG directories,
+        # with a cache.json naming a scratch cache root (an empty setting alone
+        # loses to the /volpkgs and /ephemeral mount defaults). Without this,
+        # tests read the developer's ~/.VC3D and write probes and caches into
+        # the real cache root. ENVIRONMENT_MODIFICATION is applied after a
+        # test's own ENVIRONMENT property, so QT_QPA_PLATFORM and tool paths
+        # set there do not overwrite it.
+        set(_isolated "${CMAKE_BINARY_DIR}/Testing/isolated/${test_name}")
+        file(MAKE_DIRECTORY
+            "${_isolated}/config" "${_isolated}/home" "${_isolated}/cache"
+            "${_isolated}/xdg/config" "${_isolated}/xdg/data"
+            "${_isolated}/xdg/cache" "${_isolated}/xdg/state")
+        file(WRITE "${_isolated}/config/cache.json"
+            "{\"version\":1,\"root\":\"${_isolated}/cache\"}\n")
+        set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "VC3D_CONFIG_DIR=set:${_isolated}/config"
+            "HOME=set:${_isolated}/home"
+            "XDG_CONFIG_HOME=set:${_isolated}/xdg/config"
+            "XDG_DATA_HOME=set:${_isolated}/xdg/data"
+            "XDG_CACHE_HOME=set:${_isolated}/xdg/cache"
+            "XDG_STATE_HOME=set:${_isolated}/xdg/state")
         set_property(GLOBAL APPEND PROPERTY VC_CTEST_NAMES ${test_name})
         get_property(_ctest_targets GLOBAL PROPERTY VC_CTEST_TARGETS)
         if(NOT target IN_LIST _ctest_targets)

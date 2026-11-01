@@ -21,7 +21,17 @@ using namespace vc3d::opendata;
 class CatalogProjectDialogTest : public QObject
 {
     Q_OBJECT
+    // VC3D's INI and the AppData projects directory, for every slot.
+    QTemporaryDir _config{QDir::current().filePath("catalog-dialog-config-XXXXXX")};
+
 private slots:
+    void initTestCase()
+    {
+        QVERIFY(_config.isValid());
+        qputenv("VC3D_CONFIG_DIR", _config.path().toUtf8());
+        qputenv("XDG_DATA_HOME", _config.filePath("data").toUtf8());
+    }
+
     void attachRepresentations()
     {
         vcr::catalog::OpenDataManifest manifest;
@@ -90,10 +100,8 @@ private slots:
     {
         QTemporaryDir temp(QDir::current().filePath("catalog-dialog-XXXXXX"));
         QVERIFY(temp.isValid());
-        const auto oldConfig = qgetenv("VC3D_CONFIG_DIR");
-        qputenv("VC3D_CONFIG_DIR", temp.path().toUtf8());
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, temp.filePath("cache"));
+        settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, _config.filePath("cache"));
         settings.sync();
         vcr::catalog::OpenDataManifest manifest;
         vcr::catalog::OpenDataSample sample;
@@ -213,8 +221,6 @@ private slots:
             QVERIFY(QMetaObject::invokeMethod(&catalog, "createSelectedProject", Qt::DirectConnection));
             QVERIFY(created);
         }
-        if (oldConfig.isNull()) qunsetenv("VC3D_CONFIG_DIR");
-        else qputenv("VC3D_CONFIG_DIR", oldConfig);
     }
 };
 

@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "support/LoopbackHttpServer.hpp"
+#include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -18,7 +20,9 @@ namespace {
 
 fs::path makeTmpDir(const std::string& tag)
 {
-    auto dir = fs::temp_directory_path() / ("vc_lasagna_manifest_" + tag);
+    // Per process: the suite runs these executables in parallel.
+    auto dir = fs::temp_directory_path() /
+        ("vc_lasagna_manifest_" + std::to_string(vc::memmap::pid()) + "_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;

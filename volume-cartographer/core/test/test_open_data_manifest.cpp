@@ -809,7 +809,10 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     REQUIRE(volumeFromScan->pixelSizeUm.has_value());
     CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
 
-    auto pkg = vc::test::emptyProject();
+    // Deferred: the catalog's URLs are not opened.
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto pkg = vc::test::emptyProject(deferred);
     const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
     CHECK(result.supportedVolumes == 2);
     REQUIRE(pkg->volumeEntries().size() == 2);
@@ -889,6 +892,9 @@ TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projec
 {
     const auto root = std::filesystem::current_path() /
         ("project_defaults_test_" + std::to_string(vc::memmap::pid()));
+    // projectsDirectory() creates VC3D's AppData projects directory.
+    const QByteArray previousDataHome = qgetenv("XDG_DATA_HOME");
+    qputenv("XDG_DATA_HOME", QByteArray::fromStdString((root / "xdg-data").string()));
     {
         QSettings settings(QString::fromStdString((root / "settings.ini").string()), QSettings::IniFormat);
         CHECK(vc3d::defaultNewProjectDirectory(settings) == vc3d::projectsDirectory());
@@ -896,6 +902,8 @@ TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projec
         settings.setValue(vc3d::settings::project::DEFAULT_PATH, "chosen-directory");
         CHECK(vc3d::defaultNewProjectDirectory(settings) == QStringLiteral("chosen-directory"));
     }
+    if (previousDataHome.isNull()) qunsetenv("XDG_DATA_HOME");
+    else qputenv("XDG_DATA_HOME", previousDataHome);
     std::filesystem::remove_all(root);
 }
 
@@ -1046,7 +1054,9 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     sample.segments.push_back(segment("vol-b"));
     sample.segments.push_back(segment("vol-c"));
 
-    auto pkg = vc::test::emptyProject();
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto pkg = vc::test::emptyProject(deferred);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
@@ -1056,7 +1066,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     for (auto& derived : sample.segments)
         if (derived.originalVolumeId == "vol-b")
             derived.creation.derivedFrom = vcr::catalog::OpenDataReference{"volume", "vol-c"};
-    auto derivedPkg = vc::test::emptyProject();
+    auto derivedPkg = vc::test::emptyProject(deferred);
     CHECK(attachOpenDataSampleVolumes(*derivedPkg, sample).preferredVolumeId == "vol-c");
 }
 

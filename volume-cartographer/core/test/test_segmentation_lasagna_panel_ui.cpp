@@ -109,6 +109,8 @@ int main(int argc, char** argv)
 
     QTemporaryDir tempDir;
     require(tempDir.isValid(), "Failed to create temporary settings dir");
+    // The panel's setters persist through writeSetting into VC3D's own INI.
+    qputenv("VC3D_CONFIG_DIR", tempDir.path().toUtf8());
     const QString configPath = tempDir.filePath(QStringLiteral("config.json"));
     QFile configFile(configPath);
     require(configFile.open(QIODevice::WriteOnly | QIODevice::Text),

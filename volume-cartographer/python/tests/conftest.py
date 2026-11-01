@@ -1,10 +1,31 @@
 """Explicit build selection, including when an editable install redirects vc."""
 import importlib.abc
 import importlib.machinery
+import json
 from pathlib import Path
 import sys
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_user_state(tmp_path_factory):
+    """VC3D's configuration, home and XDG directories under a scratch root.
+
+    cache.json names a scratch cache root, since an empty setting loses to the
+    /volpkgs and /ephemeral mount defaults. Nothing here reads or writes
+    ~/.VC3D or the real remote cache."""
+    root = tmp_path_factory.mktemp("vc3d-state")
+    config, cache, home = root / "config", root / "cache", root / "home"
+    for directory in (config, cache, home):
+        directory.mkdir()
+    (config / "cache.json").write_text(json.dumps({"version": 1, "root": str(cache)}))
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("VC3D_CONFIG_DIR", str(config))
+        env.setenv("HOME", str(home))
+        for name in ("CONFIG", "DATA", "CACHE", "STATE"):
+            env.setenv(f"XDG_{name}_HOME", str(root / "xdg" / name.lower()))
+        yield
 
 
 def pytest_addoption(parser):
