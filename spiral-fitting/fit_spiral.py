@@ -3581,13 +3581,16 @@ class FitContext:
             getattr(self, 'frozen_epochs', None) or (),
             getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
 
-    def _checkpoint_payload(self, completed_iterations):
+    def _checkpoint_payload(self, completed_iterations, include_optimiser=True):
+        # Without the optimiser state (about two thirds of the file) the
+        # checkpoint still exports, flattens and meshes, but cannot be resumed.
         return {
             'schema_version': 2,
             'model_state_sha256': self.model_state_digest(),
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
-            'optimiser': self.optimiser.state_dict(),
+            **({'optimiser': self.optimiser.state_dict()}
+               if include_optimiser else {}),
             'scheduler': self.lr_scheduler.state_dict(),
             'cfg': dict(self.config),
             'requested_config': dict(
@@ -3617,12 +3620,14 @@ class FitContext:
                if self.device.type == 'mps' else {}),
         }
 
-    def save_checkpoint(self, path, completed_iterations):
+    def save_checkpoint(self, path, completed_iterations, include_optimiser=True):
         destination = os.path.abspath(path)
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
-            torch.save(self._checkpoint_payload(completed_iterations), temporary)
+            torch.save(
+                self._checkpoint_payload(completed_iterations, include_optimiser),
+                temporary)
             # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
             with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
@@ -3640,10 +3645,12 @@ class FitContext:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _save_model(self, suffix, completed_iterations=None):
+    def _save_model(self, suffix, completed_iterations=None, include_optimiser=True):
         if completed_iterations is None:
             completed_iterations = self._initial_num_training_steps
-        return self.save_checkpoint(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
+        return self.save_checkpoint(
+            f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations,
+            include_optimiser)
 
     def _maybe_save_headless_checkpoint(self, completed_iterations):
         """Refresh the final checkpoint path at each headless autosave boundary.
@@ -5500,6 +5507,14 @@ class FitContext:
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
                 progress=progress,
             )
+            if self.config.get('output_slim_final_checkpoint', False):
+                # Only now: until the outputs exist, an interrupted run must
+                # still find a resumable (full) checkpoint at this path.
+                progress.begin(
+                    'saving_checkpoint', 'Saving slim final checkpoint',
+                    detail=f'checkpoint_{suffix}.ckpt')
+                self._save_model(
+                    suffix, self.num_training_steps, include_optimiser=False)
             progress.finish()
             progress.clear()
 

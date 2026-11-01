@@ -10,8 +10,10 @@ was, and that the verb is only valid in Idle.
 
 import copy
 from pathlib import Path
+import os
 import sys
 import io
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -22,7 +24,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fit_spiral
+from checkpoint_io import load_checkpoint_cpu
 from config import Config
+from flatten_spiral_checkpoint import _checkpoint_config
 from fit_session import SessionState
 from spiral_progress import NullProgressReporter
 import spiral_runtime
@@ -364,6 +368,139 @@ class CheckpointApplyTests(unittest.TestCase):
         verdict = _inspect(_checkpoint(completed_iterations=None))
         self.assertFalse(verdict.accepted)
         self.assertIn("completed_iterations", verdict.message())
+
+
+class _SavingContext(_StubContext):
+    """A _StubContext with what a checkpoint save reads."""
+
+    def __init__(self, out_path):
+        super().__init__()
+        self.out_path = str(out_path)
+        self.interactive_driver = None
+        self.lasagna_scale = 4
+        self.normal_zarr_group = "4"
+        self.base_shape_zyx = (100, 200, 300)
+        self.winding_inference = None
+        self.model_z_begin, self.model_z_end = 1000, 2000
+        self.spiral_outward_sense = "CW"
+        self.z_direction_is_top_to_bottom = False
+        self.device = torch.device("cpu")
+        # One step, so the optimiser holds moments the slim file leaves out.
+        self.model(torch.ones(1, 3)).sum().backward()
+        self.optimiser.step()
+
+
+class _RunContext(_SavingContext):
+    """A _SavingContext whose headless run() takes five no-op steps."""
+
+    def __init__(self, out_path, *, slim):
+        super().__init__(out_path)
+        self.config["output_slim_final_checkpoint"] = slim
+        self.config["output_save_png_visualizations"] = False
+        self.num_training_steps = 5
+        self.progress = None
+        self.dist = SimpleNamespace(is_main_process=True)
+        self.saves = []
+        for name in ("slice_to_spiral_transform", "dr_per_winding",
+                     "verified_patches_list", "verified_patches", "patch_atlas",
+                     "unattached_pcl_strips", "tracks",
+                     "flow_field_radius", "flow_min_corner_spiral_zyx",
+                     "flow_max_corner_spiral_zyx", "umbilicus",
+                     "render_volume_scale", "voxel_size_um", "run_tag"):
+            setattr(self, name, None)
+
+    def check_cuda_ready(self):
+        pass
+
+    def load_host_inputs(self):
+        pass
+
+    def resolve_output_path(self):
+        pass
+
+    def build_device_state(self):
+        pass
+
+    def step(self, iteration):
+        return torch.zeros(()), {}, {}, {}
+
+    def log_step_metrics(self, *args):
+        pass
+
+    def _save_model(self, suffix, completed_iterations=None, include_optimiser=True):
+        self.saves.append((completed_iterations, include_optimiser))
+        return super()._save_model(suffix, completed_iterations, include_optimiser)
+
+
+class SlimFinalCheckpointTests(unittest.TestCase):
+    def test_the_option_is_off_by_default(self):
+        self.assertIs(CONFIG["output_slim_final_checkpoint"], False)
+
+    def test_default_save_keeps_the_optimiser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = _SavingContext(tmp)
+            default = load_checkpoint_cpu(context._save_model("fitted", 10))
+            self.assertEqual(
+                default["optimiser"]["state"].keys(),
+                context.optimiser.state_dict()["state"].keys())
+
+    def test_slim_checkpoint_is_the_full_one_without_the_optimiser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = _SavingContext(tmp)
+            full_path = context._save_model("full", 10)
+            slim_path = context._save_model("slim", 10, include_optimiser=False)
+            full = load_checkpoint_cpu(full_path)
+            slim = load_checkpoint_cpu(slim_path)
+
+            self.assertNotIn("optimiser", slim)
+            self.assertEqual(list(slim), [key for key in full if key != "optimiser"])
+            for key, value in full["spiral_and_transform"].items():
+                self.assertTrue(torch.equal(slim["spiral_and_transform"][key], value))
+            # Same digest = same fitted surface; the export reads the same config.
+            self.assertEqual(slim["model_state_sha256"], full["model_state_sha256"])
+            self.assertEqual(_checkpoint_config(slim), _checkpoint_config(full))
+            self.assertLess(os.path.getsize(slim_path), os.path.getsize(full_path))
+
+    def test_run_writes_the_slim_file_only_after_the_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = _RunContext(tmp, slim=True)
+            path = Path(tmp) / "checkpoint_fitted.ckpt"
+            on_disk_during_outputs = []
+
+            def outputs(*args, **kwargs):
+                on_disk_during_outputs.append(
+                    "optimiser" in load_checkpoint_cpu(path))
+
+            with mock.patch.object(fit_spiral, "_HEADLESS_AUTOSAVE_INTERVAL", 2), \
+                    mock.patch.object(fit_spiral, "save_overlay_and_print_satisfaction",
+                                      side_effect=outputs):
+                context.run()
+
+            # Autosaves at 2 and 4, the full final save, then the slim rewrite.
+            self.assertEqual(context.saves, [(2, True), (4, True), (5, True), (5, False)])
+            # A run killed while the outputs are made can still be resumed.
+            self.assertEqual(on_disk_during_outputs, [True])
+            final = load_checkpoint_cpu(path)
+            self.assertNotIn("optimiser", final)
+            self.assertEqual(final["completed_iterations"], 5)
+
+    def test_run_keeps_the_full_file_when_the_option_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = _RunContext(tmp, slim=False)
+            with mock.patch.object(fit_spiral, "_HEADLESS_AUTOSAVE_INTERVAL", 2), \
+                    mock.patch.object(fit_spiral, "save_overlay_and_print_satisfaction"):
+                context.run()
+
+            self.assertEqual(context.saves, [(2, True), (4, True), (5, True)])
+            final = load_checkpoint_cpu(Path(tmp) / "checkpoint_fitted.ckpt")
+            self.assertIn("optimiser", final)
+
+    def test_a_slim_checkpoint_is_refused_for_resume(self):
+        checkpoint = _checkpoint()
+        del checkpoint["optimiser"]
+        verdict = _inspect(checkpoint)
+        self.assertFalse(verdict.accepted)
+        self.assertIn("checkpoint has no 'optimiser' entry", verdict.reasons)
 
 
 class _FakeContext:
