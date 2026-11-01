@@ -672,6 +672,8 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
     // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
     // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
+        QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+            QObject::tr("Another Open Data sample is still opening."));
         return false;
     }
 
@@ -737,6 +739,9 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     // Prepare edits now and check again before switching. Keep the old project
     // open while the sample is prepared, including when preparation fails.
     if (_window && _window->_state->prepareStoreSwitch && !_window->_state->prepareStoreSwitch()) {
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Pending edits prevented the project switch."));
         if (onFinished) QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished)]() {
             OpenDataSampleOpenOutcome outcome;
             outcome.success = false;
@@ -768,6 +773,12 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         }
     }
     if (!setupError.isEmpty()) {
+        // The worker's failures are reported by finishOpenDataSampleOpen; these
+        // happen before it starts, and the interactive caller only sees a bool.
+        if (interactive)
+            QMessageBox::warning(_window, QObject::tr("Open Data Sample"),
+                QObject::tr("Could not create the project for %1:\n\n%2")
+                    .arg(QString::fromStdString(sample.id), setupError));
         if (onFinished) {
             QMetaObject::invokeMethod(this, [onFinished = std::move(onFinished), setupError]() {
                 OpenDataSampleOpenOutcome outcome;

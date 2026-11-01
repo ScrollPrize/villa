@@ -149,6 +149,7 @@ def save_patch_cache(path: str | Path, patches: Iterable[Patch]) -> None:
                 ),
                 "is_validation": patch.is_validation,
                 "is_unlabeled": patch.is_unlabeled,
+                "exclude_validation_mask": patch.exclude_validation_mask,
                 "patch_finding_key": patch_finding_cache_token(
                     segment.data_config
                 ),
@@ -202,9 +203,18 @@ def load_patch_cache(
                 bbox=bbox,
                 is_validation=bool(record.get("is_validation", False)),
                 is_unlabeled=bool(record.get("is_unlabeled", False)),
+                exclude_validation_mask=bool(
+                    record.get("exclude_validation_mask", False)
+                ),
                 supervision_mask_override=(
                     record.get("active_supervision_mask_path") or None
                 ),
             )
         )
+    if config.discovery_mode != "unlabeled":
+        # Every labeled segment yields patches or fails discovery, so a segment with no
+        # record means the cache predates it (a dataset added under the same out_dir).
+        covered = {patch.segment.cache_key for patch in patches}
+        if any(segment.cache_key not in covered for segment in segments_by_key.values()):
+            return None
     return patches

@@ -41,6 +41,10 @@ from vesuvius.ink_detection.data.patch_cache import (
     patch_cache_path,
     save_patch_cache,
 )
+from vesuvius.ink_detection.data.heldout import (
+    has_heldout_validation,
+    partition_heldout,
+)
 from vesuvius.ink_detection.data.patch_finding_default import (
     find_segment_patches as find_default_patches,
     find_segment_unlabeled_patches,
@@ -170,6 +174,8 @@ class InkDataset(Dataset):
         if patches is None:
             self.segments = list(gather_segments(config))
             self.patches = self._discover_or_load_patches()
+            if has_heldout_validation(config):
+                self.patches = partition_heldout(self.patches)
         else:
             self.patches = list(patches)
             if segments is not None:
@@ -242,8 +248,9 @@ class InkDataset(Dataset):
 
         training: list[Patch] = []
         validation: list[Patch] = []
+        # Discovery threads are not DataLoader workers: dataloader_workers 0 still needs one.
         with ThreadPoolExecutor(
-            max_workers=self.config.dataloader_workers
+            max_workers=max(1, self.config.dataloader_workers)
         ) as executor:
             for segment_training, segment_validation in executor.map(
                 process, self.segments
@@ -347,7 +354,9 @@ class InkDataset(Dataset):
             supervision, _ = read_bbox_with_padding(
                 supervision_volume, supervision_bbox, fill_value=0
             )
-            if not patch.is_validation and patch.segment.validation_mask is not None:
+            if (
+                not patch.is_validation or patch.exclude_validation_mask
+            ) and patch.segment.validation_mask is not None:
                 validation_volume = self._open(
                     patch.segment.validation_mask, patch.segment.scale
                 )

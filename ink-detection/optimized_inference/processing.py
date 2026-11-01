@@ -606,6 +606,9 @@ def create_scale_bar_tiles(
     return scale_bar_tiles, mask_tiles
 
 
+PARTITION_CACHE_DIR = "/tmp/partition_cache"
+
+
 def reduce_partitions(
     zarr_output_dir: str,
     num_parts: int,
@@ -634,8 +637,14 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
-    # Cache directory for partition zarrs (network filesystem -> local /tmp)
-    cache_dir = "/tmp/partition_cache"
+    # Cache directory for partition zarrs (network filesystem -> local /tmp).
+    # Partition names are the same in every run (mask_pred_part_000.zarr), so a copy left by an
+    # earlier reduce would be served again after ZARR_OUTPUT_DIR changes or is rewritten by the
+    # next inference run. Start every reduce from an empty cache.
+    cache_dir = PARTITION_CACHE_DIR
+    if os.path.isdir(cache_dir):
+        logger.info(f"Removing partition cache left by an earlier reduce: {cache_dir}")
+        shutil.rmtree(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
 
     # Open all partition zarr arrays once (outside the generator loop)

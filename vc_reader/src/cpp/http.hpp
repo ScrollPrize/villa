@@ -152,6 +152,8 @@ public:
             // MSYS2's OpenSSL-backed libcurl defaults to a CA bundle under /ucrt64
             // that end-user machines lack; verify against the Windows store instead.
             curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+            // An HTTPS proxy is verified with its own options.
+            curl_easy_setopt(h, CURLOPT_PROXY_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
 #endif
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::receive);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
