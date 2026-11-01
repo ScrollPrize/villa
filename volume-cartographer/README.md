@@ -263,9 +263,9 @@ the decoded chunk cache in bytes (default 1e9) and `thread_limit` the number
 of OpenMP threads. The tracer reads the voxel size from the volume's
 `metadata.json` (`voxelsize: 45.532` in the log) and writes the segment to
 `out/auto_grown_<timestamp>/` as `x.tif`, `y.tif`, `z.tif`, `generations.tif`
-and `meta.json`. It also keeps a copy of every chunk it fetches in VC3D's
-remote cache directory, `~/.VC3D/remote_cache/<volume>-<id>/` unless
-`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` points elsewhere,
+and `meta.json`. It also keeps a copy of every chunk it fetches under VC3D's
+remote cache root (`~/.VC3D/remote_cache` unless `cache.json` or
+`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` says otherwise),
 and later runs on the same volume read from there. On this volume the eight
 generations take ten to twenty seconds on a 14-core workstation and fetch
 about 2 MiB the first time.
@@ -292,9 +292,7 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 
 - `-v` takes the URL itself, and nothing is written under a local directory.
   Since #1657 the renderer opens the remote volume the same way the
-  tracer does, so the chunks it fetches persist in the shared remote cache
-  (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
-  `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the volume's
+  tracer does, so the chunks it fetches persist in the shared remote cache root; `--cache-gb` (default 16) sizes the volume's
   decoded-chunk memory cache. The renderer fetches only the chunks its samples
   read, in parallel.
 - The renderer reads the voxel size from the remote volume's metadata, as the
@@ -307,7 +305,7 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with
-  `Error: group index 6 not available in remote zarr (present levels: 0 1 2 3 4 5)`.
+  `Error opening remote zarr: group index 6: ...`.
 - The `#vc-base-scale=N` selector described above applies to the tracer as
   well: with `#vc-base-scale=2` it reports
   `zarr dataset size for scale group 0 [1017, 566, 566]` and

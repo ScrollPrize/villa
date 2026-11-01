@@ -92,16 +92,4 @@ ctest --test-dir build -R '^test_fiber_replay_visualization$' --output-on-failur
 
 The tests cover anisotropic transforms, metric ellipses, inverse strip mapping,
 restart gaps/singletons, modality alignment, pagination, and invalid CT sources.
-The optional real-data case reads these environment variables:
-
-- `LASAGNA_TEST_VOLUME`: concrete local uint8 CT array.
-- `VC_TEST_GRAPH_NORMALS`, `VC_TEST_GRAPH_PREDICTIONS`: normal/prediction manifests.
-- `VC_TEST_WIDTH_FIBER`: VC3D JSON reference fiber.
-- `VC_TEST_REPLAY_VIS_OUTPUT`: writable artifact directory.
-
-The real fixture expects Paris4 CT level 1 (base-to-array scale 0.5) and samples
-the first 128 base voxels of the reference. Prediction/normal working scale is 8.
-It runs a short CPU beam replay, verifies exact CT/presence coordinate equality,
-repeated image/metadata equality, nonempty data, and six correctly sized crop
-textures. This tests rendering integration, not trace accuracy or a speedup.
 No data, generated images or experiment runners are distributed with the API.

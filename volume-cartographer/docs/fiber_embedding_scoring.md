@@ -76,20 +76,6 @@ sibling isolation, missing data, changed path selection, unchanged paths for
 neutral embeddings, eager/lazy agreement, serial/parallel agreement and the
 fused normal-corner path.
 
-For a real, already inferred local cache (no GPU inference is launched):
-
-```bash
-export VC_TEST_EMBEDDING_MANIFEST=/path/to/inference.lasagna.json
-export VC_TEST_EMBEDDING_FIBER=/path/to/annotated-fiber.json
-export VC_TEST_EMBEDDING_NORMAL_MANIFEST=/path/to/normals.lasagna.json
-build/bin/test_fiber_embedding_scoring
-```
-
-The optional test starts at the first annotated control point, not an
-extrapolated tail. It traces 64 base voxels, compares serial/parallel paths and
-independently recomputes the cosine costs. Without these variables only the
-fixture cases run. This is a numerical/integration check, not a new accuracy
-benchmark or a speedup claim. It requires cached coverage of the candidate cone.
 
 Validated with GCC 13 Release on the cached paired-embedding EMA999 prediction
 (`7ee3f7c19d12188a297b87c7ab02dde0de01792dcea97e4c691384240cc17a15`)

@@ -36,16 +36,3 @@ ctest --test-dir build -R '^test_fiber_replay_metric$' --output-on-failure
 
 The test covers strict boundaries, normal sign/scale, missing normals,
 zero-radius handling, JSON metadata, invalid inputs, and excursion reentry.
-An optional read-only real-data check samples normals at anchor positions and
-compares the metric with the explicit component formula:
-
-```sh
-export VC_TEST_METRIC_NORMAL_MANIFEST=/path/to/normals.lasagna.json
-export VC_TEST_METRIC_NORMAL_SCALE=4
-export VC_TEST_METRIC_ANCHORS=/path/to/anchors.json
-build/bin/test_fiber_replay_metric
-```
-
-The test opens the normal sampler at the specified working-to-base scale;
-this is not the stored channel's pyramid level. The anchor JSON is the output
-of `vc_fiberlets anchors`. Real datasets and generated outputs are not bundled.

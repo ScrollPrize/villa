@@ -120,10 +120,9 @@ config VC3D resolves, not the points you commit:
   currently-open gap (unlike `vc3d_grow_surface_from_seed`, which resolves
   normal grids dynamically and does support remote stores). To seed a remote
   volume, point `normal_grid_path` at the already-fetched local cache dir for
-  that sample's normal grid: `~/.VC3D/remote_cache/normal_grids/<sampleId>/
-  <volumeId>/L<level>-<hash>/` (created by `catalog.open_sample` when you pass
-  a `normal_grids`-kind `representationRefs` entry — check `vc3d_get_state` or
-  the catalog attach result for the exact hash-suffixed directory name).
+  that sample's normal grid: its directory under the remote cache root (created by `catalog.open_sample`
+  when you pass a `normal_grids`-kind `representationRefs` entry — check
+  `vc3d_get_state` or the catalog attach result for the exact directory).
 - The volume argument itself (the actual CT data source) *does* now resolve
   correctly for remote volumes (`Volume::remoteLocator()`, issue #1188) — you
   do not need to work around that part.

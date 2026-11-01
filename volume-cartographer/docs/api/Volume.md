@@ -49,7 +49,8 @@ static std::shared_ptr<Volume> New(std::filesystem::path path,
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
     const std::string& url,
-    const vc::HttpAuth& auth = {});
+    const utils::Json& metadata = {},
+    bool discoverAwsCredentials = true);
 ```
 
 Remote volumes always use the process-wide remote cache root configured by
@@ -67,7 +68,6 @@ VC3D.
 | `path()` | `std::filesystem::path` | Local volume path; empty for remote volumes |
 | `isRemote()` | `bool` | Whether the volume is backed by a remote zarr store |
 | `remoteUrl()` | `const std::string&` | Normalized remote URL for remote volumes |
-| `remoteAuth()` | `const vc::HttpAuth&` | Auth used for remote chunk reads |
 
 ### Dimensions
 

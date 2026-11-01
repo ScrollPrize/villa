@@ -43,7 +43,7 @@ earlier gate are not reused.
 
 ## Cache location and authentication
 
-`global_cache_root()` resolves without creating directories:
+`globalCacheRoot()` resolves without creating directories:
 
 1. Explicit `{"version": 1, "root": "/absolute/path"}` in
    `$VC3D_CONFIG_DIR/cache.json` (default `$HOME/.VC3D/cache.json`).
