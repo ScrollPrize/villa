@@ -38,6 +38,7 @@ inline uint32_t be32(uint32_t v) {
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include <vc/core/util/GridStore.hpp>
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
 #include "vc/core/util/normalgridtools.hpp"
@@ -1282,6 +1283,18 @@ void run_generate(const po::variables_map& vm) {
     }
 
     fs::path output_fs_path(output_path);
+    const fs::path metadata_path = output_fs_path / "metadata.json";
+    // Every shard must validate before creating files or replacing metadata.
+    // Older stores omitted the threshold and used any non-zero voxel.
+    if (fs::exists(metadata_path)) {
+        const int previous_threshold = Json::parse_file(metadata_path).value("threshold", 1);
+        if (previous_threshold != threshold) {
+            throw std::runtime_error(
+                "output directory uses threshold " + std::to_string(previous_threshold) +
+                "; requested --threshold " + std::to_string(threshold) +
+                ". Use a fresh output directory when changing --threshold.");
+        }
+    }
     for (SliceDirection dir : directions_to_run) {
         const std::string dname = direction_name(dir);
         fs::create_directories(output_fs_path / dname);
@@ -1303,8 +1316,8 @@ void run_generate(const po::variables_map& vm) {
         metadata["verify-grid-save"] = verify_grid_save;
         metadata["debug-per-slice"] = debug_per_slice;
         metadata["prune-min-length-px"] = prune_params.minLengthPx;
-        std::ofstream o(output_fs_path / "metadata.json");
-        o << metadata.dump(4) << std::endl;
+        // Other shards may be validating this file while shard 0 updates it.
+        vc::core::util::atomicWriteString(metadata_path, metadata.dump(4) + "\n");
     }
 
     int num_threads = omp_get_max_threads();
