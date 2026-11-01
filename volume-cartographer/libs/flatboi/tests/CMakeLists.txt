@@ -7,6 +7,18 @@ target_include_directories(test_slim_assembly PRIVATE
 target_link_libraries(test_slim_assembly PRIVATE
     igl::core pastix spm OpenMP::OpenMP_CXX)
 
+# This directory is added before the top-level instrumentation flags, so apply
+# them explicitly to the test without instrumenting the PaStiX dependencies.
+if(_san)
+    target_compile_options(test_slim_assembly PRIVATE ${_san})
+    target_link_options(test_slim_assembly PRIVATE ${_san})
+endif()
+if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
+   OR VC_ENABLE_TYSAN OR VC_ENABLE_NSAN)
+    target_sources(test_slim_assembly PRIVATE
+        "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.cpp")
+endif()
+
 set(_slim_test_environment
     PASTIX_NUM_THREADS=2 OMP_NUM_THREADS=2
     OPENBLAS_NUM_THREADS=2 VECLIB_MAXIMUM_THREADS=2)

@@ -117,6 +117,9 @@ void tetrahedron(igl::SLIMData& s)
     uv = v;
     uv.col(0) *= 1.05;
     uv.col(1) *= .95;
+    // Keep every singular value away from one: the generic 3D weight update
+    // evaluates a removable 0/0 before applying its unit-stretch fallback.
+    uv.col(2) *= 1.02;
     igl::slim_precompute(v, f, uv, s, igl::MappingEnergyType::SYMMETRIC_DIRICHLET, b, bc, 0.);
     require(s.dim == 3 && !s.cache.triangles && !s.cache.solver, "Stale cache on 3D reinitialization");
 }

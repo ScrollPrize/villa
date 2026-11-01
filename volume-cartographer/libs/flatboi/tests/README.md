@@ -23,6 +23,11 @@ The Linux flatboi CI job runs this target alongside the application build.
 Named cases use the repository's `vc_test.hpp` runner. Numerical failures
 report the energy, iteration and matrix coefficient or RHS row.
 
+The test executable explicitly uses the project's enabled sanitizer and coverage
+flags, including the shared sanitizer runtime configuration. PaStiX stays
+uninstrumented. Enable these checks with the existing `VC_ENABLE_ASAN`,
+`VC_ENABLE_UBSAN` or `VC_ENABLE_COVERAGE` options (coverage requires Clang).
+
 With `VC_TESTING=ON`, the same executable is registered in CTest under the
 `vc-flatboi` label. `FLATBOI_BUILD_SLIM_TESTS` defaults to `VC_TESTING` in a fresh
 configuration; an explicit cached value takes precedence.
