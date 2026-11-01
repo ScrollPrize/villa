@@ -12,6 +12,7 @@
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "ViewerManager.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
@@ -144,7 +145,8 @@ std::optional<int> omeScaledownForGroup(
     const QString& rootPath, const QString& group, QString* errorMessage)
 {
     try {
-        const auto scale = vcr::zarr::Group::open(rootPath.toStdString(), {}).placement(group.toStdString()).scale;
+        const auto scale = vcr::zarr::Group::open(rootPath.toStdString(), vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs()))
+                               .placement(group.toStdString()).scale;
         const double levelValue = std::log2(scale[0]);
         const int level = static_cast<int>(std::llround(levelValue));
         if (scale[1] != scale[0] || scale[2] != scale[0] || level < 0 || level > 30 ||
@@ -167,7 +169,9 @@ std::optional<std::array<std::size_t, 3>> omeLevelZeroShapeZYX(
     const QString& rootPath, QString* errorMessage)
 {
     try {
-        for (const auto& level : vcr::zarr::pyramidLevels(rootPath.toStdString(), {})) {
+        // Through the caches, under VC's cache settings (a remote store's levels are kept there).
+        const auto options = vc::settings::remoteOpenOptions(vc3d::remoteCachePathFs());
+        for (const auto& level : vcr::zarr::pyramidLevels(rootPath.toStdString(), options)) {
             if (level.level != 0) continue;
             if (level.meta.shape.size() == 3 &&
                 std::all_of(level.meta.shape.begin(), level.meta.shape.end(), [](auto size) { return size > 0; }))

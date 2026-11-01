@@ -5,6 +5,7 @@
 #include "OpenDataLasagna.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc_reader/zarr.hpp"
 
@@ -35,16 +36,15 @@ void preflightPredictionAndSource(const std::string& predictionUrl,
                                   int sourceLevel,
                                   const std::filesystem::path& remoteCacheRoot)
 {
-    // Through the caches: what a volume's pyramid looks like is kept with them.
-    vcr::zarr::OpenOptions options;
-    if (!remoteCacheRoot.empty())
-        options.cacheDirs = {remoteCacheRoot.string()};
+    // Through the caches, under VC's cache settings: what a volume's pyramid looks like
+    // is kept with them.
+    const auto options = vc::settings::remoteOpenOptions(remoteCacheRoot);
     auto predictionGroup = vcr::zarr::Group::open(predictionUrl, options);
     const auto levelMeta = [](vcr::zarr::Group&& group, int level) {
-        const auto node = group.node(std::to_string(level));
-        if (!node || node->first != vcr::zarr::Group::NodeKind::Array)
+        const auto meta = group.arrayMeta(std::to_string(level));
+        if (!meta)
             throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + group.location());
-        return vcr::zarr::parseArrayMeta(node->second);
+        return *meta;
     };
     const auto multiscales = predictionGroup.multiscales();
     const auto prediction = levelMeta(std::move(predictionGroup), 0);

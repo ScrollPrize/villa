@@ -1201,7 +1201,12 @@ int main(int argc, char *argv[])
     };
     params["tgt_dir"] = tgt_dir.string();
 
-    const auto level0 = vcr::zarr::openArray((vol_path / "0").string(), {}).meta;
+    // The volume's physical level 0, wherever its pyramid puts it.
+    const auto pyramid = vcr::zarr::pyramidLevels(vol_path.string(), {});
+    const auto level0It = std::find_if(pyramid.begin(), pyramid.end(), [](const auto& level) { return level.level == 0; });
+    if (level0It == pyramid.end())
+        throw std::runtime_error("no pyramid level 0 in " + vol_path.string());
+    const auto& level0 = level0It->meta;
     const std::vector<size_t> shape(level0.shape.begin(), level0.shape.end());
     std::cout << "zarr dataset size for scale group 0 " << shape << std::endl;
     std::cout << "chunk shape shape "
