@@ -8,7 +8,7 @@
 // The controller's job is reduced to: pick the participants, run the
 // planner, redirect the peers' refs with redirectBranchRefs, run the batch
 // through canonicalizeFiberSaveSnapshots + validateFiberSaveSnapshots and
-// checkStructuralEditGraph, and commit it with ONE runFiberSaveJob (new
+// checkStructuralEditGraph, and commit it in one checked store action (new
 // files + redirected peers as payloads, originals as retirements).
 
 #include <cstddef>
@@ -31,8 +31,7 @@
 namespace vc3d::line_annotation {
 
 // Set on a fiber whose line was assembled from pieces (merge join span,
-// split halves without their extrapolation tails) and awaits a re-fit; the
-// literal is duplicated in scripts/fiber_merge.py (REOPTIMIZE_TAG).
+// split halves without their extrapolation tails) and awaits a re-fit.
 inline constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
 
 // Identity of a fiber the edit creates: allocated by the controller (runtime
@@ -43,7 +42,6 @@ struct NewFiberIdentity {
     std::string startedAt;
     uint64_t sequence = 0;
     std::string fileName;
-    std::filesystem::path sourceRoot;
 };
 
 struct MergePlan {
@@ -141,18 +139,12 @@ struct StructuralGraphCheck {
     std::vector<BranchLinkValidationIssue> unrelated;
 };
 
-// Runs the loader's own issue collector over the graph the next load will
-// see (untouched records + batch records, originals removed) and splits the
-// result. `batchKeys` / `retiredKeys` are the source-qualified keys the
-// collector's sourceKey produces for the batch files and the retired
-// originals; `sourceKey(fiber, fileName)` must be the same callback the
-// collector uses.
-template<class Collect, class SourceKey>
+// Classify issues by the identities changed or retired in this action.
+template<class Collect>
 StructuralGraphCheck checkStructuralEditGraph(const std::vector<StoredFiber>& graph,
-                                              const std::unordered_set<std::string>& batchKeys,
-                                              const std::unordered_set<std::string>& retiredKeys,
-                                              Collect collect,
-                                              SourceKey sourceKey)
+                                              const std::unordered_set<uint64_t>& batchKeys,
+                                              const std::unordered_set<uint64_t>& retiredKeys,
+                                              Collect collect)
 {
     StructuralGraphCheck check;
     for (const auto& issue : collect(graph)) {
@@ -160,32 +152,14 @@ StructuralGraphCheck checkStructuralEditGraph(const std::vector<StoredFiber>& gr
             continue;
         }
         const StoredFiber& owner = graph[issue.fiberIndex];
-        bool blocking = batchKeys.count(sourceKey(owner, owner.fileName)) != 0;
+        bool blocking = batchKeys.count(owner.id) != 0;
         if (!blocking && issue.branchIndex < owner.branches.size()) {
-            const std::string targetKey =
-                sourceKey(owner, owner.branches[issue.branchIndex].branchFileName);
+            const auto targetKey = owner.branches[issue.branchIndex].branchFiberId;
             blocking = batchKeys.count(targetKey) != 0 || retiredKeys.count(targetKey) != 0;
         }
         (blocking ? check.blocking : check.unrelated).push_back(issue);
     }
     return check;
 }
-
-// The `branch_file` values a fiber document names in its "branches" and
-// "adjacent_branches" arrays, reduced to basenames, read WITHOUT the fiber
-// parser's validation: an entry the lenient loader would strip (out-of-range
-// index, missing field, non-object element) still names its target here.
-// Elements without a string branch_file, and arrays that are not arrays, are
-// skipped. Used by the structural-edit preflight to see what a file still
-// references on disk regardless of what the loaded record kept.
-[[nodiscard]] std::vector<std::string> referencedFiberFileNames(const nlohmann::json& root);
-
-// Exact geometry fingerprint the loader's source dedupe uses to recognise
-// the same fiber stored under two names (raw double bits, format-independent).
-// A structural edit must not produce a fiber with the fingerprint of a loaded
-// one: dedupe runs before link validation on load and would hide the new
-// fiber together with its links.
-[[nodiscard]] std::string fiberGeometryKey(const std::vector<StoredControlPoint>& controls,
-                                           const std::vector<cv::Vec3d>& linePoints);
 
 }  // namespace vc3d::line_annotation

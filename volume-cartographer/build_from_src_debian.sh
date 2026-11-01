@@ -68,7 +68,6 @@ fi
     libavahi-client-dev \
     libblosc-dev \
     libboost-program-options-dev \
-    libboost-system-dev \
     libcgal-dev \
     libceres-dev \
     libcurl4-openssl-dev \
@@ -83,6 +82,7 @@ fi
     libopencv-dev \
     libscotch-dev \
     libscotchmetis-dev \
+    libsqlite3-dev \
     libsuitesparse-dev \
     libtiff-dev \
     libzstd-dev \

@@ -13,6 +13,8 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.models.utilities.compilation import has_triton
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -184,6 +186,10 @@ class _CompiledWithEagerFallback(nn.Module):
             return self.model(*args, **kwargs)
 
 
+def _uses_cuda(model: nn.Module) -> bool:
+    return any(parameter.is_cuda for parameter in model.parameters())
+
+
 def maybe_compile_model(
     model: nn.Module,
     *,
@@ -202,6 +208,11 @@ def maybe_compile_model(
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         LOGGER.warning("torch.compile is unavailable; continuing eagerly")
+        return model, False
+    if _uses_cuda(model) and not has_triton():
+        # Inductor needs Triton for CUDA kernels. Without it (e.g. native Windows),
+        # compilation only fails at the first forward, after tracing has been paid for.
+        LOGGER.info("Triton is not installed; skipping torch.compile for the CUDA model")
         return model, False
     try:
         compiled_model = compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False)
@@ -234,7 +245,9 @@ def prepare_model_for_inference(
             )
         device = torch.device(f"cuda:{requested[0]}")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
+        # it adds mps for Apple Silicon, which otherwise fell back to cpu here.
+        device = get_accelerator()
 
     model = model.to(device)
     if len(requested) > 1:

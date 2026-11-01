@@ -19,6 +19,7 @@ from contextlib import suppress
 
 import numpy as np
 import torch
+from device_utils import amp_device_type, empty_cache
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -115,6 +116,11 @@ class InferenceConfig:
 
     # Compression settings
     use_zarr_compression: bool = True
+
+    # Zero-pad the final partial batch up to batch_size so torch.compile (dynamic=False)
+    # and cudnn.benchmark see a single input shape. Off by default: tiles in that batch
+    # then run through the full-batch kernels, which can change their values at fp16 noise level.
+    pad_last_batch: bool = os.environ.get("PAD_LAST_BATCH", "false").lower() == "true"
 
 CFG = InferenceConfig()
 
@@ -233,7 +239,10 @@ def preprocess_layers(
         src = LayersSource(layers, start_z=start_z, end_z=end_z)
         h, w, c = src.shape
         if c != CFG.in_chans:
-            logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
+            raise ValueError(
+                f"Model expects {CFG.in_chans} channels but the layer source provides {c} "
+                f"(z-range [{src._start_z}, {src._end_z})); check START_LAYER/END_LAYER"
+            )
 
         mask_desc = f"{fragment_mask.shape}" if fragment_mask is not None else "None"
         logger.info(f"Prepared layers source: shape={src.shape}, mask={mask_desc}, reverse={is_reverse_segment}")
@@ -434,11 +443,14 @@ def predict_fn(
                 tile_count += raw_batch_size
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
+                if CFG.pad_last_batch and raw_batch_size < CFG.batch_size:
+                    pad = images.new_zeros((CFG.batch_size - raw_batch_size, *images.shape[1:]))
+                    images = torch.cat([images, pad])
 
-                amp_device = "cuda" if device.type == "cuda" else "cpu"
+                amp_device = amp_device_type(device)
                 with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
                     with torch.autocast(device_type=amp_device, enabled=True):
-                        y_preds = model.forward(images)  # Model-specific forward
+                        y_preds = model.forward(images)[:raw_batch_size]  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
                     y_preds_resized = F.interpolate(
                         y_preds.float(),
@@ -605,6 +617,5 @@ def run_inference(
             del test_loader
         except Exception:
             pass
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_cache(device)
         gc.collect()

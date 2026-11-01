@@ -18,6 +18,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "../volume_viewers/SurfaceProjection.hpp"
+#include "vc/core/types/FiberView.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -76,15 +77,6 @@ public:
         OverlayStyle style{};
     };
 
-    struct RotatedEllipsePrimitive {
-        QPointF center;
-        qreal radiusX{3.0};
-        qreal radiusY{2.0};
-        qreal rotationRadians{0.0};
-        bool filled{true};
-        OverlayStyle style{};
-    };
-
     struct LineStripPrimitive {
         std::vector<QPointF> points;
         bool closed{false};
@@ -132,7 +124,6 @@ public:
         qreal lineWidth{3.0};
         qreal opacity{1.0};
         bool isEraser{false};
-        int pathId{0};
         PathBrushShape brushShape{PathBrushShape::Circle};
         PathRenderMode renderMode{PathRenderMode::LineStrip};
         qreal pointRadius{3.0};
@@ -172,7 +163,6 @@ public:
                                           VolumePointPrimitive,
                                           SurfacePointPrimitive,
                                           CirclePrimitive,
-                                          RotatedEllipsePrimitive,
                                           LineStripPrimitive,
                                           SurfaceLineStripPrimitive,
                                           RectPrimitive,
@@ -270,13 +260,6 @@ protected:
                        bool filled,
                        OverlayStyle style);
 
-        void addRotatedEllipse(const QPointF& center,
-                               qreal radiusX,
-                               qreal radiusY,
-                               qreal rotationRadians,
-                               bool filled,
-                               OverlayStyle style);
-
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,
                           OverlayStyle style);
@@ -343,6 +326,8 @@ protected:
     };
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
+    // Lets a controller skip the rebuild when its primitives would be unchanged.
+    virtual bool needsOverlayRebuild(VolumeViewerBase*) const { return true; }
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
     FilteredPoints projectPointChainForHitTest(
         VolumeViewerBase* viewer,
@@ -355,7 +340,9 @@ protected:
                                        const std::vector<cv::Vec3f>& volumePoints) const;
     QGraphicsScene* viewerScene(VolumeViewerBase* viewer) const;
     QRectF visibleSceneRect(VolumeViewerBase* viewer) const;
-    bool isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
+    // The slab of half depth `halfDepth` around a plane viewer's visible
+    // rectangle (the region the store overlays query); nothing off a plane.
+    std::optional<vc::fibers::ViewRegion> planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const;
     Surface* viewerSurface(VolumeViewerBase* viewer) const;
 
     FilteredPoints filterPoints(VolumeViewerBase* viewer,
@@ -425,7 +412,7 @@ protected:
     // Invalidates the surface-coordinate projections retained by
     // renderPointChain(). Controllers must call this whenever their source
     // chain storage is replaced or mutated.
-    void clearPointChainProjectionCache();
+    void clearPointChainProjectionCache() const;
 
     // Projects a chain onto the viewer's surface with per-point opacity;
     // cached — see clearPointChainProjectionCache(). `breakDistance`, when
@@ -526,10 +513,10 @@ private:
         QMetaObject::Connection destroyedConn;
         // Coalesce the rebuildOverlay fan-out onto a 16 ms single-shot
         // timer. overlaysUpdated() gets emitted on every viewport pan/zoom
-        // (post-render side-effect), and collectDirectionHints' pointTo
-        // search was measured at ~7.5% of total CPU in the live profile —
-        // debouncing drops that to one rebuild per tick window regardless
-        // of signal frequency.
+        // (post-render side-effect); overlay rebuilds that search the
+        // surface (pointTo) have measured several percent of total CPU in
+        // live profiles — debouncing drops that to one rebuild per tick
+        // window regardless of signal frequency.
         QTimer* rebuildTimer{nullptr};
         bool rebuildDirty{false};
     };

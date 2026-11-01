@@ -225,6 +225,19 @@ struct ShardConfig {
     std::vector<std::size_t> sub_chunks;   // inner chunk shape
     std::vector<ZarrCodecConfig> index_codecs;  // codecs for the shard index
     std::vector<ZarrCodecConfig> sub_codecs;    // codecs for inner chunks
+    // Where the index lives in the shard file: "start" (VC's own writer) or
+    // "end" (the zarr v3 default, used by zarr-python and volcomp exports).
+    std::string index_location = "start";
+
+    [[nodiscard]] bool index_at_end() const noexcept { return index_location == "end"; }
+    /// Bytes the index occupies in the shard: 16 per inner chunk, plus the
+    /// 4-byte checksum when the index codec pipeline ends with crc32c.
+    [[nodiscard]] std::size_t index_bytes(std::size_t n_inner) const noexcept {
+        std::size_t n = n_inner * 16;
+        for (const auto& c : index_codecs)
+            if (c.name == "crc32c") n += 4;
+        return n;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -244,6 +257,11 @@ struct ZarrMetadata {
     char byte_order = '<';
     std::string compressor_id;           // "blosc", "zlib", "zstd", or "" for raw
     int compression_level = 5;
+    // Quantiser step for codecs configured by a float ("volcomp": q).
+    // v2: compressor {"id":"volcomp","q":Q}; v3 carries it in the codec
+    // configuration instead. Unset when the metadata has no q; an explicit
+    // 0 is volcomp's lossless mode and must not be confused with "unset".
+    std::optional<float> codec_q;
     std::string dimension_separator = ".";
     std::vector<ZarrFilter> filters;     // v2 filters applied before compression
 
@@ -303,6 +321,10 @@ struct ZarrMetadata {
 /// magic-check before decode.
 [[nodiscard]] bool is_canonical_c3d(const ZarrMetadata& m) noexcept;
 
+/// Structural check: uint8, 128^3 chunks (the volcomp codec atom) carrying
+/// the "volcomp" codec — v3 sharded (any shard multiple of 128^3) or plain.
+[[nodiscard]] bool is_canonical_volcomp(const ZarrMetadata& m) noexcept;
+
 // ---------------------------------------------------------------------------
 // Store abstraction
 // ---------------------------------------------------------------------------
@@ -312,6 +334,8 @@ public:
     virtual ~Store() = default;
 
     [[nodiscard]] virtual bool exists(const std::string& key) const = 0;
+    /// Whether reads may access the network, including disk-cached remote stores.
+    [[nodiscard]] virtual bool is_remote() const noexcept { return false; }
     [[nodiscard]] virtual std::vector<std::byte> get(const std::string& key) const = 0;
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const = 0;
     virtual void set(const std::string& key, std::span<const std::byte> value) = 0;
@@ -331,6 +355,32 @@ public:
     /// Get a byte range from a key [offset, offset+length).
     [[nodiscard]] virtual std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const;
+
+    /// Size in bytes of the object at key, when the store can answer cheaply
+    /// (stat / HEAD). nullopt when unknown or absent; readers that need the
+    /// size (shard indexes stored at the end) then fall back to a full read.
+    [[nodiscard]] virtual std::optional<std::size_t> size_of(const std::string& key) const {
+        (void)key;
+        return std::nullopt;
+    }
+
+    /// Bytes counted back from the end of an object, together with the
+    /// object size they were located against.
+    struct TrailingRange {
+        std::size_t object_size = 0;
+        std::vector<std::byte> bytes;
+    };
+
+    /// Bytes [size - from_end, size - from_end + length) of the object at key
+    /// (a trailing shard index, say). The size and the bytes must come from
+    /// one view of the object, so a concurrent rewrite cannot pair a new size
+    /// with old bytes: FileSystemStore reads both through one descriptor. The
+    /// default pairs size_of() with get_partial(), which is only consistent
+    /// for objects that are replaced whole (HTTP/S3). nullopt when the object
+    /// is absent, shorter than from_end, or its size is unknown; readers then
+    /// fall back to a whole-object read.
+    [[nodiscard]] virtual std::optional<TrailingRange>
+    get_trailing_range(const std::string& key, std::size_t from_end, std::size_t length) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +399,9 @@ public:
     get_if_exists(const std::string& key) const override;
     [[nodiscard]] std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const override;
+    [[nodiscard]] std::optional<std::size_t> size_of(const std::string& key) const override;
+    [[nodiscard]] std::optional<TrailingRange>
+    get_trailing_range(const std::string& key, std::size_t from_end, std::size_t length) const override;
     void set(const std::string& key, std::span<const std::byte> value) override;
     void erase(const std::string& key) override;
 
@@ -364,6 +417,7 @@ private:
 
 class HttpStore final : public Store {
 public:
+    [[nodiscard]] bool is_remote() const noexcept override { return true; }
     /// Construct from a base URL with default HttpClient settings.
     explicit HttpStore(std::string base_url);
 
@@ -381,6 +435,7 @@ public:
     void erase(const std::string& key) override;
     [[nodiscard]] std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const override;
+    [[nodiscard]] std::optional<std::size_t> size_of(const std::string& key) const override;
 
 private:
     [[nodiscard]] std::string make_url(const std::string& key) const;
@@ -412,6 +467,10 @@ void byteswap_inplace(std::span<std::byte> data, std::size_t elem_size);
 
 void write_le64(std::byte* dst, std::uint64_t val);
 std::uint64_t read_le64(const std::byte* src);
+
+/// CRC-32C (Castagnoli), as the zarr v3 "crc32c" codec appends it (the
+/// 4-byte little-endian checksum follows the bytes it covers).
+[[nodiscard]] std::uint32_t crc32c(std::span<const std::byte> data) noexcept;
 
 // ----- Shard index -----
 
@@ -453,16 +512,6 @@ ZarrMetadata parse_zarr_json(std::string_view json_str);
 JsonValue codec_config_to_json(const ZarrCodecConfig& cc);
 
 std::string serialize_zarr_json(const ZarrMetadata& meta);
-
-// ----- Consolidated metadata (.zmetadata, v2) -----
-
-struct ConsolidatedMetadata {
-    std::unordered_map<std::string, ZarrMetadata> arrays;   // path -> metadata
-    std::unordered_map<std::string, JsonValue> attrs;       // path -> attributes
-
-    /// Parse a .zmetadata JSON file.
-    static ConsolidatedMetadata parse(std::string_view json_str);
-};
 
 // ----- Auto-detect version -----
 
@@ -578,6 +627,12 @@ public:
     [[nodiscard]] std::vector<std::byte>
     decode_chunk_payload(std::span<const std::byte> payload) const;
 
+    /// Decode an already-fetched payload into reusable caller storage. The
+    /// destination must cover the full (sub-)chunk; trailing bytes are untouched.
+    /// Codec callbacks must completely initialize their destination or throw.
+    void decode_chunk_payload_into(std::span<const std::byte> payload,
+                                   std::span<std::byte> output) const;
+
     [[nodiscard]] bool stores_chunks_with_codec(std::string_view codec_name) const noexcept;
 
     /// Read a chunk and decompress it directly into the caller-provided
@@ -586,13 +641,15 @@ public:
     /// exactly sub_chunk_byte_size() bytes into `output` and returns true.
     ///
     /// When the codec exposes `decompress_into`, decompression skips the
-    /// per-call heap allocation that `read_chunk` performs. v2 filters and
-    /// host-byte-order mismatches force a fallback to the allocating path
-    /// (and a final memcpy into `output`).
+    /// per-call heap allocation that `read_chunk` performs. v2 filters force
+    /// a fallback to allocating decode; byte swapping is done in place.
     [[nodiscard]] bool
     read_chunk_into(std::span<const std::size_t> chunk_indices,
                     std::span<std::byte> output) const;
 
+    /// Encode and store one chunk. On a sharded array the indices name an
+    /// inner chunk and it goes through write_inner_chunk_to_shard (local
+    /// arrays only).
     void write_chunk(std::span<const std::size_t> chunk_indices,
                      std::span<const std::byte> data);
 
@@ -658,9 +715,12 @@ public:
     void write_shard(std::span<const std::size_t> shard_indices,
                      std::span<const std::optional<std::vector<std::byte>>> inner_chunks);
 
-    /// Append a single chunk to its shard file. Index at start (fixed 8KB header).
-    /// Two tiny writes: (1) append chunk data at EOF, (2) update 16-byte index entry.
-    /// Creates shard with empty index if it doesn't exist.
+    /// Store one already-encoded inner chunk in its shard file (local arrays
+    /// only), creating the shard with an all-missing index if it doesn't exist.
+    /// index_location "start": append the data at EOF, then rewrite the index
+    /// entry in place (just those 16 bytes when there is no crc32c).
+    /// index_location "end": write the data over the old trailing index and
+    /// append the updated index (and its crc32c) after it.
     void write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
                                     std::span<const std::byte> data);
 
@@ -679,12 +739,9 @@ public:
 
     /// Root path of the zarr array on disk.
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return root_; }
-
-    // -- Attributes ----------------------------------------------------------
-
-    [[nodiscard]] std::string read_attrs() const;
-
-    void write_attrs(std::string_view json);
+    [[nodiscard]] bool is_remote() const noexcept {
+        return store_ && store_->is_remote();
+    }
 
 private:
     // -- Construction --------------------------------------------------------
@@ -704,6 +761,8 @@ private:
 
     [[nodiscard]] bool needs_compression() const noexcept;
     [[nodiscard]] bool needs_decompression() const noexcept;
+    bool decodePayloadInto(std::span<const std::byte> payload,
+                           std::span<std::byte> output, bool exactSize) const;
     [[nodiscard]] bool needs_byteswap() const noexcept;
 
     // -- Chunk key generation ------------------------------------------------
@@ -751,6 +810,11 @@ public:
     [[nodiscard]] std::optional<std::vector<std::byte>>
     extract_inner_chunk(std::span<const std::byte> shard_data,
                         std::span<const std::size_t> inner_indices) const;
+    /// Same, but returns the stored (still encoded) bytes, honouring
+    /// index_location; nullopt for a missing/empty chunk.
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    extract_inner_chunk_raw(std::span<const std::byte> shard_data,
+                            std::span<const std::size_t> inner_indices) const;
 
     // -- Members -------------------------------------------------------------
 private:
@@ -770,6 +834,25 @@ private:
     static constexpr std::size_t kShardMutexStripes = 64;
     mutable std::shared_ptr<std::array<std::mutex, kShardMutexStripes>>
         shard_write_mutexes_ = std::make_shared<std::array<std::mutex, kShardMutexStripes>>();
+
+    // Shard-index plumbing shared by every shard writer. Each honours
+    // index_location and a trailing crc32c index codec; the writers call
+    // check_shard_index_writable() before touching any file.
+    void check_shard_index_writable() const;
+    [[nodiscard]] std::vector<std::byte> encode_shard_index(const detail::ShardIndex& index) const;
+    [[nodiscard]] std::size_t linear_inner_index(std::span<const std::size_t> chunk_indices,
+                                                 std::vector<std::size_t>& shard_idx) const;
+    // Set index entry `linear` of the local shard at p. With a payload, the
+    // bytes are stored and the entry points at them; otherwise `entry` is
+    // written as is. Caller holds shard_mutex_for(p).
+    void set_shard_entry_locked(const std::filesystem::path& p, std::size_t linear,
+                                const std::span<const std::byte>* payload,
+                                detail::ShardIndexEntry entry);
+    // Read index entry `linear` of the local shard at p. Takes
+    // shard_mutex_for(p) itself: a trailing index moves on every update, so
+    // its position is located under the same lock as the entry read.
+    [[nodiscard]] std::optional<detail::ShardIndexEntry>
+    read_shard_entry(const std::filesystem::path& p, std::size_t linear) const;
 
     [[nodiscard]] std::mutex& shard_mutex_for(const std::filesystem::path& p) const {
         // hash_value(path) instead of hash<string>(native()): path::native()
@@ -797,285 +880,6 @@ private:
     std::optional<AwsAuth> auth = std::nullopt,
     ZarrArray::Codec codec = {},
     const std::string& array_key = {});
-
-// ---------------------------------------------------------------------------
-// Consolidated metadata reader (v2)
-// ---------------------------------------------------------------------------
-
-/// Load consolidated metadata from .zmetadata file.
-[[nodiscard]] detail::ConsolidatedMetadata
-load_consolidated_metadata(const std::filesystem::path& root);
-
-/// Open a zarr array using consolidated metadata (avoids per-array metadata reads).
-/// Uses the pre-parsed metadata directly without writing files.
-[[nodiscard]] ZarrArray open_from_consolidated(
-    const std::filesystem::path& root,
-    const std::string& array_path,
-    const detail::ConsolidatedMetadata& cm,
-    ZarrArray::Codec codec = {});
-
-// ---------------------------------------------------------------------------
-// Pyramid helpers
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] std::size_t count_pyramid_levels(const std::filesystem::path& root);
-
-[[nodiscard]] std::vector<ZarrArray> open_pyramid(
-    const std::filesystem::path& root, ZarrArray::Codec codec = {});
-
-// ===========================================================================
-// OME-NGFF (OME-Zarr) metadata and reader/writer
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// OME-Zarr axis types
-// ---------------------------------------------------------------------------
-
-enum class AxisType : std::uint8_t {
-    space,
-    time,
-    channel,
-    custom
-};
-
-struct Axis {
-    std::string name;
-    AxisType type = AxisType::space;
-    std::string unit;
-};
-
-// ---------------------------------------------------------------------------
-// Coordinate transforms (OME-NGFF multiscale)
-// ---------------------------------------------------------------------------
-
-struct ScaleTransform {
-    std::vector<double> scale;
-};
-
-struct TranslationTransform {
-    std::vector<double> translation;
-};
-
-using CoordinateTransform = std::variant<ScaleTransform, TranslationTransform>;
-
-// ---------------------------------------------------------------------------
-// Multiscale metadata
-// ---------------------------------------------------------------------------
-
-struct MultiscaleDataset {
-    std::string path;
-    std::vector<CoordinateTransform> transforms;
-};
-
-struct MultiscaleMetadata {
-    std::string version = "0.4";
-    std::string name;
-    std::string type;
-    std::vector<Axis> axes;
-    std::vector<MultiscaleDataset> datasets;
-
-    [[nodiscard]] std::size_t num_levels() const noexcept {
-        return datasets.size();
-    }
-
-    [[nodiscard]] std::size_t ndim() const noexcept {
-        return axes.size();
-    }
-
-    [[nodiscard]] std::optional<std::size_t> axis_index(std::string_view name) const noexcept {
-        for (std::size_t i = 0; i < axes.size(); ++i) {
-            if (axes[i].name == name) return i;
-        }
-        return std::nullopt;
-    }
-
-    [[nodiscard]] std::array<double, 3> voxel_size(std::size_t level) const;
-};
-
-// ---------------------------------------------------------------------------
-// Label metadata (OME-NGFF labels)
-// ---------------------------------------------------------------------------
-
-struct LabelColor {
-    std::uint32_t label_value;
-    std::array<std::uint8_t, 4> rgba;
-};
-
-struct LabelMetadata {
-    std::string version = "0.4";
-    std::vector<LabelColor> colors;
-    std::vector<std::string> properties;
-};
-
-// ---------------------------------------------------------------------------
-// Plate/Well metadata (HCS - High Content Screening)
-// ---------------------------------------------------------------------------
-
-struct WellRef {
-    std::string path;
-    std::size_t row;
-    std::size_t col;
-};
-
-struct PlateMetadata {
-    std::string version = "0.4";
-    std::string name;
-    std::vector<std::string> columns;
-    std::vector<std::string> rows;
-    std::vector<WellRef> wells;
-    std::size_t field_count = 1;
-};
-
-// ---------------------------------------------------------------------------
-// OME metadata parsing helpers
-// ---------------------------------------------------------------------------
-
-namespace ome_detail {
-
-[[nodiscard]] AxisType parse_axis_type(std::string_view s) noexcept;
-
-[[nodiscard]] std::string_view axis_type_string(AxisType t) noexcept;
-
-[[nodiscard]] std::vector<CoordinateTransform>
-parse_transforms(const JsonValue& arr);
-
-[[nodiscard]] JsonValue serialize_transforms(
-    const std::vector<CoordinateTransform>& transforms);
-
-} // namespace ome_detail
-
-// ---------------------------------------------------------------------------
-// parse_ome_metadata
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] MultiscaleMetadata parse_ome_metadata(const JsonValue& attrs);
-
-// ---------------------------------------------------------------------------
-// serialize_ome_metadata
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] JsonValue serialize_ome_metadata(const MultiscaleMetadata& meta);
-
-// ---------------------------------------------------------------------------
-// parse_label_metadata / parse_plate_metadata
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] LabelMetadata parse_label_metadata(const JsonValue& attrs);
-
-[[nodiscard]] PlateMetadata parse_plate_metadata(const JsonValue& attrs);
-
-// ---------------------------------------------------------------------------
-// Pyramid generation helpers
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] std::vector<double> compute_downsample_factors(
-    const MultiscaleMetadata& meta, std::size_t from_level, std::size_t to_level);
-
-[[nodiscard]] MultiscaleMetadata make_standard_multiscale(
-    std::string_view name,
-    std::vector<std::size_t> full_shape,
-    std::size_t num_levels,
-    std::vector<Axis> axes,
-    std::array<double, 3> voxel_size = {1.0, 1.0, 1.0});
-
-// ---------------------------------------------------------------------------
-// OmeZarrReader
-// ---------------------------------------------------------------------------
-
-class OmeZarrReader final {
-public:
-    explicit OmeZarrReader(const std::filesystem::path& root);
-
-    [[nodiscard]] const MultiscaleMetadata& multiscale() const noexcept {
-        return meta_;
-    }
-
-    [[nodiscard]] const std::vector<Axis>& axes() const noexcept {
-        return meta_.axes;
-    }
-
-    [[nodiscard]] std::size_t num_levels() const noexcept {
-        return meta_.num_levels();
-    }
-
-    [[nodiscard]] const ZarrArray& level(std::size_t idx) const {
-        if (idx >= levels_.size())
-            throw std::runtime_error("zarr: level index out of range");
-        return levels_[idx];
-    }
-
-    [[nodiscard]] std::array<double, 3> voxel_size(std::size_t lvl = 0) const {
-        return meta_.voxel_size(lvl);
-    }
-
-    [[nodiscard]] std::vector<std::size_t> shape(std::size_t lvl = 0) const {
-        if (lvl >= levels_.size())
-            throw std::runtime_error("zarr: level index out of range");
-        return levels_[lvl].metadata().shape;
-    }
-
-    [[nodiscard]] std::optional<std::vector<std::byte>>
-    read_chunk(std::size_t lvl, std::span<const std::size_t> chunk_indices) const {
-        return level(lvl).read_chunk(chunk_indices);
-    }
-
-    [[nodiscard]] bool has_labels() const noexcept {
-        return std::filesystem::is_directory(root_ / "labels");
-    }
-
-    [[nodiscard]] std::vector<std::string> label_names() const;
-
-    [[nodiscard]] OmeZarrReader open_label(std::string_view name) const {
-        auto label_path = root_ / "labels" / std::string(name);
-        return OmeZarrReader(label_path);
-    }
-
-    [[nodiscard]] bool is_plate() const noexcept;
-
-    [[nodiscard]] std::optional<PlateMetadata> plate_metadata() const;
-
-private:
-    std::filesystem::path root_;
-    std::shared_ptr<JsonValue> attrs_;
-    MultiscaleMetadata meta_;
-    std::vector<ZarrArray> levels_;
-};
-
-// ---------------------------------------------------------------------------
-// OmeZarrWriter
-// ---------------------------------------------------------------------------
-
-class OmeZarrWriter final {
-public:
-    struct Config {
-        std::filesystem::path root;
-        MultiscaleMetadata multiscale;
-        ZarrDtype dtype = ZarrDtype::uint16;
-        std::vector<std::size_t> chunk_shape;
-        ZarrArray::Codec codec = {};
-    };
-
-    explicit OmeZarrWriter(Config config)
-        : config_(std::move(config)) {
-        std::filesystem::create_directories(config_.root);
-    }
-
-    [[nodiscard]] ZarrArray& add_level(std::vector<std::size_t> shape);
-
-    void write_chunk(std::size_t lvl,
-                     std::span<const std::size_t> chunk_indices,
-                     std::span<const std::byte> data) {
-        if (lvl >= levels_.size())
-            throw std::runtime_error("zarr: level index out of range");
-        levels_[lvl].write_chunk(chunk_indices, data);
-    }
-
-    void finalize();
-
-private:
-    Config config_;
-    std::vector<ZarrArray> levels_;
-};
 
 } // namespace utils
 

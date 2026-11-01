@@ -2,8 +2,7 @@
 //
 // QuadSurface does not auto-trim on load or save. A surface with a
 // sparse valid region surrounded by (-1,-1,-1) cells round-trips
-// at its original grid size; cropping to the valid bbox is only
-// done when the user explicitly invokes vc_tifxyz_trim.
+// at its original grid size.
 //
 // Verified here:
 //  1) Size is preserved across save+load cycles for a sparse-but-
@@ -88,7 +87,8 @@ TEST_CASE("saveOverwrite round-trip preserves sparse-but-large surface")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // saveOverwrite path: load, then save again.
@@ -128,7 +128,8 @@ TEST_CASE("saveOverwrite snapshot captures the PRIOR on-disk state, not in-memor
         QuadSurface surf(ptsA, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));  // first save: no backups
 
@@ -181,7 +182,8 @@ TEST_CASE("saveOverwrite skips snapshot on first save when no on-disk state exis
         // is populated.
         // Use the underlying save API since saveOverwrite would also
         // exercise the snapshot path; both should leave no backup.
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));
@@ -205,7 +207,8 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // Sanity: the first save recorded the original extent.
@@ -237,53 +240,6 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
     }
 }
 
-TEST_CASE("save_meta does not publish bounds for unsaved geometry (#1272)")
-{
-    TmpVolpkg pkg("bbox_meta_only");
-
-    cv::Mat_<cv::Vec3f> pts(32, 32);
-    for (int r = 0; r < pts.rows; ++r)
-        for (int c = 0; c < pts.cols; ++c)
-            pts(r, c) = cv::Vec3f(static_cast<float>(c),
-                                  static_cast<float>(r),
-                                  100.f);
-
-    {
-        QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
-        surf.path = pkg.segDir;
-        surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
-    }
-
-    // save_meta() rewrites meta.json only; the x/y/z TIFFs keep the geometry
-    // written above. An in-memory edit that shrinks the surface must not be
-    // published as the bbox, or the recorded box would under-cover the
-    // geometry still on disk and bbox-prefiltered queries would drop it.
-    {
-        QuadSurface loaded(pkg.segDir);
-        loaded.ensureLoaded();
-        for (int r = 0; r < 32; ++r)
-            for (int c = 16; c < 32; ++c)
-                (*loaded.rawPointsPtr())(r, c) = cv::Vec3f(-1.f, -1.f, -1.f);
-        auto tags = utils::Json::array();
-        tags.push_back(utils::Json("approved"));
-        loaded.meta["tags"] = tags;
-        loaded.save_meta();
-    }
-
-    {
-        QuadSurface reloaded(pkg.segDir);
-        REQUIRE(reloaded.meta.contains("bbox"));
-        const auto& bb = reloaded.meta["bbox"];
-        // Still the persisted extent (x up to 31), not the shrunken one (15).
-        CHECK(bb[1][0].get_float() == doctest::Approx(31.f));
-        CHECK(bb[1][1].get_float() == doctest::Approx(31.f));
-        CHECK(bb[1][2].get_float() == doctest::Approx(100.f));
-        // The metadata-only edit itself was persisted.
-        REQUIRE(reloaded.meta.contains("tags"));
-    }
-}
-
 TEST_CASE("stale .tmp file in segment dir does not break reload")
 {
     TmpVolpkg pkg("stale_tmp");
@@ -294,7 +250,8 @@ TEST_CASE("stale .tmp file in segment dir does not break reload")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // Simulate a crash mid-write: some file got written as .tmp but

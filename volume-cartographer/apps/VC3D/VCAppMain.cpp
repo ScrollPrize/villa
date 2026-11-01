@@ -13,6 +13,7 @@
 #include <QImageReader>
 
 #include "CWindow.hpp"
+#include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
@@ -287,14 +288,6 @@ auto main(int argc, char* argv[]) -> int
         qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
     }
 
-    // Qt selects its platform plugin while QApplication is constructed, before
-    // QCommandLineParser runs. Pre-scan this replay flag so the flag alone is
-    // enough for headless offscreen benchmarking.
-    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
-        hasCliFlag(argc, argv, "--replay-offscreen-4k")) {
-        qputenv("QT_QPA_PLATFORM", "offscreen");
-    }
-
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
     // Force XCB (X11/XWayland) platform to restore full functionality.
@@ -313,6 +306,21 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
+#ifdef VC_TESTING
+    if (hasCliFlag(argc, argv, "--test-object-store")) {
+        extern int runObjectStoreControllerTests();
+        const int result=runObjectStoreControllerTests();
+        std::cout.flush(); std::cerr.flush();
+        // Match normal vc3d shutdown after controller/state cleanup.
+        std::_Exit(result);
+    }
+    if (hasCliFlag(argc, argv, "--test-surface-panel")) {
+        extern int runSurfacePanelStoreTests();
+        const int result = runSurfacePanelStoreTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
+#endif
     // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
     // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
     // after QApplication construction because Qt may cache the environment
@@ -333,6 +341,7 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+    vc3d::installSshPrompts();
 
     // Handle this before constructing the main window. QCommandLineParser's
     // built-in version option normally exits from process(), but keeping the
@@ -368,17 +377,14 @@ auto main(int argc, char* argv[]) -> int
         QString::number(CHUNK_CACHE_SIZE_GB));
     parser.addOption(cacheSizeOption);
 
-    QCommandLineOption loadFirstOption(
-        "load-first",
-        "Load the named segmentation folder first instead of loading all segmentation folders.",
-        "folder");
-    parser.addOption(loadFirstOption);
-
     QCommandLineOption volumePackageOption(
-        "volpkg",
-        "Open a volume package at startup.",
+        "project",
+        "Open a project (.vcproj) at startup.",
         "path");
     parser.addOption(volumePackageOption);
+    QCommandLineOption attachStoreOption(
+        "attach-store", "Attach an existing writable object store (.vcobj) beside the project.", "path");
+    parser.addOption(attachStoreOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -394,57 +400,6 @@ auto main(int argc, char* argv[]) -> int
         "debug-download-queue",
         "Overlay currently downloading remote chunks in every slice view.");
     parser.addOption(debugDownloadQueueOption);
-
-    QCommandLineOption recordOption(
-        "record",
-        "Record a navigation camera-state timeline to the given JSON file.",
-        "file");
-    parser.addOption(recordOption);
-
-    QCommandLineOption replayOption(
-        "replay",
-        "Replay a recorded navigation timeline (implies --profile), then exit.",
-        "file");
-    parser.addOption(replayOption);
-
-    QCommandLineOption replayWarmOption(
-        "replay-warm",
-        "With --replay, run a discarded warm-up pass before the timed pass.");
-    parser.addOption(replayWarmOption);
-
-    QCommandLineOption replayOffscreen4kOption(
-        "replay-offscreen-4k",
-        "With --replay, force the replay viewport to 3840x2160.");
-    parser.addOption(replayOffscreen4kOption);
-
-    QCommandLineOption replayLimitOption(
-        "replay-limit",
-        "With --replay, replay only the first N recorded keyframes (0 = all).",
-        "frames",
-        "0");
-    parser.addOption(replayLimitOption);
-
-    QCommandLineOption replaySkipChunkCompleteOption(
-        "replay-skip-chunk-complete",
-        "With --replay, advance after the first full render instead of waiting for chunk-complete quiet settle.");
-    parser.addOption(replaySkipChunkCompleteOption);
-
-    QCommandLineOption replaySkipFastRenderOption(
-        "replay-skip-fast-render",
-        "With --replay, skip any fast-render phase and submit the full render directly.");
-    parser.addOption(replaySkipFastRenderOption);
-
-    QCommandLineOption replayTimedProfileOption(
-        "replay-timed-profile",
-        "With --replay, switch frames on a fixed timer and print one row per paint.");
-    parser.addOption(replayTimedProfileOption);
-
-    QCommandLineOption replayTimedProfilePeriodOption(
-        "replay-timed-profile-period-ms",
-        "With --replay-timed-profile, milliseconds between frame switches.",
-        "ms",
-        "200");
-    parser.addOption(replayTimedProfilePeriodOption);
 
     QCommandLineOption agentBridgeOption(
         "agent-bridge",
@@ -466,21 +421,6 @@ auto main(int argc, char* argv[]) -> int
         SetLogLevel("debug");
     }
 
-    RenderBenchOptions benchOptions;
-    benchOptions.recordPath = parser.value(recordOption).trimmed();
-    benchOptions.replayPath = parser.value(replayOption).trimmed();
-    benchOptions.replayWarm = parser.isSet(replayWarmOption);
-    benchOptions.replayOffscreen4k = parser.isSet(replayOffscreen4kOption);
-    benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
-    benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
-    benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
-    benchOptions.debugDownloadQueue = parser.isSet(debugDownloadQueueOption);
-    bool limitOk = false;
-    const int replayLimit = parser.value(replayLimitOption).toInt(&limitOk);
-    benchOptions.replayLimit = (limitOk && replayLimit > 0) ? replayLimit : 0;
-    bool periodOk = false;
-    const int timedPeriod = parser.value(replayTimedProfilePeriodOption).toInt(&periodOk);
-    benchOptions.replayTimedProfilePeriodMs = (periodOk && timedPeriod > 0) ? timedPeriod : 200;
 
     if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);
@@ -513,10 +453,6 @@ auto main(int argc, char* argv[]) -> int
             1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
         remoteCacheDelta3d = vc::settings::remoteCacheDelta3dEnabled();
 
-        // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
-        QuadSurface::setBackupCount(
-            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
-
         constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
         vc::render::PersistentZarrCacheBudget::Limits limits;
         const auto maximumGiB = settings.value(
@@ -543,13 +479,6 @@ auto main(int argc, char* argv[]) -> int
         cacheSizeGB = static_cast<size_t>(parsed);
     }
 
-    if (parser.isSet(loadFirstOption)) {
-        const QString loadFirstDir = parser.value(loadFirstOption).trimmed();
-        if (!loadFirstDir.isEmpty()) {
-            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
-        }
-    }
-
     int rc = 0;
     std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService;
     {
@@ -572,7 +501,7 @@ auto main(int argc, char* argv[]) -> int
             chunkCacheService->configureFetchConcurrency(
                 fixedDownloadParallelism, false);
         }
-        CWindow aWin(cacheSizeGB, benchOptions);
+        CWindow aWin(cacheSizeGB, parser.isSet(debugDownloadQueueOption));
 
         if (parser.isSet(volumePackageOption)) {
             QString errorMessage;
@@ -584,6 +513,10 @@ auto main(int argc, char* argv[]) -> int
                 std::cerr.flush();
                 std::_Exit(2);
             }
+        }
+
+        if (parser.isSet(attachStoreOption)) {
+            aWin.attachStore(parser.value(attachStoreOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

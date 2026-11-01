@@ -1,16 +1,14 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceStoreEdit.hpp"
 
-#include "../OpenDataSegmentCache.hpp"
-#include "../OpenDataCoordinateIdentity.hpp"
+#include "../OpenDataManifest.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
-#include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
-#include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "tools/ThinPlateSpline3d.hpp"
 #include "growth/SegmentationCorrections.hpp"
@@ -64,17 +62,6 @@ float averageScale(const cv::Vec2f& scale)
     return (avg > 1e-4f) ? avg : 1.0f;
 }
 
-void ensureSurfaceMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-    surface->meta = utils::Json::object();
-}
-
 std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* viewer,
                                                            const QPointF& scenePos,
                                                            int rows,
@@ -107,97 +94,6 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 }
 }
 
-
-bool SegmentationModule::ensureActiveSurfaceEditableForModification()
-{
-    if (!_state || !_state->vpkg()) {
-        return true;
-    }
-
-    auto surface = _state->activeSurface().lock();
-    if (!surface) {
-        surface = std::dynamic_pointer_cast<QuadSurface>(
-            _state->surface("segmentation"));
-    }
-    if (!surface || surface->path.empty() ||
-        !vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
-        return true;
-    }
-
-    const std::filesystem::path activeSegmentsRoot =
-        _state->vpkg()->outputSegmentsPath();
-    const auto registeredCatalogRoot =
-        vc3d::opendata::registeredOpenDataCatalogRootForSegment(
-            *_state->vpkg(), surface->path);
-    const auto copySourceRoot = registeredCatalogRoot.empty()
-        ? activeSegmentsRoot
-        : registeredCatalogRoot;
-    const std::filesystem::path defaultPath =
-        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-            surface->path, copySourceRoot);
-
-    QMessageBox prompt(QApplication::activeWindow());
-    prompt.setWindowTitle(QObject::tr("Open Data Segment"));
-    prompt.setText(QObject::tr("This open-data segment is an immutable catalog cache."));
-    prompt.setInformativeText(
-        QObject::tr("Create or choose an editable copy before modifying it.\n\nSource: %1\nEditable copy: %2")
-            .arg(QString::fromStdString(surface->path.string()),
-                 QString::fromStdString(defaultPath.string())));
-    QPushButton* createButton = prompt.addButton(QObject::tr("Create Editable Copy"), QMessageBox::AcceptRole);
-    QPushButton* chooseButton = prompt.addButton(QObject::tr("Choose Existing Folder"), QMessageBox::ActionRole);
-    prompt.addButton(QMessageBox::Cancel);
-    prompt.setDefaultButton(createButton);
-    prompt.exec();
-
-    std::filesystem::path editablePath;
-    if (prompt.clickedButton() == createButton) {
-        editablePath = defaultPath;
-    } else if (prompt.clickedButton() == chooseButton) {
-        const QString chosen = QFileDialog::getExistingDirectory(
-            QApplication::activeWindow(),
-            QObject::tr("Choose Editable Segment Folder"),
-            QString::fromStdString(defaultPath.parent_path().string()),
-            QFileDialog::ShowDirsOnly);
-        if (chosen.isEmpty()) {
-            if (_widget) _widget->setEditingEnabled(false);
-            return false;
-        }
-        editablePath = std::filesystem::path(chosen.toStdString());
-    } else {
-        if (_widget) _widget->setEditingEnabled(false);
-        return false;
-    }
-
-    try {
-        vc3d::opendata::copyCatalogSegmentToEditableDirectory(
-            *_state->vpkg(), surface->path, editablePath);
-        const std::filesystem::path editableRoot = editablePath.parent_path();
-        auto pkg = _state->vpkg();
-        vc3d::opendata::attachEditableOpenDataSegmentRoot(
-            *pkg, surface->path, editableRoot, true);
-
-        const std::string segmentId = surface->id.empty()
-            ? editablePath.filename().string()
-            : surface->id;
-        auto editableSurface = pkg->loadSurface(segmentId);
-        if (!editableSurface) {
-            editableSurface = std::make_shared<QuadSurface>(editablePath);
-        }
-        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-            *editableSurface, *pkg, _state->currentVolumeId());
-        editableSurface->save_meta();
-        _state->setSurface("segmentation", editableSurface, false, false);
-        emit segmentationFolderChanged(QString::fromStdString(segmentId));
-        return true;
-    } catch (const std::exception& e) {
-        QMessageBox::warning(
-            QApplication::activeWindow(),
-            QObject::tr("Open Data Segment"),
-            QObject::tr("Could not create editable copy:\n\n%1").arg(QString::fromUtf8(e.what())));
-        if (_widget) _widget->setEditingEnabled(false);
-        return false;
-    }
-}
 
 void SegmentationModule::DragState::reset()
 {
@@ -259,8 +155,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_widget) {
         _dragRadiusSteps = _widget->dragRadius();
         _dragSigmaSteps = _widget->dragSigma();
-        _lineRadiusSteps = _widget->lineRadius();
-        _lineSigmaSteps = _widget->lineSigma();
         _pushPullRadiusSteps = _widget->pushPullRadius();
         _pushPullSigmaSteps = _widget->pushPullSigma();
         initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 100.0f);
@@ -271,32 +165,19 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
         _hoverPreviewEnabled = _widget->showHoverMarker();
-        _autoApprovalEnabled = _widget->autoApprovalEnabled();
-        _autoApprovalRadius = _widget->autoApprovalRadius();
-        _autoApprovalThreshold = _widget->autoApprovalThreshold();
-        _autoApprovalMaxDistance = _widget->autoApprovalMaxDistance();
-        _approvalMaskBrushRadius = std::max(1.0f, _widget->approvalBrushRadius());
-        _approvalBrushDepth = std::clamp(_widget->approvalBrushDepth(), 1.0f, 500.0f);
-        if (_widget->approvalBrushColor().isValid()) {
-            _approvalBrushColor = _widget->approvalBrushColor();
-        }
+        _maskBrushRadius = std::max(1.0f, _widget->maskBrushRadius());
         _drawMaskEnabled = _widget->drawMaskEnabled();
     }
 
     if (_overlay) {
         _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
-        if (_widget) {
-            _overlay->setApprovalMaskOpacity(_widget->approvalMaskOpacity());
-        }
     }
 
-    _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _state, _smoothStrength, _smoothIterations);
-    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _state);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
-    _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
     _surfaceMaskTool = std::make_unique<SurfaceMaskBrushTool>(*this);
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
@@ -313,6 +194,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
+        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
     }
 
     if (_pointCollection) {
@@ -386,7 +268,6 @@ void SegmentationModule::setHoverPreviewEnabled(bool enabled)
         return;
     }
     _hoverPreviewEnabled = enabled;
-    resetHoverLookupDetail();
     if (!enabled && _hover.valid) {
         _hover.clear();
     }
@@ -463,10 +344,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setDragRadius);
     connect(_widget, &SegmentationWidget::dragSigmaChanged,
             this, &SegmentationModule::setDragSigma);
-    connect(_widget, &SegmentationWidget::lineRadiusChanged,
-            this, &SegmentationModule::setLineRadius);
-    connect(_widget, &SegmentationWidget::lineSigmaChanged,
-            this, &SegmentationModule::setLineSigma);
     connect(_widget, &SegmentationWidget::pushPullRadiusChanged,
             this, &SegmentationModule::setPushPullRadius);
     connect(_widget, &SegmentationWidget::pushPullSigmaChanged,
@@ -507,31 +384,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::clearActiveCorrectionCollection);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
-    connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
-            this, &SegmentationModule::setShowApprovalMask);
-    connect(_widget, &SegmentationWidget::editApprovedMaskChanged,
-            this, &SegmentationModule::setEditApprovedMask);
-    connect(_widget, &SegmentationWidget::editUnapprovedMaskChanged,
-            this, &SegmentationModule::setEditUnapprovedMask);
-    connect(_widget, &SegmentationWidget::autoApprovalEnabledChanged,
-            this, &SegmentationModule::setAutoApprovalEnabled);
-    connect(_widget, &SegmentationWidget::autoApprovalRadiusChanged,
-            this, &SegmentationModule::setAutoApprovalRadius);
-    connect(_widget, &SegmentationWidget::autoApprovalThresholdChanged,
-            this, &SegmentationModule::setAutoApprovalThreshold);
-    connect(_widget, &SegmentationWidget::autoApprovalMaxDistanceChanged,
-            this, &SegmentationModule::setAutoApprovalMaxDistance);
-
-    connect(_widget, &SegmentationWidget::approvalBrushRadiusChanged,
-            this, &SegmentationModule::setApprovalMaskBrushRadius);
-    connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
-            this, &SegmentationModule::setApprovalBrushDepth);
-    connect(_widget, &SegmentationWidget::approvalBrushColorChanged,
-            this, &SegmentationModule::setApprovalBrushColor);
-    connect(_widget, &SegmentationWidget::approvalMaskOpacityChanged,
-            _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
-    connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
-            this, &SegmentationModule::undoApprovalStroke);
+    connect(_widget, &SegmentationWidget::maskBrushRadiusChanged,
+            this, &SegmentationModule::setMaskBrushRadius);
     connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
         if (_manualAddTool && _widget) {
             _manualAddTool->setConfig(_widget->manualAddConfig());
@@ -598,7 +452,6 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
     }
 
     viewerObject->setProperty("vc_segmentation_bound", true);
-    viewer->setSegmentationEditActive(_editingEnabled);
     _attachedViewers.insert(viewer);
     connect(viewerObject, &QObject::destroyed, this, [this, viewer]() {
         detachViewer(viewer);
@@ -608,7 +461,6 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
 void SegmentationModule::attachViewer(VolumeViewerBase* viewer)
 {
     bindViewerSignals(viewer);
-    updateViewerCursors();
 }
 
 void SegmentationModule::detachViewer(VolumeViewerBase* viewer)
@@ -632,23 +484,16 @@ void SegmentationModule::detachViewer(VolumeViewerBase* viewer)
     }
 }
 
-void SegmentationModule::updateViewerCursors()
+void SegmentationModule::publishEditDraft(const std::optional<cv::Rect>& vertices)
 {
-    for (auto* viewer : std::as_const(_attachedViewers)) {
-        if (!viewer) {
-            continue;
-        }
-        viewer->setSegmentationEditActive(_editingEnabled);
+    if (!_editManager || !_editManager->hasSession()) {
+        return;
     }
-}
-
-SurfacePatchIndex* SegmentationModule::activeEditSurfacePatchIndex() const
-{
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
-        return nullptr;
+    if (vertices) {
+        _editManager->publishDraft(*vertices);
+    } else {
+        _editManager->publishWholeDraft();
     }
-    auto* index = _editManager->editSurfacePatchIndex();
-    return (index && !index->empty()) ? index : nullptr;
 }
 
 void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
@@ -670,11 +515,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    if (enabled) {
-        if (!ensureActiveSurfaceEditableForModification()) {
-            return;
-        }
-    }
     _editingEnabled = enabled;
 
     if (_overlay) {
@@ -683,14 +523,10 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setActive(enabled && hasActiveSession() && _drawMaskEnabled);
     }
-    updateViewerCursors();
     if (!enabled) {
         resetManualAddState(true);
         stopAllPushPull();
-        clearLineDragStroke();
-        _lineDrawKeyActive = false;
         clearUndoStack();
-        resetHoverLookupDetail();
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
         if (_autosaveState.pending() && _editManager && _editManager->hasSession()) {
@@ -706,259 +542,28 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     updateAutosaveState();
 }
 
-void SegmentationModule::setShowApprovalMask(bool enabled)
-{
-    if (_showApprovalMask == enabled) {
-        return;
-    }
-
-    _showApprovalMask = enabled;
-    qCInfo(lcSegModule) << "=== Show Approval Mask:" << (enabled ? "ENABLED" : "DISABLED") << "===";
-
-    if (_showApprovalMask) {
-        // Showing approval mask - load it for display
-        QuadSurface* surface = nullptr;
-        std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-        if (_editManager && _editManager->hasSession()) {
-            qCInfo(lcSegModule) << "  Loading approval mask (has active session)";
-            surface = _editManager->baseSurface().get();
-        } else if (_state) {
-            qCInfo(lcSegModule) << "  Loading approval mask (from surfaces collection)";
-            surfaceHolder = _state->surface("segmentation");
-            surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-        }
-
-        if (surface && _overlay) {
-            _overlay->loadApprovalMaskImage(surface);
-            qCInfo(lcSegModule) << "  Loaded approval mask into QImage";
-        }
-    }
-
-    refreshOverlay();
-}
-
 void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
     resetManualAddState(true);
 
-    // Flush any pending approval mask saves and clear images BEFORE turning off editing
-    // loadApprovalMaskImage(nullptr) does both:
-    // 1. Saves pending changes to _approvalSaveSurface (the previous segment)
-    // 2. Clears the mask images so subsequent saveApprovalMaskToDisk() has nothing to save
-    // This prevents the old mask from being incorrectly saved to the new segment
-    if (_overlay) {
-        _overlay->loadApprovalMaskImage(nullptr);
-    }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
         _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
-    // Turn off any approval mask editing when switching segments
-    if (isEditingApprovalMask()) {
-        qCInfo(lcSegModule) << "  Turning off approval mask editing";
-        if (_editApprovedMask) {
-            setEditApprovedMask(false);
-            if (_widget) {
-                _widget->setEditApprovedMask(false);
-            }
-        }
-        if (_editUnapprovedMask) {
-            setEditUnapprovedMask(false);
-            if (_widget) {
-                _widget->setEditUnapprovedMask(false);
-            }
-        }
-    }
-
-    // Sync show approval mask state from widget (handles restored settings case)
-    if (_widget && _widget->showApprovalMask() != _showApprovalMask) {
-        qCInfo(lcSegModule) << "  Syncing showApprovalMask from widget:" << _widget->showApprovalMask();
-        _showApprovalMask = _widget->showApprovalMask();
-    }
-
-    // Check if new surface has an approval mask
-    bool hasApprovalMask = false;
-    if (newSurface) {
-        try {
-            cv::Mat approvalChannel = newSurface->channel("approval", SURF_CHANNEL_NORESIZE);
-            hasApprovalMask = !approvalChannel.empty();
-            qCInfo(lcSegModule) << "  New surface has approval mask:" << hasApprovalMask;
-        } catch (const std::exception& e) {
-            qCWarning(lcSegModule)
-                << "  Could not inspect approval mask for active segment:"
-                << e.what();
-            newSurface = nullptr;
-        }
-    }
-
-    if (_showApprovalMask) {
-        if (hasApprovalMask && newSurface && _overlay) {
-            // Load the new surface's approval mask
-            qCInfo(lcSegModule) << "  Loading approval mask for new surface";
-            _overlay->loadApprovalMaskImage(newSurface);
-        } else {
-            // No approval mask on new surface - turn off show mode
-            qCInfo(lcSegModule) << "  No approval mask on new surface, turning off show mode";
-            _showApprovalMask = false;
-            if (_widget) {
-                _widget->setShowApprovalMask(false);
-            }
-            if (_overlay) {
-                _overlay->loadApprovalMaskImage(nullptr);  // Clear the mask
-            }
-        }
-    }
-
     // Save corrections for old segment and load for new segment
     if (_pointCollection) {
-        // Save pending corrections for the old segment
-        if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
-            _correctionsSaveTimer->stop();
-        }
-        if (!_correctionsSegmentPath.empty()) {
-            qCInfo(lcSegModule) << "  Saving correction points for previous segment";
-            _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
-        }
-
-        // Load corrections for new segment
-        if (newSurface && !newSurface->path.empty()) {
-            qCInfo(lcSegModule) << "  Loading correction points for new segment:"
-                                << QString::fromStdString(newSurface->path.string());
-            _pointCollection->loadFromSegmentPath(newSurface->path);
-            _correctionsSegmentPath = newSurface->path;
-        } else {
-            // No valid path - clear anchored collections and path
-            qCInfo(lcSegModule) << "  No segment path, clearing anchored corrections";
-            _pointCollection->loadFromSegmentPath({});  // Clears anchored collections
-            _correctionsSegmentPath.clear();
-        }
+        saveCorrections();
     }
-
-    refreshOverlay();
-}
-
-void SegmentationModule::setEditApprovedMask(bool enabled)
-{
-    if (_editApprovedMask == enabled) {
-        return;
+    // The previous surface's pending saves are done: its store edit ends here.
+    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
+        _storeEdit.reset();
+        _editLease = {};
     }
-
-    // If enabling, ensure unapproved mode is off (mutual exclusion)
-    if (enabled && _editUnapprovedMask) {
-        setEditUnapprovedMask(false);
-    }
-
-    const bool wasEditing = isEditingApprovalMask();
-    _editApprovedMask = enabled;
-    qCInfo(lcSegModule) << "=== Edit Approved Mask:" << (enabled ? "ENABLED" : "DISABLED") << "===";
-
-    if (_editApprovedMask) {
-        // Entering approval mask editing mode (approve)
-        qCInfo(lcSegModule) << "  Activating approval brush tool (approve mode)";
-        if (_approvalTool) {
-            _approvalTool->setActive(true);
-            _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Approve);
-
-            // Set surface on approval tool - prefer surface from collection since it has
-            // the most up-to-date approval mask (preserved after tracer growth)
-            QuadSurface* surface = nullptr;
-            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_state) {
-                surfaceHolder = _state->surface("segmentation");
-                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-            }
-            if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface().get();
-            }
-
-            if (surface) {
-                _approvalTool->setSurface(surface);
-                // Reload approval mask image to ensure dimensions match current surface
-                if (_overlay) {
-                    _overlay->loadApprovalMaskImage(surface);
-                }
-            }
-        }
-
-        // Deactivate regular editing tools
-        clearLineDragStroke();
-        stopAllPushPull();
-    } else if (!isEditingApprovalMask()) {
-        // Exiting all approval mask editing - save to disk
-        qCInfo(lcSegModule) << "  Deactivating approval brush tool and saving";
-        if (_approvalTool) {
-            _approvalTool->setActive(false);
-        }
-
-        // Save changes to disk when exiting edit mode
-        if (wasEditing) {
-            saveApprovalMaskToDisk();
-        }
-    }
-
-    refreshOverlay();
-}
-
-void SegmentationModule::setEditUnapprovedMask(bool enabled)
-{
-    if (_editUnapprovedMask == enabled) {
-        return;
-    }
-
-    // If enabling, ensure approved mode is off (mutual exclusion)
-    if (enabled && _editApprovedMask) {
-        setEditApprovedMask(false);
-    }
-
-    const bool wasEditing = isEditingApprovalMask();
-    _editUnapprovedMask = enabled;
-    qCInfo(lcSegModule) << "=== Edit Unapproved Mask:" << (enabled ? "ENABLED" : "DISABLED") << "===";
-
-    if (_editUnapprovedMask) {
-        // Entering approval mask editing mode (unapprove)
-        qCInfo(lcSegModule) << "  Activating approval brush tool (unapprove mode)";
-        if (_approvalTool) {
-            _approvalTool->setActive(true);
-            _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Unapprove);
-
-            // Set surface on approval tool - prefer surface from collection since it has
-            // the most up-to-date approval mask (preserved after tracer growth)
-            QuadSurface* surface = nullptr;
-            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_state) {
-                surfaceHolder = _state->surface("segmentation");
-                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-            }
-            if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface().get();
-            }
-
-            if (surface) {
-                _approvalTool->setSurface(surface);
-                // Reload approval mask image to ensure dimensions match current surface
-                if (_overlay) {
-                    _overlay->loadApprovalMaskImage(surface);
-                }
-            }
-        }
-
-        // Deactivate regular editing tools
-        clearLineDragStroke();
-        stopAllPushPull();
-    } else if (!isEditingApprovalMask()) {
-        // Exiting all approval mask editing - save to disk
-        qCInfo(lcSegModule) << "  Deactivating approval brush tool and saving";
-        if (_approvalTool) {
-            _approvalTool->setActive(false);
-        }
-
-        // Save changes to disk when exiting edit mode
-        if (wasEditing) {
-            saveApprovalMaskToDisk();
-        }
+    if (_pointCollection) {
+        loadCorrections(newSurface);
     }
 
     refreshOverlay();
@@ -989,7 +594,6 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     }
 
     if (enabled) {
-        clearLineDragStroke();
         stopAllPushPull();
         cancelDrag();
     }
@@ -997,134 +601,10 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     refreshOverlay();
 }
 
-void SegmentationModule::setAutoApprovalEnabled(bool enabled)
+void SegmentationModule::setMaskBrushRadius(float radius)
 {
-    _autoApprovalEnabled = enabled;
-}
-
-void SegmentationModule::setAutoApprovalRadius(float radius)
-{
-    _autoApprovalRadius = std::clamp(radius, 0.0f, 10.0f);
-}
-
-void SegmentationModule::setAutoApprovalThreshold(float threshold)
-{
-    _autoApprovalThreshold = std::clamp(threshold, 0.0f, 10.0f);
-}
-
-void SegmentationModule::setAutoApprovalMaxDistance(float distance)
-{
-    _autoApprovalMaxDistance = std::clamp(distance, 0.0f, 500.0f);
-}
-
-std::vector<std::pair<int, int>> SegmentationModule::filterVerticesForAutoApproval(
-    const std::vector<SegmentationEditManager::VertexEdit>& edits,
-    const std::optional<std::pair<int, int>>& dragCenter) const
-{
-    std::vector<std::pair<int, int>> result;
-    result.reserve(edits.size());
-    const float autoApprovalMaxDistanceSq = _autoApprovalMaxDistance > 0.0f ? _autoApprovalMaxDistance * _autoApprovalMaxDistance : 0.0f;
-
-    for (const auto& edit : edits) {
-        // Check threshold: skip if movement is below minimum
-        if (_autoApprovalThreshold > 0.0f) {
-            const cv::Vec3f delta = edit.currentWorld - edit.originalWorld;
-            const float distance = cv::norm(delta);
-            if (distance < _autoApprovalThreshold) {
-                continue;
-            }
-        }
-
-        // Check max distance from drag center: skip if too far
-        if (_autoApprovalMaxDistance > 0.0f && dragCenter.has_value()) {
-            const int dr = edit.row - dragCenter->first;
-            const int dc = edit.col - dragCenter->second;
-            const float gridDistSq = static_cast<float>(dr * dr + dc * dc);
-            if (gridDistSq > _autoApprovalMaxDistance * _autoApprovalMaxDistance) {
-                continue;
-            }
-        }
-
-        result.emplace_back(edit.row, edit.col);
-    }
-
-    return result;
-}
-
-void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, int>>& vertices)
-{
-    if (vertices.empty() || !_overlay || !_overlay->hasApprovalMaskData()) {
-        return;
-    }
-
-    constexpr uint8_t kApproved = 255;
-    constexpr bool kIsAutoApproval = true;
-    const QColor brushColor = approvalBrushColor();
-    _overlay->paintApprovalMaskDirect(vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
-    _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-    qCDebug(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
-}
-
-void SegmentationModule::saveApprovalMaskToDisk()
-{
-    qCInfo(lcSegModule) << "Saving approval mask to disk...";
-
-    QuadSurface* surface = nullptr;
-    std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-    if (_editManager && _editManager->hasSession()) {
-        surface = _editManager->baseSurface().get();
-    } else if (_state) {
-        surfaceHolder = _state->surface("segmentation");
-        surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-    }
-
-    if (_overlay && surface) {
-        // Compose the mask onto the surface channel and let the single autosave
-        // persist it (x/y/z + meta + all channels) on its next tick.
-        _overlay->composeApprovalMaskToSurface(surface);
-        markAutosaveNeeded();
-        if (!surface->id.empty()) {
-            emit approvalMaskSaved(surface->id);
-        }
-    }
-}
-
-void SegmentationModule::setApprovalMaskBrushRadius(float radiusSteps)
-{
-    _approvalMaskBrushRadius = std::max(1.0f, radiusSteps);
-}
-
-void SegmentationModule::setApprovalBrushDepth(float depth)
-{
-    _approvalBrushDepth = std::clamp(depth, 1.0f, 500.0f);
-}
-
-void SegmentationModule::setApprovalBrushColor(const QColor& color)
-{
-    if (color.isValid()) {
-        _approvalBrushColor = color;
-    }
-}
-
-void SegmentationModule::undoApprovalStroke()
-{
-    qCInfo(lcSegModule) << "Undoing last approval stroke...";
-    if (!_overlay) {
-        qCWarning(lcSegModule) << "  No overlay controller available";
-        return;
-    }
-
-    if (!_overlay->canUndoApprovalMaskPaint()) {
-        qCInfo(lcSegModule) << "  Nothing to undo";
-        emit statusMessageRequested(tr("Nothing to undo."), kStatusShort);
-        return;
-    }
-
-    if (_overlay->undoLastApprovalMaskPaint()) {
-        refreshOverlay();
-        emit statusMessageRequested(tr("Undid last approval stroke."), kStatusShort);
-        qCInfo(lcSegModule) << "  Approval stroke undone";
-    }
+    _maskBrushRadius = std::max(1.0f, radius);
+    refreshOverlay();
 }
 
 void SegmentationModule::applyEdits()
@@ -1140,15 +620,6 @@ void SegmentationModule::applyEdits()
     // Capture delta for undo before applyPreview() clears edited vertices
     if (hadPendingChanges) {
         (void)captureUndoDelta();
-    }
-
-    // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
-    if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
-        const auto editedVerts = _editManager->editedVertices();
-        if (!editedVerts.empty()) {
-            const auto filteredVerts = filterVerticesForAutoApproval(editedVerts, std::nullopt);
-            performAutoApproval(filteredVerts);
-        }
     }
 
     _editManager->applyPreview();
@@ -1171,7 +642,6 @@ void SegmentationModule::resetEdits()
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
     cancelDrag();
-    clearLineDragStroke();
     _editManager->resetPreview();
     if (_state) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
@@ -1185,8 +655,6 @@ void SegmentationModule::resetEdits()
 
 void SegmentationModule::stopTools()
 {
-    _lineDrawKeyActive = false;
-    clearLineDragStroke();
     cancelDrag();
     cancelCorrectionDrag();
     emit stopToolsRequested();
@@ -1223,9 +691,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
     }
     if (running) {
         setAnnotateMode(false);
-        clearLineDragStroke();
-        _lineDrawKeyActive = false;
-        resetHoverLookupDetail();
     } else if (_editingEnabled && _hoverPreviewEnabled && !_hover.valid) {
         recoverHoverPointerFromCursor();
         ensureHoverTarget();
@@ -1242,7 +707,6 @@ void SegmentationModule::emitPendingChanges()
     }
     const bool pending = _editManager->hasPendingChanges();
     _widget->setPendingChanges(pending);
-    emit pendingChangesChanged(pending);
 }
 
 void SegmentationModule::refreshOverlay()
@@ -1256,60 +720,7 @@ void SegmentationModule::refreshOverlay()
     state.gaussianSigmaSteps = falloffSigma(_activeFalloff);
     state.gridStepWorld = gridStepWorld();
 
-    const auto toFalloffMode = [](FalloffTool tool) {
-        using Mode = SegmentationOverlayController::State::FalloffMode;
-        switch (tool) {
-        case FalloffTool::Drag:
-            return Mode::Drag;
-        case FalloffTool::Line:
-            return Mode::Line;
-        case FalloffTool::PushPull:
-            return Mode::PushPull;
-        }
-        return Mode::Drag;
-    };
-    state.falloff = toFalloffMode(_activeFalloff);
-
     const bool hasSession = _editManager && _editManager->hasSession();
-
-    // Get surface for approval mask - from edit session if available, otherwise from surfaces collection
-    QuadSurface* approvalSurface = nullptr;
-    std::shared_ptr<Surface> approvalSurfaceHolder;  // Keep surface alive during this scope
-    if (hasSession && _editManager) {
-        approvalSurface = _editManager->baseSurface().get();
-    } else if (_state) {
-        approvalSurfaceHolder = _state->surface("segmentation");
-        approvalSurface = dynamic_cast<QuadSurface*>(approvalSurfaceHolder.get());
-    }
-
-    // Set approval mask state even without editing session (for view-only mode)
-    // Show the mask when _showApprovalMask is true
-    if (_showApprovalMask && approvalSurface) {
-        state.approvalMaskMode = true;
-        state.surface = approvalSurface;
-    }
-
-    // Populate brush/stroke info when editing is enabled
-    if (isEditingApprovalMask() && approvalSurface) {
-        state.approvalMaskMode = true;  // Must be true to render brush
-        state.approvalBrushRadius = _approvalMaskBrushRadius;
-        state.approvalBrushDepth = _approvalBrushDepth;
-        state.surface = approvalSurface;
-        if (_approvalTool) {
-            state.approvalStrokeActive = _approvalTool->strokeActive();
-            state.approvalStrokeSegments = _approvalTool->overlayStrokeSegments();
-            state.approvalCurrentStroke = _approvalTool->overlayPoints();
-            state.paintingApproval = (_approvalTool->paintMode() == ApprovalMaskBrushTool::PaintMode::Approve);
-            state.approvalHoverWorld = _approvalTool->hoverWorldPos();
-            state.approvalHoverSurfacePos = _approvalTool->hoverSurfacePos();
-            state.approvalHoverPlaneNormal = _approvalTool->hoverPlaneNormal();
-            if (_approvalTool->strokeActive() && _approvalTool->effectivePaintRadius() > 0.0f) {
-                state.approvalEffectiveRadius = _approvalTool->effectivePaintRadius();
-            } else {
-                state.approvalEffectiveRadius = _approvalTool->hoverEffectiveRadius();
-            }
-        }
-    }
 
     // Add correction drag state (before hasSession check - corrections work without full editing session)
     if (_correctionDrag.active) {
@@ -1360,44 +771,21 @@ void SegmentationModule::refreshOverlay()
         }
     }
 
-    std::vector<cv::Vec3f> maskPoints;
-    std::size_t maskReserve = 0;
-    if (_lineTool) {
-        maskReserve += _lineTool->overlayPoints().size();
-    }
-    maskPoints.reserve(maskReserve);
-    if (_lineTool) {
-        const auto& linePts = _lineTool->overlayPoints();
-        maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
-    }
     if (_surfaceMaskTool) {
         state.surfaceMaskPoints = _surfaceMaskTool->overlaySurfacePoints();
     }
 
-    const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
-    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
     const bool surfaceMaskActive = _surfaceMaskTool && _surfaceMaskTool->active();
     const bool surfaceMaskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
-    state.maskPoints = std::move(maskPoints);
-    state.maskVisible = !state.maskPoints.empty() || !state.surfaceMaskPoints.empty();
-    state.hasLineStroke = hasLineStroke;
-    state.lineStrokeActive = lineStrokeActive;
-    state.brushActive = surfaceMaskActive;
-    state.brushStrokeActive = surfaceMaskStrokeActive;
     state.pushPullActive = pushPullActive;
 
-    FalloffTool overlayTool = _activeFalloff;
-    if (hasLineStroke) {
-        overlayTool = FalloffTool::Line;
-    } else if (pushPullActive) {
-        overlayTool = FalloffTool::PushPull;
-    }
+    const FalloffTool overlayTool = pushPullActive ? FalloffTool::PushPull : _activeFalloff;
 
     state.displayRadiusSteps = falloffRadius(overlayTool);
     if (surfaceMaskActive || surfaceMaskStrokeActive) {
-        state.displayRadiusSteps = _approvalMaskBrushRadius;
+        state.displayRadiusSteps = _maskBrushRadius;
     }
 
     if (_manualAddMode && _manualAddTool) {
@@ -1415,7 +803,7 @@ void SegmentationModule::refreshOverlay()
                 const int col = p.x;
                 line.surfacePoints.push_back(QPointF(col, row));
                 if (row >= 0 && row < preview.rows && col >= 0 && col < preview.cols &&
-                    !ManualAddTool::isInvalidPoint(preview(row, col))) {
+                    vc::geometry::validSurfacePoint(preview(row, col))) {
                     line.worldPoints.push_back(preview(row, col));
                 }
             }
@@ -1449,7 +837,7 @@ void SegmentationModule::refreshOverlay()
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
-                !ManualAddTool::isInvalidPoint(preview(key.row, key.col))) {
+                vc::geometry::validSurfacePoint(preview(key.row, key.col))) {
                 state.manualAddPreviewVertices.push_back(preview(key.row, key.col));
             }
         }
@@ -1472,7 +860,7 @@ void SegmentationModule::refreshOverlay()
                 preview(row + 1, col)
             };
             if (std::all_of(quad.begin(), quad.end(), [](const cv::Vec3f& point) {
-                    return !ManualAddTool::isInvalidPoint(point);
+                    return vc::geometry::validSurfacePoint(point);
                 })) {
                 state.manualAddPreviewQuads.push_back(quad);
             }
@@ -1546,27 +934,16 @@ void SegmentationModule::handleCorrectionPointAdded(
             gridIdx = _editManager->worldToGridIndex(worldPos);
         }
 
-        // Fallback: use patch index directly
-        if (!gridIdx) {
-            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            auto surfQ = surfaceHolder
-                ? std::dynamic_pointer_cast<QuadSurface>(surfaceHolder)
-                : activeBaseSurfaceShared();
-            if (patchIndex && !patchIndex->empty() && surfQ) {
-                const auto* pts = surface->rawPointsPtr();
-                if (pts && pts->rows > 0 && pts->cols > 0) {
-                    float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
-                    SurfacePatchIndex::PointQuery query;
-                    query.worldPoint = worldPos;
-                    query.tolerance = tol;
-                    query.surfaces.only = surfQ;
-                    auto hit = patchIndex->locate(query);
-                    if (hit) {
-                        cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
-                        int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
-                        int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
-                        gridIdx = {row, col};
-                    }
+        // Otherwise where the surface (stored, or a draft) lies at the point.
+        if (!gridIdx && _viewerManager) {
+            const auto* pts = surface->rawPointsPtr();
+            if (pts && pts->rows > 0 && pts->cols > 0) {
+                const float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
+                if (const auto hit = _viewerManager->locate(*surface, worldPos, tol)) {
+                    const cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
+                    const int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
+                    const int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
+                    gridIdx = {row, col};
                 }
             }
         }
@@ -1583,14 +960,6 @@ void SegmentationModule::handleCorrectionPointRemove(const cv::Vec3f& worldPos)
 {
     if (_corrections) {
         _corrections->handlePointRemoved(worldPos);
-    }
-}
-
-void SegmentationModule::pruneMissingCorrections()
-{
-    if (_corrections) {
-        _corrections->pruneMissing();
-        _corrections->refreshWidget();
     }
 }
 
@@ -1939,7 +1308,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
         }
 
         const cv::Vec3f& point = (*tracedPoints)(srcRow, srcCol);
-        if (ManualAddTool::isInvalidPoint(point)) {
+        if (!vc::geometry::validSurfacePoint(point)) {
             continue;
         }
         rawPreview(key.row, key.col) = point;
@@ -1965,7 +1334,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
                 continue;
             }
             const cv::Vec3f& point = snapshot(key.row, key.col);
-            if (ManualAddTool::isInvalidPoint(point)) {
+            if (!vc::geometry::validSurfacePoint(point)) {
                 continue;
             }
             boundarySamples.push_back(toTpsSample(key, point));
@@ -2025,7 +1394,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
 
             for (const auto& point : tracedFillPoints) {
                 auto predicted = tps.evaluate(cv::Point2d(point.key.col, point.key.row));
-                if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                if (!predicted || !vc::geometry::validSurfacePoint(*predicted)) {
                     smoothingOk = false;
                     break;
                 }
@@ -2036,7 +1405,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
             if (smoothingOk) {
                 for (const auto& key : boundaryKeys) {
                     auto predicted = tps.evaluate(cv::Point2d(key.col, key.row));
-                    if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                    if (!predicted || !vc::geometry::validSurfacePoint(*predicted)) {
                         smoothingOk = false;
                         break;
                     }
@@ -2094,12 +1463,9 @@ bool SegmentationModule::beginManualAdd()
     }
 
     stopAllPushPull();
-    clearLineDragStroke();
     cancelDrag();
     cancelCorrectionDrag();
     setAnnotateMode(false);
-    setEditApprovedMask(false);
-    setEditUnapprovedMask(false);
     _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
     if (_previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd) {
         _previousGrowthMethodBeforeManualAdd = _widget->lastNonManualGrowthMethod();
@@ -2448,7 +1814,7 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
         const auto& entry = _manualAddTool->entrySnapshotPoints();
         gridIsInvalid = grid->first >= 0 && grid->first < entry.rows &&
                         grid->second >= 0 && grid->second < entry.cols &&
-                        ManualAddTool::isInvalidPoint(entry(grid->first, grid->second));
+                        !vc::geometry::validSurfacePoint(entry(grid->first, grid->second));
     }
     const int throttleMs = _manualAddTool->config().previewThrottleMs;
     if (gridIsInvalid && throttleMs > 0 &&
@@ -2466,16 +1832,6 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
     return true;
 }
 
-void SegmentationModule::clearLineDragStroke()
-{
-    if (_lineTool) {
-        _lineTool->clear();
-    }
-    if (!_lineDrawKeyActive && _activeFalloff == FalloffTool::Line) {
-        useFalloff(FalloffTool::Drag);
-    }
-}
-
 bool SegmentationModule::isSegmentationViewer(const VolumeViewerBase* viewer) const
 {
     if (!viewer) {
@@ -2491,7 +1847,7 @@ float SegmentationModule::gridStepWorld() const
     const QuadSurface* surface = nullptr;
 
     if (!_editManager || !_editManager->hasSession()) {
-        // For approval mask mode, try to get base surface scale even without active session
+        // Without an active session, use the base surface's scale if there is one
         if (_editManager && _editManager->baseSurface()) {
             surface = _editManager->baseSurface().get();
             result = averageScale(surface->scale());
@@ -2533,23 +1889,40 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.lastWorld = worldPos;
     _drag.moved = true;
 
-    if (_drag.viewer) {
-        if (const auto touched = _editManager->recentTouchedBounds()) {
-            const cv::Rect changedCells(touched->x - 1,
-                                        touched->y - 1,
-                                        touched->width + 2,
-                                        touched->height + 2);
-            _drag.viewer->invalidateVisRegion("segmentation", changedCells);
-            _drag.viewer->invalidateIntersectRegion("segmentation", changedCells);
-        } else {
-            _drag.viewer->invalidateVis();
-            _drag.viewer->invalidateIntersect("segmentation");
-        }
-        _drag.viewer->requestRender();
-    }
+    if (_drag.viewer)
+        refreshEditedRegion(_drag.viewer);
 
     refreshOverlay();
     emitPendingChanges();
+}
+
+void SegmentationModule::refreshEditedRegion(VolumeViewerBase* editViewer)
+{
+    if (!_editManager)
+        return;
+    std::optional<cv::Rect> changedCells;
+    if (const auto touched = _editManager->recentTouchedBounds()) {
+        changedCells = cv::Rect(touched->x - 1, touched->y - 1,
+                                touched->width + 2, touched->height + 2);
+    }
+    const auto refresh = [&](VolumeViewerBase* viewer) {
+        if (changedCells)
+            viewer->invalidateVisRegion("segmentation", *changedCells);
+        else
+            viewer->invalidateVis();
+        viewer->requestRender("segmentation edit refresh");
+    };
+    if (editViewer)
+        refresh(editViewer);
+    // An edit made on a slice's intersection also moves the flattened view's
+    // geometry. Left out here, that view learns of the edit only from the
+    // final surface update, which drops its whole tile cache: a black flash.
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([&](VolumeViewerBase* viewer) {
+            if (viewer && viewer != editViewer && viewer->surfName() == "segmentation")
+                refresh(viewer);
+        });
+    }
 }
 
 void SegmentationModule::finishDrag()
@@ -2572,20 +1945,6 @@ void SegmentationModule::finishDrag()
 
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)captureUndoDelta();
-
-        // Auto-approve edited regions before applyPreview() clears them
-        if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {
-            if (!editedVerts.empty()) {
-                // Get drag center from the active drag state
-                const auto& activeDrag = _editManager->activeDrag();
-                std::optional<std::pair<int, int>> dragCenter;
-                if (activeDrag.center.row >= 0 && activeDrag.center.col >= 0) {
-                    dragCenter = std::make_pair(activeDrag.center.row, activeDrag.center.col);
-                }
-                const auto filteredVerts = filterVerticesForAutoApproval(editedVerts, dragCenter);
-                performAutoApproval(filteredVerts);
-            }
-        }
 
         _editManager->applyPreview();
         if (_state) {
@@ -2617,65 +1976,6 @@ bool SegmentationModule::isNearRotationHandle(VolumeViewerBase* viewer, const cv
         return false;
     }
     return _rotationHandleHitTester(viewer, worldPos);
-}
-
-SegmentationEditManager::GridSearchResolution SegmentationModule::hoverLookupDetail(const cv::Vec3f& worldPos)
-{
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
-        resetHoverLookupDetail();
-        return SegmentationEditManager::GridSearchResolution::High;
-    }
-
-    if (!_hoverLookup.initialized) {
-        _hoverLookup.initialized = true;
-        _hoverLookup.lastWorld = worldPos;
-        _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
-        _hoverLookup.timer.start();
-        return SegmentationEditManager::GridSearchResolution::High;
-    }
-
-    const qint64 elapsedNs = _hoverLookup.timer.nsecsElapsed();
-    _hoverLookup.timer.restart();
-    double dtSec = static_cast<double>(elapsedNs) / 1e9;
-    if (dtSec <= 1e-4) {
-        dtSec = 1e-4;
-    }
-
-    const cv::Vec3f delta = worldPos - _hoverLookup.lastWorld;
-    _hoverLookup.lastWorld = worldPos;
-
-    const float distance = cv::norm(delta);
-    const float instantaneousSpeed = distance / static_cast<float>(dtSec);
-
-    constexpr float kSmoothing = 0.2f;
-    if (_hoverLookup.smoothedWorldUnitsPerSecond <= 0.0f) {
-        _hoverLookup.smoothedWorldUnitsPerSecond = instantaneousSpeed;
-    } else {
-        _hoverLookup.smoothedWorldUnitsPerSecond =
-            _hoverLookup.smoothedWorldUnitsPerSecond * (1.0f - kSmoothing) +
-            instantaneousSpeed * kSmoothing;
-    }
-
-    constexpr float kMediumThreshold = 4.0f;
-    constexpr float kLowThreshold = 12.0f;
-
-    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kLowThreshold) {
-        return SegmentationEditManager::GridSearchResolution::Low;
-    }
-    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kMediumThreshold) {
-        return SegmentationEditManager::GridSearchResolution::Medium;
-    }
-    return SegmentationEditManager::GridSearchResolution::High;
-}
-
-void SegmentationModule::resetHoverLookupDetail()
-{
-    if (_hoverLookup.timer.isValid()) {
-        _hoverLookup.timer.invalidate();
-    }
-    _hoverLookup.initialized = false;
-    _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
-    _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
 }
 
 bool SegmentationModule::recoverHoverPointerFromCursor()
@@ -2746,7 +2046,6 @@ void SegmentationModule::recordPointerSample(VolumeViewerBase* viewer, const cv:
 
     // Detect viewer change and reset stale cached state
     if (_hoverPointer.valid && _hoverPointer.viewer != viewer) {
-        resetHoverLookupDetail();           // Reset velocity tracking
         _editManager->resetPointerSeed();   // Reset pointTo() seed
         _hover.clear();                     // Invalidate stale hover
     }
@@ -2783,12 +2082,9 @@ void SegmentationModule::updateHover(VolumeViewerBase* viewer,
     };
 
     if (_growthInProgress) {
-        resetHoverLookupDetail();
     } else if (!_editingEnabled || !_hoverPreviewEnabled) {
-        resetHoverLookupDetail();
         clearHover();
     } else if (!_editManager || !_editManager->hasSession()) {
-        resetHoverLookupDetail();
         clearHover();
     } else {
         if (!targetViewer || !isSegmentationViewer(targetViewer)) {
@@ -2882,11 +2178,6 @@ SegmentationModule::AutosaveStatus SegmentationModule::autosaveStatus() const
     return status;
 }
 
-bool SegmentationModule::applyPushPullStep()
-{
-    return _pushPullTool ? _pushPullTool->applyStep() : false;
-}
-
 void SegmentationModule::markAutosaveNeeded(bool immediate)
 {
     _autosaveState.markPending();
@@ -2929,10 +2220,10 @@ void SegmentationModule::performAutosave()
         return;
     }
 
-    // The single autosave persists the whole segment (x/y/z + meta + all
-    // channels incl. approval). Resolve the live surface from the edit session
-    // if there is one, else from the active "segmentation" surface — approval
-    // edits happen with editing disabled / no session and must still save.
+    // The single autosave publishes the surface's edits (vertices and
+    // channels such as the mask) to the store. Resolve the live surface from the edit session
+    // if there is one, else from the active "segmentation" surface — a save
+    // requested without a session (e.g. after growth) must still land.
     std::shared_ptr<QuadSurface> surfacePtr;
     if (_editManager && _editManager->hasSession()) {
         surfacePtr = _editManager->baseSurface();
@@ -2944,17 +2235,16 @@ void SegmentationModule::performAutosave()
         _pendingAutosaveVertexUpdates.clear();
         return;
     }
-    if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
+    const auto storeEdit = storeEditFor(surfacePtr.get());
+    if (!storeEdit) {
         if (!_autosaveState.failureNotified()) {
-            qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
-            emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
+            qCWarning(lcSegModule) << "Skipping autosave: the segmentation surface is not from the object store.";
+            emit statusMessageRequested(tr("Cannot autosave segmentation: the surface is not from the object store."),
                                         kStatusMedium);
             _autosaveState.setFailureNotified(true);
         }
         return;
     }
-
-    ensureSurfaceMetaObject(surfacePtr.get());
 
     if (_pendingAutosaveVertexUpdates.empty() && _editManager && _editManager->hasSession()
         && _editManager->hasPendingChanges()) {
@@ -2964,73 +2254,62 @@ void SegmentationModule::performAutosave()
     auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
     _pendingAutosaveVertexUpdates.clear();
 
+    // Vertex edits patch the previous save's copy and publish the rectangle they
+    // touch. Other saves (channels, masks, growth) copy the surface and publish
+    // its loaded channels and every changed vertex.
     auto snapshot = _saveSnapshot;
-    const auto savePath = surfacePtr->path;
-    const auto saveId = surfacePtr->id;
-    const auto saveMeta = surfacePtr->meta;
-    const cv::Vec2f saveScale = surfacePtr->scale();
-    const cv::Mat_<cv::Vec3f>* sourcePoints = surfacePtr->rawPointsPtr();
-    const cv::Size sourceSize = sourcePoints ? sourcePoints->size() : cv::Size();
-
-    // Non-vertex saves, such as channel/mask changes, still need the full
-    // surface state. Keep that compatibility path while avoiding it for the
-    // common geometry-edit case where vertexUpdates carries the precise delta.
-    if (snapshot && (snapshot->path != savePath || snapshot->id != saveId)) {
+    if (snapshot && (snapshot->id != surfacePtr->id ||
+                     snapshot->rawPointsPtr()->size() != surfacePtr->rawPointsPtr()->size())) {
         snapshot.reset();
     }
-
-    if (vertexUpdates.empty()) {
-        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints(), saveScale);
+    std::vector<std::string> channels;
+    cv::Rect rect;
+    if (vertexUpdates.empty() || !snapshot) {
+        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints().clone(), surfacePtr->scale());
         for (const auto& name : surfacePtr->channelNames()) {
-            cv::Mat ch = surfacePtr->channel(name, SURF_CHANNEL_NORESIZE);
-            if (!ch.empty()) {
-                snapshot->setChannel(name, ch.clone());
+            if (!surfacePtr->channelLoaded(name)) {
+                continue;
+            }
+            snapshot->setChannel(name, surfacePtr->channel(name, SURF_CHANNEL_NORESIZE).clone());
+            if (vertexUpdates.empty()) {
+                channels.push_back(name);
             }
         }
-        snapshot->path = savePath;
-        snapshot->id = saveId;
-        snapshot->meta = saveMeta;
+        snapshot->id = surfacePtr->id;
+        snapshot->meta = surfacePtr->meta;
+    }
+    if (vertexUpdates.empty()) {
+        rect = cv::Rect(0, 0, snapshot->rawPointsPtr()->cols, snapshot->rawPointsPtr()->rows);
+    } else {
+        int minRow = INT_MAX, minCol = INT_MAX, maxRow = -1, maxCol = -1;
+        for (const auto& update : vertexUpdates) {
+            minRow = std::min(minRow, update.row); maxRow = std::max(maxRow, update.row);
+            minCol = std::min(minCol, update.col); maxCol = std::max(maxCol, update.col);
+        }
+        rect = cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
     }
 
     const auto autosaveTicket = _autosaveState.startSave();
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
-    _saveFuture = QtConcurrent::run([snapshot,
-                                      vertexUpdates = std::move(vertexUpdates),
-                                      savePath,
-                                      saveId,
-                                      saveMeta,
-                                      sourceSize]() mutable -> std::shared_ptr<QuadSurface> {
-        if (!snapshot) {
-            snapshot = std::make_shared<QuadSurface>(savePath);
-            snapshot->ensureLoaded();
-        }
-
+    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels,
+                                      vertexUpdates = std::move(vertexUpdates)]() mutable -> std::shared_ptr<QuadSurface> {
         auto* points = snapshot->rawPointsPtr();
         if (!points || points->empty()) {
             throw std::runtime_error("Autosave snapshot has no point data");
         }
-
-        if (!sourceSize.empty() && points->size() != sourceSize) {
-            throw std::runtime_error("Autosave snapshot size does not match the active surface");
-        }
-
-        if (!vertexUpdates.empty()) {
-            for (const auto& update : vertexUpdates) {
-                if (update.row < 0 || update.row >= points->rows ||
-                    update.col < 0 || update.col >= points->cols) {
-                    continue;
-                }
-                (*points)(update.row, update.col) = update.world;
+        for (const auto& update : vertexUpdates) {
+            if (update.row < 0 || update.row >= points->rows ||
+                update.col < 0 || update.col >= points->cols) {
+                continue;
             }
+            (*points)(update.row, update.col) = update.world;
+        }
+        if (!vertexUpdates.empty()) {
             snapshot->invalidateCache();
         }
-
-        snapshot->path = savePath;
-        snapshot->id = saveId;
-        snapshot->meta = saveMeta;
-        snapshot->saveOverwrite();
+        storeEdit->save(*snapshot, rect, channels);
         return snapshot;
     });
     auto saveFuture = _saveFuture;
@@ -3057,8 +2336,6 @@ void SegmentationModule::performAutosave()
             failureMessage = tr("unknown error");
         }
 
-        if (failureMessage.isEmpty() && savedSnapshot)
-            emit surfaceSavedTo(QString::fromStdString(savedSnapshot->path.string()));
         const bool canRetry = _editManager && _editManager->hasSession();
         const auto completion = failureMessage.isEmpty()
             ? _autosaveState.completeSuccess(autosaveTicket)
@@ -3114,7 +2391,7 @@ void SegmentationModule::updateAutosaveState()
     }
 
     // Keep the single autosave timer running while editing a segment OR while
-    // any save is still pending (approval edits happen with editing disabled).
+    // any save is still pending (one can be requested with editing disabled).
     const bool shouldRun = (_editingEnabled && _editManager && _editManager->hasSession())
                         || _autosaveState.pending();
     if (shouldRun) {
@@ -3128,8 +2405,8 @@ void SegmentationModule::updateAutosaveState()
 
 void SegmentationModule::scheduleCorrectionsAutoSave()
 {
-    // Only auto-save if we have a valid segment path
-    if (_correctionsSegmentPath.empty() || !_pointCollection) {
+    // Only auto-save corrections of a surface from the object store
+    if (_correctionsSurfaceId.empty() || !_pointCollection) {
         return;
     }
 
@@ -3144,13 +2421,59 @@ void SegmentationModule::scheduleCorrectionsAutoSave()
 
 void SegmentationModule::performCorrectionsAutoSave()
 {
-    if (_correctionsSegmentPath.empty() || !_pointCollection) {
-        return;
-    }
+    saveCorrections();
+}
 
-    if (_pointCollection->saveToSegmentPath(_correctionsSegmentPath)) {
-        qCDebug(lcSegModule) << "Auto-saved correction points to" << QString::fromStdString(_correctionsSegmentPath.string());
-    } else {
-        qCWarning(lcSegModule) << "Failed to auto-save correction points";
+std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* surface)
+{
+    if (!surface || surface->id.empty()) {
+        return nullptr;
     }
+    const auto origin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
+    // Saves continue from the edit's own revisions until the surface is reopened.
+    if (_storeEdit && _storeEdit->uuid() == surface->id && (!origin || origin->pin == _storeEdit->origin())) {
+        return _storeEdit;
+    }
+    if (!origin || !_state) {
+        return nullptr;
+    }
+    try {
+        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), origin->pin, origin->view);
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("Cannot edit surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return nullptr;
+    }
+    return _storeEdit;
+}
+
+bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
+{
+    const auto storeEdit = surface ? storeEditFor(surface) : nullptr;
+    if (!storeEdit) {
+        return false;
+    }
+    std::vector<std::string> loaded;
+    for (const auto& name : channels.empty() ? surface->channelNames() : channels) {
+        if (surface->channelLoaded(name)) {
+            loaded.push_back(name);
+        }
+    }
+    try {
+        if (_saveFuture.isRunning()) {
+            _saveFuture.waitForFinished();
+        }
+        const auto* points = surface->rawPointsPtr();
+        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded);
+        return true;
+    } catch (const std::exception& error) {
+        qCWarning(lcSegModule) << "Saving surface channels failed:" << error.what();
+        emit statusMessageRequested(tr("Failed to save surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return false;
+    }
+}
+
+std::optional<vc::objects::PinnedObject> SegmentationModule::storePin(QuadSurface* surface)
+{
+    const auto storeEdit = storeEditFor(surface);
+    return storeEdit ? std::optional(storeEdit->pin()) : std::nullopt;
 }

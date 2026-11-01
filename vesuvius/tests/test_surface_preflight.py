@@ -68,6 +68,16 @@ def test_inspect_pair_passes_valid_pair(tmp_path, monkeypatch) -> None:
     assert report["volume"]["sampled_signal_support"]["support_fraction"] == 1.0
 
 
+def test_inspect_pair_reports_missing_uuid_as_none(tmp_path) -> None:
+    # The report must not present the directory name as a uuid the
+    # surface does not carry.
+    surface = write_surface(tmp_path / "surface", meta_extra={"uuid": None})
+
+    report = surface_preflight.inspect_pair(surface)
+
+    assert report["surface"]["uuid"] is None
+
+
 def test_inspect_pair_surface_only_passes_without_volume(tmp_path, monkeypatch) -> None:
     surface = write_surface(tmp_path / "surface")
     monkeypatch.setattr(

@@ -1,6 +1,5 @@
 #include "utils/http_fetch.hpp"
-
-#if UTILS_HAS_CURL
+#include "utils/sftp_fetch.hpp"
 
 #include <curl/curl.h>
 
@@ -81,6 +80,18 @@ std::string s3_to_https(std::string_view s3_url) {
     return s3_to_https(*parsed);
 }
 
+std::string select_ca_bundle(std::string_view builtin,
+                             std::span<const std::string_view> candidates) {
+    std::error_code ec;
+    if (builtin.empty() || std::filesystem::exists(builtin, ec))
+        return {};
+    for (auto candidate : candidates) {
+        if (std::filesystem::is_regular_file(candidate, ec))
+            return std::string{candidate};
+    }
+    return {};
+}
+
 // ---------------------------------------------------------------------------
 // curl plumbing (file-scope; not exposed in the header)
 // ---------------------------------------------------------------------------
@@ -120,6 +131,34 @@ CURL* thread_handle() {
     }
     return tl_handle.get();
 }
+
+#if defined(__linux__) && LIBCURL_VERSION_NUM >= 0x075400
+// libcurl looks for its CA bundle at the path it was built with. The Debian/
+// Ubuntu libcurl the Linux AppImage bundles expects
+// /etc/ssl/certs/ca-certificates.crt, which Fedora, RHEL and its rebuilds
+// (Rocky, Alma) and openSUSE do not have, so there every HTTPS request fails
+// with "error adding trust anchors from file". When the built-in bundle is
+// missing, use the one this machine has (same list as Go's crypto/x509).
+void use_host_ca_bundle(CURL* curl) {
+    static const std::string bundle = [curl] {
+        static constexpr std::string_view candidates[] = {
+            "/etc/ssl/certs/ca-certificates.crt",               // Debian, Ubuntu, Arch
+            "/etc/pki/tls/certs/ca-bundle.crt",                 // Fedora, RHEL
+            "/etc/ssl/ca-bundle.pem",                           // openSUSE
+            "/etc/pki/tls/cacert.pem",                          // OpenELEC
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS, RHEL 7
+            "/etc/ssl/cert.pem",                                // Alpine
+        };
+        char* builtin = nullptr;
+        curl_easy_getinfo(curl, CURLINFO_CAINFO, &builtin);
+        return select_ca_bundle(builtin ? builtin : "", candidates);
+    }();
+    if (!bundle.empty())
+        curl_easy_setopt(curl, CURLOPT_CAINFO, bundle.c_str());
+}
+#else
+void use_host_ca_bundle(CURL*) {}
+#endif
 
 HttpClient::DownloadObserver& thread_download_observer()
 {
@@ -301,7 +340,10 @@ HttpResponse perform(const HttpClient::Config& config,
         // request fails verification with an empty response. Use the Windows
         // native certificate store instead (curl >= 7.71).
         curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        // An HTTPS proxy is verified with its own options.
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+        use_host_ca_bundle(curl);
 
         // Timeouts
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
@@ -452,6 +494,7 @@ HttpClient::ScopedDownloadObserver::~ScopedDownloadObserver()
 // ---------------------------------------------------------------------------
 
 HttpResponse HttpClient::get(std::string_view url) const {
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, false, {}, thread_download_observer());
     return perform(config_, url, Method::GET, {}, {});
 }
 
@@ -460,23 +503,27 @@ HttpResponse HttpClient::get_range(std::string_view url,
     if (length == 0) {
         return HttpResponse{};
     }
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, false, std::pair{offset, length}, thread_download_observer());
     auto range = std::to_string(offset) + "-" + std::to_string(offset + length - 1);
     return perform(config_, url, Method::GET_RANGE, {}, {}, range);
 }
 
 HttpResponse HttpClient::head(std::string_view url) const {
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, true, {}, {});
     return perform(config_, url, Method::HEAD, {}, {});
 }
 
 HttpResponse HttpClient::put(std::string_view url,
                              std::span<const std::byte> data,
                              std::string_view content_type) const {
+    if (is_sftp_url(url)) throw std::invalid_argument("SFTP access is read-only");
     return perform(config_, url, Method::PUT, data, content_type);
 }
 
 HttpResponse HttpClient::put_file(std::string_view url,
                                   const std::filesystem::path& file_path,
                                   std::string_view content_type) const {
+    if (is_sftp_url(url)) throw std::invalid_argument("SFTP access is read-only");
     auto resolved = resolve_url(url);
 
     // path::c_str() is wchar_t* on Windows; _wfopen takes it directly.
@@ -503,7 +550,10 @@ HttpResponse HttpClient::put_file(std::string_view url,
         // See perform(): use the Windows native cert store — the MSYS2
         // OpenSSL CA bundle path doesn't exist on end-user machines.
         curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        // An HTTPS proxy is verified with its own options.
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+        use_host_ca_bundle(curl);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
                          static_cast<long>(config_.connect_timeout.count()));
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,
@@ -584,5 +634,3 @@ HttpResponse HttpClient::put_file(std::string_view url,
 }
 
 } // namespace utils
-
-#endif // UTILS_HAS_CURL

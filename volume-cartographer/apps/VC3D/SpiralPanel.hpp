@@ -7,6 +7,7 @@
 #include <QSet>
 #include <QWidget>
 #include <functional>
+#include <initializer_list>
 
 #include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
@@ -31,6 +32,7 @@ class QToolButton;
 class QTimer;
 class SpiralServiceManager;
 class SpiralConfigProfileEditor;
+class SpiralDescriptions;
 class QFormLayout;
 
 class SpiralPanel : public QWidget
@@ -63,7 +65,6 @@ signals:
     void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
-    void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
     void pointViewToleranceChanged(double tolerance);
@@ -72,6 +73,13 @@ signals:
     void addDraftsRequested(bool commitAfterAdd);
 
 private:
+    // Hover text: each control names its entry in spiral-fitting's
+    // descriptions.json; a state note (why a control is unavailable, who owns
+    // a path) is shown beneath the description.
+    void describe(const QString& id, std::initializer_list<QWidget*> widgets);
+    void setToolTipNote(QWidget* widget, const QString& note);
+    void applyToolTip(QWidget* widget);
+    void applyDescriptions();
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
                           bool directory);
     void addPclItem(const QString& path, const QString& role, bool required = false);
@@ -80,7 +88,6 @@ private:
     QJsonObject runAdvancedConfig() const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
     void syncTrackSamplingControlsFromAdvanced();
-    void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
     void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
@@ -111,10 +118,12 @@ private:
     void guardSessionExit(std::function<void()> action);
 
     SpiralServiceManager* _service = nullptr;
+    SpiralDescriptions* _descriptions = nullptr;
+    QHash<QWidget*, QString> _descriptionIds;
+    QHash<QWidget*, QString> _toolTipNotes;
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
-    QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;

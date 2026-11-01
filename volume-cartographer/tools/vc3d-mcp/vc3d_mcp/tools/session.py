@@ -20,7 +20,7 @@ async def vc3d_ping() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_get_state() -> dict[str, Any]:
-    """Snapshot of VC3D: open volume package, current volume, active segment,
+    """Snapshot of VC3D: open project and its stores, current volume, active segment,
     viewers (ids/names), editing mode, running job. Call this first."""
     return await _call("state.get")
 
@@ -77,21 +77,24 @@ async def vc3d_screenshot(
 
 @mcp.tool()
 async def vc3d_switch_workspace(
-    name: Literal["main", "lasagna", "fiber_slice"]
+    name: Literal["main", "lasagna", "project"]
 ) -> dict[str, Any]:
-    """Switch VC3D's active workspace tab. Requires a volume package to be open.
+    """Switch VC3D's active workspace tab. "main" and "lasagna" require a
+    volume package to be open.
 
     name: "main" (the default segmentation/navigation workspace -- v1-v4's
-    viewers live here), "lasagna" (the Lasagna optimization workspace), or
-    "fiber_slice" (the fiber-slice workspace). Any viewers the workspace
+    viewers live here), "lasagna" (the Lasagna optimization workspace) or
+    "project" (the project overview: stores, routes, volumes, caches; no
+    viewers -- capture it with vc3d_screenshot of the whole window). Any
+    viewers the workspace
     creates register with the ViewerManager and become targetable by
     vc3d_click / vc3d_drag / vc3d_screenshot etc. (they appear in
     vc3d_get_state's viewers list).
 
-    "main" is the only documented way back from "lasagna"/"fiber_slice" --
+    "main" is the only documented way back from "lasagna" --
     there's no automatic return. This tab is real Qt UI state that persists
     across app restarts: a freshly launched VC3D can silently open on a
-    leftover "lasagna"/"fiber_slice" tab from a prior session, in which case
+    leftover "lasagna" tab from a prior session, in which case
     vc3d_screenshot on a main-tab viewer fails -32009 (not visible) until you
     call this with name="main" first. Check vc3d_get_state's viewers, or just
     call this proactively if a main-tab capture unexpectedly fails.

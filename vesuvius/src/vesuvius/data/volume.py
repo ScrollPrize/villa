@@ -380,7 +380,7 @@ class Volume:
             # Provide example usage hints
             print("\nExample Usage:")
             print('  volume = Volume(type="scroll", scroll_id=1)')
-            print('  segment = Volume(type="segment", segment_id=20230827161847)')
+            print('  segment = Volume(type="segment", segment_id=20230827161847, scroll_id=1)')
             print('  zarr_vol = Volume(type="zarr", path="/path/to/my/data.zarr")')
             raise
 
@@ -1115,7 +1115,7 @@ class Volume:
 
         energy_mapping = {
             "1": 54, "1b": 54, "2": 54, "2b": 54, "2c": 88,
-            "3": 53, "4": 88, "5": 53
+            "3": 53, "4": 53, "5": 53
         }
         return energy_mapping.get(scroll_id_key)
 
@@ -1126,7 +1126,7 @@ class Volume:
 
         resolution_mapping = {
             "1": 7.91, "1b": 7.91, "2": 7.91, "2b": 7.91, "2c": 7.91,
-            "3": 3.24, "4": 3.24, "5": 7.91
+            "3": 3.24, "4": 7.91, "5": 7.91
         }
         return resolution_mapping.get(scroll_id_key)
 
