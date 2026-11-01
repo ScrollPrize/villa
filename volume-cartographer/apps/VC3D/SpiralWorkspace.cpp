@@ -32,7 +32,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <QDialog>
 #include <QDockWidget>
@@ -1941,8 +1941,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || windingMapName.startsWith(QStringLiteral("../")))
             return failure(QObject::tr("Invalid Spiral winding-ID map path"));
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
-        cv::Mat windingImage = cv::imread(
-            windingMapPath.toStdString(), cv::IMREAD_UNCHANGED);
+        cv::Mat windingImage;
+        try {
+            windingImage = vc::core::util::readImageMat(windingMapPath.toStdString());
+        } catch (const std::exception&) {
+        }
         if (windingImage.empty() || windingImage.channels() != 1)
             return failure(QObject::tr("Cannot read Spiral winding-ID map"));
         cv::Mat windingValues;
