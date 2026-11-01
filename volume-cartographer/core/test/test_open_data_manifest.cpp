@@ -924,7 +924,8 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     CHECK(result.supportedVolumes == 2);
     REQUIRE(pkg->volumeEntries().size() == 2);
 
-    // The catalog names each entry when it opens, with the pixel size it states.
+    // The catalog names each entry when it opens; its pixel size reaches the volume through
+    // vcr::zarr::volumeMetadata, where the store's documents win.
     const auto metadataFor = [&](const std::string& id) {
         for (const auto& entry : pkg->volumeEntries()) {
             const auto metadata = vc::project::catalogVolumeMetadata(&manifest, entry.location);
@@ -933,8 +934,8 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
         FAIL("no entry shows " << id);
         return utils::Json::object();
     };
-    CHECK(metadataFor("volume-with-properties").at("voxelsize").get_double() == doctest::Approx(7.91));
-    CHECK(metadataFor("volume-from-scan").at("voxelsize").get_double() == doctest::Approx(2.403));
+    CHECK_FALSE(metadataFor("volume-with-properties").contains("voxelsize"));
+    CHECK(metadataFor("volume-from-scan").at("uuid").get_string() == "volume-from-scan");
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
@@ -983,8 +984,8 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     const auto source = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[0].location);
     REQUIRE(source);
     CHECK((source->volumeId == "scan-volume" && source->level == 0 && source->source));
-    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("voxelsize").get_double() ==
-          doctest::Approx(7.91));
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("uuid").get_string() ==
+          "scan-volume");
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location));
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[2].location));
     CHECK(std::any_of(

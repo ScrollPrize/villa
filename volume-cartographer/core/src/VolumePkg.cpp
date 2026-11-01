@@ -326,9 +326,9 @@ utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog,
     auto metadata = utils::Json::object();
     const auto view = catalogVolumeView(catalog, location);
     if (!view) return metadata;
+    // Identity only: the voxel size comes through vcr::zarr::volumeMetadata, where the
+    // store's documents win and the catalog fills what they lack.
     const auto* volume = catalog->findSample(view->sampleId)->findVolume(view->volumeId);
-    if (volume->pixelSizeUm && std::isfinite(*volume->pixelSizeUm) && *volume->pixelSizeUm > 0)
-        metadata["voxelsize"] = std::ldexp(*volume->pixelSizeUm, view->level);
     std::string name = volume->suffix.empty() ? volume->id : volume->suffix;
     if (!view->source) name = view->artifact->type + " of " + name;
     if (view->level) name += " [L" + std::to_string(view->level) + "]";

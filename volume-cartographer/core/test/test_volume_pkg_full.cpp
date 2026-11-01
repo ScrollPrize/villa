@@ -320,14 +320,13 @@ TEST_CASE("A catalog gives remote entries their catalog volume identity at every
             "access_roots": [{"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]}]}}}}})");
     const auto source = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr");
     CHECK(source.at("uuid").get_string() == "vol");
-    CHECK(source.at("voxelsize").get_double() == doctest::Approx(2.5));
+    CHECK_FALSE(source.contains("voxelsize"));  // the store's metadata decides, the catalog only fills gaps
     const auto level = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr#vc-base-scale=2");
     CHECK(level.at("uuid").get_string() == "vol");
-    CHECK(level.at("voxelsize").get_double() == doctest::Approx(10.0));
     CHECK(level.at("name").get_string() == "scan.zarr [L2]");
     const auto prediction = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/pred.zarr");
     CHECK_FALSE(prediction.contains("uuid"));
-    CHECK(prediction.at("voxelsize").get_double() == doctest::Approx(5.0));
+    CHECK(prediction.at("name").get_string() == "surface-prediction-zarr of scan.zarr [L1]");
     CHECK(vc::project::catalogVolumeMetadata(&catalog, "https://example.test/elsewhere.zarr").empty());
     CHECK(vc::project::catalogVolumeMetadata(nullptr, "https://example.test/s/vol.zarr").empty());
 }
