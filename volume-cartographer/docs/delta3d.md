@@ -1,4 +1,4 @@
-# Delta3D cache integration
+# Delta3D volume and cache integration
 
 VC3D and the native reader use the preset-enabled Delta3D codec from
 [vc-delta3d#7](https://github.com/ScrollPrize/vc-delta3d/pull/7), pinned to
@@ -15,8 +15,8 @@ files remain unchanged.
 Existing Delta3D and VCZ1 data remain readable. The explicit Python VCZ1 adapter
 continues writing VCZ1, selecting the Delta predictor deliberately. Older readers
 that only support D3D1 cannot read new preset frames: upgrade consumers before
-sharing a newly written cache with them. Unrelated Python projects in the
-monorepo are not upgraded by this change.
+sharing newly encoded volumes or caches with them. Vesuvius permits both 0.2 and
+0.3 so its optional VC dependency can resolve this revision.
 
 ## Tests
 
@@ -32,6 +32,12 @@ cmake --build <reader-build> --target test_delta3d
 ctest --test-dir <reader-build> -R '^test_delta3d$' --output-on-failure
 
 python -m pytest volume-cartographer/python/tests/test_vcz1_codec.py
+
+# Minimal embedding regression: Qt autogen must not leak into codec C kernels.
+cmake -S vc_reader/tests/cmake/delta3d_embedding -B <embedding-build> \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build <embedding-build> --parallel
+ctest --test-dir <embedding-build> --output-on-failure
 ```
 
 `test_cache_compression` additionally accepts `VC_DELTA3D_TEST_CHUNK`, a path to

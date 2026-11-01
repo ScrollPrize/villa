@@ -645,7 +645,8 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
         GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d
     )
-    FetchContent_MakeAvailable(vc_delta3d)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../vc_reader/cmake/FetchDelta3D.cmake")
+    vc_fetch_delta3d()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR MSVC)

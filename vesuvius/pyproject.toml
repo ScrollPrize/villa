@@ -31,7 +31,7 @@ dependencies = [
     "cachetools>=6.2.4",
     "edt>=3.1.2",
     # numcodecs codec for vc-delta3d compressed zarrs (VC3D and vc_reader caches).
-    "vc-delta3d>=0.2.0,<0.3",
+    "vc-delta3d>=0.2.0,<0.4",
 ]
 
 [project.optional-dependencies]
@@ -46,7 +46,7 @@ volume-only = [
     "numcodecs>=0.15.1,<0.17",
     "zarr>=2.18.7,<4",
     "s3fs>=2025.9.0",
-    "vc-delta3d>=0.2.0,<0.3",
+    "vc-delta3d>=0.2.0,<0.4",
 ]
 # Machine-learning & training stack
 models = [
