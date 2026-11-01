@@ -2970,7 +2970,6 @@ void CWindow::CreateWidgets(void)
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
-    _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
     _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
@@ -3505,8 +3504,6 @@ void CWindow::CreateWidgets(void)
         .contents = ui.dockWidgetViewerControlsContents,
         .viewScrollArea = ui.scrollAreaView,
         .viewContents = ui.dockWidgetViewContents,
-        .overlayScrollArea = ui.scrollAreaOverlay,
-        .overlayContents = ui.dockWidgetOverlayContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
         .showSurfaceNormals = ui.chkShowSurfaceNormals,
         .normalArrowLengthLabel = ui.labelNormalArrowLength,

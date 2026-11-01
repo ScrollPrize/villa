@@ -89,13 +89,6 @@ std::string sanitizedCompositeMethod(const std::string& method)
     return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
 }
 
-vc::Sampling sanitizedSamplingMethod(vc::Sampling method)
-{
-    return method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
-}
-
 QString samplingMethodName(vc::Sampling method)
 {
     return method == vc::Sampling::Trilinear
@@ -861,7 +854,6 @@ void VolumeOverlayController::saveState() const
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(QString::fromLatin1(kOverlaySettingsGroup));
     settings.beginGroup(groupKey);
-    settings.setValue(volume_overlay::PATH, _volpkgPath);
     settings.setValue(volume_overlay::VOLUME_ID, QString::fromStdString(_overlayVolumeId));
     settings.setValue(volume_overlay::OPACITY, _overlayOpacity);
     settings.setValue(volume_overlay::WINDOW_LOW, _overlayWindowLow);
@@ -941,7 +933,7 @@ void VolumeOverlayController::setOpacity(float value)
 
 void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
 {
-    _overlaySamplingMethod = sanitizedSamplingMethod(method);
+    _overlaySamplingMethod = method;
 
     if (_ui.samplingMethodSelect) {
         const QSignalBlocker blocker(_ui.samplingMethodSelect);

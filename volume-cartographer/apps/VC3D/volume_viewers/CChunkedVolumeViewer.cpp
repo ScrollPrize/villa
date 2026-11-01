@@ -347,7 +347,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setTransformationAnchor(QGraphicsView::NoAnchor);
     _view->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     _view->setRenderHint(QPainter::Antialiasing, false);
-    _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
@@ -1054,7 +1053,7 @@ void CChunkedVolumeViewer::updateScalebarScale()
     if (!physical)
         voxel = 1.0;
     const double unitsPerScenePx = voxel / static_cast<double>(_scale);
-    _view->setVoxelSize(unitsPerScenePx, unitsPerScenePx, physical);
+    _view->setVoxelSize(unitsPerScenePx, physical);
 }
 
 void CChunkedVolumeViewer::setShowCoordinateFrame(bool show)
@@ -2153,14 +2152,11 @@ void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
         return;
     }
 
-    const vc::Sampling sanitized = method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
-    if (_overlaySamplingMethod == sanitized) {
+    if (_overlaySamplingMethod == method) {
         return;
     }
 
-    _overlaySamplingMethod = sanitized;
+    _overlaySamplingMethod = method;
     submitRender("overlay sampling changed");
 }
 
@@ -2570,7 +2566,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
                 scenePos,
                 appendToPreview,
                 _scale,
-                _pointCollection,
                 [this](const QPointF& point) { return sceneToVolume(point); },
                 [this](const cv::Vec3f& point) { return volumeToScene(point); },
                 [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -2850,7 +2845,6 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
-            _pointCollection,
             [this](const QPointF& point) { return sceneToVolume(point); },
             [this](const cv::Vec3f& point) { return volumeToScene(point); },
             [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -2898,7 +2892,6 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
-            _pointCollection,
             [this](const QPointF& point) { return sceneToVolume(point); },
             [this](const cv::Vec3f& point) { return volumeToScene(point); },
             [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {

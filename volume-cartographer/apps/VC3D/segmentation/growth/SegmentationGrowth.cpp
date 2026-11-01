@@ -88,48 +88,6 @@ void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload
     }
 }
 
-void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
-{
-    if (!surface || !volume) {
-        return;
-    }
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return;
-    }
-
-    const int centerRow = std::clamp(points->rows / 2, 0, points->rows - 1);
-    const int centerCol = std::clamp(points->cols / 2, 0, points->cols - 1);
-    const int nextCol = std::clamp(centerCol + 1, 0, points->cols - 1);
-    const int nextRow = std::clamp(centerRow + 1, 0, points->rows - 1);
-
-    const cv::Vec3f p = (*points)(centerRow, centerCol);
-    const cv::Vec3f px = (*points)(centerRow, nextCol);
-    const cv::Vec3f py = (*points)(nextRow, centerCol);
-
-    cv::Vec3f normal = (px - p).cross(py - p);
-    if (cv::norm(normal) < 1e-5f) {
-        return;
-    }
-    cv::normalize(normal, normal);
-
-    auto [w, h, d] = volume->shapeXyz();
-    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
-    cv::Vec3f toCenter = volumeCenter - p;
-    toCenter[2] = 0.0f;
-
-    if (normal.dot(toCenter) >= 0.0f) {
-        return; // already inward
-    }
-
-    cv::Mat normals = surface->channel("normals");
-    if (!normals.empty()) {
-        cv::Mat_<cv::Vec3f> adjusted = normals;
-        adjusted *= -1.0f;
-        surface->setChannel("normals", adjusted);
-    }
-}
-
 utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
 {
     utils::Json params = utils::Json::object();
@@ -239,7 +197,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.error = QStringLiteral("Segmentation surface lacks a generations channel");
         return result;
     }
-    ensureNormalsInward(context.resumeSurface, context.volume);
 
     utils::Json params = buildTracerParams(request);
 

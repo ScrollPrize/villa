@@ -1,4 +1,5 @@
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
+#include "ReparentLayoutItem.hpp"
 
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -15,22 +16,6 @@
 
 namespace
 {
-
-void reparentItemWidgets(QLayoutItem* item, QWidget* newParent)
-{
-    if (!item || !newParent) {
-        return;
-    }
-    if (auto* widget = item->widget()) {
-        widget->setParent(newParent);
-        return;
-    }
-    if (auto* layout = item->layout()) {
-        for (int i = 0; i < layout->count(); ++i) {
-            reparentItemWidgets(layout->itemAt(i), newParent);
-        }
-    }
-}
 
 void moveGridLayoutItems(QGridLayout* from, QGridLayout* to, QWidget* newParent)
 {

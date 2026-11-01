@@ -219,7 +219,6 @@ void InkDetectionOverlayController::setColormapId(const std::string& id)
     if (_selectedImage.singleChannel && !_selectedImage.scalar.empty()) {
         _selectedImage.baseImage = renderSingleChannelImage(_selectedImage.scalar, _colormapId);
         _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
-        _selectedImage.colormapId = _colormapId;
     }
     refreshAll();
 }
@@ -414,12 +413,10 @@ void InkDetectionOverlayController::loadSelectedImage()
     }
 
     LoadedImage loaded;
-    loaded.path = _selectedPath;
     loaded.singleChannel = imageLooksSingleChannel(src);
     if (loaded.singleChannel) {
         loaded.scalar = toU8Scalar(src);
         loaded.baseImage = renderSingleChannelImage(loaded.scalar, _colormapId);
-        loaded.colormapId = _colormapId;
     } else {
         loaded.baseImage = colorMatToImage(src);
     }

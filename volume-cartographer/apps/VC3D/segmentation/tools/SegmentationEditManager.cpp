@@ -489,11 +489,8 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
 
 std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(const cv::Vec3f& worldPos,
                                                                               float* outDistance,
-                                                                              GridSearchResolution detail,
                                                                               bool warnOnFailure) const
 {
-    (void)detail;
-
     if (!_baseSurface) {
         return std::nullopt;
     }

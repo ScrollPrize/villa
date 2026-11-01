@@ -386,7 +386,6 @@ namespace segmentation {
 // Volume Overlay Settings (stored in a QSettings group per overlay)
 // -----------------------------------------------------------------------------
 namespace volume_overlay {
-    constexpr auto PATH = "path";
     constexpr auto VOLUME_ID = "volume_id";
     constexpr auto OPACITY = "opacity";
     constexpr auto WINDOW_LOW = "window_low";

@@ -170,11 +170,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
 
     if (_overlay) {
-        _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
     }
 
-    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _state);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
@@ -2101,7 +2100,6 @@ void SegmentationModule::updateHover(VolumeViewerBase* viewer,
             float surfaceDistance = 0.0f;
             if (auto gridIndex = _editManager->worldToGridIndex(targetWorld,
                                                                 &surfaceDistance,
-                                                                SegmentationEditManager::GridSearchResolution::High,
                                                                 false)) {
                 const float maxHoverDistance = std::max(gridStepWorld(), 1.0f) * 100.0f;
                 if (surfaceDistance <= maxHoverDistance) {

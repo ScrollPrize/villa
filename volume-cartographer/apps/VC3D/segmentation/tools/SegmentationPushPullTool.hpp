@@ -15,7 +15,6 @@
 
 class OpenedVolumes;
 class SegmentationEditManager;
-class SegmentationWidget;
 class CState;
 class SegmentationModule;
 class QuadSurface;
@@ -28,7 +27,6 @@ class SegmentationPushPullTool : public SegmentationTool
 public:
     SegmentationPushPullTool(SegmentationModule& module,
                              SegmentationEditManager* editManager,
-                             SegmentationWidget* widget,
                              CState* state);
 
     void setStepMultiplier(float multiplier);
@@ -79,7 +77,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         OpenedVolumes& volumes,
         int datasetIndex,
-        float scale,
         bool* outUnavailable,
         std::string* outNoTargetReason = nullptr);
 
@@ -90,12 +87,10 @@ private:
         const std::shared_ptr<Volume>& volume,
         OpenedVolumes& volumes,
         int datasetIndex,
-        float scale,
         std::uint64_t generation);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
-    SegmentationWidget* _widget{nullptr};
     CState* _state{nullptr};
 
     struct State
@@ -105,13 +100,10 @@ private:
     };
 
     State _ppState;
-    VolumeViewerBase* _activeViewer{nullptr};
     QTimer* _timer{nullptr};
     float _stepMultiplier{4.0f};
     bool _activeAlphaEnabled{false};
-    bool _alphaOverrideActive{false};
     AlphaPushPullConfig _alphaConfig{};
-    bool _undoCaptured{false};
     QString _lastAlphaStartFailure;
 
     // Cached state to avoid rebuilding samples every tick

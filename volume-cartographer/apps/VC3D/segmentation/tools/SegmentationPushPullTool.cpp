@@ -3,7 +3,6 @@
 #include "../SegmentationModule.hpp"
 #include "../../ViewerManager.hpp"
 #include "SegmentationEditManager.hpp"
-#include "../SegmentationWidget.hpp"
 #include "../../CState.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -407,11 +406,9 @@ std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
 
 SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
                                                    SegmentationEditManager* editManager,
-                                                   SegmentationWidget* widget,
                                                    CState* state)
     : _module(module)
     , _editManager(editManager)
-    , _widget(widget)
     , _state(state)
 {
     ensureTimer();
@@ -500,14 +497,11 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     }
 
     _activeAlphaEnabled = alphaOverride.value_or(false);
-    _alphaOverrideActive = alphaOverride.has_value();
     ++_alphaGeneration;
     _stopAfterAlphaResult = false;
 
     _ppState.active = true;
     _ppState.direction = direction;
-    _activeViewer = hover.viewer;
-    _undoCaptured = false;
     _lastAlphaStartFailure.clear();
 
     // Reset cached position for new operation
@@ -563,11 +557,9 @@ void SegmentationPushPullTool::stopAll()
 
     _ppState.active = false;
     _ppState.direction = 0;
-    _activeViewer = nullptr;
     if (_timer && _timer->isActive()) {
         _timer->stop();
     }
-    _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
     _alphaComputePending = false;
     _stopAfterAlphaResult = false;
@@ -597,7 +589,6 @@ void SegmentationPushPullTool::stopAll()
         _module.markAutosaveNeeded();
     }
 
-    _undoCaptured = false;
     _lastAlphaStartFailure.clear();
 }
 
@@ -780,7 +771,6 @@ void SegmentationPushPullTool::launchAlphaCompute()
     // Alpha push/pull samples the user-selected OME-Zarr scale, independent of
     // the viewer's current display LOD.
     const int datasetIndex = std::clamp(_alphaConfig.computeScale, 0, 5);
-    constexpr float scale = 1.0f;
 
     const int direction = _ppState.direction;
     const AlphaPushPullConfig config = _alphaConfig;
@@ -853,7 +843,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     _lastAlphaStartFailure.clear();
 
     auto future = QtConcurrent::run(
-        [volume, volumes = _state->openedVolumes(), datasetIndex, scale, direction, config, generation, perVertex,
+        [volume, volumes = _state->openedVolumes(), datasetIndex, direction, config, generation, perVertex,
          centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
         AlphaResult result;
         result.generation = generation;
@@ -868,7 +858,6 @@ void SegmentationPushPullTool::launchAlphaCompute()
                                                volume,
                                                *volumes,
                                                datasetIndex,
-                                               scale,
                                                generation);
             if (!result.success) {
                 return result;
@@ -907,7 +896,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
             std::string noTargetReason;
             auto target = computeAlphaTargetStatic(
                 centerWorld, centerNormal, direction, config,
-                volume, *volumes, datasetIndex, scale, &unavailable, &noTargetReason);
+                volume, *volumes, datasetIndex, &unavailable, &noTargetReason);
 
             if (target) {
                 result.singleTarget = *target;
@@ -1061,15 +1050,14 @@ void SegmentationPushPullTool::ensureTimer()
 }
 
 // The layers of a size x size plane patch at `offsets` along `normal`: pixel (0, 0) at
-// `origin`, steps of the plane's basis / scale, sampled linearly from an opened level, as
+// `origin`, unit steps of the plane's basis, sampled linearly from an opened level, as
 // fractions of the 8-bit range (0 where there is no sample).
 static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& origin,
-                                                        const cv::Vec3f& normal, cv::Size size, float scale,
+                                                        const cv::Vec3f& normal, cv::Size size,
                                                         const std::vector<float>& offsets)
 {
     const PlaneSurface plane(origin, normal);
-    const float step = 1.0f / scale;
-    const cv::Vec3f dx = plane.basisX() * step, dy = plane.basisY() * step;
+    const cv::Vec3f dx = plane.basisX(), dy = plane.basisY();
     vcr::grid::Request request;
     request.levels = {vcr::zarr::gridLevel(*level.array, level.working)};
     request.offsets = offsets;
@@ -1105,7 +1093,6 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
     const std::shared_ptr<Volume>& volume,
     OpenedVolumes& volumes,
     int datasetIndex,
-    float scale,
     std::uint64_t generation)
 {
     AlphaResult result;
@@ -1157,7 +1144,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
         normals[i] = orientedNormal;
         valid[i] = 1;
 
-        const auto layers = samplePatchLayers(level, inputs[i].baseWorld, orientedNormal, patchSize, scale, offsets);
+        const auto layers = samplePatchLayers(level, inputs[i].baseWorld, orientedNormal, patchSize, offsets);
         for (std::size_t k = 0; k < offsets.size() && transparent[i] > 1e-3f; ++k) {
             cv::GaussianBlur(layers[k], floatPatch, cv::Size(kernel, kernel), 0);
 
@@ -1226,7 +1213,6 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     const std::shared_ptr<Volume>& volume,
     OpenedVolumes& volumes,
     int datasetIndex,
-    float scale,
     bool* outUnavailable,
     std::string* outNoTargetReason)
 {
@@ -1274,7 +1260,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     float integ = 0.0f;
 
     const auto offsets = alphaOffsets(cfg.start, cfg.stop, std::fabs(cfg.step));
-    const auto layers = samplePatchLayers(level, centerWorld, orientedNormal, patchSize, scale, offsets);
+    const auto layers = samplePatchLayers(level, centerWorld, orientedNormal, patchSize, offsets);
     cv::Mat sliceFloat(patchSize, CV_32F);
     for (std::size_t k = 0; k < offsets.size(); ++k) {
         cv::GaussianBlur(layers[k], sliceFloat, cv::Size(kernel, kernel), 0);

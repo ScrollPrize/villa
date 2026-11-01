@@ -53,28 +53,6 @@ constexpr qreal kManualAddIntersectionZ = 121.0;
 constexpr float kManualAddIntersectionOpacityScale = 1.2f;
 constexpr float kManualAddIntersectionWidthScale = 1.3f;
 constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
-constexpr int kSurfaceOverlapSampleStride = 1;
-
-int overlapSampleCount(int fullCount)
-{
-    if (fullCount <= 0) {
-        return 0;
-    }
-    int count = (fullCount - 1) / kSurfaceOverlapSampleStride + 1;
-    if ((fullCount - 1) % kSurfaceOverlapSampleStride != 0) {
-        ++count;
-    }
-    return count;
-}
-
-int overlapSampleIndex(int sampleIndex, int sampleCount, int fullCount)
-{
-    if (sampleIndex + 1 == sampleCount) {
-        return fullCount - 1;
-    }
-    return std::min(sampleIndex * kSurfaceOverlapSampleStride, fullCount - 1);
-}
-
 QColor manualAddIntersectionColor()
 {
     return QColor(0, 220, 255);
@@ -191,11 +169,6 @@ void SegmentationOverlayController::setEditingEnabled(bool enabled)
     }
     _editingEnabled = enabled;
     refreshAll();
-}
-
-void SegmentationOverlayController::setEditManager(SegmentationEditManager* manager)
-{
-    _editManager = manager;
 }
 
 void SegmentationOverlayController::applyState(const State& state)
@@ -657,12 +630,6 @@ void SegmentationOverlayController::buildVertexMarkers(const State& state,
     }
 }
 
-void SegmentationOverlayController::forceRefreshAllOverlays()
-{
-    // Force rebuild all viewer overlays, bypassing state comparison
-    refreshAll();
-}
-
 void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     VolumeViewerBase* viewer,
     ViewerOverlayControllerBase::OverlayBuilder& builder)
@@ -703,8 +670,8 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         return;
     }
 
-    const int sampleRows = overlapSampleCount(rows);
-    const int sampleCols = overlapSampleCount(cols);
+    const int sampleRows = rows;
+    const int sampleCols = cols;
     if (sampleRows <= 0 || sampleCols <= 0) {
         return;
     }
@@ -722,7 +689,6 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                         (cacheIt->second.overlaysRevision != overlaysRevision) ||
                         (cacheIt->second.surfacesVersion != surfacesVersion) ||
                         (std::abs(cacheIt->second.threshold - threshold) > 0.01f) ||
-                        (cacheIt->second.sampleStride != kSurfaceOverlapSampleStride) ||
                         (cacheIt->second.image.width() != sampleCols) ||
                         (cacheIt->second.image.height() != sampleRows);
 
@@ -751,7 +717,6 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             emptyCache.overlaysRevision = overlaysRevision;
             emptyCache.surfacesVersion = surfacesVersion;
             emptyCache.threshold = threshold;
-            emptyCache.sampleStride = kSurfaceOverlapSampleStride;
             _overlapCaches[viewer] = std::move(emptyCache);
             return;
         }
@@ -765,8 +730,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                                         pending.surface == currentQuad &&
                                         pending.overlaysRevision == overlaysRevision &&
                                         pending.surfacesVersion == surfacesVersion &&
-                                        std::abs(pending.threshold - threshold) <= 0.01f &&
-                                        pending.sampleStride == kSurfaceOverlapSampleStride;
+                                        std::abs(pending.threshold - threshold) <= 0.01f;
             if (!pendingMatches) {
                 _overlapCancel->store(true, std::memory_order_relaxed);
             }
@@ -775,9 +739,9 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         if (!_overlapComputeRunning) {
             cv::Mat_<cv::Vec3f> sampledPoints(sampleRows, sampleCols);
             for (int sr = 0; sr < sampleRows; ++sr) {
-                const int r = overlapSampleIndex(sr, sampleRows, rows);
+                const int r = sr;
                 for (int sc = 0; sc < sampleCols; ++sc) {
-                    const int c = overlapSampleIndex(sc, sampleCols, cols);
+                    const int c = sc;
                     sampledPoints(sr, sc) = (*currentPts)(r, c);
                 }
             }
@@ -789,7 +753,6 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             _pendingOverlap.cache.overlaysRevision = overlaysRevision;
             _pendingOverlap.cache.surfacesVersion = surfacesVersion;
             _pendingOverlap.cache.threshold = threshold;
-            _pendingOverlap.cache.sampleStride = kSurfaceOverlapSampleStride;
 
             _overlapComputeRunning = true;
 
@@ -920,7 +883,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     QPointF topLeft = gridToScene(0, 0);
     builder.addImage(cache.image,
                      topLeft,
-                     gridToSceneScale * static_cast<qreal>(std::max(1, cache.sampleStride)),
+                     gridToSceneScale,
                      0.6,
                      kSurfaceOverlapZ);
 }
