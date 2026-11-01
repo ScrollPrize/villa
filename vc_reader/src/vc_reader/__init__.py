@@ -7,7 +7,7 @@ from .affine import Affine
 from .artifacts import AccessRoot, Artifact, ArtifactType, Origin, to_https, to_s3
 from .catalog import DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS, Catalog, License, Model, Scan, VolumeCoverage
 from .browsing import ScrollSource, Collection, Asset, Volume, VolumeLevel, Segment, ResolutionCandidate, VolumeMapping
-from .errors import AmbiguousMatchError, CacheMissError, NotFoundError, VcReaderError
+from .errors import AmbiguousMatchError, CacheMissError, LowDiskSpaceError, NotFoundError, VcReaderError
 from .sources import (
     Companion, Encoding, Frame, LevelRequest, Plane, QueryContext, SampleResult, TargetResult,
     Selection, Source, Storage, Surface, SurfaceRegistration, ValueFrame,
@@ -26,6 +26,7 @@ __all__ = [
     "Affine",
     "AmbiguousMatchError",
     "CacheMissError",
+    "LowDiskSpaceError",
     "Artifact",
     "ArtifactType",
     "Catalog",

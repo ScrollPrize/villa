@@ -145,6 +145,7 @@ using OptionsFor = std::function<zarr::OpenOptions(const std::string& location)>
 // Seekable image files through the reader's transport and disk budget. A remote file is
 // cached at its URL's decoded-cache path, so mirrors laid out by bucket path are found in
 // place; cached copies are trusted like chunks. Descriptors pin open inodes across eviction.
+// Opens of different files run concurrently; concurrent misses for one file download it once.
 class EncodedFiles {
 public:
     explicit EncodedFiles(OptionsFor options);

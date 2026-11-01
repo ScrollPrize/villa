@@ -562,6 +562,69 @@ class RemoteTests(RemoteFixtureCase):
                 read.result(timeout=30)
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
+    def test_low_free_space_refuses_a_download_and_keeps_cached_files(self):
+        from vc_reader import LowDiskSpaceError
+        options = dict(cache_dir=self.cache)
+        kept = Source('kept', Storage(self.url+'/image.png', 'png'))
+        np.testing.assert_array_equal(read_remote_source(kept, options), self.data)
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        Image.fromarray(self.data+1).save(self.root/'later.png')
+        later = Source('later', Storage(self.url+'/later.png', 'png'))
+        budget = disk_budget(str(self.cache), None)
+        budget.set_min_free_bytes(2**62)
+        self.assertFalse(budget.low_space)
+        with self.assertRaisesRegex(LowDiskSpaceError, 'nothing cached was removed'):
+            read_remote_source(later, options)
+        self.assertTrue(budget.low_space)
+        # The refused download took nothing with it: no eviction, no temporary, no reservation.
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+        # The same floor refuses an unsized (chunked) response at its first growth.
+        def hook(handler):
+            if handler.path != '/chunked.png':
+                return False
+            payload = (self.root/'later.png').read_bytes()
+            handler.send_response(200)
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.end_headers()
+            handler.wfile.write(f'{len(payload):x}\r\n'.encode()+payload+b'\r\n0\r\n\r\n')
+            return True
+        self.server.request_hook = hook
+        chunked = Source('chunked', Storage(self.url+'/chunked.png', 'png'))
+        with self.assertRaises(LowDiskSpaceError):
+            read_remote_source(chunked, options)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        # With the floor lowered the same file downloads and the state clears.
+        budget.set_min_free_bytes(0)
+        np.testing.assert_array_equal(read_remote_source(later, options), self.data+1)
+        self.assertFalse(budget.low_space)
+        self.assertEqual(len(cached_files(self.cache)), 2)
+
+    def test_concurrent_misses_for_one_file_download_it_once(self):
+        started = threading.Barrier(4, timeout=10)
+        def hook(handler):
+            if handler.path != '/slow/image.png':
+                return False
+            time.sleep(.2)
+            handler.path = '/image.png'
+            return False
+        self.server.request_hook = hook
+        options = dict(cache_dir=self.cache)
+        def read():
+            started.wait()  # four separately opened readers miss together
+            return read_remote_source(Source('same', Storage(self.url+'/slow/image.png', 'png')), options)
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda _: read(), range(4)))
+        for result in results:
+            np.testing.assert_array_equal(result, self.data)
+        self.assertEqual(self.counts.get('/image.png'), 1)  # counted after the hook's rewrite
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+
     def test_live_download_survives_another_cache_owner_and_budget_pressure(self):
         from vc_reader import _reader
         payload = (self.root/'image.png').read_bytes()

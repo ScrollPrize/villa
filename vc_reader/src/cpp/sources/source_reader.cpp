@@ -718,6 +718,8 @@ auto annotated(const std::string& id, F&& f) -> decltype(f())
         throw CacheMiss(named(e.what()));
     } catch (const HttpDenied& e) {
         throw HttpDenied(named(e.what()));
+    } catch (const zarr::LowDiskSpace& e) {
+        throw zarr::LowDiskSpace(named(e.what()));
     } catch (const DecodeBudgetError& e) {
         throw DecodeBudgetError(named(e.what()));
     } catch (const ImageFormatError& e) {

@@ -4,12 +4,15 @@
 
 #include "chunk_io.hpp"
 #include "http.hpp"
+#include "vc_reader/zarr.hpp"
 
 #include <atomic>
 #include <iostream>
 #include <sqlite3.h>
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <sys/file.h>
@@ -197,14 +200,11 @@ public:
                     record_download(temporary, 0);
                 });
             }
-            HttpOptions options;
-            options.connections = 1;
-            options.auth = auth;
-            HttpClient client(options);
+            auto client = http_client(auth);
             std::size_t received = 0, reserved = 0;
             bool grows = false;
             File unsized_turn;
-            auto response = client.get_stream(url, [&] {
+            auto response = client->get_stream(url, [&] {
                 std::lock_guard lock(mutex_);
                 transaction([&] { output->reset(); record_download(temporary, 0); });
                 received = reserved = 0;
@@ -212,6 +212,7 @@ public:
                 if (n > reserved - received) {
                     if (!grows)
                         throw std::runtime_error("encoded file exceeds cache_max_bytes or declared Content-Length");
+                    if (!leaves_free_space(n)) refuse_low_space(url);
                     reserved = grow_download(temporary, received + n);
                 }
                 output->write(reinterpret_cast<const std::uint8_t*>(data), n);
@@ -224,6 +225,7 @@ public:
                 const auto size = header.content_encoding.empty() || header.content_encoding == "identity"
                     ? header.content_length : std::nullopt;
                 grows = !size;
+                if (size && !leaves_free_space(*size)) refuse_low_space(url);
                 if (grows && unsized_turn.fd() < 0 && max_bytes() != std::numeric_limits<std::int64_t>::max()) {
                     unsized_turn = File(::open((locks / "unsized.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
                     if (unsized_turn.fd() < 0) throw std::system_error(errno, std::generic_category(), "open cache file lock");
@@ -468,11 +470,36 @@ private:
         }
     }
 
+    // One pooled client per set of credentials, so files downloaded one after another
+    // reuse connections instead of paying a TLS handshake each (a directory of small files).
+    std::shared_ptr<HttpClient> http_client(const Auth& auth)
+    {
+        const auto key = auth.kind + '\0' + auth.user + '\0' + auth.secret + '\0' + auth.token + '\0' + auth.region;
+        std::lock_guard lock(mutex_);
+        auto& client = clients_[key];
+        if (!client) {
+            HttpOptions options;
+            options.auth = auth;
+            client = std::make_shared<HttpClient>(options);
+        }
+        return client;
+    }
+
+    [[noreturn]] void refuse_low_space(const std::string& url) const
+    {
+        throw zarr::LowDiskSpace(url + ": caching it would leave under " +
+                                 std::to_string(min_free_bytes_.load(std::memory_order_relaxed)) +
+                                 " bytes free on the disk of " + root_.string() +
+                                 "; not cached, and nothing cached was removed");
+    }
+
     bool leaves_free_space(std::size_t size)
     {
         const auto wanted = static_cast<std::uintmax_t>(min_free_bytes_.load(std::memory_order_relaxed));
-        if (wanted == 0)
+        if (wanted == 0) {
+            low_space_.store(false, std::memory_order_relaxed);  // nothing is skipped without a floor
             return true;
+        }
         const bool enough = std::filesystem::space(root_).available >= wanted + size;
         if (!enough && !low_space_warned_.exchange(true, std::memory_order_relaxed))
             std::cerr << "vc_reader: under " << wanted << " bytes free on the disk of " << root_.string()
@@ -562,6 +589,7 @@ private:
     std::mutex mutex_;
     bool reconciled_ = false;
     std::atomic<std::int64_t> min_free_bytes_{0};
+    std::map<std::string, std::shared_ptr<HttpClient>> clients_;
     std::atomic<bool> low_space_{false}, low_space_warned_{false};
 };
 

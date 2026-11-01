@@ -36,6 +36,12 @@ struct NotFound : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A remote file was not cached because the disk would fall under the free-space floor
+// (OpenOptions::cacheMinFreeBytes). Nothing cached was removed; the request was not served.
+struct LowDiskSpace : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // http(s)://, s3://, s3+REGION:// and sftp:// / ssh:// locations.
 bool isRemote(const std::string& location);
 // Whether a local directory holds any Zarr v2 or v3 node metadata.

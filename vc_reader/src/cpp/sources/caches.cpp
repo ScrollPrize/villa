@@ -227,9 +227,13 @@ std::string EncodedFiles::identity(const std::string& location, int fd)
     if (::fstat(fd, &st) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + location);
     const auto signature = std::to_string(st.st_dev) + ":" + std::to_string(st.st_ino) + ":" + std::to_string(st.st_size) + ":" +
                            std::to_string(st.st_mtime) + ":" + std::to_string(st.st_ctime);
-    const auto known = identities_.find(location);
-    if (known != identities_.end() && known->second.first == signature) return known->second.second;
+    {
+        std::lock_guard guard(mutex_);
+        const auto known = identities_.find(location);
+        if (known != identities_.end() && known->second.first == signature) return known->second.second;
+    }
     // Bounded scratch; identities match online and offline, where no validator can be consulted.
+    // Hashed outside the lock, so one file's digest does not hold up another's download.
     Sha256 hash;
     std::vector<char> block(1 << 16);
     off_t at = 0;
@@ -246,14 +250,13 @@ std::string EncodedFiles::identity(const std::string& location, int fd)
         token += hex[byte >> 4];
         token += hex[byte & 15];
     }
+    std::lock_guard guard(mutex_);
     identities_[location] = {signature, token};
     return token;
 }
 
 EncodedFiles::Opened EncodedFiles::open(const std::string& location)
 {
-    std::lock_guard guard(mutex_);
-    process();
     if (!zarr::isRemote(location)) {
         std::string path = location;
         if (path.starts_with("~/") || path == "~")
@@ -272,20 +275,27 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
                        std::to_string(st.st_ctim.tv_sec) + "." + std::to_string(st.st_ctim.tv_nsec);
         return opened;
     }
-    auto known = resolved_.find(location);
-    if (known == resolved_.end()) known = resolved_.emplace(location, options_(location)).first;
-    const auto& options = known->second;
-    if (std::find(options.cacheDirs.begin(), options.cacheDirs.end(), "vc3d") != options.cacheDirs.end())
-        throw std::invalid_argument("image files need explicit cache directories, not the vc3d chunk-cache alias");
-    std::vector<fs::path> roots;
-    for (const auto& dir : options.cacheDirs) {
-        std::string path = dir;
-        if (path.starts_with("~/"))
-            if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-        roots.push_back(fs::weakly_canonical(path));
+    // The lock covers this object's state only: downloads of different files overlap, and
+    // concurrent misses for one file wait on the budget's per-file lock instead.
+    zarr::OpenOptions options;
+    std::vector<fs::path> roots, lookIn;
+    {
+        std::lock_guard guard(mutex_);
+        process();
+        auto known = resolved_.find(location);
+        if (known == resolved_.end()) known = resolved_.emplace(location, options_(location)).first;
+        options = known->second;
+        if (std::find(options.cacheDirs.begin(), options.cacheDirs.end(), "vc3d") != options.cacheDirs.end())
+            throw std::invalid_argument("image files need explicit cache directories, not the vc3d chunk-cache alias");
+        for (const auto& dir : options.cacheDirs) {
+            std::string path = dir;
+            if (path.starts_with("~/"))
+                if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
+            roots.push_back(fs::weakly_canonical(path));
+        }
+        lookIn = roots;
+        if (!temporary_.empty()) lookIn.emplace_back(temporary_);
     }
-    auto lookIn = roots;
-    if (!temporary_.empty()) lookIn.emplace_back(temporary_);
     for (const auto& root : lookIn) {
         const auto path = zarr::decodedCachePath(root, location);
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -293,9 +303,10 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
             if (errno == ENOENT || errno == ENOTDIR) continue;
             throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
         }
-        ++cacheHits_;
         Opened opened(fd, {});
         opened.token = identity(location, fd);
+        std::lock_guard guard(mutex_);
+        ++cacheHits_;
         return opened;
     }
     if (options.offline) throw CacheMiss(location + ": encoded file is not cached (offline)");
@@ -306,6 +317,7 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     } else {
         // Scratch space the user did not choose: a large file must not fill it unasked.
         limit = limit.value_or(std::int64_t{1} << 30);
+        std::lock_guard guard(mutex_);
         if (temporary_.empty()) {
             auto pattern = (fs::temp_directory_path() / "vc-reader-images-XXXXXX").string();
             if (!::mkdtemp(pattern.data())) throw std::system_error(errno, std::generic_category(), "mkdtemp");
@@ -316,10 +328,14 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     // No limit reuses the directory's configured one, unlimited for a new directory; it
     // never resets another reader's explicit budget.
     auto budget = zarr::diskBudget(root.string(), limit);
+    if (options.cacheMinFreeBytes) budget->set_min_free_bytes(*options.cacheMinFreeBytes);
     auto [fd, received] = budget->open_file(zarr::decodedCachePath(root, location).string(), options.access.url(location), options.access.auth);
-    bytesRead_ += received;
+    {
+        std::lock_guard guard(mutex_);
+        bytesRead_ += received;
+        if (!received && fd >= 0) ++cacheHits_;
+    }
     if (fd < 0) throw zarr::NotFound(location + ": remote image does not exist");
-    if (!received) ++cacheHits_;
     Opened opened(fd, {});
     opened.token = identity(location, fd);
     return opened;

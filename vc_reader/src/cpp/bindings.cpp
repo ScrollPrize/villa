@@ -157,6 +157,9 @@ NB_MODULE(_reader, m)
             PyErr_SetString(PyExc_PermissionError, e.what());
         } catch (const vcr::zarr::NotFound& e) {
             PyErr_SetString(PyExc_FileNotFoundError, e.what());
+        } catch (const vcr::zarr::LowDiskSpace& e) {
+            nb::object cls = nb::module_::import_("vc_reader.errors").attr("LowDiskSpaceError");
+            PyErr_SetString(cls.ptr(), e.what());
         } catch (const std::filesystem::filesystem_error& e) {
             errno = e.code().value();
             PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
@@ -695,6 +698,8 @@ NB_MODULE(_reader, m)
              nb::call_guard<nb::gil_scoped_release>())
         .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_bytes", &vcr::DiskCache::max_bytes, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_min_free_bytes", &vcr::DiskCache::set_min_free_bytes, "bytes"_a)
+        .def_prop_ro("low_space", &vcr::DiskCache::low_space)
         .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& location,
                               const vcr::zarr::Access& access) {
             nb::gil_scoped_release release;
