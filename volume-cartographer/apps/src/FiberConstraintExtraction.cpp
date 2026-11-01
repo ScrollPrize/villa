@@ -3,7 +3,7 @@
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
@@ -230,11 +230,11 @@ int runFiberConstraintExtraction(int argc, char** argv)
             {"semantics","arc mean 2*(fiber tangent dot axis tangent)^2-1; V positive, H negative"},
             {"seconds",seconds(begin)},{"umbilicus_frame",result["umbilicus_frame"]}};
         std::filesystem::create_directories(target.parent_path());
-        vc::core::util::ephemeralWriteString(target,features.dump()+"\n");
+        vcr::zarr::atomicWrite(target,features.dump()+"\n");
         result["axial_seconds"]=seconds(begin);
         if(cfg.value("axial_prior_only",false)) {
             result["wall_seconds"]=seconds(started);
-            vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+            vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
             std::cout<<"axial features complete fibers="<<lines.size()<<" seconds="<<seconds(started)<<std::endl;
             return 0;
         }
@@ -252,7 +252,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
             cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr,
             cfg.contains("normal_curves_output"));
         result["wall_seconds"]=seconds(started);
-        vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;
         return 0;
     }
@@ -295,7 +295,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
             result["wall_seconds"]=seconds(started);
             std::cout<<"export complete "<<result["export"].dump()<<std::endl;
         }
-        vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<run.dump()<<std::endl;
     }
     return 0;

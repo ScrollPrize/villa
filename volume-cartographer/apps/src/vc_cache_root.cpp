@@ -1,5 +1,5 @@
 #include "vc/core/util/GlobalCacheRoot.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <chrono>
 #include <iostream>
 
@@ -22,7 +22,7 @@ int main(int argc, char** argv)
         if (!std::filesystem::create_directory(probe))
             throw std::runtime_error("cannot create cache write probe");
         try {
-            vc::core::util::atomicWriteString(probe / "probe", "write test\n");
+            vcr::zarr::atomicWrite(probe / "probe", "write test\n", vcr::zarr::Durability::Fsync);
             std::filesystem::remove(probe / "probe");
             std::filesystem::remove(probe);
         } catch (...) {
@@ -38,8 +38,8 @@ int main(int argc, char** argv)
             const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
             std::filesystem::copy_file(path, directory / ("cache.json.backup-" + std::to_string(suffix)));
         }
-        vc::core::util::atomicWriteString(path, nlohmann::json{
-            {"version", 1}, {"root", root.lexically_normal().string()}}.dump(2) + "\n");
+        vcr::zarr::atomicWrite(path, nlohmann::json{
+            {"version", 1}, {"root", root.lexically_normal().string()}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         std::cout << vc::core::util::globalCacheRoot().string() << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

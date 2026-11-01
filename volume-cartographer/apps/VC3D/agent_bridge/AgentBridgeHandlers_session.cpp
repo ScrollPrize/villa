@@ -3,7 +3,6 @@
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include <vc_object_store/objects/Project.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include "vc/core/util/AtomicFile.hpp"
 #include <QJsonDocument>
 
 #include <QBuffer>
@@ -590,7 +589,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         auto package = VolumePkg::open(staging, loadOptions);
         package->addVolumeEntry(volumeLocation, std::move(tags));
         recordedLocation = package->volumeEntries().front().location;
-        vc::core::util::atomicWriteString(outputPath, package->document().data().dump(2) + "\n");
+        vcr::zarr::atomicWrite(outputPath, package->document().data().dump(2) + "\n", vcr::zarr::Durability::Fsync);
         fs::remove(staging);
     } catch (const std::exception& error) {
         std::error_code ignored;

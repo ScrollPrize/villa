@@ -462,7 +462,7 @@ void writeRenderedOverview(const std::filesystem::path& output,
                 {"traced_top_rows", p.fiberletTopRows}, {"traced_side_rows", p.fiberletSideRows}});
         metadata["page_layout"].push_back({{"shape_yx", {page.image.rows, page.image.cols}}, {"panels", panels}});
     }
-    vc::core::util::atomicWriteString(output / "render.json", metadata.dump(2) + "\n");
+    vcr::zarr::atomicWrite(output / "render.json", metadata.dump(2) + "\n", vcr::zarr::Durability::Fsync);
 }
 
 void renderArtifact(const std::filesystem::path& artifact, const std::filesystem::path& settingsPath)
@@ -1091,9 +1091,9 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     return;
                 }
                 if (profileTracing)
-                    vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
+                    vcr::zarr::atomicWrite(output / "cases" / std::to_string(index) / "profile.json",
                         caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
-                            readinessProfile, traceProfile).dump(2) + "\n");
+                            readinessProfile, traceProfile).dump(2) + "\n", vcr::zarr::Durability::Fsync);
                 if (renderThisCase) {
                     // Render directly from this completed replay. Volume,
                     // prediction and normal chunk caches are concurrent; all
@@ -1137,7 +1137,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                         entry["original_fiber_arc_base"] = entry["original_fiber_arc_base"].get<double>() + originalBegin;
                         entry["original_fiber_arc_mm"] = entry["original_fiber_arc_base"].get<double>() * source.voxelSizeUm / 1000;
                     }
-                    vc::core::util::atomicWriteString(writeDirectory / "render.json", inspection.metadata.dump(2) + "\n");
+                    vcr::zarr::atomicWrite(writeDirectory / "render.json", inspection.metadata.dump(2) + "\n", vcr::zarr::Durability::Fsync);
                     if (resumeVisualization) {
                         if (std::filesystem::exists(directory)) {
                             auto quarantine = caseDirectory / ("rendered.incomplete." + std::to_string(
@@ -1175,7 +1175,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     pool.clear(); // join before consuming results or propagating errors
     if (caseQueue) caseQueue->join();
     if (error) {
-        vc::core::util::atomicWriteString(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         std::rethrow_exception(error);
     }
     if (resumeVisualization) {
@@ -1186,25 +1186,25 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         const Json status{{"format", "vc_visualization_resume"}, {"version", 1},
             {"cases", cases.size()}, {"rendered_cases", cases.size() - remaining.size()},
             {"remaining_cases", remaining}, {"batch_selected_cases", resumeRenderCases}};
-        vc::core::util::atomicWriteString(output / "visualization_resume.json", status.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "visualization_resume.json", status.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         // The Python publisher removes interruption markers only after the
         // complete visualization report validates every declared page.  The
         // original scientific summary and its timing remain byte-for-byte
         // untouched by this render-only operation.
-        vc::core::util::atomicWriteString(output / "incomplete.json", Json{
-            {"visualization_resume", status}, {"config", persistedConfig}}.dump(2) + "\n");
+        vcr::zarr::atomicWrite(output / "incomplete.json", Json{
+            {"visualization_resume", status}, {"config", persistedConfig}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         return 0;
     }
     Json summaries = Json::array();
     if (trialSearch) {
         if (completed.load() != cases.size())
             throw std::runtime_error("incomplete failure-search work queue");
-        vc::core::util::atomicWriteString(output / "summary.json", Json{
+        vcr::zarr::atomicWrite(output / "summary.json", Json{
             {"completed", true}, {"backend", "failure_search"}, {"cases", cases.size()},
             {"evaluated_cases", completed.load() - skippedTrials.load()},
             {"cancelled_cases", skippedTrials.load()}, {"workers", workers},
             {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()}
-        }.dump(2) + "\n");
+        }.dump(2) + "\n", vcr::zarr::Durability::Fsync);
         return 0;
     }
 
@@ -1262,7 +1262,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         evaluatedCases += selected.size();
         totalFailures += summary.totalFailures;
     }
-    vc::core::util::atomicWriteString(output / "summary.json", Json{
+    vcr::zarr::atomicWrite(output / "summary.json", Json{
         {"version", 3}, {"metric_definition", "corpus-failures-plus-one-v1"},
         {"completed", true}, {"cases", cases.size()}, {"workers", workers},
         {"evaluated_cases", evaluatedCases},
@@ -1283,6 +1283,6 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         {"mean_segment_length_mm", evaluatedCases == 0 ? Json(nullptr) : Json(directedLengthMm / (totalFailures + 1))},
         {"mean_segment_length_percent", evaluatedCases == 0 ? Json(nullptr) : Json(100.0 / (totalFailures + 1))},
         {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
-        {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n");
+        {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
     return 0;
 }

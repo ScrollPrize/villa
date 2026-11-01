@@ -9,7 +9,6 @@
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
-#include "vc/core/util/AtomicFile.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
@@ -114,7 +113,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     datasets[1]["coordinateTransformations"] = {
         {{"type","scale"},{"scale",{2,4,6}}},
         {{"type","translation"},{"translation",{2,2,2}}}};
-    vc::core::util::atomicWriteString(attrsPath, attrs.dump());
+    vcr::zarr::atomicWrite(attrsPath, attrs.dump(), vcr::zarr::Durability::Fsync);
     const auto ct = openCtLevel(directory / "ct", "1");
     const auto source = validateFiberReplayStripCtVolume(ct);
     CHECK(source.locator == (directory / "ct/1").string());

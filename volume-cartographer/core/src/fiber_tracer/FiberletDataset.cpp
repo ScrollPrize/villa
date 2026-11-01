@@ -1,7 +1,8 @@
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -789,7 +790,7 @@ void publishBytes(
                 "fiberlet chunk publication conflicts with existing bytes");
         }
     } else {
-        vc::core::util::atomicWriteBytes(path, bytes);
+        vcr::zarr::atomicWrite(path, bytes.data(), bytes.size(), vcr::zarr::Durability::Fsync);
     }
 }
 
@@ -992,7 +993,7 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::openExisting(
     const auto group = json::parse(readText(root / ".zgroup"));
     if (group != json{{"zarr_format", 2}})
         throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
-    auto metadata = parseMetadata(json::parse(readText(root / ".zattrs")));
+    auto metadata = parseMetadata(vcr::zarr::readAttributes(root));
     for (const auto kind : datasetKinds(metadata.kind)) {
         const auto storedArray = json::parse(
             readText(arrayDirectory(root, kind) / ".zarray"));

@@ -1,6 +1,7 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
 #include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/TexturedMesh.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
@@ -4303,8 +4304,8 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
     if (error) {
         throw std::filesystem::filesystem_error("cannot remove stale fiberlet material artifact", outputDirectory / "fiberlets.mtl", error);
     }
-    vc::core::util::atomicWriteString(outputDirectory / "fiberlets.json", fiberletPathReportJson(report, artifact).dump(2) + "\n");
-    vc::core::util::atomicWriteString(outputDirectory / "fiberlets.obj", fiberletPathReportObj(report));
+    vcr::zarr::atomicWrite(outputDirectory / "fiberlets.json", fiberletPathReportJson(report, artifact).dump(2) + "\n", vcr::zarr::Durability::Fsync);
+    vcr::zarr::atomicWrite(outputDirectory / "fiberlets.obj", fiberletPathReportObj(report), vcr::zarr::Durability::Fsync);
     auto graphJson = fiberletGraphJson(buildFiberletGraph(report));
     graphJson["source"] = {
         {"fiber_manifest", artifact.fiberManifestLocator},
@@ -4314,7 +4315,7 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
         {"anchor_artifact", artifact.anchorArtifactLocator},
         {"anchor_artifact_content_hash", artifact.anchorArtifactContentHash},
     };
-    vc::core::util::atomicWriteString(outputDirectory / "fiberlet_graph.json", graphJson.dump(2) + "\n");
+    vcr::zarr::atomicWrite(outputDirectory / "fiberlet_graph.json", graphJson.dump(2) + "\n", vcr::zarr::Durability::Fsync);
 }
 
 namespace
@@ -4462,8 +4463,8 @@ void writeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirecto
             if (!cv::imwrite(paths.temporaryPng.string(), presenceSliceImage(plane), {cv::IMWRITE_PNG_COMPRESSION, 1})) {
                 throw std::runtime_error("failed to write fiber presence texture: " + paths.temporaryPng.string());
             }
-            vc::core::util::atomicWriteString(paths.temporaryMtl, mtl);
-            vc::core::util::atomicWriteString(paths.temporaryObj, obj);
+            vcr::zarr::atomicWrite(paths.temporaryMtl, mtl, vcr::zarr::Durability::Fsync);
+            vcr::zarr::atomicWrite(paths.temporaryObj, obj, vcr::zarr::Durability::Fsync);
             pending.push_back(paths);
         }
         for (const auto& paths : pending) {

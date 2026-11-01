@@ -9,7 +9,6 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 
-#include <QSaveFile>
 
 
 #include <algorithm>
@@ -32,12 +31,7 @@ namespace {
 // Write a marker file whole or not at all.
 void writeMarker(const std::filesystem::path& path, const std::string& text)
 {
-    std::filesystem::create_directories(path.parent_path());
-    QSaveFile output(QString::fromStdString(path.string()));
-    if (!output.open(QIODevice::WriteOnly) ||
-        output.write(text.data(), qint64(text.size())) != qint64(text.size()) || !output.commit()) {
-        throw std::runtime_error("failed to write " + path.string());
-    }
+    vcr::zarr::atomicWrite(path, text);
 }
 
 void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest,

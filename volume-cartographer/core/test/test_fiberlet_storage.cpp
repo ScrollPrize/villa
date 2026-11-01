@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
@@ -1713,7 +1714,7 @@ TEST_CASE("Fiberlet atomic temporary cleanup removes only exact abandoned write 
         CHECK(std::filesystem::exists(root / "keep.tmp.1.invalid"));
     }
     std::filesystem::create_directories(root / "occupied-target");
-    CHECK_THROWS(vc::core::util::atomicWriteString(root / "occupied-target", "cannot replace a directory"));
+    CHECK_THROWS(vcr::zarr::atomicWrite(root / "occupied-target", "cannot replace a directory", vcr::zarr::Durability::Fsync));
     CHECK(vc::core::util::cleanupAtomicWriteTemporaryFiles(root) == 0);
     std::filesystem::remove_all(root);
 }

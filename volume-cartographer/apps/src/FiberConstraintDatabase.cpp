@@ -1,7 +1,7 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <sqlite3.h>
 #include <algorithm>
 #include <chrono>
@@ -348,7 +348,7 @@ nlohmann::json orientFiberConstraintDatabase(
                 {"columns",{"arc","nx","ny","nz","valid"}},
                 {"index",curveIndex},{"statistics",stats},{"provenance",provenance},
                 {"normal_convention","fiber-local baked gauge; apply stage1 normal_sign"}};
-            vc::core::util::ephemeralWriteString(partial/"index.json",doc.dump()+"\n");
+            vcr::zarr::atomicWrite(partial/"index.json",doc.dump()+"\n");
             std::filesystem::rename(partial,output);return stats;
         }
         std::vector<double> agreement(lines.size());
@@ -362,7 +362,7 @@ nlohmann::json orientFiberConstraintDatabase(
             {"source_ids",sourceIds},{"agreement",agreement},{"valid_arc_weight",priorWeight},
             {"provenance",provenance},{"statistics",stats}};
         std::filesystem::create_directories(output.parent_path());
-        vc::core::util::ephemeralWriteString(output,document.dump()+"\n");
+        vcr::zarr::atomicWrite(output,document.dump()+"\n");
         return stats;
     }
     std::filesystem::create_directories(output.parent_path());

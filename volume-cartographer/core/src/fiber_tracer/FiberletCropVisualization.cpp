@@ -1,6 +1,5 @@
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 
-#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/util/TexturedMesh.hpp"
 #include <vc_reader/grid.hpp>
@@ -105,11 +104,11 @@ void writeFiberletCropBoxVisualization(
             directory / textureName,
             vc::core::util::renderCoordsTexture(coordinates, {ct.array.get(), ct.meta.type}, 1, "Fiberlet crop texture sampling"));
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);
-        vc::core::util::atomicWriteString(
+        vcr::zarr::atomicWrite(
             directory / (stem + "_" + face.name + ".obj"),
-            vc::core::util::texturedMeshObj(faceMesh(face), "VC3D Fiberlet crop bbox face", mtlName, materialName, face.name));
+            vc::core::util::texturedMeshObj(faceMesh(face), "VC3D Fiberlet crop bbox face", mtlName, materialName, face.name), vcr::zarr::Durability::Fsync);
     }
-    vc::core::util::atomicWriteString(directory / mtlName, mtl);
+    vcr::zarr::atomicWrite(directory / mtlName, mtl, vcr::zarr::Durability::Fsync);
 }
 
 }  // namespace vc::fiber_tracer

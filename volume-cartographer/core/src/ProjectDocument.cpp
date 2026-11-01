@@ -1,5 +1,5 @@
 #include "vc/core/types/ProjectDocument.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <algorithm>
 #include <cctype>
@@ -96,7 +96,7 @@ void ProjectDocument::replace(nlohmann::json data) {
     validate(data);
     if (data == data_) return;
     if (!writable()) throw std::runtime_error("Project is read-only: " + path_.string());
-    vc::core::util::atomicWriteString(path_, data.dump(2) + "\n");
+    vcr::zarr::atomicWrite(path_, data.dump(2) + "\n", vcr::zarr::Durability::Fsync);
     data_ = std::move(data);
 }
 std::filesystem::path ProjectDocument::resolve(const std::string& location) const {

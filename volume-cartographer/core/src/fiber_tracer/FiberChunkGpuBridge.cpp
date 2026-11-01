@@ -1,6 +1,6 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include <atomic>
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -154,7 +154,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             bytes.write(reinterpret_cast<const char*>(byteValues.data()),byteValues.size());
             floats.write(reinterpret_cast<const char*>(widthValues.data()),widthValues.size()*sizeof(float));
             if(!bytes||!floats)throw std::runtime_error("GPU fixture write failed");
-            vc::core::util::atomicWriteString(c.benchmarkExport/"gpu_input.json",meta.dump(2)+"\n");
+            vcr::zarr::atomicWrite(c.benchmarkExport/"gpu_input.json",meta.dump(2)+"\n", vcr::zarr::Durability::Fsync);
         }
         if(!c.gpuLibrary.empty()) {
             auto result=gpu.execute(meta,std::move(byteValues),std::move(widthValues),wait);

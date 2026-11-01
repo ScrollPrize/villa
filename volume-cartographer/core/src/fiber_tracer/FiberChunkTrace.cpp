@@ -1,6 +1,6 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -548,9 +548,9 @@ std::shared_ptr<const FiberChunkPaths> FiberChunkTraceCache::get(const std::arra
             Json lines=Json::array();
             for(const auto& line:chunk->lines) {Json points=Json::array();for(const auto& p:line) points.push_back(xyz(p));lines.push_back(points);}
             std::filesystem::create_directories(output_);
-            vc::core::util::atomicWriteString(path,Json{{"key",key},{"lo",xyz(chunk->lo)},{"hi",xyz(chunk->hi)},
+            vcr::zarr::atomicWrite(path,Json{{"key",key},{"lo",xyz(chunk->lo)},{"hi",xyz(chunk->hi)},
                 {"maxima",chunk->maxima},{"seeds",chunk->seeds},{"lines",lines},{"end_reasons",chunk->endReasons},
-                {"specification",spec},{"timings",chunk->timings}}.dump()+"\n");
+                {"specification",spec},{"timings",chunk->timings}}.dump()+"\n", vcr::zarr::Durability::Fsync);
         }
         if(config_.conflictNormalBase>0)
             chunk->timings["conflict_filter"]=filterFiberChunkConflicts(*chunk,config_,normals,scale,parallelFor,
