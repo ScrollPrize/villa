@@ -109,6 +109,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _manualAddContinuation.reset();
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();

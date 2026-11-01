@@ -133,6 +133,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::manualAddApplyExitRequested);
     connect(_manualAddPanel, &SegmentationManualAddPanel::cancelRequested,
             this, &SegmentationWidget::manualAddCancelRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::extendRequested,
+            this, &SegmentationWidget::manualAddExtendRequested);
 
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
@@ -313,6 +315,7 @@ int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps()
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 int SegmentationWidget::growthScale() const { return _growthPanel->growthScale(); }
 ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
+int SegmentationWidget::manualAddExtendCells() const { return _manualAddPanel->extendCells(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {
     return _manualAddPanel->cycleLinePreviewMode();
