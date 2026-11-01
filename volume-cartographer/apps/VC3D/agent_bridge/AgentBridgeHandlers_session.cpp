@@ -11,6 +11,8 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QPixmap>
+#include <QOpenGLWidget>
+#include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
 #include <QWidget>
@@ -381,6 +383,22 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     QPixmap pixmap = widget->grab();
+    // QWidget's raster grab does not support QOpenGLWidget contents. Composite
+    // each visible GL child's framebuffer in logical coordinates so 3D colours
+    // and legends survive full-window captures, including on Retina displays.
+    {
+        QPainter painter(&pixmap);
+        for (auto* gl : widget->findChildren<QOpenGLWidget*>()) {
+            if (!gl->isVisibleTo(widget) || gl->window() != widget->window()) continue;
+            const QImage frame = gl->grabFramebuffer();
+            if (frame.isNull()) continue;
+            const QPoint position = gl->mapTo(widget, QPoint{});
+            painter.save();
+            painter.setClipRegion(gl->visibleRegion().translated(position));
+            painter.drawImage(QRect(position, gl->size()), frame);
+            painter.restore();
+        }
+    }
 
     static constexpr int kMinCaptureDim = 8;
     if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {

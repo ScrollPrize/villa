@@ -226,6 +226,8 @@ public:
                                                        float tolerance) const;
 
 signals:
+    // Request the shared Composite View mode from another viewer control.
+    void volumetricModeRequested(bool enabled);
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();

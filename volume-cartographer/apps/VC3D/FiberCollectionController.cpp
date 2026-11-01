@@ -1,6 +1,7 @@
 #include "FiberCollectionController.hpp"
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include "FiberOverlayColors.hpp"
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -290,6 +291,7 @@ void FiberCollectionController::setOptions(const FiberDisplayOptions& options)
 {
     if (options == options_) return;
     const auto previous = std::exchange(options_, options);
+    emit optionsChanged();
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("fiberCollections/minLengthMm", options_.minLengthMm);
     settings.setValue("fiberCollections/maxDisplayed", options_.maxDisplayed);
@@ -322,6 +324,24 @@ void FiberCollectionController::publishSelection(Selection selection)
 {
     selection_ = std::move(selection);
     emit selectionChanged(selection_);
+}
+void FiberCollectionController::clearSelection()
+{
+    ++selectionRevision_;
+    ++navigationRevision_;
+    ++annotationRevision_;
+    selected_ = 0;
+    selectedPin_.reset();
+    selectedBound_ = false;
+    pendingAnnotation_ = 0;
+    pendingIndex_.reset();
+    for (const auto& connection : annotationRenderConnections_)
+        disconnect(connection);
+    annotationRenderConnections_.clear();
+    publishSelection({});
+    emit annotationStatusChanged({});
+    refreshRegions();
+    refreshAll();
 }
 void FiberCollectionController::clear()
 {
@@ -933,13 +953,13 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         for (size_t i = 0; i < rainbowPaths.size(); ++i)
             draw(rainbowPaths[i], QColor::fromHsvF(double(i) / rainbowPaths.size(), 0.7, 1.0), width);
     } else {
-        draw(horizontal, QColor("#40a5ff"), width);
-        draw(vertical, QColor("#ffad43"), width);
+        draw(horizontal, vc3d::horizontalFiberColor(), width);
+        draw(vertical, vc3d::verticalFiberColor(), width);
         draw(other, QColor("#bbbbbb"), width);
     }
     for (const auto& [group, runs] : linkedPaths)
         draw(runs, groupColor(group), width);
-    draw(selected, QColor("#ffff66"), width + 2);
+    draw(selected, vc3d::selectedFiberColor(), width + 2);
     if (painter.isActive()) {
         painter.end();
         builder.addImage(raster, QPixmap::fromImage(raster), rect.topLeft(), 1, 1, 1, 45);

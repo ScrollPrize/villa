@@ -59,6 +59,7 @@ public:
     void activateFiber(int64_t id);
     void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
     void navigate(int index);
+    void clearSelection();
     void showInLineAnnotation(int64_t id);
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
@@ -69,6 +70,7 @@ public:
     void detachViewer(VolumeViewerBase* viewer) override;
 
 signals:
+    void optionsChanged();
     void catalogChanged(std::vector<FiberCollectionController::CatalogRow> rows, bool morePages);
     void statusChanged(bool attached, const QString& text);
     void selectionChanged(const FiberCollectionController::Selection& selection);

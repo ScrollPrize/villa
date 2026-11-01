@@ -20,6 +20,38 @@ set(srcs
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    FiberOverlayColors.hpp
+    fibers3d/Fiber3DScene.hpp
+    fibers3d/Fiber3DData.cpp
+    fibers3d/Fiber3DData.hpp
+    fibers3d/Fiber3DCanvas.cpp
+    fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DRenderGeometry.hpp
+    fibers3d/Fiber3DColor.hpp
+    fibers3d/Fiber3DGeometry.hpp
+    fibers3d/Fiber3DPanel.cpp
+    fibers3d/Fiber3DPanel.hpp
+    fibers3d/Fiber3DRibbon.hpp
+    fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DRibbonControls.hpp
+    fibers3d/Fiber3DRibbonControls.cpp
+    fibers3d/Fiber3DCT.hpp
+    fibers3d/Fiber3DCT.cpp
+    fibers3d/Fiber3DSlices.hpp
+    fibers3d/Fiber3DSlices.cpp
+    fibers3d/Fiber3DVolumeRenderer.hpp
+    fibers3d/Fiber3DVolumeRenderer.cpp
+    fibers3d/Fiber3DSliceControls.hpp
+    fibers3d/Fiber3DSliceControls.cpp
+    fibers3d/Fiber3DSurfaceMesh.hpp
+    fibers3d/Fiber3DSurfaceMesh.cpp
+    fibers3d/Fiber3DSurfaceProximity.hpp
+    fibers3d/Fiber3DSurfaceProximity.cpp
+    fibers3d/Fiber3DSurfaceRenderer.hpp
+    fibers3d/Fiber3DSurfaceRenderer.cpp
+    fibers3d/Fiber3DSurfaceControls.hpp
+    fibers3d/Fiber3DSurfaceControls.cpp
+    LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp

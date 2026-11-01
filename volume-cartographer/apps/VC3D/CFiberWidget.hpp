@@ -127,6 +127,7 @@ public:
 
 signals:
     void fiberDetailsRequested(uint64_t fiberId);
+    void fiberSelectionChanged(uint64_t fiberId);
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
