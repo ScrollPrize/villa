@@ -17,6 +17,7 @@ struct Options {
     float isoCutoff = 0.0f;
     float alphaMin = 0.0f, alphaMax = 1.0f, alphaOpacity = 1.0f, alphaCutoff = 1.0f;
     float extinction = 1.5f, emission = 1.5f, ambient = 0.1f;
+    bool operator==(const Options&) const = default;
 };
 
 // Median keeps every layer of a pixel; other methods stream.
