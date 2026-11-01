@@ -334,6 +334,9 @@ public:
     enum class NodeKind { Array, Group };
     // The child at a path, its metadata when it is an array; nullopt when absent.
     std::optional<std::pair<NodeKind, Json>> node(const std::string& key);
+    // The metadata of the array at a path, through the caches, without opening it;
+    // nullopt when there is no array there.
+    std::optional<ArrayMeta> arrayMeta(const std::string& key);
     OpenedArray array(const std::string& key);
     Group group(const std::string& key);
 

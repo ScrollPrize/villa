@@ -848,6 +848,14 @@ std::optional<std::pair<Group::NodeKind, Json>> Group::node(const std::string& i
     return found;
 }
 
+std::optional<ArrayMeta> Group::arrayMeta(const std::string& key)
+{
+    const auto n = node(key);
+    if (!n || n->first != NodeKind::Array)
+        return std::nullopt;
+    return parseArrayMeta(n->second);
+}
+
 OpenedArray Group::array(const std::string& key)
 {
     const auto n = node(key);

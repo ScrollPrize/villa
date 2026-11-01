@@ -220,6 +220,9 @@ void local(const fs::path& root, const std::vector<uint16_t>& v)
     level1.array->read_many({{0, 0, 0}}, {{2, 2, 2}}, {reinterpret_cast<uint8_t*>(one)});
     require(one[0] == 9 && one[7] == 9, "direct level open");
     require(!g.node("2") && g.node("1")->first == vcr::zarr::Group::NodeKind::Array, "child lookup");
+    require(g.arrayMeta("1")->shape == vcr::Index{2, 2, 2} && g.arrayMeta("1")->dtype == level1.meta.dtype,
+            "a level's metadata without opening it");
+    require(!g.arrayMeta("2"), "no metadata for an absent child");
     must_fail([&] { g.node("../x"); }, "path traversal refused");
 
     // Without multiscales, levels are the consecutive arrays "0", "1", ...
