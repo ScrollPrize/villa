@@ -3547,7 +3547,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
-        if (!used_area_fully_valid) {
+        // A fresh trace keeps the fast frontier: a candidate the x/y/z limit check skipped leaves a cell inside
+        // used_area that can never be filled, and the hole-filling branch would then end all growth.
+        if (!used_area_fully_valid && resume_surf) {
             // Offer interior candidates first, then outward neighbours on resume. Collect
             // both in one traversal while preserving the interior-before-outward order.
             std::vector<cv::Vec2i> outward_candidates;

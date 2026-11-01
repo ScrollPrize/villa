@@ -7,7 +7,8 @@ Usage:
 The normal-grid directory must contain the published grids or a
 normal-grids-remote.json pointing to the matching public normal-grids URL.
 Use --seed-surface to reuse the bounded seed run from upstream. Otherwise the
-script generates it, using the seed and spatial limits documented in #2104.
+script generates it, using the seed and spatial limits documented in #2104,
+capped at 13 generations, about where the trace in #2104 stalled.
 Downloads may take several minutes; this is deliberately not an offline CTest.
 
 Checks, on a resume of that seed under the same limits:
@@ -35,6 +36,7 @@ VOLUME = (
     "20250728140407-surface-20260413222639-surface-m7-L0-th0.2.zarr"
 )
 GENERATIONS = 200
+SEED_GENERATIONS = 13
 
 
 def load(surface):
@@ -99,7 +101,10 @@ def main():
                            env={**os.environ, "VC_GROWPATCH_RNG_SEED": "1"})
         return surface
 
-    seed = args.seed_surface or run("seed", base, ["-s", "3770", "3698", "4608"])
+    # A fresh bounded trace now grows until its fringe empties (generation 58 here), which
+    # leaves a resume nothing to add. Cap the seed near where #2104's trace stalled (12 to 13).
+    seed = args.seed_surface or run("seed", {**base, "generations": SEED_GENERATIONS},
+                                    ["-s", "3770", "3698", "4608"])
     _, seed_valid = load(seed)
 
     resumed = run("resumed", base, ["--resume", str(seed.resolve())])
