@@ -578,8 +578,7 @@ void writeDatasetMetadata(
     const std::filesystem::path& root,
     const FiberletDatasetMetadata& metadata)
 {
-    vc::core::util::atomicWriteString(
-        root / ".zattrs", metadataJson(metadata).dump(2) + "\n");
+    vcr::zarr::writeAttributes(root, metadataJson(metadata), {}, vcr::zarr::Durability::Fsync);
 }
 
 void removeLegacyBookkeeping(const std::filesystem::path& root)
@@ -956,8 +955,7 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
         const auto group = json::parse(readText(root / ".zgroup"));
         if (group != json{{"zarr_format", 2}})
             throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
-        const auto storedJson = json::parse(readText(root / ".zattrs"));
-        const auto parsed = parseMetadata(storedJson);
+        const auto parsed = parseMetadata(vcr::zarr::readAttributes(root));
         if (!fiberletDatasetMetadataCompatible(parsed, metadata))
             throw std::invalid_argument("fiberlet dataset metadata does not match the requested configuration");
         effectiveMetadata = parsed;
@@ -968,13 +966,13 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
         }
         removeLegacyBookkeeping(root);
     } else {
-        std::filesystem::create_directories(root);
-        vc::core::util::atomicWriteString(root / ".zgroup", json{{"zarr_format", 2}}.dump(2) + "\n");
-        vc::core::util::atomicWriteString(root / ".zattrs", expected.dump(2) + "\n");
+        // The dataset is a Zarr group (.zgroup, .zattrs) whose arrays' .zarray vc_reader's
+        // writer cannot express (|O), so those stay written here.
+        vcr::zarr::createGroup(root, std::optional<vcr::zarr::Json>(expected), 2, {}, vcr::zarr::Durability::Fsync);
         for (const auto kind : datasetKinds(metadata.kind)) {
             const auto directory = arrayDirectory(root, kind);
             std::filesystem::create_directories(directory);
-            vc::core::util::atomicWriteString(directory / ".zarray", arrayMetadata(metadata, kind).dump(2) + "\n");
+            vcr::zarr::atomicWrite(directory / ".zarray", arrayMetadata(metadata, kind).dump(2) + "\n", vcr::zarr::Durability::Fsync);
         }
         removeLegacyBookkeeping(root);
     }
