@@ -505,6 +505,55 @@ std::optional<std::pair<int, int>> SegmentationGrowthPanel::correctionsZRange() 
     return std::make_pair(_correctionsZMin, _correctionsZMax);
 }
 
+void SegmentationGrowthPanel::setGrowthScale(int scale)
+{
+    if (_spinGrowthScale) {
+        _spinGrowthScale->setValue(std::clamp(scale, 0, 5));
+    }
+}
+
+void SegmentationGrowthPanel::setCorrectionsZRange(bool enabled, int zMin, int zMax)
+{
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setValue(zMin);
+    }
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setValue(zMax);
+    }
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setChecked(enabled);
+    }
+}
+
+void SegmentationGrowthPanel::setAllowedGrowthDirections(
+    const std::vector<SegmentationGrowthDirection>& directions)
+{
+    int mask = 0;
+    for (const auto direction : directions) {
+        switch (direction) {
+        case SegmentationGrowthDirection::Up:    mask |= kGrowDirUpBit; break;
+        case SegmentationGrowthDirection::Down:  mask |= kGrowDirDownBit; break;
+        case SegmentationGrowthDirection::Left:  mask |= kGrowDirLeftBit; break;
+        case SegmentationGrowthDirection::Right: mask |= kGrowDirRightBit; break;
+        default:                                 mask |= kGrowDirAllMask; break;
+        }
+    }
+    setGrowthDirectionMask(mask);
+}
+
+bool SegmentationGrowthPanel::selectGrowthVolume(const QString& volumeId)
+{
+    if (!_comboVolumes) {
+        return false;
+    }
+    const int index = _comboVolumes->findData(volumeId);
+    if (index < 0) {
+        return false;
+    }
+    _comboVolumes->setCurrentIndex(index);
+    return true;
+}
+
 void SegmentationGrowthPanel::setGrowthDirectionMask(int mask)
 {
     mask = normalizeGrowthDirectionMask(mask);

@@ -417,6 +417,19 @@ void SegmentationDirectionFieldPanel::clearDirectionFieldForm()
     }
 }
 
+void SegmentationDirectionFieldPanel::setDirectionFieldConfigs(
+    const std::vector<SegmentationDirectionFieldConfig>& configs)
+{
+    _directionFields.clear();
+    for (const auto& config : configs) {
+        if (config.isValid()) {
+            _directionFields.push_back(config);
+        }
+    }
+    refreshDirectionFieldList();
+    persistDirectionFields();
+}
+
 void SegmentationDirectionFieldPanel::persistDirectionFields()
 {
     QVariantList serialized;

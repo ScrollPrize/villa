@@ -13,6 +13,7 @@
 #include <QJsonObject>
 #include <QTemporaryFile>
 #include <QVector3D>
+#include <QVector>
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
@@ -131,6 +132,85 @@ public:
 
     using AlphaCompRefineParams = AlphaCompRefineRequest;
 
+    // Arguments accepted by startNeighborCopy; defaults match the dialog.
+    struct NeighborCopyParams {
+        QString     volumeId;                 // empty => current volume
+        QString     outputTag{QStringLiteral("paths")};  // tag of the new surface
+        int         neighborMaxDistance{200};
+        int         neighborMinClearance{4};
+        bool        neighborFill{true};
+        int         neighborInterpWindow{5};
+        int         generations{2};
+        int         neighborSpikeWindow{2};
+        // The same run refines the projected surface (gen_neighbor's "refine").
+        int         resumeLocalOptStep{20};
+        int         resumeLocalOptRadius{40};
+        int         resumeLocalMaxIters{1000};
+        bool        resumeLocalDenseQr{false};
+        int         refineOmpThreads{1};      // >= 1; the refinement's thread_limit
+        QJsonObject refineParamOverrides;     // merged over the refine params
+    };
+
+    // Arguments accepted by startConvertToObj. The tool writes the OBJ into
+    // the surface's artifact directory and reports its path.
+    struct ConvertToObjParams {
+        QString objName;          // a file name; empty => <surface name>.obj
+        bool    normalizeUV{false};
+        bool    alignGrid{false};
+        int     ompThreads{-1};   // -1 => runner default
+    };
+
+    // Arguments accepted by startMergeTifxyz; RANSAC defaults match the dialog.
+    struct MergeTifxyzParams {
+        QVector<QStringList> grid;            // row-major surface UUIDs; "" is a hole
+        QString refSurface;                   // empty => largest valid-cell count
+        QString outputTag{QStringLiteral("paths")};  // tag of the merged surface
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     stripCols{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
+    // Arguments accepted by startMergePatch; defaults match the dialog.
+    struct MergePatchParams {
+        QString parentId;                     // overwritten in place (a new revision)
+        QString childId;
+        bool    explicitRoles{false};         // false => vc_merge_patch picks the
+                                              // parent by valid-cell count
+        int     borderCells{16};
+        int     blendCells{6};
+        int     idwK{4};
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
+    // Arguments accepted by startRasterizeSegments.
+    struct RasterizeParams {
+        int chunkSize{128};       // isotropic chunk size, 1..4096
+        int zMin{0};              // level-0 Z min, >= 0
+        int zMax{-1};             // level-0 Z max (exclusive); -1 => volume end
+    };
+
+    // Surfaces accepted for rasterization by startRasterizeSegments.
+    struct RasterizeLaunch {
+        QString     outputPath;   // the labels_<timestamp>.zarr the tool publishes
+        QStringList segmentIds;   // surfaces passed to the tool
+        QStringList skippedIds;   // requested surfaces that cannot be rasterized
+    };
+
+    /// Grid transforms offered by the surface context menu's Flip and Rotate
+    /// entries. The "Normals (H Flip)" entry is FlipV.
+    enum class SurfaceTransform { FlipU, FlipV, Rotate90 };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -179,6 +259,15 @@ signals:
      * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
+
+    /**
+     * Emitted once when a segment operation whose result the tool runner does
+     * not report reaches its terminal state. Emitted for interactive and
+     * dialog-free launches. `kind` names the operation ("rasterize");
+     * `outputPath` is the produced artifact on success.
+     */
+    void segmentOperationFinished(QString kind, bool success, QString message,
+                                  QString outputPath);
 
 public slots:
     void onRenderSegment(const std::string& segmentId);
@@ -279,6 +368,52 @@ public:
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
+    /// Dialog-free core of onFlipSurface / onRotateSurface. The surface must
+    /// be the active one. Applies the transform, publishes the surface to the
+    /// object store and refreshes the shared surface state; failures via
+    /// `errorMessage` (never a dialog). A failed publish leaves the in-memory
+    /// surface transformed, matching the interactive slots.
+    bool transformSurface(const std::string& segmentId,
+                          SurfaceTransform transform,
+                          QString* errorMessage = nullptr);
+
+    /// Dialog-free OBJ export (vc_tifxyz2obj). The interactive slot gathers the
+    /// same params from its dialog. Completion is observable via
+    /// CommandLineToolRunner::toolFinished, whose output path is the OBJ file.
+    bool startConvertToObj(const std::string& segmentId,
+                           const ConvertToObjParams& params,
+                           CommandLaunchError* error = nullptr);
+
+    /// Dialog-free rasterize launch (vc_tifxyz2zarr_sparse). Requested
+    /// surfaces that cannot be rasterized are skipped as in the interactive
+    /// slot; at least one must remain. Completion is reported by
+    /// segmentOperationFinished("rasterize") with the published volume.
+    bool startRasterizeSegments(const QStringList& segmentIds,
+                                const RasterizeParams& params,
+                                CommandLaunchError* error = nullptr,
+                                RasterizeLaunch* launch = nullptr);
+
+    /// Dialog-free neighbor copy (one vc_grow_seg_from_seed run that projects
+    /// and refines). The interactive slot gathers the same params from its
+    /// dialog. Completion is observable via CommandLineToolRunner::toolFinished
+    /// (the new surface's UUID as the output).
+    bool startNeighborCopy(const QString& segmentId,
+                           bool copyOut,
+                           const NeighborCopyParams& params,
+                           CommandLaunchError* error = nullptr);
+
+    /// Dialog-free vc_merge_tifxyz launch: validates the grid like the dialog
+    /// and starts the tool on a temporary merge.json. Completion is observable
+    /// via CommandLineToolRunner::toolFinished (the merged surface's UUID).
+    bool startMergeTifxyz(const MergeTifxyzParams& params,
+                          CommandLaunchError* error = nullptr);
+
+    /// Dialog-free vc_merge_patch launch. The parent is rewritten in place as
+    /// a new revision. Completion is observable via
+    /// CommandLineToolRunner::toolFinished.
+    bool startMergePatch(const MergePatchParams& params,
+                         CommandLaunchError* error = nullptr);
+
 
     // Marks a rasterized label volume and records its source surfaces (UUIDs).
 
@@ -363,6 +498,35 @@ private:
                                   CommandLaunchError* error);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
+    bool startConvertToObjImpl(const std::string& segmentId,
+                               const ConvertToObjParams& params,
+                               bool interactive,
+                               CommandLaunchError* error);
+    bool transformSurfaceImpl(const std::string& segmentId,
+                              SurfaceTransform transform,
+                              bool interactive,
+                              QString* errorMessage);
+    bool startNeighborCopyImpl(const QString& segmentId,
+                               bool copyOut,
+                               const NeighborCopyParams& params,
+                               bool interactive,
+                               CommandLaunchError* error);
+    bool launchMergeTifxyz(const QString& mergeJsonText,
+                           const StoredSurface& store,
+                           const MergeTifxyzParams& params,
+                           bool interactive,
+                           CommandLaunchError* error);
+    bool launchMergePatch(const StoredSurface& store,
+                          const MergePatchParams& params,
+                          bool interactive,
+                          CommandLaunchError* error);
+    // Interactive launches ask for the parameters when `params` is empty and
+    // present refusals as the menu always has.
+    bool startRasterizeSegmentsImpl(const QStringList& segmentIds,
+                                    const std::optional<RasterizeParams>& params,
+                                    bool interactive,
+                                    CommandLaunchError* error,
+                                    RasterizeLaunch* launch);
 
 
     QWidget* _parentWidget{nullptr};

@@ -69,9 +69,11 @@ class SurfacePanelController;
 class SurfaceCatalog;
 class StoreSurfaceOverlayController;
 class MenuActionController;
+class PluginController;
 class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
+class StatusMessageHistoryButton;
 class QLabel;
 class QMainWindow;
 class QMenu;
@@ -86,6 +88,7 @@ class LineAnnotationController;
 class FiberCollectionController;
 class WrapAnnotationWidget;
 class StatusDockPanelHost;
+class SessionRecovery;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
@@ -136,6 +139,11 @@ public:
                            QString* errorMessage = nullptr,
                            const QString& preferredVolumeId = {},
                            VolumeOpenError* openError = nullptr);
+
+    // Keeps a crash recovery copy of the points and the open segment from now
+    // on and, with offerLeftovers, offers what a crashed session left once
+    // the window is up. Does nothing when backup/session_recovery is off.
+    void startSessionRecovery(bool offerLeftovers);
 
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
@@ -284,6 +292,9 @@ private:
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
+    // Owned by the status bar; a QPointer so messages sent after the
+    // destructor detaches the status bar find it gone.
+    QPointer<StatusMessageHistoryButton> _statusHistoryButton;
     // Owned by the status bar, which the destructor detaches (and Qt then
     // deletes) before the volume closes: a QPointer, so the late refreshes
     // that close triggers see it gone.
@@ -298,6 +309,9 @@ private:
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
     QStringList _sharedCacheStatsItems;
+    // When the cache readout last needed its full width (ms since epoch); it
+    // narrows only after a few seconds without needing it.
+    qint64 _sharedCacheStatsWideAtMs{0};
     QString _segmentationGrowthStatusText;
     bool _relayingNativeStatusMessage{false};
 
@@ -309,6 +323,11 @@ private:
     QLabel* _projectNameLabel{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
+    SessionRecovery* _sessionRecovery{nullptr};
+    // While a crash recovery offer is pending, the open-data catalog shown at
+    // startup waits for it (startSessionRecovery).
+    bool _sessionRecoveryOfferPending{false};
+    bool _startupCatalogDeferred{false};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
@@ -348,6 +367,7 @@ private:
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
+    PluginController* _pluginController{nullptr};
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
     bool _debugDownloadQueue{false};

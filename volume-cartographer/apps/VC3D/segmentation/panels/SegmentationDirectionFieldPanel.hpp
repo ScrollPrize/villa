@@ -27,6 +27,9 @@ public:
 
     // Getters
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
+    // Replaces the list, as adding and removing entries in the panel would,
+    // and saves it. Invalid entries (no path) are dropped.
+    void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled);

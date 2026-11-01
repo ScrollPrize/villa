@@ -36,6 +36,11 @@ public:
     [[nodiscard]] int growthScale() const { return _growthScale; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+    // The Z range fields' values, whether or not the range is enabled.
+    [[nodiscard]] std::pair<int, int> correctionsZBounds() const
+    {
+        return {_correctionsZMin, _correctionsZMax};
+    }
 
     // Setters
     void setGrowthMethod(SegmentationGrowthMethod method);
@@ -49,6 +54,16 @@ public:
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
                              const QString& activeId);
     void setActiveVolume(const QString& volumeId);
+
+    // Programmatic counterparts of the panel's controls. Each drives its
+    // control, so the control's own handler validates, persists and notifies
+    // exactly as a click would.
+    void setGrowthScale(int scale);
+    void setCorrectionsZRange(bool enabled, int zMin, int zMax);
+    void setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions);
+    // Selects the growth volume like the Volume combo; false when the id is
+    // not offered.
+    bool selectGrowthVolume(const QString& volumeId);
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool growthInProgress);

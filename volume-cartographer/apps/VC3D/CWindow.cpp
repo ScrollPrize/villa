@@ -3,12 +3,15 @@
 
 #include <QDateTime>
 #include "FiberLengthDisplay.hpp"
+#include "elements/StatusMessageHistory.hpp"
 #include "VolumeDisplayNames.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include "StatusDockPanelHost.hpp"
+#include "SessionRecovery.hpp"
+#include "SessionRecoveryDialog.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
@@ -148,6 +151,7 @@
 #include "elements/DropdownChecklistButton.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
+#include "plugins/PluginController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -1131,6 +1135,8 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _statusMessageLabel->setMinimumWidth(160);
     _statusMessageLabel->setWordWrap(false);
     statusBar()->addWidget(_statusMessageLabel, 1);
+    _statusHistoryButton = new StatusMessageHistoryButton(this);
+    statusBar()->addWidget(_statusHistoryButton);
 
     _statusMessageTimer = new QTimer(this);
     _statusMessageTimer->setSingleShot(true);
@@ -1155,6 +1161,18 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
+    // Plugins menu: external tools declared by JSON manifests (docs/plugins.md).
+    _pluginController = new PluginController(
+        PluginController::Host{
+            this,
+            _state,
+            _inkDetectionOverlay.get(),
+            [this]() -> CommandLineToolRunner* {
+                return initializeCommandLineRunner() ? _cmdRunner : nullptr;
+            },
+            [this](const QString& text, int timeout) { showStatusBarMessage(text, timeout); }},
+        this);
+    _pluginController->installMenu(menuBar());
     // Wire the Actions -> Merge Surfaces... menu entry to the handler.
     // Has to happen here (not inside CreateWidgets) because
     // _menuController is created after CreateWidgets() returns.
@@ -1174,6 +1192,12 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             this, [this](bool) {
                 updateVolumePackageEmptyState();
             });
+    connect(_menuController.get(), &MenuActionController::undoRequested,
+            _segmentationModule.get(), &SegmentationModule::undo);
+    connect(_menuController.get(), &MenuActionController::redoRequested,
+            _segmentationModule.get(), &SegmentationModule::redo);
+    connect(_segmentationModule.get(), &SegmentationModule::undoAvailabilityChanged,
+            _menuController.get(), &MenuActionController::setUndoRedoAvailable);
 
     // The Project tab drives the File menu's project actions.
     _state->prepareStoreSwitch = [this]() {
@@ -1466,6 +1490,11 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
                        vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool()) {
         QTimer::singleShot(0, this, [this]() {
+            // A crash recovery offer goes first; the catalog follows it.
+            if (_sessionRecoveryOfferPending) {
+                _startupCatalogDeferred = true;
+                return;
+            }
             if (_menuController && !_state->hasVpkg()) {
                 _menuController->showOpenDataCatalog();
                 updateVolumePackageEmptyState();
@@ -1651,6 +1680,60 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     fRepeatLasagnaActionShortcut->setContext(Qt::ApplicationShortcut);
     connect(fRepeatLasagnaActionShortcut, &QShortcut::activated,
             this, &CWindow::repeatLastLasagnaAction);
+}
+
+void CWindow::startSessionRecovery(bool offerLeftovers)
+{
+    if (_sessionRecovery || !SessionRecovery::enabledInSettings()) {
+        return;
+    }
+    const auto projectPath = [this] {
+        return _state->vpkg() ? vc3d::pathToQString(_state->vpkg()->path()) : QString();
+    };
+    _sessionRecovery = new SessionRecovery(SessionRecovery::defaultDirectory(), this);
+    connect(_sessionRecovery, &SessionRecovery::writeFailed, this, [this](const QString& text) {
+        showStatusBarMessage(text, 15000);
+    });
+    _sessionRecovery->begin(_state->pointCollection());
+    _sessionRecovery->setProject(projectPath());
+    _sessionRecovery->setSegment(QString::fromStdString(_state->activeSurfaceId()));
+    connect(_state, &CState::vpkgChanged, _sessionRecovery, [this](std::shared_ptr<VolumePkg> vpkg) {
+        _sessionRecovery->setProject(vpkg ? vc3d::pathToQString(vpkg->path()) : QString());
+    });
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
+            _sessionRecovery, &SessionRecovery::setSegment);
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
+            _sessionRecovery, &SessionRecovery::setSegment);
+    if (!offerLeftovers || _sessionRecovery->leftoverSessions().empty()) {
+        return;
+    }
+    // The open-data catalog shown at startup would sit under the modal offer
+    // and stay over the project Recover opens, so it waits for the offer and
+    // shows only if no project is open by then.
+    _sessionRecoveryOfferPending = true;
+    QTimer::singleShot(0, this, [this, projectPath]() {
+        auto* dialog = SessionRecoveryDialog::offer(this, *_sessionRecovery, _state->pointCollection(), {
+            projectPath,
+            [this](const QString& path, QString* error) { return openVolumePackage(path, false, error); },
+            [this](const QString& id, QString* error) {
+                return _surfacePanel->activateSurfaceById(id.toStdString(), error);
+            },
+            [this](const QString& text) { showStatusBarMessage(text, 15000); }});
+        const auto offerDone = [this]() {
+            const bool showCatalog = _startupCatalogDeferred;
+            _sessionRecoveryOfferPending = false;
+            _startupCatalogDeferred = false;
+            if (showCatalog && !_destroyingWindow && _menuController && !_state->hasVpkg()) {
+                _menuController->showOpenDataCatalog();
+                updateVolumePackageEmptyState();
+            }
+        };
+        if (dialog) {
+            connect(dialog, &QDialog::finished, this, offerDone);
+        } else {
+            offerDone();
+        }
+    });
 }
 
 // Destructor
@@ -4065,6 +4148,9 @@ void CWindow::onShowStatusMessage(QString text, int timeout)
 
 void CWindow::showStatusBarMessage(const QString& text, int timeout)
 {
+    if (_statusHistoryButton) {
+        _statusHistoryButton->record(text);
+    }
     if (!_statusMessageLabel) {
         if (statusBar()) {
             statusBar()->showMessage(text, timeout);
@@ -4201,7 +4287,21 @@ void CWindow::updateSharedStatusLabel()
         items << tr("Z sens: %1")
             .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
     }
-    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
+    const QString text = items.join(QStringLiteral("  "));
+    _sharedCacheStatsLabel->setText(text);
+    // Grow at once, but narrow only once the text has fit in less for a few
+    // seconds, so the widgets beside it stop shifting whenever a number gets
+    // shorter, and one long reading does not keep it wide.
+    constexpr qint64 kNarrowAfterMs = 5000;
+    const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
+    const int needed = _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
+                       margins.left() + margins.right();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (needed >= _sharedCacheStatsLabel->minimumWidth() ||
+        now - _sharedCacheStatsWideAtMs > kNarrowAfterMs) {
+        _sharedCacheStatsLabel->setMinimumWidth(needed);
+        _sharedCacheStatsWideAtMs = now;
+    }
 }
 
 // Open volume package

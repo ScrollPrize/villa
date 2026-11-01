@@ -327,6 +327,7 @@ ManualAddTool::InterpolationMode SegmentationWidget::setManualAddInterpolationMo
 }
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
+std::pair<int, int> SegmentationWidget::correctionsZBounds() const { return _growthPanel->correctionsZBounds(); }
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
 {
@@ -342,6 +343,11 @@ void SegmentationWidget::setManualAddActive(bool active)
     syncUiState();
 }
 void SegmentationWidget::setGrowthSteps(int steps, bool persist) { _growthPanel->setGrowthSteps(steps, persist); }
+void SegmentationWidget::setGrowthScale(int scale) { _growthPanel->setGrowthScale(scale); }
+void SegmentationWidget::setCorrectionsZRange(bool enabled, int zMin, int zMax) { _growthPanel->setCorrectionsZRange(enabled, zMin, zMax); }
+void SegmentationWidget::setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions) { _growthPanel->setAllowedGrowthDirections(directions); }
+bool SegmentationWidget::selectGrowthVolume(const QString& volumeId) { return _growthPanel->selectGrowthVolume(volumeId); }
+void SegmentationWidget::setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs) { _directionFieldPanel->setDirectionFieldConfigs(configs); }
 void SegmentationWidget::setGrowthInProgress(bool running)
 {
     if (_growthInProgress == running) {

@@ -366,6 +366,17 @@ namespace tools {
 }
 
 // -----------------------------------------------------------------------------
+// Backup Settings
+// -----------------------------------------------------------------------------
+namespace backup {
+    // Keep a crash recovery copy of the points and the open project and
+    // segment under <settings dir>/recovery, and offer it on the next start
+    // after a crash. Settings dialog: "Keep a crash recovery copy of points".
+    constexpr auto SESSION_RECOVERY = "backup/session_recovery";
+    constexpr bool SESSION_RECOVERY_DEFAULT = true;
+}
+
+// -----------------------------------------------------------------------------
 // Segmentation Tool Settings
 // -----------------------------------------------------------------------------
 namespace segmentation {

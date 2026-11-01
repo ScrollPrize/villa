@@ -67,6 +67,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "ToolDialogs.hpp"
+#include "MergeTifxyzInputs.hpp"
 #include "ToolExecutable.hpp"
 #include "ToolProcess.hpp"
 #include "VolumeCommandPath.hpp"
@@ -1459,16 +1460,106 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         return;
     }
 
-    QString selectedVolumePath = dlg.selectedVolumePath();
-    if (selectedVolumePath.isEmpty()) {
+    if (dlg.selectedVolumePath().isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No target volume selected."));
         return;
     }
 
-    const QString outputTag = dlg.outputTag();
+    NeighborCopyParams params;
+    params.volumeId = dlg.selectedVolumeId();
+    params.outputTag = dlg.outputTag();
+    params.neighborMaxDistance = dlg.neighborMaxDistance();
+    params.neighborMinClearance = dlg.neighborMinClearance();
+    params.neighborFill = dlg.neighborFill();
+    params.neighborInterpWindow = dlg.neighborInterpWindow();
+    params.generations = dlg.generations();
+    params.neighborSpikeWindow = dlg.neighborSpikeWindow();
+    params.resumeLocalOptStep = dlg.resumeLocalOptStep();
+    params.resumeLocalOptRadius = dlg.resumeLocalOptRadius();
+    params.resumeLocalMaxIters = dlg.resumeLocalMaxIters();
+    params.resumeLocalDenseQr = dlg.resumeLocalDenseQr();
+    params.refineOmpThreads = dlg.pass2OmpThreads();
+    {
+        QString refineError;
+        auto extraParams = dlg.pass2TracerParamsJson(&refineError);
+        if (!refineError.isEmpty()) {
+            QMessageBox::warning(_parentWidget, tr("Error"), refineError);
+            return;
+        }
+        if (extraParams) {
+            params.refineParamOverrides = *extraParams;
+        }
+    }
+
+    CommandLaunchError error;
+    if (!startNeighborCopyImpl(segmentId, copyOut, params, /*interactive=*/true, &error) &&
+        !error.message.isEmpty()) {
+        QMessageBox::warning(_parentWidget,
+                             error.kind == CommandLaunchError::Busy ? tr("Warning") : tr("Error"),
+                             error.message);
+    }
+}
+
+bool SegmentationCommandHandler::startNeighborCopy(const QString& segmentId,
+                                                   bool copyOut,
+                                                   const NeighborCopyParams& params,
+                                                   CommandLaunchError* error)
+{
+    return startNeighborCopyImpl(segmentId, copyOut, params, /*interactive=*/false, error);
+}
+
+bool SegmentationCommandHandler::startNeighborCopyImpl(const QString& segmentId,
+                                                       bool copyOut,
+                                                       const NeighborCopyParams& params,
+                                                       bool interactive,
+                                                       CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("No volume package loaded."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    if (_neighborCopyJob) {
+        setErr(tr("Another neighbor copy request is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const auto stored = storedSurface(segmentId.toStdString(), error, true);
+    if (!stored) return false;
+
+    // Resolve the target volume as the dialog does: the current volume unless
+    // one is named.
+    QString defaultVolumeId;
+    const auto volOpts = buildVolumeOptionList(&defaultVolumeId);
+    if (volOpts.isEmpty()) {
+        setErr(tr("No volumes available in the volume package."), CommandLaunchError::VolumeNotFound);
+        return false;
+    }
+    const QString volumeId = params.volumeId.isEmpty() ? defaultVolumeId : params.volumeId;
+    QString selectedVolumePath;
+    for (const auto& opt : volOpts) {
+        if (opt.id == volumeId) {
+            selectedVolumePath = opt.path;
+            break;
+        }
+    }
+    if (selectedVolumePath.isEmpty()) {
+        setErr(tr("Unknown volume id: %1").arg(volumeId), CommandLaunchError::VolumeNotFound);
+        return false;
+    }
+
+    const QString outputTag = params.outputTag.trimmed();
     if (outputTag.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Output tag cannot be empty."));
-        return;
+        setErr(tr("Output tag cannot be empty."));
+        return false;
     }
 
     // The normal grids paired with the open volume (CWindow's catalog-aware lookup).
@@ -1478,61 +1569,57 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     refine["normal_grid_path"] = normalGridPath;
     refine["max_gen"] = 1;
     refine["generations"] = 1;
-    refine["resume_local_opt_step"] = dlg.resumeLocalOptStep();
-    refine["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
-    refine["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
-    refine["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
-    refine["thread_limit"] = std::max(1, dlg.pass2OmpThreads());
-    {
-        QString refineError;
-        auto extraParams = dlg.pass2TracerParamsJson(&refineError);
-        if (!refineError.isEmpty()) {
-            QMessageBox::warning(_parentWidget, tr("Error"), refineError);
-            return;
-        }
-        if (extraParams) {
-            for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
-                refine.insert(it.key(), it.value());
-            }
-        }
+    refine["resume_local_opt_step"] = params.resumeLocalOptStep;
+    refine["resume_local_opt_radius"] = params.resumeLocalOptRadius;
+    refine["resume_local_max_iters"] = params.resumeLocalMaxIters;
+    refine["resume_local_dense_qr"] = params.resumeLocalDenseQr;
+    refine["thread_limit"] = std::max(1, params.refineOmpThreads);
+    for (auto it = params.refineParamOverrides.begin(); it != params.refineParamOverrides.end(); ++it) {
+        refine.insert(it.key(), it.value());
     }
 
-    QJsonObject params;
-    params["normal_grid_path"] = normalGridPath;
-    params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
-    params["neighbor_max_distance"] = dlg.neighborMaxDistance();
-    params["mode"] = QStringLiteral("gen_neighbor");
-    params["neighbor_min_clearance"] = dlg.neighborMinClearance();
-    params["neighbor_fill"] = dlg.neighborFill();
-    params["neighbor_interp_window"] = dlg.neighborInterpWindow();
-    params["generations"] = dlg.generations();
-    params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
-    params["refine"] = refine;
+    QJsonObject toolParams;
+    toolParams["normal_grid_path"] = normalGridPath;
+    toolParams["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
+    toolParams["neighbor_max_distance"] = params.neighborMaxDistance;
+    toolParams["mode"] = QStringLiteral("gen_neighbor");
+    toolParams["neighbor_min_clearance"] = params.neighborMinClearance;
+    toolParams["neighbor_fill"] = params.neighborFill;
+    toolParams["neighbor_interp_window"] = params.neighborInterpWindow;
+    toolParams["generations"] = params.generations;
+    toolParams["neighbor_spike_window"] = params.neighborSpikeWindow;
+    toolParams["refine"] = refine;
 
     auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_XXXXXX.json"));
     if (!paramsFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
-        return;
+        setErr(tr("Failed to create temporary params file."));
+        return false;
     }
-    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->write(QJsonDocument(toolParams).toJson(QJsonDocument::Indented));
     paramsFile->flush();
 
-    configureCommandRunnerForVolume(dlg.selectedVolumeId().toStdString());
+    configureCommandRunnerForVolume(volumeId.toStdString());
     _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
-                                      dlg.selectedVolumeId(), outputTag, QString());
-    _cmdRunner->showConsoleOutput();
+                                      volumeId, outputTag, QString());
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
     _neighborCopyJob = NeighborCopyJob{copyOut, std::move(paramsFile)};
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch neighbor copy."));
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy, options)) {
         _neighborCopyJob.reset();
-        return;
+        setErr(tr("Failed to launch neighbor copy."));
+        return false;
     }
 
     emit statusMessage(tr("Copy %1 started for %2")
                                  .arg(copyOut ? tr("out") : tr("in"))
                                  .arg(stored->name),
                              5000);
+    return true;
 }
 
 QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
@@ -2025,19 +2112,66 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
         emit statusMessage(tr("Convert to OBJ cancelled"), 3000);
         return;
     }
-    const QString objName = dlg.objName();
-    if (objName.isEmpty() || objName.contains('/') || objName.contains('\\')) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("The OBJ name is a file name, without directories."));
-        return;
+
+    ConvertToObjParams params;
+    params.objName = dlg.objName();
+    params.normalizeUV = dlg.normalizeUV();
+    params.alignGrid = dlg.alignGrid();
+    params.ompThreads = dlg.ompThreads();
+    CommandLaunchError error;
+    if (!startConvertToObjImpl(segmentId, params, /*interactive=*/true, &error) &&
+        !error.message.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
+    }
+}
+
+bool SegmentationCommandHandler::startConvertToObj(const std::string& segmentId,
+                                                   const ConvertToObjParams& params,
+                                                   CommandLaunchError* error)
+{
+    return startConvertToObjImpl(segmentId, params, /*interactive=*/false, error);
+}
+
+bool SegmentationCommandHandler::startConvertToObjImpl(const std::string& segmentId,
+                                                       const ConvertToObjParams& params,
+                                                       bool interactive,
+                                                       CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const auto stored = storedSurface(segmentId, error, true);
+    if (!stored) return false;
+
+    const QString objName = params.objName.trimmed().isEmpty()
+        ? stored->name + QStringLiteral(".obj")
+        : params.objName.trimmed();
+    if (objName.contains('/') || objName.contains('\\')) {
+        setErr(tr("The OBJ name is a file name, without directories."), CommandLaunchError::Other);
+        return false;
     }
 
     // The tool writes into the surface's artifact directory and reports the path.
     _cmdRunner->setStore(stored->store, stored->voxelScale);
     _cmdRunner->setToObjParams(QString::fromStdString(stored->uuid), objName, stored->volumeUuid);
-    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
-    _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
+    _cmdRunner->setToObjOptions(params.normalizeUV, params.alignGrid);
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj, options)) {
+        // An interactive launch has already said why.
+        if (!interactive) setErr(tr("Failed to start vc_tifxyz2obj."));
+        return false;
+    }
     emit statusMessage(tr("Converting surface to OBJ: %1").arg(stored->name), 5000);
+    return true;
 }
 
 void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& segmentId)
@@ -2175,55 +2309,99 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
 void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, bool flipU)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
-
-    auto surf = activeSurface(segmentId);
-    loadAllChannels(*surface);
-
-    if (flipU) {
-        surface->flipU();
-    } else {
-        surface->flipV();
-    }
-
-    if (!publishSurface(surface, tr("Flip"))) {
-        return;
-    }
-
-    if (_state) {
-        _state->setSurface("segmentation", surf, false, false);
-    }
-
-    const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
-    emit statusMessage(
-        tr("Flipped %1 %2")
-            .arg(QString::fromStdString(segmentId))
-            .arg(directionLabel),
-        5000);
+    transformSurfaceImpl(segmentId,
+                         flipU ? SurfaceTransform::FlipU : SurfaceTransform::FlipV,
+                         /*interactive=*/true, nullptr);
 }
 
 void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
+    transformSurfaceImpl(segmentId, SurfaceTransform::Rotate90, /*interactive=*/true, nullptr);
+}
+
+bool SegmentationCommandHandler::transformSurface(const std::string& segmentId,
+                                                  SurfaceTransform transform,
+                                                  QString* errorMessage)
+{
+    return transformSurfaceImpl(segmentId, transform, /*interactive=*/false, errorMessage);
+}
+
+bool SegmentationCommandHandler::transformSurfaceImpl(const std::string& segmentId,
+                                                      SurfaceTransform transform,
+                                                      bool interactive,
+                                                      QString* errorMessage)
+{
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    QuadSurface* surface = nullptr;
+    if (interactive) {
+        // Presents its refusals in dialogs.
+        surface = requireSurfaceAndRunner(segmentId, false);
+        if (!surface) return false;
+    } else {
+        // The checks of requireSurfaceAndRunner without dialogs; the runner is
+        // irrelevant to a synchronous transform.
+        if (!_state || _state->currentVolume() == nullptr) {
+            return fail(tr("No volume loaded."));
+        }
+        auto active = activeSurface(segmentId);
+        if (!active) {
+            return fail(tr("Select surface %1 first.").arg(QString::fromStdString(segmentId)));
+        }
+        // The resolver reports its own failure on the status bar.
+        if (_editingDestinationResolver && !_editingDestinationResolver(active)) {
+            return fail(tr("Surface %1 cannot be edited.").arg(QString::fromStdString(segmentId)));
+        }
+        surface = active.get();
+    }
 
     auto surf = activeSurface(segmentId);
     loadAllChannels(*surface);
-    surface->rotate(90.0f);
 
-    if (!publishSurface(surface, tr("Rotate"))) {
-        return;
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        surface->flipU();
+        break;
+    case SurfaceTransform::FlipV:
+        surface->flipV();
+        break;
+    case SurfaceTransform::Rotate90:
+        surface->rotate(90.0f);
+        break;
+    }
+
+    const bool rotate = transform == SurfaceTransform::Rotate90;
+    if (interactive) {
+        if (!publishSurface(surface, rotate ? tr("Rotate") : tr("Flip"))) {
+            return false;
+        }
+    } else if (!_surfaceSaver || !_surfaceSaver(surface)) {
+        return fail(tr("Could not save surface %1 to the object store.")
+                        .arg(QString::fromStdString(surface->id)));
     }
 
     if (_state) {
         _state->setSurface("segmentation", surf, false, false);
     }
 
-    emit statusMessage(
-        tr("Rotated %1 by 90 degrees clockwise")
-            .arg(QString::fromStdString(segmentId)),
-        5000);
+    const QString segLabel = QString::fromStdString(segmentId);
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("vertically")), 5000);
+        break;
+    case SurfaceTransform::FlipV:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("horizontally")), 5000);
+        break;
+    case SurfaceTransform::Rotate90:
+        emit statusMessage(tr("Rotated %1 by 90 degrees clockwise").arg(segLabel), 5000);
+        break;
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
@@ -2379,22 +2557,64 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
 
 void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)
 {
+    startRasterizeSegmentsImpl(segmentIds, std::nullopt, /*interactive=*/true,
+                               nullptr, nullptr);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegments(const QStringList& segmentIds,
+                                                        const RasterizeParams& params,
+                                                        CommandLaunchError* error,
+                                                        RasterizeLaunch* launch)
+{
+    return startRasterizeSegmentsImpl(segmentIds, params, /*interactive=*/false,
+                                      error, launch);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegmentsImpl(
+    const QStringList& segmentIds,
+    const std::optional<RasterizeParams>& requestedParams,
+    bool interactive,
+    CommandLaunchError* error,
+    RasterizeLaunch* launch)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    // Interactive launches present each refusal as the menu always has: a
+    // status-bar note, a warning or a critical message box.
+    enum class Presentation { StatusNote, Warning, Critical };
+    auto refuse = [&](const QString& message, CommandLaunchError::Kind kind,
+                      Presentation presentation, const QString& title = {}) {
+        if (interactive) {
+            switch (presentation) {
+            case Presentation::StatusNote:
+                emit statusMessage(message, 3000);
+                break;
+            case Presentation::Warning:
+                QMessageBox::warning(_parentWidget, title, message);
+                break;
+            case Presentation::Critical:
+                QMessageBox::critical(_parentWidget, title, message);
+                break;
+            }
+        }
+        setErr(message, kind);
+        return false;
+    };
+
     if (!_state || !_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
+        return refuse(tr("No volume package loaded"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-                             tr("A command line tool is already running."));
-        return;
+        return refuse(tr("A command line tool is already running."),
+                      CommandLaunchError::Busy, Presentation::Warning, tr("Warning"));
     }
 
     QStringList requestedIds = segmentIds;
     requestedIds.removeAll(QString());
     if (requestedIds.isEmpty()) {
-        emit statusMessage(tr("No segments selected"), 3000);
-        return;
+        return refuse(tr("No segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     QStringList rasterIds;
@@ -2413,27 +2633,28 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     if (rasterIds.isEmpty()) {
-        emit statusMessage(tr("No valid segments selected"), 3000);
-        return;
+        return refuse(tr("No valid segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     std::optional<StoredSurface> store;
     QStringList missingIds;
+    QStringList skippedIds;
     for (const QString& segmentId : rasterIds) {
-        CommandLaunchError error;
-        if (auto stored = storedSurface(segmentId.toStdString(), &error, true)) {
+        CommandLaunchError surfaceError;
+        if (auto stored = storedSurface(segmentId.toStdString(), &surfaceError, true)) {
             store = stored;
             validIds << segmentId;
         } else {
-            missingIds << QStringLiteral("%1 (%2)").arg(segmentId, error.message);
+            missingIds << QStringLiteral("%1 (%2)").arg(segmentId, surfaceError.message);
+            skippedIds << segmentId;
         }
     }
 
     if (validIds.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("None of the selected surfaces can be rasterized: %1")
-                                 .arg(missingIds.join(QStringLiteral(", "))));
-        return;
+        return refuse(tr("None of the selected surfaces can be rasterized: %1")
+                          .arg(missingIds.join(QStringLiteral(", "))),
+                      CommandLaunchError::InputNotFound, Presentation::Warning, tr("Error"));
     }
     if (!missingIds.isEmpty()) {
         emit statusMessage(
@@ -2444,20 +2665,34 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     const QString referenceZarr = getCurrentVolumePath();
     if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Load a volume first."));
-        return;
+        return refuse(tr("Load a volume first."), CommandLaunchError::InvalidState,
+                      Presentation::Warning, tr("Error"));
     }
 
     const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_tifxyz2zarr_sparse"));
     if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
-        return;
+        return refuse(tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Warning, tr("Error"));
     }
 
-    RasterizeDialogResult rasterizeParams;
-    if (!selectRasterizeParams(_parentWidget, &rasterizeParams)) {
-        return;
+    RasterizeParams rasterizeParams;
+    if (requestedParams) {
+        rasterizeParams = *requestedParams;
+        if (rasterizeParams.chunkSize < 1 || rasterizeParams.chunkSize > 4096 ||
+            rasterizeParams.zMin < 0 ||
+            (rasterizeParams.zMax >= 0 && rasterizeParams.zMax <= rasterizeParams.zMin)) {
+            return refuse(tr("Invalid rasterize parameters: chunkSize must be 1..4096, zMin >= 0, "
+                             "and zMax greater than zMin unless it is -1."),
+                          CommandLaunchError::Other, Presentation::Warning, tr("Error"));
+        }
+    } else {
+        RasterizeDialogResult dialogParams;
+        if (!selectRasterizeParams(_parentWidget, &dialogParams)) {
+            return false;
+        }
+        rasterizeParams.chunkSize = dialogParams.chunkSize;
+        rasterizeParams.zMin = dialogParams.zMin;
+        rasterizeParams.zMax = dialogParams.zMax;
     }
 
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
@@ -2468,9 +2703,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const std::filesystem::path volumesDir = volpkgDir / "volumes";
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())));
-        return;
+        return refuse(tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     std::filesystem::path finalOutputRoot = volumesDir / baseOutputName.toStdString();
@@ -2479,10 +2713,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
     }
     if (std::filesystem::exists(finalOutputRoot)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve output directory after retries: %1")
-                                  .arg(QString::fromStdString(finalOutputRoot.string())));
-        return;
+        return refuse(tr("Unable to reserve output directory after retries: %1")
+                          .arg(QString::fromStdString(finalOutputRoot.string())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     // The tool publishes the volume (staged, then renamed) with its meta.json.
@@ -2507,16 +2740,15 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     auto runner = _cmdRunner;
     if (!runner) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Command runner is not available."));
-        return;
+        return refuse(tr("Command runner is not available."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Critical, tr("Error"));
     }
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(runner, &CommandLineToolRunner::toolFinished,
                          this,
-                         [this, guard, connection, runner, finalOutputRootStr,
+                         [this, guard, connection, finalOutputRootStr,
                           validIds](CommandLineToolRunner::Tool tool,
                                                   bool success,
                                                   const QString& message,
@@ -2537,21 +2769,35 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                                    .arg(validIds.size())
                                    .arg(QDir::toNativeSeparators(finalOutputRootStr)),
                                5000);
+            emit segmentOperationFinished(QStringLiteral("rasterize"), true,
+                                          tr("Rasterized %1 segment(s)").arg(validIds.size()),
+                                          finalOutputRootStr);
         } else {
             emit statusMessage(tr("Rasterize failed"), 3000);
+            emit segmentOperationFinished(QStringLiteral("rasterize"), false,
+                                          message.isEmpty() ? tr("Rasterize failed") : message,
+                                          QString());
         }
     });
 
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"), {}, store->store,
-                                      store->volumeUuid, store->voxelScale)) {
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"), options,
+                                      store->store, store->volumeUuid, store->voxelScale)) {
         QObject::disconnect(*connection);
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Failed to start vc_tifxyz2zarr_sparse."));
-        return;
+        return refuse(tr("Failed to start vc_tifxyz2zarr_sparse."),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
+    if (launch) {
+        launch->outputPath = finalOutputRootStr;
+        launch->segmentIds = validIds;
+        launch->skippedIds = skippedIds;
+    }
     emit statusMessage(
         tr("Rasterization started for %1 surface(s)...").arg(validIds.size()), 0);
+    return true;
 }
 
 std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces(bool throughView) const
@@ -2601,40 +2847,101 @@ void SegmentationCommandHandler::onMergeSurfaces(const QStringList& segmentIds)
         return;
     }
 
+    MergeTifxyzParams params;
+    params.refSurface = dlg.refSurface();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.stripCols = dlg.stripCols();
+    params.ompThreads = dlg.ompThreads();
+    if (!launchMergeTifxyz(dlg.mergeJsonText(), *store, params, /*interactive=*/true, &error) &&
+        !error.message.isEmpty()) {
+        QMessageBox::critical(_parentWidget, tr("Merge TIFXYZ"), error.message);
+    }
+}
+
+bool SegmentationCommandHandler::startMergeTifxyz(const MergeTifxyzParams& params,
+                                                  CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const auto store = storeForTools(error);
+    if (!store) return false;
+
+    // The dialog's rules, over the surfaces it would offer.
+    QStringList available;
+    for (const auto* row : toolSurfaces(true)) {
+        available << QString::fromStdString(row->record.uuid);
+    }
+    const QString invalid = vc3d::merge_tifxyz::validate(
+        params.grid, available, params.refSurface, params.ransacMinThresh, params.ransacMaxThresh);
+    if (!invalid.isEmpty()) {
+        setErr(invalid, CommandLaunchError::InputNotFound);
+        return false;
+    }
+    return launchMergeTifxyz(vc3d::merge_tifxyz::gridJsonText(params.grid), *store, params,
+                             /*interactive=*/false, error);
+}
+
+bool SegmentationCommandHandler::launchMergeTifxyz(const QString& mergeJsonText,
+                                                   const StoredSurface& store,
+                                                   const MergeTifxyzParams& params,
+                                                   bool interactive,
+                                                   CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
     auto mergeJson = std::make_shared<QTemporaryFile>(QDir::temp().filePath(QStringLiteral("vc3d_XXXXXX.merge.json")));
     if (!mergeJson->open()) {
-        QMessageBox::critical(_parentWidget, tr("Merge TIFXYZ"), tr("Failed to write merge.json."));
-        return;
+        setErr(tr("Failed to write merge.json."));
+        return false;
     }
-    mergeJson->write(dlg.mergeJsonText().toUtf8());
+    mergeJson->write(mergeJsonText.toUtf8());
     mergeJson->flush();
 
     // The merge is a new surface bound to the current volume.
-    _cmdRunner->setStore(store->store, store->voxelScale);
+    _cmdRunner->setStore(store.store, store.voxelScale);
     _cmdRunner->setMergeParams(mergeJson->fileName(),
-                               store->volumeUuid,
-                               QStringLiteral("paths"),
-                               dlg.refSurface(),
-                               dlg.ransacIters(),
-                               dlg.ransacMinThresh(),
-                               dlg.ransacMaxThresh(),
-                               dlg.ransacMadK(),
-                               dlg.ransacSeed(),
-                               dlg.anchorCap(),
-                               dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+                               store.volumeUuid,
+                               params.outputTag,
+                               params.refSurface,
+                               params.ransacIters,
+                               params.ransacMinThresh,
+                               params.ransacMaxThresh,
+                               params.ransacMadK,
+                               params.ransacSeed,
+                               params.anchorCap,
+                               params.stripCols);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
     // The merge.json lives until the tool finishes.
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished, this,
                           [connection, mergeJson](CommandLineToolRunner::Tool tool, bool, const QString&, const QString&, bool) {
                               if (tool == CommandLineToolRunner::Tool::MergeTifxyz) disconnect(*connection);
                           });
-    _cmdRunner->showConsoleOutput();
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz, options)) {
         disconnect(*connection);
-        return;
+        // An interactive launch has already said why.
+        if (!interactive) setErr(tr("Failed to start vc_merge_tifxyz."));
+        return false;
     }
     emit statusMessage(tr("Merging surfaces..."), 0);
+    return true;
 }
 
 void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
@@ -2677,20 +2984,75 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setStore(store->store, store->voxelScale);
-    _cmdRunner->setMergePatchParams(dlg.parentSurface(),
-                                    dlg.childSurface(),
-                                    dlg.explicitRoles(),
-                                    dlg.borderCells(),
-                                    dlg.blendCells(),
-                                    dlg.idwK(),
-                                    dlg.ransacIters(),
-                                    dlg.ransacMinThresh(),
-                                    dlg.ransacMaxThresh(),
-                                    dlg.ransacMadK(),
-                                    dlg.ransacSeed(),
-                                    dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+    MergePatchParams params;
+    params.parentId = dlg.parentSurface();
+    params.childId = dlg.childSurface();
+    params.explicitRoles = dlg.explicitRoles();
+    params.borderCells = dlg.borderCells();
+    params.blendCells = dlg.blendCells();
+    params.idwK = dlg.idwK();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.ompThreads = dlg.ompThreads();
+    launchMergePatch(*store, params, /*interactive=*/true, nullptr);
+}
+
+bool SegmentationCommandHandler::startMergePatch(const MergePatchParams& params,
+                                                 CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    if (params.parentId.isEmpty() || params.childId.isEmpty() || params.parentId == params.childId) {
+        setErr(tr("Patch needs two different surfaces."));
+        return false;
+    }
+    if (params.ransacMinThresh >= params.ransacMaxThresh) {
+        setErr(tr("RANSAC min threshold must be strictly less than max."));
+        return false;
+    }
+    // Patch edits the parent in place, so both inputs must be stored in the
+    // current volume's voxels, as the dialog offers them.
+    for (const QString& id : {params.parentId, params.childId}) {
+        if (!storedSurface(id.toStdString(), error, /*throughView=*/false)) {
+            return false;
+        }
+    }
+    const auto store = storeForTools(error);
+    if (!store) return false;
+    return launchMergePatch(*store, params, /*interactive=*/false, error);
+}
+
+bool SegmentationCommandHandler::launchMergePatch(const StoredSurface& store,
+                                                  const MergePatchParams& params,
+                                                  bool interactive,
+                                                  CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    _cmdRunner->setStore(store.store, store.voxelScale);
+    _cmdRunner->setMergePatchParams(params.parentId,
+                                    params.childId,
+                                    params.explicitRoles,
+                                    params.borderCells,
+                                    params.blendCells,
+                                    params.idwK,
+                                    params.ransacIters,
+                                    params.ransacMinThresh,
+                                    params.ransacMaxThresh,
+                                    params.ransacMadK,
+                                    params.ransacSeed,
+                                    params.anchorCap);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
 
     // The parent's new revision reaches the panel and an opened copy through
     // the store's commit events.
@@ -2698,7 +3060,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
                           this,
-                          [this, guard, connection]
+                          [this, guard, connection, interactive]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -2715,24 +3077,33 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         if (success) {
             emit statusMessage(tr("Patch applied to %1").arg(outputPath), 5000);
         } else {
-            QMessageBox::critical(_parentWidget, tr("Patch Surface"),
-                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            if (interactive) {
+                QMessageBox::critical(_parentWidget, tr("Patch Surface"),
+                                      tr("vc_merge_patch failed.\n%1").arg(message));
+            }
             emit statusMessage(tr("Patch failed"), 5000);
         }
     });
 
-    _cmdRunner->showConsoleOutput();
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
     // If execute() rejects the launch (preflight failure, missing binary),
     // it never emits toolFinished -- so the one-shot lambda above would
     // stay attached and fire on the NEXT tool's toolFinished. Disconnect
     // immediately on launch failure to keep the runner's signal table
     // clean across subsequent runs.
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch, options)) {
         QObject::disconnect(*connection);
         emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
-        return;
+        setErr(tr("Failed to start vc_merge_patch."));
+        return false;
     }
     emit statusMessage(tr("Patching surface..."), 0);
+    return true;
 }
 
 void SegmentationCommandHandler::onGrowTrackPatches()
