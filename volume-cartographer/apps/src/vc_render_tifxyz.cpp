@@ -40,6 +40,14 @@
 #include <omp.h>
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 namespace po = boost::program_options;
@@ -2082,5 +2090,13 @@ int main(int argc, char *argv[])
         remoteCache->stats().persistentCacheEnabled)
         remoteCache->waitForPendingChunks();
 
+#if defined(_WIN32)
+    // On Windows the process can hang after a successful render, during
+    // process teardown (worker-thread/DLL shutdown), so callers that wait for
+    // it never return. All output is written and the caches are drained at
+    // this point: flush C stdio and end the process directly.
+    std::fflush(nullptr);
+    TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
+#endif
     return EXIT_SUCCESS;
 }
