@@ -280,11 +280,8 @@ void ViewerCompositePanel::setupControls()
     if (_uiRefs.compositeMode) {
         connect(_uiRefs.compositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
             const std::string method = compositeMethodForModeIndex(index);
-            applyToAllViewers([&method](VolumeViewerBase* viewer) {
-                auto s = viewer->compositeRenderSettings();
-                s.params.method = method;
-                viewer->setCompositeRenderSettings(s);
-            });
+            for (auto* manager : _viewerManagers)
+                manager->setCompositeMethod(method);
             updateCompositeParamsVisibility();
         });
     }

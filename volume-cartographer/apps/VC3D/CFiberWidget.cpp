@@ -546,6 +546,10 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onRecalculateHvScoreClicked);
 
     auto* buttonLayout = new QHBoxLayout();
+    auto* generate = new QPushButton(tr("Generate automated fibers…"), mainWidget);
+    generate->setObjectName("fiberCollectionCreate");
+    buttonLayout->addWidget(generate);
+    connect(generate, &QPushButton::clicked, this, &CFiberWidget::generateFibersRequested);
     _importButton = new QPushButton(tr("Import"), mainWidget);
     _importButton->setObjectName(QStringLiteral("fiberImportButton"));
     buttonLayout->addWidget(_importButton);

@@ -1,6 +1,10 @@
 #pragma once
 
 #include "FiberDisplayOptions.hpp"
+#include "FiberCollectionGenerator.hpp"
+#include <QProcess>
+#include <QTemporaryDir>
+#include <tuple>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/FiberView.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -14,6 +18,12 @@
 #include <vector>
 
 class CState;
+class QMainWindow;
+class Volume;
+class QPushButton;
+class QLabel;
+class QProgressBar;
+class QDialog;
 class LineAnnotationController;
 
 // The attached store's fibers: the catalog pages listed by the Fibers panel,
@@ -52,6 +62,7 @@ public:
     [[nodiscard]] const FiberDisplayOptions& options() const { return options_; }
     void setOptions(const FiberDisplayOptions& options);
     void setLineAnnotationActive(bool active);
+    void createCollection();
     void firstPage();
     void nextPage();
     // A listed fiber was clicked: select it, focusing the main views while
@@ -88,6 +99,29 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
+    std::weak_ptr<Volume> generatorVolume_;
+    QMainWindow* window_{};
+    QDialog* generatorDialog_{};
+    QPushButton* generatorCancel_{};
+    QProgressBar* generatorProgress_{};
+    QLabel* generatorStatus_{};
+    QPointer<QProcess> generator_;
+    QString generatorOutput_, generatorError_, generatorSpace_, generatorPython_;
+    QStringList generatorLog_;
+    std::unique_ptr<QTemporaryDir> generatorPreview_;
+    std::optional<vc::objects::AttachmentIdentity> previewAttachment_;
+    std::vector<vc3d::fibergen::Block> generationBlocks_;
+    std::vector<QString> generationStates_;
+    uint64_t generationRevision_{};
+    std::unordered_map<VolumeViewerBase*, std::tuple<uint64_t, QRectF, std::optional<vc::fibers::ViewRegion>>> drawnGeneration_;
+    std::optional<vc::objects::AttachmentIdentity> displayedStore() const;
+    void openPreview(const QString& path);
+    void closePreview();
+    void readGeneratorOutput();
+    void finishGenerator(int exitCode, bool crashed);
+    void showGeneratorStatus(const QString& text);
+    void showGenerationBlocks(std::vector<vc3d::fibergen::Block> blocks);
+    void drawGenerationBlocks(VolumeViewerBase* viewer, OverlayBuilder& builder);
     struct View;
     using Slice = vc::fibers::ViewRegion;
     // The last listed row: its UUID and, when bound, its volume length.

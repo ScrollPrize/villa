@@ -279,6 +279,7 @@ private:
     CFiberWidget* _fiberWidget{nullptr};
     QDockWidget* _fibers3DDock{nullptr};
     vc3d::fibers3d::Fiber3DPanel* _fibers3DPanel{nullptr};
+    QDockWidget* _scene3DDock{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
 

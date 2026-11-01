@@ -1141,6 +1141,15 @@ void ViewerManager::setVolumeWindow(float low, float high)
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
+void ViewerManager::setCompositeMethod(const std::string& method)
+{
+    forEachBaseViewer([&method](VolumeViewerBase* viewer) {
+        auto settings = viewer->compositeRenderSettings();
+        settings.params.method = method;
+        viewer->setCompositeRenderSettings(settings);
+    });
+}
+
 bool ViewerManager::resetDefaultFor(VolumeViewerBase* viewer) const
 {
     auto it = _resetDefaults.find(viewer);

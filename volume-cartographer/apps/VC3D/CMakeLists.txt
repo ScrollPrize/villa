@@ -15,6 +15,8 @@ set(srcs
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
+    FiberCollectionGenerator.cpp
+    FiberCollectionGeneratorDialog.cpp
     FiberCollectionController.cpp
     SurfaceCatalog.cpp
     SurfaceCatalog.hpp
@@ -25,6 +27,12 @@ set(srcs
     fibers3d/Fiber3DData.cpp
     fibers3d/Fiber3DData.hpp
     fibers3d/Fiber3DCanvas.cpp
+    scene3d/Scene3DCanvas.cpp
+    scene3d/Scene3DPanel.cpp
+    scene3d/Scene3DPanel.hpp
+    scene3d/MemoryBudgetInput.hpp
+    scene3d/VolumePreview.cpp
+    scene3d/VolumePreview.hpp
     fibers3d/Fiber3DCanvas.hpp
     fibers3d/Fiber3DRenderGeometry.hpp
     fibers3d/Fiber3DColor.hpp
@@ -44,6 +52,7 @@ set(srcs
     fibers3d/Fiber3DSliceControls.hpp
     fibers3d/Fiber3DSliceControls.cpp
     fibers3d/Fiber3DSurfaceMesh.hpp
+    fibers3d/Fiber3DSurfaceTexture.cpp
     fibers3d/Fiber3DSurfaceMesh.cpp
     fibers3d/Fiber3DSurfaceProximity.hpp
     fibers3d/Fiber3DSurfaceProximity.cpp
@@ -489,7 +498,7 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
     target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
 endif()

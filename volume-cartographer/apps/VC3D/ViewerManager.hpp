@@ -126,6 +126,7 @@ public:
     const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
     void setVolumeWindow(float low, float high);
+    void setCompositeMethod(const std::string& method);
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 

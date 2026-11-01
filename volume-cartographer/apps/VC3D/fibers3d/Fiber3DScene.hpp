@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FiberOverlayColors.hpp"
+#include "scene3d/Scene3DGeometry.hpp"
 #include <QColor>
 #include <opencv2/core/types.hpp>
 #include <QString>
@@ -17,10 +18,8 @@ namespace vc3d::fibers3d
 
 // Display snapshots only. Coordinates are doubles in the active CT volume's
 // frame. Rendering never changes source geometry or creates annotations.
-using Point = std::array<double, 3>;
-struct Bounds {
-    Point lower{}, upper{};
-};
+using scene3d::Point;
+using scene3d::Bounds;
 enum class Source { Annotation, Store };
 enum class SpanStyle { Solid, Gap, InferredGap, Damaged };
 enum class MarkerKind { ControlPoint, Break, KollesisTermination };

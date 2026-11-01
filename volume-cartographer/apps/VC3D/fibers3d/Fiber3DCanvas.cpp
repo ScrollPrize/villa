@@ -1,4 +1,5 @@
 #include "Fiber3DCanvas.hpp"
+#include "scene3d/Scene3DCanvasState.hpp"
 #include "Fiber3DColor.hpp"
 #include "Fiber3DRenderGeometry.hpp"
 #include "Fiber3DRibbon.hpp"
@@ -39,10 +40,7 @@ using render::emptyBounds;
 using render::expand;
 using render::Segment;
 using render::Vertex;
-QVector3D relative(const Point& p, const Point& origin)
-{
-    return {float(p[0] - origin[0]), float(p[1] - origin[1]), float(p[2] - origin[2])};
-}
+using scene3d::relative;
 QVector3D rgb(const QColor& color)
 {
     return {float(color.redF()), float(color.greenF()), float(color.blueF())};
@@ -154,35 +152,17 @@ struct Fiber3DCanvas::Impl {
         std::shared_ptr<const surface::Index> surfaceIndex;
     };
     std::shared_ptr<const surface::Index> surfaceIndex;
-    bool surfaceVisible = true, nearSurfaceOnly = false;
+    bool nearSurfaceOnly = false;
     double surfaceDistance = 64;
-    std::shared_ptr<const surface::Mesh> surfaceMesh;
-    std::unique_ptr<Fiber3DSurfaceRenderer> surfaceRenderer;
-    float surfaceOpacity = .5f;
-    bool surfaceUploading = false;
     struct RibbonTile {
         GLuint texture = 0, buffer = 0;
         GLsizei vertices = 0;
     };
-    slices::Images slices;
-    std::unique_ptr<Fiber3DVolumeRenderer> volumeRenderer;
-    std::array<CompositeParams, 3> sliceTransfer;
-    std::unique_ptr<slices::Tree> sliceTree;
-    std::vector<GLuint> sliceTextures;
-    std::unordered_map<const slices::Polygon*, std::pair<GLint, GLsizei>> sliceRanges;
-    GLuint sliceBuffer = 0;
-    Point sliceOrigin{};
-    bool slicesDirty = false;
-    float sliceOpacity = .7f;
     std::shared_ptr<const ribbon::Image> ribbon;
     std::vector<RibbonTile> ribbonTiles;
-    std::unique_ptr<QOpenGLShaderProgram> ribbonProgram;
-    GLuint ribbonVao = 0;
     Point ribbonOrigin{};
     bool ribbonDirty = false;
     size_t ribbonTextureRefresh = SIZE_MAX;
-    float windowLow = 0, windowHigh = 255;
-    QString ribbonError;
     std::shared_ptr<const Scene> scene;
     DisplaySettings settings;
     QString selectedKey, error;
@@ -205,8 +185,6 @@ struct Fiber3DCanvas::Impl {
     bool selectedDirty = true;
     GLuint selectedBuffer = 0, markerBuffer = 0;
     bool markersDirty = true;
-    QTimer refine;
-    bool interactive = false;
     std::vector<render::Draw> commands;
     std::vector<render::Range> exactRanges;
     QMatrix4x4 commandMatrix;
@@ -214,60 +192,18 @@ struct Fiber3DCanvas::Impl {
     int commandWidth = 0, commandHeight = 0;
     float commandLineWidth = -1;
     Bounds bounds = emptyBounds();
-    Point origin{}, target{};
     std::optional<Point> cursorPosition, linePosition;
-    QQuaternion rotation = QQuaternion::fromEulerAngles(-25.0f, 30.0f, 0.0f);
-    double radius = 100.0, scale = 100.0;
-    bool fitted = false, dirty = false, glReady = false, dragging = false;
-    Qt::MouseButton pressed = Qt::NoButton;
-    QPointF pressPosition, previousPosition;
+    bool dirty = false;
     GLuint vao = 0, paletteTexture = 0;
     int uploadedPalette = -1;
     std::unique_ptr<QOpenGLShaderProgram> program;
 
-    QMatrix4x4 matrix(int width, int height) const
-    {
-        const float aspect = float(std::max(1, width)) / std::max(1, height);
-        QMatrix4x4 projection, view;
-        // Preserve apparent scale when switching between perspective and ortho.
-        const double eye = scale / std::tan(0.39269908169872415481);
-        double extent = radius + distance(target, origin);
-        if (surfaceVisible && surfaceMesh && !surfaceMesh->indices.empty())
-            extent = std::max(extent, distance(target, surfaceMesh->bounds.lower) + distance(surfaceMesh->bounds.lower, surfaceMesh->bounds.upper));
-        for (const auto& image : slices) {
-            for (const auto& p : slices::corners(*image))
-                extent = std::max(extent, distance(target, p));
-        }
-        const double farPlane = eye + 2.0 * extent + scale;
-        if (settings.perspective)
-            projection.perspective(45.0f, aspect, float(std::max(0.001, scale * 0.001)), float(farPlane));
-        else
-            projection.ortho(float(-scale * aspect), float(scale * aspect), float(-scale), float(scale), float(-farPlane), float(farPlane));
-        if (settings.perspective)
-            view.translate(0.0f, 0.0f, float(-eye));
-        view.rotate(rotation);
-        view.translate(-relative(target, origin));
-        return projection * view;
-    }
 };
 
-Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : QOpenGLWidget(parent), d(std::make_unique<Impl>())
+Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : Scene3DCanvas(parent), d(std::make_unique<Impl>())
 {
-    QSurfaceFormat fmt = format();
-    fmt.setVersion(3, 3);
-    fmt.setProfile(QSurfaceFormat::CoreProfile);
-    fmt.setDepthBufferSize(24);
-    fmt.setSamples(4);
-    setFormat(fmt);
-    setMinimumSize(180, 160);
-    setFocusPolicy(Qt::StrongFocus);
     setToolTip(tr("Drag: orbit · Right-drag: pan · Wheel: zoom · Click: select · Right-click: actions"));
-    d->refine.setSingleShot(true);
-    d->refine.setInterval(180);
-    connect(&d->refine, &QTimer::timeout, this, [this] {
-        d->interactive = false;
-        update();
-    });
+    connect(this, &Scene3DCanvas::positionClicked, this, &Fiber3DCanvas::pick);
     connect(&d->proximity, &QFutureWatcher<Impl::ProximityResult>::finished, this, [this] {
         d->proximityBusy = false;
         try {
@@ -294,15 +230,15 @@ Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : QOpenGLWidget(parent), d(std::ma
                 d->geometry = std::move(geometry);
                 d->scene = d->geometry->scene;
                 d->bounds = d->geometry->bounds;
-                d->origin = d->geometry->origin;
-                d->radius = d->geometry->chunks.empty() ? 1 : std::max(1., distance(d->bounds.lower, d->bounds.upper) * .5);
+                v->origin = d->geometry->origin;
+                v->radius = d->geometry->chunks.empty() ? 1 : std::max(1., distance(d->bounds.lower, d->bounds.upper) * .5);
                 d->dirty = true;
                 d->commandTolerance = -1;
                 setSelectedKey(d->selectedKey);
-                if (!d->fitted || d->fitPending)
+                if (!v->fitted || d->fitPending)
                     fit(d->selectedFitPending);
                 d->fitPending = false;
-                if (d->glReady && d->program && d->program->isLinked())
+                if (v->glReady && d->program && d->program->isLinked())
                     d->error.clear();
             }
         } catch (const std::exception& e) {
@@ -332,27 +268,14 @@ void Fiber3DCanvas::cleanupGL()
     // private data has gone away. It must not call this slot a second time.
     if (context())
         disconnect(context(), &QOpenGLContext::aboutToBeDestroyed, this, &Fiber3DCanvas::cleanupGL);
-    if (!context() || !d->glReady)
+    if (!context() || !v->glReady)
         return;
     makeCurrent();
-    d->surfaceRenderer.reset();
-    d->surfaceUploading = bool(d->surfaceMesh);
-    d->volumeRenderer.reset();
-    d->ribbonProgram.reset();
     for (auto& tile : d->ribbonTiles) {
         glDeleteTextures(1, &tile.texture);
         glDeleteBuffers(1, &tile.buffer);
     }
     d->ribbonTiles.clear();
-    glDeleteTextures(GLsizei(d->sliceTextures.size()), d->sliceTextures.data());
-    d->sliceTextures.clear();
-    if (d->sliceBuffer)
-        glDeleteBuffers(1, &d->sliceBuffer);
-    d->sliceBuffer = 0;
-    d->slicesDirty = true;
-    if (d->ribbonVao)
-        glDeleteVertexArrays(1, &d->ribbonVao);
-    d->ribbonVao = 0;
     d->ribbonDirty = true;
     d->program.reset();
     glDeleteBuffers(GLsizei(d->buffers.size()), d->buffers.data());
@@ -368,19 +291,16 @@ void Fiber3DCanvas::cleanupGL()
         glDeleteTextures(1, &d->paletteTexture);
     d->vao = d->paletteTexture = 0;
     d->uploadedPalette = -1;
-    d->glReady = false;
     d->dirty = true;
     doneCurrent();
 }
 
 void Fiber3DCanvas::initializeGL()
 {
-    if (!initializeOpenGLFunctions()) {
-        d->error = tr("Fibers 3D requires OpenGL 3.3.");
-        return;
-    }
-    d->glReady = true;
+    // Release fiber resources before the base cleanup marks the context unavailable.
     connect(context(), &QOpenGLContext::aboutToBeDestroyed, this, &Fiber3DCanvas::cleanupGL, Qt::DirectConnection);
+    Scene3DCanvas::initializeGL();
+    if (!v->glReady) return;
     d->program = std::make_unique<QOpenGLShaderProgram>();
     if (!d->program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShader) ||
         !d->program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShader) || !d->program->link()) {
@@ -393,43 +313,8 @@ void Fiber3DCanvas::initializeGL()
     glGenBuffers(GLsizei(d->buffers.size()), d->buffers.data());
     glGenBuffers(1, &d->selectedBuffer);
     glGenBuffers(1, &d->markerBuffer);
-    glGenVertexArrays(1, &d->ribbonVao);
-    d->ribbonProgram = std::make_unique<QOpenGLShaderProgram>();
-    if (!d->ribbonProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, R"glsl(
-        #version 330 core
-        layout(location=0) in vec3 position;
-        layout(location=1) in vec2 uv;
-        uniform mat4 mvp;
-        out vec2 texCoord;
-        void main() { gl_Position = mvp * vec4(position,1); texCoord = uv; }
-    )glsl") ||
-        !d->ribbonProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, R"glsl(
-        #version 330 core
-        in vec2 texCoord;
-        uniform sampler2D ct;
-        uniform vec2 windowRange;
-        uniform float opacity;
-        out vec4 color;
-        void main() {
-            vec2 sampleValue = texture(ct, texCoord).rg;
-            if (sampleValue.g < .999) discard;
-            float gray = clamp((sampleValue.r * 255.0 - windowRange.x) / max(1.0,windowRange.y-windowRange.x),0.0,1.0);
-            color = vec4(gray,gray,gray,opacity);
-        }
-    )glsl") ||
-        !d->ribbonProgram->link())
-        d->ribbonError = tr("Cannot initialize CT display: %1").arg(d->ribbonProgram->log());
     d->ribbonDirty = true;
     d->dirty = true;
-}
-
-float Fiber3DCanvas::pixelsPerVoxel() const
-{
-    return float(std::max(1, height()) * devicePixelRatioF() / (2.0 * d->scale));
-}
-void Fiber3DCanvas::resizeGL(int, int)
-{
-    emit viewScaleChanged();
 }
 
 void Fiber3DCanvas::setCTRibbon(std::shared_ptr<const ribbon::Image> image)
@@ -457,163 +342,6 @@ std::shared_ptr<const ribbon::Image> Fiber3DCanvas::ctRibbon() const
 {
     return d->ribbon;
 }
-void Fiber3DCanvas::setCTWindow(float low, float high)
-{
-    d->windowLow = low;
-    d->windowHigh = high;
-    update();
-}
-
-GLuint Fiber3DCanvas::uploadCTTexture(const ct::Tile& tile)
-{
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, tile.width, tile.height, 0, GL_RG, GL_UNSIGNED_BYTE, tile.pixels.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    return texture;
-}
-
-void Fiber3DCanvas::setCTSlices(slices::Images images)
-{
-    if (images == d->slices)
-        return;
-    d->slices = std::move(images);
-    d->slicesDirty = true;
-    if (!d->fitted && !d->slices.empty() && (!d->geometry || d->geometry->chunks.empty()))
-        fitAll();
-    update();
-}
-const slices::Images& Fiber3DCanvas::ctSlices() const
-{
-    return d->slices;
-}
-void Fiber3DCanvas::setCTSliceOpacity(float opacity)
-{
-    d->sliceOpacity = std::clamp(opacity, 0.f, 1.f);
-    update();
-}
-
-void Fiber3DCanvas::setCTSliceTransfer(const std::array<CompositeParams, 3>& params)
-{
-    if (d->sliceTransfer == params)
-        return;
-    d->sliceTransfer = params;
-    update();
-}
-void Fiber3DCanvas::drawCTSlices()
-{
-    const bool volumetric = !d->slices.empty() && bool(d->slices.front()->slab);
-
-    if (d->slicesDirty) {
-        glDeleteTextures(GLsizei(d->sliceTextures.size()), d->sliceTextures.data());
-        d->sliceTextures.clear();
-        if (d->sliceBuffer)
-            glDeleteBuffers(1, &d->sliceBuffer);
-        d->sliceBuffer = 0;
-        d->sliceRanges.clear();
-        d->sliceTree = volumetric ? nullptr : slices::partition(d->slices);
-        d->slicesDirty = false;
-    }
-    if (volumetric && !d->volumeRenderer)
-        d->volumeRenderer = std::make_unique<Fiber3DVolumeRenderer>();
-    if (d->volumeRenderer) {
-        const auto ratio = devicePixelRatioF();
-        if (d->volumeRenderer
-                ->draw(volumetric ? d->slices : slices::Images{}, d->sliceTransfer, d->matrix(width(), height()), d->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), d->windowLow, d->windowHigh, d->sliceOpacity, d->interactive))
-            update();
-    }
-    if (volumetric)
-        return;
-    if (d->slices.empty() || !d->ribbonProgram || !d->ribbonProgram->isLinked() || !d->ribbonError.isEmpty())
-        return;
-    glActiveTexture(GL_TEXTURE0);
-    glBindVertexArray(d->ribbonVao);
-    if (d->sliceTextures.size() < d->slices.size()) {
-        // One <= 2 MiB texture per repaint; camera motion never uploads CT.
-        const auto texture = uploadCTTexture(d->slices[d->sliceTextures.size()]->tile);
-        if (glGetError() != GL_NO_ERROR) {
-            glDeleteTextures(1, &texture);
-            d->ribbonError = tr("Cannot upload CT slices.");
-        } else
-            d->sliceTextures.push_back(texture);
-        if (d->sliceTextures.size() < d->slices.size()) {
-            glBindVertexArray(0);
-            if (d->ribbonError.isEmpty())
-                update();
-            return;
-        }
-    }
-    if (!d->sliceBuffer) {
-        struct V {
-            float x, y, z, u, v;
-        };
-        std::vector<V> vertices;
-        d->sliceOrigin = d->slices.front()->plane.origin;
-        for (const auto* polygon : slices::backToFront(d->sliceTree.get(), d->sliceOrigin)) {
-            const auto& tile = d->slices[polygon->image]->tile;
-            const size_t start = vertices.size();
-            auto append = [&](const slices::Vertex& v) {
-                const auto p = relative(v.position, d->sliceOrigin);
-                vertices.push_back(
-                    {p.x(), p.y(), p.z(), float((.5 + v.u * (tile.width - 1)) / tile.width), float((.5 + v.v * (tile.height - 1)) / tile.height)});
-            };
-            for (size_t i = 1; i + 1 < polygon->vertices.size(); ++i) {
-                append(polygon->vertices[0]);
-                append(polygon->vertices[i]);
-                append(polygon->vertices[i + 1]);
-            }
-            d->sliceRanges[polygon] = {GLint(start), GLsizei(vertices.size() - start)};
-        }
-        glGenBuffers(1, &d->sliceBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, d->sliceBuffer);
-        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(vertices.size() * sizeof(V)), vertices.data(), GL_STATIC_DRAW);
-    }
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
-    glDisable(GL_SAMPLE_ALPHA_TO_ONE);
-    glEnable(GL_BLEND);
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    auto& program = *d->ribbonProgram;
-    program.bind();
-    auto matrix = d->matrix(width(), height());
-    matrix.translate(relative(d->sliceOrigin, d->origin));
-    program.setUniformValue("mvp", matrix);
-    program.setUniformValue("ct", 0);
-    program.setUniformValue("windowRange", QVector2D(d->windowLow, d->windowHigh));
-    program.setUniformValue("opacity", d->sliceOpacity);
-    glBindBuffer(GL_ARRAY_BUFFER, d->sliceBuffer);
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
-    glVertexAttribDivisor(0, 0);
-    glVertexAttribDivisor(1, 0);
-    const double eyeDistance = d->settings.perspective ? d->scale / std::tan(0.39269908169872415481) : 1.e12;
-    const auto offset = d->rotation.conjugated().rotatedVector(QVector3D(0, 0, float(eyeDistance)));
-    const Point eye{d->target[0] + offset.x(), d->target[1] + offset.y(), d->target[2] + offset.z()};
-    for (const auto* polygon : slices::backToFront(d->sliceTree.get(), eye)) {
-        glBindTexture(GL_TEXTURE_2D, d->sliceTextures[polygon->image]);
-        const auto [start, count] = d->sliceRanges.at(polygon);
-        glDrawArrays(GL_TRIANGLES, start, count);
-    }
-    program.release();
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindVertexArray(0);
-    glDepthMask(GL_TRUE);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-}
 
 void Fiber3DCanvas::drawCTRibbon()
 {
@@ -625,17 +353,17 @@ void Fiber3DCanvas::drawCTRibbon()
         d->ribbonTiles.clear();
         d->ribbonDirty = false;
         d->ribbonTextureRefresh = SIZE_MAX;
-        if (d->ribbonProgram && d->ribbonProgram->isLinked())
-            d->ribbonError.clear();
+        if (v->ctProgram && v->ctProgram->isLinked())
+            v->ctError.clear();
     }
-    if (!d->ribbon || !d->ribbonProgram || !d->ribbonError.isEmpty() || d->ribbon->key != d->selectedKey || !d->geometry ||
+    if (!d->ribbon || !v->ctProgram || !v->ctError.isEmpty() || d->ribbon->key != d->selectedKey || !d->geometry ||
         (d->selectedIndex >= 0 && !d->visible.includes(size_t(d->selectedIndex))))
         return;
     const auto& image = *d->ribbon;
     if (image.tiles.empty())
         return;
     d->ribbonOrigin = image.tiles.front().left.front();
-    glBindVertexArray(d->ribbonVao);
+    glBindVertexArray(v->ctVao);
     glActiveTexture(GL_TEXTURE0);
     // Refine textures without discarding already visible geometry. Bound GPU
     // transfers per paint; a new chunk must not restart a multi-frame upload.
@@ -674,10 +402,10 @@ void Fiber3DCanvas::drawCTRibbon()
         if (glGetError() != GL_NO_ERROR) {
             glDeleteTextures(1, &gpu.texture);
             glDeleteBuffers(1, &gpu.buffer);
-            d->ribbonError = tr("Cannot upload CT ribbon; reduce its width.");
+            v->ctError = tr("Cannot upload CT ribbon; reduce its width.");
         } else
             d->ribbonTiles.push_back(gpu);
-        if (d->ribbonTiles.size() < image.tiles.size() && d->ribbonError.isEmpty())
+        if (d->ribbonTiles.size() < image.tiles.size() && v->ctError.isEmpty())
             update();
     }
     glEnable(GL_DEPTH_TEST);
@@ -692,13 +420,13 @@ void Fiber3DCanvas::drawCTRibbon()
     // A small depth bias lets the centerline remain readable on its CT plane.
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1, 1);
-    auto mvp = d->matrix(width(), height());
-    mvp.translate(relative(d->ribbonOrigin, d->origin));
-    auto& program = *d->ribbonProgram;
+    auto mvp = v->matrix(width(), height());
+    mvp.translate(relative(d->ribbonOrigin, v->origin));
+    auto& program = *v->ctProgram;
     program.bind();
     program.setUniformValue("mvp", mvp);
     program.setUniformValue("ct", 0);
-    program.setUniformValue("windowRange", QVector2D(d->windowLow, d->windowHigh));
+    program.setUniformValue("windowRange", QVector2D(v->windowLow, v->windowHigh));
     program.setUniformValue("opacity", 1.f);
     for (const auto& tile : d->ribbonTiles) {
         glBindTexture(GL_TEXTURE_2D, tile.texture);
@@ -760,6 +488,7 @@ void Fiber3DCanvas::setDisplaySettings(const DisplaySettings& settings)
 {
     const bool proximityChanged = settings.nearbyOnly != d->settings.nearbyOnly || settings.nearbyDistanceVoxels != d->settings.nearbyDistanceVoxels;
     d->settings = settings;
+    setPerspective(settings.perspective);
     if (proximityChanged)
         updateProximity();
     update();  // Display changes reuse uploaded geometry.
@@ -794,7 +523,7 @@ void Fiber3DCanvas::clear()
     d->selectedKey.clear();
     d->selectedIndex = -1;
     d->selectedVertices.clear();
-    d->fitted = false;
+    v->fitted = false;
     d->dirty = true;
     updateProximity();
     update();
@@ -841,7 +570,7 @@ void Fiber3DCanvas::updateProximity()
         if (!d->nearSurfaceOnly && d->selectedIndex >= 0)
             keep[d->selectedIndex] = 1;
         d->visible = render::visibility(*d->geometry, std::move(keep));
-        d->proximityPending = !d->nearSurfaceOnly || bool(d->surfaceMesh);
+        d->proximityPending = !d->nearSurfaceOnly || bool(v->surfaceMesh);
         if (d->proximityPending && !d->proximityBusy)
             startProximityBuild();
     }
@@ -858,7 +587,7 @@ void Fiber3DCanvas::startProximityBuild()
     const auto selected = size_t(d->selectedIndex);
     const auto radius = d->settings.nearbyDistanceVoxels;
     const bool aroundSelected = d->settings.nearbyOnly && d->selectedIndex >= 0;
-    const auto mesh = d->nearSurfaceOnly ? d->surfaceMesh : nullptr;
+    const auto mesh = d->nearSurfaceOnly ? v->surfaceMesh : nullptr;
     const auto index = d->surfaceIndex;
     const double surfaceRadius = d->surfaceDistance;
     d->proximity.setFuture(QtConcurrent::run([geometry, selected, radius, token, aroundSelected, mesh, index, surfaceRadius] {
@@ -902,7 +631,7 @@ void Fiber3DCanvas::fit(bool selectedOnly)
         if (selectedOnly)
             return;
         bounds = emptyBounds();
-        for (const auto& image : d->slices)
+        for (const auto& image : v->slices)
             for (const auto& p : slices::corners(*image))
                 expand(bounds, p);
     } else if (selectedOnly) {
@@ -919,60 +648,18 @@ void Fiber3DCanvas::fit(bool selectedOnly)
             expand(bounds, b.upper);
         }
     }
-    if (!selectedOnly && d->surfaceVisible && d->surfaceMesh && !d->surfaceMesh->indices.empty()) {
-        expand(bounds, d->surfaceMesh->bounds.lower);
-        expand(bounds, d->surfaceMesh->bounds.upper);
+    if (!selectedOnly && v->surfaceVisible && v->surfaceMesh && !v->surfaceMesh->indices.empty()) {
+        expand(bounds, v->surfaceMesh->bounds.lower);
+        expand(bounds, v->surfaceMesh->bounds.upper);
     }
     fitBounds(bounds);
 }
-void Fiber3DCanvas::fitBounds(const Bounds& bounds)
-{
-    if (!finite(bounds.lower) || !finite(bounds.upper))
-        return;
-    for (int k = 0; k < 3; ++k)
-        d->target[k] = (bounds.lower[k] + bounds.upper[k]) * 0.5;
-    const double aspect = double(std::max(1, width())) / std::max(1, height());
-    d->scale = std::max(1.0, distance(bounds.lower, bounds.upper) * 0.6) / std::min(1.0, aspect);
-    d->fitted = true;
-    emit viewScaleChanged();
-    update();
-}
+
 void Fiber3DCanvas::fitAll()
 {
     fit(false);
 }
-void Fiber3DCanvas::setSurfaceMesh(std::shared_ptr<const surface::Mesh> mesh)
-{
-    if (mesh && mesh->indices.empty())
-        mesh.reset();
-    if (d->surfaceMesh == mesh)
-        return;
-    d->surfaceMesh = std::move(mesh);
-    d->surfaceUploading = bool(d->surfaceMesh);
-    d->surfaceIndex.reset();
-    updateProximity();
-    if (!d->fitted && d->surfaceVisible && d->surfaceMesh)
-        fitSurface();
-    update();
-}
-std::shared_ptr<const surface::Mesh> Fiber3DCanvas::surfaceMesh() const
-{
-    return d->surfaceMesh;
-}
-bool Fiber3DCanvas::isSurfaceMeshReady() const
-{
-    return d->surfaceMesh && (!d->surfaceVisible || (d->surfaceRenderer && !d->surfaceUploading && d->surfaceRenderer->error().isEmpty()));
-}
-void Fiber3DCanvas::setSurfaceOpacity(float opacity)
-{
-    d->surfaceOpacity = std::clamp(opacity, 0.f, 1.f);
-    update();
-}
-void Fiber3DCanvas::setSurfaceVisible(bool visible)
-{
-    d->surfaceVisible = visible;
-    update();
-}
+
 void Fiber3DCanvas::setSurfaceFilter(bool enabled, double distanceVoxels)
 {
     if (d->nearSurfaceOnly == enabled && d->surfaceDistance == distanceVoxels)
@@ -981,23 +668,10 @@ void Fiber3DCanvas::setSurfaceFilter(bool enabled, double distanceVoxels)
     d->surfaceDistance = distanceVoxels;
     updateProximity();
 }
-void Fiber3DCanvas::fitSurface()
-{
-    if (d->surfaceMesh) {
-        d->fitPending = false;
-        fitBounds(d->surfaceMesh->bounds);
-    }
-}
+
 void Fiber3DCanvas::fitSelected()
 {
     fit(true);
-}
-void Fiber3DCanvas::focusPoint(Point point)
-{
-    if (!finite(point))
-        return;
-    d->target = point;
-    update();
 }
 
 void Fiber3DCanvas::setCursorPosition(std::optional<Point> position)
@@ -1020,18 +694,10 @@ void Fiber3DCanvas::setLinePosition(std::optional<Point> position)
 
 void Fiber3DCanvas::paintGL()
 {
+    beginFrame();
     const qreal ratio = devicePixelRatioF();
     const int pixelWidth = std::max(1, int(width() * ratio)), pixelHeight = std::max(1, int(height() * ratio));
-    if (d->glReady) {
-        // QPainter and the widget compositor also use this context. Restore
-        // relevant state explicitly, including before clearing the framebuffer.
-        glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_STENCIL_TEST);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDepthMask(GL_TRUE);
-        glViewport(0, 0, pixelWidth, pixelHeight);
-        glClearColor(0.045f, 0.06f, 0.075f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (v->glReady) {
         if (d->dirty) {
             // Release the previous scene before allocating the new resident levels.
             glDeleteBuffers(GLsizei(d->buffers.size()), d->buffers.data());
@@ -1047,17 +713,11 @@ void Fiber3DCanvas::paintGL()
             d->commandTolerance = -1;
         }
     }
-    const auto matrix = d->matrix(width(), height());
-    if (d->glReady && (d->surfaceMesh || d->surfaceRenderer)) {
-        if (!d->surfaceRenderer)
-            d->surfaceRenderer = std::make_unique<Fiber3DSurfaceRenderer>();
-        d->surfaceUploading = d->surfaceRenderer->draw(d->surfaceVisible ? d->surfaceMesh : nullptr, matrix, d->origin, d->rotation, d->surfaceOpacity);
-        if (d->surfaceUploading)
-            update();
-    }
-    if (d->glReady)
+    const auto matrix = v->matrix(width(), height());
+    drawSurface();
+    if (v->glReady)
         drawCTRibbon();
-    if (d->glReady && d->error.isEmpty() && d->program && d->geometry && !d->geometry->chunks.empty()) {
+    if (v->glReady && d->error.isEmpty() && d->program && d->geometry && !d->geometry->chunks.empty()) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);
@@ -1166,11 +826,11 @@ void Fiber3DCanvas::paintGL()
         program.setUniformValue("palette", 0);
         const auto range = s.fixedLengthRange ? lengthRange(*d->scene, s) : geometry.lengths;
         program.setUniformValue("lengthRange", QVector2D(float(range.first), float(range.second)));
-        const double tolerance = d->interactive ? 1.25 : .5;  // physical screen pixels
+        const double tolerance = v->interactive ? 1.25 : .5;  // physical screen pixels
         if (d->commandMatrix != matrix || d->commandTolerance != tolerance || d->commandWidth != pixelWidth ||
             d->commandHeight != pixelHeight || d->commandLineWidth != s.lineWidth) {
             d->commands =
-                render::draws(geometry, render::View(matrix, d->origin, pixelWidth, pixelHeight, (s.lineWidth + 2) * ratio), tolerance, d->visible);
+                render::draws(geometry, render::View(matrix, v->origin, pixelWidth, pixelHeight, (s.lineWidth + 2) * ratio), tolerance, d->visible);
             d->exactRanges.assign(d->commands.size(), {});
             if (geometry.deferredExact) {
                 std::vector<Vertex> exact;
@@ -1247,27 +907,27 @@ void Fiber3DCanvas::paintGL()
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
         glDisable(GL_SAMPLE_ALPHA_TO_ONE);
     }
-    if (d->glReady)
+    if (v->glReady)
         drawCTSlices();
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setPen(QColor(210, 215, 222));
-    if (d->surfaceVisible && d->surfaceMesh && d->surfaceRenderer) {
-        if (!d->surfaceRenderer->error().isEmpty())
-            painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->surfaceRenderer->error());
-        else if (d->surfaceUploading)
+    if (v->surfaceVisible && v->surfaceMesh && v->surfaceRenderer) {
+        if (!v->surfaceRenderer->error().isEmpty())
+            painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop | Qt::TextWordWrap, v->surfaceRenderer->error());
+        else if (v->surfaceUploading)
             painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop, tr("Uploading surface mesh…"));
     }
-    if (d->volumeRenderer && !d->slices.empty() && d->slices.front()->slab && !d->volumeRenderer->error().isEmpty())
-        painter.drawText(rect().adjusted(12, 40, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->volumeRenderer->error());
-    if ((d->ribbon || !d->slices.empty()) && !d->ribbonError.isEmpty())
-        painter.drawText(rect().adjusted(12, 12, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->ribbonError);
+    if (v->volumeRenderer && !v->slices.empty() && v->slices.front()->slab && !v->volumeRenderer->error().isEmpty())
+        painter.drawText(rect().adjusted(12, 40, -12, -12), Qt::AlignTop | Qt::TextWordWrap, v->volumeRenderer->error());
+    if ((d->ribbon || !v->slices.empty()) && !v->ctError.isEmpty())
+        painter.drawText(rect().adjusted(12, 12, -12, -12), Qt::AlignTop | Qt::TextWordWrap, v->ctError);
     if (!d->error.isEmpty()) {
         painter.drawText(rect().adjusted(16, 16, -16, -16), Qt::AlignCenter | Qt::TextWordWrap, d->error);
         return;
     }
     if (!d->geometry || d->geometry->chunks.empty()) {
-        if (d->slices.empty() && !d->surfaceMesh)
+        if (v->slices.empty() && !v->surfaceMesh)
             painter.drawText(
                 rect().adjusted(16, 16, -16, -16),
                 Qt::AlignCenter | Qt::TextWordWrap,
@@ -1284,7 +944,7 @@ void Fiber3DCanvas::paintGL()
             Point p;
             for (int k = 0; k < 3; ++k)
                 p[k] = (i & (1 << k)) ? bounds.upper[k] : bounds.lower[k];
-            corners[i] = matrix * QVector4D(relative(p, d->origin), 1);
+            corners[i] = matrix * QVector4D(relative(p, v->origin), 1);
         }
         auto screen = [&](const QVector4D& p) { return QPointF((p.x() / p.w() + 1) * width() * .5, (1 - p.y() / p.w()) * height() * .5); };
         for (int i = 0; i < 8; ++i)
@@ -1295,7 +955,7 @@ void Fiber3DCanvas::paintGL()
             }
     }
     if (d->linePosition) {
-        const QVector4D p = matrix * QVector4D(relative(*d->linePosition, d->origin), 1);
+        const QVector4D p = matrix * QVector4D(relative(*d->linePosition, v->origin), 1);
         if (p.w() > 0 && std::isfinite(p.w()) && std::abs(p.x()) <= p.w() && std::abs(p.y()) <= p.w() && std::abs(p.z()) <= p.w()) {
             const QPointF center((p.x() / p.w() + 1) * width() * .5, (1 - p.y() / p.w()) * height() * .5);
             painter.setPen(Qt::NoPen);
@@ -1307,7 +967,7 @@ void Fiber3DCanvas::paintGL()
     if (d->settings.showCursor && d->cursorPosition) {
         // Subtract the scene origin in double precision before projection, as
         // for the fiber geometry. Do not snap or clamp the CT focus to a fiber.
-        const QVector4D p = matrix * QVector4D(relative(*d->cursorPosition, d->origin), 1);
+        const QVector4D p = matrix * QVector4D(relative(*d->cursorPosition, v->origin), 1);
         if (std::isfinite(p.w()) && p.w() > 0 && std::isfinite(p.x()) && std::isfinite(p.y()) && std::isfinite(p.z()) &&
             std::abs(p.x()) <= p.w() && std::abs(p.y()) <= p.w() && std::abs(p.z()) <= p.w()) {
             const QPointF center((p.x() / p.w() + 1) * width() * .5, (1 - p.y() / p.w()) * height() * .5);
@@ -1355,91 +1015,13 @@ void Fiber3DCanvas::paintGL()
         painter.drawText(QRect(12, 52, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, tr("Refining display…"));
     if (isFiltering() || !d->proximityError.isEmpty())
         painter.drawText(QRect(12, 78, width() - 24, 44), Qt::AlignLeft | Qt::TextWordWrap, isFiltering() ? tr("Finding nearby fibers…") : d->proximityError);
-    if (d->nearSurfaceOnly && !d->surfaceMesh)
+    if (d->nearSurfaceOnly && !v->surfaceMesh)
         painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop | Qt::TextWordWrap, tr("Surface filter: select a surface in Main and wait for its mesh."));
-}
-
-void Fiber3DCanvas::mousePressEvent(QMouseEvent* event)
-{
-    if (event->button() != Qt::LeftButton && event->button() != Qt::RightButton && event->button() != Qt::MiddleButton) {
-        QOpenGLWidget::mousePressEvent(event);
-        return;
-    }
-    d->pressed = event->button();
-    d->pressPosition = d->previousPosition = event->position();
-    d->dragging = false;
-    setFocus(Qt::MouseFocusReason);
-    event->accept();
-}
-
-void Fiber3DCanvas::mouseMoveEvent(QMouseEvent* event)
-{
-    if (d->pressed == Qt::NoButton)
-        return;
-    if (!d->dragging && (event->position() - d->pressPosition).manhattanLength() < QApplication::startDragDistance())
-        return;
-    d->dragging = true;
-    d->interactive = true;
-    d->refine.start();
-    const QPointF delta = event->position() - d->previousPosition;
-    d->previousPosition = event->position();
-    if (d->pressed == Qt::LeftButton && !(event->modifiers() & Qt::ShiftModifier)) {
-        d->rotation = QQuaternion::fromEulerAngles(float(delta.y() * .4), float(delta.x() * .4), 0) * d->rotation;
-        d->rotation.normalize();
-    } else {
-        const double unitPerPixel = d->scale * 2.0 / std::max(1, height());
-        const QVector3D shift =
-            d->rotation.conjugated().rotatedVector(QVector3D(float(-delta.x() * unitPerPixel), float(delta.y() * unitPerPixel), 0));
-        d->target[0] += shift.x();
-        d->target[1] += shift.y();
-        d->target[2] += shift.z();
-    }
-    update();
-    event->accept();
-}
-
-void Fiber3DCanvas::mouseReleaseEvent(QMouseEvent* event)
-{
-    if (event->button() != d->pressed)
-        return;
-    // Context menus are handled here (release), never on a right-drag.
-    if (!d->dragging && d->pressed != Qt::MiddleButton)
-        pick(event->position(), d->pressed == Qt::RightButton, event->globalPosition().toPoint());
-    d->pressed = Qt::NoButton;
-    event->accept();
-}
-
-void Fiber3DCanvas::contextMenuEvent(QContextMenuEvent* event)
-{
-    if (event->reason() == QContextMenuEvent::Keyboard)
-        emit emptyContextRequested(event->globalPos());
-    event->accept();
-}
-
-void Fiber3DCanvas::keyPressEvent(QKeyEvent* event)
-{
-    if (event->key() == Qt::Key_Escape) {
-        emit clearSelectionRequested();
-        event->accept();
-        return;
-    }
-    QOpenGLWidget::keyPressEvent(event);
-}
-
-void Fiber3DCanvas::wheelEvent(QWheelEvent* event)
-{
-    d->interactive = true;
-    d->refine.start();
-    const double steps = !event->pixelDelta().isNull() ? event->pixelDelta().y() / 120.0 : event->angleDelta().y() / 120.0;
-    d->scale = std::clamp(d->scale * std::exp(-steps * 0.15), 0.01, 1.0e9);
-    emit viewScaleChanged();
-    update();
-    event->accept();
 }
 
 void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& globalPosition)
 {
-    const auto matrix = d->matrix(width(), height());
+    const auto matrix = v->matrix(width(), height());
     if (!d->geometry)
         return;
     std::optional<Segment> best;
@@ -1448,7 +1030,7 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
     double bestDepth = 2.0, bestT = 0.0;
     const auto& g = *d->geometry;
     const auto candidates =
-        render::pickChunks(g, render::View(matrix, d->origin, width(), height(), tolerance), position.x() * 2 / width() - 1, 1 - position.y() * 2 / height(), d->visible);
+        render::pickChunks(g, render::View(matrix, v->origin, width(), height(), tolerance), position.x() * 2 / width() - 1, 1 - position.y() * 2 / height(), d->visible);
     for (auto ci : candidates) {
         const auto& chunk = g.chunks[ci];
         for (size_t si = chunk.first; si < chunk.end; ++si) {
@@ -1458,7 +1040,7 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
             if (d->selectedIndex >= 0 && d->visible.includes(size_t(d->selectedIndex)) && int(segment.fiber) != d->selectedIndex &&
                 d->settings.unselectedOpacity <= 0)
                 continue;
-            QVector4D a = matrix * QVector4D(relative(segment.a, d->origin), 1), b = matrix * QVector4D(relative(segment.b, d->origin), 1);
+            QVector4D a = matrix * QVector4D(relative(segment.a, v->origin), 1), b = matrix * QVector4D(relative(segment.b, v->origin), 1);
             const double nearA = a.z() + a.w(), nearB = b.z() + b.w();
             if (nearA <= 0 && nearB <= 0)
                 continue;
@@ -1469,7 +1051,7 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
             }
             if (nearB < 0) {
                 clipB = nearA / (nearA - nearB);
-                b = matrix * QVector4D(relative(interpolate(segment.a, segment.b, clipB), d->origin), 1);
+                b = matrix * QVector4D(relative(interpolate(segment.a, segment.b, clipB), v->origin), 1);
             }
             if (a.w() <= 0 || b.w() <= 0)
                 continue;
@@ -1510,6 +1092,24 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
         emit fiberPositionPicked(key, double(best->originalIndex) + sourceT);
         emit fiberPicked(key, index, point[0], point[1], point[2]);
     }
+}
+
+void Fiber3DCanvas::setSurfaceMesh(std::shared_ptr<const surface::Mesh> mesh)
+{
+    if (mesh && mesh->indices.empty())
+        mesh.reset();
+    if (v->surfaceMesh == mesh)
+        return;
+    Scene3DCanvas::setSurfaceMesh(std::move(mesh));
+    d->surfaceIndex.reset();
+    updateProximity();
+}
+
+void Fiber3DCanvas::fitSurface()
+{
+    if (v->surfaceMesh)
+        d->fitPending = false;
+    Scene3DCanvas::fitSurface();
 }
 
 }  // namespace vc3d::fibers3d

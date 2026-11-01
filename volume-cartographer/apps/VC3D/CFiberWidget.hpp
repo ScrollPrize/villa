@@ -137,6 +137,7 @@ signals:
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void renameFiberFileRequested(uint64_t fiberId);
+    void generateFibersRequested();
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
