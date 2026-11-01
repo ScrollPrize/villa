@@ -94,11 +94,14 @@ def _copy_chunk(src_meta: dict, si: int,
     ox = xs - cx_idx * cs_x
     cdata = chunk[oz:oz + (ze - zs), oy:oy + (ye - ys), ox:ox + (xe - xs)]
 
-    # Pad partial edge chunks to full output chunk size (zarr v2 spec)
+    # Pad partial edge chunks to full output chunk size (zarr v2 spec). The
+    # cropped data keeps its offset (oz, oy, ox) inside the chunk, so a crop
+    # that starts inside a chunk stays at its own voxels.
     cs = CHUNK_SPATIAL
     if cdata.shape != (cs, cs, cs):
         padded = np.zeros((cs, cs, cs), dtype=cdata.dtype)
-        padded[:cdata.shape[0], :cdata.shape[1], :cdata.shape[2]] = cdata
+        dz, dy, dx = cdata.shape
+        padded[oz:oz + dz, oy:oy + dy, ox:ox + dx] = cdata
         cdata = padded
 
     raw = (np.ascontiguousarray(cdata) if out_order == 'C'
