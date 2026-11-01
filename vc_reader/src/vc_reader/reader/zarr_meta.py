@@ -58,17 +58,8 @@ class ArrayMeta:
         return len(self.shape)
 
     @property
-    def is_raw(self) -> bool:
-        """Chunks are stored as plain C-order bytes: no compressor, no filters."""
-        return self.compressor is None and not self.filters and self.order == "C"
-
-    @property
     def chunk_nbytes(self) -> int:
         return math.prod(self.chunks) * self.dtype.itemsize
-
-    @property
-    def grid_shape(self) -> tuple[int, ...]:
-        return tuple(-(-s // c) for s, c in zip(self.shape, self.chunks))
 
     @property
     def codec_id(self) -> str:
@@ -82,9 +73,6 @@ class ArrayMeta:
         if self.order != "C":
             raise ValueError("vc_reader cannot read arrays stored in Fortran order")
         return SUPPORTED_COMPRESSORS[cid]
-
-    def chunk_key(self, idx: tuple[int, ...]) -> str:
-        return self.separator.join(map(str, idx))
 
     def decoded_zarray(self) -> dict[str, Any]:
         """``.zarray`` of the same array stored uncompressed (the decoded-cache layout)."""

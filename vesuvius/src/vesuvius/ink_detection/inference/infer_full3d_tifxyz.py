@@ -24,6 +24,7 @@ import vesuvius.tifxyz as tifxyz
 
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
+    StoredResolutionIndex,
     native_tifxyz_pyramid_params,
     native_volume_downsample_factor,
     project_surface_distance,
@@ -31,6 +32,7 @@ from vesuvius.ink_detection.data.geometry import (
 )
 from vesuvius.ink_detection.data.normalization import normalize_image
 from vesuvius.ink_detection.inference.inference_runtime import (
+    DEVICE_CHOICES,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -143,6 +145,12 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+    )
     parser.add_argument("--gpus", default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--max-target-chunks", type=int, default=None)
@@ -867,6 +875,7 @@ class NativePatchDataset(Dataset):
         self._tifxyz = None
         self._coarse_positions = None
         self._coarse_valid = None
+        self._coarse_index = None
 
     def __len__(self) -> int:
         return len(self.patches)
@@ -877,6 +886,7 @@ class NativePatchDataset(Dataset):
         state["_tifxyz"] = None
         state["_coarse_positions"] = None
         state["_coarse_valid"] = None
+        state["_coarse_index"] = None
         return state
 
     def _ensure_volume(self):
@@ -911,6 +921,14 @@ class NativePatchDataset(Dataset):
             self._coarse_valid = valid
         return self._coarse_positions, self._coarse_valid
 
+    def _ensure_coarse_index(self):
+        if self._coarse_index is None:
+            positions, valid = self._ensure_coarse_positions()
+            self._coarse_index = StoredResolutionIndex(
+                positions, valid, native_coordinate_scale=self.native_coordinate_scale
+            )
+        return self._coarse_index
+
     def _surface_mask(self, bbox_zyx) -> np.ndarray:
         coarse_positions, coarse_valid = self._ensure_coarse_positions()
         selection = select_flat_pixels_via_stored_resolution(
@@ -922,6 +940,7 @@ class NativePatchDataset(Dataset):
             native_coordinate_scale=self.native_coordinate_scale,
             flat_grid_stride=self.flat_grid_stride,
             required=False,
+            coarse_index=self._ensure_coarse_index(),
         )
         if selection is None:
             return np.zeros(self.patch_size_zyx, dtype=np.float32)
@@ -984,6 +1003,7 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
+        device_type=args.device,
         compile_model=bool(args.compile_model),
         compile_mode=str(args.compile_mode),
     )
@@ -1037,7 +1057,11 @@ def run_native_inference(
     variants = tta_variants(bool(args.tta))
     with torch.inference_mode(), autocast:
         for images, metadata in loader:
-            images = images.to(bundle.device, non_blocking=True)
+            # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
+            # read this host batch after it is freed (pytorch/pytorch#189690).
+            images = images.to(
+                bundle.device, non_blocking=bundle.device.type == "cuda"
+            )
             probabilities = predict_batch(
                 bundle.model,
                 images,

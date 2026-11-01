@@ -7,6 +7,7 @@ tasks (prepare, reduce) to run without loading torch.
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 
+import hashlib
 import logging
 import shutil
 import math
@@ -69,8 +70,14 @@ def get_cached_zarr_store(path: str):
         # Create base S3 store using zarr3's FsspecStore
         base_store = FsspecStore(fs=fs, path=s3_path, read_only=True)
 
-        # Configure cache settings from environment variables
-        cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
+        # Configure cache settings from environment variables.
+        # Cached keys are store-relative (".zarray", "0/0/0/1"), so every source volume
+        # gets its own subdirectory; in a shared directory a second volume would be
+        # served the first volume's metadata and chunks.
+        cache_dir = os.path.join(
+            os.environ.get("ZARR_CACHE_DIR", "./zarr_cache"),
+            hashlib.sha1(path.rstrip("/").encode()).hexdigest()[:12],
+        )
         cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
         cache_max_age = os.environ.get("ZARR_CACHE_MAX_AGE", "infinity")
 
@@ -172,7 +179,12 @@ def _read_gray_any(path: str) -> np.ndarray:
                 return None
             if img.ndim > 2:
                 img = img[..., 0]
-            if img.dtype != np.uint8:
+            if img.dtype == np.uint16:
+                # 16-bit layers (what volume-cartographer renders) carry the signal in
+                # the high byte. Keep it, as cv2.IMREAD_GRAYSCALE does for the other
+                # formats; clipping at 255 saturates every voxel of such a layer.
+                img = (img >> 8).astype(np.uint8)
+            elif img.dtype != np.uint8:
                 # Minimal, safe conversion to uint8
                 img = np.clip(img, 0, 255).astype(np.uint8)
             return img
@@ -594,6 +606,9 @@ def create_scale_bar_tiles(
     return scale_bar_tiles, mask_tiles
 
 
+PARTITION_CACHE_DIR = "/tmp/partition_cache"
+
+
 def reduce_partitions(
     zarr_output_dir: str,
     num_parts: int,
@@ -622,8 +637,14 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
-    # Cache directory for partition zarrs (network filesystem -> local /tmp)
-    cache_dir = "/tmp/partition_cache"
+    # Cache directory for partition zarrs (network filesystem -> local /tmp).
+    # Partition names are the same in every run (mask_pred_part_000.zarr), so a copy left by an
+    # earlier reduce would be served again after ZARR_OUTPUT_DIR changes or is rewritten by the
+    # next inference run. Start every reduce from an empty cache.
+    cache_dir = PARTITION_CACHE_DIR
+    if os.path.isdir(cache_dir):
+        logger.info(f"Removing partition cache left by an earlier reduce: {cache_dir}")
+        shutil.rmtree(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
 
     # Open all partition zarr arrays once (outside the generator loop)

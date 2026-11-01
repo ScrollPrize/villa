@@ -19,7 +19,8 @@ class SavedFixtureModel(nn.Module):
         return self.logits.expand(image.shape[0], -1, -1, -1)
 
 @pytest.mark.parametrize('next_roi', [None, [2, 70, 4, 76]])
-def test_reused_output_never_retains_old_roi_frame(tmp_path, next_roi):
+@pytest.mark.parametrize('max_ram_gb', [0, 1])
+def test_reused_output_never_retains_old_roi_frame(tmp_path, next_roi, max_ram_gb):
     fixture = Path(__file__).parent / 'fixtures/ink_roi_case.npz'
     with np.load(fixture) as saved:
         ct, probability = saved['ct'], saved['probability']
@@ -34,7 +35,8 @@ def test_reused_output_never_retains_old_roi_frame(tmp_path, next_roi):
     output = tmp_path / 'ink.tif'
     metadata = output.with_suffix('.tif.roi.json')
     args = infer.parse_args([str(input_path), 'unused-checkpoint.pth', str(output),
-        '--num-workers', '0', '--no-compile', '--stride', '64', '--roi', '3', '66', '5', '73'])
+        '--num-workers', '0', '--no-compile', '--stride', '64', '--roi', '3', '66', '5', '73',
+        '--max-ram-accumulation-gb', str(max_ram_gb)])
     infer.infer_single_zarr(args=args, input_zarr=input_path, configured_model=configured,
                             device=torch.device('cpu'), output_tiff=output)
     assert tifffile.imread(output).shape == (63, 68)

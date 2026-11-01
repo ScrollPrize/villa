@@ -29,6 +29,7 @@ from vesuvius.ink_detection.volume_io import (
     open_volume_root,
     select_volume_level,
 )
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 def test_inference_import_does_not_add_runtime_side_effects():
     source = """
@@ -125,7 +126,9 @@ def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monke
     )
 
     assert prepared is source
-    assert device.type in {"cpu", "cuda"}
+    # Without --gpus the device is get_accelerator()'s (cuda, else mps, else cpu), and the model is on it.
+    assert device == get_accelerator()
+    assert next(prepared.parameters()).device.type == device.type
 
 
 class _BackendThatFailsWhenItRuns(nn.Module):
@@ -142,6 +145,44 @@ class _BackendThatFailsWhenItRuns(nn.Module):
             RuntimeError("Cannot find a working triton installation"),
             first_useful_frame=None,
         )
+
+
+def test_device_cpu_is_honoured_even_when_an_accelerator_exists(monkeypatch):
+    from vesuvius.ink_detection.inference import inference_runtime
+
+    def accelerator_must_not_be_asked():
+        raise AssertionError("--device cpu must not ask get_accelerator()")
+
+    monkeypatch.setattr(inference_runtime, "get_accelerator", accelerator_must_not_be_asked)
+
+    _, device = prepare_model_for_inference(
+        nn.Linear(1, 1),
+        gpu_ids=(),
+        compile_model=False,
+        compile_mode="default",
+        device_type="cpu",
+    )
+
+    assert device == torch.device("cpu")
+
+
+def test_device_rejects_unavailable_backends_and_conflicting_requests(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    def prepare(**kwargs):
+        return prepare_model_for_inference(
+            nn.Linear(1, 1), compile_model=False, compile_mode="default", **kwargs
+        )
+
+    with pytest.raises(ValueError, match="MPS is unavailable"):
+        prepare(gpu_ids=(), device_type="mps")
+    with pytest.raises(ValueError, match="CUDA is unavailable"):
+        prepare(gpu_ids=(), device_type="cuda")
+    with pytest.raises(ValueError, match="cannot be combined with --device cpu"):
+        prepare(gpu_ids=(0,), device_type="cpu")
+    with pytest.raises(ValueError, match="--device must be one of"):
+        prepare(gpu_ids=(), device_type="tpu")
 
 
 def test_compile_falls_back_when_the_backend_fails_on_the_first_forward(monkeypatch, caplog):

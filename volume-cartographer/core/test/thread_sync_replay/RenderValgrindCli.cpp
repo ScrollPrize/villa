@@ -126,10 +126,12 @@ void validateMetadata(const json& metadata, const std::string& fixture, const st
     }
 }
 
-double referenceTolerance(const json& reference, const std::map<std::string, std::string>& arguments)
+double referenceTolerance(const json& reference, const json& reference_case, const std::map<std::string, std::string>& arguments)
 {
     const auto explicit_tolerance = arguments.find("tolerance");
-    const double value = explicit_tolerance == arguments.end() ? reference.at("tolerance").get<double>() : std::stod(explicit_tolerance->second);
+    const double value = explicit_tolerance == arguments.end()
+        ? reference_case.value("tolerance", reference.at("tolerance").get<double>())
+        : std::stod(explicit_tolerance->second);
     if (!std::isfinite(value) || value < 0.0 || value >= 1.0) {
         throw std::runtime_error("reference tolerance must be in [0, 1)");
     }
@@ -221,7 +223,9 @@ int renderValgrindCli(int argc, char** argv)
         result["reference_modeled_runtime_score_ns"] = expected;
         result["reference_ratio"] = ratio;
         result["relative_error"] = ratio - 1.0;
-        if (ratio > 1.0 + referenceTolerance(reference, arguments)) {
+        const double tolerance = referenceTolerance(reference, reference_case, arguments);
+        result["reference_tolerance"] = tolerance;
+        if (ratio > 1.0 + tolerance) {
             result["status"] = "failed";
             failed = true;
         }

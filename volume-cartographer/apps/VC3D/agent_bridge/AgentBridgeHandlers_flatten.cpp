@@ -37,7 +37,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -53,17 +53,15 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 
 // ---------------------------------------------------------------------------
-// Flattening RPCs: flatten.slim / flatten.abf / flatten.straighten
+// Flattening RPCs: flatten.slim / flatten.straighten
 // ---------------------------------------------------------------------------
 
-// Shared launch body for all three flatten RPCs: the handler builds `launch`
+// Shared launch body for both flatten RPCs: the handler builds `launch`
 // (a closure over the concrete start* launcher); this registers the job and
 // maps typed launch failures to JSON-RPC errors. Completion is driven by
 // SegmentationCommandHandler::flattenJobFinished rather than a
@@ -72,7 +70,7 @@
 QJsonObject AgentBridgeServer::launchFlattenJob(
     const QString& kind, const QString& label, const QString& segmentId,
     const std::function<bool(CommandLaunchError* error,
-                             QString* outDir)>& launch)
+                             QString* outputName)>& launch)
 {
     // Only one flatten at a time (its own source, so it may run concurrently
     // with a "tool", "growth", or other source-specific job).
@@ -90,26 +88,24 @@ QJsonObject AgentBridgeServer::launchFlattenJob(
                                    /*broadcastStart=*/false);
 
     CommandLaunchError error;
-    QString outputDir;
-    if (!launch(&error, &outputDir)) {
+    QString outputName;
+    if (!launch(&error, &outputName)) {
         _activeJobs.remove(QStringLiteral("flatten"));
         throwCommandLaunchError(error, "Failed to start flatten",
                                 segmentId, "flatten");
     }
 
     // The job ctor already emitted flattenJobStarted (adopted by
-    // handleFlattenStarted into the active record); attach the resolved output
-    // path and broadcast the start now that we have it.
-    if (auto it = _activeJobs.find(QStringLiteral("flatten")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // handleFlattenStarted into the active record); broadcast the start. The
+    // new surface's UUID arrives with flattenJobFinished.
+    if (auto it = _activeJobs.find(QStringLiteral("flatten")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = kind;
     result["source"] = "flatten";
-    result["outputDir"] = outputDir;
+    result["outputName"] = outputName;
     return result;
 }
 
@@ -136,45 +132,15 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
     sp.energyType = p.value("energyType").toString(sp.energyType);
     sp.keepPercent = p.value("keepPercent").toDouble(sp.keepPercent);
     sp.inpaintHoles = p.value("inpaintHoles").toBool(sp.inpaintHoles);
-    sp.outputDir = p.value("outputDir").toString();
+    sp.outputName = p.value("outputName").toString();
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
     return launchFlattenJob(
         QStringLiteral("flatten.slim"), QStringLiteral("SLIM flatten"), segmentId,
-        [handler, segmentId, sp](CommandLaunchError* error, QString* outDir) {
+        [handler, segmentId, sp](CommandLaunchError* error, QString* outputName) {
             return handler && handler->startSlimFlatten(
-                segmentId.toStdString(), sp, error, outDir);
-        });
-}
-
-
-QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QString segmentId = p.value("segmentId").toString();
-    if (segmentId.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentId";
-        throw AgentBridgeError{-32602, "segmentId is required", data};
-    }
-
-    const int iterations = p.value("iterations").toInt(10);
-    const int downsampleFactor = p.value("downsampleFactor").toInt(1);
-
-    SegmentationCommandHandler* handler =
-        _window ? _window->_segmentationCommandHandler.get() : nullptr;
-    return launchFlattenJob(
-        QStringLiteral("flatten.abf"), QStringLiteral("ABF++ flatten"), segmentId,
-        [handler, segmentId, iterations, downsampleFactor](CommandLaunchError* error,
-                                                           QString* outDir) {
-            return handler && handler->startAbfFlatten(segmentId.toStdString(),
-                                                       iterations, downsampleFactor,
-                                                       error, outDir);
+                segmentId.toStdString(), sp, error, outputName);
         });
 }
 
@@ -205,14 +171,14 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
         p.value("orthogonalize").toBool(stp.orthogonalize);
     stp.trim = p.value("trim").toBool(stp.trim);
     stp.trimMaxEdge = p.value("trimMaxEdge").toDouble(stp.trimMaxEdge);
-    stp.outputDir = p.value("outputDir").toString();
+    stp.outputName = p.value("outputName").toString();
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
     return launchFlattenJob(
         QStringLiteral("flatten.straighten"), QStringLiteral("Straighten"), segmentId,
-        [handler, segmentId, stp](CommandLaunchError* error, QString* outDir) {
+        [handler, segmentId, stp](CommandLaunchError* error, QString* outputName) {
             return handler && handler->startStraighten(
-                segmentId.toStdString(), stp, error, outDir);
+                segmentId.toStdString(), stp, error, outputName);
         });
 }

@@ -13,6 +13,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 
@@ -185,6 +186,10 @@ class _CompiledWithEagerFallback(nn.Module):
             return self.model(*args, **kwargs)
 
 
+def _uses_cuda(model: nn.Module) -> bool:
+    return any(parameter.is_cuda for parameter in model.parameters())
+
+
 def maybe_compile_model(
     model: nn.Module,
     *,
@@ -204,6 +209,11 @@ def maybe_compile_model(
     if compile_fn is None:
         LOGGER.warning("torch.compile is unavailable; continuing eagerly")
         return model, False
+    if _uses_cuda(model) and not has_triton():
+        # Inductor needs Triton for CUDA kernels. Without it (e.g. native Windows),
+        # compilation only fails at the first forward, after tracing has been paid for.
+        LOGGER.info("Triton is not installed; skipping torch.compile for the CUDA model")
+        return model, False
     try:
         compiled_model = compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False)
     except Exception as exc:
@@ -212,17 +222,27 @@ def maybe_compile_model(
     return _CompiledWithEagerFallback(model, compiled_model), True
 
 
+DEVICE_CHOICES = ("auto", "cpu", "mps", "cuda")
+
+
 def prepare_model_for_inference(
     model: nn.Module,
     *,
     gpu_ids: Sequence[int],
     compile_model: bool,
     compile_mode: str,
+    device_type: str = "auto",
 ) -> tuple[nn.Module, torch.device]:
     """Move, optionally wrap, and optionally compile an inference model."""
 
     requested = tuple(int(device_id) for device_id in gpu_ids)
     compile_enabled = bool(compile_model)
+    if device_type not in DEVICE_CHOICES:
+        raise ValueError(
+            f"--device must be one of {', '.join(DEVICE_CHOICES)}, got {device_type!r}"
+        )
+    if requested and device_type not in ("auto", "cuda"):
+        raise ValueError(f"--gpus selects CUDA devices; it cannot be combined with --device {device_type}")
     if requested:
         if not torch.cuda.is_available():
             raise ValueError("--gpus was provided, but CUDA is unavailable")
@@ -234,10 +254,20 @@ def prepare_model_for_inference(
                 f"visible device count is {visible}"
             )
         device = torch.device(f"cuda:{requested[0]}")
-    else:
+    elif device_type == "auto":
         # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
         # it adds mps for Apple Silicon, which otherwise fell back to cpu here.
         device = get_accelerator()
+    elif device_type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("--device cuda was requested, but CUDA is unavailable")
+        device = torch.device("cuda")
+    elif device_type == "mps":
+        if not torch.backends.mps.is_available():
+            raise ValueError("--device mps was requested, but MPS is unavailable")
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     model = model.to(device)
     if len(requested) > 1:

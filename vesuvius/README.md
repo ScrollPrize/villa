@@ -29,12 +29,13 @@ _this package is in active development_
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
-| `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
-| `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
-| `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
-| `vesuvius.render_obj`         | `rendering.mesh_to_surface`        | renders `.obj` meshes and outputs their surface-volume layers                                                                                                                                             |
-| `vesuvius.flatten_obj`        | `rendering.slim_uv`                | flattens an `.obj` mesh using `slim_uv`                                                                                                                                                                   |
-| `vesuvius.train`              | `models.run.train`                 | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.voxelize_obj`       | `image_proc.run.voxelize_objs`     | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
+| `vesuvius.refine_labels`      | `image_proc.run.edt_frangi_label`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
+| `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
+| `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
+| `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
+| `vesuvius.zarr_tasks`         | `image_proc.run.zarr_tasks.__main__` | runs a Zarr processing task (threshold, scale, transpose, recompress, ...); `--list-tasks` lists them |
 
 
 
@@ -62,19 +63,37 @@ To get started, we recommend these notebooks that jump right in:
 ## Installation
 
 `vesuvius` can be installed with `pip`.
-Then, before using the library for the first time, accept the license terms:
 ```sh
 $ pip install vesuvius
-$ vesuvius.accept_terms --yes
 ```
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
-`uv sync --all-extras` build the local `volume-cartographer` Python bindings from
-C++ source. Install its [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
+`uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
+Python bindings from C++ source. Install their [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
 first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian,
 `qt` in Homebrew), even for headless use. `uv` does not install these system
 libraries. This requirement does not apply to the base `vesuvius` installation
 shown above.
+
+## Data licence
+
+Using the data that `vesuvius` reads means agreeing to these terms:
+
+All Vesuvius Challenge datasets are released under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt), except Scrolls 1–4 and Fragments 1–6, which are bound by the following terms:
+
+By registering for downloads from the EduceLab-Scrolls Dataset and Vesuvius Challenge Discord Server, I agree to license the data from Vesuvius Challenge* under the following licensing terms:
+- I agree that all points below apply to both the EduceLab-Scrolls Dataset downloaded from our webserver, as well as any data (e.g. text, pictures, code) downloaded from the Vesuvius Challenge Discord Server.
+- I will not redistribute the data without the written approval of Vesuvius Challenge (if I am working in a team, every team member will sign this form separately).
+Vesuvius Challenge reserves the right to use in any way, including in an academic or other publication, all submissions or results produced from this dataset.
+- I will not make public (outside of Discord) any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
+- I agree all publications and presentations resulting from any use of the EduceLab-Scrolls Dataset must cite use of the EduceLab-Scrolls Dataset as follows:
+- In any published abstract, I will cite "EduceLab-Scrolls" as the source of the data in the abstract.
+- In any published manuscripts using data from EduceLab-Scrolls, I will reference the following paper: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
+- I will include language similar to the following in the methods section of my manuscripts in order to accurately acknowledge the data source: "Data used in the preparation of this article were obtained from the EduceLab-Scrolls dataset [above citation]."
+- I understand that all submissions will be reviewed by the Vesuvius Challenge Review Team, and that prizes will be awarded as the sole discretion of Vesuvius Challenge.
+When I post or upload data in Discord (e.g. text, pictures, code), I agree to license it to other participants under these same terms.
+
+* All EduceLab-Scrolls data is copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge.
 
 ___
 **Note:** 
@@ -105,8 +124,8 @@ ___
 
 ### Proofreading labels
 
-1. Update the config in `/utils/vc_proofreader/config.py` with the proper paths
-2. Run `vesuvius.proofreader`
+1. The proofreader is no longer a `vesuvius` entrypoint; it lives in [`segmentation/vc_proofreader`](../segmentation/vc_proofreader/main.py)
+2. Run `python segmentation/vc_proofreader/main.py --config <config.json or config.py>` from the repository root
 3. Select your desired patch size and min labeled percentage 
 4. Click `run` 
 5. Approve patches with `a` or by checking the box

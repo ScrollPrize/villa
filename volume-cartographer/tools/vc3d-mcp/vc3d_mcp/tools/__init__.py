@@ -8,7 +8,6 @@ decorators register each tool on the shared ``mcp`` instance in
 from __future__ import annotations
 
 from . import (  # noqa: F401  (imported for their registration side effects)
-    atlas,
     catalog_volume,
     fiber,
     flatten,

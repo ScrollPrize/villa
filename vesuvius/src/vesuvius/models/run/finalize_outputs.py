@@ -47,6 +47,12 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     if is_empty:
         return None, True
 
+    # Blending leaves voxels no patch covered at logits exactly 0 in every
+    # channel. With two or more channels softmax made those p = 0.5 (and
+    # foreground at thresholds below 0.5), the halo of #1114 / #1875; write them
+    # as background. One channel is a sigmoid logit, where 0 is a valid value.
+    uncovered = np.all(logits_np == 0, axis=0) if logits_np.shape[0] >= 2 else None
+
     mode = config.mode
     threshold = config.threshold
     is_multi_task = config.is_multi_task
@@ -123,6 +129,8 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
             softmax_u8 = np.clip(np.rint(softmax * 255.0), 0, 255).astype(np.uint8)
             output_np = np.concatenate([softmax_u8, argmax], axis=0)
+        if uncovered is not None:
+            output_np[:, uncovered] = 0
 
         # Empty chunks were caught above; skip a finalized chunk only when
         # every byte is identical, which is what the old path did after scaling.
@@ -131,6 +139,8 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
         return output_np, False
 
     output_np = np.clip(output_data * 255.0, 0, 255).astype(np.uint8)
+    if uncovered is not None:
+        output_np[:, uncovered] = 0
     return output_np, False
 
 
