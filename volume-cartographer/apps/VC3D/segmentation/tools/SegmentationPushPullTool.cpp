@@ -1061,9 +1061,9 @@ void SegmentationPushPullTool::ensureTimer()
 }
 
 // The layers of a size x size plane patch at `offsets` along `normal`: pixel (0, 0) at
-// `origin`, steps of the plane's basis / scale, sampled linearly from an opened level and
-// truncated to 8 bits as before.
-static std::vector<cv::Mat_<uint8_t>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& origin,
+// `origin`, steps of the plane's basis / scale, sampled linearly from an opened level, as
+// fractions of the 8-bit range (0 where there is no sample).
+static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& origin,
                                                         const cv::Vec3f& normal, cv::Size size, float scale,
                                                         const std::vector<float>& offsets)
 {
@@ -1077,13 +1077,13 @@ static std::vector<cv::Mat_<uint8_t>> samplePatchLayers(const OpenedVolumes::Lev
                                                       {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]},
                                                       size.width, size.height},
                                      request);
-    std::vector<cv::Mat_<uint8_t>> layers(offsets.size());
+    std::vector<cv::Mat_<float>> layers(offsets.size());
     const std::size_t n = std::size_t(size.area());
     for (std::size_t k = 0; k < offsets.size(); ++k) {
         layers[k].create(size);
         for (std::size_t i = 0; i < n; ++i) {
             const float v = r.values[k * n + i];
-            layers[k](int(i)) = std::isnan(v) ? uint8_t(0) : uint8_t(std::clamp(v, 0.0f, 255.0f));
+            layers[k](int(i)) = std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 255.0f) / 255.0f;
         }
     }
     return layers;
@@ -1159,8 +1159,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
 
         const auto layers = samplePatchLayers(level, inputs[i].baseWorld, orientedNormal, patchSize, scale, offsets);
         for (std::size_t k = 0; k < offsets.size() && transparent[i] > 1e-3f; ++k) {
-            layers[k].convertTo(floatPatch, CV_32F, 1.0 / 255.0);
-            cv::GaussianBlur(floatPatch, floatPatch, cv::Size(kernel, kernel), 0);
+            cv::GaussianBlur(layers[k], floatPatch, cv::Size(kernel, kernel), 0);
 
             cv::Mat_<float> opaq = floatPatch;
             opaq = (opaq - cfg.low) / range;
@@ -1278,8 +1277,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     const auto layers = samplePatchLayers(level, centerWorld, orientedNormal, patchSize, scale, offsets);
     cv::Mat sliceFloat(patchSize, CV_32F);
     for (std::size_t k = 0; k < offsets.size(); ++k) {
-        layers[k].convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
-        cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
+        cv::GaussianBlur(layers[k], sliceFloat, cv::Size(kernel, kernel), 0);
 
         cv::Mat_<float> opaq = sliceFloat;
         opaq = (opaq - cfg.low) / range;

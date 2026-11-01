@@ -347,8 +347,8 @@ void SeedingWidget::setDrawEnabled(bool enabled)
     displayPaths();
 }
 
-// Trilinear values of the current volume's working level at XYZ points, truncated
-// to whole numbers as the 8-bit samples were.
+// Trilinear values of the current volume's working level at XYZ points (vc_reader's
+// interpolated floats, clamped to the 8-bit range).
 std::vector<float> SeedingWidget::sampleIntensities(const Volume& volume, const std::vector<cv::Vec3f>& points) const
 {
     const auto level = _state->openedVolumes()->level(volume, 0);
@@ -359,7 +359,7 @@ std::vector<float> SeedingWidget::sampleIntensities(const Volume& volume, const 
     std::vector<float> values(points.size());
     level.array->array->sample_linear(zyx.data(), points.size(), level.array->meta.type, false, values.data());
     for (auto& v : values)
-        v = std::floor(std::clamp(v, 0.0f, 255.0f));
+        v = std::clamp(v, 0.0f, 255.0f);
     return values;
 }
 
