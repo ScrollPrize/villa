@@ -476,6 +476,18 @@ def parse_args():
     parser.add_argument("--gpus", default=None,
                         help="comma-separated GPU indices (default: all visible)")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--precision", choices=("auto", "fp16", "bf16", "fp32"),
+        default="bf16",
+        help="autocast dtype for the model forward. Default bf16 keeps the "
+             "historical behaviour. 'auto' uses bf16 only when the GPU has "
+             "native bf16 (Ampere+), else fp16 (e.g. Turing/RTX 20xx, where "
+             "bf16 may be emulated). fp32 disables autocast")
+    parser.add_argument(
+        "--decode-chunk-l", type=int, default=None, metavar="N",
+        help="run the decoder + full-resolution head in ray-axis chunks of "
+             "N samples (halo 2) to cut peak GPU memory; same math as the "
+             "unchunked forward. Default: unchunked")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the model in each worker (adds "
                              "~a minute of warmup per GPU; pays off on long "
@@ -519,6 +531,10 @@ def parse_args():
              "above 1 reduces cache reads but requires --max-level to cover "
              "the wider retained-anchor gap")
     args = parser.parse_args()
+    if args.decode_chunk_l is not None and args.decode_chunk_l <= 0:
+        parser.error("--decode-chunk-l must be a positive integer")
+    _FORWARD_OPTIONS["precision"] = args.precision
+    _FORWARD_OPTIONS["decode_chunk_l"] = args.decode_chunk_l
     if args.native_phase_only:
         derived_options = {
             "--column-step", "--column-upsample", "--threshold",
@@ -1414,7 +1430,8 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         if phase_only:
             _probs, phases, _records = _forward_batch(
                 batch, model, device, 1, args=None,
-                column_stride=column_stride, out_shape=None)
+                column_stride=column_stride, out_shape=None,
+                forward_args=args)
             phase_writer.add(
                 [item[0] for item in batch], phases,
                 [item[2] for item in batch], [item[3] for item in batch])
@@ -2853,15 +2870,123 @@ def _postprocess_model_fields(
     return probs, phases, records
 
 
+# Fallback forward-pass options for callers of _forward_batch that pass
+# neither args nor forward_args (in-process use); parse_args() records the
+# CLI choice here. Defaults reproduce the historical bf16, unchunked path.
+_FORWARD_OPTIONS = {"precision": "bf16", "decode_chunk_l": None}
+
+
+def _native_bf16_supported():
+    import torch
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:
+        # Older torch: no including_emulation kwarg. Native bf16 needs sm80+.
+        return torch.cuda.get_device_capability()[0] >= 8
+
+
+def resolve_autocast_dtype(precision, device=None):
+    """Map --precision to an autocast dtype (None = no autocast, fp32)."""
+    import torch
+    if precision == "fp32":
+        return None
+    if precision == "fp16":
+        return torch.float16
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "auto":
+        return torch.bfloat16 if _native_bf16_supported() else torch.float16
+    raise ValueError(f"unknown precision {precision!r}")
+
+
+def _chunked_forward_supported(model):
+    return (getattr(model, "full_resolution_head", None) is not None
+            and len(getattr(model, "extra_decoders", ())) == 0
+            and getattr(model, "log_variance_head", None) is None
+            and getattr(model, "crossing_head", None) is None)
+
+
+def chunked_winding_forward(model, slab_image, slab_valid, chunk_l):
+    """WindingModel.forward with the decoder + full-resolution head run in
+    ray-axis chunks of ``chunk_l`` samples.
+
+    The ray axis is never resampled after the trunk (interpolation scale 1
+    on L, the full-resolution head is 1x1 along L), so only the two 3x3x3
+    decoder convs see neighbours; a halo of 2 samples per side makes each
+    chunk exact. Falls back to the stock forward for configurations this
+    path does not cover (extra decoders, log-variance or crossing heads).
+    """
+    import torch
+    import torch.nn.functional as F
+    if not _chunked_forward_supported(model) or chunk_l <= 0:
+        return model(slab_image, slab_valid)
+    image = slab_image.float()
+    valid = slab_valid.float()
+    mass = valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    mean = (image * valid).sum(dim=(1, 2, 3)) / mass
+    centered = (image - mean[:, None, None, None]) * valid
+    std = (centered.square().sum(dim=(1, 2, 3)) / mass).sqrt()
+    image = centered / (std[:, None, None, None] + 1e-6)
+    features = torch.stack([image, valid], dim=1)
+    skips = []
+    for stage in model.stages:
+        features = stage(features)
+        skips.append(features)
+    features = model.trunk_in(features)
+    for block in model.stem_blocks:
+        features = block(features)
+    tokens = features.permute(0, 2, 3, 4, 1)
+    for block in model.attention_blocks:
+        tokens = block(tokens)
+    features = tokens.permute(0, 4, 1, 2, 3)
+    length = features.shape[-1]
+    halo = 2
+    outs = []
+    for s0 in range(0, length, chunk_l):
+        e = min(length, s0 + chunk_l)
+        a = max(0, s0 - halo)
+        b = min(length, e + halo)
+        up = F.interpolate(features[..., a:b], scale_factor=(2, 2, 1),
+                           mode="trilinear", align_corners=False)
+        dec = model.decoder(torch.cat([up, skips[-2][..., a:b]], dim=1))
+        dec = dec[..., s0 - a:s0 - a + (e - s0)]
+        fine = F.interpolate(dec, size=tuple(skips[0].shape[2:4]) + (e - s0,),
+                             mode="trilinear", align_corners=False)
+        outs.append(model._pixel_shuffle_output(
+            model.full_resolution_head(
+                torch.cat([fine, skips[0][..., s0:e]], dim=1)), 2))
+    phase_increments = F.softplus(torch.cat(outs, dim=-1).float())
+    return {"phase": phase_increments.cumsum(dim=-1),
+            "phase_increments": phase_increments}
+
+
 def _forward_batch(batch, model, device, column_upsample=1, *, args=None,
                    column_stride=None, out_shape=None, phase_offsets=None,
-                   phase_seed_windings=None):
+                   phase_seed_windings=None, forward_args=None):
     import torch
 
     images = torch.from_numpy(np.stack([b[1] for b in batch])).to(device)
     valid = torch.from_numpy(np.stack([b[2] for b in batch])).to(device)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        out = model(images, valid.bool())
+    # forward_args carries --precision/--decode-chunk-l on paths that pass
+    # args=None for post-processing (phase cache); spawned GPU workers do
+    # not inherit module globals, so the CLI args are threaded explicitly.
+    opts = forward_args if forward_args is not None else args
+    if opts is not None and hasattr(opts, "precision"):
+        precision = opts.precision
+        chunk_l = getattr(opts, "decode_chunk_l", None)
+    else:
+        precision = _FORWARD_OPTIONS["precision"]
+        chunk_l = _FORWARD_OPTIONS["decode_chunk_l"]
+    dtype = resolve_autocast_dtype(precision, device)
+    forward = model if not chunk_l else (
+        lambda a, b: chunked_winding_forward(model, a, b, int(chunk_l)))
+    if dtype is None:
+        out = forward(images, valid.bool())
+    else:
+        with torch.autocast(torch.device(device).type, dtype=dtype):
+            out = forward(images, valid.bool())
     return _postprocess_model_fields(
         out["phase"], out.get("crossing_logits"), batch, column_upsample,
         args=args, column_stride=column_stride, out_shape=out_shape,
@@ -3814,6 +3939,8 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
             "gpus": str(args.gpus),
             "batch_size": int(args.batch_size),
             "compile": bool(args.compile),
+            "precision": str(getattr(args, "precision", "bf16")),
+            "decode_chunk_l": getattr(args, "decode_chunk_l", None),
             "extract_threads_per_gpu": int(args.extract_threads),
             "decode_workers_per_gpu": int(args.decode_workers),
             "volume_cache_bytes_per_gpu": (
