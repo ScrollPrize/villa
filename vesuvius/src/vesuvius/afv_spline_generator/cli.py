@@ -84,12 +84,21 @@ def open_volume(location: str, level: int):
 
     from vesuvius.data.utils import open_zarr
 
-    store = open_zarr(location)
+    # VC3D also accepts local pyramids with numeric array directories but
+    # no root group metadata. Open the requested physical array directly.
+    root = Path(location)
+    array = root / str(level)
+    implicit_pyramid = (
+        root.is_dir()
+        and not any((root / name).is_file() for name in (".zarray", ".zgroup", "zarr.json"))
+        and any((array / name).is_file() for name in (".zarray", "zarr.json"))
+    )
+    store = open_zarr(str(array) if implicit_pyramid else location)
     if isinstance(store, zarr.Group):
         if str(level) not in store:
             raise ValueError(f"The volume has no array {level}")
         store = store[str(level)]
-    elif level != 0:
+    elif level != 0 and not implicit_pyramid:
         raise ValueError("--level selects an array of an OME-Zarr group")
     if store.ndim != 3:
         raise ValueError(f"Expected a 3D volume, got shape {store.shape}")

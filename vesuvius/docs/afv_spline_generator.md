@@ -23,6 +23,8 @@ uv run --extra models vesuvius.afv_spline_generator \
 
 The volume is a local path or an `http(s)://` or `s3://` URL of a Zarr array
 or OME-Zarr group (`--level` selects the array of a group, `0` by default).
+Local pyramids with numeric array directories and no root group metadata
+are also supported; `--level` selects the numeric directory.
 The zone is given in voxels of that array by its first voxel (`--origin`) and
 its size (`--size`), both in X Y Z order, of any size: it is read one block
 at a time.

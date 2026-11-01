@@ -112,6 +112,38 @@ def test_zone_is_cut_into_blocks():
     assert cli.zone_blocks([0, 0, 0], [1024, 1024, 512], 512)[1] == ([512, 0, 0], [512, 512, 512])
 
 
+@pytest.mark.parametrize("level", [0, 1])
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_opens_local_pyramid_without_group_metadata(tmp_path, level, zarr_format):
+    if int(zarr.__version__.split(".")[0]) < 3:
+        if zarr_format == 3:
+            pytest.skip("Zarr v3 requires zarr>=3")
+        options = {}
+    else:
+        options = {"zarr_format": zarr_format}
+    root = tmp_path / "volume.zarr"
+    expected = np.arange(8 * 6 * 4, dtype=np.uint8).reshape(8, 6, 4)
+    array = zarr.open_array(str(root / str(level)), mode="w", shape=expected.shape,
+                            chunks=(4, 3, 2), dtype="u1", **options)
+    array[:] = expected
+    # Legacy volume roots may contain attributes, but no group marker.
+    (root / ".zattrs").write_text("{}")
+    files_before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    opened = cli.open_volume(str(root), level)
+
+    assert np.array_equal(opened[:], expected)
+    assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == files_before
+
+
+def test_standalone_array_does_not_accept_a_group_level(tmp_path):
+    path = tmp_path / "array.zarr"
+    zarr.open_array(str(path), mode="w", shape=(8, 6, 4), chunks=(4, 3, 2), dtype="u1")
+    assert cli.open_volume(str(path), 0).shape == (8, 6, 4)
+    with pytest.raises(ValueError, match="selects an array of an OME-Zarr group"):
+        cli.open_volume(str(path), 1)
+
+
 @pytest.mark.parametrize("spilled", [False, True])
 def test_region_reader_matches_the_volume(volume, tmp_path, spilled):
     array = cli.open_volume(str(volume), 0)
