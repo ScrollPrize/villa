@@ -3,6 +3,7 @@ import os
 import numpy as np
 import pytest
 from vc_object_store import ObjectStore, RegionSlice, RegionOptions
+from vc3d_fiber_format import parse_vc3d_fiber_format
 from vesuvius.afv_spline_generator.store import Fiber, write_store
 
 COORDINATES = {"volume_uuid": "20250101000000", "scale_factor": 1}
@@ -40,6 +41,18 @@ def test_round_trip(tmp_path):
                 view = snapshot.fiber(row["uuid"])
                 assert np.array_equal(view.line_points_array(), source.points)
                 assert np.array_equal(view.control_points_array(), source.points[[0, -1]])
+                # Check the editor's fiber-format contract as well as the
+                # store round trip: segment modes are not fiber modes.
+                parsed = parse_vc3d_fiber_format({
+                    **row["meta"]["source"],
+                    "optimization_mode": row["fiber"]["optimization_mode"],
+                    "control_points": [
+                        {"position": point.tolist()}
+                        for point in view.control_points_array()
+                    ],
+                    "line_points": view.line_points_array().tolist(),
+                })
+                assert parsed.optimization_mode == "lasagna"
         # VC3D uses these volume-targeted slab queries at the displayed level.
         slab = RegionSlice()
         slab.local_bounds = [0, 45, 495, 150, 55, 570]

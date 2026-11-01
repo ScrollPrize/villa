@@ -93,7 +93,7 @@ def write_store(
                     geometry = StoredFiber.from_arrays(np.ascontiguousarray(controls), points)
                     uid = tx.upsert_object(dict(
                         uuid=str(uuid.uuid4()), kind="fiber", name=fiber.name, format_version=4,
-                        fiber=dict(family=fiber.family, manual_family=bool(fiber.family), optimization_mode="cspline",
+                        fiber=dict(family=fiber.family, manual_family=bool(fiber.family), optimization_mode="lasagna",
                                    control_point_count=len(controls), line_point_count=len(points), length=geometry.length()),
                         meta={**extra, "coordinates": dict(coordinates), "source": source},
                     ))
