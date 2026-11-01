@@ -62,5 +62,5 @@ private:
     std::size_t gpuCacheBytes_ = 0;
     std::map<std::pair<std::string, int>, std::shared_ptr<vcr::zarr::OpenedArray>> levels_;  // (location, level)
     std::map<const vcr::Array*, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
-    std::map<std::string, Pyramid> pyramids_;  // by location
+    std::map<std::pair<std::string, int>, Pyramid> pyramids_;  // (location, working base): levels are renumbered from the base
 };

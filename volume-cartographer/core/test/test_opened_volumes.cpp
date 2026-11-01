@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "../../apps/VC3D/OpenedVolumes.hpp"
+#include "support/LoopbackHttpServer.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Volume.hpp"
 
@@ -61,5 +62,49 @@ TEST_CASE("OpenedVolumes shares opened levels and maps coordinates through place
         centre[axis] = coarse.array->placement.fromLevel0(axis, coarse.working.toLevel0(axis, 4.5));
     coarse.array->array->sample_linear(centre, 1, coarse.array->meta.type, false, &value);
     CHECK(value == float(level1[(2 * 8 + 2) * 8 + 2]));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("OpenedVolumes describes each working base of one source, sharing the physical arrays")
+{
+    // Physical levels 0, 1, 2 served over loopback HTTP; working base 0 sees three working
+    // levels, base 1 two, whichever is asked first, and both bases open the same arrays.
+    const auto dir = fs::temp_directory_path() /
+                     ("vc-opened-volumes-bases-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    vc::test::ZarrVolumeSpec spec;
+    spec.shapeZYX = {16, 16, 16};
+    spec.chunkShapeZYX = {8, 8, 8};
+    spec.numLevels = 3;
+    REQUIRE(vc::test::createZarrVolume(dir, spec));
+    vc::test::LoopbackHttpServer server;
+    server.serveDirectory(dir, "/vol.zarr");
+    const std::string url = server.url() + "/vol.zarr";
+
+    const auto describe = [&](OpenedVolumes& opened, const std::vector<int>& bases) {
+        std::vector<std::vector<int>> levels;
+        std::vector<const vcr::Array*> physical1;
+        for (const int base : bases) {
+            const auto volume = Volume::NewFromUrl(base ? url + "#vc-base-scale=" + std::to_string(base) : url);
+            REQUIRE(volume->baseScaleLevel() == base);
+            levels.push_back(opened.pyramid(*volume).levels);
+            // Working level 1 - base of each volume is physical level 1.
+            physical1.push_back(opened.level(*volume, 1 - base).array->array.get());
+            CHECK(opened.pyramid(*volume).levels == levels.back());  // a repeated hit
+        }
+        CHECK(physical1[0] == physical1[1]);
+        return levels;
+    };
+    {
+        OpenedVolumes opened(64 << 20);
+        const auto levels = describe(opened, {0, 1});
+        CHECK(levels[0] == std::vector<int>{0, 1, 2});
+        CHECK(levels[1] == std::vector<int>{0, 1});
+    }
+    {
+        OpenedVolumes opened(64 << 20);
+        const auto levels = describe(opened, {1, 0});
+        CHECK(levels[0] == std::vector<int>{0, 1});
+        CHECK(levels[1] == std::vector<int>{0, 1, 2});
+    }
     fs::remove_all(dir);
 }

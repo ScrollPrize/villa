@@ -45,14 +45,16 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
 const OpenedVolumes::Pyramid& OpenedVolumes::pyramid(const Volume& volume)
 {
     std::lock_guard lock(mutex_);
-    const auto location = volume.sourceLocation();
-    if (const auto found = pyramids_.find(location); found != pyramids_.end())
+    // Two working bases of one source describe different working pyramids, so the
+    // description is kept per base; the opened physical arrays are shared regardless.
+    const std::pair<std::string, int> key{volume.sourceLocation(), volume.baseScaleLevel()};
+    if (const auto found = pyramids_.find(key); found != pyramids_.end())
         return found->second;
     Pyramid result;
-    for (const auto& level : vcr::zarr::pyramidLevels(location, volume.sourceOpenOptions())) {
-        if (level.level >= volume.baseScaleLevel())
-            result.levels.push_back(level.level - volume.baseScaleLevel());
+    for (const auto& level : vcr::zarr::pyramidLevels(key.first, volume.sourceOpenOptions())) {
+        if (level.level >= key.second)
+            result.levels.push_back(level.level - key.second);
         result.dtype = level.meta.dtype;
     }
-    return pyramids_.emplace(location, std::move(result)).first->second;
+    return pyramids_.emplace(key, std::move(result)).first->second;
 }
