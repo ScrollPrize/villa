@@ -959,9 +959,7 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
 
 void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
 {
-    _overlaySamplingMethod = method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
+    _overlaySamplingMethod = method;
     forEachBaseViewer([this](VolumeViewerBase* v) {
         v->setOverlaySamplingMethod(_overlaySamplingMethod);
     });
