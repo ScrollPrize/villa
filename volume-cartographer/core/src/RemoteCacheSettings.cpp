@@ -201,8 +201,9 @@ fs::path settingsFilePath()
 fs::path remoteCachePath()
 {
     static const fs::path active = [] {
-        // Preserve the explicit host override used by headless fiber tools.
-        // Without it, use the shared upstream INI settings and mount defaults.
+        // cache.json (the explicit host override, also used by headless fiber tools and
+        // read by vc_reader's "vc3d" cache entry), then the INI, then globalCacheRoot's
+        // provisioned mounts and ~/.VC3D/remote_cache.
         if (fs::exists(vc::core::util::vc3dConfigDirectory() / "cache.json")) {
             return ensureWritableDirectory(vc::core::util::globalCacheRoot());
         }
@@ -210,19 +211,7 @@ fs::path remoteCachePath()
             !configured.empty()) {
             return ensureWritableDirectory(std::move(configured));
         }
-
-        for (const fs::path root : {fs::path("/volpkgs"), fs::path("/ephemeral")}) {
-            std::error_code ec;
-            if (!fs::exists(root, ec) || ec)
-                continue;
-            if (!fs::is_directory(root, ec) || ec) {
-                throw std::runtime_error(
-                    "Remote cache root '" + root.string() + "' is not a directory");
-            }
-            return ensureWritableDirectory(root / "remote_cache");
-        }
-
-        return ensureWritableDirectory(homeDirectory() / ".VC3D" / "remote_cache");
+        return ensureWritableDirectory(vc::core::util::globalCacheRoot());
     }();
     return active;
 }

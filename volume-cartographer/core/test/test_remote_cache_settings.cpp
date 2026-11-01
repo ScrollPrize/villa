@@ -13,6 +13,21 @@
 
 namespace fs = std::filesystem;
 
+// First in the file: remoteCachePath resolves once per process.
+TEST_CASE("remoteCachePath takes cache.json before the INI and creates the root")
+{
+    const auto config = fs::temp_directory_path() / ("vc_remote_cache_path_" + std::to_string(vc::memmap::pid()));
+    fs::remove_all(config);
+    fs::create_directories(config);
+    setenv("VC3D_CONFIG_DIR", config.c_str(), 1);
+    const fs::path root = config / "configured" / "cache";
+    std::ofstream(config / "VC3D.ini") << "[viewer]\nremote_cache_dir=" << (config / "ini-cache").string() << "\n";
+    std::ofstream(config / "cache.json") << "{\"version\":1,\"root\":\"" << root.string() << "\"}";
+    CHECK(vc::settings::remoteCachePath() == root.lexically_normal());
+    CHECK(fs::is_directory(root));
+    CHECK_FALSE(fs::exists(config / "ini-cache"));
+}
+
 TEST_CASE("remoteOpenOptions maps the INI to vc_reader options")
 {
     const auto config = fs::temp_directory_path() / ("vc_remote_cache_settings_" + std::to_string(vc::memmap::pid()));
