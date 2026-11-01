@@ -1388,7 +1388,9 @@ def infer_single_zarr(
     }
     if args.num_workers > 0:
         loader_kwargs.update(
-            persistent_workers=True,
+            # Each surface consumes its loader once. Persistent pinned workers
+            # retain process handles through PyTorch's atexit registrations.
+            persistent_workers=False,
             prefetch_factor=args.prefetch_factor,
             multiprocessing_context="spawn",
         )
