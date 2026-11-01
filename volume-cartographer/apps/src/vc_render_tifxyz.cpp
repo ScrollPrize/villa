@@ -1179,7 +1179,7 @@ int main(int argc, char *argv[])
     optional.add_options()
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
-        ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
+        ("cache-gb", po::value<size_t>(), "Zarr chunk cache size in GB (default: 16, or half the memory available to this process if that is less)")
         ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch the chunks this render reads into the shared remote cache before rendering instead of streaming them during the render")
         ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
@@ -1504,10 +1504,22 @@ int main(int argc, char *argv[])
     // --- Open source volume ---
     const int cacheLevel = group_idx;
 
-    const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
-    if (const size_t mem = usableMemoryBytes(); mem > 0 && cache_bytes >= mem)
-        logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
-                  (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / (1024.0 * 1024.0 * 1024.0));
+    // Without --cache-gb: 16 GB, or half the memory this process can use if that is less.
+    // A cache as large as the memory limit gets the render killed or stalled (#1404), and
+    // VC3D's Render segment never passes --cache-gb.
+    constexpr size_t gib = 1024ull * 1024ull * 1024ull;
+    const size_t mem = usableMemoryBytes();
+    size_t cache_bytes = 16 * gib;
+    if (parsed.count("cache-gb")) {
+        cache_bytes = parsed["cache-gb"].as<size_t>() * gib;
+        if (mem > 0 && cache_bytes >= mem)
+            logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
+                      (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / double(gib));
+    } else if (mem > 0 && cache_bytes > mem / 2) {
+        cache_bytes = mem / 2;
+        logPrintf(stdout, "Chunk cache: %.1f GB, half the memory available to this process (%.1f GB). Pass --cache-gb to change it.\n",
+                  double(cache_bytes) / double(gib), double(mem) / double(gib));
+    }
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     std::shared_ptr<Volume> remoteVolume;
     std::shared_ptr<vc::render::ChunkCache> remoteCache;
