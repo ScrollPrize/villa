@@ -38,6 +38,20 @@ def test_planes_follow_global_spacing_independently_of_tile_boundaries(axis, spa
 
 
 @pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('boundary', [206, 207, 208])
+def test_quantized_planes_stay_in_their_tile_at_roundoff_boundaries(axis, boundary):
+    presence = fiber_presence(axis)
+    # 90 * 2.3 is 206.99999999999997: its integer plane belongs to the tile containing voxel 206.
+    whole = plane_seeds(presence, axis, 2.3, 16, 224)
+    left = plane_seeds(presence, axis, 2.3, 16, boundary)
+    right = plane_seeds(presence, axis, 2.3, boundary, 224)
+    assert 206 in whole[:, axis]
+    assert np.all(left[:, axis] < boundary)
+    assert np.all(right[:, axis] >= boundary)
+    np.testing.assert_array_equal(np.concatenate([left, right]), whole)
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
 @pytest.mark.parametrize('spacing', [.75, 1e-9])
 def test_fractional_spacing_below_one_visits_each_plane_once(axis, spacing, monkeypatch):
     original_arange = np.arange
