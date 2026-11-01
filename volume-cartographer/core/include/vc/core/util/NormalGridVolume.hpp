@@ -14,8 +14,10 @@
 namespace vc::core::util {
 
     // Marker file inside a normal-grid directory that turns it into a streaming
-    // cache: {"url": "<https prefix>"}. Grid files missing locally are fetched
-    // from the URL on demand and stored alongside the marker.
+    // cache: {"url": "<https prefix>"}. The directory must be the URL's place under
+    // a cache root, <root>/<scheme>/<host>/<path> (vcr::zarr::decodedCachePath, as
+    // VC3D lays it out); grid files missing locally are downloaded there by
+    // vc_reader's file cache under that root's disk budget and free-space floor.
     inline constexpr const char* kNormalGridsRemoteMarker = "normal-grids-remote.json";
 
     // The URL a normal-grid directory's marker records (trailing slashes
@@ -40,6 +42,10 @@ namespace vc::core::util {
             size_t decodedPathBytes = 0;
             size_t bucketIndexEntries = 0;
             size_t bucketIndexBytes = 0;
+            // Streaming stores: fetches that failed for a reason other than the
+            // file not existing (network, low disk space), and the last such message.
+            uint64_t fetchFailures = 0;
+            std::string lastFetchError;
         };
 
         explicit NormalGridVolume(const std::string& path);

@@ -132,7 +132,9 @@ TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
     // vc_grow_seg_from_seed. It must now throw an intentional error that names
     // the remote source. The marker points at a port that refuses connections
     // so the fetch fails fast without touching external network.
-    auto d = tmpDir("remote_fetch_fail");
+    // The marker directory is the URL's place under a cache root.
+    auto d = tmpDir("remote_fetch_fail") / "http" / "127.0.0.1:1" / "nonexistent-normal-grids";
+    fs::create_directories(d);
     {
         std::ofstream f(d / "normal-grids-remote.json");
         f << "{\"url\": \"http://127.0.0.1:1/nonexistent-normal-grids\"}";
@@ -150,7 +152,7 @@ TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
     CHECK(msg.find("Failed to fetch remote normal-grid") != std::string::npos);
     CHECK(msg.find("127.0.0.1:1") != std::string::npos);
     CHECK(msg.find("Cannot open") == std::string::npos);
-    fs::remove_all(d);
+    fs::remove_all(d.parent_path().parent_path().parent_path());
 }
 
 TEST_CASE("Constructor + metadata accessor")

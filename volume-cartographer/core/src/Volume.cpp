@@ -508,24 +508,17 @@ std::string Volume::sourceLocation() const
 
 vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
 {
-    vcr::zarr::OpenOptions options;
     if (!isRemote_)
-        return options;
+        return {};
+    // Chunks live at <root>/<scheme>/<bucket>/<path>, shared with every vc_reader
+    // user of the root. A volume cached by an earlier VC3D keeps its own folder.
+    auto options = vc::settings::remoteOpenOptions(remoteCacheRoot_);
     if (!remoteAuth_.kind.empty())
         options.access = vcr::zarr::s3Access(sourceLocation(), remoteAuth_);
     if (!remoteCacheRoot_.empty()) {
-        // Chunks live at <root>/<scheme>/<bucket>/<path>, shared with every vc_reader
-        // user of the root. A volume cached by an earlier VC3D keeps its own folder.
-        options.cacheDirs = {remoteCacheRoot_.string()};
         options.compressCache = vc::settings::remoteCacheDelta3dEnabled();
         if (const auto folder = remoteCacheRoot_ / remoteSourceCacheId_; std::filesystem::is_directory(folder))
             options.vc3dVolumeDir = folder;
-        options.cacheMaxBytes = vc::settings::remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
-        options.cacheMinFreeBytes = vc::settings::remoteCacheMinFreeBytes();
-    }
-    if (const auto parallelism = vc::settings::remoteDownloadParallelism()) {
-        options.connections = *parallelism;
-        options.threads = static_cast<std::size_t>(*parallelism);
     }
     return options;
 }

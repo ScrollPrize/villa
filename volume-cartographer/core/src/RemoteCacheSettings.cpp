@@ -284,4 +284,19 @@ std::optional<int> remoteDownloadParallelism()
         iniNumber("remote_download_parallelism", kRemoteDownloadParallelismDefault), 1, 64));
 }
 
+vcr::zarr::OpenOptions remoteOpenOptions(const fs::path& root)
+{
+    vcr::zarr::OpenOptions options;
+    if (!root.empty()) {
+        options.cacheDirs = {root.string()};
+        options.cacheMaxBytes = remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
+        options.cacheMinFreeBytes = remoteCacheMinFreeBytes();
+    }
+    if (const auto parallelism = remoteDownloadParallelism()) {
+        options.connections = *parallelism;
+        options.threads = static_cast<std::size_t>(*parallelism);
+    }
+    return options;
+}
+
 } // namespace vc::settings
