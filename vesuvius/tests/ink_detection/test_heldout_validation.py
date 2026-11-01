@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,10 +14,9 @@ from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset
 from vesuvius.ink_detection.data.heldout import (
     assert_heldout_isolated,
-    crop_overlap_pairs,
     partition_heldout,
 )
-from vesuvius.ink_detection.types import Patch, Segment
+from vesuvius.ink_detection.types import Patch
 
 from .test_data_foundation import _write_pyramid
 
@@ -176,13 +174,45 @@ def test_partition_drops_validation_windows_inside_training_data(tmp_path, roots
     assert partition_heldout(only_a.patches) == only_a.training_patches
 
 
+def test_promoted_patches_preserve_supervision_excluding_validation(tmp_path, roots):
+    a, b = roots
+    _write_segment(
+        b, "overlapping", supervision=_mask(slice(None), slice(None)),
+        validation=_mask(slice(None), slice(8, 16)), seed=3,
+    )
+    original = _dataset(tmp_path / "original", [_source(b, "overlapping", "B")])
+    held = _dataset(tmp_path / "held", [
+        _source(a, "a", "A"), _source(b, "overlapping", "B", "validation"),
+    ])
+    expected = {
+        (p.bbox, p.is_validation): original[index]["supervision_mask"]
+        for index, p in enumerate(original.patches)
+    }
+    promoted = {
+        p.bbox: held[index]["supervision_mask"]
+        for index, p in enumerate(held.patches)
+        if p.exclude_validation_mask
+    }
+    checked_overlap = False
+    for index, patch in enumerate(held.patches):
+        if not patch.is_validation:
+            continue
+        was_validation = not patch.exclude_validation_mask
+        actual = held[index]["supervision_mask"]
+        assert torch.equal(actual, expected[patch.bbox, was_validation])
+        if was_validation and patch.bbox in promoted:
+            assert not torch.any((actual > 0) & (promoted[patch.bbox] > 0))
+            checked_overlap = True
+    assert checked_overlap
+
+
 def test_isolation_guard_passes_and_reports(tmp_path, roots):
     a, b = roots
     held = _dataset(tmp_path / "held", [_source(a, "a", "A"), _source(b, "b", "B", "validation")])
     report = assert_heldout_isolated(
         held.training_patches, held.validation_patches, held.config, held.segments
     )
-    assert report["overlapping_crop_pairs"] == 0 and report["shared_assets"] == 0
+    assert report["shared_assets"] == 0
     assert report["training_scrolls"] == ["A"] and report["validation_scrolls"] == ["B"]
     assert report["validation_segments"] == ["1:b"]
     assert report["validation_patches"] == len(held.validation_patches)
@@ -210,6 +240,25 @@ def test_isolation_guard_refuses_a_split_that_is_not_isolated(
         )
 
 
+@pytest.mark.parametrize("alias_kind", ["relative", "symlink"])
+def test_isolation_guard_refuses_image_path_aliases(tmp_path, roots, monkeypatch, alias_kind):
+    a, b = roots
+    image = a / "a" / "surface.zarr"
+    monkeypatch.chdir(tmp_path)
+    if alias_kind == "relative":
+        alias = image.relative_to(tmp_path)
+    else:
+        alias = tmp_path / "alias.zarr"
+        alias.symlink_to(image, target_is_directory=True)
+    held = _dataset(tmp_path / "held", [
+        _source(a, "a", "A"), _source(b, "b", "B", "validation", surface=alias),
+    ])
+    with pytest.raises(ValueError, match="shares image volumes"):
+        assert_heldout_isolated(
+            held.training_patches, held.validation_patches, held.config, held.segments
+        )
+
+
 def test_isolation_guard_refuses_a_heldout_segment_with_no_patches(tmp_path, roots):
     a, b = roots
     held = _dataset(tmp_path / "held", [_source(a, "a", "A"), _source(b, "b", "B", "validation")])
@@ -228,51 +277,6 @@ def test_isolation_guard_refuses_when_one_of_several_heldout_segments_is_missing
     assert only_b and len(only_b) < len(held.validation_patches)
     with pytest.raises(ValueError, match=r"found no patches for \['c'\]"):
         assert_heldout_isolated(held.training_patches, only_b, held.config, held.segments)
-
-
-def _box_patch(volume: str, bbox: tuple) -> Patch:
-    segment = Segment(
-        data_config=None, source=SimpleNamespace(volume_scale=0), dataset_idx=0,
-        segment_relpath="s", segment_dir=Path("s"), segment_name="s", image_volume=volume,
-    )
-    return Patch(segment=segment, bbox=bbox)
-
-
-def test_crop_overlap_pairs_matches_brute_force_and_ignores_touching_faces():
-    base = _box_patch("v", (0, 0, 0, 3, 4, 4))
-    touching = _box_patch("v", (0, 0, 4, 3, 4, 8))
-    one_voxel = _box_patch("v", (2, 3, 3, 5, 7, 7))
-    elsewhere = _box_patch("w", (0, 0, 0, 3, 4, 4))
-    assert crop_overlap_pairs([base], [touching]) == 0
-    assert crop_overlap_pairs([base], [one_voxel]) == 1
-    assert crop_overlap_pairs([base], [elsewhere]) == 0
-
-    rng = random.Random(7)
-
-    def boxes(count):
-        out = []
-        for _ in range(count):
-            z, y, x = (rng.randrange(0, 30) for _ in range(3))
-            d, h, w = (rng.randrange(1, 7) for _ in range(3))
-            out.append(_box_patch(rng.choice("vw"), (z, y, x, z + d, y + h, x + w)))
-        return out
-
-    train, val = boxes(300), boxes(120)
-    brute = sum(
-        t.image_volume == v.image_volume
-        and all(t.bbox[i] < v.bbox[i + 3] and v.bbox[i] < t.bbox[i + 3] for i in range(3))
-        for t in train
-        for v in val
-    )
-    assert brute > 0
-    assert crop_overlap_pairs(train, val) == brute
-
-
-def test_default_split_shares_crops_between_training_and_validation(tmp_path, roots):
-    a, _ = roots
-    only_a = _dataset(tmp_path / "only-a", [_source(a, "a", "A")])
-    shared = crop_overlap_pairs(only_a.training_patches, only_a.validation_patches)
-    assert shared > 0, "the fixture must reproduce the in-segment overlap the split removes"
 
 
 def test_patch_cache_from_before_a_dataset_was_added_is_rebuilt(tmp_path, roots):
@@ -352,7 +356,7 @@ def test_real_training_entry_validates_only_on_the_heldout_dataset(
     ]
     assert len(printed) == 1, printed
     report = json.loads(printed[0].split("=", 1)[1])
-    assert report["validation_segments"] == ["1:b"] and report["overlapping_crop_pairs"] == 0
+    assert report["validation_segments"] == ["1:b"] and report["shared_assets"] == 0
     records = [
         json.loads(line)
         for line in (tmp_path / "output" / "validation_metrics.jsonl").read_text().splitlines()

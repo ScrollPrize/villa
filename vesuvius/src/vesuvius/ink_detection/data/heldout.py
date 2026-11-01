@@ -11,13 +11,12 @@ training, and validation reads nothing else.
 
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
-from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import replace
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Patch, Segment
+from vesuvius.ink_detection.volume_io import normalized_source_path
 
 
 def has_heldout_validation(config: InkDataConfig) -> bool:
@@ -32,7 +31,8 @@ def partition_heldout(patches: Sequence[Patch]) -> list[Patch]:
     Training patches of training datasets come back unchanged and in their original
     order, so the training side of a run is the same as without the held-out datasets.
     A held-out dataset's training windows become validation patches scored on its
-    supervision mask; its validation-mask windows stay validation patches.
+    supervision mask excluding validation voxels; its validation-mask windows stay
+    validation patches.
     """
     partitioned: list[Patch] = []
     for patch in patches:
@@ -44,49 +44,12 @@ def partition_heldout(patches: Sequence[Patch]) -> list[Patch]:
                     patch,
                     is_validation=True,
                     supervision_mask_override=patch.segment.supervision_mask,
+                    exclude_validation_mask=True,
                 )
             )
         elif not patch.is_validation:
             partitioned.append(patch)
     return partitioned
-
-
-def _volume_key(patch: Patch) -> tuple[str, int]:
-    return str(patch.image_volume), int(patch.segment.scale)
-
-
-def crop_overlap_pairs(
-    training: Sequence[Patch], validation: Sequence[Patch]
-) -> int:
-    """Count training/validation crop pairs that share a voxel of one image volume.
-
-    Boxes are half-open ZYX bounds, so crops that only touch along a face do not count.
-    """
-    boxes: dict[tuple[str, int], tuple[list, list]] = defaultdict(lambda: ([], []))
-    for patch in training:
-        boxes[_volume_key(patch)][0].append(tuple(int(v) for v in patch.bbox))
-    for patch in validation:
-        boxes[_volume_key(patch)][1].append(tuple(int(v) for v in patch.bbox))
-    pairs = 0
-    for train_boxes, val_boxes in boxes.values():
-        if not train_boxes or not val_boxes:
-            continue
-        train_boxes.sort(key=lambda box: box[1])
-        starts = [box[1] for box in train_boxes]
-        tallest = max(box[4] - box[1] for box in train_boxes)
-        for vz0, vy0, vx0, vz1, vy1, vx1 in val_boxes:
-            lo = bisect_right(starts, vy0 - tallest)
-            hi = bisect_left(starts, vy1)
-            for tz0, ty0, tx0, tz1, ty1, tx1 in train_boxes[lo:hi]:
-                if (
-                    ty1 > vy0
-                    and tx0 < vx1
-                    and tx1 > vx0
-                    and tz0 < vz1
-                    and tz1 > vz0
-                ):
-                    pairs += 1
-    return pairs
 
 
 def assert_heldout_isolated(
@@ -99,9 +62,9 @@ def assert_heldout_isolated(
 
     Held-out datasets must name a scroll that no training dataset uses, so the two
     sides are different physical objects; they must share no image volume, segment
-    directory or label asset; and no validation crop may share a voxel with a
-    training crop. Every held-out segment must contribute validation patches, so a
-    stale patch cache cannot drop one quietly. Returns the counts that were checked.
+    directory or label asset (resolving local path aliases). Every held-out segment
+    must contribute validation patches, so a stale patch cache cannot drop one
+    quietly. Returns the counts that were checked.
     """
     sources = config.datasets
     for index, source in enumerate(sources):
@@ -151,18 +114,13 @@ def assert_heldout_isolated(
                 )
                 if value is not None
             )
-        return found
+        return {normalized_source_path(value) for value in found}
 
     shared_assets = sorted(assets(training) & assets(validation))
     if shared_assets:
         raise ValueError(
             "held-out validation shares image volumes, segment directories or label "
             f"assets with training: {shared_assets[:3]}"
-        )
-    overlaps = crop_overlap_pairs(training, validation)
-    if overlaps:
-        raise ValueError(
-            f"{overlaps} validation crops share voxels with training crops"
         )
     return {
         "training_patches": len(training),
@@ -173,5 +131,4 @@ def assert_heldout_isolated(
             {f"{p.segment.dataset_idx}:{p.segment.segment_relpath}" for p in validation}
         ),
         "shared_assets": 0,
-        "overlapping_crop_pairs": overlaps,
     }

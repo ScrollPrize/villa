@@ -338,7 +338,9 @@ class InkDataset(Dataset):
             supervision, _ = read_bbox_with_padding(
                 supervision_volume, bbox, fill_value=0
             )
-            if not patch.is_validation and patch.segment.validation_mask is not None:
+            if (
+                not patch.is_validation or patch.exclude_validation_mask
+            ) and patch.segment.validation_mask is not None:
                 validation_volume = self._open(
                     patch.segment.validation_mask, patch.segment.scale
                 )

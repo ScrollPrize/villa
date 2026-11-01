@@ -309,14 +309,15 @@ By default validation windows come from each training segment's
 crop can cover image voxels that neighbouring training crops also read, so the
 score measures interpolation within segments the model was trained on. Marking a
 dataset `"split": "validation"` holds it out whole: every window it would have
-trained on is scored on its supervision mask (its own `_validation_mask` windows
-are scored too), none of it is trained on, and in-segment validation windows of
-training datasets are dropped. The training patches of training datasets do not
-change. The trainer refuses the split, before the first step, unless every
+trained on is scored on its supervision mask excluding validation voxels
+(its own `_validation_mask` windows are scored too), none of it is trained on,
+and in-segment validation windows of training datasets are dropped. The training
+patches of training datasets do not change. The trainer refuses the split,
+before the first step, unless every
 dataset sets `sampling_scroll` and no held-out scroll is also a training scroll,
-the two sides share no image volume, segment directory or label asset, every
-held-out segment yields patches, and no validation crop shares a voxel with a
-training crop. It prints the checked counts as `heldout_validation={...}`.
+the two sides share no image volume, segment directory or label asset (local
+path aliases are resolved), and every held-out segment yields patches. It prints
+the checked counts as `heldout_validation={...}`.
 With `val_steps` at least the number of held-out batches, each validation pass
 scores the whole held-out set.
 
