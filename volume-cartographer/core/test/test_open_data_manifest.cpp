@@ -724,6 +724,22 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(entries[0].location == vcr::zarr::decodedCachePath(root, infos[0].url).string());
     CHECK(entries[1].location == vcr::zarr::decodedCachePath(root, infos[1].url).string());
 
+    // The cache state counts the store's own files: grids and metadata, not the markers,
+    // not what the file cache has in flight, not markers an older VC3D left.
+    {
+        const auto dir = vcr::zarr::decodedCachePath(root, infos[0].url);
+        std::filesystem::create_directories(dir / "xy");
+        std::ofstream(dir / "metadata.json") << "{}";
+        std::ofstream(dir / "xy" / "000000.grid") << "0123456789";
+        std::ofstream(dir / "xy" / "000001.grid.tmp.123.456") << "abc";
+        std::ofstream(dir / "xy" / "000002.grid.missing").flush();
+        const auto state = normalGridsCacheState(root, sample.id, sample.volumes.front());
+        CHECK(state.hasArtifact);
+        CHECK_FALSE(state.complete);
+        CHECK(state.cachedFiles == 2);
+        CHECK(state.cachedBytes == 12);
+    }
+
     // A store attached from another cache directory gives way to this one.
     const auto other = root / "normal_grids" / "old";
     REQUIRE(vc::core::util::writeNormalGridsRemoteMarker(other, infos[0].url));

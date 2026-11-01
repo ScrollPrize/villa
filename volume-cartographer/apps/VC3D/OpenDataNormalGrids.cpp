@@ -299,10 +299,10 @@ NormalGridsCacheState normalGridsCacheState(
                 break;
             if (!it->is_regular_file(ec))
                 continue;
+            // The store's own files: grids and metadata. Not the markers, nor whatever
+            // the file cache has in flight.
             const auto name = it->path().filename().string();
-            if (name == vc::core::util::kNormalGridsRemoteMarker ||
-                name.ends_with(".missing") ||
-                name.find(".tmp-") != std::string::npos)
+            if (!name.ends_with(".grid") && !(name.starts_with("metadata") && name.ends_with(".json")))
                 continue;
             state.cachedBytes += it->file_size(ec);
             ++state.cachedFiles;
