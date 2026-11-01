@@ -18,6 +18,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
 #include "files.hpp"
+#include "../chunk_io.hpp"
 
 #include <cmath>
 #include <fstream>
@@ -411,31 +412,26 @@ bool detail::writeCacheMetadata(const fs::path& path, const std::string& data, c
     return budget->write_metadata(fs::weakly_canonical(path).string(), reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
 }
 
-void atomicWrite(const fs::path& path, const std::string& data)
+void atomicWrite(const fs::path& path, const std::string& data, Durability durability)
 {
-    detail::atomicWriteFile(path, [&](std::ostream& out) { out.write(data.data(), std::streamsize(data.size())); });
+    atomicWrite(path, data.data(), data.size(), durability);
+}
+
+void atomicWrite(const fs::path& path, const void* data, std::size_t size, Durability durability)
+{
+    AtomicFile file(path.string());  // its destructor removes the temporary of a failed write
+    file.write(static_cast<const std::uint8_t*>(data), size);
+    file.publish(durability == Durability::Fsync);
 }
 
 void detail::atomicWriteFile(const fs::path& path, const std::function<void(std::ostream&)>& write)
 {
-    fs::create_directories(path.parent_path());
-    std::ostringstream suffix;
-    suffix << ".tmp." << getpid() << "." << std::this_thread::get_id();
-    const auto tmp = path.string() + suffix.str();
-    try {
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            write(out);
-            out.close();
-            if (!out)
-                throw std::runtime_error("cannot write " + tmp);
-        }
-        fs::rename(tmp, path);
-    } catch (...) {
-        std::error_code ec;
-        fs::remove(tmp, ec);
-        throw;
-    }
+    std::ostringstream out;
+    write(out);
+    if (!out)
+        throw std::runtime_error("cannot write " + path.string());
+    const auto data = out.str();
+    atomicWrite(path, data.data(), data.size());
 }
 
 Vc3dLease::Vc3dLease(const fs::path& volumeDir)

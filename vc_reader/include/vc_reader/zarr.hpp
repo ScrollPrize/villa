@@ -193,7 +193,15 @@ std::optional<Json> cachedSourceZarray(const std::vector<std::string>& cacheDirs
 // Every cache directory that mirrors the remote node (group or array) at `url`.
 std::vector<std::filesystem::path> cachedNodeDirs(const std::vector<std::string>& cacheDirs, const std::string& url);
 std::vector<std::filesystem::path> cacheRoots(const std::vector<std::string>& cacheDirs);
-void atomicWrite(const std::filesystem::path& path, const std::string& data);
+// Whether a published file has reached the disk: Fast leaves that to the OS (chunk and
+// cache writes); Fsync syncs the file and then its directory before returning (results
+// that must survive a crash). Remote stores are durable on their own terms either way.
+enum class Durability { Fast, Fsync };
+// Writes `data` to `path` whole or not at all (temporary file beside it, then rename),
+// creating parent directories; a failed write leaves no temporary.
+void atomicWrite(const std::filesystem::path& path, const std::string& data, Durability durability = Durability::Fast);
+void atomicWrite(const std::filesystem::path& path, const void* data, std::size_t size,
+                 Durability durability = Durability::Fast);
 
 // ---- arrays and groups ---------------------------------------------------------------
 

@@ -27,7 +27,8 @@ public:
     bool remote() const;
 
     std::optional<std::string> read(const std::string& name) const;
-    void write(const std::string& name, std::string_view data) const;
+    // Locally an atomicWrite with the given durability; remotely a PUT.
+    void write(const std::string& name, std::string_view data, Durability durability = Durability::Fast) const;
     // A file as an object, without holding it in memory: on S3 in parts above 64 MiB, so past
     // S3's 5 GiB limit on one request.
     void writeFile(const std::string& name, const std::filesystem::path& file) const;
@@ -143,7 +144,7 @@ private:
 // A group (marker and attributes), kept when it already exists; `attributes` replace
 // its attributes when given. Local parent directories are created.
 void createGroup(const std::filesystem::path& path, const std::optional<Json>& attributes = std::nullopt, int version = 2,
-                 const Access& access = {});
+                 const Access& access = {}, Durability durability = Durability::Fast);
 
 // Removes an array or group with everything in it; whether anything was there.
 bool removeNode(const std::filesystem::path& path, const Access& access = {});
@@ -152,7 +153,8 @@ std::vector<std::string> nodeChildren(const std::filesystem::path& path, const A
 
 // Attributes of a v2/v3 group or array (an empty object when absent).
 Json readAttributes(const std::filesystem::path& node, const Access& access = {});
-void writeAttributes(const std::filesystem::path& node, const Json& attributes, const Access& access = {});
+void writeAttributes(const std::filesystem::path& node, const Json& attributes, const Access& access = {},
+                     Durability durability = Durability::Fast);
 
 // ---- writing pyramids -----------------------------------------------------------------
 

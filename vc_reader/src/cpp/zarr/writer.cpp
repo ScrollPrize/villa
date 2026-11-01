@@ -594,7 +594,8 @@ std::vector<std::string> nodeChildren(const fs::path& path, const Access& access
     return out;
 }
 
-void createGroup(const fs::path& path, const std::optional<Json>& attributes, int version, const Access& access)
+void createGroup(const fs::path& path, const std::optional<Json>& attributes, int version, const Access& access,
+                 Durability durability)
 {
     if (version != 2 && version != 3)
         throw std::invalid_argument("Zarr version must be 2 or 3");
@@ -604,9 +605,9 @@ void createGroup(const fs::path& path, const std::optional<Json>& attributes, in
     if (store.exists(".zarray"))
         throw std::invalid_argument("an array is at " + path.string());
     if (!store.exists(".zgroup") && !store.exists("zarr.json"))
-        store.write(version == 3 ? "zarr.json" : ".zgroup", groupMarker(version));
+        store.write(version == 3 ? "zarr.json" : ".zgroup", groupMarker(version), durability);
     if (attributes)
-        writeAttributes(path, *attributes, access);
+        writeAttributes(path, *attributes, access, durability);
 }
 
 Json readAttributes(const fs::path& node, const Access& access)
@@ -618,7 +619,7 @@ Json readAttributes(const fs::path& node, const Access& access)
     return attributes ? Json::parse(*attributes) : Json::object();
 }
 
-void writeAttributes(const fs::path& node, const Json& attributes, const Access& access)
+void writeAttributes(const fs::path& node, const Json& attributes, const Access& access, Durability durability)
 {
     if (!attributes.is_object())
         throw std::invalid_argument("Zarr attributes must be an object");
@@ -626,10 +627,10 @@ void writeAttributes(const fs::path& node, const Json& attributes, const Access&
     if (const auto v3 = store.read("zarr.json")) {
         auto metadata = Json::parse(*v3);
         metadata["attributes"] = attributes;
-        store.write("zarr.json", metadata.dump(2) + "\n");
+        store.write("zarr.json", metadata.dump(2) + "\n", durability);
         return;
     }
-    store.write(".zattrs", attributes.dump(2) + "\n");
+    store.write(".zattrs", attributes.dump(2) + "\n", durability);
 }
 
 }  // namespace vcr::zarr

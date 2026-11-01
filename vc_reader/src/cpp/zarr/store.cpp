@@ -2,6 +2,7 @@
 #include <fstream>
 #include <unistd.h>
 #include "vc_reader/s3_listing.hpp"
+#include "../chunk_io.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/http.hpp"
 #include "vc_reader/native/thread_pool.hpp"
@@ -90,10 +91,10 @@ std::optional<std::string> Store::read(const std::string& name) const
     return impl_->signedRequest([&] { return impl_->currentReader()(impl_->location, name); });
 }
 
-void Store::write(const std::string& name, std::string_view data) const
+void Store::write(const std::string& name, std::string_view data, Durability durability) const
 {
     if (!impl_->remote) {
-        atomicWrite(fs::path(impl_->location) / name, std::string(data));
+        atomicWrite(fs::path(impl_->location) / name, data.data(), data.size(), durability);
         return;
     }
     impl_->needWritable();
@@ -106,10 +107,15 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
     if (!impl_->remote) {
         const auto target = fs::path(impl_->location) / name;
         fs::create_directories(target.parent_path());
-        auto temporary = target;
-        temporary += "." + std::to_string(::getpid()) + ".tmp";
-        fs::copy_file(file, temporary, fs::copy_options::overwrite_existing);
-        fs::rename(temporary, target);
+        const fs::path temporary = temporary_path(target.string());
+        try {
+            fs::copy_file(file, temporary, fs::copy_options::overwrite_existing);
+            fs::rename(temporary, target);
+        } catch (...) {
+            std::error_code ignored;
+            fs::remove(temporary, ignored);
+            throw;
+        }
         return;
     }
     impl_->needWritable();

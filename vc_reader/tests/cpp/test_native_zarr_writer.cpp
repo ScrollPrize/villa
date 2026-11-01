@@ -3,6 +3,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/zarr_write.hpp"
+#include "vc_reader/native/chunk_io.hpp"
 #include "vc_reader/native/rounding.hpp"
 #include "vc_reader/native/sigv4.hpp"
 #include "vc_reader/native/reader_types.hpp"
@@ -706,6 +707,42 @@ static void storedChunks(const fs::path& root)
     require(writer.storedChunks() == std::vector<vcr::Index>{{1, 2}}, "a shard lists the chunks it holds");
 }
 
+// Durable group, attribute and document writes: published whole, synced when asked, a
+// failed write leaves no temporary, and temporaries are named .tmp.<process>.<thread>.
+void durableWrites(const fs::path& root)
+{
+    using vcr::zarr::Durability;
+    const auto dir = root / "durable";
+    vcr::zarr::createGroup(dir, Json{{"k", 1}}, 2, {}, Durability::Fsync);
+    require(vcr::zarr::readAttributes(dir) == Json{{"k", 1}}, "durable group attributes");
+    require(fs::is_regular_file(dir / ".zgroup"), "durable group marker");
+    vcr::zarr::writeAttributes(dir, Json{{"k", 2}}, {}, Durability::Fsync);
+    require(vcr::zarr::readAttributes(dir) == Json{{"k", 2}}, "durable attributes replaced");
+    vcr::zarr::atomicWrite(dir / "blob", std::string("abc"), Durability::Fsync);
+    const char bytes[] = {'x', 'y'};
+    vcr::zarr::atomicWrite(dir / "nested" / "bytes", bytes, 2, Durability::Fsync);
+    std::ifstream in(dir / "nested" / "bytes", std::ios::binary);
+    std::string read((std::istreambuf_iterator<char>(in)), {});
+    require(read == "xy", "durable bytes");
+    // A parent that is a file: the error propagates and no temporary stays behind.
+    must_fail([&] { vcr::zarr::atomicWrite(dir / "blob" / "below", std::string("y"), Durability::Fsync); },
+              "writing below a file fails");
+    must_fail([&] { vcr::zarr::createGroup(dir / "blob" / "g", std::nullopt, 2, {}, Durability::Fsync); },
+              "a group below a file fails");
+    for (const auto& entry : fs::recursive_directory_iterator(dir))
+        require(entry.path().filename().string().find(".tmp.") == std::string::npos,
+                "no temporary left: " + entry.path().string());
+    const auto temporary = vcr::temporary_path((dir / "t").string());
+    const auto marker = temporary.rfind(".tmp.");
+    require(marker != std::string::npos, "temporary marker");
+    const auto suffix = temporary.substr(marker + 5);
+    const auto dot = suffix.find('.');
+    require(dot != std::string::npos && dot > 0 && dot + 1 < suffix.size() &&
+                std::all_of(suffix.begin(), suffix.begin() + std::ptrdiff_t(dot), ::isdigit) &&
+                std::all_of(suffix.begin() + std::ptrdiff_t(dot + 1), suffix.end(), ::isdigit),
+            "temporary names are .tmp.<process>.<thread>: " + temporary);
+}
+
 void signsAwsPutExample()
 {
     const vcr::S3Key key{"AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "", "us-east-1"};
@@ -745,6 +782,7 @@ int main()
             mutableChunks(dir, version);
         }
         signsAwsPutExample();
+        durableWrites(root);
         v3Metadata(root);
         codecs(root / "sharded-codecs", 3, true);
         mutableChunks(root / "sharded-mutable", 3, true);
