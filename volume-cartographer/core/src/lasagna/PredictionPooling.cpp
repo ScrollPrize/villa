@@ -13,7 +13,6 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
-#include <sstream>
 #include <unordered_map>
 #include <vector>
 #include "vc_reader/zarr.hpp"

@@ -19,7 +19,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-#include <QApplication>
+#include <QCoreApplication>
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -36,29 +36,19 @@
 #include <QPointer>
 #include <QSettings>
 #include <QTimer>
-#include <QTransform>
 #include <QVBoxLayout>
-#include <QVector3D>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <filesystem>
 #include <limits>
 #include <map>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <source_location>
-#include <sstream>
-#include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 
-#include <opencv2/imgproc.hpp>
 
 namespace {
 

@@ -3,15 +3,11 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
-#include <QFutureWatcher>
 
-#include <atomic>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -20,7 +16,6 @@
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
 
-#include <array>
 
 class QMdiArea;
 class QTimer;

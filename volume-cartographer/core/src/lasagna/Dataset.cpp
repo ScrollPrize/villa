@@ -3,25 +3,14 @@
 
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <condition_variable>
-#include <cstdint>
 #include <cmath>
-#include <chrono>
-#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <nlohmann/json.hpp>
-#include <span>
 
 #include <stdexcept>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/source_reader.hpp"

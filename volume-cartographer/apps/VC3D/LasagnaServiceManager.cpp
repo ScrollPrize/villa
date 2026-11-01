@@ -3,7 +3,6 @@
 #include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
@@ -19,17 +18,13 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QSysInfo>
-#include <QTemporaryFile>
 #include <QUrl>
 
-#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
 #include <system_error>
-#include <vector>
 
 #ifdef Q_OS_UNIX
 #include <signal.h>

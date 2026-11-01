@@ -1,25 +1,14 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
-#include <fstream>
 #include <iomanip>
-#include <limits>
-#include <mutex>
 #include <optional>
-#include <span>
 #include <sstream>
 #include <stdexcept>
-#include <type_traits>
-
-#ifdef __aarch64__
-#include <arm_neon.h>
-#endif
 
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"

@@ -3,7 +3,6 @@
 #include <sstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
-#include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>

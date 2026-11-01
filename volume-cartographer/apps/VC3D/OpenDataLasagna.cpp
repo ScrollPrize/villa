@@ -1,6 +1,5 @@
 #include "OpenDataLasagna.hpp"
 
-#include "OpenDataNormalGrids.hpp"
 #include "VCSettings.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -12,14 +11,11 @@
 
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <cmath>
 #include <fstream>
 #include <future>
-#include <iomanip>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include "vc_reader/source_reader.hpp"
 #include "vc_reader/zarr.hpp"

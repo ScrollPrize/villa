@@ -6,14 +6,12 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include <vc_reader/image_write.hpp>
 #include <vc_reader/source_reader.hpp>
 #include <vc_reader/tifxyz.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 
 #include <opencv2/imgproc.hpp>
-#include <opencv2/calib3d.hpp>
 
 #include <array>
 #include <cstdlib>
@@ -27,9 +25,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
-#include <iomanip>
 #include <chrono>
-#include <atomic>
 #include <exception>
 #include <set>
 #include <unordered_map>
@@ -52,7 +48,6 @@
 #include <unistd.h>
 #endif
 
-#include "vc/core/util/MemMap.hpp"
 
 // GCC/Clang spell the restrict qualifier __restrict__; MSVC only has __restrict.
 #if defined(_MSC_VER)

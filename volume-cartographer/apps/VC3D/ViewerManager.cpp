@@ -1,5 +1,4 @@
 #include "ViewerManager.hpp"
-#include "OpenDataManifest.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"
@@ -19,27 +18,19 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "SurfaceCatalog.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 
+#include <QLoggingCategory>
 #include <QApplication>
 #include <QCursor>
 #include <QPointer>
 #include <QMdiArea>
 #include <QTimer>
-#include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
-#include <QtConcurrent/QtConcurrent>
-#include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
-#include <exception>
-#include <iostream>
 #include <optional>
-#include <string_view>
-#include <unordered_set>
-#include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/PlaneSurface.hpp"

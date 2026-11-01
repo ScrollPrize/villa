@@ -5,7 +5,6 @@
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc_reader/native/http.hpp"
 
 #include <nlohmann/json.hpp>
@@ -13,8 +12,6 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QColor>
-#include <QCoreApplication>
-#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDialogButtonBox>
@@ -27,7 +24,6 @@
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QImage>
-#include <QIODevice>
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
@@ -37,13 +33,11 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QResizeEvent>
-#include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
 #include <QStringList>
-#include <QStandardPaths>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTabWidget>

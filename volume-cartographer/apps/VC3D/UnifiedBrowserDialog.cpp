@@ -5,11 +5,9 @@
 #include <QKeyEvent>
 
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 
 #include <vc_reader/catalog.hpp>
 
-#include <QApplication>
 #include <QButtonGroup>
 #include <QDir>
 #include <QFileInfo>
@@ -23,14 +21,12 @@
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSignalBlocker>
-#include <QStandardPaths>
 #include <QtConcurrent>
 #include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <exception>
-#include <optional>
 #include <vector>
 
 namespace {

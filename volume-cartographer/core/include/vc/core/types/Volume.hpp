@@ -1,18 +1,12 @@
 #pragma once
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <optional>
-#include <span>
 #include <string>
-#include <vector>
 #include "utils/Json.hpp"
-#include <opencv2/core/mat.hpp>
 
-#include <vc_reader/native/reader_types.hpp>
 #include <vc_reader/zarr.hpp>
 
 

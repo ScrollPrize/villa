@@ -14,7 +14,6 @@
 #include <vc_reader/zarr.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <fstream>
 #include <mutex>
 #include <thread>

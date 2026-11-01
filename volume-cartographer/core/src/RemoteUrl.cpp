@@ -3,7 +3,6 @@
 #include "vc_reader/zarr.hpp"
 
 #include <charconv>
-#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 

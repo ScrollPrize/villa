@@ -4,7 +4,6 @@
 #include <vc_reader/zarr.hpp>
 #include "VolumeComboTooltip.hpp"
 
-#include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -17,9 +16,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/LoadJson.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
@@ -32,10 +28,9 @@
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
-#include <QGridLayout>
+#include <QLoggingCategory>
 #include <QAction>
 #include <QVBoxLayout>
-#include <QCursor>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QResizeEvent>
@@ -44,22 +39,16 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
-#include <QBrush>
-#include <QDialog>
-#include <QDialogButtonBox>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
-#include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QPointF>
 #include <QMessageBox>
-#include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
-#include <QFutureWatcher>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
@@ -73,53 +62,28 @@
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
-#include <QLoggingCategory>
-#include <QDebug>
 #include <QFrame>
-#include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
-#include <QHeaderView>
-#include <QFormLayout>
-#include <QProgressBar>
-#include <QColorDialog>
-#include <QListView>
-#include <QTreeView>
-#include <QPainter>
-#include <QStandardItem>
 #include <QStandardItemModel>
-#include <QStyledItemDelegate>
-#include <QStyleOptionButton>
-#include <QPersistentModelIndex>
-#include <QSet>
 #include <QPushButton>
-#include <QItemSelectionModel>
-#include <QItemSelection>
 #include "utils/Json.hpp"
 #include <QPointer>
-#include <QListView>
 #include <algorithm>
 #include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <optional>
-#include <sstream>
-#include <cctype>
-#include <string_view>
 #include <utility>
 #include <filesystem>
 #include <system_error>
-#include <unordered_map>
 #include <vector>
-#include <opencv2/imgproc.hpp>
 #include <QStringList>
 #include <array>
 
@@ -127,7 +91,6 @@
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
-#include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
@@ -145,7 +108,6 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
-#include "elements/DropdownChecklistButton.hpp"
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
@@ -162,12 +124,9 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 
 

@@ -21,7 +21,6 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc_reader/sftp.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include <vc_reader/zarr.hpp>
 
