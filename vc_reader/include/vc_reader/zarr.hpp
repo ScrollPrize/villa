@@ -285,6 +285,7 @@ struct PyramidLevelInfo {
     int level = 0;
     std::string path;  // relative to the location; empty for a root array
     ArrayMeta meta;
+    LevelPlacement placement;  // where its indices sit relative to level 0 (see levelPlacement)
 };
 std::vector<PyramidLevelInfo> pyramidLevels(const std::string& location, const OpenOptions& options,
                                             int probeLevels = 32);

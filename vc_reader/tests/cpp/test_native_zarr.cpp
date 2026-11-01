@@ -338,6 +338,12 @@ void levelPlacement(const fs::path& root)
     expect_placement(vcr::zarr::Group::open(path.string(), {}).array("3").placement, {8, 8, 4}, {3.5, 3.5, 1.5},
                      "Group::array places its level");
     expect_placement(placed(scaleOnly, "0"), {1, 1, 1}, {0, 0, 0}, "scale-only L0");
+    {
+        const auto levels = vcr::zarr::pyramidLevels(path.string(), {});
+        require(levels.size() == 3 && levels[2].level == 3, "pyramidLevels numbers the levels");
+        expect_placement(levels[2].placement, {8, 8, 4}, {3.5, 3.5, 1.5}, "pyramidLevels places each level");
+        expect_placement(levels[0].placement, {1, 1, 1}, {0, 0, 0}, "pyramidLevels places level 0");
+    }
 
     // A declared translation is honoured, relative to level 0's.
     const std::string translated = R"({"multiscales":[{"axes":["z","y","x"],"datasets":[)"

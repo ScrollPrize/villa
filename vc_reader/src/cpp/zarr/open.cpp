@@ -751,7 +751,7 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
         const auto node = group.node(path);
         if (!node || node->first != Group::NodeKind::Array)
             throw std::runtime_error("pyramid level " + path + " of " + location + " is not an array");
-        out.push_back({number, path, parseArrayMeta(node->second)});
+        out.push_back({number, path, parseArrayMeta(node->second), group.placement(path)});
     }
     keepPyramid(group, levels);
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.level < b.level; });
