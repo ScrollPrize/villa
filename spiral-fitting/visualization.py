@@ -220,6 +220,10 @@ def save_overlay(
             for k, strip in enumerate(unattached_pcl_strips):
                 zyxs = strip['zyxs']
                 in_slab = np.abs(zyxs[:, 0] - float(slice_z)) <= pcl_z_window
+                if strip.get('fit_mask') is not None:
+                    # Points excluded from the fit (gap/damaged fiber spans)
+                    # are not evaluated, so they are not drawn.
+                    in_slab &= np.asarray(strip['fit_mask'], dtype=bool)
                 if not in_slab.any():
                     continue
                 fully = bool(unattached_pcl_fully_satisfied[k].item())

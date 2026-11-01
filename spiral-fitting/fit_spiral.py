@@ -144,6 +144,7 @@ from spiral_helpers import (
     merge_linked_point_collections,
     SequenceChain,
     scale_and_split_counts,
+    strip_flat_fit_mask,
     _infer_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
     resolve_outer_winding_idx_and_notes,
@@ -866,6 +867,9 @@ def materialize_fiber_fit_inputs(
     stretch through the frozen constraint-bake stack (1 before any bake),
     read from the catalog point dicts (see accumulate_radial_offset_bake_scale)
     so the physical offset can be expressed in the resident frame.
+    ``fit_mask`` is False for points inside gap/damaged fiber spans (the
+    catalog points' ``fit_excluded``): they stay in the strip for the theta
+    unwrap but constrain nothing.
     """
     point_collections = {}
     for logical_id, pcl in fiber_catalog.items():
@@ -914,7 +918,11 @@ def materialize_fiber_fit_inputs(
     for cid, pcl in point_collections.items():
         num_attached = sum(
             1 for point in pcl['points'].values() if 'on_patch' in point)
-        num_unattached = len(pcl['points']) - num_attached
+        # Points excluded from the fit (gap/damaged spans) are never attached
+        # and constrain nothing, so they do not make a fiber a strip either.
+        num_unattached = sum(
+            1 for point in pcl['points'].values()
+            if 'on_patch' not in point and not point.get('fit_excluded', False))
         if num_attached >= 2:
             cross_patch[cid] = pcl
         if num_unattached >= 1 or cid in linked_cids:
@@ -980,11 +988,17 @@ def materialize_fiber_fit_inputs(
             [point.get('radial_offset_bake_scale', 1.0)
              for _, point in kept_items],
             dtype=np.float32)
+        # True where the point constrains the fit; False inside gap/damaged
+        # fiber spans (spiral_helpers.load_fiber_point_collection).
+        fit_mask = np.asarray(
+            [not point.get('fit_excluded', False) for _, point in kept_items],
+            dtype=bool)
         zyxs, keep = _decimate_ordered_points_min_spacing(
             zyxs, min_point_spacing, return_indices=True,
             force_keep=force_keep | {len(zyxs) - 1})
         windings = windings[keep]
         bake_scale = bake_scale[keep]
+        fit_mask = fit_mask[keep]
         link_points = {
             int(kept_items[original_position][0]): strip_position
             for strip_position, original_position in enumerate(keep)
@@ -994,7 +1008,8 @@ def materialize_fiber_fit_inputs(
         hv_tag = classify_fiber_hv(
             metadata.get('hv_classification'), zyxs,
             min_z_fraction=vertical_min_z_fraction,
-            min_auto_certainty=vertical_min_auto_certainty)
+            min_auto_certainty=vertical_min_auto_certainty,
+            fit_mask=fit_mask)
         strips.append({
             'id': cid,
             'name': pcl.get('name'),
@@ -1006,6 +1021,7 @@ def materialize_fiber_fit_inputs(
                 float(vertical_radial_offset) if hv_tag == 'V' else 0.0,
                 dtype=np.float32),
             'radial_offset_bake_scale': bake_scale,
+            'fit_mask': fit_mask,
             'link_points': link_points,
             'hv_tag': hv_tag,
             'is_vertical': hv_tag == 'V',
@@ -1019,18 +1035,35 @@ def materialize_fiber_fit_inputs(
             resolved_links, link_components)
 
 
+def _strip_trusted_point_mask(strip, z_begin, z_end):
+    """Which strip points are trusted sheet geometry for the track exclusion:
+    inside the z-ROI and not excluded from the fit (gap/damaged fiber spans,
+    strip['fit_mask'] False), as a numpy bool array."""
+    zyxs = np.asarray(strip['zyxs'])
+    selected = (zyxs[..., 0] >= z_begin) & (zyxs[..., 0] < z_end)
+    fit_mask = strip.get('fit_mask')
+    if fit_mask is not None:
+        selected &= np.asarray(fit_mask, dtype=bool)
+    return selected
+
+
 def _build_strip_flat_bundle(strip_arrays, device):
-    # Concatenate per-strip (zyxs, windings, radial_offsets[, bake_scale]) arrays
-    # into one flat GPU tensor so the downstream computations can run a single
+    # Concatenate per-strip (zyxs, windings, radial_offsets[, bake_scale[, fit_mask]])
+    # arrays into one flat GPU tensor so the downstream computations can run a single
     # transform call plus segmented reductions instead of per-strip Python loops.
     # `strip_arrays` is a sequence of `(zyxs_np, windings_np, radial_offsets_np)`
-    # triples or `(..., radial_offset_bake_scale_np)` quadruples; radial_offsets
-    # may be None for zeros and the bake scale None for ones. The bundle's
+    # triples, `(..., radial_offset_bake_scale_np)` quadruples or
+    # `(..., fit_mask_np)` quintuples; radial_offsets may be None for zeros, the
+    # bake scale None for ones and the fit mask None for all-True. The bundle's
     # `radial_offsets` is the physical offset (scroll voxels along the sheet
     # normal) times the per-point bake scale, i.e. the offset in the resident
     # frame's voxels; consumers convert it to spiral radius through the live
     # transform's local normal stretch. `has_radial_offsets` lets them skip
-    # that work when every offset is zero. Returns None when there are no points.
+    # that work when every offset is zero. `fit_mask` (present only when some
+    # strip supplied one) is False for points that must not constrain the fit
+    # (gap/damaged fiber spans); `has_excluded_points` says whether any is
+    # False, so consumers can skip the masking when it is not. Returns None
+    # when there are no points.
     triples = [tuple(t) for t in strip_arrays]
     if len(triples) == 0:
         return None
@@ -1052,7 +1085,7 @@ def _build_strip_flat_bundle(strip_arrays, device):
             for t in triples], axis=0).astype(np.float32, copy=False)
         offsets_flat = offsets_flat * scale_flat
     strip_id_np = np.repeat(np.arange(len(triples), dtype=np.int64), lengths_np)
-    return {
+    bundle = {
         'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
         'windings': torch.from_numpy(windings_flat).to(device=device),
         'radial_offsets': torch.from_numpy(offsets_flat).to(device=device),
@@ -1065,6 +1098,16 @@ def _build_strip_flat_bundle(strip_arrays, device):
         'num_strips': len(triples),
         'total': total,
     }
+    if any(len(t) > 4 and t[4] is not None for t in triples):
+        mask_flat = np.concatenate([
+            np.asarray(t[4], dtype=bool) if len(t) > 4 and t[4] is not None
+            else np.ones(len(t[0]), dtype=bool)
+            for t in triples], axis=0)
+        if len(mask_flat) != total:
+            raise ValueError('strip fit_mask length does not match its points')
+        bundle['fit_mask'] = torch.from_numpy(mask_flat).to(device=device)
+        bundle['has_excluded_points'] = bool(not mask_flat.all())
+    return bundle
 
 
 def accumulate_radial_offset_bake_scale(slice_to_spiral_transform, zyxs,
@@ -1133,7 +1176,8 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     if flat is None and len(pcl_strips) > 0:
         flat = _build_strip_flat_bundle(
             ((s['zyxs'], s['windings'], s.get('radial_offsets'),
-              s.get('radial_offset_bake_scale')) for s in pcl_strips),
+              s.get('radial_offset_bake_scale'), s.get('fit_mask'))
+             for s in pcl_strips),
             device)
         try:
             pcl_strips.flat = flat
@@ -2301,10 +2345,8 @@ class FitContext:
             z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
             trusted_counts.append(int((valid_flat & z_in_roi).sum()))
         for strip in unattached_pcl_strips:
-            zyxs_np = np.asarray(strip['zyxs'])
-            trusted_counts.append(int((
-                (zyxs_np[..., 0] >= self.z_begin)
-                & (zyxs_np[..., 0] < self.z_end)).sum()))
+            trusted_counts.append(int(
+                _strip_trusted_point_mask(strip, self.z_begin, self.z_end).sum()))
         verified_patches_and_pcls_cpu = torch.empty(
             (sum(trusted_counts), 3), dtype=torch.float32)
         trusted_offset = 0
@@ -2325,8 +2367,8 @@ class FitContext:
             count_index += 1
             if count:
                 zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-                selected = (zyxs[..., 0] >= self.z_begin) \
-                    & (zyxs[..., 0] < self.z_end)
+                selected = torch.from_numpy(
+                    _strip_trusted_point_mask(strip, self.z_begin, self.z_end))
                 verified_patches_and_pcls_cpu[
                     trusted_offset:trusted_offset + count].copy_(zyxs[selected])
                 trusted_offset += count
@@ -3125,9 +3167,10 @@ class FitContext:
                 pieces.append(points[valid & in_roi])
         for strip in self.unattached_pcl_strips:
             points = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
-            if bool(in_roi.any()):
-                pieces.append(points[in_roi])
+            selected = torch.from_numpy(
+                _strip_trusted_point_mask(strip, self.z_begin, self.z_end))
+            if bool(selected.any()):
+                pieces.append(points[selected])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
     def _exclude_non_liftable_patches(self, verified_ids, report):
@@ -5027,6 +5070,7 @@ class FitContext:
                         pcl_flat['zyxs'], pcl_flat['starts'],
                         windings=pcl_flat['windings'],
                         radial_offsets=pcl_flat.get('radial_offsets'),
+                        fit_mask=strip_flat_fit_mask(pcl_flat),
                         floating_threshold=self.config['dt_target_floating_threshold'],
                         num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                         max_stride=self.config['dt_target_max_stride'],

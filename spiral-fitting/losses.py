@@ -21,7 +21,7 @@ from sample_spiral import (
     get_theta_and_radii,
     radius_from_unwrapped_shifted,
 )
-from spiral_helpers import _huber_abs
+from spiral_helpers import _huber_abs, strip_flat_fit_mask
 
 
 def _masked_mean(values, mask):
@@ -1238,6 +1238,10 @@ def get_unattached_pcl_strip_losses(
     # junctions. Rows can mix strips, but every walk begins at one endpoint of
     # one member strip, which supplies a canonical DT frame anchor. A singleton
     # component reduces exactly to the legacy per-strip row.
+    #
+    # Points with flat['fit_mask'] False (inside gap/damaged fiber spans) are
+    # walked and transformed like any other, so the unwrap stays continuous
+    # across them, but they are masked out of both losses.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if not pcl_strips:
@@ -1340,6 +1344,14 @@ def get_unattached_pcl_strip_losses(
     sample_mask = _pinned_to_device(
         torch.from_numpy(sample_mask_np), device)
     valid_zyxs = flat['zyxs'][sampled_flat_indices_t]
+    fit_mask_flat = strip_flat_fit_mask(flat)
+    if fit_mask_flat is None:
+        valid_fit = None
+    else:
+        # Excluded samples stay in valid_* (they are transformed with the
+        # row) but leave sample_mask, so no loss term sees them.
+        valid_fit = fit_mask_flat[sampled_flat_indices_t]
+        sample_mask = sample_mask & valid_fit[valid_gather_indices_t]
     valid_windings = flat['windings'][sampled_flat_indices_t]
     zyxs_t = valid_zyxs[valid_gather_indices_t]
     winding_t = valid_windings[valid_gather_indices_t]
@@ -1446,13 +1458,16 @@ def get_unattached_pcl_strip_losses(
         torch.sin(theta) * target_radii,
         torch.cos(theta) * target_radii,
     ], dim=-1).detach()
+    # target_spiral_zyxs[sample_mask] runs row-major over the valid picks,
+    # which is valid_zyxs' order; drop the excluded picks from both sides.
     target_scroll_valid = slice_to_spiral_transform.inv(
         target_spiral_zyxs[sample_mask])
+    fit_zyxs = valid_zyxs if valid_fit is None else valid_zyxs[valid_fit]
 
     within_p = cfg['patch_dt_within_patch_norm_p']
     across_p = cfg['patch_dt_norm_p']
     valid_point_distances = torch.linalg.norm(
-        valid_zyxs - target_scroll_valid, dim=-1)
+        fit_zyxs - target_scroll_valid, dim=-1)
     valid_point_distances = (
         F.relu(valid_point_distances - dt_hinge_margin) + 1.e-5)
     point_distances = torch.zeros_like(theta).masked_scatter(
@@ -1461,6 +1476,10 @@ def get_unattached_pcl_strip_losses(
         ((point_distances ** within_p) * sample_mask).sum(dim=-1)
         / radius_counts.squeeze(-1)
     ) ** (1 / within_p)
+    if valid_fit is not None:
+        # A row whose every sample is excluded has no DT evidence; it must
+        # not enter the power mean's denominator as a zero.
+        track_losses = track_losses[sample_mask.any(dim=-1)]
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p)
     record_loss_samples(
         'unattached_pcl_dt', spiral_zyxs, point_distances,

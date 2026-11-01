@@ -134,6 +134,12 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
+# Span tags (vc3d_fiber format v4 segment_to_next.tags) whose interior line
+# points do not constrain the fit: the span crosses a hole in the sheet or
+# damaged material. See load_fiber_point_collection (point['fit_excluded']).
+EXCLUDED_SPAN_TAGS = frozenset({'gap', 'damaged'})
+
+
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
@@ -207,6 +213,28 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         control_index = int(br.get('control_point_index', -1))
         if 0 <= control_index < num_control_points:
             link_endpoint_indices.add(int(control_line_indices[control_index]))
+    # Spans tagged 'gap' or 'damaged' (format v4 segment_to_next tags) hold no
+    # sheet: their line points are the tracer's bridge across a hole, or run
+    # over material the annotator marked unusable. Those interior line points
+    # stay in the polyline (the chain's |dtheta| < pi unwrap contract, the
+    # decimation and the link bookkeeping all need the geometry) but are
+    # flagged fit_excluded, which the strip losses, the DT targets, the
+    # satisfaction counts and patch attachment honour. The span's two control
+    # points are ordinary, correct points.
+    excluded_line_indices = set()
+    excluded_spans = 0
+    for control_index, segment in enumerate(parsed.control_point_segments):
+        if segment is None or control_index + 1 >= num_control_points:
+            continue
+        if not EXCLUDED_SPAN_TAGS.intersection(segment.tags):
+            continue
+        lo, hi = sorted((int(control_line_indices[control_index]),
+                         int(control_line_indices[control_index + 1])))
+        excluded_line_indices.update(range(lo + 1, hi))
+        excluded_spans += 1
+    # Control points are never excluded, even when another span's nearest-
+    # line-point projection overlaps them (out-of-order mappings).
+    excluded_line_indices.difference_update(int(i) for i in control_line_indices)
     # Keep the surviving points' pre-decimation (trimmed line) indices so
     # cross-fiber links resolve exactly after decimation.
     points_xyz, kept_orig_indices = _decimate_ordered_points_min_spacing(
@@ -237,6 +265,8 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
             'fiber_num_control_points': num_control_points,
+            'fiber_excluded_spans': excluded_spans,
+            'fiber_excluded_span_points': len(excluded_line_indices),
         },
         'color': color,
     }
@@ -254,6 +284,8 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'winding_annotation': float('nan'),
             'creation_time': 0,
             'orig_index': int(orig_index),
+            # Inside a gap/damaged span: geometry only, never a constraint.
+            'fit_excluded': int(orig_index) in excluded_line_indices,
         }
 
     # Cross-fiber links ("branches"): each entry connects one of this fiber's
@@ -285,7 +317,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
 
 
 def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
-                      min_auto_certainty):
+                      min_auto_certainty, fit_mask=None):
     """Return 'V', 'H', or None for one fiber polyline.
 
     Precedence: VC3D's manual H/V tag, then its automatic tag when the
@@ -294,6 +326,9 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
     covers at least ``min_z_fraction`` of its path length, horizontal when the
     z extent covers at most ``1 - min_z_fraction`` of it, and untagged
     otherwise. These tags drive radial offsets and patch-side linking.
+    ``fit_mask`` (bool per point, None = all) restricts the geometric
+    fallback to the points that constrain the fit: an excluded gap/damaged
+    span excursion must not decide the tag of the eligible points.
     """
     hv = hv_classification if isinstance(hv_classification, dict) else {}
     manual = str(hv.get('manual_tag') or '').strip().upper()
@@ -308,6 +343,8 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
         if certainty >= min_auto_certainty:
             return automatic
     zyxs = np.asarray(zyxs, dtype=np.float64)
+    if zyxs.ndim == 2 and fit_mask is not None:
+        zyxs = zyxs[np.asarray(fit_mask, dtype=bool)]
     if zyxs.ndim != 2 or len(zyxs) < 2:
         return None
     path_length = float(np.linalg.norm(np.diff(zyxs, axis=0), axis=-1).sum())
@@ -339,10 +376,13 @@ def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
         [np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float64)
          for _, point in ordered],
         dtype=np.float64).reshape(-1, 3)
+    fit_mask = np.asarray(
+        [not point.get('fit_excluded', False) for _, point in ordered], dtype=bool)
     return classify_fiber_hv(
         metadata.get('hv_classification'), zyxs,
         min_z_fraction=min_z_fraction,
-        min_auto_certainty=min_auto_certainty)
+        min_auto_certainty=min_auto_certainty,
+        fit_mask=fit_mask)
 
 
 def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
@@ -979,6 +1019,11 @@ def compute_winding_range_and_input_extents(
             strip_id = flat['strip_id']
             num_strips = flat['num_strips']
             in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
+            fit_mask = strip_flat_fit_mask(flat)
+            if fit_mask is not None:
+                # Points excluded from the fit (gap/damaged fiber spans) are
+                # no evidence for the winding range or the outer winding.
+                in_roi = in_roi & fit_mask
             if in_roi.any():
                 zyxs_roi = _stride_to_budget(zyxs[in_roi], point_budget)
                 strip_id_roi = _stride_to_budget(strip_id[in_roi], point_budget)
@@ -1765,10 +1810,28 @@ def erode_patch_valid_region(patch, num_cells):
     return True
 
 
+def strip_flat_fit_mask(flat):
+    """The flat strip bundle's per-point fit mask, or None when every point
+    constrains the fit (no gap/damaged fiber span points; see
+    fit_spiral._build_strip_flat_bundle), so consumers can skip the masking."""
+    if flat is None or not flat.get('has_excluded_points', False):
+        return None
+    return flat.get('fit_mask')
+
+
+def strip_fit_counts(fit_mask, strip_id, num_strips):
+    """Per-strip count of points whose fit_mask is True."""
+    counts = torch.zeros(num_strips, dtype=torch.int64, device=fit_mask.device)
+    return counts.scatter_add_(0, strip_id, fit_mask.to(torch.int64))
+
+
 def _segmented_median_per_strip(ctx):
     # Segmented median: sort the flat values with a composite key
     # (strip_id-major, normalised_radii-minor) so values for each strip end
-    # up contiguous and sorted within their range.
+    # up contiguous and sorted within their range. With a fit mask in the
+    # context (strip_flat_fit_mask), excluded points sort behind every kept
+    # value of their strip and the median index counts kept points only; a
+    # strip with no kept point gets an arbitrary (unused) value.
     normalised_radii = ctx['normalised_radii']
     strip_id = ctx['strip_id']
     starts = ctx['starts']
@@ -1777,13 +1840,22 @@ def _segmented_median_per_strip(ctx):
     device = ctx['device']
     if normalised_radii.numel() == 0:
         return torch.zeros(S, dtype=normalised_radii.dtype, device=device)
+    fit_mask = ctx.get('fit_mask')
+    if fit_mask is not None:
+        lengths = strip_fit_counts(fit_mask, strip_id, S)
+        kept = normalised_radii[fit_mask]
+        behind = (kept.max() if kept.numel() else normalised_radii.max()) + 1.0
+        normalised_radii = torch.where(fit_mask, normalised_radii, behind)
+    # An empty strip (or one without a kept point) reads the element before
+    # its start: an arbitrary value nothing consumes.
+    median_offsets = (lengths - 1) // 2
 
     if float_hi(device) != torch.float64:
         # The composite key below needs float64 to keep the value bits. A
         # value sort followed by a stable strip sort gives the same order.
         order = torch.argsort(normalised_radii)
         order = order[torch.argsort(strip_id[order], stable=True)]
-        return normalised_radii[order][starts[:-1] + (lengths - 1) // 2]
+        return normalised_radii[order][starts[:-1] + median_offsets]
 
     val_min = normalised_radii.min().to(torch.float64)
     val_max = normalised_radii.max().to(torch.float64)
@@ -1794,5 +1866,4 @@ def _segmented_median_per_strip(ctx):
     )
     order = torch.argsort(composite)
     sorted_norm = normalised_radii[order]
-    median_indices = starts[:-1] + (lengths - 1) // 2
-    return sorted_norm[median_indices]
+    return sorted_norm[starts[:-1] + median_offsets]

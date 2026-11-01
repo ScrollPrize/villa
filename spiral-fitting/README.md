@@ -1111,6 +1111,33 @@ and samples `sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
 
+## Fiber span tags
+
+VC3D fiber files (format v4) can tag a span between two control points as
+`gap` or `damaged`. The line points inside such a span are the tracer's
+bridge across a hole in the sheet, or run over material the annotator marked
+unusable, so they must not constrain the fit. The fiber loader
+(`spiral_helpers.load_fiber_point_collection`) keeps them in the polyline,
+because the chain's theta unwrap (consecutive points less than half a turn
+apart), the decimation and the cross-fiber link bookkeeping all need the
+geometry, and marks each retained interior point `fit_excluded`. The flag is
+carried into the unattached strips as `fit_mask` (False = excluded) and
+honoured by every consumer of a fiber point: the strip radius and DT losses
+mask excluded samples out, the whole-strip DT target and the satisfaction
+median ignore them, satisfaction counts neither count nor total them, and
+patch attachment (`point_collection.link_points_to_patches`) refuses them
+and counts no hits of theirs towards a neighbour's window support, so an
+excluded point never ties its fiber's winding to a patch, the trusted
+geometry that masks track samples (`track_exclusion_radius`) leaves them out,
+they are no evidence for the winding range, the shell outer-winding
+inference or the geometric H/V fallback (`spiral_helpers.classify_fiber_hv`),
+and they do not by themselves make a fiber an unattached strip.
+The span's two control points are ordinary points, also when another tagged
+span's projection overlaps them. A span whose points all decimate away
+changes nothing. `break` control-point tags are not interpreted. The
+collection metadata records `fiber_excluded_spans` and
+`fiber_excluded_span_points` (interior line points before decimation).
+
 ## Fiber classification
 
 Each fiber strip is tagged at load time (`spiral_helpers.classify_fiber_hv`):

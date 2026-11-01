@@ -171,6 +171,56 @@ class WindowLinkingTests(unittest.TestCase, _BackendCases):
             self.assertAlmostEqual(pcl['points'][1]['on_patch']['distance'], 0.2, places=5)
         self.for_each_backend(body)
 
+    def test_fit_excluded_points_are_never_attached(self):
+        # A point inside a gap/damaged fiber span (fit_excluded) is offered
+        # to the linker like any other but must not receive on_patch. The
+        # brute-force case runs without a surface-index tolerance so the
+        # index is really bypassed.
+        for name, patcher in self.backends():
+            with self.subTest(backend=name), patcher:
+                patches, pcl = self._scene()
+                pcl['points'][1]['fit_excluded'] = True
+                link_points_to_patches(
+                    patches, {1: pcl}, tolerance=self.TOL,
+                    surface_index_tolerance=self.TOL if name == 'surface_index' else None,
+                    general_hit_policy='largest_area', options=PatchLinkOptions(window_points=1))
+                self.assertEqual(_attached(pcl), ['a', None, 'a'])
+                self.assertNotIn('on_patch', pcl['points'][1])
+
+    def test_record_link_guard_refuses_excluded_points(self):
+        # The single-hit legacy path records directly; the guard there is
+        # the only thing standing between an excluded point and on_patch.
+        links = {}
+        collection = _collection(1, [(50.0, 0.0, 0.0)])
+        point = collection['points'][0]
+        point['fit_excluded'] = True
+        point_collection._record_point_patch_link(links, collection, 1, 0, point, 'a', 0.1, [0.0, 0.0])
+        self.assertEqual(links, {})
+        self.assertNotIn('on_patch', point)
+        point['fit_excluded'] = False
+        point_collection._record_point_patch_link(links, collection, 1, 0, point, 'a', 0.1, [0.0, 0.0])
+        self.assertEqual(point['on_patch']['id'], 'a')
+        self.assertEqual(len(links['a']), 1)
+
+    def test_excluded_neighbours_give_no_window_support(self):
+        # The middle point's only window members are excluded: with two hits
+        # required, neither A (hit by the excluded neighbours) nor B qualifies
+        # for it, so it stays unattached; with one hit required it attaches.
+        # The brute-force case runs without a surface-index tolerance so the
+        # index is really bypassed.
+        for name, patcher in self.backends():
+            with self.subTest(backend=name), patcher:
+                for min_points, expected in ((2, None), (1, 'b')):
+                    patches, pcl = self._scene()
+                    pcl['points'][0]['fit_excluded'] = True
+                    pcl['points'][2]['fit_excluded'] = True
+                    link_points_to_patches(
+                        patches, {1: pcl}, tolerance=self.TOL,
+                        surface_index_tolerance=self.TOL if name == 'surface_index' else None,
+                        general_hit_policy='largest_area',
+                        options=PatchLinkOptions(window_points=3, window_min_points=min_points))
+                    self.assertEqual(_attached(pcl), [None, expected, None], (name, min_points))
+
     def test_min_hit_gate_drops_the_patch_only_one_point_touches(self):
         def body():
             # B is hit by the middle point alone, so with two hits required it
