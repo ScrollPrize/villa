@@ -13,6 +13,10 @@ from vesuvius.ink_detection.types import Patch, Segment
 
 
 _CACHE_VERSION = "v6"
+# Default discovery now measures coverage at the ink store's own mid-plane.
+_LABELED_DEFAULT_CACHE_VERSION = "v7"
+# Subtiling caches written before the patch Z window came from the image mid-plane hold label-based Z.
+_SUBTILING_CACHE_VERSION = "v7"
 
 
 def label_asset_fingerprint(paths: Iterable[Path | str | None]) -> str:
@@ -76,7 +80,7 @@ def _segment_label_fingerprint(segment: Segment) -> str:
 
 
 def patch_finding_cache_token(config: InkDataConfig) -> str:
-    """Return the v6 token including every patch-semantic input."""
+    """Return a versioned token including every patch-semantic input."""
     finding = config.patch_finding
     patch_y = config.patch_size[1]
     default_stride = int(patch_y * finding.overlap)
@@ -84,7 +88,7 @@ def patch_finding_cache_token(config: InkDataConfig) -> str:
         tile_size = patch_y if finding.tile_size is None else finding.tile_size
         stride = default_stride if finding.stride is None else finding.stride
         return (
-            f"{config.discovery_mode}-subtiling-{_CACHE_VERSION}"
+            f"{config.discovery_mode}-subtiling-{_SUBTILING_CACHE_VERSION}"
             f"-ts-{tile_size}_st-{stride}_fe-{int(finding.filter_empty_tile)}"
         )
     scan_scale = "" if finding.scan_scale is None else finding.scan_scale
@@ -97,7 +101,7 @@ def patch_finding_cache_token(config: InkDataConfig) -> str:
             f"-pfs-{scan_scale}"
         )
     return (
-        f"labeled-default-{_CACHE_VERSION}"
+        f"labeled-default-{_LABELED_DEFAULT_CACHE_VERSION}"
         f"-po-{finding.overlap}"
         f"-mlc-{finding.min_labeled_coverage}"
         f"-pfs-{scan_scale}"
