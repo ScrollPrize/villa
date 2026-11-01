@@ -143,10 +143,13 @@ int runObjectStoreControllerTests()
                 viewer->setCompositeRenderSettings(settings);
                 dynamic_cast<QWidget*>(viewer)->hide();
             }
-            auto* canvas = new Fiber3DCanvas(&host);
-            canvas->hide(); // Sampling and control wiring do not require a GL context.
+            // Sampling/control wiring needs no GL context. Keep the hidden
+            // canvas out of the visible host's widget tree so Qt's offscreen
+            // compositor does not try to create a GL backing store for it.
+            auto canvas = std::make_unique<Fiber3DCanvas>();
+            canvas->hide();
             auto* toggle = new QToolButton(&host);
-            auto* controls = new Fiber3DSliceControls(&state, &annotationViews, canvas, toggle, &host);
+            auto* controls = new Fiber3DSliceControls(&state, &annotationViews, canvas.get(), toggle, &host);
             controls->setCenter(Point{16,18,20});
             host.show();
             toggle->setChecked(true);

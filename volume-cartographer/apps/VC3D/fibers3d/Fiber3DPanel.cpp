@@ -7,6 +7,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "Fiber3DSliceControls.hpp"
 #include "Fiber3DSurfaceControls.hpp"
+#include "scene3d/MemoryBudgetInput.hpp"
 #include "CState.hpp"
 #include "FiberCollectionController.hpp"
 #include "VCSettings.hpp"
@@ -69,7 +70,8 @@ struct Fiber3DPanel::Impl {
     Fiber3DSurfaceControls* surfaceControls;
     QLabel *status, *selection;
     QCheckBox *storeSource, *h, *v, *unknown;
-    QComboBox *region, *colors, *direction, *palette, *memoryBudget;
+    QComboBox *region, *colors, *direction, *palette;
+    QDoubleSpinBox* memoryBudget;
     QSpinBox *boxWidth, *limit;
     QDoubleSpinBox *minimum, *rangeMin, *rangeMax;
     QPushButton *customColor, *hColor, *vColor;
@@ -470,24 +472,17 @@ struct Fiber3DPanel::Impl {
         boxWidthRow = row(q->tr("Box width"), boxWidth);
 
         page(q->tr("Surface"), QStringLiteral("fibers3DSettingsSurface"));
-        surfaceControls = new Fiber3DSurfaceControls(state, canvas, settingsContents);
+        surfaceControls = new Fiber3DSurfaceControls(state, canvas, settingsContents, QStringLiteral("fibers3d"),
+            [this](bool enabled, double distance) { canvas->setSurfaceFilter(enabled, distance); });
         body->addWidget(surfaceControls);
 
         page(q->tr("Memory"), QStringLiteral("fibers3DSettingsMemory"));
         section(q->tr("Loading limits"));
 
-        memoryBudget = new QComboBox(settingsContents);
+        memoryBudget = scene3d::makeMemoryBudgetInput(settingsContents, settings.value("fibers3DMemoryBudgetMiB", 2048).toDouble());
         preferenceFields.push_back(memoryBudget);
         memoryBudget->setObjectName(QStringLiteral("fibers3DMemoryBudgetMiB"));
-        for (int mib = 64; mib <= 32768; mib *= 2) {
-            // Omit values that cannot be represented on this build's address space.
-            if (uint64_t(mib) * 1024 * 1024 > std::numeric_limits<size_t>::max())
-                break;
-            memoryBudget->addItem(mib < 1024 ? q->tr("%1 MiB").arg(mib) : q->tr("%1 GiB").arg(mib / 1024), mib);
-        }
-        const int savedBudget = memoryBudget->findData(settings.value(memoryBudget->objectName(), 512).toInt());
-        memoryBudget->setCurrentIndex(savedBudget >= 0 ? savedBudget : memoryBudget->findData(512));
-        surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
+        surfaceControls->setMemoryBudget(scene3d::memoryBudgetBytes(memoryBudget));
         memoryBudget->setToolTip(
             q->tr("Maximum decoded fiber coordinates per source, and maximum surface mesh buffer size. Additional rendering buffers, snapshots and CT use more memory. This is a limit, not a preallocation."));
         row(q->tr("Memory budget"), memoryBudget);
@@ -641,8 +636,8 @@ struct Fiber3DPanel::Impl {
             request();
             saveSettings();
         });
-        QObject::connect(memoryBudget, &QComboBox::currentIndexChanged, q, [this] {
-            surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
+        QObject::connect(memoryBudget, &QDoubleSpinBox::valueChanged, q, [this] {
+            surfaceControls->setMemoryBudget(scene3d::memoryBudgetBytes(memoryBudget));
             request();
             saveSettings();
         });
@@ -681,7 +676,7 @@ struct Fiber3DPanel::Impl {
             if (auto* w = qobject_cast<QCheckBox*>(field))
                 s.setValue(w->objectName(), w->isChecked());
             else if (auto* w = qobject_cast<QComboBox*>(field))
-                s.setValue(w->objectName(), w == memoryBudget ? w->currentData().toInt() : w->currentIndex());
+                s.setValue(w->objectName(), w->currentIndex());
             else if (auto* w = qobject_cast<QSpinBox*>(field))
                 s.setValue(w->objectName(), w->objectName() == QStringLiteral("fibers3DOpacity") ? w->value() / 100.0 : w->value());
             else if (auto* w = qobject_cast<QDoubleSpinBox*>(field))
@@ -767,7 +762,7 @@ struct Fiber3DPanel::Impl {
         options.vertical = v->isChecked();
         options.unclassified = unknown->isChecked();
         options.maximumFibers = size_t(limit->value());
-        options.byteBudget = size_t(memoryBudget->currentData().toUInt()) * 1024 * 1024;
+        options.byteBudget = scene3d::memoryBudgetBytes(memoryBudget);
         options.selectedKey = selectedKey;
         const auto shape = volume->shapeXyz();
         Bounds volumeBounds;

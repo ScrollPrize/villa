@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DCanvas.hpp"
 #include "fibers3d/Fiber3DRibbon.hpp"
+#include "scene3d/VolumePreview.hpp"
 
 #include <QApplication>
 #include <QSurfaceFormat>
@@ -38,6 +39,57 @@ class Fiber3DCanvasTest : public QObject
     }
 
 private slots:
+    void volumeShowsInteriorWithoutSurfaceOrSlices()
+    {
+        vc3d::scene3d::Scene3DCanvas canvas;
+        canvas.resize(480,360);
+        canvas.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        QVERIFY(canvas.isValid());
+        canvas.setSurfaceOpacity(1);
+        canvas.setCTVolumeDensity(4);
+        auto volume = [&](bool interior) {
+            auto data = std::make_shared<vc3d::scene3d::VolumeData>();
+            data->bounds = {{-16,-16,-16},{16,16,16}};
+            auto image = std::make_shared<slices::Image>();
+            auto& slab = image->slab.emplace();
+            slab.origin = {-16,-16,-16};
+            slab.right={32,0,0}; slab.down={0,32,0}; slab.through={0,0,32};
+            slab.width=slab.height=slab.depth=16;
+            slab.pixels.resize(16*16*16*2);
+            for (int z=0; z<16; ++z)
+                for (int y=0; y<16; ++y)
+                    for (int x=0; x<16; ++x) {
+                        const bool core = x>=4 && x<12 && y>=4 && y<12 && z>=4 && z<12;
+                        const int i=2*((z*16+y)*16+x);
+                        slab.pixels[i]=interior && core ? 230 : 35;
+                        slab.pixels[i+1]=255;
+                    }
+            data->images.push_back(image);
+            return data;
+        };
+        const auto outerOnly = volume(false), withInterior = volume(true);
+        canvas.setCTVolume(outerOnly);
+        QTRY_VERIFY(canvas.isCTVolumeReady());
+        const auto outer = canvas.grabFramebuffer();
+        canvas.setCTVolume(withInterior);
+        QTRY_VERIFY(canvas.isCTVolumeReady());
+        const auto internal = canvas.grabFramebuffer();
+        QVERIFY(internal != outer); // same contour and boundary voxels
+        QVERIFY(canvas.ctSlices().empty());
+        QVERIFY(!canvas.surfaceMesh());
+        canvas.setCTVolumeDensity(0);
+        const auto transparent = canvas.grabFramebuffer();
+        canvas.setCTVolume({});
+        QCOMPARE(canvas.grabFramebuffer(), transparent);
+        canvas.setCTVolume(withInterior);
+        canvas.setCTVolumeDensity(4);
+        canvas.setPerspective(true);
+        QTRY_VERIFY(canvas.isCTVolumeReady());
+        QVERIFY(canvas.grabFramebuffer() != transparent);
+        canvas.clearContent();
+        QVERIFY(!canvas.ctVolume());
+    }
     void ctSlicesRenderWithoutARibbon_data()
     {
         QTest::addColumn<bool>("volumetric");
@@ -115,6 +167,22 @@ private slots:
         QCOMPARE(canvas.grabFramebuffer(), empty);
         canvas.setSurfaceVisible(true);
         QTRY_VERIFY(canvas.grabFramebuffer() != empty);
+        const auto shaded = canvas.grabFramebuffer();
+        auto textured = std::make_shared<surface::Mesh>(*mesh);
+        auto texture = std::make_shared<surface::Texture>();
+        texture->width = texture->height = 2;
+        texture->pixels = {200,255,200,255,200,255,200,255};
+        textured->texture = texture;
+        canvas.setSurfaceMesh(textured);
+        QTRY_VERIFY(canvas.isSurfaceMeshReady());
+        QTRY_VERIFY(grayPixels(canvas.grabFramebuffer()) > grayPixels(shaded) + 1000);
+        canvas.setSurfaceTextured(false);
+        QCOMPARE(canvas.grabFramebuffer(), shaded);
+        canvas.setSurfaceTextured(true);
+        canvas.setCTWindow(220, 255);
+        QCOMPARE(grayPixels(canvas.grabFramebuffer()), 0);
+        canvas.setCTWindow(0, 255);
+        QVERIFY(grayPixels(canvas.grabFramebuffer()) > 1000);
         canvas.setSurfaceMesh({});
         QCOMPARE(canvas.grabFramebuffer(), empty);
     }

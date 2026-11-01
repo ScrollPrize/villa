@@ -319,6 +319,12 @@ auto main(int argc, char* argv[]) -> int
 
     QApplication app(argc, argv);
 #ifdef VC_TESTING
+    if (hasCliFlag(argc, argv, "--test-scene-3d")) {
+        extern int runScene3DPanelTests();
+        const int result = runScene3DPanelTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
     if (hasCliFlag(argc, argv, "--test-object-store")) {
         extern int runObjectStoreControllerTests();
         const int result=runObjectStoreControllerTests();

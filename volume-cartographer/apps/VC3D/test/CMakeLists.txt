@@ -647,10 +647,13 @@ set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=
 # The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.
 if(TARGET VC3D)
+    add_test(NAME scene_3d_panel COMMAND VC3D --test-scene-3d)
+    set_tests_properties(scene_3d_panel PROPERTIES TIMEOUT 180)
     add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
     set_tests_properties(object_store_vc3d_controller PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
     vc_register_test_target(VC3D)
+    vc_register_ctest(scene_3d_panel VC3D)
     vc_register_ctest(object_store_vc3d_controller VC3D)
     add_test(NAME surface_panel_store COMMAND VC3D --test-surface-panel)
     set_tests_properties(surface_panel_store PROPERTIES

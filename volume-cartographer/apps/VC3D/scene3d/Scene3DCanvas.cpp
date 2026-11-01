@@ -51,6 +51,7 @@ void Scene3DCanvas::cleanupGL()
     v->surfaceRenderer.reset();
     v->surfaceUploading = bool(v->surfaceMesh);
     v->volumeRenderer.reset();
+    v->volumeUploading = bool(v->ctVolume);
     v->ctProgram.reset();
     glDeleteTextures(GLsizei(v->sliceTextures.size()), v->sliceTextures.data());
     v->sliceTextures.clear();
@@ -122,7 +123,7 @@ void Scene3DCanvas::drawSurface()
     if (v->glReady && (v->surfaceMesh || v->surfaceRenderer)) {
         if (!v->surfaceRenderer)
             v->surfaceRenderer = std::make_unique<fibers3d::Fiber3DSurfaceRenderer>();
-        v->surfaceUploading = v->surfaceRenderer->draw(v->surfaceVisible ? v->surfaceMesh : nullptr, matrix, v->origin, v->rotation, v->surfaceOpacity);
+        v->surfaceUploading = v->surfaceRenderer->draw(v->surfaceVisible ? v->surfaceMesh : nullptr, matrix, v->origin, v->rotation, v->surfaceOpacity, v->surfaceTextured, v->windowLow, v->windowHigh);
         if (v->surfaceUploading)
             update();
     }
@@ -162,6 +163,10 @@ void Scene3DCanvas::fitAll()
         expand(v->surfaceMesh->bounds.lower);
         expand(v->surfaceMesh->bounds.upper);
     }
+    if (v->ctVolume) {
+        expand(v->ctVolume->bounds.lower);
+        expand(v->ctVolume->bounds.upper);
+    }
     fitBounds(bounds);
 }
 float Scene3DCanvas::pixelsPerVoxel() const
@@ -172,6 +177,17 @@ float Scene3DCanvas::pixelsPerVoxel() const
 void Scene3DCanvas::resizeGL(int, int)
 {
     emit viewScaleChanged();
+}
+
+void Scene3DCanvas::clearContent()
+{
+    setCTSlices({});
+    setSurfaceMesh({});
+    setCTVolume({});
+    v->fitted = false;
+    v->origin = {};
+    v->radius = 100.0;
+    update();
 }
 
 void Scene3DCanvas::setCTWindow(float low, float high)
@@ -213,6 +229,25 @@ const slices::Images& Scene3DCanvas::ctSlices() const
     return v->slices;
 }
 
+void Scene3DCanvas::setCTVolume(std::shared_ptr<const VolumeData> data)
+{
+    if (v->ctVolume == data) return;
+    v->ctVolume = std::move(data);
+    v->volumeUploading = bool(v->ctVolume);
+    if (!v->fitted && v->ctVolume) fitAll();
+    update();
+}
+std::shared_ptr<const VolumeData> Scene3DCanvas::ctVolume() const { return v->ctVolume; }
+bool Scene3DCanvas::isCTVolumeReady() const
+{
+    return v->ctVolume && !v->volumeUploading && v->volumeRenderer && v->volumeRenderer->error().isEmpty();
+}
+void Scene3DCanvas::setCTVolumeDensity(float density)
+{
+    v->volumeDensity = std::clamp(density, 0.f, 100.f);
+    update();
+}
+
 void Scene3DCanvas::setCTSliceOpacity(float opacity)
 {
     v->sliceOpacity = std::clamp(opacity, 0.f, 1.f);
@@ -241,12 +276,25 @@ void Scene3DCanvas::drawCTSlices()
         v->sliceTree = volumetric ? nullptr : slices::partition(v->slices);
         v->slicesDirty = false;
     }
-    if (volumetric && !v->volumeRenderer)
+    if ((volumetric || v->ctVolume) && !v->volumeRenderer)
         v->volumeRenderer = std::make_unique<fibers3d::Fiber3DVolumeRenderer>();
     if (v->volumeRenderer) {
         const auto ratio = devicePixelRatioF();
-        if (v->volumeRenderer
-                ->draw(volumetric ? v->slices : slices::Images{}, v->sliceTransfer, v->matrix(width(), height()), v->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), v->windowLow, v->windowHigh, v->sliceOpacity, v->interactive))
+        auto transfer = v->sliceTransfer;
+        if (v->ctVolume) {
+            auto& p = transfer[0];
+            p = CompositeParams{};
+            const auto& bounds = v->ctVolume->bounds;
+            double thickness = std::numeric_limits<double>::infinity();
+            for (int k=0; k<3; ++k) thickness=std::min(thickness,std::max(1.,bounds.upper[k]-bounds.lower[k]));
+            p.alphaOpacity = float(v->volumeDensity / thickness);
+            p.alphaMin = std::clamp(v->windowLow/255.f,0.f,1.f);
+            p.alphaMax = std::clamp(v->windowHigh/255.f,0.f,1.f);
+            p.isoCutoff = 1;
+        }
+        v->volumeUploading = v->volumeRenderer
+                ->draw(v->ctVolume ? v->ctVolume->images : (volumetric ? v->slices : slices::Images{}), transfer, v->matrix(width(), height()), v->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), v->windowLow, v->windowHigh, v->ctVolume ? (v->surfaceVisible ? v->surfaceOpacity : 0.f) : v->sliceOpacity, v->interactive);
+        if (v->volumeUploading)
             update();
     }
     if (volumetric)
@@ -358,6 +406,11 @@ bool Scene3DCanvas::isSurfaceMeshReady() const
     return v->surfaceMesh && (!v->surfaceVisible || (v->surfaceRenderer && !v->surfaceUploading && v->surfaceRenderer->error().isEmpty()));
 }
 
+void Scene3DCanvas::setSurfaceTextured(bool enabled)
+{
+    v->surfaceTextured = enabled;
+    update();
+}
 void Scene3DCanvas::setSurfaceOpacity(float opacity)
 {
     v->surfaceOpacity = std::clamp(opacity, 0.f, 1.f);
@@ -366,8 +419,15 @@ void Scene3DCanvas::setSurfaceOpacity(float opacity)
 
 void Scene3DCanvas::setSurfaceVisible(bool visible)
 {
+    if (v->surfaceVisible == visible) return;
     v->surfaceVisible = visible;
+    emit surfaceDisplayChanged();
     update();
+}
+
+bool Scene3DCanvas::isSurfaceVisible() const
+{
+    return v->surfaceVisible;
 }
 
 void Scene3DCanvas::fitSurface()
@@ -469,6 +529,7 @@ void Scene3DCanvas::setSurfaceMesh(std::shared_ptr<const surface::Mesh> mesh)
     if (v->surfaceMesh == mesh) return;
     v->surfaceMesh = std::move(mesh);
     v->surfaceUploading = bool(v->surfaceMesh);
+    emit surfaceDisplayChanged();
     if (!v->fitted && v->surfaceVisible && v->surfaceMesh) fitSurface();
     update();
 }

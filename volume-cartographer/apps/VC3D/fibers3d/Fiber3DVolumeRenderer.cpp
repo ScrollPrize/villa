@@ -205,6 +205,12 @@ bool Fiber3DVolumeRenderer::draw(
         if (!budget)
             continue;
         if (!gpu.id) {
+            GLint maxEdge = 0;
+            glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &maxEdge);
+            if (slab.width > maxEdge || slab.height > maxEdge || slab.depth > maxEdge) {
+                error_ = QStringLiteral("CT volume exceeds this GPU's 3D texture limit. Choose a coarser Zarr level.");
+                return false;
+            }
             glGenTextures(1, &gpu.id);
             glBindTexture(GL_TEXTURE_3D, gpu.id);
             glTexImage3D(GL_TEXTURE_3D, 0, GL_RG8, slab.width, slab.height, slab.depth, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);

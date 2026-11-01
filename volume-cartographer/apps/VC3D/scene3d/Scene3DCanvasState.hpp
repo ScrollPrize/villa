@@ -1,5 +1,6 @@
 #pragma once
 #include "Scene3DCanvas.hpp"
+#include "VolumePreview.hpp"
 #include "fibers3d/Fiber3DSurfaceRenderer.hpp"
 #include "fibers3d/Fiber3DVolumeRenderer.hpp"
 #include <QTimer>
@@ -14,12 +15,15 @@ inline QVector3D relative(const Point& p, const Point& origin)
     return {float(p[0]-origin[0]), float(p[1]-origin[1]), float(p[2]-origin[2])};
 }
 struct Scene3DCanvas::State {
-    bool surfaceVisible = true;
+    bool surfaceVisible = true, surfaceTextured = true;
     std::shared_ptr<const surface::Mesh> surfaceMesh;
     std::unique_ptr<fibers3d::Fiber3DSurfaceRenderer> surfaceRenderer;
     float surfaceOpacity = .5f;
     bool surfaceUploading = false;
     slices::Images slices;
+    std::shared_ptr<const VolumeData> ctVolume;
+    bool volumeUploading = false;
+    float volumeDensity = 8.f;
     std::unique_ptr<fibers3d::Fiber3DVolumeRenderer> volumeRenderer;
     std::array<CompositeParams, 3> sliceTransfer;
     std::unique_ptr<slices::Tree> sliceTree;
@@ -50,6 +54,8 @@ struct Scene3DCanvas::State {
         double extent = radius + distance(target, origin);
         if (surfaceVisible && surfaceMesh && !surfaceMesh->indices.empty())
             extent = std::max(extent, distance(target, surfaceMesh->bounds.lower) + distance(surfaceMesh->bounds.lower, surfaceMesh->bounds.upper));
+        if (ctVolume)
+            extent = std::max(extent, distance(target, ctVolume->bounds.lower) + distance(ctVolume->bounds.lower, ctVolume->bounds.upper));
         for (const auto& image : slices) {
             for (const auto& p : slices::corners(*image))
                 extent = std::max(extent, distance(target, p));

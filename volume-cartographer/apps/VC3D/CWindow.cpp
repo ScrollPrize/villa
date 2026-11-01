@@ -135,6 +135,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberCollectionController.hpp"
 #include "fibers3d/Fiber3DPanel.hpp"
+#include "scene3d/Scene3DPanel.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -1411,6 +1412,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
                                         _inkDetectionDock,
                                    _transformsDock,
                                    _fibers3DDock,
+                                   _scene3DDock,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
@@ -1695,6 +1697,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, _transformsDock);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
+    addDock(menu, _scene3DDock);
 
     addDock(menu, _point_collection_widget);
     addDock(menu, _wrapAnnotationWidget);
@@ -3548,6 +3551,27 @@ void CWindow::CreateWidgets(void)
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    _scene3DDock = new QDockWidget(tr("3D Viewer"), _segmentWorkspaceWindow);
+    _scene3DDock->setObjectName(QStringLiteral("scene3DDock"));
+    auto* scenePanel = new vc3d::scene3d::Scene3DPanel(_state, _viewerManager.get(), _scene3DDock);
+    _scene3DDock->setWidget(scenePanel);
+    ensureDockWidgetFeatures(_scene3DDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _scene3DDock);
+    _scene3DDock->hide();
+    connect(_scene3DDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::visibilityChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::detachRequested, this, [this] {
+        _scene3DDock->setFloating(!_scene3DDock->isFloating());
+        _scene3DDock->show();
+        _scene3DDock->raise();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::attachVolumeRequested, this, [this] {
+        if (_menuController) _menuController->attachVolume();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::importSurfaceRequested, this, [this] {
+        if (_menuController) _menuController->importIntoObjectStore();
+    });
     _fibers3DDock = new QDockWidget(tr("Fibers 3D"), _segmentWorkspaceWindow);
     _fibers3DDock->setObjectName(QStringLiteral("fibers3DDock"));
     _fibers3DPanel = new vc3d::fibers3d::Fiber3DPanel(

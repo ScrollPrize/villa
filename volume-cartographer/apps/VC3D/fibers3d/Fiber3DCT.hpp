@@ -5,6 +5,7 @@
 
 namespace vc3d::fibers3d { using scene3d::Point; using scene3d::Bounds; }
 #include <atomic>
+#include <opencv2/core.hpp>
 
 class Volume;
 namespace vc::render
@@ -23,6 +24,10 @@ struct Tile {
 
 // Row endpoints and all sample coordinates use active level-0 CT voxels.
 // Bounded, cancellable trilinear sampling; no slab, MIP or extra disk cache.
+// Shared blocking CT sampling, with the same uint16 conversion and bounds mask.
+cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>&, Volume&, int level);
+// Shared display normalization for raw uint8/uint16 CT data.
+cv::Mat_<uint8_t> displayBytes(const cv::Mat&);
 void sampleTile(Tile&, Volume&, int level, const std::atomic_bool* cancelled = nullptr);
 
 struct Progress {

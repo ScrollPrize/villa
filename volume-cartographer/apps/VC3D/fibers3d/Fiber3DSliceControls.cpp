@@ -1,6 +1,6 @@
 #include "Fiber3DSliceControls.hpp"
 #include "Fiber3DSlices.hpp"
-#include "Fiber3DCanvas.hpp"
+#include "scene3d/Scene3DCanvas.hpp"
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -12,6 +12,8 @@
 #include <QFutureWatcher>
 #include <QLabel>
 #include <QSettings>
+#include <QDoubleSpinBox>
+#include <limits>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
@@ -39,11 +41,16 @@ struct Result {
 struct Fiber3DSliceControls::Impl {
     Fiber3DSliceControls* q;
     CState* state;
+    QString settingsGroup;
     ViewerManager* viewers;
-    Fiber3DCanvas* canvas;
+    scene3d::Scene3DCanvas* canvas;
     QToolButton* button;
     std::array<QCheckBox*, 3> axes{};
     QCheckBox* volumetric;
+    QWidget* xyPositionRow = nullptr;
+    QSlider* xyPosition = nullptr;
+    QDoubleSpinBox* xyPositionValue = nullptr;
+    QCheckBox* followMain = nullptr;
     QLabel* status;
     QTimer poll, debounce;
     QFutureWatcher<Result> watcher;
@@ -52,10 +59,13 @@ struct Fiber3DSliceControls::Impl {
     std::vector<slices::Plane> requested;
     slices::Images cache;
     std::optional<Point> center;
+    std::optional<Point> meshCenter, lastMeshCenter;
+    std::optional<scene3d::Bounds> meshBounds;
+    std::array<bool, 3> savedAxes{};
     bool busy = false, pending = false;
 
-    Impl(Fiber3DSliceControls* widget, CState* s, ViewerManager* vm, Fiber3DCanvas* c, QToolButton* b)
-        : q(widget), state(s), viewers(vm), canvas(c), button(b)
+    Impl(Fiber3DSliceControls* widget, CState* s, ViewerManager* vm, scene3d::Scene3DCanvas* c, QToolButton* b, QString group)
+        : q(widget), state(s), settingsGroup(std::move(group)), viewers(vm), canvas(c), button(b)
     {
         q->setObjectName(QStringLiteral("fibers3DSliceControls"));
         auto* layout = new QVBoxLayout(q);
@@ -65,12 +75,12 @@ struct Fiber3DSliceControls::Impl {
         for (int i = 0; i < 3; ++i) {
             axes[i] = new QCheckBox(QStringList{"XY", "XZ", "YZ"}[i], q);
             axes[i]->setObjectName(QStringLiteral("fibers3DSlice") + axes[i]->text());
-            axes[i]->setChecked(prefs.value(QStringLiteral("fibers3d/") + axes[i]->objectName(), i != 1).toBool());
+            axes[i]->setChecked(prefs.value(settingsGroup + QStringLiteral("/") + axes[i]->objectName(), i != 1).toBool());
             axes[i]->setToolTip(q->tr("Follow the position, orientation and visible area of this CT view"));
             row->addWidget(axes[i]);
             QObject::connect(axes[i], &QCheckBox::toggled, q, [this, i](bool on) {
                 QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
-                prefs.setValue(QStringLiteral("fibers3d/") + axes[i]->objectName(), on);
+                prefs.setValue(settingsGroup + QStringLiteral("/") + axes[i]->objectName(), on);
                 refresh();
             });
         }
@@ -100,7 +110,7 @@ struct Fiber3DSliceControls::Impl {
         opacity->setRange(0, 100);
         opacity->setSingleStep(5);
         opacity->setSuffix(QStringLiteral(" %"));
-        opacity->setValue(prefs.value(QStringLiteral("fibers3d/fibers3DSliceOpacity"), 70).toInt());
+        opacity->setValue(prefs.value(settingsGroup + QStringLiteral("/fibers3DSliceOpacity"), 70).toInt());
         auto* slider = new QSlider(Qt::Horizontal, q);
         slider->setObjectName(QStringLiteral("fibers3DSliceOpacitySlider"));
         slider->setRange(0, 100);
@@ -111,7 +121,7 @@ struct Fiber3DSliceControls::Impl {
         QObject::connect(opacity, &QSpinBox::valueChanged, slider, &QSlider::setValue);
         QObject::connect(opacity, &QSpinBox::valueChanged, q, [this](int value) {
             QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
-            prefs.setValue(QStringLiteral("fibers3d/fibers3DSliceOpacity"), value);
+            prefs.setValue(settingsGroup + QStringLiteral("/fibers3DSliceOpacity"), value);
             canvas->setCTSliceOpacity(value / 100.f);
         });
         canvas->setCTSliceOpacity(opacity->value() / 100.f);
@@ -124,7 +134,7 @@ struct Fiber3DSliceControls::Impl {
         status->setObjectName(QStringLiteral("fibers3DSliceStatus"));
         layout->addWidget(status);
         button->setCheckable(true);
-        button->setToolTip(q->tr("Show the linked CT slice planes among the fibers"));
+        button->setToolTip(q->tr("Show the linked CT slice planes in 3D"));
         button->setEnabled(bool(state->currentVolume()));
         q->hide();
         poll.setInterval(150);
@@ -142,12 +152,14 @@ struct Fiber3DSliceControls::Impl {
         QObject::connect(state, &CState::volumeChanged, q, [this] { invalidate(); });
         QObject::connect(state, &CState::vpkgChanged, q, [this] { invalidate(); });
         QObject::connect(state, &CState::volumeClosing, q, [this] {
+            resetXYPosition();
+            if (xyPositionRow) xyPositionRow->setEnabled(false);
             q->cancel();
             volume.reset();
             cache.clear();
             button->setEnabled(button->isChecked());
         });
-        QObject::connect(viewers, &ViewerManager::volumeWindowChanged, canvas, &Fiber3DCanvas::setCTWindow);
+        QObject::connect(viewers, &ViewerManager::volumeWindowChanged, canvas, &scene3d::Scene3DCanvas::setCTWindow);
         canvas->setCTWindow(viewers->volumeWindowLow(), viewers->volumeWindowHigh());
         QObject::connect(&watcher, &QFutureWatcher<Result>::finished, q, [this] {
             busy = false;
@@ -165,8 +177,73 @@ struct Fiber3DSliceControls::Impl {
                 debounce.start();
         });
     }
+    void enableXYPositionControl()
+    {
+        if (xyPositionRow)
+            return;
+        xyPositionRow = new QWidget(q);
+        auto* row = new QHBoxLayout(xyPositionRow);
+        row->setContentsMargins(0, 0, 0, 0);
+        auto* label = new QLabel(q->tr("XY slice Z"), xyPositionRow);
+        xyPosition = new QSlider(Qt::Horizontal, xyPositionRow);
+        xyPosition->setObjectName(QStringLiteral("scene3DSliceZ"));
+        xyPosition->setAccessibleName(q->tr("XY slice Z position"));
+        xyPosition->setSingleStep(1);
+        xyPosition->setPageStep(10);
+        xyPosition->setToolTip(q->tr("Move the XY slice through the mesh along the volume Z axis. The mesh and Main views stay fixed."));
+        xyPositionValue = new QDoubleSpinBox(xyPositionRow);
+        xyPositionValue->setObjectName(QStringLiteral("scene3DSliceZValue"));
+        xyPositionValue->setDecimals(2);
+        xyPositionValue->setSuffix(q->tr(" vx"));
+        xyPositionValue->setKeyboardTracking(false);
+        label->setBuddy(xyPositionValue);
+        followMain = new QCheckBox(q->tr("Follow Main"), xyPositionRow);
+        followMain->setObjectName(QStringLiteral("scene3DFollowMainXY"));
+        followMain->setChecked(true);
+        row->addWidget(label);
+        row->addWidget(xyPosition, 1);
+        row->addWidget(xyPositionValue);
+        row->addWidget(followMain);
+        static_cast<QVBoxLayout*>(q->layout())->insertWidget(1, xyPositionRow);
+        QObject::connect(xyPosition, &QSlider::valueChanged, q, [this](int value) {
+            xyPositionValue->setValue(value);
+        });
+        QObject::connect(xyPositionValue, &QDoubleSpinBox::valueChanged, q, [this](double value) {
+            const QSignalBlocker sliderBlock(xyPosition);
+            const QSignalBlocker followBlock(followMain);
+            xyPosition->setValue(int(std::lround(value)));
+            followMain->setChecked(false);
+            refresh();
+        });
+        QObject::connect(followMain, &QCheckBox::toggled, q, [this] { refresh(); });
+        refresh();
+    }
+    void resetXYPosition()
+    {
+        if (!followMain) return;
+        const QSignalBlocker blocker(followMain);
+        followMain->setChecked(true);
+    }
+    void updateXYPosition(double mainZ)
+    {
+        if (!xyPositionRow) return;
+        const auto current = state->currentVolume();
+        xyPositionRow->setEnabled(bool(current) && axes[0]->isChecked());
+        if (!current) return;
+        const int last = int(std::clamp<double>(double(current->shapeXyz()[2]) - 1, 0, std::numeric_limits<int>::max()));
+        const QSignalBlocker sliderBlock(xyPosition);
+        const QSignalBlocker valueBlock(xyPositionValue);
+        xyPosition->setRange(0, last);
+        xyPositionValue->setRange(0, last);
+        if (followMain->isChecked())
+            xyPositionValue->setValue(mainZ);
+        xyPosition->setValue(int(std::lround(xyPositionValue->value())));
+    }
     void invalidate()
     {
+        resetXYPosition();
+        if (xyPositionRow)
+            xyPositionRow->setEnabled(bool(state->currentVolume()) && axes[0]->isChecked());
         q->cancel();
         volume.reset();
         cache.clear();
@@ -193,6 +270,7 @@ struct Fiber3DSliceControls::Impl {
     std::vector<slices::Plane> snapshot()
     {
         std::vector<slices::Plane> planes;
+        const auto center = meshCenter ? meshCenter : this->center;
         const auto linkedViews = linkedViewers();
         for (int i = 0; i < 3; ++i) {
             if (!axes[i]->isChecked())
@@ -234,9 +312,34 @@ struct Fiber3DSliceControls::Impl {
                 }
                 if (linked && !center)
                     position += plane->normal({}, {}) * linked->normalOffset();
-                a = position - plane->basisX() * 512 - plane->basisY() * 512;
-                b = a + plane->basisX() * 1024;
-                d = a + plane->basisY() * 1024;
+                const auto x = plane->basisX(), y = plane->basisY();
+                double halfWidth = 512, halfHeight = 512;
+                if (meshBounds) {
+                    // Project the entire mesh AABB onto the plane, including
+                    // its Z extent when tilted. Texture resolution must not
+                    // limit the physical extent of the displayed slice.
+                    halfWidth = halfHeight = 0;
+                    for (int k = 0; k < 3; ++k) {
+                        const double halfExtent = .5 * (meshBounds->upper[k] - meshBounds->lower[k]);
+                        halfWidth += std::abs(x[k]) * halfExtent;
+                        halfHeight += std::abs(y[k]) * halfExtent;
+                    }
+                    halfWidth = std::max(1., halfWidth * 1.05);
+                    halfHeight = std::max(1., halfHeight * 1.05);
+                }
+                a = position - x * float(halfWidth) - y * float(halfHeight);
+                b = a + x * float(2 * halfWidth);
+                d = a + y * float(2 * halfHeight);
+            }
+            if (i == 0 && xyPositionRow) {
+                const double mainZ = .5 * (double(b[2]) + double(d[2]));
+                updateXYPosition(mainZ);
+                if (!followMain->isChecked()) {
+                    const float shift = float(xyPositionValue->value() - mainZ);
+                    a[2] += shift;
+                    b[2] += shift;
+                    d[2] += shift;
+                }
             }
             const double w = cv::norm(b - a), h = cv::norm(d - a);
             if (!std::isfinite(w) || !std::isfinite(h) || w < 1e-6 || h < 1e-6)
@@ -284,7 +387,12 @@ struct Fiber3DSliceControls::Impl {
                                 .arg(slab.width)
                                 .arg(slab.height)
                                 .arg(slab.depth));
-        } else
+        } else if (followMain && !followMain->isChecked() && axes[0]->isChecked())
+            status->setText(meshCenter ? q->tr("XY at Z %1").arg(xyPositionValue->value(), 0, 'f', 2)
+                                      : q->tr("XY at Z %1 · XZ/YZ linked to Main").arg(xyPositionValue->value(), 0, 'f', 2));
+        else if (meshCenter)
+            status->setText(q->tr("XY centered on mesh"));
+        else
             status->setText(q->tr("Linked to CT views · single slices"));
     }
     void refresh()
@@ -297,6 +405,8 @@ struct Fiber3DSliceControls::Impl {
             requested.clear();
             volume = current;
         }
+        if (xyPositionRow)
+            xyPositionRow->setEnabled(bool(volume) && axes[0]->isChecked());
         if (!volume) {
             q->cancel();
             status->setText(q->tr("Open a CT volume."));
@@ -364,8 +474,8 @@ struct Fiber3DSliceControls::Impl {
         }));
     }
 };
-Fiber3DSliceControls::Fiber3DSliceControls(CState* s, ViewerManager* v, Fiber3DCanvas* c, QToolButton* b, QWidget* parent)
-    : QWidget(parent), d(std::make_unique<Impl>(this, s, v, c, b))
+Fiber3DSliceControls::Fiber3DSliceControls(CState* s, ViewerManager* v, scene3d::Scene3DCanvas* c, QToolButton* b, QWidget* parent, QString settingsGroup)
+    : QWidget(parent), d(std::make_unique<Impl>(this, s, v, c, b, std::move(settingsGroup)))
 {
 }
 Fiber3DSliceControls::~Fiber3DSliceControls()
@@ -384,9 +494,13 @@ void Fiber3DSliceControls::cancel()
     d->requested.clear();
     d->canvas->setCTSlices({});
 }
+void Fiber3DSliceControls::enableXYPositionControl()
+{
+    d->enableXYPositionControl();
+}
 void Fiber3DSliceControls::resume()
 {
-    if (d->button->isChecked()) {
+    if (d->button->isChecked() && isVisible()) {
         d->poll.start();
         d->refresh();
     }
@@ -396,6 +510,39 @@ void Fiber3DSliceControls::setCenter(std::optional<Point> center)
     if (d->center == center)
         return;
     d->center = center;
+    d->refresh();
+}
+void Fiber3DSliceControls::setMeshBounds(std::optional<scene3d::Bounds> bounds)
+{
+    if (d->meshBounds.has_value() == bounds.has_value() &&
+        (!bounds || (d->meshBounds->lower == bounds->lower && d->meshBounds->upper == bounds->upper)))
+        return;
+    d->meshBounds = bounds;
+    std::optional<Point> center;
+    if (bounds) {
+        Point midpoint;
+        for (int k = 0; k < 3; ++k)
+            midpoint[k] = .5 * (bounds->lower[k] + bounds->upper[k]);
+        center = midpoint;
+    }
+    const bool entering = center && !d->meshCenter;
+    const bool leaving = !center && d->meshCenter;
+    for (int i = 0; i < 3; ++i) {
+        const QSignalBlocker blocker(d->axes[i]);
+        if (entering) d->savedAxes[i] = d->axes[i]->isChecked();
+        if (center) d->axes[i]->setChecked(i == 0);
+        else if (leaving) d->axes[i]->setChecked(d->savedAxes[i]);
+        d->axes[i]->setEnabled(!center);
+    }
+    d->meshCenter = center;
+    if (d->followMain) {
+        d->followMain->setText(center ? tr("Center on mesh") : tr("Follow Main"));
+        if (center && center != d->lastMeshCenter) {
+            const QSignalBlocker blocker(d->followMain);
+            d->followMain->setChecked(true);
+        }
+    }
+    if (center) d->lastMeshCenter = center;
     d->refresh();
 }
 }  // namespace vc3d::fibers3d

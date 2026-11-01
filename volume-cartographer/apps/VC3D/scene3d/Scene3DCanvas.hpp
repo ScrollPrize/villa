@@ -8,6 +8,7 @@
 
 namespace vc3d::scene3d
 {
+struct VolumeData;
 namespace slices = fibers3d::slices;
 namespace surface = fibers3d::surface;
 namespace ct = fibers3d::ct;
@@ -20,16 +21,23 @@ class Scene3DCanvas : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core
 public:
     explicit Scene3DCanvas(QWidget* parent = nullptr);
     ~Scene3DCanvas() override;
+    void clearContent();
     void setCTSlices(slices::Images);
     const slices::Images& ctSlices() const;
+    void setCTVolume(std::shared_ptr<const VolumeData>);
+    std::shared_ptr<const VolumeData> ctVolume() const;
+    bool isCTVolumeReady() const;
+    void setCTVolumeDensity(float);
     void setCTWindow(float low, float high);
     void setCTSliceOpacity(float opacity);
     void setCTSliceTransfer(const std::array<CompositeParams, 3>&);
     virtual void setSurfaceMesh(std::shared_ptr<const surface::Mesh>);
     std::shared_ptr<const surface::Mesh> surfaceMesh() const;
     bool isSurfaceMeshReady() const;
+    void setSurfaceTextured(bool enabled);
     void setSurfaceOpacity(float opacity);
     void setSurfaceVisible(bool visible);
+    bool isSurfaceVisible() const;
     void setPerspective(bool perspective);
     float pixelsPerVoxel() const;
     virtual void fitAll();
@@ -37,6 +45,7 @@ public:
     void focusPoint(Point point);
 
 signals:
+    void surfaceDisplayChanged();
     void viewScaleChanged();
     void positionClicked(QPointF position, bool context, QPoint globalPosition);
     void emptyContextRequested(QPoint globalPosition);
