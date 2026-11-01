@@ -175,9 +175,8 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     const PlaneSurface plane(point, normal);
     const float m = 1.0f / reader.scale;
     const cv::Vec3f dx = plane.basisX() * m, dy = plane.basisY() * m;
-    const auto map = reader.level.placement.indexMapFrom(reader.base);
     vcr::grid::Request request;
-    request.levels = {{reader.level.array.get(), reader.level.meta.type, map.scale, map.offset}};
+    request.levels = {vcr::zarr::gridLevel(reader.level, reader.base)};
     request.offsets = offsets;
     const auto layers = vcr::grid::sample(vcr::grid::Plane{{point[0], point[1], point[2]}, {dx[0], dx[1], dx[2]},
                                                            {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]}, d, d},

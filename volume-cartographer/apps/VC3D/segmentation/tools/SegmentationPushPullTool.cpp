@@ -1070,9 +1070,8 @@ static std::vector<cv::Mat_<uint8_t>> samplePatchLayers(const OpenedVolumes::Lev
     const PlaneSurface plane(origin, normal);
     const float step = 1.0f / scale;
     const cv::Vec3f dx = plane.basisX() * step, dy = plane.basisY() * step;
-    const auto map = level.array->placement.indexMapFrom(level.working);
     vcr::grid::Request request;
-    request.levels = {{level.array->array.get(), level.array->meta.type, map.scale, map.offset}};
+    request.levels = {vcr::zarr::gridLevel(*level.array, level.working)};
     request.offsets = offsets;
     const auto r = vcr::grid::sample(vcr::grid::Plane{{origin[0], origin[1], origin[2]}, {dx[0], dx[1], dx[2]},
                                                       {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]},

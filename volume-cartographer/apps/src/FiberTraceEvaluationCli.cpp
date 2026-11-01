@@ -684,9 +684,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     source.renderLevelIndex = 1;
                 } catch (const std::out_of_range&) {
                 }
-                const auto map = source.renderLevel->placement.indexMapFrom(base->placement);
-                source.renderGridLevel = {source.renderLevel->array.get(), source.renderLevel->meta.type,
-                                          map.scale, map.offset};
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, base->placement);
                 for (size_t axis = 0; axis < 3; ++axis)
                     if (source.renderSource.shapeZYX[axis] != dataset.manifest().baseShapeZYX->at(axis))
                         throw std::invalid_argument("render CT base shape differs from predictions");
@@ -695,7 +693,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
                 source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, decodedCache));
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);
-                source.renderGridLevel = {source.renderLevel->array.get(), source.renderLevel->meta.type};
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel);
             }
         }
         if(backend=="chunk-beam") {

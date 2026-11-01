@@ -46,9 +46,7 @@ std::array<double, 3> ViewerLevels::voxelExtent(int level) const
 vcr::grid::Level ViewerLevels::gridLevel(int level) const
 {
     const auto& l = levels[std::size_t(level)];
-    const auto map = l.array->placement.indexMapFrom(l.working);
-    return {l.array->array.get(), l.array->meta.type, map.scale, map.offset, std::nullopt,
-            gpuFailed->load() ? nullptr : l.cuda.get()};
+    return vcr::zarr::gridLevel(*l.array, l.working, gpuFailed->load() ? nullptr : l.cuda.get());
 }
 
 ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume)
