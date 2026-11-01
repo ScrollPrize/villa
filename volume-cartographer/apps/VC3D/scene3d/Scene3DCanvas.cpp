@@ -65,6 +65,10 @@ void Scene3DCanvas::cleanupGL()
     v->glReady = false;
     doneCurrent();
 }
+int Scene3DCanvas::maximumVolumeTextureEdge() const
+{
+    return v->maximumVolumeTextureEdge;
+}
 void Scene3DCanvas::initializeGL()
 {
     if (!initializeOpenGLFunctions()) {
@@ -72,6 +76,12 @@ void Scene3DCanvas::initializeGL()
         return;
     }
     v->glReady = true;
+    GLint maxEdge = 256;
+    glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &maxEdge);
+    if (maxEdge > 0 && maxEdge != v->maximumVolumeTextureEdge) {
+        v->maximumVolumeTextureEdge = maxEdge;
+        emit volumeTextureLimitChanged(maxEdge);
+    }
     v->ctError.clear();
     connect(context(), &QOpenGLContext::aboutToBeDestroyed, this, &Scene3DCanvas::cleanupGL, Qt::DirectConnection);
     glGenVertexArrays(1, &v->ctVao);
@@ -281,7 +291,10 @@ void Scene3DCanvas::drawCTSlices()
     if (v->volumeRenderer) {
         const auto ratio = devicePixelRatioF();
         auto transfer = v->sliceTransfer;
+        int raySamples = 512;
         if (v->ctVolume) {
+            const auto& slab = *v->ctVolume->images.front()->slab;
+            raySamples = 2 * std::min(2048, std::max({slab.width, slab.height, slab.depth}));
             auto& p = transfer[0];
             p = CompositeParams{};
             const auto& bounds = v->ctVolume->bounds;
@@ -293,7 +306,7 @@ void Scene3DCanvas::drawCTSlices()
             p.isoCutoff = 1;
         }
         v->volumeUploading = v->volumeRenderer
-                ->draw(v->ctVolume ? v->ctVolume->images : (volumetric ? v->slices : slices::Images{}), transfer, v->matrix(width(), height()), v->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), v->windowLow, v->windowHigh, v->ctVolume ? (v->surfaceVisible ? v->surfaceOpacity : 0.f) : v->sliceOpacity, v->interactive);
+                ->draw(v->ctVolume ? v->ctVolume->images : (volumetric ? v->slices : slices::Images{}), transfer, v->matrix(width(), height()), v->origin, defaultFramebufferObject(), int(width() * ratio), int(height() * ratio), v->windowLow, v->windowHigh, v->ctVolume ? (v->surfaceVisible ? v->surfaceOpacity : 0.f) : v->sliceOpacity, v->interactive, raySamples);
         if (v->volumeUploading)
             update();
     }

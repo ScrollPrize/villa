@@ -23,6 +23,7 @@ struct Scene3DCanvas::State {
     slices::Images slices;
     std::shared_ptr<const VolumeData> ctVolume;
     bool volumeUploading = false;
+    int maximumVolumeTextureEdge = 256;
     float volumeDensity = 8.f;
     std::unique_ptr<fibers3d::Fiber3DVolumeRenderer> volumeRenderer;
     std::array<CompositeParams, 3> sliceTransfer;

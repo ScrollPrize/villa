@@ -8,22 +8,22 @@
 namespace vc3d::scene3d
 {
 std::shared_ptr<VolumeData> sampleVolume(Volume& volume, int requestedLevel, size_t maxBytes,
-                                       const std::atomic_bool& cancelled)
+                                       const std::atomic_bool& cancelled, int maxEdge)
 {
     auto checkCancelled = [&] {
         if (cancelled.load()) throw std::runtime_error("CT volume loading cancelled");
     };
     checkCancelled();
     if (maxBytes < 128) throw std::invalid_argument("CT preview needs at least 128 bytes");
+    if (maxEdge < 1) throw std::invalid_argument("CT preview resolution must be positive");
     const auto native = volume.shapeXyz();
     if (std::any_of(native.begin(), native.end(), [](int n) { return n <= 0; }))
         throw std::runtime_error("Invalid CT volume dimensions");
     auto levels = volume.presentScaleLevels();
     std::sort(levels.begin(), levels.end());
     if (levels.empty()) throw std::runtime_error("CT volume has no available Zarr levels");
-    constexpr int maxEdge = 256; // guaranteed minimum 3D texture size in OpenGL 3.3
     const size_t scratchBytes = std::min(maxBytes/4, size_t(256*1024));
-    const size_t textureBytes = std::min(maxBytes-scratchBytes, size_t(64*1024*1024));
+    const size_t textureBytes = maxBytes-scratchBytes;
     const size_t maxVoxels = textureBytes/4; // RG8 on CPU and GPU
     const int batchSize = int(std::max(size_t(1), scratchBytes/64));
     auto fits = [&](const std::array<int,3>& shape) {

@@ -89,7 +89,7 @@ Scene3DPanel::Scene3DPanel(CState* state, ViewerManager* viewers, QWidget* paren
     QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto* budget = makeMemoryBudgetInput(controls, prefs.value("scene3d/memoryMiB", 2048).toDouble());
     budget->setObjectName(QStringLiteral("scene3DMemoryBudgetMiB"));
-    budget->setToolTip(tr("Memory allowance for 3D loading, allocated only as needed. Type a larger value for large surfaces. The CT overview keeps its preview size bounded automatically."));
+    budget->setToolTip(tr("Memory allowance for 3D loading, allocated only as needed. Increase this for larger surfaces or higher-resolution CT previews. Volume resolution controls the requested preview size."));
     auto* budgetRow = new QHBoxLayout;
     auto* budgetLabel = new QLabel(tr("3D memory budget"), controls);
     budgetLabel->setBuddy(budget);
@@ -136,7 +136,7 @@ Scene3DPanel::Scene3DPanel(CState* state, ViewerManager* viewers, QWidget* paren
         canvas_->clearContent();
         surface_->setVolumeSource(volume);
         if (!volume) ct->setChecked(savedCT_);
-        help->setText(volume ? tr("Drag to rotate the CT volume. Volume density controls how much internal structure shows through. Preview resolution adjusts automatically to keep memory bounded; no surface mesh is needed.") : surfaceHelp);
+        help->setText(volume ? tr("Drag to rotate the CT volume. Volume density controls how much internal structure shows through. Increase Volume resolution for more detail; the preview stays within the memory budget and GPU limits. Choose a finer Zarr level if the source data is too coarse.") : surfaceHelp);
     });
 }
 void Scene3DPanel::showEvent(QShowEvent* event)

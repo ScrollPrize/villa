@@ -10,6 +10,7 @@
 #include <QThread>
 #include <QSlider>
 #include <QDoubleSpinBox>
+#include <QSpinBox>
 #include <iostream>
 #include "VolumePreviewTest.inc"
 
@@ -289,8 +290,11 @@ int runScene3DPanelTests()
         require(!canvas->surfaceMesh(), "surface removal clears the mesh");
         auto* displayMode = panel.findChild<QComboBox*>("scene3DDisplayMode");
         require(displayMode, "volume-only display mode exists");
+        auto* resolution = panel.findChild<QSpinBox*>("scene3DVolumeResolution");
+        require(resolution && resolution->value()==256 && !resolution->isVisible(), "resolution defaults to 256 and is specific to volume mode");
         displayMode->setCurrentIndex(1);
         settle([&] { return bool(canvas->ctVolume()); });
+        require(resolution->isVisible(), "volume mode exposes resolution control");
         require(canvas->ctSlices().empty() && !canvas->surfaceMesh(), "CT volume renders without a surface or slice planes");
         require(!state.surface("segmentation"), "volume view does not create or require a segmentation");
         auto* density = panel.findChild<QDoubleSpinBox*>("scene3DVolumeDensity");
@@ -304,8 +308,36 @@ int runScene3DPanelTests()
             settle([&] { canvas->grabFramebuffer(); return canvas->isCTVolumeReady(); });
             require(panel.grab().save(qEnvironmentVariable("VC3D_SCENE3D_SCREENSHOT") + ".volume.png"), "cannot save CT volume screenshot");
         }
+        // Rapid edits must publish only the final resolution; larger requests
+        // must reload the volume while retaining its native bounds.
+        resolution->setValue(2);
+        resolution->setValue(4);
+        const int requestedEdge = volumePath.isEmpty() ? 16 : 512;
+        resolution->setValue(requestedEdge);
+        settle([&] { return bool(canvas->ctVolume()); });
+        const auto detailed = canvas->ctVolume();
+        const auto& detailedSlab = *detailed->images.front()->slab;
+        require(detailed != loaded && detailed->bounds.upper == loaded->bounds.upper,
+                "resolution changes replace data without changing physical bounds");
+        require(std::max({detailedSlab.width,detailedSlab.height,detailedSlab.depth}) <=
+                std::min(requestedEdge,canvas->maximumVolumeTextureEdge()), "resolution obeys requested and GPU limits");
+        if (volumePath.isEmpty()) {
+            require(detailedSlab.width==16 && detailedSlab.height==16 && detailedSlab.depth==16,
+                    "latest resolution wins over cancelled requests");
+            Scene3DPanel restored(&state, &viewers);
+            require(restored.findChild<QSpinBox*>("scene3DVolumeResolution")->value()==16,
+                    "volume resolution preference is restored");
+        }
+        std::cout << "volume resolution: requested=" << requestedEdge << " GPU_limit=" << canvas->maximumVolumeTextureEdge()
+                  << " preview=" << detailedSlab.width << 'x' << detailedSlab.height << 'x' << detailedSlab.depth
+                  << " CPU_texture_bytes=" << detailedSlab.pixels.size() << std::endl;
+        if (render) {
+            settle([&] { canvas->grabFramebuffer(); return canvas->isCTVolumeReady(); });
+            require(panel.grab().save(qEnvironmentVariable("VC3D_SCENE3D_SCREENSHOT") + ".volume-detailed.png"), "cannot save detailed CT volume screenshot");
+        }
         if (volumePath.isEmpty()) {
             displayMode->setCurrentIndex(0);
+            require(!resolution->isVisible(), "surface mode hides volume resolution");
             require(!canvas->ctVolume(), "switching to slices removes volume data");
             displayMode->setCurrentIndex(1);
             displayMode->setCurrentIndex(0);

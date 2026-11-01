@@ -63,4 +63,15 @@ static void testVolumePreview(const std::filesystem::path& root)
     data=sampleVolume(*tall,0,budget,stop);
     require(data && data->resampled && data->images.front()->slab->depth==256,"long single-level volumes are reduced automatically");
     require(data->images.front()->slab->through==Point{0,0,300},"texture edge limit does not shrink the volume");
+    auto detailed=sampleVolume(*tall,0,budget,stop,512);
+    require(detailed && !detailed->resampled && detailed->images.front()->slab->depth==300,
+            "raising resolution retains source detail above the former 256-voxel limit");
+    require(detailed->bounds.upper==data->bounds.upper && detailed->images.front()->slab->through==data->images.front()->slab->through,
+            "increasing resolution preserves native geometry");
+    auto limited=sampleVolume(*tall,0,4096,stop,1024);
+    require(limited && limited->resampled && 2*limited->images.front()->slab->pixels.size()<=4096-4096/4,
+            "higher requested resolution still respects texture and scratch memory budget");
+    rejected=false;
+    try { sampleVolume(*tall,0,budget,stop,0); } catch (const std::invalid_argument&) { rejected=true; }
+    require(rejected,"invalid resolutions are rejected");
 }

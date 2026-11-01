@@ -27,6 +27,7 @@ public:
     void setCTVolume(std::shared_ptr<const VolumeData>);
     std::shared_ptr<const VolumeData> ctVolume() const;
     bool isCTVolumeReady() const;
+    int maximumVolumeTextureEdge() const;
     void setCTVolumeDensity(float);
     void setCTWindow(float low, float high);
     void setCTSliceOpacity(float opacity);
@@ -45,6 +46,7 @@ public:
     void focusPoint(Point point);
 
 signals:
+    void volumeTextureLimitChanged(int maxEdge);
     void surfaceDisplayChanged();
     void viewScaleChanged();
     void positionClicked(QPointF position, bool context, QPoint globalPosition);

@@ -13,6 +13,7 @@
 #include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <QFutureWatcher>
 #include <QLabel>
 #include <QPushButton>
@@ -47,6 +48,8 @@ struct Fiber3DSurfaceControls::Impl {
     QLabel* title;
     QWidget* densityRow;
     QDoubleSpinBox* density;
+    QWidget* resolutionRow;
+    QSpinBox* resolution;
     std::function<void(bool, double)> applyFilter;
     QCheckBox* nearby;
     QSpinBox* distance;
@@ -135,6 +138,35 @@ struct Fiber3DSurfaceControls::Impl {
             QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
             prefs.setValue(settingsGroup + QStringLiteral("/volumeDensity"), value);
             canvas->setCTVolumeDensity(float(value));
+        });
+        resolutionRow = new QWidget(q);
+        auto* resolutionLayout = new QHBoxLayout(resolutionRow);
+        resolutionLayout->setContentsMargins(0,0,0,0);
+        auto* resolutionLabel = new QLabel(q->tr("Volume resolution (max edge)"), resolutionRow);
+        resolution = new QSpinBox(resolutionRow);
+        resolution->setObjectName(QStringLiteral("scene3DVolumeResolution"));
+        resolution->setRange(1, std::numeric_limits<int>::max());
+        resolution->setSingleStep(256);
+        resolution->setSuffix(q->tr(" voxels"));
+        resolution->setKeyboardTracking(false);
+        resolution->setValue(prefs.value(settingsGroup + QStringLiteral("/volumeResolution"), 256).toInt());
+        resolutionLabel->setBuddy(resolution);
+        resolutionLayout->addWidget(resolutionLabel);
+        resolutionLayout->addWidget(resolution, 1);
+        layout->addWidget(resolutionRow);
+        resolutionRow->hide();
+        auto updateResolutionHelp = [this] {
+            resolution->setToolTip(q->tr("Maximum voxels along any preview axis, for example 256, 512, or 1024. Higher values load more detail and need more memory and time. The actual size is limited by the selected Zarr level, 3D memory budget, and GPU limit (%1 voxels). Choose a finer Zarr level if needed.").arg(canvas->maximumVolumeTextureEdge()));
+        };
+        updateResolutionHelp();
+        QObject::connect(canvas, &scene3d::Scene3DCanvas::volumeTextureLimitChanged, q, [this, updateResolutionHelp] {
+            updateResolutionHelp();
+            if (volumeSource) invalidate();
+        });
+        QObject::connect(resolution, &QSpinBox::valueChanged, q, [this](int value) {
+            QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
+            prefs.setValue(settingsGroup + QStringLiteral("/volumeResolution"), value);
+            if (volumeSource) invalidate();
         });
         auto* options = new QWidget(q);
         auto* line = new QHBoxLayout(options);
@@ -264,6 +296,8 @@ struct Fiber3DSurfaceControls::Impl {
                         status->setText(status->text() + q->tr(" (requested %1; preview uses a coarser level)").arg(result.volume->requestedLevel));
                     if (result.volume && result.volume->resampled)
                         status->setText(status->text() + q->tr(" · downsampled overview"));
+                    if (result.volume && resolution->value() > canvas->maximumVolumeTextureEdge())
+                        status->setText(status->text() + q->tr(" · GPU max edge %1").arg(canvas->maximumVolumeTextureEdge()));
                     if (result.mesh && result.mesh->texture)
                         status->setText(status->text() + q->tr(" · CT level %1").arg(result.mesh->texture->level));
                 } else
@@ -348,13 +382,14 @@ struct Fiber3DSurfaceControls::Impl {
             auto volume = overview || withTexture ? state->currentVolume() : nullptr;
             if (overview && !volume) { status->setText(q->tr("Attach a CT volume.")); return; }
             const int level = textureLevel->currentData().toInt();
+            const int maxEdge = std::min(resolution->value(), canvas->maximumVolumeTextureEdge());
             cancelled = std::make_shared<std::atomic_bool>(false);
             busy = true;
-            watcher.setFuture(QtConcurrent::run([points = std::move(points), stop = cancelled, budget = maxBytes, scale, volume, level, overview, withTexture] {
+            watcher.setFuture(QtConcurrent::run([points = std::move(points), stop = cancelled, budget = maxBytes, scale, volume, level, overview, withTexture, maxEdge] {
                 Result r;
                 try {
                     if (overview) {
-                        r.volume = scene3d::sampleVolume(*volume, level, budget, *stop);
+                        r.volume = scene3d::sampleVolume(*volume, level, budget, *stop, maxEdge);
                         return r;
                     }
                     auto mesh = surface::build(points, budget, *stop);
@@ -408,6 +443,7 @@ void Fiber3DSurfaceControls::setVolumeSource(bool volume)
     d->enabled->setToolTip(volume ? tr("Display a bounded, rotatable CT volume preview.") : tr("Display the surface selected in Main."));
     d->fit->setText(volume ? tr("Fit volume") : tr("Fit surface"));
     d->densityRow->setVisible(volume);
+    d->resolutionRow->setVisible(volume);
     d->textured->setVisible(!volume);
     d->textureLevel->setEnabled((volume || d->textured->isChecked()) && d->textureLevel->count() > 0);
     QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);

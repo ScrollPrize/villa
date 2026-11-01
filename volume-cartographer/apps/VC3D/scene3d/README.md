@@ -71,24 +71,35 @@ ray marcher uses a small 3D texture directly; no contour mesh is constructed.
 Zero-valued CT background is transparent. **Volume density** adjusts absorption
 without reloading data. Window/level still follows the active CT display.
 
-Preview memory is automatic. The loader prefers the requested available Zarr
-level (default 3), then coarser levels. If even the coarsest level is too large,
-it resamples that level into at most 256 voxels per axis. CPU and GPU texture
-storage together are capped at 64 MiB, with at most 256 KiB of sampler scratch
-allowance; the application's shared chunk cache is separate. Source coordinates
+**Volume resolution (max edge)** sets the maximum voxels along any preview axis.
+It defaults to **256**; enter **512**, **1024**, or another size for more detail.
+The preference is saved. Larger previews take longer to load and render, and
+texture memory can grow eightfold when doubling all three dimensions.
+The loader prefers the requested available Zarr level (default 3), then coarser
+levels. If even the coarsest level is too large, it resamples that level.
+The actual dimensions stay within the requested resolution, GPU 3D texture
+limit, and 3D memory budget. A coarse source is never enlarged to invent detail;
+choose a finer **CT texture OME-Zarr level** if needed. The status shows the
+actual level and dimensions, and identifies requests above the GPU limit.
+CPU and GPU texture storage plus up to 256 KiB of sampler scratch fit the budget;
+the application's shared chunk cache is separate. At the default 256 edge,
+CPU and GPU textures still use at most 64 MiB together. Source coordinates
 and native volume dimensions are preserved, so reducing resolution never shrinks
 or stretches the displayed volume. The status reports the source Zarr level and
 preview dimensions. The 3D memory budget defaults to **2048 MiB (2 GiB)**. Type a larger whole-MiB
 value directly; there is no preset ceiling, only the process address-size limit.
 Existing saved budgets are preserved. The same editable budget is used in
-Fibers 3D. Increasing it allows larger surface/fiber loads; the CT overview
-continues to allocate only its bounded preview.
+Fibers 3D. Increasing it allows larger surface/fiber loads and higher-resolution
+CT previews when a larger Volume resolution is requested. Ray sampling also
+increases with volume resolution when stationary (up to 4096 steps); orbiting
+uses the lighter 512-step limit and refines after release.
 
 This is a display overview: coarser/resampled data can blur or miss small features.
 Source data and tifxyz geometry are unchanged. Orbiting, zooming, and changing
 density reuse the resident texture. Regression tests cover volumes with no
 pyramid, an oversized coarsest level, small budgets, native coordinates,
-cancellation, empty data, uint16 normalization, and internal-voxel rendering.
+cancellation, empty data, uint16 normalization, internal-voxel rendering, and
+configurable resolution with saved preferences and budget enforcement.
 
 **Volumetric** in the surface/slice mode uses the
 shared Composite View thickness and material settings, so changing it also
@@ -121,7 +132,8 @@ build/bin/VC3D --test-scene-3d
 For a real-data rendering check, provide a CT volume directory and a tifxyz
 surface in its coordinate frame. This test uses temporary settings and reads
 source data without modifying it. It also captures a CT volume-only image at
-`<screenshot-path>.volume.png`:
+`<screenshot-path>.volume.png` and a 512-edge request at
+`<screenshot-path>.volume-detailed.png`:
 
 ```sh
 VC3D_SCENE3D_VOLUME=/path/to/volume.zarr \

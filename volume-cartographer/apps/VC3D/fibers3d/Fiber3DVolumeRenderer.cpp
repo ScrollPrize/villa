@@ -26,7 +26,7 @@ uniform mat4 inverseMvp, toTexture[3];
 uniform vec3 voxelSize[3];
 uniform int count, axis[3];
 uniform vec2 windowRange;
-uniform float opacity, stepFactor;
+uniform float opacity, stepFactor, maxRaySamples;
 vec3 world(float depth) {
     vec4 p = inverseMvp * vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     return p.xyz / p.w;
@@ -59,7 +59,8 @@ void main() {
         if (interval(o[i], d[i], limit, a, b)) { enter[i] = a; leave[i] = b; t = min(t, a); }
     }
     vec3 rgb = vec3(0); float transmittance = 1.0;
-    // At most six entry/exit events, with <=512 samples per interval.
+    // Slabs use <=512 samples per interval (at most six entry/exit events).
+    // A standalone volume can use up to 4096 samples for higher-resolution data.
     // Empty gaps are skipped, and overlapping slabs are sampled once.
     for (int iteration = 0; iteration < 4096; ++iteration) {
         if (t >= limit || transmittance < 0.004) break;
@@ -68,7 +69,7 @@ void main() {
             if (i >= count || leave[i] <= t + 1e-4) continue;
             if (enter[i] > t + 1e-4) boundary = min(boundary, enter[i]);
             else { insideSlab = true; boundary = min(boundary, leave[i]);
-                   spacing = min(spacing, max(min(voxelSize[i].x, min(voxelSize[i].y, voxelSize[i].z)) * stepFactor, (leave[i]-enter[i])/512.0)); }
+                   spacing = min(spacing, max(min(voxelSize[i].x, min(voxelSize[i].y, voxelSize[i].z)) * stepFactor, (leave[i]-enter[i])/maxRaySamples)); }
         }
         if (!insideSlab) { if (boundary <= t) break; t = boundary; continue; }
         float dt = min(boundary - t, spacing);
@@ -181,7 +182,8 @@ bool Fiber3DVolumeRenderer::draw(
     float low,
     float high,
     float opacity,
-    bool interactive)
+    bool interactive,
+    int maxRaySamples)
 {
     if (!program_->isLinked())
         return false;
@@ -286,6 +288,7 @@ bool Fiber3DVolumeRenderer::draw(
     program_->setUniformValue("windowRange", QVector2D(low, high));
     program_->setUniformValue("opacity", opacity);
     program_->setUniformValue("stepFactor", interactive ? 1.f : .5f);
+    program_->setUniformValue("maxRaySamples", float(interactive ? 512 : std::clamp(maxRaySamples, 512, 4096)));
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
