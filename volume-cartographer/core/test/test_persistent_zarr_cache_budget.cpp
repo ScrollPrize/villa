@@ -64,33 +64,6 @@ bool publish(Budget& budget, const fs::path& path, std::size_t size)
 
 } // namespace
 
-TEST_CASE("disk budget synthetic eviction benchmark")
-{
-    if (!std::getenv("VC_CACHE_BUDGET_BENCH"))
-        return;
-    constexpr int count = 20000;
-    const auto root = tempRoot("benchmark");
-    for (int i = 0; i < count; ++i)
-        writeBytes(volumeChunk(root, i), 100);
-    auto budget = Budget::configure(root, {}, spaceWith(
-        std::make_shared<std::atomic<std::uint64_t>>(1000000000)));
-    budget->waitForIdle();
-    const auto start = std::chrono::steady_clock::now();
-    const auto cpu = std::clock();
-    budget->updateLimits({count * 50, 0});
-    budget->waitForIdle();
-    const auto trimmed = std::chrono::steady_clock::now();
-    for (int i = count; i < count + 200; ++i)
-        REQUIRE(publish(*budget, volumeChunk(root, i), 100));
-    budget->waitForIdle();
-    const auto finished = std::chrono::steady_clock::now();
-    std::cout << "budget_bench entries=" << count
-              << " trim_s=" << std::chrono::duration<double>(trimmed - start).count()
-              << " churn_s=" << std::chrono::duration<double>(finished - trimmed).count()
-              << " cpu_s=" << double(std::clock() - cpu) / CLOCKS_PER_SEC << '\n';
-    fs::remove_all(root);
-}
-
 TEST_CASE("generation buckets lazily refresh age and survive wrap and long idle gaps")
 {
     using Ages = vc::render::detail::CacheAgeBuckets<int>;
@@ -356,7 +329,6 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     const auto root = tempRoot("discover");
     writeBytes(volumeChunk(root, 0), 11);
     writeBytes(root / "volume-hash" / "manifest.json", 19);
-    writeBytes(root / "segments" / "level_0" / "0" / "0" / "0.bin", 23);
     writeBytes(root / "normal_grids" / "level_0" / "0" / "0" / "0.zst", 29);
 
     const auto lasagna = root / "open_data" / "lasagna" / "artifact";

@@ -106,6 +106,35 @@ def _run_ordered(process, items, worker_count, on_result=None):
                 on_result(result)
 
 
+def close_memmap(array: object) -> None:
+    """Release the file mapping behind ``array``, if it has one.
+
+    POSIX lets a mapped file be unlinked or replaced while the mapping is live;
+    Windows refuses with a sharing violation (``WinError 32``), so a mapping
+    that is still open when its backing file, or an enclosing temporary
+    directory, is removed makes the removal fail. Dropping the last reference
+    is not enough: the mapping closes at an unspecified garbage collection, not
+    deterministically, so the file stays locked in the meantime.
+
+    ``array`` may be a ``numpy.memmap`` or a plain array that views one:
+    ``numpy.asarray`` on a memmap strips the subclass but keeps the mapping
+    reachable through ``base``. The underlying mapping is found along the
+    ``base`` chain and closed. Closing it is shared state, so pass an array
+    whose mapping nothing else still needs; an owned array has no mapping and
+    is ignored.
+    """
+    seen: set[int] = set()
+    obj = array
+    while obj is not None and id(obj) not in seen:
+        seen.add(id(obj))
+        mapping = getattr(obj, "_mmap", None)
+        if mapping is not None:
+            if not mapping.closed:
+                mapping.close()
+            return
+        obj = getattr(obj, "base", None)
+
+
 @dataclass
 class Surface:
     """A stored-resolution TIFXYZ coordinate grid."""
@@ -116,6 +145,23 @@ class Surface:
     scale_yx: Tuple[float, float] = (1.0, 1.0)
     valid: Optional[BoolArray] = None
     name: str = ""
+
+    def close(self) -> None:
+        """Release any file mappings behind the coordinate grids.
+
+        ``load_surface`` may hand back ``x``/``y``/``z`` as live memory maps of
+        the stored ``x/y/z.tif`` grids. On Windows those mappings block removal
+        of the surface directory until they are closed, so a caller that is done
+        with the surface closes it. Harmless when the grids are owned arrays.
+        """
+        for grid in (self.x, self.y, self.z):
+            close_memmap(grid)
+
+    def __enter__(self) -> "Surface":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def __post_init__(self) -> None:
         if self.x.ndim != 2 or self.y.ndim != 2 or self.z.ndim != 2:

@@ -416,8 +416,6 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         PlaneVisual visual;
         visual.origin = origin;
         visual.directionXY = dirXY;
-        visual.handlePositiveVolume = handlePositive;
-        visual.handleNegativeVolume = handleNegative;
         visual.handlePositiveScene = handlePositiveScene;
         visual.handleNegativeScene = handleNegativeScene;
         visual.baseAngleDegrees = baseAngle;

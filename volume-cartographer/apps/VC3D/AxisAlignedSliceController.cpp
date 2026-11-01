@@ -8,7 +8,6 @@
 #include "VCSettings.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include <QTimer>
 #include <QCheckBox>
 #include <QSpinBox>
@@ -71,11 +70,6 @@ bool isFiniteVec3(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-bool isValidSurfacePoint(const cv::Vec3f& v)
-{
-    return isFiniteVec3(v) && v[0] != -1.0f && v[1] != -1.0f && v[2] != -1.0f;
-}
-
 struct SegmentSliceFrame {
     cv::Vec3f origin{0, 0, 0};
     cv::Vec3f xNormal{0, 0, 0};
@@ -89,18 +83,19 @@ struct SegmentSliceFrame {
 std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     QuadSurface& segment,
     const cv::Vec3f& focus,
-    SurfacePatchIndex* patchIndex)
+    const ViewerManager* viewerManager)
 {
-    if (!isFiniteVec3(focus)) {
+    if (!isFiniteVec3(focus) || !viewerManager) {
         return std::nullopt;
     }
 
-    cv::Vec3f ptr(0, 0, 0);
     constexpr float kProjectionThreshold = 1.0f;
-    const float dist = segment.pointTo(ptr, focus, kProjectionThreshold, 1000, patchIndex);
-    if (!std::isfinite(dist) || dist < 0.0f || dist >= kProjectionThreshold || !isFiniteVec3(ptr)) {
+    const auto hit = viewerManager->locate(segment, focus, kProjectionThreshold);
+    if (!hit || hit->distance >= kProjectionThreshold || !isFiniteVec3(hit->ptr)) {
         return std::nullopt;
     }
+    const cv::Vec3f ptr = hit->ptr;
+    const float dist = hit->distance;
 
     const cv::Vec2f grid = segment.ptrToGrid(ptr);
     if (!std::isfinite(grid[0]) || !std::isfinite(grid[1])) {
@@ -131,9 +126,9 @@ std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     const cv::Vec3f surfOrigin = segment.coord(ptr, {0, 0, 0});
     const cv::Vec3f xDir = segment.coord(ptr, {1, 0, 0});
     const cv::Vec3f yDir = segment.coord(ptr, {0, 1, 0});
-    if (!isValidSurfacePoint(surfOrigin) ||
-        !isValidSurfacePoint(xDir) ||
-        !isValidSurfacePoint(yDir)) {
+    if (!vc::geometry::validSurfacePoint(surfOrigin) ||
+        !vc::geometry::validSurfacePoint(xDir) ||
+        !vc::geometry::validSurfacePoint(yDir)) {
         return std::nullopt;
     }
 
@@ -494,8 +489,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
-        const auto frame = segmentSliceFrameAtFocus(*segment, origin, patchIndex);
+        const auto frame = segmentSliceFrameAtFocus(*segment, origin, _viewerManager);
         if (!frame) {
             if (!hadSegmentPlanes) {
                 configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);

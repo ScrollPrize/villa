@@ -43,6 +43,49 @@ using vc::render::ChunkRequestScheduler;
 using vc::render::ChunkRequestSelectionGate;
 using vc::render::ChunkWorkPriority;
 
+TEST_CASE("ChunkRequestScheduler source contention does not freeze unrelated selection")
+{
+    auto gate = std::make_shared<ChunkRequestSelectionGate>();
+    ChunkRequestScheduler scheduler(1, 3, gate);
+    std::mutex source;
+    std::unique_lock sourceHeld(source);
+    std::latch entering{1};
+    auto publication = std::async(std::launch::async, [&] {
+        entering.count_down();
+        gate->publish(source, [] {});
+    });
+    entering.wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::promise<void> selected;
+    auto ran = selected.get_future();
+    scheduler.submit(1, {}, 1, 0, [&] { selected.set_value(); });
+    const auto status = ran.wait_for(std::chrono::seconds(2));
+    sourceHeld.unlock(); // Always unblock cleanup, including on regression.
+    publication.get();
+    scheduler.waitIdle();
+    CHECK(status == std::future_status::ready);
+}
+
+TEST_CASE("EmptyChunkMap exact paged states include source level and all spatial axes")
+{
+    using Map = vc::render::EmptyChunkMap;
+    Map map;
+    for (int z=0;z<16;++z) for(int y=0;y<16;++y) for(int x=0;x<16;++x)
+        map.set({0,z,y,x}, x%2 ? Map::Value::Missing : Map::Value::AllFill);
+    CHECK(map.size() == 4096);
+    CHECK(map.pageBytes() <= 1056);
+    CHECK(map.get({1,0,0,0}) == Map::Value::Unknown);
+    CHECK(map.get({0,16,0,0}) == Map::Value::Unknown);
+    CHECK(map.get({0,0,16,0}) == Map::Value::Unknown);
+    CHECK(map.get({0,0,0,16}) == Map::Value::Unknown);
+    for (int z=0;z<16;++z) for(int y=0;y<16;++y) for(int x=0;x<16;++x) {
+        CHECK(map.get({0,z,y,x}) == (x%2 ? Map::Value::Missing : Map::Value::AllFill));
+        map.set({0,z,y,x}, Map::Value::Unknown);
+    }
+    CHECK(map.size() == 0);
+    CHECK(map.pageBytes() == 0);
+}
+
 namespace {
 
 class CountingFetcher : public IChunkFetcher {
@@ -637,6 +680,23 @@ TEST_CASE("Delta3D cache mode permits sources without persistent caching")
           vc::render::PersistentCacheLayout::Legacy);
 }
 
+TEST_CASE("ChunkCacheService can initialize bounded physical worker pools")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.fetchConcurrency.workerCapacity = 1;
+    options.probeWorkerCapacity = 1;
+    options.decodeWorkerCapacity = 1;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    CHECK(service->fetchConcurrency().workerCapacity == 1);
+    CHECK(service->probeWorkerCapacity() == 1);
+    CHECK(service->decodeWorkerCapacity() == 1);
+    CHECK(service->decodeConcurrency() == 1);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    CHECK(makeServiceCache(service, "bounded-workers", fetcher));
+    options.decodeWorkerCapacity = 0;
+    CHECK_THROWS_AS(ChunkCacheService(options), std::invalid_argument);
+}
+
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
 {
     const ChunkCacheService::AdaptiveDownloadState initial{
@@ -1008,6 +1068,100 @@ TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
     CHECK(cacheB->getChunkIfCached(0, 0, 0, 0).status ==
           ChunkStatus::MissQueued);
     CHECK(cacheB->getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
+}
+
+TEST_CASE("released decoded leases race safely with shared budget reductions")
+{
+    auto service=makeService(512);
+    auto fetcher=std::make_shared<CountingFetcher>();
+    for(int z=0;z<2;++z)for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+        ChunkFetchResult result;result.status=ChunkFetchStatus::Found;
+        result.bytes=makeBytes(64,std::byte{91});
+        fetcher->setCanned({0,z,y,x},result);
+    }
+    auto cache=makeServiceCache(service,"recycle-shrink",fetcher);
+    auto budget=service->decodedByteBudget();
+    for(int repeat=0;repeat<8;++repeat){
+        budget->setMaximumBytes(512);
+        std::vector<ChunkResult> leases;
+        for(int z=0;z<2;++z)for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+            leases.push_back(cache->getChunkBlocking(0,z,y,x));
+            REQUIRE(leases.back().bytes);
+        }
+        cache->invalidate();
+        std::atomic_bool go{false};
+        std::vector<std::thread> releases;
+        for(auto& lease:leases)releases.emplace_back([value=std::move(lease.bytes),&go]() mutable {
+            while(!go.load())std::this_thread::yield();
+            value.reset();
+        });
+        std::thread shrink([&]{
+            go.store(true);
+            for(int i=0;i<32;++i)budget->setMaximumBytes(i%2?128:0);
+            budget->setMaximumBytes(0);
+        });
+        shrink.join();for(auto& thread:releases)thread.join();
+        CHECK(budget->stats().decodedBytes==0);
+        CHECK(budget->stats().recycledBytes==0);
+    }
+}
+
+TEST_CASE("a non-Zarr decoder can consume cache-owned reusable output")
+{
+    class ReusingFetcher final : public IChunkFetcher {
+    public:
+        mutable std::atomic<int> reuse{0};
+        ChunkFetchResult fetch(const ChunkKey& key) override { return decodeFetched(key,fetchEncoded(key)); }
+        ChunkFetchResult fetchEncoded(const ChunkKey& key) override {
+            ChunkFetchResult r;r.status=ChunkFetchStatus::Found;
+            r.bytes={std::byte(21+key.ix)};return r;
+        }
+        ChunkFetchResult decodeFetched(const ChunkKey&,ChunkFetchResult input) const override {
+            const auto value=input.bytes.front();
+            ChunkFetchResult r;r.status=ChunkFetchStatus::Found;
+            if(!input.decodeBuffer.empty())++reuse;
+            r.bytes=std::move(input.decodeBuffer);
+            r.bytes.resize(64);
+            std::fill(r.bytes.begin(),r.bytes.end(),value);
+            return r;
+        }
+    };
+    auto service=makeService(128);
+    auto fetcher=std::make_shared<ReusingFetcher>();
+    auto cache=makeServiceCache(service,"generic-reuse",fetcher);
+    auto first=cache->getChunkBlocking(0,0,0,0);
+    REQUIRE(first.bytes);
+    const auto* address=first.bytes->data();
+    cache->invalidate();
+    CHECK(service->decodedByteBudget()->stats().recycledBytes==0);
+    first.bytes.reset();
+    auto second=cache->getChunkBlocking(0,0,0,1);
+    REQUIRE(second.bytes);
+    CHECK(fetcher->reuse==1);
+    CHECK(second.bytes->data()==address);
+    CHECK(*second.bytes==makeBytes(64,std::byte{22}));
+}
+
+TEST_CASE("shrinking the idle pool trims only excess capacity")
+{
+    auto service=makeService(256);
+    auto fetcher=std::make_shared<CountingFetcher>();
+    for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+        ChunkFetchResult r;r.status=ChunkFetchStatus::Found;r.bytes=makeBytes(64,std::byte{17});
+        fetcher->setCanned({0,0,y,x},std::move(r));
+    }
+    auto cache=makeServiceCache(service,"partial-pool-trim",fetcher);
+    for(int y=0;y<2;++y)for(int x=0;x<2;++x)
+        REQUIRE(cache->getChunkBlocking(0,0,y,x).status==ChunkStatus::Data);
+    cache->invalidate();
+    auto budget=service->decodedByteBudget();
+    REQUIRE(budget->stats().recycledBytes==256);
+    budget->setMaximumBytes(192);
+    CHECK(budget->stats().recycledBytes==192);
+    CHECK(budget->stats().trimmedBuffers==1);
+    CHECK(budget->stats().trimmedBytes==64);
+    budget->setMaximumBytes(0);
+    CHECK(budget->stats().recycledBytes==0);
 }
 
 TEST_CASE("ChunkCacheService capacity changes preserve sources and global LRU")
@@ -1540,9 +1694,10 @@ TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // Releasing the pin re-enforces the budget, so the overshoot the pin
-    // allowed does not persist.
-    CHECK(service->decodedByteBudget()->stats().decodedBytes <= 16);
+    // The parked reader is gone. Drop cache ownership immediately, without
+    // invalidating the returned lease or waiting for another cache operation.
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+    CHECK(result.bytes->at(0) == std::byte{55});
 }
 
 TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
@@ -1573,9 +1728,10 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // The reader's exit re-enforces the entry-count capacity, so the entry
-    // its registration protected is evicted once the reader has the result.
+    // The lease survives eviction but does not defeat metadata capacity.
+    CHECK(cache->stats().blockingReaders == 0);
     CHECK(cache->stats().decodedBytes == 0);
+    CHECK(result.bytes->at(0) == std::byte{55});
 }
 
 TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
@@ -1612,6 +1768,7 @@ TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
+    CHECK(cache->stats().blockingReaders == 0);
     CHECK(cache->stats().decodedBytes == 0);
 }
 
@@ -1671,7 +1828,8 @@ TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection"
     REQUIRE(resultA.bytes);
     REQUIRE(resultB.bytes);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
-    // Both readers exited; the last exit re-enforced the budget.
+    // Both callers retain the same bytes without retaining the cache entry.
+    CHECK(resultA.bytes == resultB.bytes);
     CHECK(cache->stats().decodedBytes == 0);
     CHECK(cache->stats().blockingReaders == 0);
 }
@@ -2177,6 +2335,67 @@ TEST_CASE("ChunkCache: shared decoded budget is enforced across caches")
     CHECK(c2->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
 }
 
+TEST_CASE("ChunkCache: external leases cannot defeat byte or entry limits")
+{
+    struct Payload final : vc::render::DecodedChunkPayload {
+        std::array<std::byte, 64> data{};
+        std::size_t residentBytes() const noexcept override { return data.size(); }
+    };
+    struct FreshFetcher final : IChunkFetcher {
+        bool opaque;
+        explicit FreshFetcher(bool value) : opaque(value) {}
+        ChunkFetchResult fetch(const ChunkKey&) override {
+            ChunkFetchResult result;
+            result.status = ChunkFetchStatus::Found;
+            if (opaque)
+                result.payload = std::make_shared<Payload>();
+            else
+                result.bytes = makeBytes(64, std::byte{55});
+            return result;
+        }
+    };
+    for (bool opaque : {false, true}) {
+        for (bool limitEntries : {false, true}) {
+            CAPTURE(opaque);
+            CAPTURE(limitEntries);
+            auto service = makeService(limitEntries ? 1024 : 128);
+            ChunkCache::Options options;
+            options.detectAllFillChunks = false;
+            options.metadataEntryCapacity = limitEntries ? 2 : 100;
+            auto cache = service->acquireSource(
+                "lease-budget", {{{8, 8, 8}, {4, 4, 4}, {}}},
+                {std::make_shared<FreshFetcher>(opaque)}, 0.0,
+                opaque ? ChunkDtype::Opaque : ChunkDtype::UInt8, options);
+            std::vector<ChunkResult> leases;
+            for (int z : {0, 1})
+                for (int y : {0, 1})
+                    for (int x : {0, 1}) {
+                        leases.push_back(cache->getChunkBlocking(0, z, y, x));
+                        REQUIRE(leases.back().status == ChunkStatus::Data);
+                        CHECK(service->decodedByteBudget()->stats().decodedBytes <= 128);
+                    }
+            CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+            for (const auto& lease : leases) {
+                if (opaque) {
+                    REQUIRE(lease.payload);
+                    CHECK(lease.payload->residentBytes() == 64);
+                } else {
+                    REQUIRE(lease.bytes);
+                    CHECK(lease.bytes->at(0) == std::byte{55});
+                }
+            }
+            std::weak_ptr<const std::vector<std::byte>> firstBytes = leases.front().bytes;
+            std::weak_ptr<const vc::render::DecodedChunkPayload> firstPayload = leases.front().payload;
+            leases.clear();
+            // No read or budget update after release: evicted buffers must
+            // die immediately, with at most the two budgeted chunks retained.
+            CHECK(firstBytes.expired());
+            CHECK(firstPayload.expired());
+            CHECK(service->decodedByteBudget()->stats().decodedBytes <= 128);
+        }
+    }
+}
+
 TEST_CASE("ChunkCache: invalidation releases shared decoded budget bytes")
 {
     auto budget = std::make_shared<DecodedChunkCacheBudget>(128);
@@ -2195,6 +2414,84 @@ TEST_CASE("ChunkCache: invalidation releases shared decoded budget bytes")
     CHECK(budget->stats().decodedBytes == 64);
     c2->invalidate();
     CHECK(budget->stats().decodedBytes == 0);
+}
+
+TEST_CASE("ChunkCache empty knowledge survives metadata pressure but not invalidation")
+{
+    auto service = makeService(128, 4);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkCache::Options options;
+    options.metadataEntryCapacity = 0;
+    options.detectAllFillChunks = true;
+    auto cache = service->acquireSource("negative-bitmap", {{{64,64,64},{4,4,4},{}}},
+        {fetcher}, 17, ChunkDtype::UInt8, options);
+    ChunkFetchResult fill;
+    fill.status = ChunkFetchStatus::Found;
+    fill.bytes.assign(64, std::byte{17});
+    fetcher->setCanned({0,0,0,0}, fill);
+    std::vector<ChunkKey> keys;
+    for(int z=0;z<16;++z) for(int y=0;y<16;++y) for(int x=0;x<16;++x)
+        keys.push_back({0,z,y,x});
+    cache->prefetchChunks(keys, true);
+    std::vector<ChunkResult> loaded;
+    for (const auto& key : keys) loaded.push_back(cache->getChunkBlocking(key.level,key.iz,key.iy,key.ix));
+    REQUIRE(loaded.size() == keys.size());
+    CHECK(loaded[0].status == ChunkStatus::AllFill);
+    CHECK(loaded[1].status == ChunkStatus::Missing);
+    CHECK(cache->stats().knownEmptyChunks == keys.size());
+    CHECK(cache->stats().metadataEntries == 0);
+    CHECK(cache->stats().emptyBitmapBytes <= 1056);
+    CHECK(cache->stats().evictionEntriesExamined == 0);
+    const auto calls = fetcher->fetchCalls.load();
+    cache->prefetchChunks(keys, true);
+    for (const auto& key : keys) CHECK(cache->getChunkBlocking(key.level,key.iz,key.iy,key.ix).status != ChunkStatus::MissQueued);
+    CHECK(cache->tryGetChunk(0,0,0,0).status == ChunkStatus::AllFill);
+    CHECK(cache->getChunkIfCached(0,0,0,1).status == ChunkStatus::Missing);
+    CHECK(fetcher->fetchCalls.load() == calls);
+    CHECK(cache->fillValue() == 17);
+    fill.bytes[0] = std::byte{19};
+    fetcher->setCanned({0,0,0,0}, fill);
+    cache->invalidate();
+    CHECK(cache->stats().knownEmptyChunks == 0);
+    CHECK(cache->stats().emptyBitmapBytes == 0);
+    REQUIRE(cache->getChunkBlocking(0,0,0,0).status == ChunkStatus::Data);
+    CHECK(service->decodedByteBudget()->stats().pendingRequests == 0);
+}
+
+TEST_CASE("ChunkCache anticipatory eviction prepares headroom before hard overflow")
+{
+    auto service = makeService(4096, 4);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    auto cache = service->acquireSource("headroom", {{{4,4,256},{4,4,4},{}}},
+        {fetcher}, 0, ChunkDtype::UInt8, options);
+    for(int x=0;x<64;++x) {
+        ChunkFetchResult data;
+        data.status=ChunkFetchStatus::Found;
+        data.bytes.assign(64,std::byte{13});
+        fetcher->setCanned({0,0,0,x},data);
+        REQUIRE(cache->getChunkBlocking(0,0,0,x).status == ChunkStatus::Data);
+    }
+    const auto budget = service->decodedByteBudget();
+    const auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while (budget->stats().decodedBytes > 4096-budget->stats().reserveBytes &&
+           std::chrono::steady_clock::now()<deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto stats=budget->stats();
+    CHECK(stats.reserveBytes == 128);
+    CHECK(stats.decodedBytes <= 4096-stats.reserveBytes);
+    CHECK(stats.backgroundEvictedBytes >= 128);
+    CHECK(stats.hardLimitPasses == 0);
+    CHECK(stats.pendingRequests == 0);
+    // A delayed readiness consumer can see a miss after publication. Merely
+    // polling is not a new request; it must use tryGetChunk to arrange a retry.
+    const auto calls = fetcher->fetchCalls.load();
+    CHECK(cache->getChunkIfCached(0,0,0,0).status == ChunkStatus::MissQueued);
+    CHECK(fetcher->fetchCalls.load() == calls);
+    CHECK(cache->tryGetChunk(0,0,0,0).status == ChunkStatus::MissQueued);
+    REQUIRE(cache->getChunkBlocking(0,0,0,0).status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == calls+1);
 }
 
 TEST_CASE("ChunkCache: separate decoded budgets do not evict each other")

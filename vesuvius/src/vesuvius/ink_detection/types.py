@@ -59,6 +59,8 @@ class Patch:
     is_validation: bool = False
     is_unlabeled: bool = False
     supervision_mask_override: Path | str | None = None
+    # Promoted held-out patches retain their original training supervision mask.
+    exclude_validation_mask: bool = False
 
     @property
     def image_volume(self) -> str | Path:

@@ -40,7 +40,7 @@ inline uint32_t be32(uint32_t v) {
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
-#include "support.hpp"
+#include "vc/core/util/normalgridtools.hpp"
 #include "vc/core/util/LifeTime.hpp"
 
 namespace fs = std::filesystem;
@@ -1640,7 +1640,7 @@ void run_generate(const po::variables_map& vm) {
                         grid_step);
 
                     const auto populate_start = std::chrono::steady_clock::now();
-                    populate_normal_grid(scratch.traces, grid_store, spiral_step);
+                    vc::core::util::populate_normal_grid(scratch.traces, grid_store, spiral_step);
                     const double populate_seconds = seconds_since(populate_start);
                     record_timing(local_stats, "populate_grid", populate_seconds);
 

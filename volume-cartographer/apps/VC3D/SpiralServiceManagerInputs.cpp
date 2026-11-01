@@ -20,6 +20,7 @@
 #include <QUuid>
 
 namespace {
+QString objectInputKey(const QString& objectUuid) { return QStringLiteral("object:") + objectUuid; }
 QString uuid() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 
 using vc3d::spiral::copyInput;
@@ -158,6 +159,11 @@ QString SpiralServiceManager::logicalInputId(const QString& kind, const QString&
                                              const QString& role, const QString& targetCollection,
                                              const QString& sourceIdentity)
 {
+    // Service input IDs are workspace-scoped. An opened artifact establishes
+    // the explicit association to its stable object UUID, independent of labels.
+    if (_inputAliases.contains(objectInputKey(alias))) return _inputAliases.value(objectInputKey(alias));
+    // New fiber inputs use the object UUID supplied by the store exporter.
+    if (kind == QStringLiteral("fiber")) return alias;
     if (_inputDrafts.contains(alias)) return alias;
     const QString key = kind + QLatin1Char(':') + role + QLatin1Char(':') + alias
         + QLatin1Char(':') + sourceIdentity;
@@ -170,7 +176,7 @@ QString SpiralServiceManager::logicalInputId(const QString& kind, const QString&
             ? !sourceIdentity.isEmpty() && input.value(QStringLiteral("source")).toString() == sourceIdentity
                 && !targetCollection.isEmpty() && input.value(QStringLiteral("role")).toString() == role
                 && QString::number(input.value(QStringLiteral("collection_id")).toInteger()) == targetCollection
-            : (kind == QStringLiteral("fiber") ? source.completeBaseName() : source.fileName()) == alias;
+            : source.fileName() == alias;
         if (match) return _inputAliases[key] = it.key();
     }
     if (kind == QStringLiteral("pcl") && !targetCollection.isEmpty()) return {};
@@ -247,13 +253,13 @@ void SpiralServiceManager::stagePclReplacement(vc3d::spiral::PclRole role, const
 
 void SpiralServiceManager::removeInputDraft(const QString& id)
 {
-    if (auto draft = _inputDrafts.value(id)) draft->remove();
+    if (auto draft = _inputDrafts.value(_inputAliases.value(objectInputKey(id), id))) draft->remove();
     emit inputDraftsChanged();
 }
 
 void SpiralServiceManager::restoreInputDraft(const QString& id)
 {
-    if (auto draft = _inputDrafts.value(id)) draft->restore();
+    if (auto draft = _inputDrafts.value(_inputAliases.value(objectInputKey(id), id))) draft->restore();
     emit inputDraftsChanged();
 }
 
@@ -837,13 +843,31 @@ void SpiralServiceManager::editInputDraft(const QString& id)
             emit inputEditorRequested(editorInput, source);
             return;
         }
-        const bool fiber = input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber");
-        const auto copySource = fiber ? QFileInfo(source).absolutePath() : source;
-        _inputWorkingCopySources[id].insert(QFileInfo(copySource).absoluteFilePath());
-        workingCopyAsync(copySource,
-            [this, input, source, fiber](const QString& working, const QString& error) {
+        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")) {
+            // Bind the selected object and peers carried by this immutable
+            // component artifact to their existing service entries before staging.
+            // Artifact filenames locate bytes; UUIDs establish object identity.
+            for (auto it = _inputCatalog.cbegin(); it != _inputCatalog.cend(); ++it) {
+                if (it.value().value(QStringLiteral("kind")).toString() != QStringLiteral("fiber")) continue;
+                const auto file = it.key() == id ? source : QDir(QFileInfo(source).absolutePath()).filePath(
+                    QFileInfo(it.value().value(QStringLiteral("source")).toString()).fileName());
+                if (!QFileInfo::exists(file)) continue;
+                QString error;
+                const auto document = readDocument(file, error);
+                const auto objectUuid = document.value(QStringLiteral("uuid")).toString();
+                if (!error.isEmpty() || document.value(QStringLiteral("type")).toString() != QStringLiteral("vc3d_fiber") ||
+                    document.value(QStringLiteral("version")).toInt() != 4 ||
+                    QUuid(objectUuid).isNull() || QUuid(objectUuid).toString(QUuid::WithoutBraces) != objectUuid) continue;
+                _inputAliases[objectInputKey(objectUuid)] = it.key();
+            }
+            emit inputEditorRequested(input, source);
+            return;
+        }
+        _inputWorkingCopySources[id].insert(QFileInfo(source).absoluteFilePath());
+        workingCopyAsync(source,
+            [this, input](const QString& working, const QString& error) {
                 if (working.isEmpty()) emit errorOccurred(error);
-                else emit inputEditorRequested(input, fiber ? QDir(working).filePath(QFileInfo(source).fileName()) : working);
+                else emit inputEditorRequested(input, working);
             });
     };
     const auto local = snapshot.content.manifest.value(QStringLiteral("path")).toString();

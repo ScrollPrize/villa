@@ -1,32 +1,73 @@
 # VC3D Line Annotation Fibers
 
-## Fiber coordinate shape
+## Storage and coordinates
 
-Every saved fiber includes `coordinate_base_shape_zyx`, the dimensions of the
-grid its stored points index. New viewer annotations record the active volume's
-exact shape; linked fibers inherit the parent session's shape and display scale.
-Headless inference annotations require the inference manifest's `base_shape_zyx`.
-These are coordinate-frame dimensions, not necessarily the scan's finest grid.
-Opening older unstamped fibers first uses their recorded/selected inference
-manifest; without one, their existing unscaled active-volume interpretation is
-recorded on save. Saving without a valid shape fails rather than omitting it.
-Once resolved, this shape is retained in the loaded fiber and its open sessions
-before saves are queued. Changing the active volume or inference dataset does
-not reinterpret previously resolved geometry.
-Package loading happens before volume activation. Load-time metadata writes
-(including assigning a missing UUID) that cannot yet resolve a coordinate shape
-are deferred until a volume becomes active. The already generated in-memory UUID
-is preserved during that wait; existing UUIDs are not replaced. Deferred writes
-are discarded on a fiber reload/package change, and this retry does not enable
-writes withheld for unresolved branch-link issues.
+Fibers live in the open project's store (`.vcobj`), or in a store attached beside
+it and chosen for fibers (**File → Stores**). **Attach Read-only Store** supports
+browsing without permitting writes.
+VC3D edits geometry, annotations, relationships and retirement directly through
+the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
+objects and retire the original in that transaction. VC3D retains pinned working
+snapshots; the database owns revision history and synchronization.
+The Fibers panel lists catalog pages from the store's records; selecting or
+expanding a fiber reads its exact span details from its current revision. The
+total length sums the listed fibers' stored lengths. Closing a read-only view does
+not remove its catalog entry.
 
-Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
-unchanged. There is no import/export scale control or API parameter; the shape
-determines the display conversion into the active volume. Agent requests that
-still supply `scale` are rejected. Old collection-level `scale` metadata is not
-applied; it described a transform already baked into the exported points.
-Previously scaled exports with inconsistent shape metadata need correction
-at their source; they cannot be repaired unambiguously on import.
+In the Fibers panel a click selects a fiber (and focuses the main views when
+they are shown); a double click opens it in Line Annotation, a span row at that
+span.
+
+A stored fiber opens read-only, from the Fibers panel, a viewer, a linked
+control point or the agent bridge (`fiber.open`), so opening it never re-solves
+or rewrites it. The view needs no Lasagna dataset; without one the strips use an
+inspection frame. **Enable editing** in the window's top bar switches the same
+view to editing: it checks that the store still holds the revision on screen,
+asks for the dataset editing needs, and rebuilds the strips in the sheet frame.
+A single-point fiber is traced at that moment. Fibers created or merged in the
+window open editable; `fiber.open` takes `editable: true` for the same. With a
+read-only store attachment the button stays disabled.
+
+Each fiber's explicit coordinate binding determines its transform into the active
+volume. Unbound fibers remain listed but are excluded from spatial overlays and
+search until bound. Slice, map and point-collection views apply the same
+per-fiber transform. Stored geometry and solver coordinates remain unchanged.
+`coordinate_base_shape_zyx`, when present, describes the stored coordinate grid.
+
+Import/export is an explicit transfer operation. VC3D imports current **version 4**
+`vc3d_fiber` JSON with UUIDs and exports that format. There is no implicit file
+migration, filename identity inference, gap repair, branch stripping, project
+fiber-folder lookup or `.afv` backend. Store records load directly from typed
+geometry and relationships, independently of their original ingestion format.
+Control-only fibers remain in the catalog and round-trip through import/export
+without generating line points. Import/export does not rescale points.
+
+Spiral stages newly drawn and reopened fibers, including their linked endpoints,
+as input drafts. Subsequent edits refresh those drafts; applying them to the fit
+remains an explicit action. Fiber identity is the object UUID, not its display name.
+
+Native JSON needed by external processing tools is materialized explicitly from
+pinned revisions into temporary transfer files.
+
+The scroll umbilicus (Fiber Map unrolling, generated-view normal orientation) is
+an `umbilicus` object in the attached store, bound to a volume like a fiber. **File → Import Umbilicus...** reads an umbilicus
+file (JSON, text or CSV) for the active volume and decides its frame once: a file
+stamping its grid (`volume_width/height/slices` or `voxelsize_um`) is scaled from
+that stamp, a stamp contradicting the volume it names is refused, and a file that
+states nothing (or only matches by inference) asks for its units per voxel.
+Importing replaces the volume's previous umbilicus; **Remove Umbilicus** retires
+it. A volume uses the one live umbilicus bound to it; with none, or several, the
+consumers report it and use none. An umbilicus drawn in a registration's
+fixed-volume frame must be transformed before import: a binding is a scale.
+`vc_object_ingest --umbilicus FILE` imports the store's own `vc_umbilicus` JSON.
+
+Example build and checks (existing configured Ninja build):
+
+```sh
+ninja -C build VC3D test_fiber_side_strip_intersections
+QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
+build/bin/test_fiber_side_strip_intersections
+```
 
 ## CP direction annotations
 
@@ -65,21 +106,10 @@ the cross-section plane normal. Existing auto/manual optimization scheduling is
 retained; edits dirty adjacent spans and connected spline runs follow the normal
 optimization path. Saved display-normal corrections remain separate.
 
-VC3D writes line annotations as `vc3d_fiber` JSON, currently **version 4**.
-Version 3 stores `control_points` as objects with a required `position`. Every
-non-final control point owns a required `segment_to_next` descriptor for its
-span to control point `i+1`; the final control point cannot contain
-`segment_to_next`. Version 4 is version 3 plus an optional `tags` array of
-strings on each span descriptor, written only when non-empty, so a span
-without tags serializes exactly as in version 3. A version-3 span carrying
-`tags` is rejected, so the version is a true signal of what a file may
-contain. Every loader (the core strict loader, VC3D, the python format
-package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D writes 4, and so
-does the lasagna line probe for a re-optimized result (its plain `--output`
-copy still copies the validated input as-is, whatever its version). The merge tool treats 3 and 4 as one lineage (a v3 base
-with v4 sides is the normal state after an upgrade, not a conflict) and
-writes the merge as version 4 when any side is 4. Builds older than version 4
-refuse to load a version-4 file. A control point
+VC3D's explicit transfer format is `vc3d_fiber` JSON **version 4**.
+Control points are objects with a required `position`. Every non-final control
+point owns a `segment_to_next` descriptor; the final control point has none.
+Span descriptors may carry an optional `tags` array. A control point
 may also carry an optional `tags` array of strings, written only when non-empty;
 the one tag today is `kollesis_termination`, set from the control point's
 Ctrl+right-click menu ("Kollesis termination", a toggle) to mark where the fiber
@@ -90,8 +120,9 @@ it: the click, the `/` and `0` keys and the current-position marker all treat
 that region as blocked (red marker), and a merge whose join side is a tagged end
 is refused. Remove the tag to extend or merge. The toggle itself is refused
 while a solve is running or pending for the session (its rollback would
-restore the pre-edit points). The extrapolated tail still draws past a tagged
-end. Tags belong to the point, not its span: they survive a
+restore the pre-edit points). The open tail past a tagged end is a short
+straight ray (see "Short tails past breaks and kollesis ends" below), not the
+model's extrapolation. Tags belong to the point, not its span: they survive a
 click that replaces the point, a split, a reverse and a merge (union of both
 points' tags), and go with a deleted point. Loaders reject any other
 control-point field, so a tagged fiber does not load on builds older than this
@@ -134,13 +165,13 @@ The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
 the same arclength radius as CP replacement, and is disabled outside that radius.
 Setting an angle to zero removes its manual normal.
 
-Version-3 JSON stores optional top-level `width`, always-written top-level
+Version-4 transfer JSON stores optional top-level `width`, always-written top-level
 `width_gap_fraction` (default 0.2), and optional per-control-point
 `display_normal: [x,y,z]` and `display_normal_source`. The source is `manual`
 for explicit angle/edge-drag edits, `interpolated` for inheritance on CP
 creation, and `unknown` for older normals without provenance. Training should
 select only `manual`. Normal and provenance travel together through saving,
-replacement, reversal, split/merge, optimization and remote three-way sync.
+replacement, reversal, split/merge and optimization.
 Clearing a normal omits both fields. The normal is the baked world-space unit normal,
 not an angle. The gap is a dimensionless fraction between 0 and 1; missing
 values load as 0.2 and are explicitly written on the next save. Existing values
@@ -177,12 +208,11 @@ overlay through the main window's shared toggle action. **Space** continues to
 toggle cross-view mouse-follow. The annotation menu also exposes the overlay
 toggle. This is independent of width/normal guide visibility.
 
-Edits use the ordinary queued fiber save/sync path without retracing or changing
+Edits commit through the database without retracing or changing
 review tags. CP metadata follows CP movement, reversal and split; each split
 inherits width and gap. Joining fibers uses the clicked fiber's nonzero width
-and its gap, otherwise the other fiber's width and gap. Three-way sync merges
-width, gap and per-CP normal changes
-independently of span refits; divergent edits and edits to removed CPs conflict.
+and its gap, otherwise the other fiber's width and gap. Database revision
+checks reject stale edits before any changes are committed.
 
 The former cross-section polygon/line editor and `cross_sections` storage are
 removed. Old records are not migrated and are omitted when rewriting a fiber.
@@ -216,11 +246,76 @@ stale-file guard as the adjacent-link heal. Every pair of consecutive break
 points is therefore a gap; to keep a span between two breaks open, place
 another control point between them.
 
+### Short tails past breaks and kollesis ends
+
+An end control point (first or last in line order; a single control is both)
+that is a **lone break**, a break whose one adjacent span is not a gap span,
+or that carries `kollesis_termination`, gets a short straight tail instead of
+the global mode's extrapolation: a ray along the line's end tangent (a
+direction annotation on the point wins, negated on the head side as for the
+tracer), `Break extrapolation` base voxels long (hamburger menu row, default
+400, at least 100), sampled at the Lasagna segment length. The papyrus past a
+break is damaged or hard to follow, and the fiber tracers hunt for signal in
+it and loop back onto the fiber; a kollesis end terminates the fiber. The rule
+applies in every global mode (native prediction tracer, fiber-follow model,
+Lasagna, and the Lasagna seed optimizer), in the asynchronous solves and in
+the save/close finalization alike, which now finalizes a single control
+through the same fiber-mode path as the asynchronous solves so that removing
+the tag regrows the ordinary tails. The gap is read from the span tag: a break
+that closes a gap span is the far edge of the damage, so the fiber continues
+past it with the ordinary extrapolation. The tail is ordinary open-tail
+geometry (clipped from the other fibers' overlays and excluded from the
+length of a fiber with two or more controls as before; a single control's
+length counts its whole line, rays included); the solve report counts it as
+`ray_extrapolations`.
+
+Placing a control point beyond a lone end break (a pure append on the ray, or
+a prepend before a lone head break; the `/` and `0` keys and the strips go
+through the same handler) tags the NEW point `break` as well, so the span
+between them is a gap span at once: closed to placement, bridged by a cubic
+spline (the gap goal policy), never traced. The old break keeps its tag, the
+new point is now a gap-closing break and gets the ordinary extrapolation, so
+tracing resumes from it. A click that collapses onto the end point, an
+interior insert, and placement beyond an untagged or gap-closing end are not
+affected. Placement beyond a kollesis end is refused as before.
+
+Toggling `break` or `kollesis_termination` on an end point, or forming or
+dissolving a gap at one from the span menu, changes the tail policy. When the
+committed tags changed a span's goal (a gap formed on a span that was not yet
+cspline, or dissolved from one still cspline), those spans are re-solved at
+once in either reoptimization mode, which re-traces the tails too. When no
+goal changed (a gap formed on a span already cspline, a lone end break
+toggled, a kollesis end tagged) the session is marked Unoptimized and, in
+Auto-reoptimize mode, its tails are re-traced (a tails-only solve, or a
+whole-line one when the interior was not optimized or work was already
+queued); in manual mode the next reoptimization or the save/close
+finalization applies it. Changing either menu distance marks the session
+Unoptimized and starts a whole-line solve in Auto-reoptimize mode (in manual
+mode the change waits for the next reoptimization or save/close; a change
+made while a solve runs queues a whole-line pass behind it), and invalidates
+an armed collapse/mode rollback snapshot (a later restore lands Unoptimized
+rather than as the snapshot's state). The gap goal policy (cspline when a
+gap forms, global when it dissolves while still cspline) is applied in the
+same write that saves the break tag, so the file, the pane and its peers
+carry the goal together; the re-solve that follows rolls back geometry only
+when it fails or cannot start (a refused dataset leaves the session
+Unoptimized and owing a whole-line pass, so no later partial or
+global-goals-only solve certifies the span before it is bridged; save/close
+finalizes it). The same fiber open
+in another pane receives the tag together with the span tags and the gap goal
+policy, so a save from that pane cannot regress a goal; that pane starts no
+new solve of its own but is marked Unoptimized (save/close finalizes it) and
+owed a whole-line pass, and a solve already running there is superseded and
+its successor dispatched or, in manual mode, kept queued. A landing that still owes queued work publishes as Unoptimized
+so the autosave never persists it and save/close finalizes it; a solve that
+fails while the interior is not optimized owes a whole-line pass again for
+the next dispatch, and a goal change or tail refresh from such an interior
+solves the whole line rather than certifying provisional spans.
+
 A gap span is closed to placement: the click, the `/` and `0` keys and the
-current-position marker (cut views, strips, overview bar and the
-intersection-inspection panes) treat any line position strictly inside it as
-blocked (red marker) until one of the breaks is removed. A break is refused
-at or immediately next to a kollesis termination (line-order neighbours), from
+current-position marker (cut views, strips and overview bar) treat any line
+position strictly inside it as blocked (red marker) until one of the breaks is
+removed. A break is refused at or immediately next to a kollesis termination (line-order neighbours), from
 the point menu and the span menu alike, so the span next to a sheet join can
 never become a gap. When a gap span
 forms, its `interp_goal` becomes `cspline` and the span is re-solved (the
@@ -258,9 +353,9 @@ through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
 is never guessed. Centimetres show two decimals everywhere. The shared
 formatting lives in `FiberLengthDisplay.hpp`.
 
-- The Fibers dock's `len` column carries the unit in its header (`len (cm)`
-  or `len (vx)`), the cells are bare numbers, and a total over the loaded
-  fibers sits at the top of the dock.
+- The Fibers panel's `len` column carries the unit in its header (`len (cm)`
+  or `len (vx)`), the cells are bare numbers, and a total over the listed
+  fibers sits above the list.
 - The main window's status bar shows "Fiber length" for the fiber open in
   the active Line Annotation tab, left of the cache figures; it hides when
   another workspace is active.
@@ -311,6 +406,115 @@ counts do not settle, or a gap would read as more than a hundred sheets),
 and nothing is predicted then. The overlay is display-only: it changes no
 layout, heat-map or publishing result. The grouping and statistics live in
 `FiberMapKollesis.hpp`.
+
+## Linking two fibers from the Fiber Map
+
+The Fiber Map links two fibers in two gestures, without opening either in the
+Line Annotation tab.
+
+Selection: a left click selects one fiber (as before). Shift+left click keeps
+the last two fibers clicked with Shift held selected: clicking a third drops the
+oldest, re-clicking a selected one moves it to the back, Shift on empty space
+changes nothing. Both selected fibers draw bold with their control dots; the
+linked-network glow and the dock row follow the most recent one, and the status
+line names the pair. A rebuild (an automatic Update, a theme change) keeps the
+pair selected.
+
+With two fibers selected, Ctrl+right-click on either of them (its line or one
+of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
+
+1. finalizes, saves and closes any open Line Annotation of either fiber (what
+   opening another fiber does; annotations of other fibers stay open), and
+   every dialog-less session of them, saving each first. If that saved something the map is stale: it updates
+   by itself and the link continues on the rebuilt map without a second
+   gesture, as long as both fibers still draw where the click saw them. If
+   the saved work moved one of them on the map, the status line asks you to
+   choose Link again (the pair stays selected);
+2. finds where the two fibers meet on the map: the drawn crossing nearest the
+   click, or, when the drawn lines never cross, their closest approach if it
+   is within 1 mm on the map (otherwise the link is refused). That point is
+   inverted exactly to a position on each fiber's stored line through the
+   unrolled arclength the map was drawn with;
+3. searches the fibers' closest 3D pass only within ±5 mm along each fiber
+   around that position (a multi-winding fiber never searches another
+   winding), and never refuses because the pass is far apart: the Fiber
+   Map's own link checks flag a bad link afterwards;
+4. picks a control point on each fiber: an UNLINKED existing control within
+   1 mm along the fiber of the pass is reused (no re-optimization of that
+   fiber); otherwise a new control is placed at the nearest position to the
+   pass that is clear of every existing control by the strip's minimum
+   spacing (so nothing collapses), not beyond a kollesis termination, not in
+   a gap span and inside the focus bounds, then the two spans around it are
+   re-optimized synchronously (wait cursor) and the fiber is saved;
+5. links the two control points with a **pending automatic link**, committed
+   with both fibers in one checked object-store action, and reports the result
+   in the status line.
+
+While step 4 and 5 run, the operation holds the same guard a merge or split
+holds: a rename, delete, import, merge or split started from the dock meanwhile
+is refused ("A merge, split or link is in progress"). A failed link commit
+changes nothing, and the status line says so.
+
+### Linking from a fiber-intersection X
+
+Inside an open Line Annotation, Ctrl+right-click on the yellow X of another
+fiber's intersection (in the current cut, the side cut or a strip) and choose
+**Link <this fiber> and <that fiber>**, directly under "Go to nearby
+annotation". It makes the same pending automatic link as the Fiber Map does,
+with the open fiber's control point anchored at the pass of its DRAWN line
+nearest to the X in that view (a strip: the X's column; the side cut: the
+nearest drawn segment of the windowed projection; the current cut: the one
+visible pass, the cut position) and the other fiber's at the X itself; from
+those two anchors the same ±5 mm closest-pass search and 1 mm reuse rule
+decide the two control points. Differences from the map:
+
+- this annotation stays open: its new control point is placed exactly like a
+  manual placement (asynchronous span re-optimization, autosave, the same
+  placement limit), and the link is made right after the placement;
+- the OTHER fiber's open annotation or dialog-less sessions are saved and
+  closed first (the map's rule for both fibers, applied to that one);
+- the entry is disabled while the view is still updating or no pass of this
+  fiber is drawn near the marker, and absent for a never-saved annotation.
+
+Failures are reported in the usual error dialog with the map's wording; a
+control point already committed before a refusal is kept, unlinked.
+
+A pending automatic link is an ordinary pending link drawn in its own
+palette: bright cyan (#20f0ff), or light pink (#ffa8d8) for a same-H/V link,
+instead of the pending blue / orange - solid markers like every other link
+state, everywhere a linked point is drawn: the cut views and strips (both
+renderers), the overview bar, the slice-view rings and the Fiber Map dots, and
+the connector and projected X of the linked fiber in the cut views. A tagged
+point (kollesis termination, break) keeps its tag ring over that fill, as any
+linked point does. The rule for a point carrying several links: the automatic
+palette only when every pending link on it is automatic; a human-made pending
+link outranks (pending blue / orange). The control-point menu's approve entry reads
+"Approve auto link to <fiber> / CP n"; approving makes an ordinary approved
+link, exactly like approving a pending link. "Mark link as pending" on an
+approved link makes a plain (human) pending link.
+
+Storage: the link is one `fiber_branch` edge whose metadata carries
+`"auto": true` only while it is pending and ordinary (never on an adjacent
+link); approving, or re-flagging an approved link as pending, removes it.
+Transfer documents write `"auto": true` next to `"pending": true` on both
+reciprocal entries; an import whose two entries disagree on it is rejected
+like any other conflicting reciprocal declaration. Whenever two refs of one
+link are combined (a collapse of two control points, a dedup), the result is
+automatic only if every pending contributor was; a human-made pending link
+outranks, and an approved contributor says nothing about it.
+
+Refusals are shown in the map's status line. Everything decidable up front
+refuses with nothing changed: the fibers do not meet on the map, one of them
+is read-only or open in a session that did not finish its optimization, a
+fiber's control points do not resolve in line order (or its line passes
+through one of its controls twice), no admissible position for a new control
+in the search window, the two existing controls are already linked to each
+other. A
+failure after the first fiber's new control was placed and committed (the
+second fiber's re-optimization or commit, a change to the fibers, the store
+attachment, the umbilicus, the focus bounds or the active volume while the
+operation yielded, or the link's own commit) leaves that first control in
+place - a plain, unlinked control point - and the message says so.
 
 ## Overview bar during re-optimization
 
@@ -401,12 +605,13 @@ menu offers the same three.
 The control-point menu is ordered by use in four sections: navigation and
 linking (go to linked annotation, go to nearby annotation, delete, link or
 merge with the candidate, designate as link or adjacent link candidate,
-unlink, approve or mark pending); the point tags (kollesis termination,
+unlink, approve or mark pending - an unreviewed automatic link's entry reads
+"Approve auto link"); the point tags (kollesis termination,
 break); new annotations at the click; and the corrections reset.
 
 The top-level `optimization_mode` is either `lasagna` or
-`native_fiber_trace3d`. It is required in version 3; only legacy version-1
-files may omit it and default to `lasagna`. The mode
+`native_fiber_trace3d`. It defaults to `lasagna` when a typed geometry export
+has no optimization annotations. The mode
 selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `global`. A segment goal is `global`, `cspline`, `lasagna`, or `trace`; its
 `interp_mode` is the actual producer of the stored geometry and is one of
@@ -469,8 +674,8 @@ is stored per project together with its enabled state. UI fields and viewer
 mask APIs use the current volume's voxel coordinates, but `focus_bounds` in
 the project JSON uses the source annotation grid (`coordinate_frame:
 "annotation"`). The same frame derivation used by the Fiber Map supplies the
-conversion: exact catalog coordinate factors take precedence, and untagged
-rebased volumes use their pyramid-base factor. Bounds are converted on read,
+conversion: the open volume's store voxels (`vc::project::annotationVolume`),
+whose scale is 2^-level at a working level or a prediction's level. Bounds are converted on read,
 not repeatedly rewritten on volume changes, so switching pyramid levels or
 reopening with another preferred level preserves the region. With no usable
 volume frame, the mask is unavailable; stored bounds are retained. Bounds with
@@ -630,8 +835,9 @@ combo box has the keyboard.
 
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
-the initial centerline length and the base-voxel extrapolation distance,
-Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
+the initial centerline length, the base-voxel extrapolation distance and the
+break extrapolation (the ray length past a lone break or a kollesis end, see
+above), Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
 the shared cursor cross between the four generated panes: on by default,
 remembered between sessions, and independent of the global "Sync cursor across
 views" setting, so unchecking it keeps the cross in the hovered pane even while
@@ -651,10 +857,8 @@ UI like any other tag: the fiber panel's tag checkboxes and the Line
 Annotation toolbar's tag pills, where `reviewed` is pinned first and always
 offered even in a volpkg where no fiber carries it yet. The only
 programmatic change is the mode-switch strip described above; ordinary
-control-point edits, merges, and splits never touch it, and
-`scripts/fiber_merge.py` treats it as a plain tag under the usual
-three-way tag merge. `scripts/vc_sync.py hfsync` publishes gated on it
-(`reviewed` is its default `--tag`), so the tag doubles as the publish gate.
+control-point edits, merges, and splits never touch it. It has no publishing
+side effects.
 
 The fiber panel's `interp` column shows the interpolation provenance per
 fiber — `legacy` (no trace spans), `predictions` (trace spans, native mode),
@@ -720,59 +924,19 @@ the reconstructed exact public manifest URL, never its local cache path.
 Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
 the metric and message. Labels are laid out in viewport pixels, remain visible
 while any part of their span intersects the view, and use a deterministic
-second row when one row cannot avoid overlap. Legacy version-1 fibers remain
-readable and acquire explicit version-3 descriptors on the next save. The
-unpublished file version 2 and its pre-v3 descriptor schemas are unsupported.
-This does not affect the current `tracer_version: 2` stored inside a version-3
-segment descriptor.
+second row when one row cannot avoid overlap.
 
-All v3 readers validate this complete contract before using even geometry-only
-data. VC3D, native CLI tools, Atlas, Lasagna, Spiral, Python training loaders,
-and sync reject a missing mode, a missing non-final descriptor, a descriptor on
-the final CP, malformed config, or inconsistent mode diagnostics. They never
-repair, normalize, tag, or rewrite invalid v3 input. Sync routes it to the
-manual conflict workflow and keeps local, remote, and base files unchanged.
+Transfer readers accept only version 4 with explicit UUIDs. Tracing annotations
+are optional for typed geometry; when present, descriptors and their diagnostics
+are validated. A descriptor on the final control point is invalid. Evaluation
+that depends on trace provenance requires the per-span descriptors.
 
-## Sync Conflict Handling
+## Database persistence
 
-`scripts/vc_sync.py` compares local and S3 content with the last successfully
-synced shadow copy. When both versions changed, `scripts/fiber_merge.py`
-performs a three-way merge. Version-3 fibers are divided into complete stored
-span results: each result contains its dense CP-to-CP line slice and the
-starting CP's complete `segment_to_next` descriptor. Geometry and metadata are
-never merged field by field or selected by generation.
-
-A span run changed on only one side is retained verbatim, and identical
-two-sided results converge. Separate local and remote changes can be combined
-only when at least one complete base span between them is unchanged on both
-sides. Adjacent edits, different edits to the same run, overlapping topology
-changes, missing ordered CP/line anchors, and inexact joins are conflicts.
-`optimization_mode` follows the same base-aware policy: one changed side wins,
-equal changes converge, and different two-sided changes conflict.
-
-An ambiguous merge does not modify the fiber. The sync tool stores local,
-remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
-complete local version, keep the complete remote version, or skip. Those
-questions are asked before the link-consistency planning of the other
-conflicts: a decided file ([l]ocal or [r]emote) is a known source the planner
-can plan its linked neighbours against, so their auto-merges land in the same
-run; only a skipped file blocks the neighbours that depend on it, which are
-then asked about in turn. A merge that dropped its link to a peer deleted on
-both sides (or pending local deletion) needs no reciprocal fix and is not
-treated as a dangling link. `--dry-run` reports content-merge eligibility only;
-link consistency is assessed in a real run. Existing
-base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
-only after geometry merges cleanly. Version-1 fibers retain the older merge
-behavior, including the CP-polyline `needs_reoptimization`
-fallback for disjoint geometry edits.
-
-`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent new v3
-Lasagna result: exact CP positions and existing goals are retained, actual span
-modes become `lasagna`, the input normal manifest and per-span maximum normal
-alignment error are recorded, trace-only diagnostics are cleared, and geometry
-and descriptors receive one generation update. The probe validates this result
-before atomically replacing its output. Without either optimization flag,
-`--output` copies the validated input without inventing new producer metadata.
+VC3D uses the database's checked transactions, geometry edit APIs, relationships
+and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
+or publish fibers to Hugging Face. S3/SFTP fiber merging, one-off fiber tag
+migration scripts and `vc_sync.py` have been retired.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
@@ -789,4 +953,16 @@ Lasagna tail adjacent to a successful native span uses the same hard
 continuation direction. Each retained fallback emits a terminal warning
 containing `side`, the full `reason`, `trace_points`, and `source`
 (`trace_result` or `exception`). Completed length-based tails and accepted
-data-edge truncation do not emit this warning.
+data-edge truncation do not emit this warning. A side whose end control is a
+lone break or a kollesis termination publishes a straight ray of the break
+extrapolation distance in place of whatever tail the solver grew, and the
+tracer is never called for it (`Break extrapolation` menu
+row, `lineAnnotation/break_extrapolation_distance_vx`, default 400, clamped to
+100..1000000 everywhere it is read), in every global mode. A single control
+whose both sides are rays traces nothing and needs no inference inputs (nor
+the fiber-follow service in a normal-backed session). A single control with
+a traced side under the native prediction tracer (fiber-follow off) whose
+session holds no trace inputs finalizes synchronously as Lasagna for that one
+solve instead of opening a dataset picker (the session's persisted mode is
+untouched); model sessions and fiber-follow sessions ensure their service as
+before.
