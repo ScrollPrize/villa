@@ -158,20 +158,24 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
 
 // The catalog Lasagna artifact a dataset entry caches (the artifact_url of its
 // remote marker); nullopt for other entries.
-std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumePkg& pkg,
-                                                                   const vc::project::Entry& entry)
+std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(
+    const std::filesystem::path& projectPath, const std::shared_ptr<const vcr::catalog::OpenDataManifest>& catalog, const vc::project::Entry& entry)
 {
-    if (!pkg.catalog() || vc::project::isLocationRemote(entry.location)) return std::nullopt;
-    const auto marker = vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()).parent_path() /
-                        vc::lasagna::kLasagnaRemoteMarker;
+    if (!catalog || vc::project::isLocationRemote(entry.location))
+        return std::nullopt;
+    const auto marker = vc::project::resolveLocalPath(entry.location, projectPath.parent_path()).parent_path() / vc::lasagna::kLasagnaRemoteMarker;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(marker, ec)) return std::nullopt;
     try {
-        return pkg.catalog()->volumeAt(
-            nlohmann::json::parse(std::ifstream(marker)).value("artifact_url", std::string{}), 0);
+        return catalog->volumeAt(nlohmann::json::parse(std::ifstream(marker)).value("artifact_url", std::string{}), 0);
     } catch (const std::exception&) {
         return std::nullopt;
     }
+}
+
+std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumePkg& pkg, const vc::project::Entry& entry)
+{
+    return lasagnaCatalogView(pkg.path(), pkg.catalog(), entry);
 }
 
 std::filesystem::path lasagnaCacheDir(const std::filesystem::path& remoteCacheRoot,
@@ -441,19 +445,34 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     const std::optional<vcr::catalog::OpenDataVolumeView>& view,
     const std::optional<std::array<int, 3>>& workingShape)
 {
+    return resolveLasagnaSnapshot({pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), view, workingShape});
+}
+
+LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg& pkg, const std::string& volumeId)
+{
+    const auto volume = pkg.volume(volumeId);
+    if (!volume)
+        throw std::runtime_error("Active volume is unavailable for Lasagna");
+    return {pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), pkg.catalogView(volumeId), volume->shape()};
+}
+
+std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResolutionSnapshot& snapshot)
+{
+    const auto& view = snapshot.view;
+    const auto& workingShape = snapshot.workingShape;
     if (view) {
         const int activeLevel = view->level;
         std::vector<std::pair<vc::project::Entry, vcr::catalog::OpenDataVolumeView>> parentMatches;
-        for (const auto& entry : pkg.lasagnaDatasetEntries()) {
-            const auto cached = lasagnaCatalogView(pkg, entry);
+        for (const auto& entry : snapshot.entries) {
+            const auto cached = lasagnaCatalogView(snapshot.projectPath, snapshot.catalog, entry);
             if (cached && cached->sampleId == view->sampleId && cached->volumeId == view->volumeId)
                 parentMatches.emplace_back(entry, *cached);
         }
 
         if (!parentMatches.empty()) {
             if (workingShape) {
-                const auto shapeManifestPath = vc::project::resolveLocalPath(
-                    parentMatches.front().first.location, pkg.path().parent_path());
+                const auto shapeManifestPath =
+                    vc::project::resolveLocalPath(parentMatches.front().first.location, snapshot.projectPath.parent_path());
                 const auto dataset =
                     vc::lasagna::LasagnaDataset::open(shapeManifestPath);
                 if (!dataset.manifest().baseShapeZYX)
@@ -477,28 +496,27 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
 
             const auto& [entry, cached] = *compatibleMatches.front();
             return ResolvedOpenDataLasagna{
-                vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()),
-                lasagnaSourceManifestLocation(pkg, entry),
+                vc::project::resolveLocalPath(entry.location, snapshot.projectPath.parent_path()),
+                vcr::catalog::joinOpenDataUrl(cached.artifact->url(), std::filesystem::path(entry.location).filename().string()),
                 std::ldexp(1.0, activeLevel),
                 cached.artifact->url(),
                 true};
         }
-        const auto* volume = pkg.catalog()->findSample(view->sampleId)->findVolume(view->volumeId);
-        if (!lasagnaArtifacts(*volume).empty()) {
+        const auto* volume = snapshot.catalog->findSample(view->sampleId)->findVolume(view->volumeId);
+        if (volume && !lasagnaArtifacts(*volume).empty()) {
             throw std::runtime_error(
                 "The manifest declares Lasagna for the active catalog volume, "
                 "but its validated local cache entry is unavailable");
         }
     }
 
-    const auto manualLocation = pkg.selectedLasagnaDataset();
+    const auto manualLocation = snapshot.manualLocation;
     if (manualLocation.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
     const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
-        ? manualLocation
-        : vc::project::resolveLocalPath(
-              manualLocation, pkg.path().parent_path()).string();
+                                      ? manualLocation
+                                      : vc::project::resolveLocalPath(manualLocation, snapshot.projectPath.parent_path()).string();
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
         resolvedLocation, options);
     return ResolvedOpenDataLasagna{

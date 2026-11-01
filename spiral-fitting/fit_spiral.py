@@ -5385,6 +5385,9 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                # A headless fit usually writes stdout to a file, where Python block-buffers it: without this
+                # flush the per-200-step loss report only appears when the buffer fills or the fit ends.
+                sys.stdout.flush()
                 payload = {
                     'total_loss': loss.item(),
                     **conditioning_payload,

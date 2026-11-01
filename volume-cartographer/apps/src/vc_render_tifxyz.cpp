@@ -3,6 +3,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -1520,6 +1521,8 @@ int main(int argc, char *argv[])
             // identity and the process-wide cache service, with fetched chunks
             // persisted. Opening the pyramid directly rebuilt a private cache
             // each run and re-downloaded the whole ROI.
+            // Same VC3D.ini disk budget as the VC3D app, so batch renders cannot fill the disk.
+            vc::settings::configureRemoteCacheBudget();
             remoteVolume = Volume::NewFromUrl(remoteUrl, remoteAuth);
             vc::render::processChunkCacheService()->configureDecodedByteCapacity(
                 cache_bytes);

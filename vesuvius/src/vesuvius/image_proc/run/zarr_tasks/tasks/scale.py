@@ -76,6 +76,7 @@ class ScaleTask(ZarrTask):
         super().__init__(config)
         self.config: ScaleConfig = config
         self._lvl0_path: str = ""
+        self._input_array_path: str = ""
         self._axes_names = ["z", "y", "x"]
         self._out_shape: Tuple[int, ...] = ()
         self._out_chunks: Tuple[int, ...] = ()
@@ -126,6 +127,12 @@ class ScaleTask(ZarrTask):
             str(self.config.level) if self.config.level is not None else "0"
         )
 
+        # Workers must reopen the selected array, not an OME-Zarr group.
+        input_root = str(self.config.input_zarr).rstrip("/")
+        self._input_array_path = (
+            f"{input_root}/{input_z.path}" if input_z.path else input_root
+        )
+
         sf = self.config.scale_factor
         self._out_shape = tuple(max(1, int(round(d * sf))) for d in input_z.shape)
         self._out_chunks = tuple(
@@ -157,7 +164,7 @@ class ScaleTask(ZarrTask):
 
         for coords in out_chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_array_path,
                 self._lvl0_path,
                 self.config.scale_factor,
                 coords,

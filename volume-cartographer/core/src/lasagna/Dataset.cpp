@@ -321,6 +321,8 @@ public:
                 std::string message =
                     "Remote Lasagna Zarr fetch failed HTTP " +
                     std::to_string(response.status_code) + ": " + key;
+                if (!response.error_message.empty())
+                    message += " (" + response.error_message + ")";
                 if (requestResult.anonymousFailure) {
                     message += " after anonymous request failed HTTP " +
                         std::to_string(

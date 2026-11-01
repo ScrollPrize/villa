@@ -1293,6 +1293,7 @@ void CFiberWidget::onSelectionChanged()
         emit fiberDetailsRequested(fiber.id);
     _deleteButton->setEnabled(!selected.empty());
     updateClassificationUi();
+    emit fiberSelectionChanged(_selectedFiberId);
 }
 
 void CFiberWidget::onDoubleClicked(const QModelIndex& index)

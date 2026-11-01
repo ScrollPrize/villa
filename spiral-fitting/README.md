@@ -1085,6 +1085,18 @@ mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
 declarative input catalog determine which conventional inputs are resolved.
 
+To follow a headless fit while it runs, set `FIT_SPIRAL_METRICS_HISTORY` to a
+file path: every 200 iterations the fit appends one JSON line,
+`{"iteration": N, "metrics": {...}}`, whose metrics hold `total_loss`, each
+`<term>_loss` and the other logged values (what it also prints, and what
+`runners/run_single.py` records for sweeps). For example:
+
+```bash
+FIT_SPIRAL_METRICS_HISTORY=/tmp/fit_metrics.jsonl \
+  ./.venv/bin/python fit_spiral.py --dataset /path/to/dataset > fit.log 2>&1 &
+tail -f /tmp/fit_metrics.jsonl
+```
+
 ## Fiber direction samples
 
 The optional fiber-direction loss consumes one packed artifact extracted from a

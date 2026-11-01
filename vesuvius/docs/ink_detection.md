@@ -302,6 +302,24 @@ Each `datasets` item supports:
 | `sampling_scroll` | Scroll identifier required by balanced and fixed-prior sampling. |
 | `sampling_physical_segment_keys` | Per-segment physical identity required by fixed-prior sampling. |
 | `sampling_representation_keys` | Per-segment representation identity required by fixed-prior sampling. |
+| `split` | `train` (default) or `validation`. A `validation` dataset is held out whole; see below. Flat mode only. |
+
+By default validation windows come from each training segment's
+`_validation_mask`. Training supervision excludes those voxels, but a validation
+crop can cover image voxels that neighbouring training crops also read, so the
+score measures interpolation within segments the model was trained on. Marking a
+dataset `"split": "validation"` holds it out whole: every window it would have
+trained on is scored on its supervision mask excluding validation voxels
+(its own `_validation_mask` windows are scored too), none of it is trained on,
+and in-segment validation windows of training datasets are dropped. The training
+patches of training datasets do not change. The trainer refuses the split,
+before the first step, unless every
+dataset sets `sampling_scroll` and no held-out scroll is also a training scroll,
+the two sides share no image volume, segment directory or label asset (local
+path aliases are resolved), and every held-out segment yields patches. It prints
+the checked counts as `heldout_validation={...}`.
+With `val_steps` at least the number of held-out batches, each validation pass
+scores the whole held-out set.
 
 Data, patch, and augmentation controls:
 
@@ -448,6 +466,7 @@ the second output.
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
+| `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 
@@ -509,6 +528,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 | `--gpus` | Unique comma-separated CUDA IDs; omit for automatic CUDA/CPU selection. |
+| `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--plan-only` | Print volume/chunk/patch counts without building or running the model or creating output. The checkpoint is still deserialized for its config. |
 | `--max-target-chunks` | Refuse plans larger than this positive count. |
 | `--cache-dir`, `--cache-max-gb` | Optional Zarr-3 compressed-volume cache root and per-volume decimal-GB budget. |

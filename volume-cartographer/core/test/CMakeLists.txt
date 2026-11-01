@@ -645,6 +645,7 @@ vc_add_test(NAME test_load_json)
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_remote_file_cache)
+vc_add_test(NAME test_remote_cache_budget_settings)
 vc_add_test(NAME test_remote_metadata_cache)
 
 vc_add_test(NAME test_open_data_manifest
@@ -666,6 +667,18 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
+
+if(TARGET vc_gen_normalgrids)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_gen_normalgrids)
+    add_test(NAME test_normal_grid_threshold_resume
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_normal_grid_threshold_resume.py"
+            $<TARGET_FILE:vc_gen_normalgrids>)
+    set_tests_properties(test_normal_grid_threshold_resume PROPERTIES
+        LABELS network SKIP_RETURN_CODE 77 TIMEOUT 300)
+    vc_register_ctest(test_normal_grid_threshold_resume vc_gen_normalgrids)
+endif()
 
 if(TARGET vc_render_tifxyz)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
