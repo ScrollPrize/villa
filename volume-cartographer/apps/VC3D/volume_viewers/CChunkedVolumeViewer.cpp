@@ -326,30 +326,22 @@ QString formatByteSize(std::size_t bytes)
     return QString("%1 B").arg(bytes);
 }
 
-float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
+// The view scale (pixels per working level-0 voxel) at which `level` of the opened
+// levels is the source level: 0.75 pixels per voxel of that level. With no opened levels
+// there is only a nominal level 0.
+float scaleForRenderLevel(const vc3d::ViewerLevels* levels, int level, float lodZoomBias)
 {
-    const int maxLevel = std::max(0, numLevels - 1);
-    const int clampedRenderLevel = std::clamp(renderLevel, 0, maxLevel);
-    int dsLevel = clampedRenderLevel + kSurfaceResolutionLevelBias;
-    if (dsLevel > maxLevel)
-        dsLevel = maxLevel;
-
-    const float dsScale = static_cast<float>(std::uint64_t{1} << dsLevel);
-    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
+    const int count = levels ? levels->count() : 1;
+    const int clamped = std::clamp(level, 0, std::max(0, count - 1));
+    double extent = levels ? vc3d::maximumBaseVoxelExtent(*levels, clamped) : 1.0;
+    if (!std::isfinite(extent) || extent <= 0.0)
+        extent = 1.0;
+    return std::clamp(0.75f / (static_cast<float>(extent) * lodZoomBias), kMinScale, kMaxScale);
 }
 
-float scaleForCoarsestPlaneRenderLevel(int numLevels)
+float scaleForCoarsestRenderLevel(const vc3d::ViewerLevels* levels, float lodZoomBias)
 {
-    const int coarsestLevel = std::max(0, numLevels - 1);
-    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
-    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
-}
-
-float scaleForCoarsestSegmentationRenderLevel(int numLevels)
-{
-    const int coarsestLevel = std::max(0, numLevels - 1);
-    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
-    return std::clamp(0.75f / (dsScale * kSegmentationResolutionLodZoomBias), kMinScale, kMaxScale);
+    return scaleForRenderLevel(levels, (levels ? levels->count() : 1) - 1, lodZoomBias);
 }
 
 float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewportH)
@@ -707,8 +699,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     ensureDefaultSurface();
     if (_volume && isAxisAlignedView() && !hadVolume) {
-        const int n = _levels ? _levels->count() : 1;
-        _scale = scaleForCoarsestPlaneRenderLevel(n);
+        _scale = scaleForCoarsestRenderLevel(_levels.get(), kResolutionLodZoomBias);
     }
     recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
     updateContentBounds();
@@ -884,17 +875,16 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
             (void)setSegmentationPointerFromFocus();
         }
         setZOffset(0.0f);
-        const int n = _levels ? _levels->count() : 1;
         if (_resetViewOnSurfaceChange) {
-            _scale = scaleForCoarsestSegmentationRenderLevel(n);
+            _scale = scaleForCoarsestRenderLevel(_levels.get(), kSegmentationResolutionLodZoomBias);
             recalcPyramidLevel();
         }
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
         setZOffset(0.0f);
-        const int n = _levels ? _levels->count() : 1;
-        _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
+        _scale = scaleForRenderLevel(_levels.get(), kInitialSegmentationSurfaceLevel + kSurfaceResolutionLevelBias,
+                                     kResolutionLodZoomBias);
         recalcPyramidLevel();
     } else if (preservedViewCenter) {
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -1083,12 +1073,9 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         const double extent = vc3d::maximumBaseVoxelExtent(*_levels, _dsScaleIdx);
         _dsScale = std::isfinite(extent) ? static_cast<float>(extent) : 1.0f;
     } else {
-        const int n = 1;  // no opened levels: this frame has only a nominal level
-        const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
-        _dsScaleIdx = std::clamp(
-            static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
-            0, std::max(0, n - 1));
-        _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
+        // No opened levels: this frame has only a nominal level 0.
+        _dsScaleIdx = 0;
+        _dsScale = 1.0f;
     }
     updateScalebarScale();
 }

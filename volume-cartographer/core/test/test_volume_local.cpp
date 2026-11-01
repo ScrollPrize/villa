@@ -6,6 +6,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include <vc_reader/zarr_write.hpp>
 
 
 #include <array>
@@ -99,5 +100,29 @@ TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
         CHECK(v->voxelSize() == 0.0);
     }
 
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: base dimensions and level shapes follow the pyramid's placement, not powers of two")
+{
+    // Level 1 is placed by an OME scale of 3. The base dimensions come from level 0 as
+    // placed, and level 1's shape is checked against ceil(base / 3), so the volume opens.
+    auto d = tmpDir("placement");
+    vcr::zarr::MultiscalesOptions multiscales;
+    multiscales.levels = 1;
+    multiscales.factors = {3, 3, 3};
+    vcr::zarr::createGroup(d, vcr::zarr::Json{{"multiscales", vcr::zarr::Json::array({vcr::zarr::omeMultiscales(multiscales)})}});
+    vcr::zarr::CreateOptions level0;
+    level0.shape = {9, 12, 15};
+    level0.chunks = {3, 3, 3};
+    (void)vcr::zarr::Writer::create(d / "0", level0);
+    vcr::zarr::PyramidOptions pyramid;
+    pyramid.levels = 1;
+    pyramid.factors = {3, 3, 3};
+    vcr::zarr::createPyramidLevels(d, level0, pyramid);
+    REQUIRE(vcr::zarr::openArray((d / "1").string(), {}).meta.shape == vcr::Index{3, 4, 5});
+
+    const auto v = Volume::New(d);
+    CHECK(v->shape() == std::array<int, 3>{9, 12, 15});
     fs::remove_all(d);
 }

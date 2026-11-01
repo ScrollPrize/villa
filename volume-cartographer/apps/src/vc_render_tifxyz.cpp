@@ -1095,7 +1095,6 @@ int main(int argc, char *argv[])
         logPrintf(stdout, "Accumulation: %zu samples/slice at step %.4f (%s)\n", samples, spacing, accum_type_str.c_str());
     }
 
-    const float ds_scale = std::ldexp(1.0f, -group_idx);
     float scale_seg = parsed["scale-segmentation"].as<float>();
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
@@ -1177,6 +1176,9 @@ int main(int argc, char *argv[])
                   group_idx, e.what());
         return EXIT_FAILURE;
     }
+    // Rendered-level voxels per working level-0 voxel, from the pyramid's placement of the
+    // group (the mean over the axes: the renderer's scale is one number).
+    const float ds_scale = (levelMap.scale[0] + levelMap.scale[1] + levelMap.scale[2]) / 3.0f;
     const vcr::ElementType sourceType = source->meta.type;
     if (source->meta.shape.size() != 3 || sourceType.kind != 'u' ||
         (sourceType.itemsize != 1 && sourceType.itemsize != 2)) {
