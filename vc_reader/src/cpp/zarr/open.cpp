@@ -737,6 +737,12 @@ OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOpti
     throw std::out_of_range("pyramid level " + std::to_string(level) + " is not present in " + location);
 }
 
+grid::Level gridLevel(const OpenedArray& opened, const LevelPlacement& working, reader_cuda::Reader* cuda)
+{
+    const auto map = opened.placement.indexMapFrom(working);
+    return {opened.array.get(), opened.meta.type, map.scale, map.offset, std::nullopt, cuda};
+}
+
 std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const OpenOptions& options, int probeLevels)
 {
     if (probeLevels < 0)

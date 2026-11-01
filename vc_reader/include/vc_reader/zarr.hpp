@@ -6,6 +6,7 @@
 // vc_reader/zarr_write.hpp and a volume's metadata vc_reader/zarr_metadata.hpp.
 
 #include "vc_reader/native/memory_cache.hpp"
+#include "vc_reader/grid.hpp"
 #include "vc_reader/native/reader_types.hpp"
 #include "vc_reader/s3_listing.hpp"
 #include "vc_reader/zarr_array_meta.hpp"
@@ -266,6 +267,11 @@ struct OpenedArray {
     // Finishes queued cache writes and releases VC3D's leases. Reads must have ended.
     void close();
 };
+
+// The level as vcr::grid samples it: index (ZYX) = scale * p + offset for XYZ points p in
+// the voxels of `working` (a level-0 placement for level-0 points), with the level's CUDA
+// reader when one is given.
+grid::Level gridLevel(const OpenedArray& opened, const LevelPlacement& working = {}, reader_cuda::Reader* cuda = nullptr);
 // The array's attributes, read on first use (and then kept with a writable cache for
 // opening offline). CacheMiss offline when no cache holds them.
 const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options);
