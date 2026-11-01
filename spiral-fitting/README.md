@@ -1056,6 +1056,38 @@ plus one. The explicit forms avoid that extra pass for large databases.
 combined into one output, so separate scrolls should be converted in separate
 commands.
 
+## Relative-winding hints from Lasagna (winding-phase)
+
+[winding-phase](https://github.com/millerandmuller/winding-phase) (Lutfiya Miller, MIT) builds relative-winding constraints from a Lasagna run alone: it walks from one cosine ridge to the next along the normal, keeps a hop only when both the integrated `grad_mag` density and a 2D phase unwrap call it one winding, chains hops into ladders, and reads each ladder's sign from a prior fit. It writes them as `relative_windings.json` (point collections v1, level-0 coordinates), which this fitter loads with `input_use_pcl_relative`. No hand labels are needed, so it works on any scroll that has a Lasagna field.
+
+We checked it against hand-traced windings on two scrolls that are not on any prize list. Settings: villa `e2254ebe`, 30,000 steps, no verified patches (`input_disable_patches`), the same seed per pair of arms. Without patches every ladder is an unattached strip, so it acts through the strip radius loss:
+
+```json
+{
+  "input_use_pcl_relative": true,
+  "patch_radius_loss_margin": 0.3,
+  "loss_weight_unattached_pcl_radius": 0.5,
+  "sample_count_unattached_pcls_per_step": 680,
+  "loss_start_unattached_pcl_dt": 30000
+}
+```
+
+Truth is pairs of points on published hand-traced segments, sampled on four planes per window; a pair is exact when the fit puts its two points the right number of windings apart.
+
+| Scroll and window | Truth | Pairs | No hints | Ladders, default count | Ladders, count 680 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| PHerc1667, scan `20251217075048`, z 4515 to 5539 at level 2 (three seeds, window chosen before scoring) | w028 to w041 | 2,345 | 35.8% | not run | 46.6% |
+| PHerc0139, scan `20260102150214`, z 3340 to 4364 at level 2 (one seed) | w023 to w040 | 9,126 | 43.6% | 55.6% | 57.5% |
+
+On PHerc1667 every seed improved (+10.3, +12.8 and +9.5 points). A control with every ladder shifted by one winding fell to 18.8%, so the fit follows the ladders' winding counts rather than just their positions.
+
+Things to know before using it:
+
+- **Draw enough of them.** `sample_count_unattached_pcls_per_step` (default 84) is scaled with the z range, so a short window draws only a handful of strips per step, while winding-phase writes tens of thousands of ladders (57,283 on the PHerc1667 window). We used 680 on PHerc1667, close to the 840 draws per step in winding-phase's README. On PHerc0139 it added about 2 points over the default count; on a third band at the default count the ladders made no clear difference (+2.0 points, interval -3.1 to +7.1, 706 pairs).
+- **Leave the winding snap off.** With `loss_start_unattached_pcl_dt` at 25,000 of 30,000 steps the PHerc0139 fit tore: exact fell to 20.8%.
+- **It does not separate touching sheets.** Most of the gain is fewer neighbouring windings pushed two or more apart (35.9% to 22.7% of one-apart pairs on PHerc1667). Neighbouring windings merged onto one winding went up, 12.7% to 16.0%.
+- **Patches.** With verified patches on, `patch_radius_loss_margin` is shared with them; #2269 adds `unattached_pcl_radius_loss_margin` so the ladders can get their own margin.
+
 ## Neural winding-inference losses
 
 Set `dense_spacing_mode` to `winding_model` and provide the compact exported
