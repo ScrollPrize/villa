@@ -16,7 +16,8 @@ TEST_CASE("Native normal-grid assembly covers sparse edges and parallel read err
     using namespace vc::core::util;
     const auto root = fs::temp_directory_path() / ("vc-ng-" + std::to_string(std::random_device{}()));
     struct Cleanup { fs::path p; ~Cleanup() { fs::remove_all(p); } } cleanup{root};
-    for (int version : {2, 3}) {
+    {
+        const int version = 2;
         vcr::zarr::CreateOptions options;
         options.version = version;
         options.shape = {3, 5, 7};

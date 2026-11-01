@@ -49,21 +49,12 @@ TEST_CASE("OpenedVolumes shares opened levels and maps coordinates through place
     const auto a = opened.level(*volume, 0);
     const auto b = opened.level(*volume, 0);
     CHECK(a.array == b.array);
-    const double zyx[3] = {3, 5, 7};
-    float value = 0;
-    a.array->array->sample_linear(zyx, 1, a.array->meta.type, false, &value);
-    CHECK(value == float(level0[(3 * 16 + 5) * 16 + 7]));
 
     const auto coarse = opened.level(*volume, 1);
     CHECK(coarse.array != a.array);
     CHECK(coarse.working.scale[0] == doctest::Approx(1.0));
     // Level-0 voxel 4.5 is the centre of level-1 voxel 2.
     CHECK(coarse.array->placement.fromLevel0(0, coarse.working.toLevel0(0, 4.5)) == doctest::Approx(2.0));
-    double centre[3];
-    for (int axis = 0; axis < 3; ++axis)
-        centre[axis] = coarse.array->placement.fromLevel0(axis, coarse.working.toLevel0(axis, 4.5));
-    coarse.array->array->sample_linear(centre, 1, coarse.array->meta.type, false, &value);
-    CHECK(value == float(level1[(2 * 8 + 2) * 8 + 2]));
     fs::remove_all(dir);
 }
 

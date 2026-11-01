@@ -61,10 +61,7 @@ TEST_CASE("updateSurfaceRegion covers the partial-rebuild path")
 TEST_CASE("rebuild against a path-backed (tifxyz) fixture exercises the mapped-cache path")
 {
     auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing");
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     auto qs = std::make_shared<QuadSurface>(seg);
     qs->ensureLoaded();
     SurfacePatchIndex idx;

@@ -32,10 +32,7 @@ fs::path fixtureSegment(const std::string& name)
 TEST_CASE("load_quad_from_tifxyz: returns a valid surface for a real fixture")
 {
     auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     auto qs = load_quad_from_tifxyz(seg.string(), 0);
     REQUIRE(qs);
     qs->ensureLoaded();
@@ -72,7 +69,7 @@ TEST_CASE("load_quad_from_tifxyz: works for the other fixtures too")
 {
     for (const char* name : {"20241113080880", "20241113090990"}) {
         auto seg = fixtureSegment(name);
-        if (!fs::exists(seg / "meta.json")) continue;
+        REQUIRE(fs::exists(seg / "meta.json"));
         auto qs = load_quad_from_tifxyz(seg.string(), 0);
         REQUIRE(qs);
         qs->ensureLoaded();
@@ -84,10 +81,7 @@ TEST_CASE("load_quad_from_tifxyz: works for the other fixtures too")
 TEST_CASE("load_quad_from_tifxyz_region: decodes only the requested grid region")
 {
     const auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
 
     QuadSurface lazy(seg);
     CHECK_FALSE(lazy.isLoaded());
@@ -110,9 +104,6 @@ TEST_CASE("load_quad_from_tifxyz_region: decodes only the requested grid region"
 TEST_CASE("load_quad_from_tifxyz_region: rejects an out-of-bounds region")
 {
     const auto seg = fixtureSegment("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing at " << seg);
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     CHECK_THROWS(load_quad_from_tifxyz_region(seg, cv::Rect(120, 0, 20, 10)));
 }

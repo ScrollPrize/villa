@@ -34,22 +34,6 @@ bool requireNetwork()
     return value && value[0] && value[0] != '0';
 }
 
-class ConstantNormalSampler final : public vc::lasagna::NormalSampler {
-public:
-    explicit ConstantNormalSampler(cv::Vec3d normal)
-        : normal_(normal)
-    {
-    }
-
-    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& /*volumePoint*/) const override
-    {
-        return {normal_, true, {}};
-    }
-
-private:
-    cv::Vec3d normal_;
-};
-
 } // namespace
 
 TEST_CASE("Lasagna shape pairing identifies a dyadic coordinate scale")
@@ -573,14 +557,3 @@ TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
     CHECK_FALSE(manifest.hasNormalSource());
 }
 
-TEST_CASE("NormalSampler interface supports framework tests without Qt")
-{
-    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
-
-    const auto sample = sampler.sampleNormal({10.0, 20.0, 30.0});
-
-    CHECK(sample.valid);
-    CHECK(sample.normal[0] == doctest::Approx(0.0));
-    CHECK(sample.normal[1] == doctest::Approx(0.0));
-    CHECK(sample.normal[2] == doctest::Approx(1.0));
-}

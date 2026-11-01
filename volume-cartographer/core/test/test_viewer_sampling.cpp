@@ -171,8 +171,10 @@ TEST_CASE("pixels outside the volume read as fill and are not read in the backgr
 
 TEST_CASE("a GPU frame that fails renders on the CPU")
 {
-    if (!vcr::cuda::available())
+    if (!vcr::cuda::available()) {
+        MESSAGE("Skipped: no CUDA device");
         return;
+    }
     Fixture f;
     OpenedVolumes cpu(64 << 20);
     OpenedVolumes tooSmall(64 << 20, 1);  // no brick fits this device budget
@@ -327,8 +329,10 @@ TEST_CASE("a zoomed-out frame takes resident finer data and does not read its ow
 #ifdef VC_READER_CUDA
 TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads load them")
 {
-    if (!vcr::cuda::available())
+    if (!vcr::cuda::available()) {
+        MESSAGE("Skipped: no CUDA device");
         return;
+    }
     Fixture f;
     for (const auto sampling : {vc::Sampling::Nearest, vc::Sampling::Trilinear}) {
         CAPTURE(int(sampling));

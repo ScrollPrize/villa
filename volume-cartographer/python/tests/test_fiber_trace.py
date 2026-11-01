@@ -15,7 +15,7 @@ import os
 import vc
 if os.environ.get("VC_BUILD_PYTHON"):
     vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
-fiber_trace = pytest.importorskip("vc.fiber_trace")
+from vc import fiber_trace
 
 SHAPE = (16, 16, 64)  # z, y, x
 START = (8.0, 8.0, 8.0)  # x, y, z

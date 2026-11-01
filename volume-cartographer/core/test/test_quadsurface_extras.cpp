@@ -185,10 +185,7 @@ TEST_CASE("pointTo with a SurfacePatchIndex hint")
 TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid points")
 {
     auto seg = fixtureSeg("20241113070770");
-    if (!fs::exists(seg / "meta.json")) {
-        MESSAGE("Skipping: fixture missing");
-        return;
-    }
+    REQUIRE(fs::exists(seg / "meta.json"));
     // Stage the segment + an extra mask.tif into a tmp dir so we don't
     // pollute the committed fixtures.
     auto d = tmpDir("mask_load");
@@ -198,9 +195,14 @@ TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid point
         fs::copy(f.path(), dst / f.path().filename(),
                  fs::copy_options::recursive);
     }
-    // Write a 129x129 mask of all 255 (no trimming) just to exercise the
-    // mask-application code path.
-    cv::Mat mask(129, 129, CV_8UC1, cv::Scalar(255));
+    // A mask at the surface's size that clears one block of vertices.
+    QuadSurface unmasked(seg);
+    unmasked.ensureLoaded();
+    const cv::Mat_<cv::Vec3f> before = *unmasked.rawPointsPtr();
+    const int row = before.rows / 2, col = before.cols / 2;
+    REQUIRE(before(row, col)[0] != -1.0f);
+    cv::Mat mask(before.rows, before.cols, CV_8UC1, cv::Scalar(255));
+    mask(cv::Rect(col, row, 1, 1)).setTo(0);
     vcr::sources::TiffOptions tiled;
     tiled.tile = std::array<int, 2>{128, 128};
     vcr::sources::writeTiff(dst / "mask.tif", mask.data, "|u1", mask.rows, mask.cols, 1, tiled);
@@ -208,7 +210,8 @@ TEST_CASE("load_quad_from_tifxyz with an associated mask.tif trims invalid point
     auto qs = load_quad_from_tifxyz(dst.string(), 0);
     REQUIRE(qs);
     qs->ensureLoaded();
-    CHECK(qs->rawPointsPtr() != nullptr);
+    REQUIRE(qs->rawPointsPtr() != nullptr);
+    CHECK((*qs->rawPointsPtr())(row, col)[0] == -1.0f);
     fs::remove_all(d);
 }
 

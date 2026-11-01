@@ -407,13 +407,10 @@ vc_add_test(NAME test_gridstore_branches)
 
 vc_add_test(NAME test_gridstore_malformed)
 
-# Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
-# Soft-skips on network failure so offline runs still pass; set
-# VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
-
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+# Live S3: PHerc 0139 catalog/object-store identity. Soft-skips when offline;
+# VC_TEST_REQUIRE_NETWORK=1 turns that into a failure.
 vc_add_test(NAME test_volume_live_s3
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
@@ -426,11 +423,6 @@ vc_add_test(NAME test_surface_patch_index)
 
 
 vc_add_test(NAME test_global_cache_root)
-
-# Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
-# the NormalGridGenerate library API against it. Soft-skips on network.
-vc_add_test(NAME test_normal_grid_live)
-set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
 
 vc_add_test(NAME test_geometry)

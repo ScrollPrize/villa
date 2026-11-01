@@ -152,14 +152,3 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     }
 }
 
-TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
-{
-    auto v = openOrSkip();
-    if (!v) return;
-    CHECK(v->isRemote());
-    CHECK_FALSE(v->remoteUrl().empty());
-    CHECK_FALSE(v->id().empty());
-    const auto folder = v->remoteCacheRoot() / v->id();
-    CHECK(v->remotePersistentCachePath() ==
-          (std::filesystem::is_directory(folder) ? folder : vcr::zarr::decodedCachePath(v->remoteCacheRoot(), v->sourceLocation())));
-}

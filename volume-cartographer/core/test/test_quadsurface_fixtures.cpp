@@ -50,10 +50,7 @@ bool haveFixture(const std::string& name)
 
 TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
 {
-    if (!haveFixture(kSeg770)) {
-        MESSAGE("Skipping: fixture not present at " << segPath(kSeg770));
-        return;
-    }
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* pts = qs.rawPointsPtr();
@@ -72,7 +69,7 @@ TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
 
 TEST_CASE("Fixture: validMask, countValid*, and bbox on segment 770")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
 
@@ -98,7 +95,7 @@ TEST_CASE("Fixture: validMask, countValid*, and bbox on segment 770")
 TEST_CASE("Fixture: segment 880 and 990 also load")
 {
     for (const char* name : {kSeg880, kSeg990}) {
-        if (!haveFixture(name)) continue;
+        REQUIRE(haveFixture(name));
         CAPTURE(name);
         QuadSurface qs(segPath(name));
         qs.ensureLoaded();
@@ -110,7 +107,7 @@ TEST_CASE("Fixture: segment 880 and 990 also load")
 
 TEST_CASE("Fixture: rotate(0) is a no-op; rotate(90) keeps surface loaded")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* p = qs.rawPointsPtr();
@@ -123,7 +120,7 @@ TEST_CASE("Fixture: rotate(0) is a no-op; rotate(90) keeps surface loaded")
 
 TEST_CASE("Fixture: flipU and flipV are involutions")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     int validBefore = qs.countValidPoints();
@@ -137,7 +134,7 @@ TEST_CASE("Fixture: flipU and flipV are involutions")
 
 TEST_CASE("Fixture: gridNormal yields a unit-length normal somewhere on the surface")
 {
-    if (!haveFixture(kSeg770)) return;
+    REQUIRE(haveFixture(kSeg770));
     QuadSurface qs(segPath(kSeg770));
     qs.ensureLoaded();
     auto* p = qs.rawPointsPtr();
@@ -166,7 +163,5 @@ TEST_CASE("Fixture: three segments share the same uuid pattern (date_id)")
     for (const char* name : {kSeg770, kSeg880, kSeg990}) {
         if (haveFixture(name)) ++found;
     }
-    // Three live in the repo by default; running from a different cwd may
-    // miss the path — accept >=1 for the soft-skip case.
-    CHECK(found >= 1);
+    CHECK(found == 3);
 }
