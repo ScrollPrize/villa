@@ -30,9 +30,8 @@ struct LasagnaChannelGroup {
     // a remote group's array is opened at this URL.
     std::string sourceLocation;
     // Remote groups: the vc_reader disk cache directory of their chunks and
-    // how requests are signed (explicit keys, else AWS discovery when allowed).
+    // whether the environment's AWS credentials may sign requests (vcr::zarr::resolveAccess).
     std::filesystem::path remoteCacheRoot;
-    vcr::Auth remoteAuth;
     bool discoverAwsCredentials = true;
     int scaledown = 0;
     std::vector<std::string> channels;

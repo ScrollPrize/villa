@@ -357,43 +357,23 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
-    const vcr::Auth& authIn,
     const utils::Json& metadata,
     bool discoverAwsCredentials)
 {
     const auto spec = vc::parseRemoteVolumeSpec(url);
     const std::string& remoteUrl = spec.sourceUrl;
-    auto auth = authIn;
 
-    // Recognized S3 sources are tried anonymously, then with the given or
-    // discovered credentials only when anonymous access fails.
-    const auto openLevels = [&](const vcr::Auth& requestAuth) {
-        // VC's cache root, byte limit, floor and parallelism apply from the first metadata read.
-        auto options = vc::settings::remoteOpenOptions(vc::settings::remoteCachePath());
-        std::string location = remoteUrl;
-        if (!requestAuth.kind.empty()) {
-            location = signedS3Location(remoteUrl);
-            options.access = vcr::zarr::s3Access(location, requestAuth);
-        }
-        return std::pair{vcr::zarr::pyramidLevels(location, options), options};
-    };
-    decltype(openLevels(auth)) opened;
-    if (!spec.useAwsSigv4) {
-        opened = openLevels(auth);
-    } else {
-        try {
-            opened = openLevels({});
-            auth = {};
-        } catch (const std::exception&) {
-            if (auth.kind.empty() && discoverAwsCredentials) {
-                auth = vcr::zarr::awsCredentials().value_or(vcr::Auth{});
-            }
-            if (auth.kind.empty())
-                throw;
-            opened = openLevels(auth);
-        }
-    }
-    auto& [allLevels, openOptions] = opened;
+    // Public Open Data is anonymous; another S3 bucket is signed with the environment's
+    // credentials when there are any (vcr::zarr::resolveAccess). Requests to a signed
+    // source go to its s3:// form.
+    const auto access = vcr::zarr::resolveAccess(
+        spec.useAwsSigv4 ? signedS3Location(remoteUrl) : remoteUrl,
+        discoverAwsCredentials ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
+    // VC's cache root, byte limit, floor and parallelism apply from the first metadata read.
+    auto openOptions = vc::settings::remoteOpenOptions(vc::settings::remoteCachePath());
+    openOptions.access = access;
+    const auto allLevels = vcr::zarr::pyramidLevels(
+        access.kind == vcr::zarr::Access::Kind::Anonymous ? remoteUrl : signedS3Location(remoteUrl), openOptions);
     if (allLevels.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
     if (spec.baseScaleLevel > 0)
@@ -419,7 +399,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteUrl_ = remoteUrl;
     vol->remoteLocator_ = spec.portableLocator;
     vol->baseScaleLevel_ = spec.baseScaleLevel;
-    vol->remoteAuth_ = auth;
+    vol->remoteAccess_ = access;
     vol->remoteCacheRoot_ = vc::settings::remoteCachePath();
     const auto& firstShape = shapes[static_cast<std::size_t>(firstPresentLevel)];
     const size_t firstScale = spec.baseScaleLevel > 0 ? 1 : size_t{1} << firstPresentLevel;
@@ -503,7 +483,7 @@ std::string Volume::sourceLocation() const
 {
     if (!isRemote_)
         return path_.string();
-    return remoteAuth_.kind.empty() ? remoteUrl_ : signedS3Location(remoteUrl_);
+    return remoteAccess_.kind == vcr::zarr::Access::Kind::Anonymous ? remoteUrl_ : signedS3Location(remoteUrl_);
 }
 
 vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
@@ -513,8 +493,7 @@ vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
     // Chunks live at <root>/<scheme>/<bucket>/<path>, shared with every vc_reader
     // user of the root. A volume cached by an earlier VC3D keeps its own folder.
     auto options = vc::settings::remoteOpenOptions(remoteCacheRoot_);
-    if (!remoteAuth_.kind.empty())
-        options.access = vcr::zarr::s3Access(sourceLocation(), remoteAuth_);
+    options.access = remoteAccess_;
     if (!remoteCacheRoot_.empty()) {
         options.compressCache = vc::settings::remoteCacheDelta3dEnabled();
         if (const auto folder = remoteCacheRoot_ / remoteSourceCacheId_; std::filesystem::is_directory(folder))

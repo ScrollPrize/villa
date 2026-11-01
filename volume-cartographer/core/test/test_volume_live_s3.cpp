@@ -52,7 +52,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         "20260102150214-2.399um-0.2m-78keV-masked.zarr";
     std::shared_ptr<Volume> untagged;
     try {
-        untagged = Volume::NewFromUrl(url, {}, utils::Json::object(), false);
+        untagged = Volume::NewFromUrl(url, utils::Json::object(), false);
     } catch (const std::exception& e) {
         if (requireNetwork()) FAIL("PHerc0139 remote open failed: " << e.what());
         MESSAGE("Skipping (network unavailable?): " << e.what());
@@ -162,27 +162,4 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
     const auto folder = v->remoteCacheRoot() / v->id();
     CHECK(v->remotePersistentCachePath() ==
           (std::filesystem::is_directory(folder) ? folder : vcr::zarr::decodedCachePath(v->remoteCacheRoot(), v->sourceLocation())));
-}
-
-TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")
-{
-    vcr::Auth invalid;
-    invalid.kind = "s3";
-    invalid.user = "INVALIDACCESSKEY";
-    invalid.secret = "INVALIDSECRET";
-    invalid.token = "INVALIDSESSIONTOKEN";
-    invalid.region = "us-east-1";
-
-    try {
-        const auto volume = Volume::NewFromUrl(kVolumeUrl, invalid);
-        REQUIRE(volume != nullptr);
-        CHECK(volume->isRemote());
-        CHECK(volume->remoteAuth().kind.empty());
-    } catch (const std::exception& e) {
-        if (requireNetwork()) {
-            FAIL("invalid-credential anonymous fallback failed: " << e.what());
-        }
-        MESSAGE("Skipping invalid-credential fallback (network unavailable?): "
-                << e.what());
-    }
 }

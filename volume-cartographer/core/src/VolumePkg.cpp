@@ -108,15 +108,12 @@ constexpr const char* kDirectRemoteZarrRequired =
 
 std::shared_ptr<Volume> openRemoteVolumeEntry(
     const vc::project::Entry& entry,
-    const vcr::catalog::OpenDataManifest* catalog,
-    const vcr::Auth& auth = {})
+    const vcr::catalog::OpenDataManifest* catalog)
 {
-    const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
     return Volume::NewFromUrl(
         entry.location,
-        anonymous ? vcr::Auth{} : auth,
         vc::project::catalogVolumeMetadata(catalog, entry.location),
-        !anonymous);
+        !vc::project::usesAnonymousRemoteAuth(entry));
 }
 
 std::string validateRemoteVolumeLocation(

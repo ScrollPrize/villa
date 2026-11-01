@@ -495,7 +495,7 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (!document.at("provenance").contains("ct_volume") ||
         ct != document.at("provenance").at("ct_volume").get<std::string>())
         throw std::invalid_argument("render CT differs from or is absent in the evaluated source binding");
-    if (ct.find("://") != std::string::npos)
+    if (vcr::zarr::isRemote(ct))
         throw std::invalid_argument("post-hoc strip rendering currently requires local OME-Zarr CT metadata");
     const auto ctLevel = openCtLevel(ct, ctCache);
     auto overview = renderFiberReplayTraceOverview(reference, replay, normals,
@@ -654,7 +654,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if (entry.value("ct_base_volume", false)) {
                 // The input pyramid's level zero defines base coordinates;
                 // no inferred power-of-two transform for selected groups.
-                const bool remoteCt = source.renderCt.find("://") != std::string::npos;
+                const bool remoteCt = vcr::zarr::isRemote(source.renderCt);
                 if (remoteCt && std::filesystem::weakly_canonical(options.remoteCacheRoot) !=
                     std::filesystem::weakly_canonical(vc::settings::remoteCachePath()))
                     throw std::invalid_argument("render CT cache root must match the process-wide VC3D cache root");
@@ -691,7 +691,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     if (source.renderSource.shapeZYX[axis] != dataset.manifest().baseShapeZYX->at(axis))
                         throw std::invalid_argument("render CT base shape differs from predictions");
             } else {
-                if (source.renderCt.find("://") != std::string::npos)
+                if (vcr::zarr::isRemote(source.renderCt))
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
                 source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, decodedCache));
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);

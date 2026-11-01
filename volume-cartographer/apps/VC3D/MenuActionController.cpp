@@ -102,8 +102,6 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
-bool isAuthError(const QString& msg);
-
 } // namespace
 
 // Kept local so the QtConcurrent result type does not leak into the header.
@@ -1218,29 +1216,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                 return;
             }
 
-            if (isAuthError(outcome.error)) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                settings.remove(vc3d::settings::aws::SECRET_KEY);
-                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                const auto reply = QMessageBox::warning(
-                    self->_window,
-                    QObject::tr("Authentication Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                "Would you like to enter new AWS credentials and retry?")
-                        .arg(outcome.error),
-                    QMessageBox::Yes | QMessageBox::No);
-                if (reply == QMessageBox::Yes) {
-                    QTimer::singleShot(
-                        0, self, [self, persistedLocator]() {
-                            if (self)
-                                self->attachRemoteZarrUrl(persistedLocator);
-                        });
-                    return;
-                }
-            }
-
             QMessageBox::critical(
                 self->_window,
                 QObject::tr("Attach Remote Zarr Error"),
@@ -1259,15 +1234,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
 
 namespace
 {
-
-bool isAuthError(const QString& msg)
-{
-    return msg.contains("Access denied", Qt::CaseInsensitive) ||
-           msg.contains("403", Qt::CaseInsensitive) ||
-           msg.contains("401", Qt::CaseInsensitive) ||
-           msg.contains("credential", Qt::CaseInsensitive) ||
-           msg.contains("Forbidden", Qt::CaseInsensitive);
-}
 
 } // namespace
 
@@ -1623,12 +1589,6 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
-    dlg.setAuthResolver([this](const QString& url, vcr::Auth* out, QString* err) {
-        auto* attachment = _window
-            ? _window->_volumeAttachmentController.get()
-            : nullptr;
-        return attachment && attachment->resolveRemoteAuth(url, out, err);
-    });
     dlg.setStartUri(defaultDir, startAtFile);
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
@@ -1957,48 +1917,18 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
+    // Requests are signed with the environment's AWS credentials where a bucket needs
+    // them (vcr::zarr::resolveAccess); a remote manifest or group needs a cache root.
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     bool needsRemoteCache = remote;
-    bool needsRemoteAuth = remote;
-    QString authLocation = location;
     if (!remote) {
         try {
-            const auto localManifest = std::filesystem::path(location.toStdString());
-            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(localManifest);
-            const auto remoteGroup = std::find_if(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
+            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(std::filesystem::path(location.toStdString()));
+            needsRemoteCache = std::any_of(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
                 return vcr::zarr::isRemote(group.relativeZarrKey);
             });
-            if (remoteGroup != parsed.groups.end()) {
-                needsRemoteCache = true;
-                needsRemoteAuth = true;
-                authLocation = QString::fromStdString(remoteGroup->relativeZarrKey);
-            } else {
-                const auto markerPath = localManifest.parent_path() /
-                    vc::lasagna::kLasagnaRemoteMarker;
-                if (std::filesystem::is_regular_file(markerPath)) {
-                    const auto marker = utils::Json::parse_file(markerPath);
-                    const auto artifactUrl = marker.value(
-                        "artifact_url", std::string{});
-                    if (vcr::zarr::isRemote(artifactUrl)) {
-                        needsRemoteAuth = true;
-                        authLocation = QString::fromStdString(artifactUrl);
-                    }
-                }
-            }
         } catch (...) {
             // The background loader reports manifest parse errors uniformly.
-        }
-    }
-    if (needsRemoteAuth || needsRemoteCache) {
-        auto* attachment = _window->_volumeAttachmentController.get();
-        if (!attachment) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Remote attachment settings are unavailable."));
-            return;
-        }
-        QString authError;
-        if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), authError);
-            return;
         }
     }
     if (needsRemoteCache) {

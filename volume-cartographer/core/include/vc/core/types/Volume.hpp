@@ -13,8 +13,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include <vc_reader/native/reader_types.hpp>
-
-namespace vcr::zarr { struct OpenOptions; }
+#include <vc_reader/zarr.hpp>
 
 
 class Volume
@@ -39,14 +38,14 @@ public:
     static std::shared_ptr<Volume> New(std::filesystem::path path,
                                        const utils::Json& metadata);
 
-    // Create a Volume backed by a remote zarr store over HTTP.
-    // If auth is provided, it is used as-is. Otherwise credentials are read
-    // from the ambient AWS configuration only when discoverAwsCredentials is
-    // true; false forces an anonymous request. Remote chunks are always
-    // persisted beneath the process-wide remote cache root.
+    // Create a Volume backed by a remote zarr store over HTTP. Access is
+    // vcr::zarr::resolveAccess: public Open Data is read anonymously; another
+    // s3:// bucket (or S3 virtual-host URL) is signed with the AWS credentials of
+    // the environment and ~/.aws when there are any and discoverAwsCredentials is
+    // true; false forces anonymous requests. Remote chunks are always persisted
+    // beneath the process-wide remote cache root.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
-        const vcr::Auth& auth = {},
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);
 
@@ -56,7 +55,6 @@ public:
     [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
-    [[nodiscard]] const vcr::Auth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
     // Source identity before project/catalog metadata overrides: annotation IDs
     // and working levels do not rename disk caches.
@@ -107,6 +105,6 @@ protected:
     std::string remoteSourceCacheId_;  // the cache of the physical (not rebased) pyramid
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;
-    vcr::Auth remoteAuth_;
+    vcr::zarr::Access remoteAccess_;
     std::filesystem::path remoteCacheRoot_;
 };

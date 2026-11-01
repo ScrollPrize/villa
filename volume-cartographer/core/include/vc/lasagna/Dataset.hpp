@@ -19,7 +19,6 @@ inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
     std::filesystem::path remoteCacheRoot;
-    vcr::Auth remoteAuth;
     bool refreshManifest = false;  // read a remote manifest again even when it is cached
     // False forces anonymous S3 access for both the manifest and its groups.
     bool discoverAwsCredentials = true;

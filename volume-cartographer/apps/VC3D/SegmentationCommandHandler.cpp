@@ -644,7 +644,6 @@ void SegmentationCommandHandler::configureCommandRunnerForVolume(const std::stri
         return;
     }
     _cmdRunner->setRemoteVolumeUrl(QString());
-    _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
     if (!_state || !_state->vpkg() || !_state->vpkg()->hasVolume(volumeId)) {
         return;
     }
@@ -652,12 +651,7 @@ void SegmentationCommandHandler::configureCommandRunnerForVolume(const std::stri
     if (!volume->isRemote()) {
         return;
     }
-    const auto& auth = volume->remoteAuth();
     _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
-    _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.user),
-                                    QString::fromStdString(auth.secret),
-                                    QString::fromStdString(auth.token),
-                                    QString::fromStdString(auth.region));
 }
 
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)

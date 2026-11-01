@@ -3,7 +3,6 @@
 #include "OpenDataManifest.hpp"
 
 #include <QFutureWatcher>
-#include <QSettings>
 #include <QtConcurrent>
 
 #include <exception>
@@ -78,11 +77,6 @@ bool VolumeAttachmentController::prepare(
     if (vcr::zarr::isRemote(input)) {
         const auto spec = vc::parseRemoteVolumeSpec(input);
         prepared.location = QString::fromStdString(spec.portableLocator);
-        if (!resolveRemoteAuth(prepared.location, &prepared.auth, errorMessage)) {
-            if (failure)
-                *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
-            return false;
-        }
     } else {
         auto localPath = vc::project::resolveLocalPath(input);
         if (localPath.is_relative())
@@ -195,7 +189,6 @@ bool VolumeAttachmentController::start(
                         request.tags.end();
                     result.volume = Volume::NewFromUrl(
                         location,
-                        anonymous ? vcr::Auth{} : request.auth,
                         vc::project::catalogVolumeMetadata(
                             vc3d::opendata::cachedCatalog().get(), location),
                         !anonymous);
@@ -219,40 +212,3 @@ bool VolumeAttachmentController::inFlight() const
     return _inFlight;
 }
 
-bool VolumeAttachmentController::resolveRemoteAuth(
-    const QString& url,
-    vcr::Auth* authOut,
-    QString* errorMessage) const
-{
-    if (!authOut)
-        return false;
-
-    *authOut = {};
-    const auto spec = vc::parseRemoteVolumeSpec(url.trimmed().toStdString());
-    if (!spec.useAwsSigv4)
-        return true;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    *authOut = vcr::zarr::awsCredentials().value_or(vcr::Auth{});
-
-    if (authOut->user.empty() || authOut->secret.empty()) {
-        const auto savedAccess =
-            settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
-        const auto savedSecret =
-            settings.value(vc3d::settings::aws::SECRET_KEY).toString();
-        const auto savedToken =
-            settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
-        if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            authOut->kind = "s3";
-            authOut->user = savedAccess.toStdString();
-            authOut->secret = savedSecret.toStdString();
-            authOut->token = savedToken.toStdString();
-        }
-    }
-
-    // Public S3 buckets should attempt anonymous access before the interactive
-    // caller offers a credential retry.
-    if (errorMessage)
-        errorMessage->clear();
-    return true;
-}

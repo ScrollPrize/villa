@@ -31,11 +31,6 @@ public:
     void setLocalNameFilters(const QStringList& globs) { _localFilters = globs; }
     void setStartUri(const QString& uri, bool isFile = false);
 
-    using AuthResolver = std::function<bool(const QString& url,
-                                             vcr::Auth* out,
-                                             QString* err)>;
-    void setAuthResolver(AuthResolver r) { _authResolver = std::move(r); }
-
     QString selectedUri() const { return _selectedUri; }
 
 private slots:
@@ -50,7 +45,6 @@ private:
     bool eventFilter(QObject* watched, QEvent* event) override;
     void navigateLocal(const QString& absDir);
     void navigateRemote(const QString& urlPrefix);
-    bool ensureRemoteAuth(const QString& probeUrl);
     static Mode detectModeFromUri(const QString& uri);
     QString currentUri() const;
     bool isAcceptableUri(const QString& uri, bool isFile) const;
@@ -66,10 +60,6 @@ private:
     QString _currentRemoteUrl;
     bool _pathBarEdited = false;
 
-    vcr::Auth _auth;
-    bool _authResolved = false;
-    QString _authProbeUrl;
-    AuthResolver _authResolver;
 
     QRadioButton* _localRadio{nullptr};
     QRadioButton* _remoteRadio{nullptr};

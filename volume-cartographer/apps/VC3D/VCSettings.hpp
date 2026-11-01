@@ -326,15 +326,6 @@ namespace neighbor_copy {
 }
 
 // -----------------------------------------------------------------------------
-// AWS Settings
-// -----------------------------------------------------------------------------
-namespace aws {
-    constexpr auto ACCESS_KEY = "aws/access_key";
-    constexpr auto SECRET_KEY = "aws/secret_key";
-    constexpr auto SESSION_TOKEN = "aws/session_token";
-}
-
-// -----------------------------------------------------------------------------
 // Tools Settings
 // -----------------------------------------------------------------------------
 namespace tools {

@@ -28,7 +28,6 @@ enum class VolumeAttachmentPreparationFailure {
 struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
-    vcr::Auth auth;
     VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
 };
 
@@ -57,11 +56,6 @@ public:
         std::function<void(const VolumeAttachmentOutcome&)> onFinished,
         QString* errorMessage = nullptr);
     bool inFlight() const;
-
-    bool resolveRemoteAuth(
-        const QString& url,
-        vcr::Auth* authOut,
-        QString* errorMessage = nullptr) const;
 private:
     struct TaskResult;
 

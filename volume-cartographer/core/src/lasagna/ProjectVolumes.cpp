@@ -38,13 +38,8 @@ std::shared_ptr<Volume> openRegularVolumeForGroup(
     const LasagnaChannelGroup& group)
 {
     const std::string location = attachmentLocationForGroup(group);
-    if (group.isRemote()) {
-        const auto auth = group.discoverAwsCredentials
-            ? group.remoteAuth
-            : vcr::Auth{};
-        return Volume::NewFromUrl(
-            location, auth, {}, group.discoverAwsCredentials);
-    }
+    if (group.isRemote())
+        return Volume::NewFromUrl(location, {}, group.discoverAwsCredentials);
     return Volume::New(std::filesystem::path(location));
 }
 

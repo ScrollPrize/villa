@@ -979,7 +979,7 @@ int main(int argc, char *argv[])
     }
     if (volumeSource.empty()) { logPrintf(stderr, "Error: --volume required\n"); return EXIT_FAILURE; }
     std::filesystem::path vol_path = volumeSource;
-    const std::string remoteUrl = volumeSource.find("://") != std::string::npos ? volumeSource : std::string{};
+    const std::string remoteUrl = vcr::zarr::isRemote(volumeSource) ? volumeSource : std::string{};
     const bool useRemoteCache = !remoteUrl.empty();
 
     std::optional<StoreToolOptions> store_options;
@@ -1151,7 +1151,7 @@ int main(int argc, char *argv[])
     int workingLevel = 0;
     if (useRemoteCache) {
         try {
-            remoteVolume = Volume::NewFromUrl(remoteUrl, vcr::zarr::awsCredentials().value_or(vcr::Auth{}));
+            remoteVolume = Volume::NewFromUrl(remoteUrl);
         } catch (const std::exception& e) {
             logPrintf(stderr, "Error opening remote zarr: %s\n", e.what());
             return EXIT_FAILURE;

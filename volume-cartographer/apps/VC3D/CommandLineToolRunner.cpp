@@ -1,4 +1,6 @@
 #include "CommandLineToolRunner.hpp"
+
+#include <vc_reader/zarr.hpp>
 #include "ToolExecutable.hpp"
 #include "ToolOutput.hpp"
 #include <QDir>
@@ -54,17 +56,6 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
 void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
 {
     _remoteVolumeUrl = url.trimmed();
-}
-
-void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
-                                                const QString& secretKey,
-                                                const QString& sessionToken,
-                                                const QString& region)
-{
-    _remoteAccessKey = accessKey;
-    _remoteSecretKey = secretKey;
-    _remoteSessionToken = sessionToken;
-    _remoteRegion = region;
 }
 
 void CommandLineToolRunner::setStore(const QString& storePath, double voxelScale)
@@ -208,10 +199,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     }
 
     if (tool == Tool::GrowSegFromSegment || tool == Tool::AlphaCompRefine) {
-        const auto lowered = _volumePath.trimmed().toLower();
-        if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
-            lowered.startsWith("s3://") || lowered.startsWith("s3+") ||
-            lowered.startsWith("sftp://") || lowered.startsWith("ssh://")) {
+        if (vcr::zarr::isRemote(_volumePath.trimmed().toStdString())) {
             warn(
                 tr("Unsupported Remote Volume"),
                 tr("This command accepts only a local volume path. "
@@ -267,16 +255,6 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     auto launch = launchFor(tool);
     launch.tool = toolCmd;
     launch.ompThreads = ompThreads;
-    if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
-        launch.environment.insert(QStringLiteral("AWS_ACCESS_KEY_ID"), _remoteAccessKey);
-        launch.environment.insert(QStringLiteral("AWS_SECRET_ACCESS_KEY"), _remoteSecretKey);
-        launch.secretVariables << QStringLiteral("AWS_ACCESS_KEY_ID") << QStringLiteral("AWS_SECRET_ACCESS_KEY");
-        if (!_remoteSessionToken.isEmpty()) {
-            launch.environment.insert(QStringLiteral("AWS_SESSION_TOKEN"), _remoteSessionToken);
-            launch.secretVariables << QStringLiteral("AWS_SESSION_TOKEN");
-        }
-        if (!_remoteRegion.isEmpty()) launch.environment.insert(QStringLiteral("AWS_DEFAULT_REGION"), _remoteRegion);
-    }
     const QString toolLabel = isCustom && !_customLabel.isEmpty() ? _customLabel : QFileInfo(toolCmd).baseName();
     launch.logPath = QStringLiteral("%1/%2_%3.txt")
         .arg(QDir::tempPath(), QFileInfo(toolCmd).baseName(),

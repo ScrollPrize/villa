@@ -52,13 +52,10 @@ namespace {
     return query == std::string_view::npos ? std::string(location) : std::string(location.substr(0, query)) + "?<redacted>";
 }
 
-// Keys sign s3:// requests; otherwise public buckets are read anonymously and others
-// with discovered AWS credentials when allowed.
-[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, const vcr::Auth& keys, bool discover)
+// Public buckets are read anonymously, others with the environment's AWS credentials
+// when allowed (vcr::zarr::resolveAccess).
+[[nodiscard]] vcr::zarr::Access lasagnaAccess(const std::string& location, bool discover)
 {
-    if (!keys.kind.empty())
-        if (const auto s3 = vcr::zarr::s3Location(location); s3 && !vcr::zarr::isPublicLocation(*s3))
-            return vcr::zarr::s3Access(*s3, keys);
     return vcr::zarr::resolveAccess(location, discover ? vcr::zarr::AuthMode::Auto : vcr::zarr::AuthMode::Anonymous);
 }
 
@@ -87,14 +84,12 @@ namespace {
 
 void applyRemoteGroup(LasagnaChannelGroup& group,
                       std::filesystem::path remoteCacheRoot,
-                      const vcr::Auth& remoteAuth,
                       bool discoverAwsCredentials)
 {
     if (remoteCacheRoot.empty()) {
         throw std::runtime_error("Remote Lasagna group requires a remote cache directory: " + group.relativeZarrKey);
     }
     group.remoteCacheRoot = std::move(remoteCacheRoot);
-    group.remoteAuth = remoteAuth;
     group.discoverAwsCredentials = discoverAwsCredentials;
 }
 
@@ -114,9 +109,6 @@ void resolveGroupLocations(
             : optionRemoteCacheRoot;
     const bool discoverAwsCredentials =
         manifest.discoverAwsCredentials && options.discoverAwsCredentials;
-    const vcr::Auth remoteAuth = discoverAwsCredentials
-        ? options.remoteAuth
-        : vcr::Auth{};
 
     for (auto& group : manifest.groups) {
         group.sourceLocation.clear();
@@ -126,8 +118,7 @@ void resolveGroupLocations(
 
         if (vcr::zarr::isRemote(group.relativeZarrKey)) {
             group.sourceLocation = runtimeLocation(group.relativeZarrKey);
-            applyRemoteGroup(group, defaultRemoteCacheRoot,
-                             remoteAuth, discoverAwsCredentials);
+            applyRemoteGroup(group, defaultRemoteCacheRoot, discoverAwsCredentials);
             continue;
         }
 
@@ -141,8 +132,7 @@ void resolveGroupLocations(
         if (!manifest.remoteSourceBaseLocation.empty()) {
             const auto key = normalizedRelativeRemoteKey(group.relativeZarrKey);
             group.sourceLocation = vcr::joinLocation(manifest.remoteSourceBaseLocation, key);
-            applyRemoteGroup(group, defaultRemoteCacheRoot, remoteAuth,
-                             discoverAwsCredentials);
+            applyRemoteGroup(group, defaultRemoteCacheRoot, discoverAwsCredentials);
             continue;
         }
 
@@ -210,8 +200,7 @@ MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manife
         std::filesystem::remove(manifestPath, ignored);
     }
     const bool hit = std::filesystem::is_regular_file(manifestPath);
-    const auto keys = options.discoverAwsCredentials ? options.remoteAuth : vcr::Auth{};
-    const auto access = lasagnaAccess(identity, keys, options.discoverAwsCredentials);
+    const auto access = lasagnaAccess(identity, options.discoverAwsCredentials);
     vcr::sources::EncodedFiles files([root, access](const std::string&) {
         auto open = vc::settings::remoteOpenOptions(root);
         open.access = access;
@@ -316,7 +305,7 @@ vcr::zarr::OpenedArray openLasagnaGroupArray(
     const auto& location = group.sourceLocation;
     auto options = vc::settings::remoteOpenOptions(group.remoteCacheRoot);
     options.memoryCache = std::move(cache);
-    options.access = lasagnaAccess(location, group.remoteAuth, group.discoverAwsCredentials);
+    options.access = lasagnaAccess(location, group.discoverAwsCredentials);
     return vcr::zarr::openArray(location, options);
 }
 

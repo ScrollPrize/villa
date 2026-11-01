@@ -69,13 +69,6 @@ static void cap_blas_thread_pool()
 #endif
 }
 
-static bool is_remote_volume_path(const std::string& path)
-{
-    return path.rfind("http://", 0) == 0 ||
-           path.rfind("https://", 0) == 0 ||
-           path.rfind("s3://", 0) == 0;
-}
-
 // Whether a uint8 chunk is stored and holds anything but the fill value.
 static bool chunk_has_source_data(vcr::Array& volume, std::int64_t iz, std::int64_t iy, std::int64_t ix)
 {
@@ -328,13 +321,13 @@ static int run_main(int argc, char *argv[])
     }
 
     const std::string volume_arg = vol_path.string();
-    const bool remote_volume = is_remote_volume_path(volume_arg);
+    const bool remote_volume = vcr::zarr::isRemote(volume_arg);
     const double requested_voxelsize = params.value("voxelsize", 0.0);
     utils::Json remote_metadata;
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
+        ? Volume::NewFromUrl(volume_arg, remote_metadata)
         : Volume::New(vol_path);
     auto level0_options = volume->sourceOpenOptions();
     level0_options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));

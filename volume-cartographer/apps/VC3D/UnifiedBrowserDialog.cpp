@@ -125,15 +125,13 @@ bool isCatalogSiteFile(const QString& name)
 // One page of the remote directory at `url`, from vc_reader's listing of an s3:// (or
 // public Open Data) location: subdirectories first, then files; `continuationToken`
 // continues an earlier page.
-RemoteListResult listRemotePage(const QString& url,
-                                const vcr::Auth& auth,
-                                const QString& continuationToken = {})
+RemoteListResult listRemotePage(const QString& url, const QString& continuationToken = {})
 {
     RemoteListResult result;
     const std::string location = url.toStdString();
     vcr::zarr::Listing page;
     try {
-        const auto access = auth.kind == "s3" ? vcr::zarr::s3Access(location, auth) : vcr::zarr::resolveAccess(location);
+        const auto access = vcr::zarr::resolveAccess(location);
         page = vcr::zarr::listPage(access, location, {}, continuationToken.toStdString());
     } catch (const std::invalid_argument&) {
         result.error = QObject::tr("Browsing is available for s3:// buckets and sftp:// hosts. Paste a full URL and click Open to attach it directly.");
@@ -407,27 +405,6 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
     _status->setText(tr("%1 items").arg(shown));
 }
 
-bool UnifiedBrowserDialog::ensureRemoteAuth(const QString& probeUrl)
-{
-    if (vcr::sftp::isSftpUrl(probeUrl.toStdString())) return true;
-    if (_authResolved && probeUrl == _authProbeUrl) return true;
-    if (!_authResolver) {
-        // No resolver — proceed with empty auth (works for fully public buckets).
-        _auth = {};
-        _authResolved = true;
-        _authProbeUrl = probeUrl;
-        return true;
-    }
-    QString err;
-    if (!_authResolver(probeUrl, &_auth, &err)) {
-        _status->setText(tr("Auth failed: %1").arg(err));
-        return false;
-    }
-    _authResolved = true;
-    _authProbeUrl = probeUrl;
-    return true;
-}
-
 void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
 {
     ++_listSeq;
@@ -444,9 +421,6 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
         return;
     }
 
-    if (!ensureRemoteAuth(_currentRemoteUrl)) {
-        return;
-    }
 
     auto* watcher = new QFutureWatcher<RemoteListResult>(this);
     connect(watcher, &QFutureWatcher<RemoteListResult>::finished, this, [this, watcher, mySeq]() {
@@ -488,7 +462,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
             ? tr("%1 items").arg(shown)
             : tr("%1 items; more available").arg(shown));
     });
-    watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth]() {
+    watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl]() {
         if (vcr::sftp::isSftpUrl(url.toStdString())) {
             RemoteListResult result;
             static vcr::sftp::Fetcher fetcher;
@@ -497,7 +471,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
                     QString::fromStdString(entry.url), entry.directory});
             return result;
         }
-        return listRemotePage(url, auth);
+        return listRemotePage(url);
     }));
 }
 
@@ -509,7 +483,6 @@ void UnifiedBrowserDialog::onItemDoubleClicked(QListWidgetItem* item)
     const QString continuationToken = item->data(Qt::UserRole + 2).toString();
     if (!continuationToken.isEmpty() && _mode == Mode::Remote) {
         _status->setText(tr("Loading more..."));
-        if (!ensureRemoteAuth(_currentRemoteUrl)) return;
         auto* loadMoreItem = item;
         auto* watcher = new QFutureWatcher<RemoteListResult>(this);
         const std::uint64_t mySeq = _listSeq;
@@ -546,8 +519,8 @@ void UnifiedBrowserDialog::onItemDoubleClicked(QListWidgetItem* item)
             }
             _status->setText(tr("%1 items").arg(_list->count() - (result.nextToken.isEmpty() ? 0 : 1)));
         });
-        watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth, continuationToken]() {
-            return listRemotePage(url, auth, continuationToken);
+        watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, continuationToken]() {
+            return listRemotePage(url, continuationToken);
         }));
         return;
     }

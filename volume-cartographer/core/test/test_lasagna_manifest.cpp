@@ -402,11 +402,16 @@ struct SignedManifestBucket {
           }
         })";
         server.serveBucket("bucket", dir / "bucket", true);
+        // The environment's keys sign the bucket's requests (vcr::zarr::resolveAccess).
+        setenv("AWS_ACCESS_KEY_ID", "test-access", 1);
+        setenv("AWS_SECRET_ACCESS_KEY", "test-secret", 1);
+        setenv("AWS_REGION", "us-east-1", 1);
         setenv("AWS_ENDPOINT_URL", server.url().c_str(), 1);
     }
     ~SignedManifestBucket()
     {
-        unsetenv("AWS_ENDPOINT_URL");
+        for (const char* name : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ENDPOINT_URL"})
+            unsetenv(name);
         fs::remove_all(dir);
     }
     std::size_t fetches() const { return server.requestCount("/bucket/artifact/fiber.lasagna.json"); }
@@ -414,7 +419,6 @@ struct SignedManifestBucket {
     {
         vc::lasagna::LasagnaDatasetOpenOptions options;
         options.remoteCacheRoot = dir / "cache";
-        options.remoteAuth = vcr::Auth{"s3", "test-access", "test-secret", "", "us-east-1"};
         return options;
     }
 };
@@ -433,7 +437,6 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     CHECK(first.manifest().manifestLocation == location);
     REQUIRE(first.manifest().groups.size() == 1);
     CHECK(first.manifest().groups.front().sourceLocation == "s3://bucket/artifact/pred.zarr");
-    CHECK(first.manifest().groups.front().remoteAuth.user == "test-access");
     const auto root = fs::absolute(bucket.dir / "cache").lexically_normal();
     CHECK(first.manifest().groups.front().remoteCacheRoot == root);
     CHECK(first.manifest().manifestPath == vcr::zarr::decodedCachePath(root, location));
@@ -467,7 +470,7 @@ TEST_CASE("LasagnaDataset reads remote manifests under VC's cache settings")
     unsetenv("VC3D_CONFIG_DIR");
 }
 
-TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
+TEST_CASE("public S3 Lasagna is read anonymously whatever keys the environment holds")
 {
     if (!requireNetwork()) {
         MESSAGE("Set VC_TEST_REQUIRE_NETWORK=1 to run the public S3 smoke test");
@@ -477,11 +480,11 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
     const auto dir = makeTmpDir("public-s3-auth-fallback");
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = dir;
-    options.remoteAuth.kind = "s3";
-    options.remoteAuth.user = "AKIAIOSFODNN7EXAMPLE";
-    options.remoteAuth.secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    options.remoteAuth.token = "malformed-session-token";
-    options.remoteAuth.region = "us-east-1";
+    // Rejected keys in the environment: Open Data is never signed, so they are not used.
+    setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE", 1);
+    setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", 1);
+    setenv("AWS_SESSION_TOKEN", "malformed-session-token", 1);
+    struct Unset { ~Unset() { for (const char* n : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}) unsetenv(n); } } unset;
 
     const std::string location =
         "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/representations/"
