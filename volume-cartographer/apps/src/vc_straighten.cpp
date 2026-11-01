@@ -25,13 +25,11 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Rect3D.hpp"
-#include <vc_reader/image_write.hpp>
-#include <vc_object_store/Uuid.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/flann.hpp>
 
 #include <boost/program_options.hpp>
@@ -82,76 +80,40 @@ static Grid gridOf(QuadSurface& surf)
 
 static Grid loadGrid(const fs::path& dir)
 {
-    Grid g = gridOf(*load_quad_from_tifxyz(dir.string()));
-    const int H = g.P.rows, W = g.P.cols;
-
-    // Honor an explicit mask.tif the same way the Python loader does.
-    const fs::path mp = dir / "mask.tif";
-    if (fs::exists(mp)) {
-        std::vector<cv::Mat> layers;
-        cv::imreadmulti(mp.string(), layers, cv::IMREAD_UNCHANGED);
-        if (!layers.empty() && !layers[0].empty()
-            && layers[0].rows == H && layers[0].cols == W) {
-            cv::Mat m = layers[0];
-            if (m.channels() > 1) { std::vector<cv::Mat> ch; cv::split(m, ch); m = ch[0]; }
-            cv::Mat m8; m.convertTo(m8, CV_8U);
-            for (int r = 0; r < H; ++r)
-                for (int c = 0; c < W; ++c)
-                    if (m8.at<uint8_t>(r, c) < 255) g.valid(r, c) = 0;
-        }
-    }
-    return g;
+    // The loader honours mask.tif (any nonzero sample allows a vertex).
+    return gridOf(*load_quad_from_tifxyz(dir.string()));
 }
 
+// Written by vcr::tifxyz::write: x, y, z, mask (255 valid) and meta.json, whole or not at
+// all. A straightened copy is a new object (fresh uuid) with the input's other metadata,
+// its scale, and the extent of its valid points as bbox.
 static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcdir)
 {
-    if (fs::exists(outdir))
-        throw std::runtime_error("output exists: " + outdir.string());
-    fs::create_directories(outdir);
-
-    cv::Mat_<cv::Vec3f> P = g.P.clone();
-    for (int r = 0; r < g.H(); ++r)
-        for (int c = 0; c < g.W(); ++c)
-            if (!g.valid(r, c)) P(r, c) = cv::Vec3f(-1, -1, -1);
-
-    std::vector<cv::Mat> xyz;
-    cv::split(P, xyz);
-    vcr::sources::TiffOptions tiff;
-    tiff.compression = "deflate";
-    vcr::sources::writeTiff(outdir / "x.tif", xyz[0].data, "<f4", g.H(), g.W(), 1, tiff);
-    vcr::sources::writeTiff(outdir / "y.tif", xyz[1].data, "<f4", g.H(), g.W(), 1, tiff);
-    vcr::sources::writeTiff(outdir / "z.tif", xyz[2].data, "<f4", g.H(), g.W(), 1, tiff);
-    cv::Mat mask(g.H(), g.W(), CV_8U);
-    for (int r = 0; r < g.H(); ++r)
-        for (int c = 0; c < g.W(); ++c)
-            mask.at<uint8_t>(r, c) = g.valid(r, c) ? 255 : 0;
-    vcr::sources::writeTiff(outdir / "mask.tif", mask.data, "|u1", g.H(), g.W(), 1, tiff);
-
-    Json meta;
+    const int H = g.H(), W = g.W();
+    std::vector<float> xyz(std::size_t(H) * W * 3);
+    std::vector<std::uint8_t> mask(std::size_t(H) * W);
+    for (int r = 0; r < H; ++r)
+        for (int c = 0; c < W; ++c) {
+            const auto& p = g.P(r, c);
+            float* out = &xyz[(std::size_t(r) * W + c) * 3];
+            out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+            mask[std::size_t(r) * W + c] = g.valid(r, c) ? 255 : 0;
+        }
+    vcr::tifxyz::Metadata metadata;
+    metadata.scale = {g.scale[1], g.scale[0]};  // rows, columns
     const fs::path sm = srcdir / "meta.json";
-    if (fs::exists(sm)) meta = Json::parse_file(sm.string());
-    meta["uuid"] = vc::objects::util::newUuid();  // a straightened copy is a new object
-    meta["name"] = outdir.filename().string();
-    meta["format"] = "tifxyz";
-    meta["type"] = "seg";
-    if (!meta.contains("scale")) {           // preserve the input's scale array
-        Json arr = Json::array();            // (resampling does not change it)
-        Json a; a = (double)g.scale[0]; arr.push_back(a);
-        Json b; b = (double)g.scale[1]; arr.push_back(b);
-        meta["scale"] = arr;
+    if (fs::exists(sm)) {
+        std::ifstream in(sm);
+        metadata.extra = vcr::tifxyz::parseMetadata(nlohmann::json::parse(in), sm.string()).extra;
     }
-    // Recompute rather than erase: straightening moves every point, so the
-    // input's bbox is stale, but dropping the key entirely makes the output
-    // invisible to any tool gating on meta.contains("bbox") — e.g. three
-    // checks in vc_grow_seg_from_seed.cpp. See villa#1321.
-    Rect3D bb;
-    if (bbox_of_valid_points(P, bb)) {
-        meta["bbox"] = bbox_to_json(bb);
-    } else {
-        meta.erase("bbox");  // genuinely no valid points left; nothing to report
-    }
-    std::ofstream out(outdir / "meta.json");
-    out << meta.dump();
+    metadata.extra["name"] = outdir.filename().string();
+    metadata.extra["format"] = "tifxyz";
+    metadata.extra["type"] = "seg";
+    vcr::tifxyz::Surface surface(H, W, std::move(xyz), std::move(mask), std::move(metadata));
+    vcr::tifxyz::WriteOptions options;
+    options.compression = "deflate";
+    options.tile = std::nullopt;
+    vcr::tifxyz::write(outdir, surface, options);
 }
 
 // ---------------------------------------------------------------------------
