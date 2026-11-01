@@ -676,6 +676,16 @@ vcr::grid::SurfaceOptions QuadSurface::gridOptions() const
     return options;
 }
 
+vcr::grid::Vertices QuadSurface::gridVertices(std::vector<std::uint8_t>& valid, const cv::Mat_<cv::Vec3f>* points) const
+{
+    if (!points) points = rawPointsPtr();
+    valid.assign(std::size_t(points->rows) * std::size_t(points->cols), 1);
+    for (int j = 0; j < points->rows; ++j)
+        for (int i = 0; i < points->cols; ++i)
+            if ((*points)(j, i) == cv::Vec3f(-1.f, -1.f, -1.f)) valid[std::size_t(j) * std::size_t(points->cols) + std::size_t(i)] = 0;
+    return {reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols, points->step1(), nullptr, valid.data()};
+}
+
 vcr::grid::Raster QuadSurface::gridRaster(double u0, double v0, double scale, cv::Size size) const
 {
     const cv::Vec2d origin = surfaceToGrid({u0, v0});
@@ -1703,22 +1713,15 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
     cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
 
-    std::optional<std::array<std::int64_t, 4>> window;
-    if (requestedRegion) window = std::array<std::int64_t, 4>{requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width};
-    const auto stored = vcr::tifxyz::readCoordinates(path.string(), window);
+    vcr::tifxyz::Reader reader(path.string(), !(flags & SURF_LOAD_IGNORE_MASK));
+    const auto stored = requestedRegion ? reader.window({requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width}) : reader.whole();
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(int(stored.rows), int(stored.cols));
     std::memcpy(points->data, stored.xyz.data(), stored.xyz.size() * sizeof(float));
-
-    std::vector<std::uint8_t> mask;
-    if (!(flags & SURF_LOAD_IGNORE_MASK)) mask = vcr::tifxyz::readMask(path.string(), stored.whole[0], stored.whole[1]);
-    const auto offsetY = window ? (*window)[0] : 0, offsetX = window ? (*window)[1] : 0;
-    // Missing vertices: vc_reader's rule, the store's (z > 0), and the mask.
+    // Invalid vertices: vc_reader's rule and the mask, and the store's (z > 0).
     for (int j = 0; j < points->rows; ++j)
-        for (int i = 0; i < points->cols; ++i) {
-            const bool masked = !mask.empty() && !mask[std::size_t(j + offsetY) * std::size_t(stored.whole[1]) + std::size_t(i + offsetX)];
-            if (masked || !vcr::tifxyz::vertexPresent((*points)(j, i).val) || !vc::geometry::validSurfacePoint((*points)(j, i)))
+        for (int i = 0; i < points->cols; ++i)
+            if (!stored.valid[std::size_t(j) * std::size_t(stored.cols) + std::size_t(i)] || !vc::geometry::validSurfacePoint((*points)(j, i)))
                 (*points)(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
-        }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     if (!requestedRegion) surf->path = path;

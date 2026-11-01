@@ -7,7 +7,9 @@
 
 #include "vc_reader/grid.hpp"
 #include "vc_reader/tifxyz.hpp"
+#include "../element_type.hpp"
 #include "../reader_types.hpp"
+#include "../rounding.hpp"
 
 namespace vcr::sources {
 using nlohmann::json;
@@ -128,30 +130,14 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
 {
     if (!surface.xyzToVolume || !surface.componentOrder) bad(surface.id + ": unknown geometry coordinate frame/components");
     auto grid = surface.pixelToUv;
-    const auto trimmed = [](std::string text) {
-        while (!text.empty() && text.back() == '/') text.pop_back();
-        return text;
-    };
     if (surface.geometry.format == "tifxyz") {
         if (!surface.geometry.location) bad("surface geometry location is unresolved");
-        std::string root = *surface.geometry.location;
-        json meta;
-        EncodedFiles files(owner.options.reader.options);
-        std::vector<std::string> candidates{root};
+        // The first of the location and its alternatives that holds the directory.
+        std::vector<std::string> candidates{*surface.geometry.location};
         candidates.insert(candidates.end(), surface.geometry.alternatives.begin(), surface.geometry.alternatives.end());
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             try {
-                const auto opened = files.open(trimmed(candidates[i]) + "/meta.json");
-                std::string text;
-                char block[1 << 16];
-                ssize_t n;
-                off_t at = 0;
-                while ((n = ::pread(opened.fd, block, sizeof block, at)) > 0) {
-                    text.append(block, std::size_t(n));
-                    at += n;
-                }
-                meta = json::parse(text);
-                root = candidates[i];
+                tifxyz = std::make_unique<tifxyz::Reader>(candidates[i], surface.tifxyzMask, owner.options.reader);
                 break;
             } catch (const zarr::NotFound&) {
                 if (i + 1 == candidates.size()) throw;
@@ -159,32 +145,16 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
                 if (i + 1 == candidates.size()) throw;
             }
         }
-        files.close();
-        const auto scale = tifxyz::parseMetadata(meta, root).scale;  // rows, columns
+        const auto& scale = tifxyz->metadata().scale;  // rows, columns
         const PixelAffine observed{{{1 / scale[1], 0, 0}, {0, 1 / scale[0], 0}}};
         if (grid && *grid != observed) bad("surface pixel_to_uv contradicts tifxyz scale");
-        grid = observed;
-        for (const char* axis : {"x", "y", "z"}) {
-            Source source;
-            source.id = surface.id + "/" + axis;
-            source.storage.location = trimmed(root) + "/" + axis + ".tif";
-            source.storage.format = "tiff";
-            source.role = "scalar";
-            source.axes = std::vector<std::string>{"y", "x"};
-            coordinateReaders.push_back(owner.open(finished(std::move(source))));
-        }
-        if (surface.tifxyzMask) {
-            Source source;
-            source.id = surface.id + "/geometry-mask";
-            source.storage.location = trimmed(root) + "/mask.tif";
-            source.storage.format = "tiff";
-            source.role = "label";
-            source.axes = std::vector<std::string>{"y", "x"};
-            try {
-                mask = owner.open(finished(std::move(source)));
-            } catch (const zarr::NotFound&) {
-            }
-        }
+        shape = tifxyz->shape();
+        // Full-resolution pixels sit at stored cells scale * pixel, exactly as tifxyz::fullRaster places them.
+        Affine from;
+        from(0, 0) = scale[1];
+        from(1, 1) = scale[0];
+        fromUv = VolumeTransform{from, {}};
+        toUv = VolumeTransform{from.inverse(), {}};
     } else {
         if (!grid) bad("coordinate grid requires explicit pixel_to_uv");
         Source source;
@@ -192,31 +162,22 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
         source.storage = surface.geometry;
         source.role = "scalar";
         source.axes = surface.axes;
-        coordinateReaders.push_back(owner.open(finished(std::move(source))));
-    }
-    const auto yxOf = [](SourceReader& r) -> Pair {
-        const auto& axes = r.axes();
-        const auto& sizes = r.shape();
-        Pair out{};
+        coordinates = owner.open(finished(std::move(source)));
+        const auto& axes = coordinates->axes();
+        const auto& sizes = coordinates->shape();
+        if (coordinates->spatialAxes() != std::vector<std::string>{"y", "x"}) bad("surface coordinates require YX grids");
         for (std::size_t i = 0; i < axes.size(); ++i) {
-            if (axes[i] == "y") out[0] = sizes[i];
-            if (axes[i] == "x") out[1] = sizes[i];
+            if (axes[i] == "y") shape[0] = sizes[i];
+            if (axes[i] == "x") shape[1] = sizes[i];
         }
-        return out;
-    };
-    auto& first = *coordinateReaders.front();
-    shape = yxOf(first);
-    for (auto& r : coordinateReaders)
-        if (r->spatialAxes() != std::vector<std::string>{"y", "x"} || yxOf(*r) != shape) bad("surface coordinates require matching YX grids");
-    if (coordinateReaders.size() == 1) {
-        const auto& axes = first.axes();
         const auto at = std::find(axes.begin(), axes.end(), "c");
-        if (at == axes.end() || first.shape()[std::size_t(at - axes.begin())] != 3) bad("coordinate grid must contain three components");
+        if (at == axes.end() || sizes[std::size_t(at - axes.begin())] != 3) bad("coordinate grid must contain three components");
+        toUv = pixelAffine(*grid);
+        fromUv = VolumeTransform{toUv.forward.inverse(), {}};
     }
-    if (mask && (mask->shape() != std::vector<std::int64_t>{shape[0], shape[1]})) bad("tifxyz mask shape does not match coordinate grid");
-    toUv = pixelAffine(*grid);
-    fromUv = VolumeTransform{toUv.forward.inverse(), {}};
-    orientation = (*grid)[0][0] * (*grid)[1][1] - (*grid)[0][1] * (*grid)[1][0] > 0 ? 1 : -1;
+    // A mirrored UV grid turns the patch normals around.
+    const auto& m = toUv.forward;
+    flipNormals = m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0) < 0;
     explicitMask = auxiliary(surface.mask);
     normals = auxiliary(surface.normals);
     if (normals) {
@@ -248,46 +209,26 @@ std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair
     auto out = std::make_shared<GeometryTile>();
     out->rows = size[0];
     out->cols = size[1];
-    out->xyz.resize(cells * 3);
-    // Channels of each component, in XYZ order.
-    const std::vector<std::int64_t> startList{start[0], start[1]}, sizeList{size[0], size[1]};
-    std::vector<int> order{0, 1, 2};
-    std::vector<Block> arrays;
-    for (auto& reader : coordinateReaders) {
-        arrays.push_back(owner.canonical(reader->read(startList, sizeList), reader->axes()));
-        owner.geometryReadBytes += arrays.back().nbytes;
-    }
-    if (coordinateReaders.size() == 1) {
+    if (tifxyz) {
+        auto stored = tifxyz->window({start[0], start[1], size[0], size[1]});
+        owner.geometryReadBytes += stored.storedBytes;
+        out->xyz = std::move(stored.xyz);
+        out->valid = std::move(stored.valid);
+    } else {
+        // Channels in XYZ order; a vertex with a non-finite coordinate is invalid.
+        const auto block = convertBlock(owner.canonical(coordinates->read({start[0], start[1]}, {size[0], size[1]}), coordinates->axes()), "<f4");
+        owner.geometryReadBytes += block.nbytes;
+        const auto* values = reinterpret_cast<const float*>(block.data.get());
         const std::string letters = "xyz";
-        for (int i = 0; i < 3; ++i)
-            order[std::size_t(i)] = int(std::find(surface.componentOrder->begin(), surface.componentOrder->end(), std::string(1, letters[std::size_t(i)])) - surface.componentOrder->begin());
-    }
-    const auto load = [&](const Block& block, std::size_t index) {
-        ElementType type;
-        type.kind = block.dtype[1];
-        type.itemsize = block.itemsize();
-        return type.kind == 'f' && type.itemsize == 4 ? *reinterpret_cast<const float*>(block.data.get() + index * 4) : float(type.load(block.data.get() + index * type.itemsize));
-    };
-    for (int component = 0; component < 3; ++component) {
-        const Block& block = arrays[coordinateReaders.size() == 1 ? 0 : std::size_t(component)];
-        const std::size_t channel = coordinateReaders.size() == 1 ? std::size_t(order[std::size_t(component)]) : 0;
-        for (std::size_t i = 0; i < cells; ++i) out->xyz[i * 3 + std::size_t(component)] = load(block, channel * cells + i);
-    }
-    out->valid.assign(cells, 1);
-    const bool tifxyz = surface.geometry.format == "tifxyz";
-    for (std::size_t i = 0; i < cells; ++i) {
-        for (int a = 0; a < 3; ++a) {
-            const float v = out->xyz[i * 3 + std::size_t(a)];
-            if (!std::isfinite(v) || (tifxyz && !(v >= 0))) out->valid[i] = 0;
+        out->xyz.resize(cells * 3);
+        for (std::size_t component = 0; component < 3; ++component) {
+            const auto channel = std::size_t(std::find(surface.componentOrder->begin(), surface.componentOrder->end(), std::string(1, letters[component])) - surface.componentOrder->begin());
+            for (std::size_t i = 0; i < cells; ++i) out->xyz[i * 3 + component] = values[channel * cells + i];
         }
-    }
-    if (mask) {
-        const auto values = mask->read(startList, sizeList);
-        const auto item = values.itemsize();
-        for (std::size_t i = 0; i < cells; ++i) {
-            const auto* p = values.data.get() + i * item;
-            if (std::all_of(p, p + item, [](std::uint8_t b) { return b == 0; })) out->valid[i] = 0;
-        }
+        out->valid.assign(cells, 1);
+        for (std::size_t i = 0; i < cells; ++i)
+            for (int a = 0; a < 3; ++a)
+                if (!std::isfinite(out->xyz[i * 3 + std::size_t(a)])) out->valid[i] = 0;
     }
     if (explicitMask || normals) {
         std::vector<float> coords(cells * 3, 0.f);
@@ -401,13 +342,12 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
         throw DecodeBudgetError("derived output shape (" + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2]) + ") requires approximately " +
                                 std::to_string(estimate) + " bytes; increase surface_output_bytes or use iter_project_surface");
 }
-// A UV patch as a raster over the stored grid, with the vertex window it reads. Vertices
-// missing are NaN. None when the patch misses the grid. A grid position's patch is the cell
-// at its floor, so the window holds every cell the patch can reach.
+// A UV patch as a raster over the stored grid, with the vertex window it reads. None when
+// the patch misses the grid. A grid position's patch is the cell at its floor, so the window
+// holds every cell the patch can reach.
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
-    std::vector<float> xyz;
-    double x0, y0, sx, sy, kx, ky;
+    grid::Raster raster;
 };
 std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
 {
@@ -428,30 +368,22 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
     Patch patch;
     patch.tile = geom.tile({r0, c0}, {r1 - r0, c1 - c0});
-    patch.xyz = patch.tile->xyz;
-    for (std::size_t i = 0; i < patch.tile->valid.size(); ++i)
-        if (!patch.tile->valid[i])
-            for (int a = 0; a < 3; ++a) patch.xyz[i * 3 + std::size_t(a)] = std::numeric_limits<float>::quiet_NaN();
-    patch.x0 = x0 - double(c0);
-    patch.y0 = y0 - double(r0);
-    patch.sx = sx, patch.sy = sy, patch.kx = kx, patch.ky = ky;
+    patch.raster = grid::Raster{x0 - double(c0), y0 - double(r0), sx, sy, int(size[1]), int(size[0]), kx, ky};
     return patch;
 }
-std::vector<float> layerOffsets(const Geometry& geom, bool explicitNormals, const std::vector<double>& offsets)
-{
-    // A mirrored UV grid flips the patch normals; explicit vertex normals keep their sign.
-    std::vector<float> out;
-    for (const double v : offsets) out.push_back(float(v * (explicitNormals ? 1 : geom.orientation)));
-    return out;
-}
-grid::Surface gridSurface(const Patch& patch, const Vec3& spacing)
+// The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
+std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation)
 {
     grid::SurfaceOptions options;
-    options.spacing = {float(spacing[0]), float(spacing[1]), float(spacing[2])};
-    grid::Vertices vertices{patch.xyz.data(), int(patch.tile->rows), int(patch.tile->cols), std::size_t(patch.tile->cols) * 3, patch.tile->normals.empty() ? nullptr : patch.tile->normals.data()};
-    return grid::Surface(vertices, options);
+    options.interpolation = interpolation;
+    options.flipNormals = geom.flipNormals;
+    if (geom.surface.spacingUm) {
+        const auto& spacing = *geom.surface.spacingUm;
+        options.spacing = {float(spacing[0]), float(spacing[1]), float(spacing[2])};
+    }
+    return std::make_unique<grid::Surface>(grid::Vertices{tile.xyz.data(), int(tile.rows), int(tile.cols), std::size_t(tile.cols) * 3, tile.normals.empty() ? nullptr : tile.normals.data(), tile.valid.data()}, options);
 }
-TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const std::optional<Patch>& patch, const Pair& size, const std::vector<float>& layers, const Affine& toReference, const Vec3& spacing)
+TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const grid::Surface* surface, const grid::Raster& raster, const Pair& size, const std::vector<float>& layers, const Affine& toReference)
 {
     const std::vector<std::string> zyx{"z", "y", "x"};
     Array* array = target.reader->directArray();
@@ -463,29 +395,23 @@ TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const std::opt
     const auto n = std::size_t(size[0] * size[1]);
     std::vector<float> values(layers.size() * n, std::numeric_limits<float>::quiet_NaN());
     std::vector<std::int8_t> level(n, std::int8_t(-2));
-    if (patch) {
+    if (surface) {
         const auto mapping = target.mapping.forward * toReference;
         std::array<double, 12> map{};
         for (int a = 0; a < 3; ++a)
             for (int c = 0; c < 4; ++c) map[std::size_t(a * 4 + c)] = mapping(2 - a, c);
-        ElementType type;
-        type.kind = dtype[1];
-        type.itemsize = itemOf(dtype);
-        type.swap = dtype[0] == '>';
         grid::Request request;
-        request.levels = {grid::levelFromMap(*array, type, map)};
+        request.levels = {grid::levelFromMap(*array, elementOf(dtype), map)};
         request.order = target.order;
         request.offsets = layers;
-        const auto surface = gridSurface(*patch, spacing);
-        const grid::Raster raster{patch->x0, patch->y0, patch->sx, patch->sy, int(size[1]), int(size[0]), patch->kx, patch->ky};
         grid::Result result;
 #ifdef VC_READER_CUDA
         if (s.backend == "cuda") {
             if (!target.cuda) target.cuda = std::make_shared<reader_cuda::Reader>(*array, s.tiles.limit, s.device);
-            result = grid::cuda::sample(surface, raster, request, {static_cast<reader_cuda::Reader*>(target.cuda.get())});
+            result = grid::cuda::sample(*surface, raster, request, {static_cast<reader_cuda::Reader*>(target.cuda.get())});
         } else
 #endif
-            result = grid::sample(surface, raster, request);
+            result = grid::sample(*surface, raster, request);
         std::copy(result.values.begin(), result.values.end(), values.begin());
         std::copy(result.level.begin(), result.level.end(), level.begin());
     }
@@ -509,7 +435,7 @@ TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const std::opt
 }
 } // namespace
 
-SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsetsUm)
+SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsetsUm, grid::Interpolation interpolation)
 {
     auto& s = *impl_;
     std::lock_guard lock(s.mutex);
@@ -531,10 +457,12 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
     const auto patch = patchOf(*geom, start, size);
-    const auto layers = layerOffsets(*geom, patch && !patch->tile->normals.empty(), offsetsUm);
+    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
+    const grid::Raster raster = patch ? patch->raster : grid::Raster{};
+    const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
     for (auto& [name, target] : s.targets) {
-        auto out = renderVolume(s, target, patch, size, layers, toReference, *surface.spacingUm);
-        for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, patch, size, layers, toReference, *surface.spacingUm).data);
+        auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
+        for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
         result.targets.emplace_back(name, std::move(out));
     }
     // Surface-registered targets are read at the patch's own UV pixels.
@@ -617,43 +545,26 @@ struct SurfaceIndex {
         for (const auto& child : children) child->query(lower, upper, expansion, f);
     }
 };
-struct Triangles {
-    std::vector<float> data;  // N x 3 x 5: XYZ, then UV
+// The surface points of one leaf of the grid: positions in reference array coordinates
+// relative to `base`, per point the move per micrometre along the unit normal, the UV
+// relative to the selecting patch's origin, and an id ordering the points by grid position.
+struct Samples {
+    std::vector<float> xyz, step;  // n x 3
+    std::vector<float> uv;         // n x 2
     std::vector<std::int64_t> ids;
-    std::optional<Bounds> bounds;
+    std::optional<Bounds> bounds;  // of the points, absolute
     Triple base{};
+    [[nodiscard]] std::size_t count() const { return ids.size(); }
+    [[nodiscard]] std::size_t bytes() const { return (xyz.size() + step.size() + uv.size()) * 4 + ids.size() * 8 + 128; }
 };
-// One vertex: position and label-pixel attributes.
-using Vertex = std::array<float, 5>;
-// Clips XYZ and pixel attributes together to a convex label-pixel rectangle.
-std::vector<std::array<Vertex, 3>> clipped(const std::array<Vertex, 3>& triangle, const std::array<float, 2>& lower, const std::array<float, 2>& upper)
+// Points per grid cell along one direction whose spacing in reference voxels is `extent`: a
+// power of two, at most kSubdivisions, that puts them half a voxel apart or closer.
+constexpr int kSubdivisions = 64;
+int subdivisions(double extent)
 {
-    std::vector<Vertex> polygon(triangle.begin(), triangle.end());
-    for (int axis : {3, 4}) {
-        for (const auto& [limit, sign] : {std::pair{lower[std::size_t(axis - 3)], 1.f}, std::pair{upper[std::size_t(axis - 3)], -1.f}}) {
-            if (polygon.empty()) return {};
-            std::vector<Vertex> result;
-            Vertex previous = polygon.back();
-            float distance = (previous[std::size_t(axis)] - limit) * sign;
-            for (const auto& point : polygon) {
-                const float d = (point[std::size_t(axis)] - limit) * sign;
-                if ((d >= 0) != (distance >= 0)) {
-                    const float t = distance / (distance - d);
-                    Vertex crossing;
-                    for (std::size_t k = 0; k < 5; ++k) crossing[k] = previous[k] + (point[k] - previous[k]) * t;
-                    crossing[std::size_t(axis)] = limit;
-                    result.push_back(crossing);
-                }
-                if (d >= 0) result.push_back(point);
-                previous = point;
-                distance = d;
-            }
-            polygon = std::move(result);
-        }
-    }
-    std::vector<std::array<Vertex, 3>> out;
-    for (std::size_t i = 1; i + 1 < polygon.size(); ++i) out.push_back({polygon[0], polygon[i], polygon[i + 1]});
-    return out;
+    int n = 1;
+    while (n < kSubdivisions && double(n) * .5 < extent) n *= 2;
+    return n;
 }
 std::vector<std::pair<Triple, Triple>> tileRegions(const Triple& origin, const Triple& shape, const Triple& tile)
 {
@@ -664,6 +575,20 @@ std::vector<std::pair<Triple, Triple>> tileRegions(const Triple& origin, const T
                 out.push_back({Triple{origin[0] + z, origin[1] + y, origin[2] + x},
                                Triple{std::min(tile[0], shape[0] - z), std::min(tile[1], shape[1] - y), std::min(tile[2], shape[2] - x)}});
     return out;
+}
+// The vertices of a geometry tile in reference array coordinates about `anchor` (floor of
+// the first valid vertex); none when no vertex is valid.
+std::optional<std::pair<Local, std::array<double, 3>>> movedVertices(const GeometryTile& tile, const Affine& destination)
+{
+    const auto firstValid = std::find(tile.valid.begin(), tile.valid.end(), std::uint8_t(1));
+    if (firstValid == tile.valid.end()) return std::nullopt;
+    const auto first = std::size_t(firstValid - tile.valid.begin());
+    const std::array<double, 3> anchor{std::floor(double(tile.xyz[first * 3])), std::floor(double(tile.xyz[first * 3 + 1])), std::floor(double(tile.xyz[first * 3 + 2]))};
+    std::vector<float> shifted(tile.xyz.size(), 0.f);
+    for (std::size_t i = 0; i < tile.valid.size(); ++i)
+        if (tile.valid[i])
+            for (std::size_t a = 0; a < 3; ++a) shifted[i * 3 + a] = tile.xyz[i * 3 + a] - float(anchor[a]);
+    return std::pair{transformPoints(shifted.data(), tile.valid.size(), destination, anchor), anchor};
 }
 } // namespace
 
@@ -676,10 +601,11 @@ struct SurfaceProjection::Impl {
     const Target* selecting = nullptr;
     Pair start{}, size{};
     double thickness = 0, padding = 0, radius = 0;
-    Affine metric, destination, labelToUv, gridToLabel;
+    Affine metric, destination, labelToUv;
     std::array<double, 3> uvOrigin{}, expansion{};
     std::array<std::int64_t, 3> margin{};
     Pair gridStart{}, gridEnd{};
+    std::vector<float> offsets;  // the band's layers, micrometres along the normal
     std::string key;
     Triple origin{}, shape{};
     double preparationSeconds = 0;
@@ -688,12 +614,13 @@ struct SurfaceProjection::Impl {
     Impl(AlignedEngine::Impl& r, const Surface& s, const Pair& patchStart, const Pair& patchSize, const std::string& label, double thicknessUm, double paddingUm);
     std::vector<std::pair<Pair, Pair>> tiles() const;
     std::shared_ptr<SurfaceIndex> spatialIndex();
-    std::shared_ptr<const Triangles> triangles(const TileRef& tile, bool clip);
+    std::optional<Bounds> footprintBounds(const TileRef& tile);
+    std::shared_ptr<const Samples> samples(const TileRef& tile);
     json metadataFor(const Triple& at, const Triple& extent) const;
     using State = std::array<SampledArray, 7>;
     State newState(const Target& target, const Triple& extent);
-    void rasterize(const std::vector<float>& triangleData, const std::vector<std::int64_t>& ids, const std::array<float, 3>& rasterOrigin, const Triple& extent,
-                   std::vector<std::pair<std::string, State>>& states, const std::vector<const std::pair<std::string, Target>*>& active);
+    void rasterize(const std::vector<projection::Sample>& batch, const Triple& extent, std::vector<std::pair<std::string, State>>& states,
+                   const std::vector<const std::pair<std::string, Target>*>& active);
     SampleResult read(const Triple& at, const Triple& extent);
     SampleResult readCrop(const Triple& at, const Triple& extent);
 };
@@ -714,21 +641,26 @@ SurfaceProjection::Impl::Impl(AlignedEngine::Impl& r, const Surface& s, const Pa
         if (start[std::size_t(a)] < 0 || start[std::size_t(a)] + size[std::size_t(a)] > selecting->shape[std::size_t(a + 1)]) bad("selected label patch must lie inside its opened pixel grid");
     thickness = checkDistance(thicknessUm, "thickness_um");
     padding = checkDistance(paddingUm, "padding_um");
+    if (!surface.spacingUm) bad("surface physical spacing is unknown");
     const auto* registration = std::get_if<VolumeRegistration>(&*r.referenceReader->registration());
     if (!registration || !registration->volumeSpacingUm) bad("projection requires known reference volume physical spacing");
     metric = scaled(*registration->volumeSpacingUm) * r.referenceMap.forward;
     const auto inverse = metric.inverse();
     radius = thickness / 2;
+    double voxelUm = INFINITY;
     for (int i = 0; i < 3; ++i) {
         const double norm = std::sqrt(inverse(i, 0) * inverse(i, 0) + inverse(i, 1) * inverse(i, 1) + inverse(i, 2) * inverse(i, 2));
         expansion[std::size_t(i)] = radius * norm;
         margin[std::size_t(i)] = std::int64_t(std::ceil(padding * norm));
+        voxelUm = std::min(voxelUm, std::sqrt(metric(0, i) * metric(0, i) + metric(1, i) * metric(1, i) + metric(2, i) * metric(2, i)));
     }
+    // The band's layers: at most half the smallest reference voxel apart, its two faces included.
+    const auto half = radius > 0 ? std::max<std::int64_t>(1, std::int64_t(std::ceil(radius / (.5 * voxelUm) - 1e-9))) : 0;
+    for (std::int64_t k = -half; k <= half; ++k) offsets.push_back(half ? float(radius * double(k) / double(half)) : 0.f);
     const auto between = r.between(selecting->source, surfaceFrame(surface));
     destination = r.referenceMap.forward.inverse() * between.forward * surface.xyzToVolume->forward;
     labelToUv = pixelAffine(*surfaceOf(selecting->reader->registration())->pixelToUv).forward;
     uvOrigin = labelToUv.apply({double(start[1]), double(start[0]), 0});
-    gridToLabel = labelToUv.inverse() * geom->toUv.forward;
     const double x0 = double(start[1]) - .5, y0 = double(start[0]) - .5, x1 = double(start[1] + size[1]) - .5, y1 = double(start[0] + size[0]) - .5;
     const auto toGrid = geom->fromUv.forward * labelToUv;
     std::array<std::array<double, 3>, 4> corners{toGrid.apply({x0, y0, 0}), toGrid.apply({x1, y0, 0}), toGrid.apply({x1, y1, 0}), toGrid.apply({x0, y1, 0})};
@@ -740,13 +672,11 @@ SurfaceProjection::Impl::Impl(AlignedEngine::Impl& r, const Surface& s, const Pa
     gridStart = {std::max<std::int64_t>(0, std::int64_t(std::floor(extreme(1, false)))), std::max<std::int64_t>(0, std::int64_t(std::floor(extreme(0, false))))};
     gridEnd = {std::min<std::int64_t>(geom->shape[0] - 1, std::int64_t(std::ceil(extreme(1, true)))), std::min<std::int64_t>(geom->shape[1] - 1, std::int64_t(std::ceil(extreme(0, true))))};
     key = "projection|" + geom->key + "|" + std::to_string(start[0]) + "," + std::to_string(start[1]) + "," + std::to_string(size[0]) + "," + std::to_string(size[1]) + "|" + matrixKey(labelToUv) + "|" + matrixKey(destination);
+    // The crop: the sheet under the selecting patch, the band and the padding around it.
     const auto before = Clock::now();
     std::array<std::optional<double>, 3> low, high;
     for (const auto& [tileStart, tileSize] : tiles()) {
-        const auto boundsKey = "surface-bounds|" + key + "|" + std::to_string(tileStart[0]) + "," + std::to_string(tileStart[1]) + "|1";
-        std::optional<Bounds> bounds;
-        if (const auto* cached = r.plans.get(boundsKey)) bounds = *std::static_pointer_cast<const Bounds>(*cached);
-        else bounds = triangles({tileStart, tileSize}, true)->bounds;
+        const auto bounds = footprintBounds({tileStart, tileSize});
         if (!bounds) continue;
         for (std::size_t a = 0; a < 3; ++a) {
             low[a] = low[a] ? std::min(*low[a], (*bounds)[0][a]) : (*bounds)[0][a];
@@ -776,11 +706,61 @@ std::vector<std::pair<Pair, Pair>> SurfaceProjection::Impl::tiles() const
     return out;
 }
 
+// The extent in reference array coordinates of the surface under the selecting patch, on
+// one tile: the patch's pixel corners and edges (every half pixel) through the patches.
+std::optional<Bounds> SurfaceProjection::Impl::footprintBounds(const TileRef& tile)
+{
+    const auto boundsKey = "surface-bounds|" + key + "|" + std::to_string(tile.start[0]) + "," + std::to_string(tile.start[1]);
+    if (const auto* cached = reader.plans.get(boundsKey)) return *std::static_pointer_cast<const std::optional<Bounds>>(*cached);
+    std::optional<Bounds> out;
+    const auto toGrid = geom->fromUv.forward * labelToUv;  // label pixel to grid position
+    const auto toPixel = toGrid.inverse();
+    // Footprint pixel (i, j) is label pixel (start - .5) + (i, j) / 2; those over this tile.
+    double lo[2]{INFINITY, INFINITY}, hi[2]{-INFINITY, -INFINITY};
+    for (const double c : {double(tile.start[1]), double(tile.start[1] + tile.size[1] - 1)})
+        for (const double r : {double(tile.start[0]), double(tile.start[0] + tile.size[0] - 1)}) {
+            const auto p = toPixel.apply({c, r, 0});
+            const double i = (p[0] - (double(start[1]) - .5)) * 2, j = (p[1] - (double(start[0]) - .5)) * 2;
+            lo[0] = std::min(lo[0], i), hi[0] = std::max(hi[0], i);
+            lo[1] = std::min(lo[1], j), hi[1] = std::max(hi[1], j);
+        }
+    const auto i0 = std::max<std::int64_t>(0, std::int64_t(std::floor(lo[0]))), i1 = std::min<std::int64_t>(2 * size[1], std::int64_t(std::ceil(hi[0])));
+    const auto j0 = std::max<std::int64_t>(0, std::int64_t(std::floor(lo[1]))), j1 = std::min<std::int64_t>(2 * size[0], std::int64_t(std::ceil(hi[1])));
+    if (i1 >= i0 && j1 >= j0 && std::isfinite(lo[0]) && std::isfinite(lo[1])) {
+        const auto grid = geom->tile(tile.start, tile.size);
+        const auto g0 = toGrid.apply({double(start[1]) - .5 + double(i0) * .5, double(start[0]) - .5 + double(j0) * .5, 0});
+        const grid::Raster raster{g0[0] - double(tile.start[1]), g0[1] - double(tile.start[0]), .5 * toGrid(0, 0), .5 * toGrid(1, 1), int(i1 - i0 + 1), int(j1 - j0 + 1), .5 * toGrid(0, 1), .5 * toGrid(1, 0)};
+        const auto n = std::size_t(raster.width) * std::size_t(raster.height);
+        std::vector<float> points(n * 3);
+        gridSurface(*geom, *grid, grid::Interpolation::Linear)->resample(raster, points.data(), nullptr);
+        std::vector<float> kept;
+        std::optional<std::array<double, 3>> anchor;
+        for (std::size_t i = 0; i < n; ++i) {
+            const float* p = &points[i * 3];
+            if (!std::isfinite(p[0])) continue;
+            if (!anchor) anchor = {std::floor(double(p[0])), std::floor(double(p[1])), std::floor(double(p[2]))};
+            for (std::size_t a = 0; a < 3; ++a) kept.push_back(p[a] - float((*anchor)[a]));
+        }
+        if (anchor) {
+            const auto moved = transformPoints(kept.data(), kept.size() / 3, destination, *anchor);
+            Bounds bounds{{{INFINITY, INFINITY, INFINITY}, {-INFINITY, -INFINITY, -INFINITY}}};
+            for (std::size_t i = 0; i < moved.points.size(); i += 3)
+                for (std::size_t a = 0; a < 3; ++a) {
+                    bounds[0][a] = std::min(bounds[0][a], double(moved.points[i + a]) + double(moved.base[a]));
+                    bounds[1][a] = std::max(bounds[1][a], double(moved.points[i + a]) + double(moved.base[a]));
+                }
+            out = bounds;
+        }
+    }
+    reader.plans.put(boundsKey, std::make_shared<std::optional<Bounds>>(out), 512);
+    return out;
+}
+
 std::shared_ptr<SurfaceIndex> SurfaceProjection::Impl::spatialIndex()
 {
     // Index the whole registered sheet once, including folds returning to a crop. Bulk
     // coordinate reads are large; index leaves are smaller, and only intersecting leaves
-    // are triangulated and read as labels.
+    // are sampled and read as labels.
     std::int64_t block = 256;
     while (std::size_t((block + 1) * (block + 1)) * 80 > reader.workBytes / 2 && block > 1) block /= 2;
     std::int64_t step = std::min<std::int64_t>(64, block);
@@ -795,14 +775,8 @@ std::shared_ptr<SurfaceIndex> SurfaceProjection::Impl::spatialIndex()
         for (std::int64_t x = 0; x < geom->shape[1] - 1; x += block) {
             const Pair tileSize{std::min(block, geom->shape[0] - 1 - y) + 1, std::min(block, geom->shape[1] - 1 - x) + 1};
             const auto tile = geom->tile({y, x}, tileSize);
-            const auto firstValid = std::find(tile->valid.begin(), tile->valid.end(), std::uint8_t(1));
-            if (firstValid == tile->valid.end()) continue;
-            const auto first = std::size_t(firstValid - tile->valid.begin());
-            const std::array<double, 3> anchor{std::floor(double(tile->xyz[first * 3])), std::floor(double(tile->xyz[first * 3 + 1])), std::floor(double(tile->xyz[first * 3 + 2]))};
-            std::vector<float> shifted(tile->xyz.size());
-            for (std::size_t i = 0; i < tile->valid.size(); ++i)
-                for (std::size_t a = 0; a < 3; ++a) shifted[i * 3 + a] = tile->xyz[i * 3 + a] - float(anchor[a]);
-            const auto moved = transformPoints(shifted.data(), tile->valid.size(), destination, anchor);
+            const auto moved = movedVertices(*tile, destination);
+            if (!moved) continue;
             for (std::int64_t iy = 0; iy < tileSize[0] - 1; iy += step)
                 for (std::int64_t ix = 0; ix < tileSize[1] - 1; ix += step) {
                     const Pair leaf{std::min(step, tileSize[0] - 1 - iy) + 1, std::min(step, tileSize[1] - 1 - ix) + 1};
@@ -814,15 +788,15 @@ std::shared_ptr<SurfaceIndex> SurfaceProjection::Impl::spatialIndex()
                             if (!tile->valid[at]) continue;
                             any = true;
                             for (std::size_t a = 0; a < 3; ++a) {
-                                lo[a] = std::min(lo[a], moved.points[at * 3 + a]);
-                                hi[a] = std::max(hi[a], moved.points[at * 3 + a]);
+                                lo[a] = std::min(lo[a], moved->first.points[at * 3 + a]);
+                                hi[a] = std::max(hi[a], moved->first.points[at * 3 + a]);
                             }
                         }
                     if (!any) continue;
                     Bounds bounds;
                     for (std::size_t a = 0; a < 3; ++a) {
-                        bounds[0][a] = double(lo[a]) + double(moved.base[a]);
-                        bounds[1][a] = double(hi[a]) + double(moved.base[a]);
+                        bounds[0][a] = double(lo[a]) + double(moved->first.base[a]);
+                        bounds[1][a] = double(hi[a]) + double(moved->first.base[a]);
                     }
                     entries.push_back({TileRef{Pair{y + iy, x + ix}, leaf}, bounds});
                 }
@@ -833,125 +807,72 @@ std::shared_ptr<SurfaceIndex> SurfaceProjection::Impl::spatialIndex()
     return built;
 }
 
-std::shared_ptr<const Triangles> SurfaceProjection::Impl::triangles(const TileRef& tile, bool clip)
+std::shared_ptr<const Samples> SurfaceProjection::Impl::samples(const TileRef& tile)
 {
-    const auto tileKey = key + "|" + std::to_string(tile.start[0]) + "," + std::to_string(tile.start[1]) + "," + std::to_string(tile.size[0]) + "," + std::to_string(tile.size[1]) + "|" + (clip ? "1" : "0");
-    if (const auto* cached = reader.tiles.get(tileKey)) return std::static_pointer_cast<const Triangles>(*cached);
+    const auto tileKey = key + "|samples|" + std::to_string(tile.start[0]) + "," + std::to_string(tile.start[1]) + "," + std::to_string(tile.size[0]) + "," + std::to_string(tile.size[1]);
+    if (const auto* cached = reader.tiles.get(tileKey)) return std::static_pointer_cast<const Samples>(*cached);
+    auto out = std::make_shared<Samples>();
     const auto grid = geom->tile(tile.start, tile.size);
     const auto rows = grid->rows, cols = grid->cols;
+    const auto moved = movedVertices(*grid, destination);
+    if (!moved) return out;
+    // Points per cell: the longest step between neighbouring valid vertices, in reference
+    // voxels, is covered half a voxel at a time.
     const auto validAt = [&](std::int64_t y, std::int64_t x) { return grid->valid[std::size_t(y * cols + x)] != 0; };
-    std::vector<std::pair<std::int64_t, std::int64_t>> cells;
-    for (std::int64_t y = 0; y + 1 < rows; ++y)
-        for (std::int64_t x = 0; x + 1 < cols; ++x)
-            if (validAt(y, x) && validAt(y + 1, x) && validAt(y, x + 1) && validAt(y + 1, x + 1)) cells.emplace_back(y, x);
-    auto out = std::make_shared<Triangles>();
-    if (cells.empty()) return out;
-    const auto xyzAt = [&](std::int64_t y, std::int64_t x) { return &grid->xyz[std::size_t(y * cols + x) * 3]; };
-    const float* firstPoint = xyzAt(cells[0].first, cells[0].second);
-    const std::array<double, 3> anchor{std::floor(double(firstPoint[0])), std::floor(double(firstPoint[1])), std::floor(double(firstPoint[2]))};
-    const auto triangleCount = cells.size() * 2;
-    std::vector<float> points(triangleCount * 9), gridPixels(triangleCount * 9, 0.f);
-    std::vector<std::int64_t> ids(triangleCount);
-    for (std::size_t c = 0; c < cells.size(); ++c) {
-        const auto [y, x] = cells[c];
-        const std::array<std::array<std::int64_t, 2>, 4> corners{{{y, x}, {y, x + 1}, {y + 1, x + 1}, {y + 1, x}}};
-        const std::array<std::array<int, 3>, 2> order{{{0, 1, 2}, {0, 2, 3}}};
-        for (std::size_t t = 0; t < 2; ++t) {
-            for (std::size_t v = 0; v < 3; ++v) {
-                const auto& corner = corners[std::size_t(order[t][v])];
-                const float* p = xyzAt(corner[0], corner[1]);
-                for (std::size_t a = 0; a < 3; ++a) points[(c * 2 + t) * 9 + v * 3 + a] = p[a] - float(anchor[a]);
-                gridPixels[(c * 2 + t) * 9 + v * 3] = float(corner[1]);
-                gridPixels[(c * 2 + t) * 9 + v * 3 + 1] = float(corner[0]);
-            }
+    const auto distance = [&](std::int64_t a, std::int64_t b) {
+        const float* p = &moved->first.points[std::size_t(a) * 3];
+        const float* q = &moved->first.points[std::size_t(b) * 3];
+        return std::sqrt(double(p[0] - q[0]) * (p[0] - q[0]) + double(p[1] - q[1]) * (p[1] - q[1]) + double(p[2] - q[2]) * (p[2] - q[2]));
+    };
+    double stepU = 0, stepV = 0;
+    for (std::int64_t y = 0; y < rows; ++y)
+        for (std::int64_t x = 0; x < cols; ++x) {
+            if (!validAt(y, x)) continue;
+            if (x + 1 < cols && validAt(y, x + 1)) stepU = std::max(stepU, distance(y * cols + x, y * cols + x + 1));
+            if (y + 1 < rows && validAt(y + 1, x)) stepV = std::max(stepV, distance(y * cols + x, (y + 1) * cols + x));
         }
-        const auto id = ((y + tile.start[0]) * (geom->shape[1] - 1) + x + tile.start[1]) * 2;
-        ids[c * 2] = id;
-        ids[c * 2 + 1] = id + 1;
-    }
-    const auto local = transformPoints(points.data(), triangleCount * 3, destination, anchor);
-    const auto pixels = transformPoints(gridPixels.data(), triangleCount * 3, gridToLabel, {double(tile.start[1]), double(tile.start[0]), 0});
-    // Clip in patch-local label pixels to preserve boundary ties at large origins.
-    const float pixelShiftX = float(pixels.base[0] - start[1]), pixelShiftY = float(pixels.base[1] - start[0]);
-    std::vector<std::array<Vertex, 3>> all(triangleCount);
-    for (std::size_t t = 0; t < triangleCount; ++t)
-        for (std::size_t v = 0; v < 3; ++v) {
-            const auto at = (t * 3 + v) * 3;
-            all[t][v] = {local.points[at], local.points[at + 1], local.points[at + 2], pixels.points[at] + pixelShiftX, pixels.points[at + 1] + pixelShiftY};
+    const int nu = subdivisions(stepU), nv = subdivisions(stepV);
+    // The last row and column of cells belong to the next leaf, except at the grid's end.
+    const bool lastCol = tile.start[1] + tile.size[1] == geom->shape[1], lastRow = tile.start[0] + tile.size[0] == geom->shape[0];
+    const std::int64_t width = (cols - 1) * nu + (lastCol ? 1 : 0), height = (rows - 1) * nv + (lastRow ? 1 : 0);
+    if (width <= 0 || height <= 0) return out;
+    const auto n = std::size_t(width) * std::size_t(height);
+    std::vector<float> points(n * 3), steps(n * 3);
+    gridSurface(*geom, *grid, grid::Interpolation::Linear)->resample(grid::Raster{0, 0, 1.0 / nu, 1.0 / nv, int(width), int(height)}, points.data(), steps.data());
+    // The points that exist: about the vertices' anchor, then into reference coordinates.
+    const auto& anchor = moved->second;
+    float linear[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) linear[r * 3 + c] = float(destination(r, c));
+    std::vector<float> kept;
+    const std::int64_t layers = std::int64_t(offsets.size()), ids = geom->shape[1] * kSubdivisions;
+    for (std::int64_t j = 0; j < height; ++j)
+        for (std::int64_t i = 0; i < width; ++i) {
+            const auto at = std::size_t(j * width + i);
+            const float* p = &points[at * 3];
+            if (!std::isfinite(p[0])) continue;
+            for (std::size_t a = 0; a < 3; ++a) kept.push_back(p[a] - float(anchor[a]));
+            const float* s = &steps[at * 3];
+            for (int r = 0; r < 3; ++r) out->step.push_back(linear[r * 3] * s[0] + linear[r * 3 + 1] * s[1] + linear[r * 3 + 2] * s[2]);
+            const auto uv = geom->toUv.forward.apply({double(tile.start[1]) + double(i) / nu, double(tile.start[0]) + double(j) / nv, 0});
+            out->uv.push_back(float(uv[0] - uvOrigin[0]));
+            out->uv.push_back(float(uv[1] - uvOrigin[1]));
+            const std::int64_t row = tile.start[0] * kSubdivisions + j * (kSubdivisions / nv), col = tile.start[1] * kSubdivisions + i * (kSubdivisions / nu);
+            out->ids.push_back((row * ids + col) * layers);
         }
-    std::vector<std::array<Vertex, 3>> kept;
-    std::vector<std::int64_t> keptIds;
-    if (clip) {
-        const std::array<float, 2> lower{-.5f, -.5f}, upper{float(size[1]) - .5f, float(size[0]) - .5f};
-        for (std::size_t t = 0; t < all.size(); ++t) {
-            bool inside = true;
-            for (const auto& v : all[t]) inside = inside && v[3] >= lower[0] && v[4] >= lower[1] && v[3] <= upper[0] && v[4] <= upper[1];
-            if (inside) {
-                kept.push_back(all[t]);
-                keptIds.push_back(ids[t]);
-            }
-        }
-        for (std::size_t t = 0; t < all.size(); ++t) {
-            bool inside = true;
-            for (const auto& v : all[t]) inside = inside && v[3] >= lower[0] && v[4] >= lower[1] && v[3] <= upper[0] && v[4] <= upper[1];
-            if (inside) continue;
-            for (const auto& piece : clipped(all[t], lower, upper)) {
-                kept.push_back(piece);
-                keptIds.push_back(ids[t]);
-            }
-        }
-    } else {
-        kept = std::move(all);
-        keptIds = std::move(ids);
-    }
-    // Drop degenerate triangles.
-    std::vector<std::array<Vertex, 3>> good;
-    std::vector<std::int64_t> goodIds;
-    for (std::size_t t = 0; t < kept.size(); ++t) {
-        const auto& p = kept[t];
-        const float a[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
-        const float b[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
-        const float n[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
-        if ((n[0] != 0 || n[1] != 0 || n[2] != 0) && std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
-            good.push_back(p);
-            goodIds.push_back(keptIds[t]);
-        }
-    }
-    if (good.empty()) return out;
-    // UV values are local to the selecting patch's mapped origin. All target mappings
-    // include this same integer label-pixel origin explicitly.
-    Affine uvLinear = labelToUv;
-    for (int r = 0; r < 3; ++r) uvLinear(r, 3) = 0;
-    std::vector<float> uvIn(good.size() * 9, 0.f);
-    for (std::size_t t = 0; t < good.size(); ++t)
-        for (std::size_t v = 0; v < 3; ++v) {
-            uvIn[(t * 3 + v) * 3] = good[t][v][3];
-            uvIn[(t * 3 + v) * 3 + 1] = good[t][v][4];
-        }
-    const auto uv = transformPoints(uvIn.data(), good.size() * 3, uvLinear);
-    out->data.resize(good.size() * 15);
-    std::array<float, 3> lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
-    for (std::size_t t = 0; t < good.size(); ++t)
-        for (std::size_t v = 0; v < 3; ++v) {
-            auto* slot = &out->data[(t * 3 + v) * 5];
+    if (!kept.empty()) {
+        auto local = transformPoints(kept.data(), kept.size() / 3, destination, anchor);
+        Bounds bounds{{{INFINITY, INFINITY, INFINITY}, {-INFINITY, -INFINITY, -INFINITY}}};
+        for (std::size_t i = 0; i < local.points.size(); i += 3)
             for (std::size_t a = 0; a < 3; ++a) {
-                slot[a] = good[t][v][a];
-                lo[a] = std::min(lo[a], slot[a]);
-                hi[a] = std::max(hi[a], slot[a]);
+                bounds[0][a] = std::min(bounds[0][a], double(local.points[i + a]) + double(local.base[a]));
+                bounds[1][a] = std::max(bounds[1][a], double(local.points[i + a]) + double(local.base[a]));
             }
-            slot[3] = uv.points[(t * 3 + v) * 3] + float(uv.base[0]);
-            slot[4] = uv.points[(t * 3 + v) * 3 + 1] + float(uv.base[1]);
-        }
-    out->ids = std::move(goodIds);
-    Bounds bounds;
-    for (std::size_t a = 0; a < 3; ++a) {
-        bounds[0][a] = double(lo[a]) + double(local.base[a]);
-        bounds[1][a] = double(hi[a]) + double(local.base[a]);
+        out->xyz = std::move(local.points);
+        out->base = local.base;
+        out->bounds = bounds;
     }
-    out->bounds = bounds;
-    out->base = local.base;
-    if (!clip) reader.tiles.put(tileKey, out, out->data.size() * 4 + out->ids.size() * 8 + 128);
-    reader.plans.put("surface-bounds|" + key + "|" + std::to_string(tile.start[0]) + "," + std::to_string(tile.start[1]) + "|" + (clip ? "1" : "0"), std::make_shared<Bounds>(bounds), 512);
+    reader.tiles.put(tileKey, out, out->bytes());
     return out;
 }
 
@@ -989,42 +910,32 @@ SurfaceProjection::Impl::State SurfaceProjection::Impl::newState(const Target& t
     return state;
 }
 
-void SurfaceProjection::Impl::rasterize(const std::vector<float>& data, const std::vector<std::int64_t>& ids, const std::array<float, 3>& rasterOrigin, const Triple& extent,
-                                        std::vector<std::pair<std::string, State>>& states, const std::vector<const std::pair<std::string, Target>*>& active)
+void SurfaceProjection::Impl::rasterize(const std::vector<projection::Sample>& batch, const Triple& extent, std::vector<std::pair<std::string, State>>& states,
+                                        const std::vector<const std::pair<std::string, Target>*>& active)
 {
     auto& r = reader;
     const auto before = Clock::now();
     const auto splitAll = [&](const std::vector<const std::pair<std::string, Target>*>& which) {
-        const auto middle = ids.size() / 2;
-        rasterize(std::vector<float>(data.begin(), data.begin() + std::ptrdiff_t(middle * 15)), std::vector<std::int64_t>(ids.begin(), ids.begin() + std::ptrdiff_t(middle)), rasterOrigin, extent, states, which);
-        rasterize(std::vector<float>(data.begin() + std::ptrdiff_t(middle * 15), data.end()), std::vector<std::int64_t>(ids.begin() + std::ptrdiff_t(middle), ids.end()), rasterOrigin, extent, states, which);
+        const auto middle = batch.size() / 2;
+        rasterize(std::vector(batch.begin(), batch.begin() + std::ptrdiff_t(middle)), extent, states, which);
+        rasterize(std::vector(batch.begin() + std::ptrdiff_t(middle), batch.end()), extent, states, which);
     };
-    std::array<float, 12> metricFloat{};
-    for (std::size_t i = 0; i < 12; ++i) metricFloat[i] = float(metric.values[i]);
-    std::optional<surface::Plan> plan;
+    std::optional<projection::Plan> plan;
     try {
-        plan.emplace(data.data(), ids.data(), ids.size(), extent, metricFloat, float(radius),
-                     std::array<float, 3>{float(expansion[0]), float(expansion[1]), float(expansion[2])}, rasterOrigin, r.workBytes / 3);
+        plan.emplace(batch.data(), batch.size(), extent, r.workBytes / 3);
     } catch (const std::length_error&) {
-        if (ids.size() <= 1) throw DecodeBudgetError("raster candidate batch exceeds sampling_work_bytes");
+        if (batch.size() <= 1) throw DecodeBudgetError("projection sample batch exceeds sampling_work_bytes");
         splitAll(active);
         return;
     }
     r.candidateIndexSeconds += since(before);
-    const auto planBytes = sizeof(*plan) + plan->triangles.size() * 4 + plan->ids.size() * 8 + plan->offsets.size() * 8 + plan->candidates.size() * 4;
-    r.peakWork = std::max(r.peakWork, planBytes * 3);
-    std::vector<float> uv(ids.size() * 6);
-    for (std::size_t t = 0; t < ids.size(); ++t)
-        for (std::size_t v = 0; v < 3; ++v) {
-            uv[(t * 3 + v) * 2] = data[(t * 3 + v) * 5 + 3];
-            uv[(t * 3 + v) * 2 + 1] = data[(t * 3 + v) * 5 + 4];
-        }
-    // Triangles carry UV relative to the selecting label patch origin.
+    r.peakWork = std::max(r.peakWork, plan->bytes() * 3);
+    // Samples carry UV relative to the selecting label patch origin.
     const auto patchShift = shift(uvOrigin[0], uvOrigin[1], uvOrigin[2]);
     for (const auto* item : active) {
         const auto& [name, target] = *item;
         const auto mapping = target.mapping.forward * patchShift;
-        const auto p = pixelPoints(uv.data(), uv.size() / 2, mapping);
+        const auto p = pixelPoints(plan->uv.data(), plan->uv.size() / 2, mapping);
         float minY = INFINITY, maxY = -INFINITY, minX = INFINITY, maxX = -INFINITY;
         for (std::size_t i = 0; i < p.points.size() / 3; ++i) {
             minY = std::min(minY, p.points[i * 3 + 1]), maxY = std::max(maxY, p.points[i * 3 + 1]);
@@ -1038,7 +949,7 @@ void SurfaceProjection::Impl::rasterize(const std::vector<float>& data, const st
             extentYX = {0, 0};
         }
         if (std::size_t(extentYX[0] * extentYX[1] * target.channels) * itemOf(target.dtype) * 3 > r.workBytes) {
-            if (ids.size() <= 1) throw DecodeBudgetError("one triangle label footprint exceeds sampling_work_bytes");
+            if (batch.size() <= 1) throw DecodeBudgetError("one sample's label footprint exceeds sampling_work_bytes");
             // This target only, so that earlier targets are not processed twice.
             splitAll({item});
             continue;
@@ -1078,18 +989,16 @@ void SurfaceProjection::Impl::rasterize(const std::vector<float>& data, const st
         config.label_origin[0] = lo[0];
         config.label_origin[1] = lo[1];
         auto* entry = &std::find_if(states.begin(), states.end(), [&](const auto& s) { return s.first == name; })->second;
-        ElementType type;
-        type.kind = target.nativeDtype[1];
-        type.itemsize = itemOf(target.nativeDtype);
+        const auto type = elementOf(target.nativeDtype);
         if (type.kind == 'f') bad("projection requires categorical integers");
         const auto rasterBefore = Clock::now();
 #ifdef VC_READER_CUDA
         if (r.backend == "cuda") {
             const auto ptr = [](SampledArray& a) { return std::static_pointer_cast<device::Buffer>(a.device)->ptr; };
             device::Guard guard(r.device);
-            surface::launch(*plan, config, label->device->ptr, type, ptr((*entry)[0]), static_cast<bool*>(ptr((*entry)[1])), static_cast<bool*>(ptr((*entry)[2])),
-                            static_cast<float*>(ptr((*entry)[3])), static_cast<std::int64_t*>(ptr((*entry)[4])), static_cast<float*>(ptr((*entry)[5])), static_cast<bool*>(ptr((*entry)[6])), r.device);
-            r.candidateUploadBytes += plan->triangles.size() * 4 + plan->ids.size() * 8 + plan->offsets.size() * 8 + plan->candidates.size() * 4;
+            projection::launch(*plan, config, label->device->ptr, type, ptr((*entry)[0]), static_cast<bool*>(ptr((*entry)[1])), static_cast<bool*>(ptr((*entry)[2])),
+                               static_cast<float*>(ptr((*entry)[3])), static_cast<std::int64_t*>(ptr((*entry)[4])), static_cast<float*>(ptr((*entry)[5])), static_cast<bool*>(ptr((*entry)[6])), r.device);
+            r.candidateUploadBytes += plan->bytes();
         } else
 #endif
         {
@@ -1097,10 +1006,10 @@ void SurfaceProjection::Impl::rasterize(const std::vector<float>& data, const st
             type.visit_load([&](auto load) {
                 using T = decltype(load(static_cast<const std::uint8_t*>(nullptr)));
                 for (std::size_t i = 0; i < config.count; ++i)
-                    surface::raster(config, plan->triangles.data(), plan->ids.data(), plan->offsets.data(), plan->candidates.data(), reinterpret_cast<const T*>(labelData),
-                                    reinterpret_cast<T*>((*entry)[0].host.get()), reinterpret_cast<bool*>((*entry)[1].host.get()), reinterpret_cast<bool*>((*entry)[2].host.get()),
-                                    reinterpret_cast<float*>((*entry)[3].host.get()), reinterpret_cast<std::int64_t*>((*entry)[4].host.get()), reinterpret_cast<float*>((*entry)[5].host.get()),
-                                    reinterpret_cast<bool*>((*entry)[6].host.get()), i);
+                    projection::raster(config, plan->uv.data(), plan->distance.data(), plan->ids.data(), plan->offsets.data(), reinterpret_cast<const T*>(labelData),
+                                       reinterpret_cast<T*>((*entry)[0].host.get()), reinterpret_cast<bool*>((*entry)[1].host.get()), reinterpret_cast<bool*>((*entry)[2].host.get()),
+                                       reinterpret_cast<float*>((*entry)[3].host.get()), reinterpret_cast<std::int64_t*>((*entry)[4].host.get()), reinterpret_cast<float*>((*entry)[5].host.get()),
+                                       reinterpret_cast<bool*>((*entry)[6].host.get()), i);
             });
         }
         r.rasterCallSeconds += since(rasterBefore);
@@ -1139,44 +1048,43 @@ SampleResult SurfaceProjection::Impl::read(const Triple& at, const Triple& exten
             if (b[1][a] + expansion[a] + .5 < requestLo[a] || b[0][a] - expansion[a] - .5 > requestHi[a]) return true;
         return false;
     };
+    float metricLinear[9];
+    for (int row = 0; row < 3; ++row)
+        for (int c = 0; c < 3; ++c) metricLinear[row * 3 + c] = float(metric(row, c));
     std::vector<TileRef> hits;
     index->query(requestLo, requestHi, expansion, [&](const TileRef& tile) { hits.push_back(tile); });
+    // Every layer of every sample rounds to a voxel; inside the crop it is a candidate,
+    // at the physical distance from that voxel's centre to the sample's surface point.
+    std::vector<projection::Sample> batch;
     for (const auto& tile : hits) {
-        const auto boundsKey = "surface-bounds|" + key + "|" + std::to_string(tile.start[0]) + "," + std::to_string(tile.start[1]) + "|0";
-        if (const auto* cached = r.plans.get(boundsKey))
-            if (outside(*std::static_pointer_cast<const Bounds>(*cached))) continue;
-        const auto tris = triangles(tile, false);
-        if (!tris->bounds || outside(*tris->bounds)) continue;
-        const std::array<float, 3> rasterOrigin{float(requestLo[0] - double(tris->base[0])), float(requestLo[1] - double(tris->base[1])), float(requestLo[2] - double(tris->base[2]))};
-        // Reject triangles before label reads and candidate construction: a spatial-index
-        // leaf can be much larger than a small training crop.
-        std::array<float, 3> lower{}, upper{};
-        for (std::size_t a = 0; a < 3; ++a) {
-            lower[a] = rasterOrigin[a] - .5f - float(expansion[a]);
-            upper[a] = lower[a] + float(extent[2 - a]) + 2 * float(expansion[a]);
-            lower[a] = std::nextafter(lower[a], -INFINITY);
-            upper[a] = std::nextafter(upper[a], INFINITY);
-        }
-        std::vector<float> keptData;
-        std::vector<std::int64_t> keptIds;
-        for (std::size_t t = 0; t < tris->ids.size(); ++t) {
-            bool keep = true;
-            const float* p = &tris->data[t * 15];
-            for (std::size_t a = 0; a < 3; ++a) {
-                const float high = std::max({p[a], p[5 + a], p[10 + a]}), low = std::min({p[a], p[5 + a], p[10 + a]});
-                keep = keep && high >= lower[a] && low <= upper[a];
-            }
-            if (keep) {
-                keptData.insert(keptData.end(), p, p + 15);
-                keptIds.push_back(tris->ids[t]);
+        const auto s = samples(tile);
+        if (!s->bounds || outside(*s->bounds)) continue;
+        float origin[3];
+        for (std::size_t a = 0; a < 3; ++a) origin[a] = float(requestLo[a] - double(s->base[a]));
+        for (std::size_t i = 0; i < s->count(); ++i) {
+            const float* p = &s->xyz[i * 3];
+            const float* step = &s->step[i * 3];
+            for (std::size_t k = 0; k < offsets.size(); ++k) {
+                std::int64_t index3[3];
+                bool inside = true;
+                for (std::size_t a = 0; a < 3 && inside; ++a) {
+                    index3[a] = nearest_index(p[a] + step[a] * offsets[k] - origin[a]);
+                    inside = index3[a] >= 0 && index3[a] < extent[2 - a];
+                }
+                if (!inside) continue;
+                float c[3];
+                for (std::size_t a = 0; a < 3; ++a) c[a] = float(index3[a]) + origin[a] - p[a];
+                float d2 = 0;
+                for (int row = 0; row < 3; ++row) {
+                    const float v = metricLinear[row * 3] * c[0] + metricLinear[row * 3 + 1] * c[1] + metricLinear[row * 3 + 2] * c[2];
+                    d2 += v * v;
+                }
+                batch.push_back({(index3[2] * extent[1] + index3[1]) * extent[2] + index3[0], {s->uv[i * 2], s->uv[i * 2 + 1]}, std::sqrt(d2), s->ids[i] + std::int64_t(k)});
             }
         }
-        if (keptIds.empty()) continue;
-        const Triple rasterExtent = {extent[0], extent[1], extent[2]};
-        rasterize(keptData, keptIds, rasterOrigin, rasterExtent, states, targets);
     }
+    if (!batch.empty()) rasterize(batch, extent, states, targets);
     const auto patchShift = shift(uvOrigin[0], uvOrigin[1], uvOrigin[2]);
-    const std::vector<std::int64_t> spatial{extent[0], extent[1], extent[2]};
     for (std::size_t s = 0; s < states.size(); ++s) {
         const auto& [name, target] = *targets[s];
         auto& state = states[s].second;
@@ -1227,7 +1135,7 @@ SampleResult SurfaceProjection::Impl::readCrop(const Triple& at, const Triple& e
 #ifdef VC_READER_CUDA
         if (r.backend == "cuda") {
             device::Guard guard(r.device);
-            surface::copy_region_cuda(std::static_pointer_cast<device::Buffer>(source.device)->ptr, std::static_pointer_cast<device::Buffer>(destination.device)->ptr,
+            aligned::copy_region_cuda(std::static_pointer_cast<device::Buffer>(source.device)->ptr, std::static_pointer_cast<device::Buffer>(destination.device)->ptr,
                                       Triple{source.shape[1], source.shape[2], source.shape[3]}, Triple{destination.shape[1], destination.shape[2], destination.shape[3]}, offset, int(channels), item);
             return;
         }
@@ -1298,44 +1206,4 @@ SampleResult SampleReader::projectSurface(const Surface& surface, const Pair& st
     return cursor->readCrop(cursor->origin(), cursor->shape());
 }
 
-// ---- geometry alone ----
-SurfaceGeometry::SurfaceGeometry(const Surface& surface, AlignedOptions options) : AlignedEngine(std::move(options))
-{
-    try {
-        impl_->geometries["surface-geometry"] = std::make_shared<Geometry>(*impl_, surface);
-    } catch (...) {
-        close();
-        throw;
-    }
-}
-SurfaceGeometry::~SurfaceGeometry() = default;
-Pair SurfaceGeometry::shape() const { return impl_->geometries.at("surface-geometry")->shape; }
-std::pair<Block, Block> SurfaceGeometry::readPoints(const Pair& start, const Pair& size, const std::vector<double>& offsetsUm)
-{
-    auto& s = *impl_;
-    std::lock_guard lock(s.mutex);
-    s.checkOpen();
-    checkPatch(start, size);
-    if (offsetsUm.empty() || std::any_of(offsetsUm.begin(), offsetsUm.end(), [](double v) { return !std::isfinite(v); })) bad("offsets_um must be nonempty and finite");
-    if (std::size_t(size[0] * size[1]) * offsetsUm.size() * 32 > s.workBytes) throw DecodeBudgetError("geometry point request exceeds sampling_work_bytes; request smaller UV tiles");
-    auto geom = s.geometries.at("surface-geometry");
-    if (!geom->surface.spacingUm) bad("surface physical spacing is unknown");
-    const auto layers = std::int64_t(offsetsUm.size());
-    Block points = Block::allocate({layers, size[0], size[1], 3}, "<f4");
-    auto* out = reinterpret_cast<float*>(points.data.get());
-    const auto n = std::size_t(size[0] * size[1]);
-    std::fill_n(out, n * 3 * offsetsUm.size(), std::numeric_limits<float>::quiet_NaN());
-    if (const auto patch = patchOf(*geom, start, size)) {
-        std::vector<float> at(n * 3), step(n * 3);
-        const auto surface = gridSurface(*patch, *geom->surface.spacingUm);
-        const grid::Raster raster{patch->x0, patch->y0, patch->sx, patch->sy, int(size[1]), int(size[0]), patch->kx, patch->ky};
-        surface.resample(raster, at.data(), step.data());
-        const auto offsets = layerOffsets(*geom, !patch->tile->normals.empty(), offsetsUm);
-        for (std::size_t k = 0; k < offsets.size(); ++k)
-            for (std::size_t i = 0; i < n * 3; ++i) out[k * n * 3 + i] = offsets[k] != 0 ? at[i] + step[i] * offsets[k] : at[i];
-    }
-    Block valid = Block::allocate({layers, size[0], size[1]}, "|b1");
-    for (std::size_t i = 0; i < n * offsetsUm.size(); ++i) valid.data[i] = std::isfinite(out[i * 3]) && std::isfinite(out[i * 3 + 1]) && std::isfinite(out[i * 3 + 2]);
-    return {std::move(points), std::move(valid)};
-}
 } // namespace vcr::sources

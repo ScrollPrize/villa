@@ -132,11 +132,14 @@ class SampleReader(SamplingEngine):
             return registration.surface
         return self._ready().surface_named(getattr(surface, 'id', surface))
 
-    def render_surface(self, surface, start, size, *, offsets_um=(0,)):
-        """Sample physical-offset layers over a YX patch in full-resolution surface UV."""
+    def render_surface(self, surface, start, size, *, offsets_um=(0,), interpolation='linear'):
+        """Sample physical-offset layers over a YX patch in full-resolution surface UV.
+
+        ``interpolation`` is ``'linear'`` (bilinear patches) or ``'smooth'`` (bicubic).
+        """
         native = self._ready()
         start, size = _yx(start, size)
-        return native.render_surface(self._surface(surface), start, size, [float(v) for v in offsets_um])
+        return native.render_surface(self._surface(surface), start, size, [float(v) for v in offsets_um], interpolation)
 
     def project_surface(self, surface, start, size, *, label_target, thickness_um=0, padding_um=0):
         """Use a label YX patch to bound a crop, then project its sheet across it.

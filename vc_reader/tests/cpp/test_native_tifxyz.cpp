@@ -3,6 +3,7 @@
 #include "vc_reader/source_reader.hpp"
 #include "vc_reader/tifxyz.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -132,21 +133,34 @@ int main()
             CHECK(r[0] == p[0] && r[1] == p[1]);
         }
     }
-    // Coordinates as stored: the whole grid and a window of it.
+    // Windows of the stored grid with their validity: the mask (here at twice the grid)
+    // and the coordinate rule both count.
     {
         auto surface = plane(40, 50, 1, "w");
+        surface.metadata().extra = {};
         const auto path = root / "window";
-        tifxyz::write(path, surface);
-        const auto whole = tifxyz::readCoordinates(path.string());
-        CHECK(whole.rows == 40 && whole.cols == 50 && whole.xyz == surface.xyz());
-        const auto part = tifxyz::readCoordinates(path.string(), std::array<std::int64_t, 4>{3, 4, 5, 6});
+        tifxyz::WriteOptions options;
+        options.mask = false;
+        tifxyz::write(path, surface, options);
+        std::vector<std::uint8_t> mask(80 * 100, 255);
+        mask[std::size_t(2 * 7 + 1) * 100 + 2 * 9] = 0;  // one pixel of vertex (7, 9)
+        sources::writeTiff(path / "mask.tif", mask.data(), "|u1", 80, 100, 1, {});
+        tifxyz::Reader reader(path.string());
+        CHECK(reader.shape() == (std::array<std::int64_t, 2>{40, 50}) && reader.metadata().uuid == "w");
+        const auto whole = reader.whole();
+        CHECK(whole.rows == 40 && whole.cols == 50 && whole.xyz == surface.xyz() && whole.storedBytes == 40 * 50 * 12);
+        CHECK(!whole.valid[7 * 50 + 9] && std::count(whole.valid.begin(), whole.valid.end(), 1) == 40 * 50 - 1);
+        const auto part = reader.window({3, 4, 5, 6});
         CHECK(part.rows == 5 && part.cols == 6 && part.whole[0] == 40);
         for (int r = 0; r < 5; ++r)
             for (int c = 0; c < 6; ++c)
                 for (int a = 0; a < 3; ++a) CHECK(part.xyz[std::size_t(r * 6 + c) * 3 + a] == whole.xyz[std::size_t((r + 3) * 50 + c + 4) * 3 + a]);
+        CHECK(!part.valid[(7 - 3) * 6 + (9 - 4)]);
+        CHECK(tifxyz::Reader(path.string(), false).whole().valid == std::vector<std::uint8_t>(40 * 50, 1));
+        CHECK(tifxyz::readMask(path.string(), 40, 50) == whole.valid);
         bool outside = false;
         try {
-            (void)tifxyz::readCoordinates(path.string(), std::array<std::int64_t, 4>{38, 0, 5, 6});
+            (void)reader.window({38, 0, 5, 6});
         } catch (const std::exception&) {
             outside = true;
         }

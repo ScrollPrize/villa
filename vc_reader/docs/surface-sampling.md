@@ -83,8 +83,8 @@ Tifxyz opens `x.tif`, `y.tif`, `z.tif`, and `meta.json` through the shared stora
 readers. Its `scale` is **XY**: stored column/row coordinates equal full-resolution UV
 coordinates multiplied by those respective scales. Coordinate-value units are
 independent of UV scale. An explicitly supplied surface `pixel_to_uv` must
-agree with that metadata. Nonfinite/negative tifxyz coordinates and an optional
-`mask.tif` mark invalid geometry. Set `tifxyz_mask=False` when the bundle is
+agree with that metadata. A nonfinite or negative tifxyz coordinate and an optional
+`mask.tif` mark a vertex invalid, by the same rule as `vc_reader.tifxyz.read`. Set `tifxyz_mask=False` when the bundle is
 known to have no mask file, particularly for offline reopening: a missing cache
 entry does not prove that a remote mask does not exist.
 
@@ -117,8 +117,9 @@ labels and masks remain `(C, H, W)`. Each volume target is one native
 `vcr::grid` call (the sampler of VC3D's viewer): the patch becomes a raster
 over the stored coordinate grid, the window of vertices it reaches is read once,
 and every layer is sampled from the target's array in tiles. Coordinate grids
-are bilinear on complete quads; there is no point across holes or beyond the
-final stored row/column. Normals follow `dP/du cross dP/dv` (taken in physical
+are bilinear (or, with `interpolation='smooth'`, bicubic) on quads whose four
+vertices are valid; there is no point across holes or beyond the final stored
+row/column. Normals follow `dP/du cross dP/dv` (taken in physical
 space), with increasing columns defining u, or are the interpolated explicit
 normals. Degenerate normals give no point. Offsets are applied in the surface's
 physical frame; any affine from coordinate values to the volume's array
@@ -133,36 +134,34 @@ sampler carries values as float32). With `backend="cuda"` volume targets must be
 uint8 and outputs are device arrays. Surface-registered targets (UV labels)
 keep the aligned sampler and its CPU/CUDA support for every dtype.
 
-`vc_reader.surface.SurfaceGeometry` exposes the same surface points without
-reading a volume. Its `read_points(...)` returns `(points, valid)`: XYZ float32
-points `(D, H, W, 3)` in the stored coordinate-value frame, NaN where invalid.
-The benchmark uses this helper too.
+`interpolation='smooth'` renders bicubic Hermite patches instead of bilinear ones.
+The same positions without a volume come from `vc_reader.tifxyz`: `read(...)` gives
+the stored grid and `resample_full(start, size, normals=True)` its points and unit
+normals at full-resolution pixels, NaN where invalid; a layer at physical offset d
+is `xyz + d * normal * spacing`. The benchmark selects its surface tiles this way.
 
 ## Projection geometry and determinism
 
-Projection splits each valid coordinate-grid quad along its top-left to
-bottom-right diagonal. It clips triangles to the selected label footprint only
-when deriving crop bounds; rasterization uses complete triangles intersecting
-the resulting 3D crop.
-This piecewise-planar surface differs from bilinear layer sampling on curved
-quads; they agree on planar geometry.
+Projection samples the same bilinear quads that `render_surface` reads, so the two
+agree on curved sheets. Each valid quad is covered by points at most half a
+reference voxel apart (a power-of-two subdivision per cell, up to 64), and with a
+positive thickness each point is offset along the unit physical normal through the
+band in steps of at most half the smallest reference voxel, both faces included.
+Every such point rounds (half up) to one voxel; the voxel is covered when a point
+lands in it. Features narrower than that spacing, such as a sheet clipping a voxel's
+corner, can be missed. The crop is the extent of the sheet under the selecting label
+patch (its pixel corners and edges every half pixel), widened by the band and the
+padding. A patch without valid surface geometry raises `ValueError` because no
+spatial crop can be derived.
 
-Zero thickness includes closed voxel cells intersecting a triangle, including
-exact face contacts. Positive thickness includes cells within half the requested
-width of a triangle in the reference physical metric, including edge and corner
-caps. Reference physical spacing is required. Invalid or degenerate triangles
-contribute nothing. A patch without valid nondegenerate geometry raises
-`ValueError` because no spatial crop can be derived.
-
-For each contributing triangle/voxel, the closest surface point to the voxel
-center supplies barycentric UV coordinates. Labels use nearest-neighbor
-sampling with half-voxel ties rounding up and exact integer comparisons, including multichannel
-values. Invalid label support contributes no label validity, but geometric
-coverage remains true where the surface intersects a voxel. Overlapping contributions
-select the smallest physical distance, then the stable triangle ID; each named
-target has a single source identity. Disagreeing values set `conflict` while
-retaining the selected value. Even coplanar neighboring triangles can disagree
-near categorical boundaries under conservative cell coverage.
+A voxel holding several points keeps the one whose surface point is nearest its
+centre in the reference physical metric, then the lowest id (points are ordered by
+grid position, then layer); each named target has a single source identity. That
+point's UV selects the label with nearest-neighbor sampling, half-pixel ties
+rounding up, and exact integer comparisons, including multichannel values. Invalid
+label support contributes no label validity, but geometric coverage remains true
+wherever a point landed. Points with disagreeing values set `conflict` while the
+selected value is retained.
 
 ## Bounded output, caching and workers
 
@@ -185,7 +184,7 @@ also scans the registered coordinate grid in bounded blocks to build a spatial
 index; this is necessary to find sheet regions that fold back into a crop. It
 reads geometry, not the complete CT or label image. The index is reused across
 patches while retained by `plan_cache_bytes`. Only intersecting leaves are
-triangulated, and triangle bounds are filtered before reading label pixels.
+sampled, and a leaf's point bounds are checked before reading label pixels.
 Index metadata and coordinate blocks obey `sampling_work_bytes`; an index too
 large for that budget fails explicitly. If the index exceeds the cache budget,
 it is rebuilt for the next projection. Decoded coordinate and label tiles share
@@ -195,9 +194,9 @@ separate decoded-cache and maximum-decode limits.
 
 CPU output uses NumPy; CUDA output uses the existing owned `DeviceArray`/DLPack
 interface. Coordinate/UV planning metadata can cross the CPU/device boundary;
-volume and categorical sampling, normal/offset interpolation, rasterization,
-and collision selection have CUDA kernels. File decoding and spatial indexing
-remain host work. CUDA kernels synchronize before returning, as in the existing
+volume and categorical sampling, layer offsets along the normal, and the per-voxel
+selection of projected points have CUDA kernels. File decoding, spatial indexing
+and the surface points themselves remain host work. CUDA kernels synchronize before returning, as in the existing
 reader. No PyTorch or SciPy runtime dependency is introduced.
 
 CPU readers reopen in workers after serialization/fork. CUDA readers must live

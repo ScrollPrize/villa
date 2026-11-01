@@ -345,6 +345,9 @@ public:
     // top-left pixel sits at surface coordinate (u0, v0), `scale` pixels per unit.
     [[nodiscard]] vcr::grid::SurfaceOptions gridOptions() const;
     [[nodiscard]] vcr::grid::Raster gridRaster(double u0, double v0, double scale, cv::Size size) const;
+    // vcr::grid::Vertices over `points` (rawPointsPtr() by default), with `valid`
+    // filled in: VC marks an invalid vertex (-1, -1, -1).
+    [[nodiscard]] vcr::grid::Vertices gridVertices(std::vector<std::uint8_t>& valid, const cv::Mat_<cv::Vec3f>* points = nullptr) const;
 
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).

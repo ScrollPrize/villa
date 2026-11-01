@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 import tifffile
 
+from build_support import load_build
+load_build()
 from vc_reader import tifxyz
 
 

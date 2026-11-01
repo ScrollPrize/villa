@@ -126,10 +126,8 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
         return nullptr;
     auto options = surface.gridOptions();
     options.spacing = spacing;
-    return std::make_shared<const vcr::grid::Surface>(
-        vcr::grid::Vertices{reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
-                            points->step1()},
-        std::move(options));
+    std::vector<std::uint8_t> valid;
+    return std::make_shared<const vcr::grid::Surface>(surface.gridVertices(valid, points), std::move(options));
 }
 
 vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const

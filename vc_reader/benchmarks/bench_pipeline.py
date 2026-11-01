@@ -262,54 +262,50 @@ def coordinate_box(coords, base):
 
 
 def surface_workload(args, volume_shape):
-    """Select real curved UV patches using the library's bounded geometry reader."""
-    from vc_reader import Affine, Storage, Surface
-    from vc_reader.surface import SurfaceGeometry
+    """Select real curved UV patches from the stored tifxyz grid."""
+    from vc_reader import tifxyz
 
     path = args.surface
     meta = json.loads((path / "meta.json").read_text())
-    surface = Surface(str(path), Storage(str(path), "tifxyz"), "PHercParis4", "20260411134726",
-                      axes=("y", "x"), component_order=("x", "y", "z"),
-                      xyz_to_volume=Affine.scale(4), spacing_um=(9.6,)*3)
+    surface = tifxyz.read(path)
     scale = np.asarray(meta["scale"], dtype=np.float32)
-    with SurfaceGeometry(surface) as geometry:
-        # tifxyz scale is XY; public patch dimensions and starts are YX.
-        extent = np.floor((np.asarray(geometry.shape)-1)/scale[::-1]).astype(int)+1
-        size = np.asarray(args.surface_size)
-        if np.any(size > extent):
-            raise ValueError(f"--surface-size does not fit supported UV extent {extent.tolist()}")
-        row = int((extent[0]-size[0])//2)
-        candidates = np.unique(np.rint(np.linspace(0, extent[1]-size[1], max(64,args.crops*8))).astype(int))
-        tiles = []
-        for col in candidates:
-            _, valid = geometry.read_points((row,int(col)),tuple(size))
-            if valid.all():
-                tiles.append(int(col))
-        if len(tiles) < args.crops:
-            raise ValueError(f"only {len(tiles)} valid surface tiles found; reduce --surface-size/--crops")
-        selected = np.rint(np.linspace(0,len(tiles)-1,args.crops)).astype(int)
-        requests, descriptions = [], []
-        for index in selected:
-            col = tiles[index]
-            points, _ = geometry.read_points((row,col),tuple(size))
-            # Keep coordinates local before applying a requested volume-level scale.
-            local = np.asarray(points[0], np.float32) * np.float32(args.surface_coordinate_scale)
-            local = np.ascontiguousarray(local[...,::-1]); base = (0, 0, 0)
-            shape = tuple(int(n) for n in size)
-            lower = local.reshape(-1,3).min(axis=0)
-            upper = local.reshape(-1,3).max(axis=0)
-            if any(lo+b<0 or hi+b>n-1 for lo,hi,b,n in zip(lower,upper,base,volume_shape)):
-                raise ValueError("surface coordinates fall outside the selected volume")
-            requests.append([(shape,base,local)])
-            descriptions.append(dict(uv_start=[row,col],shape=list(shape),coordinate_origin=base,
-                local_coordinates_sha256=hashlib.sha256(local.tobytes()).hexdigest(),
-                bounds_zyx=[[float(v)+b for v,b in zip(lower,base)],[float(v)+b for v,b in zip(upper,base)]]))
-        stored_shape = geometry.shape
+    # tifxyz scale is XY; public patch dimensions and starts are YX.
+    extent = np.floor((np.asarray(surface.shape)-1)/scale[::-1]).astype(int)+1
+    size = np.asarray(args.surface_size)
+    if np.any(size > extent):
+        raise ValueError(f"--surface-size does not fit supported UV extent {extent.tolist()}")
+    row = int((extent[0]-size[0])//2)
+    candidates = np.unique(np.rint(np.linspace(0, extent[1]-size[1], max(64,args.crops*8))).astype(int))
+    tiles = []
+    for col in candidates:
+        _, valid = surface.resample_full((row,int(col)),tuple(int(n) for n in size))
+        if valid.all():
+            tiles.append(int(col))
+    if len(tiles) < args.crops:
+        raise ValueError(f"only {len(tiles)} valid surface tiles found; reduce --surface-size/--crops")
+    selected = np.rint(np.linspace(0,len(tiles)-1,args.crops)).astype(int)
+    requests, descriptions = [], []
+    for index in selected:
+        col = tiles[index]
+        points, _ = surface.resample_full((row,col),tuple(int(n) for n in size))
+        # Keep coordinates local before applying a requested volume-level scale.
+        local = np.asarray(points, np.float32) * np.float32(args.surface_coordinate_scale)
+        local = np.ascontiguousarray(local[...,::-1]); base = (0, 0, 0)
+        shape = tuple(int(n) for n in size)
+        lower = local.reshape(-1,3).min(axis=0)
+        upper = local.reshape(-1,3).max(axis=0)
+        if any(lo+b<0 or hi+b>n-1 for lo,hi,b,n in zip(lower,upper,base,volume_shape)):
+            raise ValueError("surface coordinates fall outside the selected volume")
+        requests.append([(shape,base,local)])
+        descriptions.append(dict(uv_start=[row,col],shape=list(shape),coordinate_origin=base,
+            local_coordinates_sha256=hashlib.sha256(local.tobytes()).hexdigest(),
+            bounds_zyx=[[float(v)+b for v,b in zip(lower,base)],[float(v)+b for v,b in zip(upper,base)]]))
+    stored_shape = list(surface.shape)
     filenames = ["meta.json","x.tif","y.tif","z.tif"] + (["mask.tif"] if (path/"mask.tif").exists() else [])
     return requests, dict(path=str(path),uuid=meta.get("uuid"),stored_shape=stored_shape,
         scale_xy=scale.tolist(),voxel_size_um=meta.get("voxel_size_um"),
         coordinate_scale=args.surface_coordinate_scale,layers=1,
-        preparation="shared bounded geometry reader; excludes geometry preparation from volume sampling timings",
+        preparation="tifxyz surface read whole; excludes geometry preparation from volume sampling timings",
         files_sha256={name:hashlib.sha256((path/name).read_bytes()).hexdigest() for name in filenames},tiles=descriptions)
 
 

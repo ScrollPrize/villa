@@ -97,5 +97,10 @@ void launch_many(const std::vector<Grid>&,const std::vector<std::vector<std::int
                  const std::vector<std::vector<const void*>>&,const void*,ElementType,void*,bool*,int);
 void launch_box(Triple,Triple,Triple,bool*);
 void launch_field(float*,bool*,std::size_t,Field);
+// Device-to-device copies of sampled blocks, complete on return: `rows` rows of `sw` items
+// (`item` bytes) into rows of `dw` items from item `offset`; a CZYX block of `shape` into
+// one of `output` at `offset`.
+void copy_cuda(const void* src,void* dst,std::size_t rows,std::size_t sw,std::size_t dw,std::size_t offset,std::size_t item,int device);
+void copy_region_cuda(const void* src,void* dst,Triple shape,Triple output,Triple offset,int channels,std::size_t item);
 #endif
 }

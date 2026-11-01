@@ -1,6 +1,7 @@
 #pragma once
 // What the aligned readers and surface operations share.
 #include "vc_reader/aligned_reader.hpp"
+#include "vc_reader/tifxyz.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -10,7 +11,7 @@
 
 #include "../array.hpp"
 #include "../aligned/plan.hpp"
-#include "../surface/plan.hpp"
+#include "../projection/plan.hpp"
 #ifdef VC_READER_CUDA
 #include "../cuda_buffer.hpp"
 #include "../reader_cuda/reader.hpp"
@@ -153,22 +154,23 @@ private:
     void pointBlock(const Target& target, const float* points, std::size_t n, const Triple& base, SampledArray& out, SampledArray& valid, std::size_t& cursor);
 };
 
-// A surface's coordinate grid: metadata and bounded tiles through shared source readers.
+// A surface's coordinate grid: metadata and bounded tiles of its vertices, read through
+// vcr::tifxyz (a tifxyz directory) or one coordinate source (any other grid).
 struct GeometryTile {
     std::int64_t rows = 0, cols = 0;
-    std::vector<float> xyz;      // rows x cols x 3
-    std::vector<std::uint8_t> valid;
-    std::vector<float> normals;  // empty, or rows x cols x 3
+    std::vector<float> xyz;           // rows x cols x 3
+    std::vector<std::uint8_t> valid;  // per vertex
+    std::vector<float> normals;       // empty, or rows x cols x 3
 };
 struct Geometry {
     Geometry(AlignedEngine::Impl& owner, const Surface& surface);
     AlignedEngine::Impl& owner;
     Surface surface;
-    std::vector<std::shared_ptr<SourceReader>> coordinateReaders;
-    std::shared_ptr<SourceReader> mask;
+    std::unique_ptr<tifxyz::Reader> tifxyz;
+    std::shared_ptr<SourceReader> coordinates;
     std::array<std::int64_t, 2> shape{};
     VolumeTransform toUv, fromUv;
-    int orientation = 1;
+    bool flipNormals = false;
     std::optional<Target> explicitMask, normals;
     std::array<float, 9> normalTransform{};
     std::string key;

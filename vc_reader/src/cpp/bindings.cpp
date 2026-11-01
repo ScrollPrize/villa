@@ -98,7 +98,6 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 
 #include "sheet_normal/bindings.hpp"
 #include "geometry/bindings.hpp"
-#include "grid/bindings.hpp"
 
 NB_MODULE(_reader, m)
 {
@@ -140,7 +139,6 @@ NB_MODULE(_reader, m)
 #endif
     vcr::sheet_normal::bind(m);
     vcr::geometry::bind(m);
-    vcr::grid::python::bind(m);
     vcr::sources::python::bind(m);
     vcr::tifxyz::python::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never

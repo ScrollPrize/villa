@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "vc_reader/browsing.hpp"
+#include "vc_reader/grid.hpp"
 #include "vc_reader/source_reader.hpp"
 
 namespace vcr::sources {
@@ -103,8 +104,10 @@ public:
     [[nodiscard]] std::pair<SampledArray, SampledArray> sampleTarget(const std::string& name, const std::array<std::int64_t, 3>& start, const std::array<std::int64_t, 3>& size);
     [[nodiscard]] bool hasTarget(const std::string& name) const;
 
-    // Physical-offset layers over a YX patch in full-resolution surface UV.
-    [[nodiscard]] SampleResult renderSurface(const Surface& surface, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, const std::vector<double>& offsetsUm = {0});
+    // Physical-offset layers over a YX patch in full-resolution surface UV, the surface
+    // interpolated between its vertices linearly or smoothly (grid::Interpolation).
+    [[nodiscard]] SampleResult renderSurface(const Surface& surface, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, const std::vector<double>& offsetsUm = {0},
+                                             grid::Interpolation interpolation = grid::Interpolation::Linear);
     // Uses a label YX patch to bound a crop, then projects its sheet across it. Geometric
     // coverage includes sheet outside the selecting patch; label validity additionally
     // requires annotation support at the surface point.
@@ -157,18 +160,6 @@ private:
     std::array<std::int64_t, 2> shape_{};
     std::int64_t layerStart_ = 0, layerCount_ = 0, layerDepth_ = 0;
     bool dropLayer_ = false;
-};
-
-// Reusable geometry-only UV interpolation; no volume is sampled.
-class SurfaceGeometry : public AlignedEngine {
-public:
-    SurfaceGeometry(const Surface& surface, AlignedOptions options);
-    ~SurfaceGeometry() override;
-    // Rows and columns of the stored coordinate grid.
-    [[nodiscard]] std::array<std::int64_t, 2> shape() const;
-    // XYZ float32 points (layers, y, x, 3) in the surface's coordinate-value frame and
-    // their validity (layers, y, x); offsets are physical micrometers.
-    [[nodiscard]] std::pair<Block, Block> readPoints(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, const std::vector<double>& offsetsUm = {0});
 };
 
 } // namespace vcr::sources

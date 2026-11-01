@@ -46,6 +46,8 @@ class SurfaceTests(unittest.TestCase):
                 result=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2))
                 expected=np.stack([self.image[z,3:6,5:9] for z in (4,5,7)])[None]
                 np.testing.assert_allclose(host(result['image'].data),expected)
+                smooth=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2),interpolation='smooth')
+                np.testing.assert_allclose(host(smooth['image'].data),expected)  # a flat sheet: bicubic patches agree
                 np.testing.assert_array_equal(host(result['ink'].data),self.labels[None,1:4,2:6])
                 self.assertTrue(host(result['image'].valid).all())
                 with self.assertRaisesRegex(ValueError,'explicit'):
@@ -61,7 +63,8 @@ class SurfaceTests(unittest.TestCase):
                 np.testing.assert_array_equal(host(result['image'].data),self.image[None,z:z+d,y:y+h,x:x+w])
                 coverage=host(result['ink'].valid);self.assertEqual(int(coverage.sum()),42)
                 np.testing.assert_array_equal(host(result['ink'].data)[coverage],self.labels[:6,:7].ravel())
-                self.assertTrue(host(result['ink'].masks['conflict']).any())
+                # One label pixel per voxel on a flat unit sheet: nothing disagrees.
+                self.assertFalse(host(result['ink'].masks['conflict']).any())
                 tiled=np.zeros_like(host(result['ink'].data));tilevalid=np.zeros_like(coverage)
                 for tile in reader.iter_project_surface(self.surface,(2,2),(2,3),label_target='ink',padding_um=1,tile_size=(1,2,3)):
                     at=tuple(a-b for a,b in zip(tile.metadata['projection']['origin_zyx'],meta['origin_zyx']))
@@ -299,19 +302,6 @@ class SurfaceTests(unittest.TestCase):
             np.testing.assert_allclose(result['image'].data[0,0],self.image[5:9,3:6,5].T)
             np.testing.assert_allclose(result['image'].data[0,1],self.image[5:9,3:6,5].T+1.5)
             self.assertTrue(result['image'].valid.all())
-
-    def test_geometry_points_without_a_volume(self):
-        from vc_reader.surface import SurfaceGeometry
-        with SurfaceGeometry(self.surface) as geometry:
-            points,valid=geometry.read_points((1,2),(3,4),offsets_um=(0,2))
-            y,x=np.indices((3,4),dtype=np.float32)
-            np.testing.assert_allclose(points[0],np.stack((x+5,y+3,np.full_like(x,5)),-1))
-            np.testing.assert_allclose(points[1][...,2],7)
-            self.assertTrue(valid.all())
-            # The 8 x 9 grid ends at row 7 and column 8.
-            points,valid=geometry.read_points((6,7),(3,3))
-            np.testing.assert_array_equal(valid[0],[[1,1,0],[1,1,0],[0,0,0]])
-            self.assertTrue(np.isnan(points[0][~valid[0]]).all())
 
     def test_render_volume_target_limits(self):
         wide=self.source('wide-seg',np.zeros(self.image.shape,np.uint32),('z','y','x'),role='label',

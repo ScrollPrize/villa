@@ -45,6 +45,15 @@ Level levelFromMap(Array& array, ElementType type, const std::array<double, 12>&
     return L;
 }
 
+Interpolation interpolationNamed(const std::string& name)
+{
+    if (name == "linear")
+        return Interpolation::Linear;
+    if (name == "smooth")
+        return Interpolation::Smooth;
+    throw std::invalid_argument("interpolation must be 'linear' or 'smooth'");
+}
+
 namespace {
 
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
@@ -57,12 +66,12 @@ ThreadPool& resamplePool()
 
 }  // namespace
 
-// A surface's vertices with what grid::point needs: which vertices are present, the
+// A surface's vertices with what grid::point needs: which vertices are valid, the
 // piece of each column, and (smooth mode) the Hermite derivatives of every vertex.
 struct Surface::Impl {
     Vertices v;
     SurfaceOptions options;
-    std::vector<std::uint8_t> present;  // per vertex (bool-sized)
+    std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
     std::vector<float> du, dv, duv;     // per vertex, smooth mode
     std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
@@ -76,7 +85,7 @@ struct Surface::Impl {
     {
         GridView g;
         g.xyz = xyz();
-        g.present = reinterpret_cast<const bool*>(present.data());
+        g.valid = reinterpret_cast<const bool*>(valid.data());
         g.piece = piece.empty() ? nullptr : piece.data();
         g.normals = normals();
         if (options.interpolation == Interpolation::Smooth) {
@@ -96,6 +105,7 @@ struct Surface::Impl {
             g.physical[a * 5] = options.spacing[std::size_t(a)];
             g.destination[a * 5] = 1.0f / options.spacing[std::size_t(a)];
         }
+        g.orientation = options.flipNormals ? -1.0f : 1.0f;
         return g;
     }
 
@@ -108,7 +118,7 @@ struct Surface::Impl {
         du.assign(n, 0.0f);
         dv.assign(n, 0.0f);
         duv.assign(n, 0.0f);
-        const auto ok = [&](int r, int c) { return r >= 0 && r < rows && c >= 0 && c < cols && present[index(r, c)]; };
+        const auto ok = [&](int r, int c) { return r >= 0 && r < rows && c >= 0 && c < cols && valid[index(r, c)]; };
         const auto same = [&](int c, int d) { return piece.empty() || piece[std::size_t(c)] == piece[std::size_t(d)]; };
         const auto put = [&](std::vector<float>& d, int r, int c, geometry::V value) { geometry::store(&d[3 * index(r, c)], value); };
         const auto get = [&](const std::vector<float>& d, int r, int c) { return geometry::vector(&d[3 * index(r, c)]); };
@@ -192,7 +202,7 @@ struct Surface::Impl {
                 const std::size_t o = (std::size_t(j) * std::size_t(w) + std::size_t(i)) * 3;
                 float step[3];
                 if (!point(g, grid, float(x + double(i0 + i) * raster.sx), Sheared ? float(y + double(i0 + i) * raster.ky) : row,
-                           xyz + o, nullptr, step)) {
+                           xyz + o, step)) {
                     xyz[o] = xyz[o + 1] = xyz[o + 2] = kNaN;
                     step[0] = step[1] = step[2] = kNaN;
                 }
@@ -227,12 +237,15 @@ Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_un
                 std::copy_n(vertices.normals + r * vertices.stride, cols * 3, s.packedNormals.data() + r * cols * 3);
         }
     }
-    // A vertex is missing when a coordinate is NaN or all three are -1.
-    s.present.resize(rows * cols);
-    for (std::size_t k = 0; k < rows * cols; ++k) {
-        const float* p = s.xyz() + 3 * k;
-        const bool nan = p[0] != p[0] || p[1] != p[1] || p[2] != p[2];
-        s.present[k] = !(nan || (p[0] == -1.f && p[1] == -1.f && p[2] == -1.f));
+    s.valid.resize(rows * cols);
+    if (vertices.valid) {
+        for (std::size_t k = 0; k < rows * cols; ++k)
+            s.valid[k] = vertices.valid[k] != 0;
+    } else {
+        for (std::size_t k = 0; k < rows * cols; ++k) {
+            const float* p = s.xyz() + 3 * k;
+            s.valid[k] = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+        }
     }
     if (!s.options.components.empty()) {  // unlisted columns belong to no piece
         s.piece.assign(cols, -1);
@@ -285,7 +298,7 @@ void Surface::pointsAt(const float* xy, std::size_t n, float* xyz, float* normal
     resamplePool().parallel_for(parts, [&](std::size_t k) {
         for (std::size_t i = n * k / parts; i < n * (k + 1) / parts; ++i) {
             float step[3];
-            if (!point(g, grid, xy[i * 2], xy[i * 2 + 1], xyz + i * 3, nullptr, step)) {
+            if (!point(g, grid, xy[i * 2], xy[i * 2 + 1], xyz + i * 3, step)) {
                 xyz[i * 3] = xyz[i * 3 + 1] = xyz[i * 3 + 2] = kNaN;
                 step[0] = step[1] = step[2] = kNaN;
             }
@@ -673,7 +686,7 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     const std::size_t vertices = std::size_t(impl.v.rows) * std::size_t(impl.v.cols);
     const GridView host = impl.view();
     const auto xyz = upload(host.xyz, vertices * 12, id);
-    const auto present = upload(host.present, vertices, id);
+    const auto valid = upload(host.valid, vertices, id);
     const auto piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
     const auto normals = upload(host.normals, host.normals ? vertices * 12 : 0, id);
     const bool smooth = host.du != nullptr;
@@ -688,7 +701,7 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     base.ky = raster.ky;
     base.map = impl.map();
     base.grid.xyz = static_cast<const float*>(xyz->ptr);
-    base.grid.present = static_cast<const bool*>(present->ptr);
+    base.grid.valid = static_cast<const bool*>(valid->ptr);
     base.grid.piece = host.piece ? static_cast<const int*>(piece->ptr) : nullptr;
     base.grid.normals = host.normals ? static_cast<const float*>(normals->ptr) : nullptr;
     if (smooth) {

@@ -161,10 +161,8 @@ TEST_CASE("A stored multi-component surface does not interpolate across its seam
     // Rendered depth along the middle row, across the seam between columns 7 and 8.
     const auto seamDepths = [&](const std::string& uuid) {
         const auto loaded = store.load(uuid);
-        const auto* points = loaded->rawPointsPtr();
-        const vcr::grid::Surface surface({reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
-                                          points->step1()},
-                                         loaded->gridOptions());
+        std::vector<std::uint8_t> valid;
+        const vcr::grid::Surface surface(loaded->gridVertices(valid), loaded->gridOptions());
         std::vector<float> xyz(64 * 3);
         surface.resample(loaded->gridRaster(-2.0, 0.0, 4.0, cv::Size(64, 1)), xyz.data(), nullptr);
         std::vector<float> depths;

@@ -74,7 +74,7 @@ __global__ void samplePixels(Params P)
             n[a] = P.normal[a];
         }
     } else if (!point(P.map, P.grid, float(P.x0 + double(j) * P.kx + double(i) * P.sx),
-                      float(P.y0 + double(j) * P.sy + double(i) * P.ky), p, nullptr, n)) {
+                      float(P.y0 + double(j) * P.sy + double(i) * P.ky), p, n)) {
         return;  // no surface point here
     }
     composite::detail::Reducer reducer(P.composite);

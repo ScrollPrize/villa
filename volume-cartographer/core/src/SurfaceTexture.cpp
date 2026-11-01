@@ -28,8 +28,12 @@ cv::Mat_<std::uint8_t> renderCoordsTexture(
     if (coords.empty())
         throw std::runtime_error("surface has no points for texture rendering");
     renderScale = std::max(1, renderScale);
+    std::vector<std::uint8_t> valid(std::size_t(coords.rows) * std::size_t(coords.cols), 1);
+    for (int j = 0; j < coords.rows; ++j)
+        for (int i = 0; i < coords.cols; ++i)
+            if (coords(j, i) == cv::Vec3f(-1.f, -1.f, -1.f)) valid[std::size_t(j) * std::size_t(coords.cols) + std::size_t(i)] = 0;
     const vcr::grid::Surface surface({reinterpret_cast<const float*>(coords.data), coords.rows, coords.cols,
-                                      coords.step1()});
+                                      coords.step1(), nullptr, valid.data()});
     // Pixel centres of a renderScale-times upsampled image: pixel i at grid
     // column (i + 0.5) / renderScale - 0.5.
     const double step = 1.0 / renderScale;

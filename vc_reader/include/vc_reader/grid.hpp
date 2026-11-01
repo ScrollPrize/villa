@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,24 +25,27 @@ class Array;
 namespace vcr::grid {
 
 // rows x cols vertices of three floats (XYZ), row r starting at xyz + r * stride floats.
-// A vertex is missing when a coordinate is NaN or all three are -1. With `normals`
-// (the same layout: a unit normal per vertex, in physical space), normals are those
-// interpolated over each patch instead of the patch's own.
+// `valid` (rows x cols, contiguous; nonzero where the vertex is valid) says which
+// vertices count; without it every vertex with finite coordinates does. A file format's
+// own marker for an invalid vertex (tifxyz's -1) is read into `valid` by its reader.
+// With `normals` (the layout of `xyz`: a unit normal per vertex, in physical space),
+// normals are those interpolated over each patch instead of the patch's own.
 struct Vertices {
     const float* xyz = nullptr;
     int rows = 0, cols = 0;
     std::size_t stride = 0;
     const float* normals = nullptr;
+    const std::uint8_t* valid = nullptr;
 };
 
-// A missing vertex never enters a position: in a cell with missing corners, the
-// present corners are blended with renormalised bilinear weights.
 enum class Interpolation {
     Linear,  // bilinear patches
     Smooth,  // bicubic Hermite patches (C1 across cells), from per-vertex derivatives
 };
+// The interpolation named "linear" or "smooth"; any other name raises.
+[[nodiscard]] Interpolation interpolationNamed(const std::string& name);
 
-// A cell of the grid is a surface patch when its four vertices are present and in one
+// A cell of the grid is a surface patch when its four vertices are valid and in one
 // piece; elsewhere there is no point. Normals are the patch's (its derivatives' cross
 // product, column direction x row direction).
 struct SurfaceOptions {
@@ -52,6 +56,9 @@ struct SurfaceOptions {
     // The physical size of one unit of vertex coordinates, per axis (XYZ): normals are
     // taken in physical space and layer offsets are physical lengths along them.
     std::array<float, 3> spacing{1, 1, 1};
+    // Negate the patch normals (a grid whose rows and columns are mirrored against the
+    // convention). Vertex normals given in `Vertices` keep their sign.
+    bool flipNormals = false;
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,
@@ -62,9 +69,10 @@ struct Raster {
     double kx = 0, ky = 0;
 };
 
-// The vertices of a surface (a view, not a copy: they must outlive the Surface and
-// not change while it is used; build a new Surface after an edit) and what
-// interpolating them needs (vertex presence, pieces, Hermite derivatives).
+// The vertices of a surface (a view, not a copy: `xyz` and `normals` must outlive the
+// Surface and not change while it is used; build a new Surface after an edit; `valid`
+// is copied) and what interpolating them needs (vertex validity, pieces, Hermite
+// derivatives).
 class Surface {
 public:
     explicit Surface(Vertices vertices, SurfaceOptions options = {});
@@ -75,10 +83,11 @@ public:
     const Vertices& vertices() const;
     const SurfaceOptions& options() const;
 
-    // Positions and normals at every pixel of `raster`, row-major, three floats each;
-    // NaN where the surface has no point. A normal is the move in vertex coordinates
-    // per unit of physical offset along the unit physical normal (the unit normal when
-    // spacing is 1). Either output may be null.
+    // Positions (vertex coordinates) and normals at every pixel of `raster`, row-major,
+    // three floats each; NaN where the surface has no point. A normal is the move in
+    // vertex coordinates per unit of physical offset along the unit physical normal
+    // (the unit normal itself when spacing is 1): a layer at physical offset d lies at
+    // xyz + d * normal. Either output may be null.
     void resample(const Raster& raster, float* xyz, float* normals) const;
     // The same at `n` real-valued grid positions (`xy`: column, row pairs).
     void pointsAt(const float* xy, std::size_t n, float* xyz, float* normals) const;

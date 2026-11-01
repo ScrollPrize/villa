@@ -125,7 +125,7 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
     }
     // A negative coordinate marks a vertex invalid, as in tifxyz files.
     for (auto& p : *points)
-        if (!vcr::tifxyz::vertexPresent(p.val)) p = kInvalid;
+        if (!vcr::tifxyz::vertexValid(p.val)) p = kInvalid;
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;
     surface->meta = utils::Json::parse(object->meta);

@@ -31,14 +31,6 @@ std::int64_t product(const std::vector<std::int64_t>& values)
     for (const auto v : values) out *= v;
     return out;
 }
-ElementType elementOf(const std::string& typestr)
-{
-    ElementType type;
-    type.kind = typestr[1];
-    type.itemsize = std::size_t(typestr[2] - '0');
-    type.swap = typestr[0] == '>';
-    return type;
-}
 std::string nativeOf(const std::string& typestr)
 {
     auto out = typestr;
@@ -729,8 +721,8 @@ void AlignedEngine::Impl::pointBlock(const Target& target, const float* points, 
         grid.field = target.fieldState;
         aligned::launch(grid, plan_.keys, pointers, fill.data(), type, storageOf(block)->ptr, static_cast<bool*>(storageOf(support)->ptr), device);
         device::complete();
-        surface::copy_cuda(storageOf(block)->ptr, storageOf(out)->ptr, channels, n, total, cursor, item, device);
-        surface::copy_cuda(storageOf(support)->ptr, storageOf(valid)->ptr, 1, n, total, cursor, 1, device);
+        aligned::copy_cuda(storageOf(block)->ptr, storageOf(out)->ptr, channels, n, total, cursor, item, device);
+        aligned::copy_cuda(storageOf(support)->ptr, storageOf(valid)->ptr, 1, n, total, cursor, 1, device);
         cursor += n;
         return;
     }

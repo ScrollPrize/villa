@@ -30,12 +30,6 @@ inline std::pair<std::int64_t, std::int64_t> checkedTile(const sources::TiffWrit
     if (tile.ndim() < 2 || tile.ndim() > 3 || (tile.ndim() == 3 ? std::int64_t(tile.shape(2)) : 1) != channels) throw nb::value_error("TiffWriter takes (rows, cols) or (rows, cols, channels) of its channels");
     return {std::int64_t(tile.shape(0)), std::int64_t(tile.shape(1))};
 }
-inline grid::Interpolation interpolationOf(const std::string& name)
-{
-    if (name == "linear") return grid::Interpolation::Linear;
-    if (name == "smooth") return grid::Interpolation::Smooth;
-    throw nb::value_error("interpolation must be 'linear' or 'smooth'");
-}
 inline nb::object fromJson(const nlohmann::json& value) { return nb::module_::import_("json").attr("loads")(value.dump()); }
 inline nlohmann::json toJson(nb::handle value) { return nlohmann::json::parse(nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(value))); }
 
@@ -211,15 +205,15 @@ inline void bind(nb::module_& m)
                 xy[i * 2] = cols.data()[i];
                 xy[i * 2 + 1] = rows.data()[i];
             }
-            return pointsOut(s, xy.data(), n, r, c, interpolationOf(interpolation), normals);
+            return pointsOut(s, xy.data(), n, r, c, grid::interpolationNamed(interpolation), normals);
         }, "rows"_a, "cols"_a, "interpolation"_a = "linear", "normals"_a = false)
         .def("resample", [](const Surface& s, std::array<double, 2> origin, std::array<double, 2> step, std::array<int, 2> size, const std::string& interpolation, bool normals) {
             if (size[0] <= 0 || size[1] <= 0) throw nb::value_error("resample size must be positive");
-            return rasterOut(s, grid::Raster{origin[1], origin[0], step[1], step[0], size[1], size[0]}, interpolationOf(interpolation), normals);
+            return rasterOut(s, grid::Raster{origin[1], origin[0], step[1], step[0], size[1], size[0]}, grid::interpolationNamed(interpolation), normals);
         }, "origin"_a, "step"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
            "Positions at grid positions origin + (j, i) * step, in stored cells (row, column); NaN where no patch covers one.")
         .def("resample_full", [](const Surface& s, std::array<std::int64_t, 2> start, std::array<std::int64_t, 2> size, const std::string& interpolation, bool normals) {
-            return rasterOut(s, s.fullRaster(start, size), interpolationOf(interpolation), normals);
+            return rasterOut(s, s.fullRaster(start, size), grid::interpolationNamed(interpolation), normals);
         }, "start"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
            "Positions of a window at full resolution: start and size in rows and columns of full_shape.");
 

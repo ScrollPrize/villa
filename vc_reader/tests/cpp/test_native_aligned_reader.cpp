@@ -237,16 +237,6 @@ void testSurface(const fs::path& root, const std::string& backend)
     const auto stats = reader.stats();
     require(stats.hasSurface && stats.geometryReadBytes > 0, "surface stats");
     reader.close();
-
-    if (backend == "cpu") {
-        SurfaceGeometry geometry(surface, AlignedOptions{});
-        require(geometry.shape() == Pair{8, 9}, "grid shape");
-        const auto [points, valid] = geometry.readPoints({1, 1}, {2, 2}, {0, 2});
-        require(points.shape == Index{2, 2, 2, 3}, "points shape");
-        const auto* xyz = reinterpret_cast<const float*>(points.data.get());
-        require(xyz[0] == 4.f && xyz[1] == 3.f && xyz[2] == 5.f && valid.data[0] == 1, "points on the sheet");
-        require(std::abs(std::abs(xyz[3 * 4 + 2] - 5.f) - 1.f) < 1e-5f, "two micrometers along the normal at 2 um spacing");
-    }
 }
 
 void testPaired(const fs::path& root, const std::string& backend)

@@ -191,6 +191,8 @@ static RenderSurface renderSurface(const QuadSurface& surf, vcr::grid::Interpola
                                    bool hasAffine, const Affine& aff, const LevelMap& level)
 {
     RenderSurface r;
+    std::vector<std::uint8_t> valid;
+    surf.gridVertices(valid);
     r.vertices = surf.rawPointsPtr()->clone();
     for (auto& v : r.vertices) {
         if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
@@ -209,7 +211,7 @@ static RenderSurface renderSurface(const QuadSurface& surf, vcr::grid::Interpola
     options.interpolation = interpolation;
     r.grid = std::make_unique<vcr::grid::Surface>(
         vcr::grid::Vertices{reinterpret_cast<const float*>(r.vertices.ptr()), r.vertices.rows, r.vertices.cols,
-                            r.vertices.step1()},
+                            r.vertices.step1(), nullptr, valid.data()},
         std::move(options));
     return r;
 }

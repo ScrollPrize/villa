@@ -55,7 +55,7 @@ already link them. The Python extensions link those same CUDA libraries.
 | `vc_reader/computed.hpp` | `vcr::computed::open`: an `Array` whose chunks a callback computes from other data, persisted in a decoded disk cache named by the computation's identity | Register with the service and sample like any array, on CPU and CUDA |
 | `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
-| `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `surface::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surfaces, curves and voxel membership |
+| `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `projection::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surface projection, curves and voxel membership |
 | `vc_reader/transforms.hpp` | All `transforms::Op` alternatives, parameter types, `Pipeline`, `Sample`, `Plan`, `save_plan`, `load_plan` | Full transform catalog; `cpu`, `cuda` and `auto` pipeline backends |
 | `vc_reader/cuda.hpp` | Device storage, borrowed storage, stream scope, completion, resident transform input/output sessions, device sample and batch runs | CUDA only |
 | `vc_reader/cuda_reader.hpp` | `reader_cuda::Reader`, region/affine grids, point plans, resident sampling, cache statistics; CUDA sampling declarations | CUDA only |

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace vcr {
 // How sample() reads stored elements as numbers.
@@ -92,5 +93,16 @@ struct ElementType {
         }
     }
 };
+
+
+// The element type of a numpy typestr such as "<f4" or "|u1".
+inline ElementType elementOf(const std::string& typestr)
+{
+    ElementType type;
+    type.kind = typestr[1];
+    type.itemsize = std::size_t(typestr[2] - '0');
+    type.swap = typestr[0] == '>';
+    return type;
+}
 
 }  // namespace vcr

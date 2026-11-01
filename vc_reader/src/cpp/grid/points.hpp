@@ -1,6 +1,5 @@
 // Points on a surface stored as a grid of vertices, at real-valued grid positions:
-// the position, the unit normal and an offset along it, shared by the CPU and CUDA
-// samplers and the Python surface reader.
+// the position and the unit normal, shared by the CPU and CUDA samplers.
 #pragma once
 #include "../geometry/math.hpp"
 
@@ -25,24 +24,23 @@ namespace vcr::grid {
 
 // How grid positions become points: `physical` maps vertex coordinates to physical
 // space (where normals are taken), `destination` maps physical points to the output
-// space; both row-major 3x4. `offset` moves the point along the unit normal (in
-// physical units); `orientation` (+-1) flips the normal.
+// space; both row-major 3x4. `orientation` (+-1) flips the patch normal.
 struct PointMap {
     int height = 0, width = 0;
     float physical[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     float destination[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-    float orientation = 1, offset = 0;
+    float orientation = 1;
 };
 
 // A grid's vertices (height x width x 3 floats, rows contiguous) and what
 // interpolating them needs. A cell is a surface patch only when its four vertices are
-// present (`present`) and in one piece (`piece`, per column; null: one piece). With
+// valid (`valid`) and in one piece (`piece`, per column; null: one piece). With
 // `normals`, normals are those vertex normals interpolated; otherwise they are the
 // patch's. With the Hermite derivatives (du, dv, duv per vertex), patches are bicubic
 // Hermite (smooth); otherwise bilinear.
 struct GridView {
     const float* xyz = nullptr;
-    const bool* present = nullptr;
+    const bool* valid = nullptr;
     const int* piece = nullptr;
     const float* normals = nullptr;
     const float* du = nullptr;
@@ -64,12 +62,11 @@ VCR_POINTS_HD inline Hermite hermite(float t)
 
 // The point at grid position (x = column, y = row): false when no patch covers it.
 // The patch's tangents are taken in physical space, so its normal accounts for
-// anisotropic spacing. `point` gets the mapped point (offset included), `normal`
-// (optional) the unit normal in physical space, and `step` (optional) the move in
-// output coordinates per unit of physical offset along it (destination's linear
-// part applied to the normal).
+// anisotropic spacing. `point` gets the position in vertex coordinates and `step`
+// (optional) the move in output coordinates per unit of physical offset along the unit
+// physical normal (destination's linear part applied to the normal).
 VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const GridView& v, float x, float y, float* point,
-                                                   float* normal, float* step = nullptr)
+                                                   float* step = nullptr)
 {
     using geometry::V;
     using geometry::vector;
@@ -81,7 +78,7 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
     const float u = x - float(col), w = y - float(row);
     const int at[4]{row * g.width + col, row * g.width + col + 1, (row + 1) * g.width + col, (row + 1) * g.width + col + 1};
     for (int k = 0; k < 4; ++k)
-        if (!v.present[at[k]])
+        if (!v.valid[at[k]])
             return false;
     if (v.piece && v.piece[col] != v.piece[col + 1])
         return false;
@@ -123,12 +120,9 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
         return false;
     n = n * (1 / scale);
     n = n * (1 / sqrtf(geometry::dot(n, n)));
-    const V out = geometry::transform(g.destination, geometry::transform(g.physical, position) + n * g.offset);
-    if (!geometry::finite(out))
+    if (!geometry::finite(position))
         return false;
-    geometry::store(point, out);
-    if (normal)
-        geometry::store(normal, n);
+    geometry::store(point, position);
     if (step)
         geometry::store(step, geometry::linear(g.destination, n));
     return true;

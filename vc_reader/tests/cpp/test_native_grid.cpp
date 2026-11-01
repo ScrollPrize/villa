@@ -57,17 +57,17 @@ void testResample()
             }
     }
 
-    // Outside the grid, and on the cells of a missing vertex, there is no point.
-    std::vector<float> holed = xyz;
-    float* hole = &holed[(std::size_t(2) * std::size_t(cols) + std::size_t(3)) * 3];
-    hole[0] = hole[1] = hole[2] = -1.0f;
-    const vcr::grid::Vertices hv{holed.data(), rows, cols, std::size_t(cols) * 3};
+    // Outside the grid, and on the cells of an invalid vertex, there is no point. A
+    // vertex is invalid when its flag says so (its coordinates do not matter).
+    std::vector<std::uint8_t> valid(std::size_t(rows) * std::size_t(cols), 1);
+    valid[std::size_t(2) * std::size_t(cols) + std::size_t(3)] = 0;
+    const vcr::grid::Vertices hv{xyz.data(), rows, cols, std::size_t(cols) * 3, nullptr, valid.data()};
     const vcr::grid::Raster probe{3.0, 2.0, 0.25, 0.25, 5, 1};  // grid x 3.0 .. 4.0 on row 2
     float out[15];
     vcr::grid::Surface nearest(hv);
     nearest.resample(probe, out, nullptr);
     for (int i = 0; i < 4; ++i)  // x 3.0 .. 3.75: the cell (3..4, 2..3) holds the missing vertex
-        require(std::isnan(out[3 * i]), "a cell with a missing vertex has no point");
+        require(std::isnan(out[3 * i]), "a cell with an invalid vertex has no point");
     require(near(out[12], 8.0f) && near(out[13], 6.0f), "the next cell is a patch");
     for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
         vcr::grid::Surface s(hv, {mode});
@@ -78,13 +78,29 @@ void testResample()
         for (std::size_t i = 0; i < q.size(); i += 3) {
             points += !std::isnan(q[i]);
             require(std::isnan(q[i]) || (q[i] >= 1.999f && q[i] <= 10.001f && q[i + 1] >= -0.001f && near(q[i + 2], 10.0f)),
-                    "positions are made of present vertices only");
+                    "positions are made of valid vertices only");
         }
         require(points > 0, "cells away from the hole are patches");
     }
     const vcr::grid::Raster outside{-3.0, 1.0, 1.0, 1.0, 2, 1};
     nearest.resample(outside, out, nullptr);
     require(std::isnan(out[0]) && std::isnan(out[3]), "outside the grid");
+    {
+        std::vector<float> nanHole = xyz;
+        nanHole[(std::size_t(2) * std::size_t(cols) + std::size_t(3)) * 3 + 1] = NAN;
+        vcr::grid::Surface unflagged({nanHole.data(), rows, cols, std::size_t(cols) * 3});
+        unflagged.resample(probe, out, nullptr);
+        require(std::isnan(out[0]) && near(out[12], 8.0f), "without flags, a NaN vertex is invalid");
+    }
+    // Flipped normals: the patch normal is negated, a vertex normal is not.
+    {
+        vcr::grid::SurfaceOptions flipped;
+        flipped.flipNormals = true;
+        float p[3], n[3];
+        vcr::grid::Surface s(v, flipped);
+        s.resample({1.5, 1.5, 1, 1, 1, 1}, p, n);
+        require(near(n[2], -1.0f), "flipped patch normal");
+    }
 
     // Anisotropic spacing: the sheet z = x (in vertex units) with voxels twice as long
     // in z is z = 2x physically, so its unit physical normal is (-2, 0, 1) / sqrt(5), and

@@ -73,14 +73,14 @@ target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl P
 
 if(VC_READER_ENABLE_CUDA)
     add_library(vc_reader_reader_cuda STATIC
-        src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/surface/kernels.cu
+        src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/projection/kernels.cu
         src/cpp/sheet_normal/kernels.cu src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu
         src/cpp/grid/kernels.cu)
     add_library(vc_reader::reader_cuda ALIAS vc_reader_reader_cuda)
     set_target_properties(vc_reader_reader_cuda PROPERTIES EXPORT_NAME reader_cuda
         POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     # Separate float32 rounding preserves geometric ties and filter agreement.
-    set_source_files_properties(src/cpp/surface/kernels.cu src/cpp/sheet_normal/kernels.cu
+    set_source_files_properties(src/cpp/projection/kernels.cu src/cpp/sheet_normal/kernels.cu
         src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu src/cpp/grid/kernels.cu
         PROPERTIES COMPILE_OPTIONS "--fmad=false")
     target_compile_definitions(vc_reader_reader_cuda PUBLIC VC_READER_CUDA=1)

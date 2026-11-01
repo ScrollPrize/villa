@@ -363,14 +363,15 @@ inline void bind(nb::module_& m)
             }
             return pairOf(std::move(*value));
         }, "name"_a, "start"_a, "size"_a)
-        .def("render_surface", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsets) {
+        .def("render_surface", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::vector<double>& offsets, const std::string& interpolation) {
+            const auto mode = grid::interpolationNamed(interpolation);
             std::optional<SampleResult> value;
             {
                 nb::gil_scoped_release release;
-                value = r.renderSurface(surface, start, size, offsets);
+                value = r.renderSurface(surface, start, size, offsets, mode);
             }
             return sampleResult(*value);
-        }, "surface"_a, "start"_a, "size"_a, "offsets_um"_a)
+        }, "surface"_a, "start"_a, "size"_a, "offsets_um"_a, "interpolation"_a)
         .def("projection", [](SampleReader& r, const Surface& surface, const Pair& start, const Pair& size, const std::string& label, double thickness, double padding) {
             nb::gil_scoped_release release;
             return r.projection(surface, start, size, label, thickness, padding);
@@ -413,21 +414,5 @@ inline void bind(nb::module_& m)
             }
             return pairOf(std::move(*value));
         }, "name"_a, "start"_a, "size"_a);
-    auto geometry = nb::class_<SurfaceGeometry, AlignedEngine>(m, "SurfaceGeometry");
-    bindEngineCommon(geometry);
-    geometry.def("__init__", [](SurfaceGeometry* self, const Surface& surface, std::size_t cache, std::size_t work, nb::object options, std::shared_ptr<DecodedCache> decoded) {
-            auto settings = alignedOptions("cpu", 0, cache, work, 0, std::size_t(512) << 20, std::move(options), std::move(decoded));
-            nb::gil_scoped_release release;
-            new (self) SurfaceGeometry(surface, std::move(settings));
-        })
-        .def_prop_ro("shape", &SurfaceGeometry::shape)
-        .def("read_points", [](SurfaceGeometry& g, const Pair& start, const Pair& size, const std::vector<double>& offsets) {
-            std::optional<std::pair<Block, Block>> value;
-            {
-                nb::gil_scoped_release release;
-                value = g.readPoints(start, size, offsets);
-            }
-            return nb::make_tuple(toArray(value->first), toArray(value->second));
-        }, "start"_a, "size"_a, "offsets_um"_a);
 }
 } // namespace vcr::sources::python

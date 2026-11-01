@@ -65,10 +65,8 @@ TEST_CASE("QuadSurface(path,json) with components: the grid is never interpolate
     CHECK(options.components[1] == std::pair{8, 16});
 
     // Grid columns 6.5, 7.5 (the seam cell) and 8.5 of row 3.
-    const auto* points = qs.rawPointsPtr();
-    const vcr::grid::Surface surface({reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
-                                      points->step1()},
-                                     options);
+    std::vector<std::uint8_t> valid;
+    const vcr::grid::Surface surface(qs.gridVertices(valid), options);
     const auto origin = qs.gridToSurface({6.5, 3.0});
     float xyz[9];
     surface.resample(qs.gridRaster(origin[0], origin[1], 1.0, cv::Size(3, 1)), xyz, nullptr);
@@ -103,10 +101,8 @@ TEST_CASE("components-meta ranges are clamped to the grid and empty ones ignored
     QuadSurface qs(segDir, j);
     qs.ensureLoaded();
     // [0, 100) clamps to every column: one piece, interpolated everywhere.
-    const auto* points = qs.rawPointsPtr();
-    const vcr::grid::Surface surface({reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols,
-                                      points->step1()},
-                                     qs.gridOptions());
+    std::vector<std::uint8_t> valid;
+    const vcr::grid::Surface surface(qs.gridVertices(valid), qs.gridOptions());
     const auto origin = qs.gridToSurface({0.5, 3.0});
     float xyz[7 * 3];
     surface.resample(qs.gridRaster(origin[0], origin[1], 1.0, cv::Size(7, 1)), xyz, nullptr);

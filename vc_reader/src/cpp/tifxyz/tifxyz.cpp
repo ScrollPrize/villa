@@ -4,6 +4,7 @@
 #include "vc_reader/sources.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
+#include "../element_type.hpp"
 #include "../rounding.hpp"
 
 #include <unistd.h>
@@ -44,6 +45,7 @@ std::string readText(const std::string& location, const sources::OptionsFor& opt
     files.close();
     return text;
 }
+// Settings for one-off reads: no decoded cache, no decode limit.
 sources::SourceReader::Settings settingsOf(const sources::OptionsFor& options)
 {
     sources::SourceReader::Settings settings;
@@ -52,33 +54,76 @@ sources::SourceReader::Settings settingsOf(const sources::OptionsFor& options)
     settings.maxDecodeBytes = std::numeric_limits<std::size_t>::max() / 2;
     return settings;
 }
-// One coordinate image, whole, as stored values.
-sources::Block readGrid(const std::string& location, const sources::OptionsFor& options)
+// One image of the directory open with the declared axes (checked against the file).
+std::unique_ptr<sources::SourceReader> openImage(const std::string& path, const char* role, std::vector<std::string> axes, const sources::SourceReader::Settings& settings)
 {
-    return sources::readImage(location, resolved(options), std::vector<std::string>{"y", "x"});
+    sources::Source source;
+    source.id = path;
+    source.storage.location = path;
+    source.storage.format = "tiff";
+    source.role = role;
+    source.axes = std::move(axes);
+    auto reader = std::make_unique<sources::SourceReader>(sources::finished(std::move(source)), settings);
+    (void)reader->shape();
+    return reader;
 }
-template <class T>
-void toFloats(const std::uint8_t* data, std::size_t n, float* out, std::size_t stride)
+// mask.tif as YX or as pages (ZYX, the first counts); null when there is none.
+std::unique_ptr<sources::SourceReader> openMask(const std::string& location, const sources::SourceReader::Settings& settings)
 {
-    for (std::size_t i = 0; i < n; ++i) {
-        T value;
-        std::memcpy(&value, data + i * sizeof(T), sizeof(T));
-        out[i * stride] = float(value);
+    const auto path = child(location, "mask.tif");
+    try {
+        try {
+            return openImage(path, "label", {"y", "x"}, settings);
+        } catch (const std::invalid_argument&) {
+            return openImage(path, "label", {"z", "y", "x"}, settings);
+        }
+    } catch (const zarr::NotFound&) {
+        return nullptr;
     }
 }
-// The first-axis component of a coordinate image into every third float.
-void copyComponent(const sources::Block& block, float* out)
+// How a mask's pixels cover a grid of rows x cols: an integer number per vertex each way.
+struct MaskGrid {
+    std::int64_t factorY = 1, factorX = 1;
+    bool pages = false;
+};
+MaskGrid maskGridOf(sources::SourceReader& mask, std::int64_t rows, std::int64_t cols, const std::string& location)
 {
-    const auto n = block.nbytes / block.itemsize();
-    const auto& d = block.dtype;
-    if (d == "<f4") toFloats<float>(block.data.get(), n, out, 3);
-    else if (d == "<f8") toFloats<double>(block.data.get(), n, out, 3);
-    else if (d == "|u1") toFloats<std::uint8_t>(block.data.get(), n, out, 3);
-    else if (d == "<u2") toFloats<std::uint16_t>(block.data.get(), n, out, 3);
-    else if (d == "<i2") toFloats<std::int16_t>(block.data.get(), n, out, 3);
-    else if (d == "<u4") toFloats<std::uint32_t>(block.data.get(), n, out, 3);
-    else if (d == "<i4") toFloats<std::int32_t>(block.data.get(), n, out, 3);
-    else bad("tifxyz coordinates of dtype " + d + " are not supported");
+    const auto& shape = mask.shape();
+    const auto height = shape[shape.size() - 2], width = shape[shape.size() - 1];
+    if (height % rows || width % cols)
+        bad(child(location, "mask.tif") + ": tifxyz mask shape (" + std::to_string(height) + ", " + std::to_string(width) + ") does not match the coordinate grid");
+    return {height / rows, width / cols, shape.size() == 3};
+}
+// Clears `valid` of the vertices in the window (rows x cols from grid row r0, column c0) whose
+// mask block has a zero pixel.
+void applyMask(sources::SourceReader& mask, const MaskGrid& g, std::int64_t r0, std::int64_t c0, std::int64_t rows, std::int64_t cols, std::uint8_t* valid)
+{
+    std::vector<std::int64_t> start{r0 * g.factorY, c0 * g.factorX}, size{rows * g.factorY, cols * g.factorX};
+    if (g.pages) {
+        start.insert(start.begin(), 0);
+        size.insert(size.begin(), 1);
+    }
+    const auto stored = mask.read(start, size);
+    const auto item = stored.itemsize();
+    const auto height = rows * g.factorY, width = cols * g.factorX;
+    for (std::int64_t y = 0; y < height; ++y)
+        for (std::int64_t x = 0; x < width; ++x) {
+            const auto* p = stored.data.get() + (std::size_t(y) * std::size_t(width) + std::size_t(x)) * item;
+            if (std::all_of(p, p + item, [](std::uint8_t b) { return b == 0; })) valid[std::size_t(y / g.factorY) * std::size_t(cols) + std::size_t(x / g.factorX)] = 0;
+        }
+}
+// A block's values as floats, every `stride`th output.
+void toFloats(const sources::Block& block, float* out, std::size_t stride)
+{
+    const auto type = elementOf(block.dtype);
+    if (type.kind != 'f' && type.kind != 'u' && type.kind != 'i') bad("tifxyz coordinates of dtype " + block.dtype + " are not supported");
+    const auto n = block.nbytes / type.itemsize;
+    const auto* data = block.data.get();
+    if (block.dtype == "<f4") {
+        for (std::size_t i = 0; i < n; ++i) std::memcpy(out + i * stride, data + i * 4, 4);
+        return;
+    }
+    for (std::size_t i = 0; i < n; ++i) out[i * stride] = float(type.load(data + i * type.itemsize));
 }
 std::string newUuid()
 {
@@ -105,6 +150,70 @@ bool hasMissingMarker(const Bounds& bbox)
     return std::any_of(bbox.begin(), bbox.end(), [](double v) { return v == -1.0; });
 }
 
+grid::Raster fullRaster(const std::array<double, 2>& scale, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size)
+{
+    if (size[0] <= 0 || size[1] <= 0 || size[0] >= (1LL << 31) || size[1] >= (1LL << 31)) bad("full-resolution window must have a positive size");
+    const auto [sy, sx] = scale;
+    return grid::Raster{double(start[1]) * sx, double(start[0]) * sy, sx, sy, int(size[1]), int(size[0])};
+}
+
+// ---- Reader ----
+struct Reader::Impl {
+    std::string location;
+    Metadata metadata;
+    std::unique_ptr<sources::SourceReader> xyz[3], mask;
+    MaskGrid maskGrid;
+    std::array<std::int64_t, 2> shape{};
+};
+
+Reader::Reader(std::string location, bool useMask, sources::SourceReader::Settings settings) : impl_(std::make_unique<Impl>())
+{
+    auto& s = *impl_;
+    s.location = trimmed(std::move(location));
+    if (!settings.options) settings.options = sources::defaultOptions();
+    s.metadata = readMetadata(s.location, settings.options);
+    const char* names[3]{"x.tif", "y.tif", "z.tif"};
+    for (std::size_t a = 0; a < 3; ++a) {
+        s.xyz[a] = openImage(child(s.location, names[a]), "scalar", {"y", "x"}, settings);
+        const auto& shape = s.xyz[a]->shape();
+        if (!a) s.shape = {shape[0], shape[1]};
+        else if (shape[0] != s.shape[0] || shape[1] != s.shape[1]) bad(s.location + ": tifxyz coordinates require matching YX grids");
+    }
+    if (useMask) {
+        s.mask = openMask(s.location, settings);
+        if (s.mask) s.maskGrid = maskGridOf(*s.mask, s.shape[0], s.shape[1], s.location);
+    }
+}
+
+Reader::~Reader() = default;
+const std::string& Reader::location() const { return impl_->location; }
+const Metadata& Reader::metadata() const { return impl_->metadata; }
+std::array<std::int64_t, 2> Reader::shape() const { return impl_->shape; }
+
+Coordinates Reader::window(const std::array<std::int64_t, 4>& box)
+{
+    auto& s = *impl_;
+    if (box[2] <= 0 || box[3] <= 0 || box[0] < 0 || box[1] < 0 || box[0] + box[2] > s.shape[0] || box[1] + box[3] > s.shape[1]) bad(s.location + ": window is outside the coordinate grid");
+    Coordinates out;
+    out.whole = s.shape;
+    out.rows = box[2];
+    out.cols = box[3];
+    const auto cells = std::size_t(box[2]) * std::size_t(box[3]);
+    out.xyz.resize(cells * 3);
+    for (std::size_t a = 0; a < 3; ++a) {
+        const auto block = s.xyz[a]->read({box[0], box[1]}, {box[2], box[3]});
+        out.storedBytes += block.nbytes;
+        toFloats(block, out.xyz.data() + a, 3);
+    }
+    out.valid.resize(cells);
+    for (std::size_t i = 0; i < cells; ++i) out.valid[i] = vertexValid(out.xyz.data() + i * 3);
+    if (s.mask) applyMask(*s.mask, s.maskGrid, box[0], box[1], box[2], box[3], out.valid.data());
+    return out;
+}
+
+Coordinates Reader::whole() { return window({0, 0, impl_->shape[0], impl_->shape[1]}); }
+
+// ---- Surface ----
 struct Surface::Interpolators {
     std::once_flag once[2];
     std::unique_ptr<grid::Surface> surfaces[2];
@@ -120,9 +229,8 @@ Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, s
     valid_.resize(cells);
     for (std::size_t i = 0; i < cells; ++i) {
         float* p = xyz_.data() + i * 3;
-        const bool present = vertexPresent(p) && (mask.empty() || mask[i]);
-        valid_[i] = present;
-        if (!present) p[0] = p[1] = p[2] = -1.f;
+        valid_[i] = vertexValid(p) && (mask.empty() || mask[i]);
+        if (!valid_[i]) p[0] = p[1] = p[2] = -1.f;
     }
 }
 
@@ -170,7 +278,7 @@ const grid::Surface& Surface::interpolator(grid::Interpolation interpolation) co
     std::call_once(interpolators_->once[k], [&] {
         grid::SurfaceOptions options;
         options.interpolation = interpolation;
-        interpolators_->surfaces[k] = std::make_unique<grid::Surface>(grid::Vertices{xyz_.data(), int(rows_), int(cols_), std::size_t(cols_) * 3}, options);
+        interpolators_->surfaces[k] = std::make_unique<grid::Surface>(grid::Vertices{xyz_.data(), int(rows_), int(cols_), std::size_t(cols_) * 3, nullptr, valid_.data()}, options);
     });
     return *interpolators_->surfaces[k];
 }
@@ -187,52 +295,18 @@ void Surface::resample(const grid::Raster& raster, grid::Interpolation interpola
 
 grid::Raster Surface::fullRaster(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size) const
 {
-    if (size[0] <= 0 || size[1] <= 0 || size[0] >= (1LL << 31) || size[1] >= (1LL << 31)) bad("full-resolution window must have a positive size");
-    const auto [sy, sx] = metadata_.scale;
-    return grid::Raster{double(start[1]) * sx, double(start[0]) * sy, sx, sy, int(size[1]), int(size[0])};
+    return tifxyz::fullRaster(metadata_.scale, start, size);
 }
 
+// ---- files ----
 std::vector<std::uint8_t> readMask(const std::string& location, std::int64_t rows, std::int64_t cols, const sources::OptionsFor& options)
 {
-    const auto path = child(location, "mask.tif");
-    const auto open = [&](std::vector<std::string> axes) {
-        sources::Source source;
-        source.id = path;
-        source.storage.location = path;
-        source.storage.format = "tiff";
-        source.role = "label";
-        source.axes = std::move(axes);
-        auto reader = std::make_unique<sources::SourceReader>(sources::finished(std::move(source)), settingsOf(options));
-        (void)reader->shape();  // opens it: the declared axes are checked against the file
-        return reader;
-    };
-    std::unique_ptr<sources::SourceReader> reader;
-    try {
-        try {
-            reader = open({"y", "x"});
-        } catch (const std::invalid_argument&) {
-            reader = open({"z", "y", "x"});
-        }
-    } catch (const zarr::NotFound&) {
-        return {};
-    }
-    const auto& shape = reader->shape();
-    const auto height = shape[shape.size() - 2], width = shape[shape.size() - 1];
-    std::vector<std::int64_t> start(shape.size(), 0), size(shape.size(), 1);
-    size[shape.size() - 2] = height;
-    size[shape.size() - 1] = width;
-    if (height % rows || width % cols)
-        bad(path + ": tifxyz mask shape (" + std::to_string(height) + ", " + std::to_string(width) + ") does not match the coordinate grid");
-    const auto stored = reader->read(start, size);
-    const auto item = stored.itemsize();
-    const auto factorY = height / rows, factorX = width / cols;
-    std::vector<std::uint8_t> mask(std::size_t(rows) * std::size_t(cols), 1);
-    for (std::int64_t y = 0; y < height; ++y)
-        for (std::int64_t x = 0; x < width; ++x) {
-            const auto* p = stored.data.get() + (std::size_t(y) * std::size_t(width) + std::size_t(x)) * item;
-            if (std::all_of(p, p + item, [](std::uint8_t b) { return b == 0; })) mask[std::size_t(y / factorY) * std::size_t(cols) + std::size_t(x / factorX)] = 0;
-        }
-    return mask;
+    const auto mask = openMask(location, settingsOf(options));
+    if (!mask) return {};
+    const auto g = maskGridOf(*mask, rows, cols, location);
+    std::vector<std::uint8_t> valid(std::size_t(rows) * std::size_t(cols), 1);
+    applyMask(*mask, g, 0, 0, rows, cols, valid.data());
+    return valid;
 }
 
 Metadata parseMetadata(const json& document, const std::string& location)
@@ -266,53 +340,10 @@ Metadata readMetadata(const std::string& location, const sources::OptionsFor& op
 
 Surface read(const std::string& location, bool useMask, const sources::OptionsFor& options)
 {
-    auto metadata = readMetadata(location, options);
-    const auto x = readGrid(child(location, "x.tif"), options);
-    const auto y = readGrid(child(location, "y.tif"), options);
-    const auto z = readGrid(child(location, "z.tif"), options);
-    if (x.shape.size() != 2 || x.shape != y.shape || x.shape != z.shape) bad(location + ": tifxyz coordinates require matching YX grids");
-    const auto cells = std::size_t(x.shape[0]) * std::size_t(x.shape[1]);
-    std::vector<float> xyz(cells * 3);
-    copyComponent(x, xyz.data());
-    copyComponent(y, xyz.data() + 1);
-    copyComponent(z, xyz.data() + 2);
-    std::vector<std::uint8_t> mask;
-    if (useMask) mask = readMask(location, x.shape[0], x.shape[1], options);
-    Surface out(x.shape[0], x.shape[1], std::move(xyz), std::move(mask), std::move(metadata), location);
+    Reader reader(location, useMask, settingsOf(options));
+    auto stored = reader.whole();
+    Surface out(stored.rows, stored.cols, std::move(stored.xyz), std::move(stored.valid), reader.metadata(), reader.location());
     if (out.metadata().bbox && hasMissingMarker(*out.metadata().bbox)) out.metadata().bbox = out.bounds();
-    return out;
-}
-
-Coordinates readCoordinates(const std::string& location, const std::optional<std::array<std::int64_t, 4>>& window, const sources::OptionsFor& options)
-{
-    Coordinates out;
-    const auto component = [&](const std::string& name, std::size_t axis) {
-        sources::Source source;
-        source.id = child(location, name);
-        source.storage.location = source.id;
-        source.storage.format = "tiff";
-        source.role = "scalar";
-        source.axes = std::vector<std::string>{"y", "x"};
-        auto settings = settingsOf(options);
-        settings.decodedCacheBytes = std::nullopt;
-        sources::SourceReader reader(sources::finished(std::move(source)), std::move(settings));
-        const auto& shape = reader.shape();
-        const std::array<std::int64_t, 2> whole{shape[0], shape[1]};
-        const auto box = window.value_or(std::array<std::int64_t, 4>{0, 0, shape[0], shape[1]});
-        if (box[2] <= 0 || box[3] <= 0 || box[0] < 0 || box[1] < 0 || box[0] + box[2] > shape[0] || box[1] + box[3] > shape[1]) bad(location + ": window is outside the coordinate grid");
-        if (!axis) {
-            out.whole = whole;
-            out.rows = box[2];
-            out.cols = box[3];
-            out.xyz.resize(std::size_t(box[2]) * std::size_t(box[3]) * 3);
-        } else if (whole != out.whole) {
-            bad(location + ": tifxyz coordinates require matching YX grids");
-        }
-        copyComponent(reader.read({box[0], box[1]}, {box[2], box[3]}), out.xyz.data() + axis);
-    };
-    component("x.tif", 0);
-    component("y.tif", 1);
-    component("z.tif", 2);
     return out;
 }
 
