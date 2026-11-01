@@ -722,6 +722,7 @@ vc_register_ctest(fiber_3d_surface test_fiber_3d_surface)
 
 add_executable(test_fiber_3d_canvas test_fiber_3d_canvas.cpp
     ../fibers3d/Fiber3DCanvas.cpp
+    ../scene3d/Scene3DCanvas.cpp
     ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp
     ../fibers3d/Fiber3DVolumeRenderer.cpp ../volume_viewers/VolumetricCompositor.cpp
     ../fibers3d/Fiber3DSurfaceRenderer.cpp ../fibers3d/Fiber3DSurfaceProximity.cpp)

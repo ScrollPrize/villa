@@ -34,10 +34,7 @@ inline void expand(Bounds& bounds, const Point& p)
         bounds.upper[k] = std::max(bounds.upper[k], p[k]);
     }
 }
-inline double distance(const Point& a, const Point& b)
-{
-    return std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-}
+using scene3d::distance;
 struct Chunk {
     Bounds bounds = emptyBounds();
     size_t fiber = 0, run = 0, first = 0, end = 0;

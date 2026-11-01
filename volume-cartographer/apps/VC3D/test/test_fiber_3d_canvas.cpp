@@ -41,22 +41,33 @@ private slots:
     void ctSlicesRenderWithoutARibbon_data()
     {
         QTest::addColumn<bool>("volumetric");
-        QTest::newRow("single-slice") << false;
-        QTest::newRow("volumetric-slab") << true;
+        QTest::addColumn<bool>("withFibers");
+        QTest::newRow("single-slice") << false << true;
+        QTest::newRow("ct-only-slice") << false << false;
+        QTest::newRow("volumetric-slab") << true << true;
+        QTest::newRow("ct-only-volume") << true << false;
     }
     void ctSlicesRenderWithoutARibbon()
     {
         QFETCH(bool, volumetric);
-        Fiber3DCanvas canvas;
+        QFETCH(bool, withFibers);
+        QWidget container;
+        container.resize(480, 360);
+        std::unique_ptr<vc3d::scene3d::Scene3DCanvas> view;
+        if (withFibers) view = std::make_unique<Fiber3DCanvas>();
+        else view = std::make_unique<vc3d::scene3d::Scene3DCanvas>();
+        auto& canvas = *view;
         canvas.resize(480, 360);
         canvas.show();
         QVERIFY(QTest::qWaitForWindowExposed(&canvas));
-        if (!canvas.isValid())
-            QSKIP("OpenGL 3.3 widget unavailable");
-        auto scene = line("fiber");
-        canvas.setScene(scene);
-        QTRY_VERIFY(canvas.scene() == scene && !canvas.isPreparing());
-        canvas.fitAll();
+        QVERIFY(canvas.isValid());
+        if (withFibers) {
+            auto& fibers = static_cast<Fiber3DCanvas&>(canvas);
+            auto scene = line("fiber");
+            fibers.setScene(scene);
+            QTRY_VERIFY(fibers.scene() == scene && !fibers.isPreparing());
+            fibers.fitAll();
+        }
         const int without = grayPixels(canvas.grabFramebuffer());
         auto image = std::make_shared<slices::Image>();
         image->plane = {0, {-20,-12,0}, {40,0,0}, {0,24,0}, 2, 2};
@@ -75,6 +86,37 @@ private slots:
         QTRY_VERIFY(grayPixels(canvas.grabFramebuffer()) > without + 1000);
         canvas.setCTSlices({});
         QTRY_COMPARE(grayPixels(canvas.grabFramebuffer()), without);
+        canvas.setCTSlices({image});
+        // Moving a widget between top-level windows recreates its GL context.
+        // Both base and fiber resources must be released and uploaded again.
+        canvas.setParent(&container);
+        container.show();
+        canvas.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&container));
+        QTRY_VERIFY(grayPixels(canvas.grabFramebuffer()) > without + 1000);
+    }
+    void surfaceWithoutFibers()
+    {
+        vc3d::scene3d::Scene3DCanvas canvas;
+        canvas.resize(480, 360);
+        canvas.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        QVERIFY(canvas.isValid());
+        const auto empty = canvas.grabFramebuffer();
+        auto mesh = std::make_shared<surface::Mesh>();
+        mesh->bounds = {{-20,-20,0}, {20,20,0}};
+        mesh->vertices = {{{-20,-20,0},{0,0,1}}, {{20,-20,0},{0,0,1}}, {{0,20,0},{0,0,1}}};
+        mesh->indices = {0,1,2};
+        canvas.setSurfaceMesh(mesh);
+        canvas.fitAll();
+        QTRY_VERIFY(canvas.isSurfaceMeshReady());
+        QVERIFY(canvas.grabFramebuffer() != empty);
+        canvas.setSurfaceVisible(false);
+        QCOMPARE(canvas.grabFramebuffer(), empty);
+        canvas.setSurfaceVisible(true);
+        QTRY_VERIFY(canvas.grabFramebuffer() != empty);
+        canvas.setSurfaceMesh({});
+        QCOMPARE(canvas.grabFramebuffer(), empty);
     }
     void pinnedFiberKeepsPaletteAndDisplaysRibbon()
     {

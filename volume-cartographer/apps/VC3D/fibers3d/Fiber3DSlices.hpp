@@ -1,6 +1,7 @@
 #pragma once
 #include "Fiber3DCT.hpp"
 #include <memory>
+#include <optional>
 
 namespace vc3d::fibers3d::slices
 {

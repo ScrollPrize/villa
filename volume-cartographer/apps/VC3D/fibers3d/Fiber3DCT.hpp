@@ -1,5 +1,9 @@
 #pragma once
-#include "Fiber3DScene.hpp"
+#include "scene3d/Scene3DGeometry.hpp"
+#include <vector>
+#include <cstdint>
+
+namespace vc3d::fibers3d { using scene3d::Point; using scene3d::Bounds; }
 #include <atomic>
 
 class Volume;
