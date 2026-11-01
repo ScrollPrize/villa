@@ -1544,7 +1544,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
-            viewer->renderVisible(true);
+            viewer->renderVisible();
         }
     });
 
@@ -1555,7 +1555,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
         VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
         if (viewer) {
-            viewer->resetViewForCurrentContent(true);
+            viewer->resetViewForCurrentContent();
         }
     });
 

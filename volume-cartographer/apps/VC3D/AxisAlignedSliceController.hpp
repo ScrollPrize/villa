@@ -98,13 +98,12 @@ private:
 
     QTimer* _rotationTimer{nullptr};
     bool _orientationDirty{false};
-    double _pendingOrientationMotionPx{0.0};
     // Azimuth last folded into each plane by applyOrientation, keyed by
     // surface name; lets syncVolumetricAzimuths skip no-op reconfigures.
     std::unordered_map<std::string, float> _appliedVolumetricAzimuthDeg;
 
     void processOrientationUpdate();
-    void notifyInteractiveOrientationViewers(double motionPx);
+    void notifyInteractiveOrientationViewers();
     void updateTiltHandles();
     void attachViewer(VolumeViewerBase* baseViewer);
 };

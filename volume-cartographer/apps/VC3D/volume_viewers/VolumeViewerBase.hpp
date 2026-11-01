@@ -70,30 +70,21 @@ public:
     virtual void setSurface(const std::string& name) = 0;
     virtual void setIntersects(const std::set<std::string>& names) = 0;
     virtual void renderVisible(
-        bool force = false,
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
     virtual void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
-    // Called by ViewerManager's global maintenance clock. Render requests submit
-    // immediately; this hook is for non-render maintenance such as deferred
-    // intersections and status refreshes.
-    virtual void serviceRenderTick() {}
+    // Called by ViewerManager's status clock every few seconds.
+    virtual void refreshStatus() {}
     virtual void invalidateVis() = 0;
-    virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
-    {
-        (void)name;
-        (void)changedCells;
-        invalidateVis();
-    }
-    virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
-    virtual void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) = 0;
+    virtual void centerOnVolumePoint(const cv::Vec3f& point) = 0;
+    virtual void centerOnSurfacePoint(const cv::Vec2f& point) = 0;
     virtual void adjustZoomByFactor(float factor) = 0;
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
-    virtual void resetViewForCurrentContent(bool forceRender = false) { (void)forceRender; }
+    virtual void resetViewForCurrentContent() {}
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;
@@ -103,9 +94,7 @@ public:
 
     // --- Display settings ---
     virtual float getCurrentScale() const = 0;
-    virtual float dsScale() const = 0;
     virtual float normalOffset() const = 0;
-    virtual int datasetScaleIndex() const = 0;
 
     // --- Surface normal hints ---
     virtual bool isShowSurfaceNormals() const = 0;

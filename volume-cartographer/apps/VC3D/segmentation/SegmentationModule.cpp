@@ -1900,16 +1900,8 @@ void SegmentationModule::refreshEditedRegion(VolumeViewerBase* editViewer)
 {
     if (!_editManager)
         return;
-    std::optional<cv::Rect> changedCells;
-    if (const auto touched = _editManager->recentTouchedBounds()) {
-        changedCells = cv::Rect(touched->x - 1, touched->y - 1,
-                                touched->width + 2, touched->height + 2);
-    }
     const auto refresh = [&](VolumeViewerBase* viewer) {
-        if (changedCells)
-            viewer->invalidateVisRegion("segmentation", *changedCells);
-        else
-            viewer->invalidateVis();
+        viewer->invalidateVis();
         viewer->requestRender("segmentation edit refresh");
     };
     if (editViewer)

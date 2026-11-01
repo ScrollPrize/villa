@@ -294,7 +294,6 @@ void AxisAlignedSliceController::onTiltHandleChanged(VolumeViewerBase* viewer, Q
         return;
     }
 
-    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, 96.0);
     scheduleOrientationUpdate();
     updateTiltHandles();
 }
@@ -348,7 +347,6 @@ void AxisAlignedSliceController::onMouseMove(VolumeViewerBase* viewer, const cv:
     }
 
     setRotationDegrees(surfaceName, candidate);
-    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, std::abs(double(dragPixels)));
     scheduleOrientationUpdate();
 }
 
@@ -617,11 +615,9 @@ void AxisAlignedSliceController::flushOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
-    const double motionPx = _pendingOrientationMotionPx;
     cancelOrientationTimer();
     applyOrientation();
-    notifyInteractiveOrientationViewers(motionPx);
-    _pendingOrientationMotionPx = 0.0;
+    notifyInteractiveOrientationViewers();
 }
 
 void AxisAlignedSliceController::processOrientationUpdate()
@@ -629,11 +625,9 @@ void AxisAlignedSliceController::processOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
-    const double motionPx = _pendingOrientationMotionPx;
     _orientationDirty = false;
-    _pendingOrientationMotionPx = 0.0;
     applyOrientation();
-    notifyInteractiveOrientationViewers(motionPx);
+    notifyInteractiveOrientationViewers();
 }
 
 void AxisAlignedSliceController::cancelOrientationTimer()
@@ -644,21 +638,20 @@ void AxisAlignedSliceController::cancelOrientationTimer()
     _orientationDirty = false;
 }
 
-void AxisAlignedSliceController::notifyInteractiveOrientationViewers(double motionPx)
+void AxisAlignedSliceController::notifyInteractiveOrientationViewers()
 {
     if (!_viewerManager) {
         return;
     }
 
-    const double clampedMotionPx = std::max(0.0, motionPx);
-    _viewerManager->forEachBaseViewer([clampedMotionPx](VolumeViewerBase* viewer) {
+    _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
             if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
-                chunkedViewer->notifyInteractiveViewChange(clampedMotionPx);
+                chunkedViewer->notifyInteractiveViewChange();
             }
         }
     });

@@ -64,32 +64,11 @@ QString compactViewerLabel(const std::string& surfaceName, const QString& title)
     return {};
 }
 
-bool isChunkedViewer(VolumeViewerBase* viewer)
-{
-    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
-}
-
 bool isAnnotationViewer(VolumeViewerBase* viewer)
 {
     return viewer &&
            viewer->asQObject() &&
            viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
-}
-
-void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
-}
-
-void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
 }
 
 bool finiteVec3(const cv::Vec3f& v)
@@ -186,12 +165,11 @@ ViewerManager::ViewerManager(CState* state,
                 &ViewerManager::handleFocusPoiChanged);
     }
 
-    // The single maintenance clock for the whole app: ~60Hz, free-running. Render
-    // requests submit immediately; this services deferred intersections and status.
-    _globalClock = new QTimer(this);
-    _globalClock->setInterval(16);
-    connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
-    _globalClock->start();
+    // Every viewer refreshes its status readout (download progress) every 5 s.
+    _statusClock = new QTimer(this);
+    _statusClock->setInterval(5000);
+    connect(_statusClock, &QTimer::timeout, this, &ViewerManager::onStatusTick);
+    _statusClock->start();
 }
 
 ViewerManager::~ViewerManager()
@@ -205,11 +183,11 @@ const std::vector<ViewerManager*>& ViewerManager::allManagers()
     return managerRegistry();
 }
 
-void ViewerManager::onGlobalTick()
+void ViewerManager::onStatusTick()
 {
     for (auto* v : _baseViewers) {
         if (v)
-            v->serviceRenderTick();
+            v->refreshStatus();
     }
 }
 
@@ -606,7 +584,7 @@ bool ViewerManager::recenterViewersOnCurrentFocus()
     const cv::Vec3f position = focus->p;
     forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (viewer && !isAnnotationViewer(viewer)) {
-            centerViewerOnVolumePointForNavigation(viewer, position);
+            viewer->centerOnVolumePoint(position);
         }
     });
 
@@ -622,7 +600,7 @@ void ViewerManager::recenterPlaneViewersOn(const cv::Vec3f& position)
 
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
-            centerViewerOnVolumePointForNavigation(viewer, position);
+            viewer->centerOnVolumePoint(position);
         }
     });
 }
@@ -646,7 +624,7 @@ void ViewerManager::recenterSegmentationViewerNear(const cv::Vec3f& position)
 
     if (const auto hit = locate(*activeSurface, position, kMaxDistanceVoxels)) {
         const cv::Vec3f loc = activeSurface->loc(hit->ptr);
-        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
+        viewer->centerOnSurfacePoint({loc[0], loc[1]});
     }
 }
 
@@ -808,8 +786,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
         }
 
         viewer->centerOnVolumePoint(
-            clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
-            false);
+            clampToVolumeBounds(*transformedCenter, _state->currentVolume()));
         auto camera = viewer->cameraState();
         camera.scale = captured.camera.scale;
         if (navigationScale) {
@@ -820,15 +797,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
             ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
                                  *navigationScale)
             : captured.camera.zOffset;
-        camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
-        if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
-            const auto direction = transformNormal(
-                captured.camera.zOffsetWorldDir, transform);
-            if (finiteVec3(direction)) {
-                camera.zOffsetWorldDir = direction;
-            }
-        }
-        viewer->applyCameraState(camera, false);
+        viewer->applyCameraState(camera);
     }
 }
 

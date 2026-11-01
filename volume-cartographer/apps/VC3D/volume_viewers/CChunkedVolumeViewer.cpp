@@ -64,9 +64,6 @@ namespace {
 
 constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
-// Global clock is ~16ms/tick. Durations expressed in ticks for serviceRenderTick.
-constexpr int kGlobalTickMs = 16;
-constexpr int kStatusRefreshTicks = 5000 / kGlobalTickMs;           // ~313 ticks (5s)
 // Non-interactive chunk-ready coalescing. Chunks for one viewpoint trickle in
 // over many milliseconds; the default 16ms render debounce re-renders the whole
 // frame per chunk (~9-11x per viewpoint). Debounce chunk-ready re-renders on a
@@ -410,7 +407,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     // No per-viewer timers: render requests submit immediately. ViewerManager's
     // global clock still drains intersection requests and status refreshes.
-    _statusRefreshTicks = kStatusRefreshTicks;
 
     reloadPerfSettings();
 
@@ -492,7 +488,6 @@ void CChunkedVolumeViewer::quiesceForClose()
     _activeRenderJob.reset();
     _pendingRenderJob.reset();
     _displayedRenderJob.reset();
-    _pendingRenderDirty = false;
     ++_renderSerial;
 
     // A running background read finishes its current part and stops.
@@ -552,7 +547,6 @@ CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
     state.surfacePtrY = _surfacePtrY;
     state.scale = _scale;
     state.zOffset = _zOff;
-    state.zOffsetWorldDir = _zOffWorldDir;
     return state;
 }
 
@@ -561,7 +555,7 @@ float CChunkedVolumeViewer::clampCameraScale(float scale)
     return std::clamp(scale, kMinScale, kMaxScale);
 }
 
-void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
+void CChunkedVolumeViewer::applyCameraState(const CameraState& state)
 {
     if (_closing) {
         return;
@@ -570,14 +564,9 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
     setZOffset(state.zOffset);
-    _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
     _geometryDirty = true;
-    if (forceRender) {
-        renderVisible(true, "annotation camera state applied");
-    } else {
-        submitRender("annotation camera state applied");
-    }
+    submitRender("annotation camera state applied");
     refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
@@ -676,7 +665,6 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _defaultSurface.reset();
     }
     _geometryDirty = true;
-    _zOffWorldDir = {0, 0, 0};
     if (_cursorCrosshair)
         _cursorCrosshair->hide();
     clearLineAnnotationPlacementMarker();
@@ -709,11 +697,6 @@ void CChunkedVolumeViewer::invalidateVis()
     }
     _geometryDirty = true;
     _gridSurface.reset();
-}
-
-void CChunkedVolumeViewer::invalidateVisRegion(const std::string&, const cv::Rect&)
-{
-    invalidateVis();
 }
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
@@ -802,7 +785,6 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
         if (dynamic_cast<PlaneSurface*>(surf.get())) {
             ++_surfaceGeometryEpoch;
         }
-        _zOffWorldDir = {0, 0, 0};
         updateContentBounds();
         updateFocusMarker();
         if (_suppressNextSurfaceEditRender) {
@@ -814,7 +796,6 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     }
 
     _geometryDirty = true;
-    _zOffWorldDir = {0, 0, 0};
     if (!surf) {
         _measurement = {};
         // Forget the overlay groups before the scene deletes their items, so
@@ -1064,12 +1045,8 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         : kResolutionLodZoomBias;
     if (_levels) {
         _dsScaleIdx = vc3d::sourceLevelForView(*_levels, _scale, lodZoomBias);
-        const double extent = vc3d::maximumBaseVoxelExtent(*_levels, _dsScaleIdx);
-        _dsScale = std::isfinite(extent) ? static_cast<float>(extent) : 1.0f;
     } else {
-        // No opened levels: this frame has only a nominal level 0.
-        _dsScaleIdx = 0;
-        _dsScale = 1.0f;
+        _dsScaleIdx = 0;  // no opened levels: this frame has only a nominal level 0
     }
     updateScalebarScale();
 }
@@ -1142,16 +1119,11 @@ void CChunkedVolumeViewer::requestRender(const char* reason, std::source_locatio
 
 // Driven by ViewerManager's single global clock (~60Hz). Rendering is submitted
 // immediately by view/data updates; this tick only drains non-render maintenance.
-void CChunkedVolumeViewer::serviceRenderTick()
+void CChunkedVolumeViewer::refreshStatus()
 {
     if (_closing)
         return;
-
-    // Periodic status refresh (background download progress).
-    if (--_statusRefreshTicks <= 0) {
-        _statusRefreshTicks = kStatusRefreshTicks;
-        updateStatusLabel();
-    }
+    updateStatusLabel();  // background download progress
 }
 
 void CChunkedVolumeViewer::syncCameraTransform()
@@ -1210,12 +1182,6 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _overlayMaxDisplayedResolution);
     return std::clamp(level, 0, _overlayLevels->count() - 1);
-}
-
-void CChunkedVolumeViewer::markInteractiveMotion(double)
-{
-    // Interactions schedule a normal full-quality render directly (scheduleRender in
-    // the handler). The old interactive-preview + settle-timer fast path is gone.
 }
 
 void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSettings& s)
@@ -1344,7 +1310,6 @@ struct CChunkedVolumeViewer::RenderContext {
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
     float zOff = 0.0f;
-    cv::Vec3f zOffWorldDir{0, 0, 0};
     int startLevel = 0;
     int overlayStartLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
@@ -1766,7 +1731,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.surfacePtrY = _surfacePtrY;
     job.scale = _scale;
     job.zOff = _zOff;
-    job.zOffWorldDir = _zOffWorldDir;
     const bool preferSurfaceResolution = dynamic_cast<PlaneSurface*>(surf.get()) == nullptr;
     job.startLevel = renderStartLevel(preferSurfaceResolution);
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
@@ -1846,7 +1810,6 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.surfacePtrY == b.surfacePtrY &&
            a.scale == b.scale &&
            a.zOff == b.zOff &&
-           vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
            a.startLevel == b.startLevel &&
            a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
@@ -1905,19 +1868,16 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
 
     _renderWorkerBusy.store(true, std::memory_order_release);
     _activeRenderJob = job;
-    _pendingRenderDirty = false;
 
     RenderContext ctx;
     ctx.renderJob = job;
     ctx.serial = ++_renderSerial;
-    emit renderFrameSubmitted(ctx.serial);
     ctx.fbW = job.fbW;
     ctx.fbH = job.fbH;
     ctx.surfacePtrX = job.surfacePtrX;
     ctx.surfacePtrY = job.surfacePtrY;
     ctx.scale = job.scale;
     ctx.zOff = job.zOff;
-    ctx.zOffWorldDir = job.zOffWorldDir;
     ctx.startLevel = job.startLevel;
     ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
@@ -1959,7 +1919,6 @@ void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
         return;
     }
     if (!_pendingRenderJob) {
-        _pendingRenderDirty = false;
         return;
     }
 
@@ -1967,7 +1926,6 @@ void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
     _pendingRenderJob.reset();
     if (_displayedRenderJob &&
         renderJobsEquivalentForDisplay(job, *_displayedRenderJob)) {
-        _pendingRenderDirty = false;
         return;
     }
     startRenderJob(std::move(job));
@@ -2032,12 +1990,10 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         }
         if (_pendingRenderJob &&
             renderJobsEquivalentForDisplay(*job, *_pendingRenderJob)) {
-            _pendingRenderDirty = true;
             profile.setDetails("action=skip_duplicate_pending");
             return;
         }
         _pendingRenderJob = std::move(*job);
-        _pendingRenderDirty = true;
         updateStatusLabel();
         profile.setDetails("action=queued_latest_after_worker");
         return;
@@ -2045,7 +2001,6 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
 
     if (_displayedRenderJob &&
         renderJobsEquivalentForDisplay(*job, *_displayedRenderJob)) {
-        _pendingRenderDirty = false;
         profile.setDetails("action=skip_duplicate_displayed");
         return;
     }
@@ -2099,7 +2054,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (_pendingRenderJob &&
         renderJobsEquivalentForDisplay(*_pendingRenderJob, result->renderJob)) {
         _pendingRenderJob.reset();
-        _pendingRenderDirty = false;
     }
     if (!_pendingRenderJob) {
         auto surf = _surfWeak.lock();
@@ -2122,7 +2076,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             if (latest &&
                 !renderJobsEquivalentForDisplay(*latest, result->renderJob)) {
                 _pendingRenderJob = std::move(*latest);
-                _pendingRenderDirty = true;
             }
         }
     }
@@ -2136,19 +2089,19 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
 }
 
-void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
+void CChunkedVolumeViewer::renderVisible(const char* reason, std::source_location caller)
 {
     ProfileScope profile("renderVisible", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' force={} scale={:.4f} zOff={:.3f}",
-            _surfName, force, _scale, _zOff));
+            "surf='{}' scale={:.4f} zOff={:.3f}",
+            _surfName, _scale, _zOff));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
         return;
     }
-    submitRender(reason ? reason : (force ? "renderVisible force" : "renderVisible non-force"), caller);
+    submitRender(reason ? reason : "renderVisible", caller);
     profile.setDetails("action=submit");
 }
 
@@ -2278,7 +2231,6 @@ void CChunkedVolumeViewer::setOverlayComposite(const OverlayCompositeSettings& s
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
 {
-    markInteractiveMotion(std::hypot(double(dx), double(dy)));
     const float invScale = _panSensitivity / _scale;
     // Pan deltas are screen-space; under the volumetric camera the UV view
     // center must move along the (rotated/foreshortened) screen directions.
@@ -2331,10 +2283,6 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0)
         return;
-    const double zoomMotionPx = std::hypot(double(_view->viewport()->width()),
-                                          double(_view->viewport()->height())) *
-                                0.08 * std::abs(double(steps));
-    markInteractiveMotion(zoomMotionPx);
     const float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     zoomByFactorAt(factor, scenePos);
 }
@@ -2343,27 +2291,17 @@ void CChunkedVolumeViewer::adjustZoomByFactor(float factor)
 {
     if (!std::isfinite(factor) || factor <= 0.0f || factor == 1.0f)
         return;
-    // Apply the true scale multiplier directly, centered on the viewport, and
-    // mark motion proportionally so cache/LOD heuristics treat a large
-    // programmatic zoom like a large wheel zoom.
+    // Apply the true scale multiplier directly, centered on the viewport.
     const QPointF center(_view->viewport()->width() * 0.5,
                          _view->viewport()->height() * 0.5);
-    const double mag = std::abs(std::log(double(factor)) / std::log(1.05));
-    if (mag > 0.0) {
-        const double motionPx = std::hypot(double(_view->viewport()->width()),
-                                           double(_view->viewport()->height())) *
-                                0.08 * mag;
-        markInteractiveMotion(motionPx);
-    }
     zoomByFactorAt(factor, center);
 }
 
-void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
+void CChunkedVolumeViewer::notifyInteractiveViewChange()
 {
     if (!_volume || !_levels)
         return;
 
-    markInteractiveMotion(motionPx);
     _geometryDirty = true;
     submitRender("interactive view change");
     emit overlaysUpdated();
@@ -2387,7 +2325,6 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _surfacePtrX = 0.0f;
     _surfacePtrY = 0.0f;
     setZOffset(0.0f);
-    _zOffWorldDir = {0, 0, 0};
     _geometryDirty = true;
     submitRender("surface offsets reset");
 }
@@ -2429,7 +2366,7 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     submitRender("fit surface in view");
 }
 
-void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
+void CChunkedVolumeViewer::resetViewForCurrentContent()
 {
     if (_closing || !_view) {
         return;
@@ -2488,20 +2425,15 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                viewportSize.width(),
                                viewportSize.height());
     setZOffset(0.0f);
-    _zOffWorldDir = {0, 0, 0};
     recalcPyramidLevel();
     _geometryDirty = true;
     updateFocusMarker();
-    if (forceRender) {
-        renderVisible(true, "reset view for current content");
-    } else {
-        submitRender("reset view for current content");
-    }
+    submitRender("reset view for current content");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
+void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point)
 {
     auto surf = _surfWeak.lock();
     if (!surf)
@@ -2526,28 +2458,18 @@ void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forc
         return;
     }
 
-    centerOnSurfacePoint(surfacePoint, forceRender);
+    centerOnSurfacePoint(surfacePoint);
 }
 
-void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender)
+void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point)
 {
     if (!std::isfinite(point[0]) || !std::isfinite(point[1]))
         return;
 
-    const float oldSurfacePtrX = _surfacePtrX;
-    const float oldSurfacePtrY = _surfacePtrY;
     _surfacePtrX = point[0];
     _surfacePtrY = point[1];
     _geometryDirty = true;
-    if (forceRender) {
-        renderVisible(true, "center on surface point");
-    } else {
-        const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
-                                          double(_surfacePtrY - oldSurfacePtrY)) *
-                                double(std::max(_scale, kMinScale));
-        markInteractiveMotion(motionPx);
-        submitRender("center on surface point");
-    }
+    submitRender("center on surface point");
     emit overlaysUpdated();
 }
 
@@ -2569,7 +2491,6 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
                 shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
                 setZOffset(0.0f);
-                _zOffWorldDir = {0, 0, 0};
                 if (_state) {
                     _state->setSurface(_surfName, shiftedPlane, false, true);
                 } else {
@@ -2638,7 +2559,6 @@ void CChunkedVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
     _panSmoothingInitialized = false;
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
-    markInteractiveMotion(0.0);
     _lastPanSceneF = _view->mapToScene(_view->mapFromGlobal(QCursor::pos()));
 }
 

@@ -57,4 +57,4 @@ void ViewerManager::handleFocusPoiChanged(std::string, POI*) {}
 void ViewerManager::handleVolumeClicked(cv::Vec3f, cv::Vec3f, Surface*,
                                         Qt::MouseButton, Qt::KeyboardModifiers) {}
 
-void ViewerManager::onGlobalTick() {}
+void ViewerManager::onStatusTick() {}

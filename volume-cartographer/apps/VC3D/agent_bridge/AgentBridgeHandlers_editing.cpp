@@ -203,8 +203,7 @@ QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& param
         data["point"] = vec3ToJson(point);
         throw AgentBridgeError{-32003, "Point is outside volume bounds", data};
     }
-    const bool forceRender = p.value("forceRender").toBool(true);
-    viewer->centerOnVolumePoint(point, forceRender);
+    viewer->centerOnVolumePoint(point);  // "forceRender" is accepted and ignored: every centering renders
 
     QJsonObject result;
     result["centered"] = true;

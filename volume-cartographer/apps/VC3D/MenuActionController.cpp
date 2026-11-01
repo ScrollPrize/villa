@@ -1259,7 +1259,7 @@ void MenuActionController::showSettingsDialog()
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
                 // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
-                viewer->renderVisible(true);
+                viewer->renderVisible();
             }
         });
     }

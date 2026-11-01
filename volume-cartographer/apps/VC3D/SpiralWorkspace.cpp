@@ -2543,8 +2543,7 @@ void SpiralWorkspace::panFlattenedViewerToColumn(float column)
     const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
         view->mapToScene(view->viewport()->rect().center()));
     const float surfaceX = column / scale[0] - center[0];
-    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
-                                           true);
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]));
 }
 
 void SpiralWorkspace::updateWindingTransitionOverlay()

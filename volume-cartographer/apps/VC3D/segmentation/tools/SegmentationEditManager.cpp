@@ -846,28 +846,6 @@ std::vector<SegmentationEditManager::VertexEdit> SegmentationEditManager::edited
     return result;
 }
 
-std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
-{
-    if (_recentTouched.empty()) {
-        return std::nullopt;
-    }
-
-    int minRow = _recentTouched.front().row;
-    int maxRow = minRow;
-    int minCol = _recentTouched.front().col;
-    int maxCol = minCol;
-
-    for (const auto& key : _recentTouched) {
-        minRow = std::min(minRow, key.row);
-        maxRow = std::max(maxRow, key.row);
-        minCol = std::min(minCol, key.col);
-        maxCol = std::max(maxCol, key.col);
-    }
-
-    cv::Rect rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
-    return rect;
-}
-
 void SegmentationEditManager::markNextEditsAsGrowth()
 {
     _pendingGrowthMarking = true;

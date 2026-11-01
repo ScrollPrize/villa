@@ -146,7 +146,6 @@ public:
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
-    [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
     void markNextEditsAsGrowth();

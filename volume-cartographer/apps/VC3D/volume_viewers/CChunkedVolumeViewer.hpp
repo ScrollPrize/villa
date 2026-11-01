@@ -63,7 +63,6 @@ public:
         float surfacePtrY = 0.0f;
         float scale = 1.0f;
         float zOffset = 0.0f;
-        cv::Vec3f zOffsetWorldDir{0, 0, 0};
     };
     struct SceneVolumeSample {
         cv::Vec3f position{0, 0, 0};
@@ -79,37 +78,33 @@ public:
     void setSurface(const std::string& name) override;
     void setIntersects(const std::set<std::string>& names) override;
     void renderVisible(
-        bool force = false,
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
     void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
-    void serviceRenderTick() override;
+    void refreshStatus() override;
     void invalidateVis() override;
-    void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
-    void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
-    void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) override;
+    void centerOnVolumePoint(const cv::Vec3f& point) override;
+    void centerOnSurfacePoint(const cv::Vec2f& point) override;
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
-    void resetViewForCurrentContent(bool forceRender = false) override;
-    void notifyInteractiveViewChange(double motionPx);
+    void resetViewForCurrentContent() override;
+    void notifyInteractiveViewChange();
 
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     float getCurrentScale() const override { return _scale; }
     static float clampCameraScale(float scale);
-    float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
-    void applyCameraState(const CameraState& state, bool forceRender = true);
+    void applyCameraState(const CameraState& state);
     // Pins the camera's surface Y: pans move only along X, zooms are anchored
     // on that row, and resets, centering and applied camera states land back
     // on it. Enforced in syncCameraTransform(), i.e. before any render is
     // submitted or repainted, so no frame is ever shown off the pinned row.
     void setPinnedSurfaceY(std::optional<float> surfaceY);
-    int datasetScaleIndex() const override { return _dsScaleIdx; }
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
@@ -303,7 +298,6 @@ signals:
     void pointSelected(vc::PointRef point);
     void pointClicked(vc::PointRef point);
     void overlaysUpdated();
-    void renderFrameSubmitted(std::uint64_t serial);
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
     void sharedCacheStatsChanged(const QStringList& items);
@@ -354,7 +348,6 @@ private:
         float surfacePtrY = 0.0f;
         float scale = 1.0f;
         float zOff = 0.0f;
-        cv::Vec3f zOffWorldDir{0, 0, 0};
         int startLevel = 0;
         int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
@@ -407,7 +400,6 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
-    void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     // Sync the volumetric camera gizmo's visibility/state with the current
@@ -466,7 +458,6 @@ private:
     // No per-viewer timers. ViewerManager's global clock only services
     // status maintenance; render requests submit immediately.
     bool _closing = false;
-    int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
     // A render was requested while this viewer was hidden (minimized MDI subwindow /
     // background tab). We skip the work and set this; showEvent re-renders so the
     // viewer catches up on whatever went stale while invisible.
@@ -509,13 +500,11 @@ private:
     // the same geometry reuses its pixels where chunks are missing so a
     // transient cache miss never blanks an already-shown region.
     std::shared_ptr<RenderResult> _lastRenderResult;
-    bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _surfaceEditEpoch = 0;
     std::uint64_t _renderSerial = 0;
-    cv::Mat_<uint8_t> _values;
     // The shown QuadSurface's vertex grid for vcr::grid; dropped on every edit.
     std::shared_ptr<const vcr::grid::Surface> _gridSurface;
     const QuadSurface* _gridSurfaceFor = nullptr;
@@ -526,13 +515,11 @@ private:
     float _surfacePtrY = 0.0f;
     std::optional<float> _pinnedSurfacePtrY;
     float _scale = 1.0f;
-    float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
     float _camScale = 1.0f;
-    cv::Vec3f _zOffWorldDir{0, 0, 0};
 
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;

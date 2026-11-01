@@ -228,7 +228,7 @@ signals:
     void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
-    void onGlobalTick();
+    void onStatusTick();
     void handleFocusPoiChanged(std::string name, POI* poi);
     void handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -254,7 +254,7 @@ private:
     SurfacePicker _surfacePicker;
     // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
     // submit immediately, while deferred intersections/status are serviced here.
-    QTimer* _globalClock{nullptr};
+    QTimer* _statusClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};

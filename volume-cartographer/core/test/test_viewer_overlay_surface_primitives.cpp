@@ -102,11 +102,11 @@ public:
 
     void setSurface(const std::string&) override {}
     void setIntersects(const std::set<std::string>&) override {}
-    void renderVisible(bool, const char*, std::source_location) override {}
+    void renderVisible(const char*, std::source_location) override {}
     void requestRender(const char*, std::source_location) override {}
     void invalidateVis() override {}
-    void centerOnVolumePoint(const cv::Vec3f&, bool) override {}
-    void centerOnSurfacePoint(const cv::Vec2f&, bool) override {}
+    void centerOnVolumePoint(const cv::Vec3f&) override {}
+    void centerOnSurfacePoint(const cv::Vec2f&) override {}
     void adjustZoomByFactor(float) override {}
     void adjustSurfaceOffset(float) override {}
     void resetSurfaceOffsets() override {}
@@ -126,9 +126,7 @@ public:
     void setPointCollection(VCCollection* collection) { pointCollection_ = collection; }
 
     float getCurrentScale() const override { return 1.0f; }
-    float dsScale() const override { return 1.0f; }
     float normalOffset() const override { return 0.0f; }
-    int datasetScaleIndex() const override { return 0; }
 
     bool isShowSurfaceNormals() const override { return false; }
     float normalArrowLengthScale() const override { return 1.0f; }

@@ -11656,7 +11656,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     if (!pane->dialog->panes().empty() && pane->dialog->panes().front().viewer) {
         camera = pane->dialog->panes().front().viewer->cameraState();
         camera.zOffset = 0.0f;
-        camera.zOffsetWorldDir = {0, 0, 0};
     }
 
     if (!pane->dialog->setGeneratedLineViews(std::move(generatedViews), camera)) {
