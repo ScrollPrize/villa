@@ -245,8 +245,14 @@ def build_pyramid(
         out_path = f"{base_group_path}/{level}"
 
         in_z = zarr.open(in_path, mode="r")
+        # Ceiling, not round(): a level must hold every voxel of the one above
+        # it, so an odd axis of 2k + 1 gives k + 1. VC3D checks each level
+        # against ceil(n / 2**level) (Volume.cpp, ceilDivPow2) and its own
+        # pyramid writer uses (n + 1) / 2 (Zarr.cpp); the published volumes
+        # follow the same rule. round() is half to even, so 1125 gave 562 and
+        # VC3D refused the volume (#2135).
         out_shape = tuple(
-            max(1, int(round(s * dim)))
+            max(1, int(np.ceil(s * dim)))
             for dim, s in zip(in_z.shape, per_axis_scales)
         )
         out_chunks = tuple(min(c, s) for c, s in zip(in_z.chunks, out_shape))
