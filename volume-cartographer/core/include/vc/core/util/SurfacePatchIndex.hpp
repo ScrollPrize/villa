@@ -87,8 +87,9 @@ public:
     SurfacePatchIndex(const SurfacePatchIndex&) = delete;
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
-    // useMappedSurfaces: read surfaces loaded from a tifxyz directory by
-    // memory-mapping its x/y/z TIFFs (the standalone tifxyz tools).
+    // useMappedSurfaces: index surfaces loaded from a tifxyz directory from its
+    // files, read through vc_reader in bands with mask validity, instead of the
+    // loaded points (the standalone tifxyz tools).
     void rebuild(const std::vector<SurfacePtr>& surfaces,
                  float bboxPadding = 0.0f,
                  bool useMappedSurfaces = false);

@@ -22,12 +22,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <vc_object_store/MemMap.hpp>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
 #include <boost/iterator/function_output_iterator.hpp>
-#include <vc_reader/source_reader.hpp>
+#include <vc_reader/tifxyz.hpp>
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -218,78 +217,61 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
     return raw;
 }
 
-// One float32 band of a tifxyz: mapped where its values lie in one uncompressed run,
-// otherwise decoded into memory.
-class MappedTifBand {
+// A tifxyz directory read through vc_reader in bands of rows, each vertex with its validity
+// (the coordinate rule and mask.tif), so a surface is indexed from its files without loading
+// it whole. The two most recent bands are kept; a cell spans at most one band boundary.
+class TifxyzBands {
 public:
-    void open(const std::filesystem::path& path)
+    explicit TifxyzBands(const std::filesystem::path& dir)
+        : reader_(dir.string(), /*useMask=*/true)
     {
-        try {
-            const auto mapping = vcr::sources::tiffMapping(path.string());
-            setShape(path, mapping.shape, mapping.dtype);
-            map_.open(path);
-            const std::uint64_t bytes = std::uint64_t(width_) * std::uint64_t(height_) * sizeof(float);
-            if (mapping.offset > map_.size() || bytes > map_.size() - mapping.offset) {
-                throw std::runtime_error("TIFF values point outside file: " + path.string());
+        const auto shape = reader_.shape();
+        rows_ = int(shape[0]);
+        cols_ = int(shape[1]);
+    }
+
+    int rows() const { return rows_; }
+    int cols() const { return cols_; }
+    // The vertex at (row, col) when it is valid; nothing otherwise.
+    std::optional<cv::Vec3f> at(int row, int col) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Band& band = this->band(row);
+        const std::size_t index = std::size_t(row - band.first) * std::size_t(cols_) + std::size_t(col);
+        if (!band.coordinates.valid[index]) {
+            return std::nullopt;
+        }
+        const float* xyz = band.coordinates.xyz.data() + index * 3;
+        return cv::Vec3f(xyz[0], xyz[1], xyz[2]);
+    }
+
+private:
+    static constexpr int kBandRows = 256;
+    struct Band {
+        int first = -1;
+        vcr::tifxyz::Coordinates coordinates;
+    };
+    const Band& band(int row) const
+    {
+        const int first = row - row % kBandRows;
+        for (const auto& band : bands_) {
+            if (band.first == first) {
+                return band;
             }
-            values_ = static_cast<const std::uint8_t*>(map_.data()) + mapping.offset;
-        } catch (const std::invalid_argument&) {
-            decoded_ = vcr::sources::readImage(path.string());
-            setShape(path, decoded_.shape, decoded_.dtype);
-            values_ = decoded_.data.get();
         }
+        Band& band = bands_[std::size_t(next_)];
+        next_ = (next_ + 1) % int(bands_.size());
+        band.first = first;
+        band.coordinates = reader_.window({first, 0, std::min(kBandRows, rows_ - first), cols_});
+        return band;
     }
 
-    int width() const { return width_; }
-    int height() const { return height_; }
-    float at(int row, int col) const
-    {
-        float value;
-        std::memcpy(&value, values_ + (std::size_t(row) * width_ + col) * sizeof(float), sizeof(float));
-        return value;
-    }
-
-private:
-    void setShape(const std::filesystem::path& path, const std::vector<std::int64_t>& shape, const std::string& dtype)
-    {
-        if (shape.size() != 2 || dtype != "<f4") {
-            throw std::runtime_error("tifxyz band is not one float32 channel: " + path.string());
-        }
-        height_ = int(shape[0]);
-        width_ = int(shape[1]);
-    }
-
-    vc::objects::memmap::MappedFileRO map_;
-    vcr::sources::Block decoded_;
-    const std::uint8_t* values_ = nullptr;
-    int width_ = 0;
-    int height_ = 0;
-};
-
-class MappedTifxyzSurface {
-public:
-    explicit MappedTifxyzSurface(const std::filesystem::path& dir)
-    {
-        x_.open(dir / "x.tif");
-        y_.open(dir / "y.tif");
-        z_.open(dir / "z.tif");
-        if (x_.width() != y_.width() || x_.width() != z_.width() ||
-            x_.height() != y_.height() || x_.height() != z_.height()) {
-            throw std::runtime_error("mmap tifxyz band size mismatch: " + dir.string());
-        }
-    }
-
-    int rows() const { return x_.height(); }
-    int cols() const { return x_.width(); }
-    cv::Vec3f at(int row, int col) const
-    {
-        return cv::Vec3f(x_.at(row, col), y_.at(row, col), z_.at(row, col));
-    }
-
-private:
-    MappedTifBand x_;
-    MappedTifBand y_;
-    MappedTifBand z_;
+    mutable std::mutex mutex_;
+    mutable vcr::tifxyz::Reader reader_;
+    mutable std::array<Band, 2> bands_;
+    mutable int next_ = 0;
+    int rows_ = 0;
+    int cols_ = 0;
 };
 
 struct LoadedSurface {
@@ -300,7 +282,7 @@ struct LoadedSurface {
 
 struct SurfaceForIndex {
     SurfacePtr surface;
-    std::shared_ptr<MappedTifxyzSurface> mapped;
+    std::shared_ptr<TifxyzBands> mapped;
     int rows = 0;
     int cols = 0;
 };
@@ -429,7 +411,7 @@ struct SurfacePatchIndex::Impl {
         // Raw pointer: the SurfaceRecord in surfaceRecords owns the
         // shared_ptr and outlives every PatchRecord that references it.
         QuadSurface* surface = nullptr;
-        const MappedTifxyzSurface* mapped = nullptr;
+        const TifxyzBands* mapped = nullptr;
         int i = 0;
         int j = 0;
         // NOTE: stride is not stored — it is always equal to
@@ -692,7 +674,7 @@ struct SurfacePatchIndex::Impl {
     // Surface record holding the shared_ptr and associated mask
     struct SurfaceRecord {
         SurfacePtr surface;  // Keeps the surface alive
-        std::shared_ptr<MappedTifxyzSurface> mapped;
+        std::shared_ptr<TifxyzBands> mapped;
         SurfaceCellMask mask;
     };
 
@@ -747,7 +729,7 @@ struct SurfacePatchIndex::Impl {
                                                        float bboxPadding,
                                                        int samplingStride);
     static std::vector<Entry> collectMappedEntriesForRebuild(QuadSurface* surface,
-                                                             const MappedTifxyzSurface& points,
+                                                             const TifxyzBands& points,
                                                              SurfaceCellMask& mask,
                                                              float bboxPadding,
                                                              int samplingStride);
@@ -759,7 +741,7 @@ struct SurfacePatchIndex::Impl {
                                   float bboxPadding,
                                   Entry& outEntry);
     static bool buildMappedEntryForCell(QuadSurface* surface,
-                                        const MappedTifxyzSurface& points,
+                                        const TifxyzBands& points,
                                         int col,
                                         int row,
                                         int stride,
@@ -1088,7 +1070,7 @@ SurfacePatchIndex::Impl::collectEntriesForRebuild(QuadSurface* surface,
 }
 
 bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
-                                                      const MappedTifxyzSurface& points,
+                                                      const TifxyzBands& points,
                                                       int col,
                                                       int row,
                                                       int stride,
@@ -1120,8 +1102,9 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest(),
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
-    auto extend = [&](const cv::Vec3f& p) {
-        if (!vc::geometry::validSurfacePoint(p)) return;
+    auto extend = [&](const std::optional<cv::Vec3f>& vertex) {
+        if (!vertex || !vc::geometry::validSurfacePoint(*vertex)) return;
+        const cv::Vec3f& p = *vertex;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
@@ -1145,7 +1128,7 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
 
 std::vector<SurfacePatchIndex::Impl::Entry>
 SurfacePatchIndex::Impl::collectMappedEntriesForRebuild(QuadSurface* surface,
-                                                        const MappedTifxyzSurface& points,
+                                                        const TifxyzBands& points,
                                                         SurfaceCellMask& mask,
                                                         float bboxPadding,
                                                         int samplingStride)
@@ -1196,12 +1179,12 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
         if (!surface) {
             continue;
         }
-        std::shared_ptr<MappedTifxyzSurface> mapped;
+        std::shared_ptr<TifxyzBands> mapped;
         if (useMappedSurfaces && !surface->path.empty()) {
             try {
-                mapped = std::make_shared<MappedTifxyzSurface>(surface->path);
+                mapped = std::make_shared<TifxyzBands>(surface->path);
             } catch (const std::exception& e) {
-                std::cerr << "[SurfacePatchIndex] mmap unavailable for "
+                std::cerr << "[SurfacePatchIndex] cannot read the tifxyz files of "
                           << surface->id << ": " << e.what()
                           << " -- falling back to loaded points" << std::endl;
             }
@@ -1963,7 +1946,7 @@ void SurfacePatchIndex::Impl::removeSurfaceEntriesFromTree(const SurfacePtr& sur
     }
 
     if (tree) {
-        const MappedTifxyzSurface* mapped = nullptr;
+        const TifxyzBands* mapped = nullptr;
         if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
             mapped = it->second.mapped.get();
         }
@@ -2400,10 +2383,17 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     cv::Vec3f p01;
     cv::Vec3f p11;
     if (rec.mapped) {
-        p00 = rec.mapped->at(row, col);
-        p10 = rec.mapped->at(row, col + effectiveColStride);
-        p01 = rec.mapped->at(row + effectiveRowStride, col);
-        p11 = rec.mapped->at(row + effectiveRowStride, col + effectiveColStride);
+        const auto v00 = rec.mapped->at(row, col);
+        const auto v10 = rec.mapped->at(row, col + effectiveColStride);
+        const auto v01 = rec.mapped->at(row + effectiveRowStride, col);
+        const auto v11 = rec.mapped->at(row + effectiveRowStride, col + effectiveColStride);
+        if (!v00 || !v10 || !v01 || !v11) {
+            return false;
+        }
+        p00 = *v00;
+        p10 = *v10;
+        p01 = *v01;
+        p11 = *v11;
     } else {
         const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
         if (!points) {
@@ -2466,8 +2456,9 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest(),
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
-    auto extend = [&](const cv::Vec3f& p) {
-        if (!vc::geometry::validSurfacePoint(p)) return;
+    auto extend = [&](const std::optional<cv::Vec3f>& vertex) {
+        if (!vertex || !vc::geometry::validSurfacePoint(*vertex)) return;
+        const cv::Vec3f& p = *vertex;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
@@ -2522,7 +2513,7 @@ void SurfacePatchIndex::Impl::removeCellEntry(SurfaceCellMask& mask,
     bool removed = false;
     if (tree) {
         if (auto cachedBox = mask.bboxAt(row, col)) {
-            const MappedTifxyzSurface* mapped = nullptr;
+            const TifxyzBands* mapped = nullptr;
             if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
                 mapped = it->second.mapped.get();
             }
@@ -2765,7 +2756,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
         // Remove old entry if it exists
         if (mask.isActive(row, col)) {
             if (auto cachedBox = mask.bboxAt(row, col)) {
-                const MappedTifxyzSurface* mapped = nullptr;
+                const TifxyzBands* mapped = nullptr;
                 if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
                     mapped = it->second.mapped.get();
                 }

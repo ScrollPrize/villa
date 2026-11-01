@@ -12,6 +12,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <random>
@@ -67,9 +68,16 @@ TEST_CASE("rebuild against a path-backed (tifxyz) fixture exercises the mapped-c
     auto qs = std::make_shared<QuadSurface>(seg);
     qs->ensureLoaded();
     SurfacePatchIndex idx;
+    const auto start = std::chrono::steady_clock::now();
     idx.rebuild({qs}, /*bboxPadding=*/0.5f, /*useMappedSurfaces=*/true);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    MESSAGE("mapped rebuild of " << qs->rawPointsPtr()->rows << "x" << qs->rawPointsPtr()->cols << ": " << elapsed << " ms, "
+                                 << idx.patchCount() << " patches");
     CHECK(idx.surfaceCount() == 1);
     CHECK(idx.patchCount() > 0);
+    SurfacePatchIndex loaded;
+    loaded.rebuild({qs}, 0.5f, /*useMappedSurfaces=*/false);
+    CHECK(loaded.patchCount() == idx.patchCount());
 
     // updateSurface re-scans the mapped cache.
     CHECK(idx.updateSurface(qs));
@@ -109,6 +117,58 @@ TEST_CASE("mapped and compressed coordinate files index the same, and stay as th
     CHECK(entries(compressed) == plainPatches);
     // Indexing does not rewrite a surface's files.
     CHECK(fs::file_size(compressed / "x.tif") == sizeBefore);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("masked vertices are excluded from the mapped index as from the loaded one")
+{
+    // The loader applies mask.tif; the mapped path must see the same validity, for a mask
+    // of the grid's shape and one at a block multiple of it (a vertex needs its whole block).
+    const fs::path root = fs::temp_directory_path() / ("vc_patch_index_mask_" + std::to_string(std::random_device{}()));
+    fs::create_directories(root);
+    const int rows = 64, cols = 64;  // several index cells, so a masked region removes whole cells
+    const auto writeMask = [&](const fs::path& dir, int maskRows, int maskCols, auto allowed) {
+        std::vector<std::uint8_t> mask(std::size_t(maskRows) * maskCols);
+        for (int r = 0; r < maskRows; ++r)
+            for (int c = 0; c < maskCols; ++c)
+                mask[std::size_t(r) * maskCols + c] = allowed(r, c) ? 255 : 0;
+        vcr::sources::writeTiff(dir / "mask.tif", mask.data(), "|u1", maskRows, maskCols);
+    };
+    const auto patches = [&](const fs::path& dir, bool mapped) {
+        auto surface = std::make_shared<QuadSurface>(dir);
+        surface->ensureLoaded();
+        SurfacePatchIndex idx;
+        idx.rebuild({surface}, 0.5f, mapped);
+        return idx.patchCount();
+    };
+    const auto save = [&](const char* name) {
+        const auto dir = root / name;
+        makeSurface(rows, cols)->save(dir.string());
+        return dir;
+    };
+    const auto unmasked = patches(save("unmasked"), true);
+    REQUIRE(unmasked > 0);
+    CHECK(patches(root / "unmasked", false) == unmasked);
+
+    const auto none = save("none");
+    writeMask(none, rows, cols, [](int, int) { return false; });
+    CHECK(patches(none, false) == 0);
+    CHECK(patches(none, true) == 0);
+
+    const auto half = save("half");
+    writeMask(half, rows, cols, [&](int, int c) { return c < cols / 2; });
+    const auto halfLoaded = patches(half, false);
+    CHECK(halfLoaded > 0);
+    CHECK(halfLoaded < unmasked);
+    CHECK(patches(half, true) == halfLoaded);
+
+    const auto block = save("block");  // a 2x2 block mask refusing the vertices of the first index cells
+    writeMask(block, 2 * rows, 2 * cols, [](int r, int c) { return !(r < 20 && c < 20); });
+    const auto blockLoaded = patches(block, false);
+    CHECK(blockLoaded > 0);
+    CHECK(blockLoaded < unmasked);
+    CHECK(patches(block, true) == blockLoaded);
     std::error_code ec;
     fs::remove_all(root, ec);
 }
