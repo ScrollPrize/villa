@@ -436,6 +436,11 @@ class ZarrDataset(Dataset):
             self._load_from_cache(cache_data)
             return
 
+        if self.unlabeled_fg_enabled and not self.skip_patch_validation:
+            raise ValueError(
+                'Unlabeled foreground sampling needs a matching patch cache; run vesuvius.find_patches --config <config.yaml> to regenerate it.'
+            )
+
         # No cache found - enumerate all patches without validation
         logger.warning(
             "No patch cache found. Enumerating all patches without validation. "
@@ -500,6 +505,10 @@ class ZarrDataset(Dataset):
                 if cache_data is not None:
                     self._load_from_cache(cache_data)
                 else:
+                    if self.unlabeled_fg_enabled:
+                        raise ValueError(
+                            'Unlabeled foreground sampling needs a matching patch cache; run vesuvius.find_patches --config <config.yaml> to regenerate it.'
+                        )
                     self._enumerate_all_patches()
             return
 
@@ -688,6 +697,8 @@ class ZarrDataset(Dataset):
             unlabeled_fg_enabled=self.unlabeled_fg_enabled,
             unlabeled_fg_threshold=self.unlabeled_fg_threshold,
             unlabeled_fg_bbox_threshold=self.unlabeled_fg_bbox_threshold,
+            primary_target=self.target_names[0],
+            unlabeled_fg_volume_ids=tuple(self.unlabeled_fg_volume_ids),
         )
 
     def _load_from_cache(self, cache_data) -> None:
