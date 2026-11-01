@@ -95,6 +95,14 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
+# The modules link vc_reader's shared native library, found through $ORIGIN.
+if(TARGET vc_reader_native)
+    get_target_property(_vc_reader_native_type vc_reader_native TYPE)
+    if(_vc_reader_native_type STREQUAL "SHARED_LIBRARY")
+        install(TARGETS vc_reader_native LIBRARY DESTINATION . RUNTIME DESTINATION .)
+    endif()
+endif()
+
 install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .

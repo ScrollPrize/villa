@@ -97,6 +97,8 @@ required_formulae=(
   eigen
   opencv
   c-blosc
+  zstd
+  lz4
   boost
   libtiff
   libpng

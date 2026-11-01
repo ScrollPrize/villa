@@ -32,6 +32,10 @@
     "zlib",
     "blosc",
     "zstd",
-    "lz4"
+    "lz4",
+    "libpng",
+    "libjpeg-turbo",
+    "openssl",
+    "pkgconf"
   ]
 }

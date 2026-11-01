@@ -48,4 +48,8 @@ cache-keys = [
     { file = "../vc_object_store/cmake/**" },
     { file = "../vc_object_store/include/**" },
     { file = "../vc_object_store/src/**" },
+    { file = "../vc_reader/CMakeLists.txt" },
+    { file = "../vc_reader/cmake/**" },
+    { file = "../vc_reader/include/**" },
+    { file = "../vc_reader/src/cpp/**" },
 ]

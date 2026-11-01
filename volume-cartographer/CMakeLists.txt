@@ -524,10 +524,8 @@ if(APPLE)
 endif()
 find_package(nlohmann_json REQUIRED)
 if(MSVC)
-    # On MSVC, zstd/lz4 come from vcpkg CMake configs (below), and the
-    # pkg-config-only consumers (vendored libbacktrace, avahi) are Linux-only,
-    # so pkg-config is optional rather than required.
-    find_package(PkgConfig)
+    # vc_reader and vc_object_store need pkg-config on every platform (vcpkg's pkgconf).
+    find_package(PkgConfig REQUIRED)
 else()
     find_package(PkgConfig REQUIRED)
 endif()

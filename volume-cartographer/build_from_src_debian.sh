@@ -71,15 +71,18 @@ fi
     libceres-dev \
     libcurl4-openssl-dev \
     libhwloc-dev \
+    libjpeg-dev \
     liblapack-dev \
     liblapacke-dev \
     liblz4-dev \
     libopenblas-dev \
+    libpng-dev \
     libopencv-contrib-dev \
     libopencv-dev \
     libscotch-dev \
     libscotchmetis-dev \
     libsqlite3-dev \
+    libssl-dev \
     libsuitesparse-dev \
     libtiff-dev \
     libzstd-dev \
