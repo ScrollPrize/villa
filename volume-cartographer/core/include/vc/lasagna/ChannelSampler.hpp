@@ -31,12 +31,10 @@ struct LasagnaGroupArrays {
         : cache(std::make_shared<vcr::MemoryCache>(memoryCacheBytes)) {}
     explicit LasagnaGroupArrays(std::shared_ptr<vcr::MemoryCache> sharedCache)
         : cache(std::move(sharedCache)) {}
-    struct Opened {
-        std::shared_ptr<vcr::Array> array;
-        vcr::zarr::ArrayMeta meta;
-    };
     std::shared_ptr<vcr::MemoryCache> cache;
-    std::map<const LasagnaChannelGroup*, Opened> arrays;
+    // The opened level of each group, whole: its cache layers (and a VC3D layer's lease)
+    // live as long as any binding shares its array.
+    std::map<const LasagnaChannelGroup*, std::shared_ptr<vcr::zarr::OpenedArray>> arrays;
 };
 
 // One channel of a dataset in working coordinates: working point p (xyz) lies

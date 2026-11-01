@@ -350,15 +350,13 @@ LasagnaChannelBinding bindLasagnaChannel(
         throw std::runtime_error("Internal Lasagna channel lookup failure");
     }
     auto& opened = arrays.arrays[group];
-    if (!opened.array) {
-        auto array = openLasagnaGroupArray(*group, arrays.cache);
-        opened = {std::shared_ptr<vcr::Array>(std::move(array.array)), std::move(array.meta)};
-    }
-    const auto& meta = opened.meta;
+    if (!opened)
+        opened = std::make_shared<vcr::zarr::OpenedArray>(openLasagnaGroupArray(*group, arrays.cache));
+    const auto& meta = opened->meta;
     LasagnaChannelBinding binding;
     binding.group = group;
     binding.channelIndex = *channelIndex;
-    binding.array = opened.array;
+    binding.array = std::shared_ptr<vcr::Array>(opened, opened->array.get());  // shares the whole opened level
     binding.spacing = static_cast<double>(group->scaleFactor()) *
                       manifest.sourceToBase / manifest.workingToBaseScale;
     binding.float32 = meta.dtype == "<f4";

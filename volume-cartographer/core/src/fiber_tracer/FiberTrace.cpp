@@ -3687,7 +3687,7 @@ public:
             canonicalGridInfo_.predictionToBaseScale = manifest.sourceToBase * static_cast<double>(canonical.presence.group->scaleFactor());
         }
         for (const auto& [group, opened] : arrays_.arrays)
-            stored_.emplace(group, opened.array);
+            stored_.emplace(group, std::shared_ptr<vcr::Array>(opened, opened->array.get()));
     }
 
     // Live inference: every group array becomes a computed array whose chunks
@@ -3706,7 +3706,7 @@ public:
                 arrays.emplace(group, array);
                 continue;
             }
-            const auto& meta = arrays_.arrays.at(group).meta;
+            const auto& meta = arrays_.arrays.at(group)->meta;
             std::shared_ptr<vcr::Array> store(vc::lasagna::openLasagnaGroupArray(*group, nullptr).array);
             vcr::computed::Options options;
             options.shape = meta.shape;
@@ -4014,7 +4014,7 @@ public:
     {
         (void)storedGridInfo();
         const auto& binding = options_[*canonicalOptionIndex_].presence;
-        if (arrays_.arrays.at(binding.group).meta.raw.value("fill_value", nlohmann::json()) != 0)
+        if (arrays_.arrays.at(binding.group)->meta.raw.value("fill_value", nlohmann::json()) != 0)
             throw std::invalid_argument(
                 "sparse fiber presence scanning requires fill_value=0");
         if (binding.packed)
