@@ -1,20 +1,13 @@
 #include "OpenDataManifest.hpp"
 #include "utils/hash.hpp"
 
-#include <QDir>
-#include <QStandardPaths>
-#include <QString>
-
 #include <iomanip>
 #include <sstream>
 namespace vc3d::opendata {
 std::filesystem::path cachedOpenDataManifestPath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+    // vc_reader's cache file for the catalog: the one its volume metadata reads too.
+    return vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl));
 }
 
 std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog()
