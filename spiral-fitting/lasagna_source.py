@@ -25,12 +25,16 @@ A fit names its dataset with a ``*.lasagna.json`` manifest (the command-line
 fit) or with a source document a service writes from the project VC3D sends
 (``write_lasagna_source``); ``load_lasagna_source`` reads either.
 
-A manifest that states its ``base_shape_zyx`` gives the dataset's frame: the
-arrays' downsampling relative to that base grid (``source_to_base`` times
-2^scaledown). With the fit volume's own shape that fixes the arrays'
-downsampling relative to the fit volume (``lasagna_scale_for``), as VC3D's
-SpiralProjectInputs computes it; it assumes the two grids cover one aligned
-extent, which shapes alone cannot show.
+A manifest that states its ``base_shape_zyx`` gives the dataset's frame:
+the shape of level 0 of the finest real scan the arrays' ``scaledown`` levels
+count from (published datasets computed from a downsampled level of that
+scan still count from its level 0, with ``source_to_base`` 1). With the fit
+volume's own shape that fixes the arrays' downsampling relative to the fit
+volume (``lasagna_scale_for``), as VC3D's SpiralProjectInputs computes it; it
+assumes the two grids cover one aligned extent, which shapes alone cannot
+show. A ``source_to_base`` other than 1 (a dataset whose levels count from a
+pre-downsampled volume) has no agreed convention between VC3D and the
+Lasagna writer yet, so no scale is derived from it.
 
 Fiber-direction samples (fiber_direction_samples.py) extracted from a
 fiber-inference dataset are kept the same way, by that dataset's identity and
@@ -74,15 +78,17 @@ class LasagnaSource:
     (LASAGNA_CHANNELS), the OME-Zarr store holding that channel; a store is
     ``<store>/<group>``. The stores are where the dataset was found and need
     not be readable here: only building a pack reads them.
-    ``base_shape_zyx`` and ``base_voxels_per_array_voxel`` are the dataset's
-    frame, None where its manifest does not state it."""
+    ``base_shape_zyx``, ``source_to_base`` and ``scaledown`` (the channels'
+    level) are the dataset's frame as its manifest states it, None where it
+    does not."""
 
     identity: str
     location: str
     group: str
     stores: Mapping[str, str] = field(default_factory=dict)
     base_shape_zyx: tuple[int, int, int] | None = None
-    base_voxels_per_array_voxel: float | None = None
+    source_to_base: float | None = None
+    scaledown: int | None = None
 
     def __post_init__(self):
         check_identity(self.identity)
@@ -94,8 +100,10 @@ class LasagnaSource:
                     "group": self.group, "stores": dict(sorted(self.stores.items()))}
         if self.base_shape_zyx is not None:
             document["base_shape_zyx"] = list(self.base_shape_zyx)
-        if self.base_voxels_per_array_voxel is not None:
-            document["base_voxels_per_array_voxel"] = self.base_voxels_per_array_voxel
+        if self.source_to_base is not None:
+            document["source_to_base"] = self.source_to_base
+        if self.scaledown is not None:
+            document["scaledown"] = self.scaledown
         return document
 
     def dataset_directory(self, cache_directory: str | os.PathLike[str]) -> str:
@@ -216,18 +224,12 @@ def read_lasagna_manifest(path: str | os.PathLike[str],
         raise LasagnaSourceError(f"{path} has no nx, ny or grad_mag channel")
 
     # The frame, read as vc::lasagna's manifest reader reads it.
-    source_to_base = document.get("source_to_base", 1.0)
-    if (type(source_to_base) not in (int, float) or not math.isfinite(source_to_base)
-            or source_to_base <= 0):
-        raise LasagnaSourceError(f"{path}: source_to_base must be a positive number")
-    scaledown = 0 if scaledown is None else scaledown
-    if type(scaledown) is not int or not 0 <= scaledown <= 30:
-        raise LasagnaSourceError(f"{path}: invalid scaledown {scaledown!r}")
     base_shape = document.get("base_shape_zyx")
-    if base_shape is not None:
-        base_shape = _checked_shape(base_shape, f"{path}: base_shape_zyx")
-    frame = {"base_shape_zyx": base_shape,
-             "base_voxels_per_array_voxel": float(source_to_base) * 2 ** scaledown}
+    frame = {"base_shape_zyx": (None if base_shape is None else
+                                _checked_shape(base_shape, f"{path}: base_shape_zyx")),
+             "source_to_base": _checked_source_to_base(
+                 document.get("source_to_base", 1.0), path),
+             "scaledown": _checked_scaledown(0 if scaledown is None else scaledown, path)}
 
     if url is not None:
         return LasagnaSource(identity=url_identity(url), location=dataset_url(url),
@@ -241,6 +243,18 @@ def _checked_shape(value: Any, what: str) -> tuple[int, int, int]:
             or any(type(extent) is not int or extent <= 0 for extent in value)):
         raise LasagnaSourceError(f"{what} must be a ZYX list of three positive integers")
     return tuple(value)
+
+
+def _checked_source_to_base(value: Any, what) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise LasagnaSourceError(f"{what}: source_to_base must be a positive number")
+    return float(value)
+
+
+def _checked_scaledown(value: Any, what) -> int:
+    if type(value) is not int or not 0 <= value <= 30:
+        raise LasagnaSourceError(f"{what}: invalid scaledown {value!r}")
+    return value
 
 
 def _same_level(fine: int, coarse: int, factor: int) -> bool:
@@ -288,16 +302,20 @@ def lasagna_scale_for(source: LasagnaSource, volume_shape_zyx) -> tuple[int | No
     base grid cover the same aligned extent."""
     if volume_shape_zyx is None:
         return None, "the fit volume's shape (base_shape_zyx) is not known"
-    if source.base_shape_zyx is None or source.base_voxels_per_array_voxel is None:
+    if source.base_shape_zyx is None or source.scaledown is None:
         return None, f"{source.location} does not state its base_shape_zyx"
+    if source.source_to_base != 1:
+        return None, (f"{source.location} states source_to_base "
+                      f"{source.source_to_base:g}, whose frame has no agreed convention")
     try:
         base_per_volume_voxel = dyadic_coordinate_scale(volume_shape_zyx, source.base_shape_zyx)
     except ValueError as exc:
         return None, (f"the fit volume's shape {list(volume_shape_zyx)} and the "
                       f"dataset's base shape {list(source.base_shape_zyx)} are not "
                       f"levels of one grid ({exc})")
-    scale = source.base_voxels_per_array_voxel / base_per_volume_voxel
-    how = (f"{source.base_voxels_per_array_voxel:g} base voxels per array voxel, "
+    base_per_array_voxel = 2 ** source.scaledown
+    scale = base_per_array_voxel / base_per_volume_voxel
+    how = (f"{base_per_array_voxel} base voxels per array voxel, "
            f"{base_per_volume_voxel:g} per fit-volume voxel")
     if scale < 1 or scale != round(scale):
         return None, f"{how} is not a whole downsampling ({scale:g})"
@@ -332,18 +350,17 @@ def load_lasagna_source(path: str | os.PathLike[str]) -> LasagnaSource:
     if not isinstance(stores, Mapping) or set(stores) - set(LASAGNA_CHANNELS):
         raise LasagnaSourceError(f"{path}: stores must be keyed by {sorted(LASAGNA_CHANNELS)}")
     base_shape = document.get("base_shape_zyx")
-    per_array_voxel = document.get("base_voxels_per_array_voxel")
-    if per_array_voxel is not None and (
-            type(per_array_voxel) not in (int, float) or not per_array_voxel > 0):
-        raise LasagnaSourceError(f"{path}: invalid base_voxels_per_array_voxel")
+    source_to_base, scaledown = document.get("source_to_base"), document.get("scaledown")
     return LasagnaSource(identity=str(document.get("identity") or ""),
                          location=str(document.get("location") or ""),
                          group=str(document.get("group") or ""),
                          stores={key: str(value) for key, value in stores.items() if value},
                          base_shape_zyx=(None if base_shape is None else
                                          _checked_shape(base_shape, f"{path}: base_shape_zyx")),
-                         base_voxels_per_array_voxel=(
-                             None if per_array_voxel is None else float(per_array_voxel)))
+                         source_to_base=(None if source_to_base is None else
+                                         _checked_source_to_base(source_to_base, path)),
+                         scaledown=(None if scaledown is None else
+                                    _checked_scaledown(scaledown, path)))
 
 
 def fiber_directions_path(cache_directory: str | os.PathLike[str], identity: str,

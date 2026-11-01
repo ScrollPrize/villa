@@ -151,9 +151,15 @@ Lasagna dataset (see "Lasagna inputs must be packed first";
 file's `base_shape_zyx` and the manifest's `base_shape_zyx`. The two shapes
 must be power-of-two levels of one grid (ceil or floor halving; at one level
 they may differ by one voxel, the voxel-count and inclusive conventions), and
-the scale is then the manifest's base voxels per array voxel
-(`source_to_base` × 2^`scaledown`) over its base voxels per fit-volume voxel,
-which must be a whole number. **The derivation assumes the two grids cover
+the scale is then the manifest's base voxels per array voxel (2^`scaledown`)
+over its base voxels per fit-volume voxel, which must be a whole number. The
+manifest's `base_shape_zyx` is level 0 of the finest real scan, and
+`scaledown` counts from it even when the Lasagna was computed from a
+downsampled level: PHercParis4's, inferred on level 2 of its 2.4 µm volume,
+states that volume's full shape and normals at `scaledown` 4 (16
+full-resolution voxels). A manifest with `source_to_base` other than 1
+(levels counted from a pre-downsampled volume) has no agreed convention
+between VC3D and the Lasagna writer yet, so no scale is derived from it. **The derivation assumes the two grids cover
 the same aligned volume extent** (one origin, one extent): shapes cannot show
 a cropped or offset Lasagna dataset, or another volume of the same shape.
 
@@ -408,8 +414,8 @@ it, and `fit_spiral.py --lasagna-url <URL>` fits it, under that URL's
 identity, so a service fitting the URL finds its packs. Either way a host
 needs only the packs, not the arrays; the packer writes the dataset's source
 document (`lasagna-<identity>.json`, recording its location and, where the
-manifest states it, its frame: `base_shape_zyx` and base voxels per array
-voxel) beside them. The command-line fit derives `lasagna_scale` from that
+manifest states it, its frame: `base_shape_zyx`, `source_to_base` and the
+channels' `scaledown`) beside them. The command-line fit derives `lasagna_scale` from that
 frame (see "Scroll specification").
 
 The command-line fit builds a missing pool from the arrays (reporting chunk

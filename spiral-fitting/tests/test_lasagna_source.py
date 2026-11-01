@@ -158,7 +158,8 @@ def test_a_manifest_s_frame_gives_the_arrays_downsampling(tmp_path):
     path = write_manifest(tmp_path, base_shape_zyx=[400, 800, 1200])
     source = read_lasagna_manifest(path)
     # scaledown 4 of the fixture: 16 base voxels per array voxel.
-    assert (source.base_shape_zyx, source.base_voxels_per_array_voxel) == ((400, 800, 1200), 16.0)
+    assert (source.base_shape_zyx, source.source_to_base, source.scaledown) == (
+        (400, 800, 1200), 1.0, 4)
     assert lasagna_scale_for(source, (400, 800, 1200))[0] == 16
     assert lasagna_scale_for(source, (399, 800, 1199))[0] == 16   # inclusive convention
     assert lasagna_scale_for(source, (800, 1600, 2400))[0] == 32  # a 2x finer fit volume
@@ -167,9 +168,38 @@ def test_a_manifest_s_frame_gives_the_arrays_downsampling(tmp_path):
     assert load_lasagna_source(write_lasagna_source(tmp_path / 'c', copy)) == copy
     assert lasagna_scale_for(copy, (400, 800, 1200))[0] == 16
 
+    # Levels counted from a pre-downsampled volume: no agreed convention yet.
     scaled = read_lasagna_manifest(write_manifest(
-        tmp_path, name='t.lasagna.json', base_shape_zyx=[400, 800, 1200], source_to_base=0.5))
-    assert lasagna_scale_for(scaled, (400, 800, 1200))[0] == 8
+        tmp_path, name='t.lasagna.json', base_shape_zyx=[200, 400, 600], source_to_base=2.0))
+    scale, why = lasagna_scale_for(scaled, (400, 800, 1200))
+    assert scale is None and 'source_to_base 2' in why
+
+
+def write_published_manifest(directory, name, base_shape_zyx, normal_scaledown):
+    """The frame of a published open-data manifest (version 2, one
+    single-channel store per channel, source_to_base 1)."""
+    stem = name.removesuffix('.lasagna.json')
+    path = directory / name
+    path.write_text(json.dumps({
+        'version': 2, 'source_to_base': 1.0, 'base_shape_zyx': base_shape_zyx,
+        'groups': {channel: {'zarr': f'{stem}_{channel}.ome.zarr/{normal_scaledown}',
+                             'scaledown': normal_scaledown, 'channels': [channel]}
+                   for channel in ('nx', 'ny', 'grad_mag')}}))
+    return path
+
+
+def test_published_datasets_give_their_scales(tmp_path):
+    # PHercParis4: inferred on level 2 of the 2.4 um volume, its levels still
+    # count from that volume's level 0 (normals at 16 full-resolution voxels).
+    paris4 = read_lasagna_manifest(write_published_manifest(
+        tmp_path, 'p4.lasagna.json', [75784, 32693, 32693], 4))
+    assert lasagna_scale_for(paris4, (75784, 32693, 32693))[0] == 16
+    assert lasagna_scale_for(paris4, (18946, 8174, 8174))[0] == 4
+    # PHerc1447: inferred at the native 8.64 um resolution.
+    pherc1447 = read_lasagna_manifest(write_published_manifest(
+        tmp_path, 'h.lasagna.json', [24297, 8343, 8343], 2))
+    assert lasagna_scale_for(pherc1447, (24297, 8343, 8343))[0] == 4
+    assert lasagna_scale_for(pherc1447, (24296, 8342, 8342))[0] == 4
 
 
 def test_the_downsampling_is_not_derived_without_a_frame_or_a_matching_shape(tmp_path):
