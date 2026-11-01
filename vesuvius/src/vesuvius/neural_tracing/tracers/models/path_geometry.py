@@ -51,8 +51,11 @@ def path_geometry_samples(item):
     return features, valid
 
 
-def path_geometry_inputs(items):
-    samples = [path_geometry_samples(item) for item in items]
+def path_geometry_inputs(items, pool=None):
+    # Independent CPU-only rows. Keep ordered results, and create tensors only
+    # in the caller so no torch shared-memory transport is needed by workers.
+    samples = (list(pool.map(path_geometry_samples, items, chunksize=8))
+               if pool is not None else [path_geometry_samples(item) for item in items])
     return dict(path_geometry=torch.from_numpy(np.stack([s[0] for s in samples])),
                 path_geometry_valid=torch.from_numpy(np.stack([s[1] for s in samples])))
 

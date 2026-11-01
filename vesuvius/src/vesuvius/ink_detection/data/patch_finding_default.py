@@ -83,10 +83,12 @@ def find_segment_patches(
     validation_surface = (
         None if validation is None else int(validation.shape[0] // 2)
     )
-    support = combined_patch_discovery_support(
-        supervision[mask_surface],
-        None if validation is None else validation[validation_surface],
-    )
+    # Read each mask surface once; per-candidate slices decompress the same chunks again.
+    supervision = np.asarray(supervision[mask_surface])
+    inklabels = np.asarray(inklabels[mask_surface])
+    if validation is not None:
+        validation = np.asarray(validation[validation_surface])
+    support = combined_patch_discovery_support(supervision, validation)
     ys, xs = np.nonzero(support)
     if len(ys) == 0:
         raise ValueError(f"{segment.supervision_mask} contains no nonzero voxels at scan scale")
@@ -99,9 +101,10 @@ def find_segment_patches(
             )
         ),
     )
-    corners = np.unique(
-        np.stack([ys // stride * stride, xs // stride * stride], axis=1), axis=0
-    )
+    # Mark occupied stride cells; np.argwhere keeps np.unique's row-major order.
+    occupied = np.zeros((support.shape[0] // stride + 1, support.shape[1] // stride + 1), bool)
+    occupied[ys // stride, xs // stride] = True
+    corners = np.argwhere(occupied) * stride
     scan_h = max(1, int(round(patch_size[1] / scale_y)))
     scan_w = max(1, int(round(patch_size[2] / scale_x)))
     training: list[Patch] = []
@@ -109,13 +112,12 @@ def find_segment_patches(
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
         supervision_patch = supervision[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         has_training = bool(supervision_patch.size and np.any(supervision_patch))
         has_validation = False
         if validation is not None:
             validation_patch = validation[
-                validation_surface,
                 y_scan : y_scan + scan_h,
                 x_scan : x_scan + scan_w,
             ]
@@ -137,7 +139,7 @@ def find_segment_patches(
                 )
             )
         label_patch = inklabels[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         if has_training and labeled_patch_coverage(label_patch) >= (
             segment.data_config.patch_finding.min_labeled_coverage

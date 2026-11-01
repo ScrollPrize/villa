@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+
+import torch
+from torch._functorch import config as functorch_config
+
+from dinovol_2.pretrain import DinoIBOTPretrainer
+
+
+class CompilationTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        torch.compiler.reset()
+        torch.manual_seed(47)
+
+    def tearDown(self):
+        torch.compiler.reset()
+        self.tempdir.cleanup()
+
+    def config(self, compile_settings=False):
+        return {
+            "device": "cpu", "use_amp": False, "compile": compile_settings,
+            "output_dir": self.tempdir.name, "max_iterations": 3, "warmup_steps": 0,
+            "freeze_last_layer_steps": 0, "batch_size": 2, "lr": 1e-4,
+            "ibot_masked_loss_chunk_size": 8,
+            "model": {
+                "model_type": "v3", "embed_dim": 36, "num_heads": 3, "depth": 2,
+                "global_crops_size": [16]*3, "local_crops_size": [8]*3, "patch_size": [4]*3,
+                "embedding_type": "deeper", "deeper_embed_stage_channels": [4, 8, 36],
+                "deeper_embed_stage_strides": [1, 2, 2], "deeper_embed_depth_per_level": [1]*3,
+                "deeper_embed_use_stem": True, "deeper_embed_stem_type": "conv",
+                "deeper_embed_stem_channels": 4, "deeper_embed_final_projection": False,
+                "grad_checkpointing": True, "drop_path_rate": 0., "rope_rescale_coords": None,
+                "dino_out_dim": 64, "ibot_out_dim": 64,
+                "dino_head_hidden_dim": 32, "ibot_head_hidden_dim": 32,
+                "dino_head_bottleneck_dim": 12, "ibot_head_bottleneck_dim": 12,
+            },
+        }
+
+    @staticmethod
+    def batch(mask_every=3):
+        masks = torch.zeros(4, 64, dtype=torch.bool)
+        if mask_every:
+            masks[:2, ::mask_every] = True
+        indices = masks.flatten().nonzero().flatten()
+        weights = (1. / masks.sum(1).clamp(min=1)).unsqueeze(1).expand_as(masks)[masks]
+        return {
+            "collated_global_crops": torch.randn(4, 1, 16, 16, 16),
+            "collated_local_crops": torch.randn(4, 1, 8, 8, 8),
+            "collated_masks": masks, "mask_indices_list": indices,
+            "n_masked_patches": torch.tensor(indices.numel()), "masks_weight": weights,
+            "n_global_views": 2, "n_local_views": 2,
+        }
+
+    def assert_models_close(self, first, second):
+        for name, tensor in first.model_module.state_dict().items():
+            torch.testing.assert_close(tensor, second.model_module.state_dict()[name], rtol=2e-4, atol=1e-5, msg=name)
+
+    def test_compiled_training_matches_eager_and_checkpoint_resume(self):
+        # AOTAutograd compiles forward/backward graphs without requiring a native compiler in CI.
+        compiled = DinoIBOTPretrainer(self.config({"enabled": True, "backend": "aot_eager", "fullgraph": True}))
+        eager = DinoIBOTPretrainer(self.config())
+        eager.model_module.load_state_dict(compiled.model_module.state_dict(), strict=True)
+        keys = set(compiled.model_module.state_dict())
+        self.assertFalse(any("_orig_mod" in name for name in keys))
+        self.assertTrue(compiled.compile_enabled)
+        for branch in (compiled.model_module.student, compiled.model_module.teacher):
+            for module in branch.values():
+                self.assertIsNotNone(module._compiled_call_impl)
+        teacher_before = {name: p.detach().clone() for name, p in compiled.model_module.teacher.named_parameters()}
+        for step, mask_every in enumerate((3, 5, 0)):
+            batch = self.batch(mask_every)
+            expected = eager.train_step(batch, step)
+            actual = compiled.train_step(batch, step)
+            for name in expected:
+                torch.testing.assert_close(actual[name], expected[name], rtol=1e-4, atol=2e-5, msg=name)
+            self.assert_models_close(compiled, eager)
+        self.assertTrue(any(not torch.equal(p, teacher_before[name])
+                            for name, p in compiled.model_module.teacher.named_parameters()))
+        self.assertTrue(all(p.grad is None for p in compiled.model_module.teacher.parameters()))
+        self.assertEqual(keys, set(compiled.model_module.state_dict()))
+        checkpoint = compiled.save_checkpoint(2)
+        self.assertEqual(eager.load_checkpoint(checkpoint), 2)
+        self.assert_models_close(compiled, eager)
+        eager_checkpoint = eager.save_checkpoint(3)
+        self.assertEqual(compiled.load_checkpoint(eager_checkpoint), 3)
+        self.assert_models_close(compiled, eager)
+        self.assertEqual(len(compiled.optimizer.state), len(eager.optimizer.state))
+        compiled.model.eval()
+        eager.model.eval()
+        with torch.no_grad():
+            x = torch.randn(1, 1, 8, 8, 8)
+            actual = compiled.model_module.student.backbone(x)["x_norm_patchtokens"]
+            expected = eager.model_module.student.backbone(x)["x_norm_patchtokens"]
+        torch.testing.assert_close(actual, expected)
+
+    def test_compiled_amp_backward_matches_eager(self):
+        config = self.config({"enabled": True, "backend": "aot_eager", "fullgraph": True})
+        config.update(use_amp=True, koleo_loss_weight=0.)
+        compiled = DinoIBOTPretrainer(config)
+        eager = DinoIBOTPretrainer({**config, "compile": False})
+        eager.model_module.load_state_dict(compiled.model_module.state_dict())
+        batch = self.batch()
+        previous_autocast = functorch_config.backward_pass_autocast
+        expected = eager.train_step(batch, 0)
+        actual = compiled.train_step(batch, 0)
+        self.assertEqual(functorch_config.backward_pass_autocast, previous_autocast)
+        torch.testing.assert_close(actual["loss"], expected["loss"], rtol=0.01, atol=0.01)
+        eager_grad = torch.cat([p.grad.flatten() for p in eager.model_module.student.parameters() if p.grad is not None])
+        compiled_grad = torch.cat([p.grad.flatten() for p in compiled.model_module.student.parameters() if p.grad is not None])
+        self.assertTrue(torch.isfinite(compiled_grad).all())
+        self.assertGreater(torch.nn.functional.cosine_similarity(eager_grad, compiled_grad, dim=0).item(), 0.99)
+
+    def test_compile_configuration_and_disabled_default(self):
+        trainer = DinoIBOTPretrainer(self.config())
+        self.assertFalse(trainer.compile_enabled)
+        self.assertIsNone(trainer.model_module.student.backbone._compiled_call_impl)
+        for setting in ("yes", {"enabled": "yes"}, {"enabled": True, "dynamic": "yes"},
+                        {"enabled": True, "fullgraph": "yes"}, {"enabled": True, "typo": 1},
+                        {"enabled": True, "dynamic": {"typo": False}},
+                        {"enabled": True, "dynamic": {"backbone": "yes"}}):
+            with self.subTest(setting=setting), self.assertRaises(ValueError):
+                trainer.config["compile"] = setting
+                trainer._configure_model_compilation()
+
+
+if __name__ == "__main__":
+    unittest.main()

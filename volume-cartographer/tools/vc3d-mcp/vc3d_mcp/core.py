@@ -83,18 +83,6 @@ def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
-def _is_placeholder_error(exc: Exception) -> bool:
-    """True when a segments.activate failure is the 'unmaterialized open-data
-    placeholder; fetch it first' refusal (SurfacePanelController::activateSurfaceById),
-    so vc3d_activate_segment knows a fetch+retry can resolve it."""
-    if not isinstance(exc, BridgeError):
-        return False
-    detail = ""
-    if isinstance(exc.data, dict):
-        detail = str(exc.data.get("detail", ""))
-    return "placeholder" in detail.lower() or "placeholder" in str(exc.message).lower()
-
-
 POLL_INTERVAL_S = 1.0
 PROGRESS_REPORT_TIMEOUT_S = 1.0
 
