@@ -1,14 +1,18 @@
 # Spiral input list
 
-A Spiral fit's patches, point collections and fibers come from the Spiral
+A Spiral fit's patches, point collections, fibers and tracks come from the Spiral
 service's object store; see "Object store, positions and input updates"
 and "Connecting from VC3D" in the
 [Spiral fitting README](../../spiral-fitting/README.md). The workspace shows
-them as the project's store for those kinds (all three routed to one store)
+patches, point collections and fibers as the project's store for those kinds
 holds them now, updating each one a commit changes (fibers
 with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
-including its links.
+including its links. Tracks and their crossing relationships participate in
+the same input comparison, but track geometry is not displayed by this view.
+Use VC3D and the service from the same checkout (API 45); enable tracks in
+the fit settings after importing them into the service's store. There is no
+track-DBM path selector.
 
 The scroll's facts, the umbilicus and the Lasagna stores are the open
 project's: every build request sends the service, which cannot read the
@@ -28,7 +32,18 @@ name; import an umbilicus for that volume (File > Import Umbilicus) and
 select the Lasagna dataset before building. For a volume outside the
 catalog, choose the spiral's *Outward sense* in the panel (a fit setting).
 The outer shell is the store's surface tagged `spiral-outer-shell`, shown
-from the fit's inputs. The panel's *Scroll* and *Store layout* lines show the session's scroll,
+from the fit's inputs. There is no dataset: VC3D neither picks nor sends a
+dataset directory, and the service reads no `spiral-scroll.json`. Set the
+winding count in the fit configuration.
+
+Winding-model supervision reads the service's winding-inference artifact
+from the path the service was launched with (`--winding-inference`); VC3D
+never downloads or interprets it. For a local service VC3D owns, set the
+optional *Winding inference* path in the launch settings (changing it
+restarts the service); a remote service's binding is configured on its host.
+The panel's *Winding inference* line says whether the service can run
+winding-model supervision, and why not; a fit enabling it without a usable
+binding fails preparation. The panel's *Scroll* and *Store layout* lines show the session's scroll,
 volume, umbilicus revision and Lasagna dataset. Line annotation reads its
 normals from the same selected dataset.
 
@@ -44,6 +59,14 @@ update pushes them first. A service that can be named no position (a remote
 one on a plain store) sees saved edits when it is rebuilt with current inputs. The text filter applies to the list. Remove (or
 *Discard Local Changes* in its context menu) discards an unsaved drawing.
 Leaving the workspace with unsaved drawings asks before discarding them.
+
+Changing tracks or their crossings requires *Rebuild Fit* → *Rebuild with
+Current Inputs*, as does changing the outer shell. With tracks enabled and
+`track_exclusion_radius > 0`, updates also require a rebuild because the
+track exclusion masks depend on the fit's trusted geometry. SSH hub setup
+now requires the one-time process-lock migration documented in the
+[object-store guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas);
+all clients, including the service, must then use the SSH hub address.
 
 Build and run the Spiral tests from the repository root using the existing
 configured build directory:

@@ -49,11 +49,13 @@ constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
 constexpr int kPreviewCacheKept = 3;
 
-// Deterministic per-dataset default output root, outside the dataset: the
-// service requires --output and rejects a location under --dataset.
-QString defaultLocalOutputRoot(const QString& datasetRoot)
+// Deterministic default output root per attached object store: the service
+// requires --output, and two stores fitted on this computer must not share
+// generated state (autosaves, previews, replicas). Keyed by the store's
+// absolute path, so reattaching the same store reuses its output.
+QString defaultLocalOutputRoot(const QString& storePath)
 {
-    const QString canonical = QFileInfo(datasetRoot).absoluteFilePath();
+    const QString canonical = QFileInfo(storePath).absoluteFilePath();
     const QString digest = QString::fromLatin1(
         QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256)
             .toHex().left(8));
@@ -250,7 +252,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _eventsInFlight = false;
     _eventFailures = 0;
     _lastEventCursor = 0;
-    _advertisedDataset = {};
+    _advertisedBindings = {};
 
     _credential = profile.apiKey;
     if (_credential.isEmpty())
@@ -307,18 +309,9 @@ void SpiralServiceManager::startTunnel()
 
 void SpiralServiceManager::startLocalProcess()
 {
-    // The owned service is bound to one dataset/output/cache triple at
-    // startup; a different selection is a different service instance.
-    if (_profile.datasetRoot.trimmed().isEmpty()) {
-        const QString message = tr("The local Spiral service needs a dataset root. "
-                                   "Set it in the Spiral Service connection panel.");
-        setConnectionState(ConnectionState::Failed, message);
-        emit errorOccurred(message);
-        return;
-    }
-    QString outputRoot = _profile.outputRoot.trimmed();
-    if (outputRoot.isEmpty())
-        outputRoot = defaultLocalOutputRoot(_profile.datasetRoot.trimmed());
+    // The owned service is bound to one store/output/cache/winding-inference
+    // selection at startup; a different selection is a different service
+    // instance.
     // Patches, PCLs and fibers come from an object store: the local service
     // is launched bound to the one attached here.
     if (_localStorePath.isEmpty()) {
@@ -330,8 +323,10 @@ void SpiralServiceManager::startLocalProcess()
         emit errorOccurred(message);
         return;
     }
-    QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
-                        QStringLiteral("--output"), outputRoot};
+    QString outputRoot = _profile.outputRoot.trimmed();
+    if (outputRoot.isEmpty())
+        outputRoot = defaultLocalOutputRoot(_localStorePath);
+    QStringList binding{QStringLiteral("--output"), outputRoot};
     // A hosted replica's service works on its own replica of the same hub
     // (cloned at first launch, reattached later), never on this one.
     if (_storeBinding.localHosted())
@@ -342,6 +337,11 @@ void SpiralServiceManager::startLocalProcess()
         binding << QStringLiteral("--object-store") << _localStorePath;
     if (!_profile.cacheRoot.trimmed().isEmpty())
         binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
+    // A directly consumed supervision artifact on this host; VC3D never reads
+    // it, only names it to the service it launches.
+    if (!_profile.windingInference.trimmed().isEmpty())
+        binding << QStringLiteral("--winding-inference")
+                << _profile.windingInference.trimmed();
 
     if (ownsProcess()) {
         if (binding == _ownedLaunchBinding) {
@@ -349,10 +349,10 @@ void SpiralServiceManager::startLocalProcess()
             beginHandshake();
             return;
         }
-        // A different dataset/output/cache/store selection restarts the
-        // owned process with the new binding.
+        // A different output/cache/store/winding-inference selection
+        // restarts the owned process with the new binding.
         emit logMessage(tr("Restarting the local Spiral service for a different "
-                           "dataset binding"));
+                           "launch binding"));
         stopService();
     }
     const QString python = findPython();
@@ -481,7 +481,7 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
-    fetchAdvertisedDataset();
+    fetchAdvertisedBindings();
     get(QStringLiteral("/configuration"), Timeout::Quick,
         [this](const QJsonObject& catalog) {
             _configurationDefaults =
@@ -501,16 +501,36 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     pollEvents();
 }
 
-void SpiralServiceManager::fetchAdvertisedDataset()
+void SpiralServiceManager::fetchAdvertisedBindings()
 {
     const quint64 generation = _connectionGeneration;
-    get(QStringLiteral("/dataset"), Timeout::Command,
-        [this, generation](const QJsonObject& dataset) {
+    get(QStringLiteral("/bindings"), Timeout::Command,
+        [this, generation](const QJsonObject& bindings) {
             if (generation != _connectionGeneration) return;
-            _advertisedDataset = dataset;
+            _advertisedBindings = bindings;
             updateStoreBinding();
-            emit datasetResolved(dataset);
+            emit bindingsAdvertised(bindings);
         });
+}
+
+bool SpiralServiceManager::windingInferenceAvailable(QString* reason) const
+{
+    const QJsonObject binding =
+        _advertisedBindings.value(QStringLiteral("bindings")).toObject()
+            .value(QStringLiteral("winding_inference")).toObject();
+    const bool available = _advertisedBindings.value(QStringLiteral("capabilities"))
+                               .toObject().value(QStringLiteral("winding_inference")).toBool();
+    if (reason) {
+        if (available)
+            reason->clear();
+        else if (!binding.value(QStringLiteral("bound")).toBool())
+            *reason = tr("The service was launched without --winding-inference");
+        else
+            *reason = tr("The service's winding-inference artifact %1 is unusable: %2")
+                          .arg(binding.value(QStringLiteral("path")).toString(),
+                               binding.value(QStringLiteral("error")).toString());
+    }
+    return available;
 }
 
 void SpiralServiceManager::setObjectStore(
@@ -574,7 +594,7 @@ QString SpiralServiceManager::serviceHubAddress() const
 
 void SpiralServiceManager::updateStoreBinding()
 {
-    const QJsonObject store = _advertisedDataset.value(QStringLiteral("object_store")).toObject();
+    const QJsonObject store = _advertisedBindings.value(QStringLiteral("object_store")).toObject();
     _storeBinding.serviceUuid = store.value(QStringLiteral("uuid")).toString();
     _storeBinding.servicePath = store.value(QStringLiteral("path")).toString();
     const QJsonObject hub = store.value(QStringLiteral("hub")).toObject();
@@ -733,9 +753,9 @@ void SpiralServiceManager::rebuildSession(QJsonObject request, bool reloadInputs
 void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
                                                  bool initialize)
 {
-    // The service owns its base inputs (it is launched with --dataset), so a
-    // session construction request carries run
-    // parameters plus the client-selectable checkpoint only.
+    // The service owns its host inputs (its launch bindings and the project
+    // block), so a session construction request carries run parameters plus
+    // the client-selectable checkpoint only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
     QJsonObject selectable;
@@ -769,9 +789,9 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
     // uploaded first and the load resumes from the returned host path.
     bool serviceSide = false;
     for (const QJsonValue& value :
-         _advertisedDataset.value(QStringLiteral("detected_checkpoints")).toArray())
+         _advertisedBindings.value(QStringLiteral("session_checkpoints")).toArray())
         if (value.toString() == checkpoint) serviceSide = true;
-    const QString outputDir = _advertisedDataset.value(QStringLiteral("resolved")).toObject()
+    const QString outputDir = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
                                   .value(QStringLiteral("output_directory")).toString();
     if (!outputDir.isEmpty() && checkpoint.startsWith(outputDir)) serviceSide = true;
     if (serviceSide || !QFileInfo(checkpoint).isFile()) {
@@ -1202,7 +1222,7 @@ void SpiralServiceManager::saveCheckpoint(const QString& name)
                       handleStatus(response);
                       // The saved file joins the checkpoints the service
                       // advertises, which is what a load offers to choose from.
-                      fetchAdvertisedDataset();
+                      fetchAdvertisedBindings();
                   });
 }
 
@@ -1232,10 +1252,9 @@ void SpiralServiceManager::requestPreview()
 QStringList SpiralServiceManager::serviceCheckpoints() const
 {
     QStringList paths;
-    for (const QString& key : {QStringLiteral("session_checkpoints"),
-                               QStringLiteral("detected_checkpoints")})
-        for (const QJsonValue& value : _advertisedDataset.value(key).toArray())
-            if (!value.toString().isEmpty()) paths.push_back(value.toString());
+    for (const QJsonValue& value :
+         _advertisedBindings.value(QStringLiteral("session_checkpoints")).toArray())
+        if (!value.toString().isEmpty()) paths.push_back(value.toString());
     return paths;
 }
 
@@ -1579,7 +1598,7 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
     // A session identity appears when explicit initialization starts. Until
-    // then the service remains connected for dataset/checkpoint discovery.
+    // then the service remains connected for binding/checkpoint discovery.
     const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;

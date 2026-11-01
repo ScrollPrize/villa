@@ -157,7 +157,6 @@ private:
         QStringList warnings;
     };
 
-    QString mapServicePath(const QString& servicePath) const;
     // Loss-map entries of one manifest, resolved against the artifact
     // directory holding them. Shared by the surface manifest (older services
     // still carry the overlays there) and the diagnostics manifest.
@@ -219,7 +218,6 @@ private:
                                         Qt::KeyboardModifiers modifiers);
     [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
         resolveLineAnnotationInputs(QString* errorMessage) const;
-    [[nodiscard]] QStringList fallbackFiberManifests() const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveFiberBaseShape(QString* errorMessage) const;
     void updatePreviewCoordinateScale();
@@ -294,7 +292,6 @@ private:
     VolumeViewerBase* _flattenedViewer = nullptr;
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
-    QJsonObject _sessionPaths;
     QJsonObject _sessionRunConfig;
     // The scroll the session fits (its request's "scroll").
     QJsonObject _sessionScroll;

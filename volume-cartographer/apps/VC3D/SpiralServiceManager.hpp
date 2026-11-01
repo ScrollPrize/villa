@@ -51,7 +51,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 44;
+    static constexpr int kApiVersion = 45;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted only when both
@@ -61,7 +61,7 @@ public:
     // A local service on a plain store shares the file with this VC3D and
     // fits positions of the store itself.
     struct StoreBinding {
-        QString serviceUuid;   // /dataset object_store.uuid
+        QString serviceUuid;   // /bindings object_store.uuid
         QString servicePath;   // where the service host opened it
         QString serviceHub;    // the hub address on the service host
         QString serviceHubIdentity;
@@ -118,7 +118,12 @@ public:
 
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
-    QJsonObject advertisedDataset() const { return _advertisedDataset; }
+    // GET /bindings: the service's host-owned output/cache roots, its
+    // winding-inference binding, capabilities, store binding and checkpoints.
+    QJsonObject advertisedBindings() const { return _advertisedBindings; }
+    // Whether the service can run winding-model supervision (a usable
+    // --winding-inference artifact is bound on its host), and if not, why.
+    bool windingInferenceAvailable(QString* reason = nullptr) const;
     // The "project" block every initialize and rebuild carries
     // (SpiralProjectInputs): the service reads the project's facts and
     // umbilicus from it, not from the project file. Throws when the project
@@ -133,7 +138,7 @@ public:
     QString displayedPreviewInputDigest() const { return _displayedPreviewInputDigest; }
     qint64 displayedPreviewInputPosition() const { return _displayedPreviewInputPosition; }
 
-    // Create the first resident session. The service exposes dataset and
+    // Create the first resident session. The service exposes its bindings and
     // checkpoint discovery before this without importing the fit runtime.
     void initializeSession(QJsonObject request);
     // Replace an initialized session. This is also the only later verb that
@@ -179,8 +184,8 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
-    // Every checkpoint the service says it can load: GET /dataset's
-    // session_checkpoints (newest first) followed by detected_checkpoints.
+    // Every checkpoint the service says it can load: GET /bindings'
+    // session_checkpoints (newest first).
     QStringList serviceCheckpoints() const;
     // The store this VC3D has attached. A local service is launched bound to
     // it (and relaunched when it changes); any service is compared with it.
@@ -238,7 +243,7 @@ signals:
     void storeBindingChanged();
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
-    void datasetResolved(const QJsonObject& resolution);
+    void bindingsAdvertised(const QJsonObject& bindings);
     void configurationCatalogChanged(const QJsonObject& catalog);
     // Emitted once when this connection first observes a resident session,
     // whether VC3D loaded it or attached after another client did.
@@ -285,7 +290,7 @@ private:
         Quick = 5000,          // health checks and status polls
         Command = 30000,       // run/stop and small mutations
         LongCommand = 240000,  // save-checkpoint blocks up to two minutes
-        Load = 600000,         // session load tears down and validates datasets
+        Load = 600000,         // session load tears down and validates inputs
     };
 
     // Failure callback that also receives the parsed error body, for
@@ -326,7 +331,7 @@ private:
     void pollEvents();
     void handleStatus(const QJsonObject& status);
     void syncArtifacts(const QJsonObject& status);
-    void fetchAdvertisedDataset();
+    void fetchAdvertisedBindings();
     QString commandId();
     QString endpointFingerprint() const;
     void claimSessionLease();
@@ -369,7 +374,7 @@ private:
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
-    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache/--object-store of _process
+    QStringList _ownedLaunchBinding;    // --output/--cache/--object-store/--winding-inference of _process
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::unique_ptr<vc::objects::AttachmentIdentity> _storeAttachment;
     QString _localStorePath;
@@ -391,7 +396,7 @@ private:
     bool _eventsInFlight = false;
     int _eventFailures = 0;
     qint64 _lastEventCursor = 0;
-    QJsonObject _advertisedDataset;
+    QJsonObject _advertisedBindings;
     std::function<QJsonObject()> _projectSource;
     QJsonObject _configurationDefaults;
     QJsonObject _appliedConfiguration;

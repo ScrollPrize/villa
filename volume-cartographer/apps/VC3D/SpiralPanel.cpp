@@ -164,9 +164,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("service_api_key"), {_apiKeyRow});
 
     // Local launch binding: the owned service is started with these values as
-    // --dataset/--output/--cache; selecting a different dataset restarts the
-    // bound service instance. Remote services advertise their immutable paths
-    // through /dataset instead.
+    // --output/--cache/--winding-inference; changing one restarts the bound
+    // service instance. Remote services are configured on their hosts and
+    // advertise their bindings through /bindings instead.
     auto makeLaunchRow = [this, serviceContents, serviceForm](
                              QLineEdit*& edit, QWidget*& row,
                              const QString& label, const QString& placeholder) {
@@ -189,36 +189,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             }
         });
     };
-    makeLaunchRow(_datasetRoot, _datasetRow, tr("Dataset"),
-                  tr("Dataset root (required for the local service)"));
-    describe(QStringLiteral("service_dataset"), {_datasetRow});
     makeLaunchRow(_outputRoot, _outputRow, tr("Output"),
-                  tr("Generated state root (default: per-dataset app data dir)"));
+                  tr("Generated state root (default: per-store app data dir)"));
     describe(QStringLiteral("service_output"), {_outputRow});
     makeLaunchRow(_cacheRoot, _cacheRow, tr("Cache"),
                   tr("Derived cache root (default: ~/.cache/vc3d/spiral)"));
     describe(QStringLiteral("service_cache"), {_cacheRow});
-
-    // One box, not a pair: the service advertises its own dataset root, so the
-    // only thing this viewer cannot know is where the same dataset is mounted
-    // here. Service paths are translated by swapping the advertised root for
-    // this local root.
-    _mappingRow = new QWidget(serviceContents);
-    auto* mappingLayout = new QHBoxLayout(_mappingRow);
-    mappingLayout->setContentsMargins(0, 0, 0, 0);
-    _mapLocalRoot = new QLineEdit(_mappingRow);
-    _mapLocalRoot->setPlaceholderText(tr("local mount of the service's dataset root"));
-    auto* browseLocalRoot = new QToolButton(_mappingRow);
-    browseLocalRoot->setText(QStringLiteral("…"));
-    mappingLayout->addWidget(_mapLocalRoot, 1);
-    mappingLayout->addWidget(browseLocalRoot);
-    serviceForm->addRow(tr("Local dataset path"), _mappingRow);
-    describe(QStringLiteral("service_local_dataset_path"), {_mappingRow});
-    connect(browseLocalRoot, &QToolButton::clicked, this, [this]() {
-        const QString chosen = QFileDialog::getExistingDirectory(
-            this, tr("Select the local dataset root"), _mapLocalRoot->text());
-        if (!chosen.isEmpty()) _mapLocalRoot->setText(chosen);
-    });
+    makeLaunchRow(_windingInferenceRoot, _windingInferenceRow, tr("Winding inference"),
+                  tr("Optional winding-inference directory (winding-model supervision)"));
+    describe(QStringLiteral("service_winding_inference"), {_windingInferenceRow});
 
     auto* connectRow = new QWidget(serviceContents);
     auto* connectLayout = new QHBoxLayout(connectRow);
@@ -238,18 +217,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("service_status"), {_connectionStatus});
 
     // ------------------------------------------------------------------
-    // Dataset and fit geometry
+    // Fit inputs and geometry
     // ------------------------------------------------------------------
-    auto* pathsGroup = makeSection(tr("Dataset and fit geometry"),
+    auto* pathsGroup = makeSection(tr("Fit inputs and geometry"),
                                    QStringLiteral("spiralDatasetGeometryGroup"),
                                    QStringLiteral("spiral/groups/dataset_geometry_expanded"));
     auto* pathsContents = new QWidget(pathsGroup->contentWidget());
     auto* pathsForm = new QFormLayout(pathsContents);
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
-    addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
-    // Read-only: the project's fit volume (and, for what it does not know,
-    // spiral-scroll.json in the dataset root) is the only source of these, and
+    // Read-only: the project's fit volume is the only source of these, and
     // the service rejects a request that restates them. They are still shown,
     // because a fit's meaning depends on them.
     _scrollSummary = new QLabel(tr("From the project's fit volume when a fit is built"), pathsContents);
@@ -268,9 +245,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsForm->addRow(tr("Outward sense"), _outwardSense);
     describe(QStringLiteral("outward_sense"), {_outwardSense});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
+    _windingInferenceSummary = new QLabel(tr("Advertised by the service once connected"), pathsContents);
+    _windingInferenceSummary->setObjectName(QStringLiteral("spiralWindingInferenceSummary"));
+    _windingInferenceSummary->setWordWrap(true);
+    _windingInferenceSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pathsForm->addRow(tr("Winding inference"), _windingInferenceSummary);
+    describe(QStringLiteral("winding_inference_summary"), {_windingInferenceSummary});
 
     // Patches, point collections and fibers come from the object store the
-    // service was launched with, not from dataset files.
+    // service was launched with, not from files.
     _objectStoreSummary = new QLabel(tr("No object store advertised"), pathsContents);
     _objectStoreSummary->setObjectName(QStringLiteral("spiralObjectStoreSummary"));
     _objectStoreSummary->setWordWrap(true);
@@ -702,7 +685,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    // Connecting discovers the dataset but does not create a fit. This button
+    // Connecting discovers the service's bindings but does not create a fit. This button
     // initializes the first one and becomes Rebuild Fit afterward.
     _load = new QPushButton(tr("Initialize Fit"), runContents);
     _load->setEnabled(false);
@@ -837,7 +820,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _inputFilter->setPlaceholderText(tr("Filter inputs by name or kind"));
     connect(_inputFilter, &QLineEdit::textChanged, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_inputFilter);
-    _showOriginalInputs = new QCheckBox(tr("Show original dataset inputs"), runContents);
+    _showOriginalInputs = new QCheckBox(tr("Show original store inputs"), runContents);
     connect(_showOriginalInputs, &QCheckBox::toggled, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_showOriginalInputs);
     runLayout->addWidget(_inputList);
@@ -896,19 +879,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // ------------------------------------------------------------------
     // Wiring
     // ------------------------------------------------------------------
-    // A changed local launch binding (dataset/output/cache) restarts the
-    // owned service: it is bound to one dataset for its whole lifetime.
+    // A changed local launch binding (output/cache/winding inference)
+    // restarts the owned service: it is bound to them for its whole lifetime.
     auto launchBindingEdited = [this]() {
         if (_currentProfileId != kLocalhostProfileId) return;
         const SpiralServiceProfile& active = _service->profile();
-        if (active.datasetRoot.trimmed() == _datasetRoot->text().trimmed()
-            && active.outputRoot.trimmed() == _outputRoot->text().trimmed()
-            && active.cacheRoot.trimmed() == _cacheRoot->text().trimmed())
+        if (active.outputRoot.trimmed() == _outputRoot->text().trimmed()
+            && active.cacheRoot.trimmed() == _cacheRoot->text().trimmed()
+            && active.windingInference.trimmed() == _windingInferenceRoot->text().trimmed())
             return;
         if (!_service->isReady()) return; // Connect applies the new binding
         guardSessionExit([this]() { connectToSelectedProfile(); });
     };
-    for (QLineEdit* edit : {_datasetRoot, _outputRoot, _cacheRoot})
+    for (QLineEdit* edit : {_outputRoot, _cacheRoot, _windingInferenceRoot})
         connect(edit, &QLineEdit::editingFinished, this, launchBindingEdited);
 
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
@@ -929,7 +912,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _connected = state == CS::Ready;
                 _connectButton->setEnabled(state == CS::Disconnected || state == CS::Failed);
                 _disconnectButton->setEnabled(state != CS::Disconnected);
-                // Connection must succeed before dataset resolution or fit
+                // Connection must succeed before the bindings or fit
                 // controls are enabled. Nothing is enabled from here: the
                 // status poll decides which verbs the resident session can
                 // take, and Rebuild is one of them.
@@ -955,8 +938,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 if (state == CS::Starting || state == CS::Connecting) {
                     _editingAccessError.clear();
-                    // A new connection may be to another dataset entirely, so
-                    // the previous scroll specification stops being true here.
+                    // A new connection may be to another service entirely, so
+                    // the previous scroll and bindings stop being true here.
                     resetScrollSummaries();
                     _hasSession = false;
                     _loadedSessionRequest = {};
@@ -969,15 +952,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 _state->setText(tr("Service: %1").arg(text));
             });
-    connect(_service, &SpiralServiceManager::datasetResolved, this,
+    connect(_service, &SpiralServiceManager::bindingsAdvertised, this,
             [this](const QJsonObject&) { refreshCheckpointChoices(); });
-    connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
-        // A service-owned dataset advertisement describes what a future load
-        // would use. Once attached, the resident session's canonical request
-        // is authoritative and may intentionally differ.
-        if (!_hasSession)
-            applyResolution(value, true);
-    });
+    connect(_service, &SpiralServiceManager::bindingsAdvertised, this,
+            [this](const QJsonObject& value) { applyBindings(value); });
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
             _advancedProfiles, &SpiralConfigProfileEditor::setCatalog);
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
@@ -1310,8 +1288,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                         .arg(detail);
                 question += wholeFit
                     ? tr("Loading it means rebuilding the whole fit — the "
-                         "dataset inputs are re-read, and any added inputs "
-                         "not committed to the dataset are discarded. Rebuild?")
+                         "fit inputs are re-read, and any drafts not saved "
+                         "to the object store are discarded. Rebuild?")
                     : tr("Loading it means rebuilding the model only. The "
                          "loaded inputs, including everything already added to "
                          "this fit, are kept. Rebuild?");
@@ -1532,19 +1510,17 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
     _apiKey->setPlaceholderText(
         ssh ? tr("Optional override — read from the host over SSH when empty")
             : tr("Printed by the service at startup (or set SPIRAL_API_KEY)"));
-    _mappingRow->setVisible(!localhost);
     // The launch binding only exists for the locally owned service; remote
     // profiles display the service's advertised paths instead.
-    _datasetRow->setVisible(localhost);
     _outputRow->setVisible(localhost);
     _cacheRow->setVisible(localhost);
-    _datasetRoot->setText(profile.datasetRoot);
+    _windingInferenceRow->setVisible(localhost);
     _outputRoot->setText(profile.outputRoot);
     _cacheRoot->setText(profile.cacheRoot);
+    _windingInferenceRoot->setText(profile.windingInference);
     _endpointUrl->setText(profile.baseUrl.toString());
     _sshDestination->setText(profile.sshDestination);
     if (profile.remoteServicePort > 0) _sshPort->setValue(profile.remoteServicePort);
-    _mapLocalRoot->setText(profile.localRootPrefix);
     _apiKey->clear();
 }
 
@@ -1553,16 +1529,15 @@ SpiralServiceProfile SpiralPanel::profileFromFields() const
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     if (_currentProfileId == kLocalhostProfileId) {
         SpiralServiceProfile profile = SpiralServiceProfile::localhostProfile();
-        profile.datasetRoot = _datasetRoot->text().trimmed();
         profile.outputRoot = _outputRoot->text().trimmed();
         profile.cacheRoot = _cacheRoot->text().trimmed();
+        profile.windingInference = _windingInferenceRoot->text().trimmed();
         return profile;
     }
     SpiralServiceProfile profile = SpiralServiceProfile::load(settings, _currentProfileId);
     profile.baseUrl = QUrl(_endpointUrl->text().trimmed());
     profile.sshDestination = _sshDestination->text().trimmed();
     profile.remoteServicePort = _sshPort->value();
-    profile.localRootPrefix = _mapLocalRoot->text().trimmed();
     profile.apiKey = _apiKey->text();
     return profile;
 }
@@ -1591,9 +1566,9 @@ void SpiralPanel::guardSessionExit(std::function<void()> action)
 void SpiralPanel::setRemoteMode(bool remote)
 {
     _remoteMode = remote;
-    // Every service owns its base inputs (local and remote alike): the path
-    // rows populate read-only from the service's advertised dataset
-    // resolution. Checkpoints have their own section and are never a path
+    // Every service owns its host paths (local and remote alike): the path
+    // rows populate read-only from the service's advertised bindings and the
+    // resident session. Checkpoints have their own section and are never a path
     // the client types here.
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
         it.value()->setReadOnly(true);
@@ -1601,7 +1576,6 @@ void SpiralPanel::setRemoteMode(bool remote)
             _pathBrowseButtons[it.key()]->setVisible(false);
     }
     _save->setVisible(true);
-    setToolTipNote(_paths["dataset_root"]->parentWidget(), tr("Service-host path, owned by the service"));
     setToolTipNote(_paths["umbilicus"]->parentWidget(),
                    tr("The project's umbilicus of the fit volume, written by the service for the fit"));
 }
@@ -1619,7 +1593,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     _pathBrowseButtons[key] = browse;
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
         if (!_applyingResolution) {
-            if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
+            _hasManualEdits = true;
             refreshReloadRequired();
         }
     });
@@ -1629,7 +1603,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
             : QFileDialog::getOpenFileName(this, tr("Select file"), edit->text());
         if (!chosen.isEmpty()) {
             edit->setText(chosen);
-            if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
+            _hasManualEdits = true;
             refreshReloadRequired();
         }
     });
@@ -1786,31 +1760,31 @@ double SpiralPanel::pointViewTolerance() const
         : kDefaultPointViewTolerance;
 }
 
-void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
+void SpiralPanel::applyBindings(const QJsonObject& advertisement)
 {
-    if (!force && _hasManualEdits) {
-        if (QMessageBox::question(this, tr("Refill Spiral paths"),
-                tr("Replace manually edited path rows with the Dataset Root proposals?")) != QMessageBox::Yes) return;
+    // The service's host-owned roots. Once attached, the resident session's
+    // canonical request is authoritative for the path rows.
+    if (!_hasSession) {
+        const QJsonObject before = sessionRequest();
+        _applyingResolution = true;
+        const QJsonObject bindings =
+            advertisement.value(QStringLiteral("bindings")).toObject();
+        for (const QString& key : {QStringLiteral("output_directory"),
+                                   QStringLiteral("cache_directory")})
+            if (_paths.contains(key))
+                _paths[key]->setText(bindings.value(key).toString());
+        _applyingResolution = false;
+        _hasManualEdits = false;
+        // A re-advertisement of the same bindings (after a checkpoint save,
+        // say) must not disable Run on the live session.
+        if (sessionRequest() != before) refreshReloadRequired();
     }
-    const QJsonObject before = sessionRequest();
-    _applyingResolution = true;
-    const QString root = resolution.value(QStringLiteral("root")).toString();
-    if (!root.isEmpty()) _paths[QStringLiteral("dataset_root")]->setText(root);
-    const QJsonObject resolved = resolution.value("resolved").toObject();
-    for (auto it = resolved.begin(); it != resolved.end(); ++it)
-        if (_paths.contains(it.key())) _paths[it.key()]->setText(it.value().toString());
-    _applyingResolution = false; _hasManualEdits = false;
-    // A refreshed resolution that resolves to the very same inputs (e.g. the
-    // re-advertisement after committing ephemeral inputs) must not disable Run
-    // on the live session; only an actual form change requires a reload.
-    if (sessionRequest() != before) refreshReloadRequired();
-    const QStringList missing = resolution.value("missing_required").toVariant().toStringList();
-    QStringList notes;
-    if (!missing.isEmpty()) notes << tr("Missing required: %1").arg(missing.join(", "));
-    const QStringList checkpoints = resolution.value("detected_checkpoints").toVariant().toStringList();
-    if (!checkpoints.isEmpty())
-        notes << tr("Detected resume checkpoints on the service: %1").arg(checkpoints.join(", "));
-    _warnings->setText(notes.join(QStringLiteral("\n")));
+    // Explained, never acted on: VC3D does not read the artifact.
+    QString reason;
+    _windingInferenceSummary->setText(
+        _service->windingInferenceAvailable(&reason)
+            ? tr("Available on the service host — winding-model supervision can run")
+            : tr("Unavailable — winding-model supervision cannot run. %1").arg(reason));
 }
 
 void SpiralPanel::updateObjectStoreSummary()
@@ -1945,6 +1919,7 @@ void SpiralPanel::resetScrollSummaries()
     // built (applySessionScroll).
     _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
     _lasagnaSummary->setText(tr("From the project's selected Lasagna dataset when a fit is built"));
+    _windingInferenceSummary->setText(tr("Advertised by the service once connected"));
 }
 
 void SpiralPanel::applySessionScroll(const QJsonObject& request)

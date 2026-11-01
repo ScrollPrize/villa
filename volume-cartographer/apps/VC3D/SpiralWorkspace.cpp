@@ -38,7 +38,6 @@
 #include <QDialog>
 #include <QDockWidget>
 #include <QDir>
-#include <QDirIterator>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -592,11 +591,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::sessionSynchronized, this,
             [this](const QJsonObject& request, const QJsonObject& status) {
-                const QJsonObject paths =
-                    request.value(QStringLiteral("paths")).toObject();
                 const qint64 generation =
                     status.value(QStringLiteral("session_generation")).toInteger();
-                _sessionPaths = paths;
                 _sessionRunConfig = request.value(QStringLiteral("run")).toObject()
                     .value(QStringLiteral("config")).toObject();
                 _sessionScroll = request.value(QStringLiteral("scroll")).toObject();
@@ -624,28 +620,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 resetSessionSurfaces(static_cast<quint64>(generation));
             });
     synchronizeVolume(_mainState ? _mainState->currentVolume() : nullptr);
-}
-
-QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
-{
-    const SpiralServiceProfile& profile = _service->profile();
-    if (profile.isLocalhost()) return servicePath;
-    // The service side of the mapping is the dataset root the service
-    // advertises; the profile only names where this computer mounts it.
-    QString serviceRoot = _service->advertisedDataset()
-                              .value(QStringLiteral("root")).toString();
-    while (serviceRoot.endsWith(QLatin1Char('/'))) serviceRoot.chop(1);
-    if (serviceRoot.isEmpty() || profile.localRootPrefix.isEmpty()
-        || !servicePath.startsWith(serviceRoot))
-        return {};
-    // Translate separators as well as prefixes: a Windows viewer may map a
-    // POSIX service root.
-    QString rest = servicePath.mid(serviceRoot.size());
-    rest.replace(QLatin1Char('\\'), QLatin1Char('/'));
-    QString local = profile.localRootPrefix;
-    while (local.endsWith(QLatin1Char('/')) || local.endsWith(QLatin1Char('\\'))) local.chop(1);
-    if (!rest.startsWith(QLatin1Char('/'))) rest.prepend(QLatin1Char('/'));
-    return QDir::toNativeSeparators(local + rest);
 }
 
 void SpiralWorkspace::resetSessionSurfaces(quint64 generation)
@@ -741,7 +715,7 @@ void SpiralWorkspace::updateSurfaceIntersections()
         if (visible.value()) addCategory(visible.key());
     }
     // Brush-created patches are session annotations and remain visible even
-    // when the dataset input categories are hidden.
+    // when the fit input categories are hidden.
     addCategory(QStringLiteral("brush"));
     for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) continue;
@@ -874,21 +848,6 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
     _lineDraftOverlay->setDraft(_flattenedViewer, std::move(points));
 }
 
-QStringList SpiralWorkspace::fallbackFiberManifests() const
-{
-    const QString serviceRoot = _sessionPaths.value(QStringLiteral("dataset_root")).toString();
-    const QString localRoot = serviceRoot.isEmpty() ? QString() : mapServicePath(serviceRoot);
-    QStringList manifests;
-    if (!localRoot.isEmpty()) {
-        QDirIterator it(QDir(localRoot).filePath(QStringLiteral("fiber_zarrs")),
-                        {QStringLiteral("*.lasagna.json")}, QDir::Files,
-                        QDirIterator::Subdirectories);
-        while (it.hasNext()) manifests.push_back(it.next());
-    }
-    manifests.sort();
-    return manifests;
-}
-
 std::optional<std::array<std::size_t, 3>>
 SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
 {
@@ -897,12 +856,11 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
         return std::nullopt;
     }
     const auto vpkg = _state->vpkg();
+    // The project's selected fiber-inference dataset; nothing is discovered
+    // from a service directory layout.
     QStringList candidates;
     const QString selected = QString::fromStdString(vpkg->selectedFiberInferenceDataset());
     if (!selected.isEmpty()) candidates.push_back(selected);
-    const QStringList fallbacks = fallbackFiberManifests();
-    if (fallbacks.size() == 1 && !candidates.contains(fallbacks.front()))
-        candidates.push_back(fallbacks.front());
 
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
@@ -926,9 +884,7 @@ SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
     }
     if (errorMessage) {
         if (candidates.isEmpty()) {
-            *errorMessage = fallbacks.isEmpty()
-                ? tr("No fiber-inference manifest was found below fiber_zarrs")
-                : tr("Multiple fiber-inference manifests were found below fiber_zarrs; select one in the project");
+            *errorMessage = tr("The project selects no fiber-inference dataset; select one in the project");
         } else {
             *errorMessage = tr("No fiber-inference base shape is available: %1")
                                 .arg(failures.join(QStringLiteral("; ")));
@@ -969,19 +925,10 @@ std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
 SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
 {
     if (!_lineAnnotationController) return std::nullopt;
-    // The normals are the project's selected Lasagna dataset, which Spiral
-    // fits read too; the fiber inference may fall back to the one manifest
-    // below the service dataset's fiber_zarrs.
-    QString fallbackFiber;
-    const QStringList manifests = fallbackFiberManifests();
-    if (manifests.size() == 1) fallbackFiber = manifests.front();
-    auto result = _lineAnnotationController->resolveFiberOptimizationInputs(
-        {}, fallbackFiber.toStdString(), errorMessage);
-    if (!result && errorMessage && manifests.size() != 1)
-        *errorMessage += manifests.isEmpty()
-            ? tr(" No fiber-inference manifest was found below fiber_zarrs.")
-            : tr(" Multiple fiber-inference manifests were found below fiber_zarrs; select one in the project.");
-    return result;
+    // The normals and the fiber inference are the project's selected Lasagna
+    // and fiber-inference datasets, which Spiral fits read too.
+    return _lineAnnotationController->resolveFiberOptimizationInputs(
+        {}, {}, errorMessage);
 }
 
 void SpiralWorkspace::finalizeLineAnnotationDraft()

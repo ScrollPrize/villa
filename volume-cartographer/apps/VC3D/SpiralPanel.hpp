@@ -105,7 +105,7 @@ private:
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
-    void applyResolution(const QJsonObject& resolution, bool force);
+    void applyBindings(const QJsonObject& advertisement);
     void resetScrollSummaries();
     // The scroll the session fits and its project volume (its request's
     // "scroll" and "project").
@@ -156,9 +156,12 @@ private:
     QCheckBox* _backgroundPreview = nullptr;
     QSpinBox* _previewCadence = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
-    // Read-only reports of what spiral-scroll.json specifies.
+    // Read-only reports of the project's scroll facts and Lasagna dataset.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
+    // Whether the service can run winding-model supervision (its bound
+    // --winding-inference artifact), from /bindings.
+    QLabel* _windingInferenceSummary = nullptr;
     QComboBox* _outwardSense = nullptr;
     // The checkpoint the resident fit was built from, reported by the service
     // and carried back in later rebuild requests.
@@ -193,12 +196,12 @@ private:
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
     QPushButton* _loadCheckpoint = nullptr;
-    QLineEdit* _datasetRoot = nullptr;
     QLineEdit* _outputRoot = nullptr;
     QLineEdit* _cacheRoot = nullptr;
-    QWidget* _datasetRow = nullptr;
+    QLineEdit* _windingInferenceRoot = nullptr;
     QWidget* _outputRow = nullptr;
     QWidget* _cacheRow = nullptr;
+    QWidget* _windingInferenceRow = nullptr;
     QLabel* _checkpointDownloadStatus = nullptr;
     QProgressBar* _checkpointDownloadProgress = nullptr;
     QTimer* _checkpointDownloadTimer = nullptr;
@@ -217,14 +220,12 @@ private:
     QLineEdit* _sshDestination = nullptr;
     QSpinBox* _sshPort = nullptr;
     QLineEdit* _apiKey = nullptr;
-    QLineEdit* _mapLocalRoot = nullptr;
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;
     QPushButton* _disconnectButton = nullptr;
     QWidget* _endpointRow = nullptr;
     QWidget* _sshRow = nullptr;
     QWidget* _apiKeyRow = nullptr;
-    QWidget* _mappingRow = nullptr;
 
     // Input drafts
     QListWidget* _inputList = nullptr;
