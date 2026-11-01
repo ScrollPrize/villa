@@ -44,6 +44,9 @@ public:
     std::vector<s3::Object> list(const std::string& keyPrefix = {}) const;
     // The immediate subdirectories (prefixes), sorted.
     std::vector<std::string> children() const;
+    // One page of the objects and subdirectories directly below the location whose relative
+    // keys start with `keyPrefix` (vcr::zarr::listPage); locally, a directory listing paged the same way.
+    Listing listPage(const std::string& keyPrefix = {}, const std::string& continuationToken = {}, int maxKeys = 1000) const;
     // Whether the location holds Zarr v2 or v3 node metadata / is an array.
     bool isNode() const;
     bool isArray() const;

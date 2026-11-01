@@ -256,6 +256,37 @@ std::vector<s3::Object> Store::list(const std::string& keyPrefix) const
     return impl_->signedRequest([&] { return listObjects(impl_->access, impl_->location, keyPrefix); });
 }
 
+Listing Store::listPage(const std::string& keyPrefix, const std::string& continuationToken, int maxKeys) const
+{
+    if (impl_->remote)
+        return impl_->signedRequest([&] { return zarr::listPage(impl_->access, impl_->location, keyPrefix, continuationToken, maxKeys); });
+    if (maxKeys < 1) throw std::invalid_argument("listing: max-keys must be positive");
+    // The directory named by the prefix's directory part, entries starting with its name part.
+    const auto slash = keyPrefix.rfind('/');
+    const std::string directory = slash == std::string::npos ? std::string() : keyPrefix.substr(0, slash + 1);
+    const std::string namePrefix = slash == std::string::npos ? keyPrefix : keyPrefix.substr(slash + 1);
+    struct Item { std::string key; bool directory; std::uint64_t size; };
+    std::vector<Item> items;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::path(impl_->location) / directory, ec)) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with(namePrefix)) continue;
+        if (entry.is_directory(ec)) items.push_back({directory + name, true, 0});
+        else if (entry.is_regular_file(ec)) items.push_back({directory + name, false, entry.file_size(ec)});
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.key < b.key; });
+    std::size_t start = 0;
+    if (!continuationToken.empty()) start = std::stoull(continuationToken);
+    const auto end = std::min(items.size(), start + std::size_t(maxKeys));
+    Listing listing;
+    for (auto i = start; i < end; ++i) {
+        if (items[i].directory) listing.children.push_back(items[i].key);
+        else listing.objects.push_back({items[i].key, items[i].size, {}, {}});
+    }
+    if (end < items.size()) listing.nextContinuationToken = std::to_string(end);
+    return listing;
+}
+
 std::vector<std::string> Store::children() const
 {
     std::vector<std::string> names;

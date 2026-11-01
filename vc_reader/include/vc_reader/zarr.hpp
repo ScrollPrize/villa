@@ -92,6 +92,17 @@ bool isPublicLocation(const std::string& location);
 std::vector<std::string> listChildren(const Access& access, const std::string& location);
 // Every object below such a location: keys relative to it, in key order.
 std::vector<s3::Object> listObjects(const Access& access, const std::string& location, const std::string& keyPrefix = {});
+// One page of what sits directly below such a location (ListObjectsV2 with delimiter "/"):
+// the objects, keys relative to the location, and the names of the child prefixes, in key
+// order, at most `maxKeys` of them together. `keyPrefix` narrows both to keys starting with
+// it. `nextContinuationToken` continues where the page stopped; empty on the last page.
+struct Listing {
+    std::vector<s3::Object> objects;
+    std::vector<std::string> children;
+    std::string nextContinuationToken;
+};
+Listing listPage(const Access& access, const std::string& location, const std::string& keyPrefix = {},
+                 const std::string& continuationToken = {}, int maxKeys = 1000);
 // AWS keys from AWS_ACCESS_KEY_ID/..., then the AWS_PROFILE (or default) profile of
 // the shared credentials and config files. kind is "s3"; region is the profile's.
 std::optional<Auth> awsCredentials(const std::string& profile = {});

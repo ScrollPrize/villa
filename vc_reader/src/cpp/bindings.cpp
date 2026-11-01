@@ -623,6 +623,27 @@ NB_MODULE(_reader, m)
             return out;
         })
         .def("children", &Store::children, nb::call_guard<nb::gil_scoped_release>())
+        .def("list_page", [](const Store& s, const std::string& prefix, const std::string& continuation_token, int max_keys) {
+            vcr::zarr::Listing listing;
+            {
+                nb::gil_scoped_release release;
+                listing = s.listPage(prefix, continuation_token, max_keys);
+            }
+            nb::list objects;
+            for (const auto& object : listing.objects) {
+                nb::dict entry;
+                entry["key"] = object.key;
+                entry["size"] = object.size;
+                entry["etag"] = object.etag;
+                entry["last_modified"] = object.lastModified;
+                objects.append(entry);
+            }
+            nb::dict out;
+            out["objects"] = objects;
+            out["children"] = listing.children;
+            out["next_continuation_token"] = listing.nextContinuationToken;
+            return out;
+        }, "prefix"_a = "", "continuation_token"_a = "", "max_keys"_a = 1000)
         .def("is_node", &Store::isNode, nb::call_guard<nb::gil_scoped_release>())
         .def("is_array", &Store::isArray, nb::call_guard<nb::gil_scoped_release>());
     using vcr::zarr::Access;

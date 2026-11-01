@@ -133,17 +133,22 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return self.wfile.write(part)
         prefix, delimiter = query.get("prefix", ""), query.get("delimiter", "")
-        keys, prefixes = [], set()
+        items = []  # (key or common prefix, is_prefix) in key order, as S3 pages them
         for key in sorted(self.objects):
             if key.startswith(prefix):
                 rest = key[len(prefix):]
                 if delimiter and delimiter in rest:
-                    prefixes.add(prefix + rest.split(delimiter)[0] + delimiter)
+                    common = prefix + rest.split(delimiter)[0] + delimiter
+                    if not items or items[-1] != (common, True):
+                        items.append((common, True))
                 else:
-                    keys.append(key)
-        contents = "".join(f"<Contents><Key>{escape(k)}</Key><Size>{len(self.objects[k])}</Size></Contents>" for k in keys)
-        common = "".join(f"<CommonPrefixes><Prefix>{escape(p)}</Prefix></CommonPrefixes>" for p in sorted(prefixes))
-        self._respond(200, f"<ListBucketResult><IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>".encode())
+                    items.append((key, False))
+        start = int(query.get("continuation-token", "0"))
+        end = min(len(items), start + int(query.get("max-keys", "1000")))
+        contents = "".join(f"<Contents><Key>{escape(k)}</Key><Size>{len(self.objects[k])}</Size></Contents>" for k, p in items[start:end] if not p)
+        common = "".join(f"<CommonPrefixes><Prefix>{escape(k)}</Prefix></CommonPrefixes>" for k, p in items[start:end] if p)
+        truncated = f"<IsTruncated>true</IsTruncated><NextContinuationToken>{end}</NextContinuationToken>" if end < len(items) else "<IsTruncated>false</IsTruncated>"
+        self._respond(200, f"<ListBucketResult>{truncated}{contents}{common}</ListBucketResult>".encode())
 
 
 @pytest.fixture
@@ -257,6 +262,21 @@ def test_object_store(s3, tmp_path):
         assert store.keys() == ["a/b.json", "c"] and store.sizes()["c"] == 2 and store.children() == ["a"]
         assert store.keys("a/") == ["a/b.json"] and store.keys("c") == ["c"] and store.keys("z") == []
         assert [o["key"] for o in store.objects("c")] == ["c"] and store.objects("c")[0]["size"] == 2
+        # One level, paged: children and objects in key order, relative keys, a token between pages.
+        store.write("a/d", b"1")
+        store.write("e/f", b"2")
+        store.write("g", b"3")
+        first = store.list_page(max_keys=2)
+        assert first["children"] == ["a"] and [o["key"] for o in first["objects"]] == ["c"]
+        assert first["next_continuation_token"]
+        second = store.list_page(continuation_token=first["next_continuation_token"], max_keys=2)
+        assert second["children"] == ["e"] and [o["key"] for o in second["objects"]] == ["g"]
+        assert second["next_continuation_token"] == ""
+        below = store.list_page("a/")
+        assert [o["key"] for o in below["objects"]] == ["a/b.json", "a/d"] and below["children"] == []
+        assert store.list_page("z") == {"objects": [], "children": [], "next_continuation_token": ""}
+        for key in ("a/d", "e/f", "g"):
+            store.remove(key)
         assert pickle.loads(pickle.dumps(store)).read("c") == b"\x00\x01"
         assert store.remove("c") and not store.remove("c")
         assert store.remove_all() and store.keys() == []

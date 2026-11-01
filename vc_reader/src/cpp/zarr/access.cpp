@@ -293,9 +293,14 @@ std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& p
 }
 
 namespace {
-// Every page of a listing under `location`, with its key prefix.
-void listPages(const Access& access, const std::string& location, std::string_view delimiter, const std::string& keyPrefix,
-               const std::function<void(const s3::ListPage&, const std::string&)>& visit)
+// The listing endpoint and key prefix of `location`/`keyPrefix`, and the location's own key
+// (with its '/'), which listed keys are relative to.
+struct ListingRequest {
+    std::string s3;
+    s3::Prefix prefix;
+    std::string prefixKey;
+};
+ListingRequest listingRequest(const Access& access, const std::string& location, const std::string& keyPrefix)
 {
     // s3+<region>:// names the region for plain HTTP; listing goes through the bucket's own endpoint.
     const auto regional = location.starts_with("s3+") ? location.find("://") : std::string::npos;
@@ -312,22 +317,61 @@ void listPages(const Access& access, const std::string& location, std::string_vi
         prefixKey.pop_back();
     if (!prefixKey.empty())
         prefixKey += '/';
-    const s3::Prefix prefix{origin, prefixKey + keyPrefix};
+    return {*s3, s3::Prefix{origin, prefixKey + keyPrefix}, prefixKey};
+}
+
+s3::ListPage fetchPage(HttpClient& http, const ListingRequest& request, std::string_view delimiter,
+                       const std::string& token, int maxKeys)
+{
+    std::vector<std::uint8_t> body;
+    if (!http.get(s3::listUrl(request.prefix, delimiter, token, maxKeys), body))
+        throw NotFound("cannot list " + request.s3 + ": bucket not found");
+    return s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
+}
+
+// Every page of a listing under `location`, with its key prefix.
+void listPages(const Access& access, const std::string& location, std::string_view delimiter, const std::string& keyPrefix,
+               const std::function<void(const s3::ListPage&, const std::string&)>& visit)
+{
+    const auto request = listingRequest(access, location, keyPrefix);
     HttpOptions options;
     options.connections = 1;
     options.auth = access.auth;
     HttpClient http(options);
     std::string token;
     do {
-        std::vector<std::uint8_t> body;
-        if (!http.get(s3::listUrl(prefix, delimiter, token), body))
-            throw NotFound("cannot list " + *s3 + ": bucket not found");
-        const auto page = s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
-        visit(page, prefixKey);
+        const auto page = fetchPage(http, request, delimiter, token, 1000);
+        visit(page, request.prefixKey);
         token = page.nextContinuationToken;
     } while (!token.empty());
 }
 }  // namespace
+
+Listing listPage(const Access& access, const std::string& location, const std::string& keyPrefix,
+                 const std::string& continuationToken, int maxKeys)
+{
+    const auto request = listingRequest(access, location, keyPrefix);
+    HttpOptions options;
+    options.connections = 1;
+    options.auth = access.auth;
+    HttpClient http(options);
+    const auto page = fetchPage(http, request, "/", continuationToken, maxKeys);
+    Listing listing;
+    for (const auto& object : page.objects) {
+        auto key = object.key.substr(request.prefixKey.size());
+        if (!key.empty() && key.back() != '/')
+            listing.objects.push_back({std::move(key), object.size, object.etag, object.lastModified});
+    }
+    for (const auto& child : page.commonPrefixes) {
+        auto name = child.substr(request.prefixKey.size());
+        while (!name.empty() && name.back() == '/')
+            name.pop_back();
+        if (!name.empty())
+            listing.children.push_back(std::move(name));
+    }
+    listing.nextContinuationToken = page.nextContinuationToken;
+    return listing;
+}
 
 std::vector<std::string> listChildren(const Access& access, const std::string& location)
 {

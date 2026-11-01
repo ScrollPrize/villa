@@ -100,6 +100,14 @@ class ObjectStore:
         """The immediate subdirectories (prefixes), sorted."""
         return self._native.children()
 
+    def list_page(self, prefix: str = "", continuation_token: str = "", max_keys: int = 1000) -> dict[str, Any]:
+        """One page of what sits directly below the location: ``objects`` (as :meth:`objects`) and
+        ``children`` (subdirectory names) whose relative keys start with ``prefix``, in key order, at
+        most ``max_keys`` together; ``next_continuation_token`` continues where the page stopped,
+        empty on the last page.
+        """
+        return self._native.list_page(prefix, continuation_token, max_keys)
+
 
 class _Attributes(MutableMapping):
     """A node's attributes: every change is written, and only this mapping's keys change."""
