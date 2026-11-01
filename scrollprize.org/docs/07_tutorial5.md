@@ -179,6 +179,16 @@ uv sync --extra models
 uv run --extra models python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
 ```
 
+:::info
+The `models` extra also builds the repo's C++ packages, `volume-cartographer` and `vc-object-store`, from source, so `uv sync --extra models` needs their native dependencies (CMake, Ceres, Qt, SQLite3, OpenSSL, ...) and fails with `CMake configuration failed` without them. The ink detection pipeline imports neither package; they are used by the tracing side (`vesuvius.neural_tracing`, `vesuvius.tifxyz.store`, the fiber tracers). If you only need this tutorial, you can skip both C++ builds:
+
+```bash
+uv sync --extra models --no-install-package volume-cartographer --no-install-package vc-object-store
+```
+
+Then pass `--no-sync` to every `uv run` command in this tutorial, including the check above, so `uv run` doesn't try to build them again. To get the full packages instead, install the native dependencies listed in the [volume-cartographer README](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer).
+:::
+
 ### Training
 
 Training runs are configured with a single JSON file. Create `configs/ink_tutorial.json` (the `configs` folder doesn't exist yet; create it too), pointing `segments_path` at the folder containing your downloaded segments:
