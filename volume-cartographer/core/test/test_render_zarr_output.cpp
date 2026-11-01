@@ -4,6 +4,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "support/LoopbackHttpServer.hpp"
+
 #include <vc_reader/array.hpp>
 #include <vc_reader/image_write.hpp>
 #include <vc_reader/zarr.hpp>
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -153,4 +156,45 @@ TEST_CASE("vc_render_tifxyz writes, resumes and partitions a Zarr pyramid")
             fs::remove_all(root, ignored);
         }
     }
+}
+
+TEST_CASE("vc_render_tifxyz exits non-zero when a remote volume cannot be read")
+{
+    const char* renderer = std::getenv("VC_RENDER_TIFXYZ_BIN");
+    REQUIRE(renderer);
+    const auto root = fs::temp_directory_path() /
+                      ("vc-render-remote-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto store = root / "store" / "ct.zarr";
+    vcr::zarr::createGroup(store);
+    auto writer = vcr::zarr::Writer::create(store / "0", {.shape = {16, 64, 64}, .chunks = {16, 64, 64}, .compressor = ""});
+    const std::vector<std::uint8_t> voxels(16 * 64 * 64, 100);
+    writer.writeChunk({0, 0, 0}, voxels.data(), voxels.size());
+    const int width = 32, height = 32;
+    const auto surface = root / "surface";
+    fs::create_directories(surface);
+    writeSurfaceAxis(surface / "x.tif", height, width, [](int, int x) { return float(x + 4); });
+    writeSurfaceAxis(surface / "y.tif", height, width, [](int y, int) { return float(y + 4); });
+    writeSurfaceAxis(surface / "z.tif", height, width, [](int, int) { return 8.0f; });
+    std::ofstream(surface / "meta.json") << nlohmann::json{
+        {"format", "tifxyz"}, {"type", "seg"}, {"uuid", "surface"}, {"scale", {1, 1}},
+        {"bbox", {{4, 4, 8}, {width + 3, height + 3, 8}}}}.dump();
+
+    vc::test::LoopbackHttpServer server;
+    server.serveDirectory(root / "store");
+    server.setHandler([](const vc::test::LoopbackHttpServer::Request& request)
+                          -> std::optional<vc::test::LoopbackHttpServer::Response> {
+        // Metadata is served; the chunk fails.
+        if (request.path.ends_with("/0/0.0.0")) return vc::test::LoopbackHttpServer::Response{.status = 500};
+        return std::nullopt;
+    });
+    const auto config = root / "config";
+    fs::create_directories(config);
+    std::ofstream(config / "cache.json") << nlohmann::json{{"version", 1}, {"root", (root / "cache").string()}}.dump();
+    const std::string command = "VC3D_CONFIG_DIR=\"" + config.string() + "\" \"" + renderer + "\" -v " + server.url() + "/ct.zarr -s \"" +
+                                surface.string() + "\" -g 0 --scale 1 --zarr-compressor none --pyramid false --zarr-output \"" +
+                                (root / "render").string() + "\" > \"" + (root / "log.txt").string() + "\" 2>&1";
+    CHECK(std::system(command.c_str()) != 0);
+    CHECK(server.requestCount("/ct.zarr/0/0.0.0") > 0);
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
 }
