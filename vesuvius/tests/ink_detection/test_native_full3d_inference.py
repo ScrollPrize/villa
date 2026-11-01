@@ -356,6 +356,76 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
     assert restored._coarse_positions is None
 
 
+def test_native_dataset_batch_reads_match_single_reads(monkeypatch):
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    class CountingVolume:
+        def __init__(self, values):
+            self.values = values
+            self.shape = values.shape
+            self.dtype = values.dtype
+            self.reads = 0
+
+        def __getitem__(self, key):
+            self.reads += 1
+            return self.values[key]
+
+    rng = np.random.default_rng(0)
+    volume = CountingVolume(rng.integers(0, 256, (20, 24, 28), dtype=np.uint8))
+    monkeypatch.setattr(
+        native, "_open_shared_volume", lambda *args, **kwargs: volume
+    )
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            mode="full_3d",
+            normalization=NormalizationConfig.from_value(
+                {"mode": "divide", "divisor": 7}
+            ),
+        )
+    )
+    patches = native.build_patch_plan_for_chunks(
+        target_chunks=[native.ChunkId(0, 0, 0), native.ChunkId(1, 1, 1)],
+        array_shape_zyx=volume.shape,
+        chunk_shape_zyx=(10, 12, 14),
+        patch_size_zyx=(8, 8, 8),
+        stride_zyx=(4, 4, 4),
+    )
+    patches = [*patches, native.PatchSpec(-3, 20, 25), native.PatchSpec(30, 0, 0)]
+    dataset = native.NativePatchDataset(
+        tifxyz_dir=Path("unused"),
+        volume_path="memory://native",
+        resolution="0",
+        patches=patches,
+        patch_size_zyx=(8, 8, 8),
+        config=config,
+    )
+    indices = list(range(len(patches)))
+    single = [dataset[index] for index in indices]
+    volume.reads = 0
+    batched = dataset.__getitems__(indices)
+    assert 0 < volume.reads < len(patches)
+    assert len(batched) == len(single)
+    for (image, metadata), (expected, expected_metadata) in zip(batched, single):
+        assert torch.equal(metadata, expected_metadata)
+        assert torch.equal(image, expected)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=5)
+    images = torch.cat([batch[0] for batch in loader])
+    assert torch.equal(images, torch.stack([image for image, _ in single]))
+
+    local = native.NativePatchDataset(
+        tifxyz_dir=Path("unused"),
+        volume_path="local.zarr",
+        resolution="0",
+        patches=patches,
+        patch_size_zyx=(8, 8, 8),
+        config=config,
+    )
+    volume.reads = 0
+    local_batch = local.__getitems__(indices)
+    assert volume.reads == len(patches) - 1  # the outside patch reads nothing
+    assert all(torch.equal(a[0], b[0]) for a, b in zip(local_batch, single))
+
+
 def test_explicit_v2_sparse_ome_zarr_and_encoded_uint8_pyramid(tmp_path):
     path = tmp_path / "prediction.zarr"
     arrays = native.create_output_zarr(

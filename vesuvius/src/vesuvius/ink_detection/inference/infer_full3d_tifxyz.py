@@ -835,6 +835,17 @@ def build_downsample_levels(
         current_chunks = set(target_chunks)
 
 
+def _union_bbox(bboxes) -> tuple[int, ...]:
+    return (
+        *(min(bbox[axis] for bbox in bboxes) for axis in range(3)),
+        *(max(bbox[axis + 3] for bbox in bboxes) for axis in range(3)),
+    )
+
+
+def _bbox_voxels(bbox) -> int:
+    return math.prod(bbox[axis + 3] - bbox[axis] for axis in range(3))
+
+
 class NativePatchDataset(Dataset):
     """Lazy, spawn-safe reader for planned native ZYX patches."""
 
@@ -948,16 +959,71 @@ class NativePatchDataset(Dataset):
             ),
         )
 
-    def __getitem__(self, index: int):
-        patch = self.patches[int(index)]
+    def _bbox(self, patch: PatchSpec) -> tuple[int, ...]:
         starts = (int(patch.z0), int(patch.y0), int(patch.x0))
         stops = tuple(
             starts[axis] + self.patch_size_zyx[axis] for axis in range(3)
         )
-        bbox = (*starts, *stops)
+        return (*starts, *stops)
+
+    def __getitem__(self, index: int):
+        bbox = self._bbox(self.patches[int(index)])
         crop, valid_slices = read_bbox_with_padding(
             self._ensure_volume(), bbox, fill_value=0
         )
+        return self._sample(bbox, crop, valid_slices)
+
+    def __getitems__(self, indices: Sequence[int]):
+        """Read a batch, fetching the chunks neighbouring patches share once.
+
+        Consecutive patches are grouped while their union box holds no more
+        voxels than their separate crops; each group is one volume read.
+        Only remote volumes are grouped: there each chunk is a request, while
+        local per-patch reads were faster than the union read and its copy.
+        """
+        if not is_url_like(self.volume_path):
+            return [self[index] for index in indices]
+        volume = self._ensure_volume()
+        shape = tuple(int(value) for value in volume.shape[:3])
+        patch_voxels = math.prod(self.patch_size_zyx)
+        bboxes = [self._bbox(self.patches[int(index)]) for index in indices]
+        groups: list[list[tuple[int, ...]]] = []
+        for bbox in bboxes:
+            if groups:
+                union = _union_bbox([*groups[-1], bbox])
+                limit = (len(groups[-1]) + 1) * patch_voxels
+                if _bbox_voxels(union) <= limit:
+                    groups[-1].append(bbox)
+                    continue
+            groups.append([bbox])
+        samples = []
+        for group in groups:
+            union = _union_bbox(group)
+            block, _ = read_bbox_with_padding(volume, union, fill_value=0)
+            for bbox in group:
+                # A copy: normalization below writes into the crop.
+                offset = tuple(
+                    slice(bbox[axis] - union[axis], bbox[axis + 3] - union[axis])
+                    for axis in range(3)
+                )
+                crop = np.array(block[offset], dtype=np.float32)
+                starts = tuple(max(0, bbox[axis]) for axis in range(3))
+                stops = tuple(
+                    min(shape[axis], bbox[axis + 3]) for axis in range(3)
+                )
+                valid_slices = (
+                    None
+                    if any(stop <= start for start, stop in zip(starts, stops))
+                    else tuple(
+                        slice(starts[axis] - bbox[axis], stops[axis] - bbox[axis])
+                        for axis in range(3)
+                    )
+                )
+                samples.append(self._sample(bbox, crop, valid_slices))
+        return samples
+
+    def _sample(self, bbox, crop: np.ndarray, valid_slices):
+        starts = bbox[:3]
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
             crop[valid_slices] = normalize_image(
