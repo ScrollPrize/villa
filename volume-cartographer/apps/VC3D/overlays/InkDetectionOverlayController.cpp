@@ -9,7 +9,7 @@
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -403,7 +403,12 @@ void InkDetectionOverlayController::loadSelectedImage()
             });
         return;
     }
-    const cv::Mat src = cv::imread(_selectedPath.string(), cv::IMREAD_UNCHANGED);
+    // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
+    cv::Mat src;
+    try {
+        src = vc::core::util::readImageMat(_selectedPath);
+    } catch (const std::exception&) {
+    }
     if (src.empty()) {
         return;
     }
