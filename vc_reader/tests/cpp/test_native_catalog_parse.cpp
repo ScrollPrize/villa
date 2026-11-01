@@ -326,6 +326,12 @@ int main()
         require(camel.samples.front().volumes.front().scanId.empty() &&
                     !camel.samples.front().volumes.front().pixelSizeUm,
                 "camelCase keys are not read");
+
+        // Absent, null, or anything but a boolean is unset, never a default.
+        const auto unset = parseOpenDataManifest(
+            R"({"samples": {"s": {"volumes": {"v": {"properties": {"left_handed_coordinates": null, "z_direction_is_top_to_bottom": "true"}}}}}})");
+        const auto& orientation = unset.samples.front().volumes.front().orientation;
+        require(!orientation.zTopToBottom && !orientation.leftHandedCoordinates, "non-boolean orientation is unset");
     } catch (const std::exception& e) {
         std::cerr << "FAILED: " << e.what() << "\n";
         return 1;
