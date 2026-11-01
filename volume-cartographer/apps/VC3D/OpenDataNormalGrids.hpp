@@ -72,10 +72,11 @@ struct NormalGridsDownloadProgress {
 using NormalGridsProgressCallback =
     std::function<void(const NormalGridsDownloadProgress&)>;
 
-// Enumerate the artifact's S3 prefix (anonymous ListObjectsV2) and download all
-// objects with `workers` threads into the volume's normal-grid cache. The download
-// lands in a temp dir and is published atomically. Returns the final cache dir,
-// or an empty path on failure/cancellation (errorOut explains why).
+// List the artifact's prefix and fetch every object with `workers` threads through
+// vc_reader's file cache into the volume's normal-grid cache directory, under the
+// root's byte limit and free-space floor. Files already there are kept, so a
+// cancelled or failed download resumes. Returns the cache dir, or an empty path on
+// failure/cancellation (errorOut explains why).
 [[nodiscard]] std::filesystem::path downloadOpenDataNormalGrids(
     const OpenDataNormalGridsInfo& info,
     const std::filesystem::path& remoteCacheRoot,

@@ -3,132 +3,24 @@
 #include "OpenDataManifest.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc_reader/native/http.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <vc_reader/s3_listing.hpp>
+#include <vc_reader/source_reader.hpp>
 #include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <cctype>
-#include <chrono>
-#include <iomanip>
 #include <fstream>
 #include <mutex>
-#include <sstream>
-#include <system_error>
 #include <thread>
 
 namespace vc3d::opendata {
 namespace {
-
-struct RemoteObject {
-    std::string relativePath;  // key with the listing prefix stripped
-    std::uint64_t size = 0;
-};
-
-// Every object under `prefix` (anonymous ListObjectsV2), 1000 keys a page.
-std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
-                                           const std::atomic<bool>* cancelRequested,
-                                           std::string* errorOut)
-{
-    std::vector<RemoteObject> objects;
-    std::string continuationToken;
-    do {
-        if (cancelRequested && cancelRequested->load(std::memory_order_acquire)) {
-            if (errorOut) *errorOut = "cancelled";
-            return {};
-        }
-        vcr::s3::ListPage page;
-        try {
-            vcr::HttpClient http{vcr::HttpOptions{}};
-            std::vector<std::uint8_t> body;
-            http.get(vcr::s3::listUrl(prefix, {}, continuationToken), body);
-            page = vcr::s3::parseListPage(std::string_view(reinterpret_cast<const char*>(body.data()), body.size()));
-        } catch (const std::exception& e) {
-            if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
-            return {};
-        }
-        for (const auto& object : page.objects) {
-            if (object.key.rfind(prefix.key, 0) != 0 || object.key.size() == prefix.key.size() ||
-                object.key.back() == '/') {
-                continue;
-            }
-            objects.push_back({object.key.substr(prefix.key.size()), object.size});
-        }
-        continuationToken = std::move(page.nextContinuationToken);
-    } while (!continuationToken.empty());
-
-    if (objects.empty() && errorOut) {
-        *errorOut = "no objects found under " + prefix.key;
-    }
-    return objects;
-}
-
-void writeFile(const std::filesystem::path& target, const std::vector<std::byte>& bytes)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(target.parent_path(), ec);
-    if (ec) {
-        throw std::runtime_error("failed to create directory " +
-                                 target.parent_path().string() + ": " + ec.message());
-    }
-    std::ofstream out(target, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("failed to open " + target.string() + " for writing");
-    }
-    if (!bytes.empty()) {
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-    }
-    out.close();
-    if (!out) {
-        throw std::runtime_error("failed to write " + target.string());
-    }
-}
-
-std::filesystem::path makeTempDir(const std::filesystem::path& finalDir)
-{
-    const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-    return finalDir.parent_path() /
-           (finalDir.filename().string() + ".tmp-" + std::to_string(tick));
-}
-
-void publishDirectory(const std::filesystem::path& tempDir,
-                      const std::filesystem::path& finalDir)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(finalDir.parent_path(), ec);
-    if (ec) {
-        throw std::runtime_error("failed to create cache parent: " + ec.message());
-    }
-
-    const auto backupDir = finalDir.parent_path() /
-        (finalDir.filename().string() + ".previous");
-    std::filesystem::remove_all(backupDir, ec);
-    ec.clear();
-    if (std::filesystem::exists(finalDir, ec)) {
-        std::filesystem::rename(finalDir, backupDir, ec);
-        if (ec) {
-            throw std::runtime_error("failed to move existing cache aside: " + ec.message());
-        }
-    }
-
-    std::filesystem::rename(tempDir, finalDir, ec);
-    if (ec) {
-        std::error_code restoreEc;
-        if (std::filesystem::exists(backupDir, restoreEc) &&
-            !std::filesystem::exists(finalDir, restoreEc)) {
-            std::filesystem::rename(backupDir, finalDir, restoreEc);
-        }
-        throw std::runtime_error("failed to publish normal grids cache: " + ec.message());
-    }
-
-    std::filesystem::remove_all(backupDir, ec);
-}
 
 // Where the store's URL caches under the root, as every vc_reader cache does.
 std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot, const std::string& url)
@@ -329,12 +221,9 @@ std::filesystem::path downloadOpenDataNormalGrids(
     if (std::filesystem::is_regular_file(finalDir / kCompleteMarker, completeEc)) {
         return finalDir;
     }
-
-    const auto remote = vcr::s3::splitPrefixUrl(info.url);
-    if (!remote || remote->key.empty()) {
-        if (errorOut) *errorOut = "unsupported normal grids URL: " + info.url;
-        return {};
-    }
+    const auto cancelled = [&] {
+        return cancelRequested && cancelRequested->load(std::memory_order_acquire);
+    };
 
     NormalGridsDownloadProgress state;
     state.status = "listing";
@@ -342,8 +231,23 @@ std::filesystem::path downloadOpenDataNormalGrids(
         progress(state);
     }
 
-    const auto objects = listRemotePrefix(*remote, cancelRequested, errorOut);
+    const auto access = vcr::zarr::resolveAccess(info.url);
+    std::vector<vcr::s3::Object> objects;
+    try {
+        objects = vcr::zarr::listObjects(access, info.url);
+    } catch (const std::exception& e) {
+        if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
+        return {};
+    }
+    std::erase_if(objects, [](const vcr::s3::Object& object) {
+        return object.key.empty() || object.key.back() == '/';
+    });
     if (objects.empty()) {
+        if (errorOut) *errorOut = "no objects found under " + info.url;
+        return {};
+    }
+    if (cancelled()) {
+        if (errorOut) *errorOut = "cancelled";
         return {};
     }
 
@@ -356,13 +260,15 @@ std::filesystem::path downloadOpenDataNormalGrids(
         progress(state);
     }
 
-    const auto tempDir = makeTempDir(finalDir);
-    std::error_code ec;
-    std::filesystem::create_directories(tempDir, ec);
-    if (ec) {
-        if (errorOut) *errorOut = "failed to create " + tempDir.string() + ": " + ec.message();
-        return {};
-    }
+    // Each object is fetched by vc_reader's file cache to its place under the root, which
+    // is where streaming puts it too, under the root's byte limit and free-space floor.
+    // Files already there are kept, so a cancelled or failed download resumes next time,
+    // and one download serves every worker or tracer asking for the same file.
+    vcr::sources::EncodedFiles files([root = remoteCacheRoot, access](const std::string&) {
+        auto options = vc::settings::remoteOpenOptions(root);
+        options.access = access;
+        return options;
+    });
 
     const int workerCount = std::clamp(workers, 1, kNormalGridsDownloadWorkers);
     std::atomic<std::size_t> next{0};
@@ -373,35 +279,14 @@ std::filesystem::path downloadOpenDataNormalGrids(
     std::string firstError;
 
     auto worker = [&]() {
-        while (true) {
-            if (cancelRequested && cancelRequested->load(std::memory_order_acquire)) {
-                return;
-            }
+        while (!cancelled()) {
             const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
             if (index >= objects.size()) {
                 return;
             }
             const auto& object = objects[index];
             try {
-                const auto target = tempDir / object.relativePath;
-                // Reuse files a streaming session already cached: hardlink from
-                // the live dir when the size matches the listing.
-                const auto streamed = finalDir / object.relativePath;
-                std::error_code linkEc;
-                if (std::filesystem::is_regular_file(streamed, linkEc) &&
-                    std::filesystem::file_size(streamed, linkEc) == object.size && !linkEc) {
-                    std::filesystem::create_directories(target.parent_path(), linkEc);
-                    std::filesystem::create_hard_link(streamed, target, linkEc);
-                }
-                if (linkEc || !std::filesystem::is_regular_file(target, linkEc)) {
-                    const auto url = vcr::s3::objectUrl(remote->origin, remote->key + object.relativePath);
-                    vcr::HttpClient http{vcr::HttpOptions{}};
-                    std::vector<std::uint8_t> received;
-                    if (!http.get(url, received))
-                        throw std::runtime_error("object is missing: " + url);
-                    const auto* bytes = reinterpret_cast<const std::byte*>(received.data());
-                    writeFile(target, std::vector<std::byte>(bytes, bytes + received.size()));
-                }
+                (void)files.open(info.url + "/" + object.key);
                 completed.fetch_add(1, std::memory_order_relaxed);
                 completedBytes.fetch_add(object.size, std::memory_order_relaxed);
             } catch (const std::exception& e) {
@@ -417,7 +302,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
                 update.completedFiles = completed.load(std::memory_order_relaxed);
                 update.failedFiles = failed.load(std::memory_order_relaxed);
                 update.completedBytes = completedBytes.load(std::memory_order_relaxed);
-                update.fileName = object.relativePath;
+                update.fileName = object.key;
                 progress(update);
             }
         }
@@ -432,24 +317,13 @@ std::filesystem::path downloadOpenDataNormalGrids(
         thread.join();
     }
 
-    const bool cancelled =
-        cancelRequested && cancelRequested->load(std::memory_order_acquire);
-    if (cancelled || failed.load() > 0) {
-        std::filesystem::remove_all(tempDir, ec);
+    if (cancelled() || failed.load() > 0) {
         if (errorOut) {
-            *errorOut = cancelled
+            *errorOut = cancelled()
                 ? "cancelled"
                 : ("failed to download " + std::to_string(failed.load()) +
                    " file(s): " + firstError);
         }
-        return {};
-    }
-
-    try {
-        publishDirectory(tempDir, finalDir);
-    } catch (const std::exception& e) {
-        std::filesystem::remove_all(tempDir, ec);
-        if (errorOut) *errorOut = e.what();
         return {};
     }
 
@@ -459,6 +333,16 @@ std::filesystem::path downloadOpenDataNormalGrids(
                         " is not a normal grid store (missing xy/xz/yz or metadata.json)";
         }
         return {};
+    }
+
+    // Markers an older VC3D's streaming left for absent files: nothing reads them now.
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             finalDir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().filename().string().ends_with(".missing")) {
+            std::filesystem::remove(it->path(), ec);
+        }
     }
 
     // Keep the dir streamable (harmless once complete) and record completion

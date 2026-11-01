@@ -11,6 +11,7 @@
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "support/LoopbackHttpServer.hpp"
 #include "support/TestProject.hpp"
 #include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -748,6 +749,95 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
     CHECK(pkg->normalGridEntries().size() == 2);
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Normal grids download through the file cache: listing, signed objects, resume, completion")
+{
+    // A signed bucket on a loopback server, reached through the environment's keys and endpoint.
+    const auto scratch = std::filesystem::temp_directory_path() /
+        ("vc_open_data_grid_download_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(scratch);
+    const auto bucket = scratch / "bucket", root = scratch / "cache";
+    for (const char* plane : {"xy", "xz", "yz"}) {
+        std::filesystem::create_directories(bucket / "ng" / plane);
+        for (int slice = 0; slice < 3; ++slice) {
+            char name[32];
+            std::snprintf(name, sizeof name, "%06d.grid", slice);
+            std::ofstream(bucket / "ng" / plane / name) << plane << slice << std::string(100, 'g');
+        }
+    }
+    std::ofstream(bucket / "ng" / "metadata.json") << R"({"sparse-volume": 1, "spiral-step": 20.0})";
+    std::filesystem::create_directories(bucket / "ng" / "empty-dir");
+    vc::test::LoopbackHttpServer server;
+    server.serveBucket("grids", bucket, true);
+    setenv("AWS_ACCESS_KEY_ID", "key", 1);
+    setenv("AWS_SECRET_ACCESS_KEY", "secret", 1);
+    setenv("AWS_REGION", "us-east-1", 1);
+    setenv("AWS_ENDPOINT_URL", server.url().c_str(), 1);
+    setenv("VC3D_CONFIG_DIR", (scratch / "config").c_str(), 1);
+    std::filesystem::create_directories(scratch / "config");
+    std::ofstream(scratch / "config" / "VC3D.ini") << "[perf]\nremote_cache_min_free_gib=0\n";
+
+    OpenDataNormalGridsInfo info;
+    info.sampleId = "sample";
+    info.volumeId = "volume";
+    info.url = "s3://grids/ng";
+    const auto finalDir = vcr::zarr::decodedCachePath(root, info.url);
+    std::filesystem::create_directories(finalDir / "xy");
+    std::ofstream(finalDir / "xy" / "000007.grid.missing").flush();  // an older VC3D's marker
+
+    // Cancelled after the first file: what was fetched stays, nothing is complete.
+    std::atomic<bool> cancel{false};
+    std::vector<std::string> statuses;
+    std::string error;
+    auto dir = downloadOpenDataNormalGrids(info, root, 2, [&](const NormalGridsDownloadProgress& p) {
+        if (statuses.empty() || statuses.back() != p.status) statuses.push_back(p.status);
+        if (p.completedFiles >= 1) cancel.store(true);
+    }, &cancel, &error);
+    CHECK(dir.empty());
+    CHECK(error == "cancelled");
+    CHECK(statuses == std::vector<std::string>{"listing", "downloading"});
+    CHECK_FALSE(std::filesystem::exists(finalDir / "normal-grids-complete.json"));
+    std::size_t fetched = 0;  // grids and metadata.json fetched before the cancel
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(finalDir))
+        if (entry.is_regular_file() && (entry.path().extension() == ".grid" || entry.path().filename() == "metadata.json")) ++fetched;
+    CHECK(fetched >= 1);
+    CHECK(fetched < 10);
+
+    // The rerun lists again, fetches only what is missing, clears the old marker and completes.
+    const auto requestsBefore = server.requests().size();
+    cancel.store(false);
+    NormalGridsDownloadProgress last;
+    dir = downloadOpenDataNormalGrids(info, root, 4, [&](const NormalGridsDownloadProgress& p) { last = p; }, &cancel, &error);
+    CHECK(dir == finalDir);
+    CHECK(last.totalFiles == 10);
+    CHECK(last.completedFiles == 10);
+    CHECK(last.failedFiles == 0);
+    std::uint64_t servedBytes = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(bucket / "ng"))
+        if (entry.is_regular_file()) servedBytes += entry.file_size();
+    CHECK(last.totalBytes == servedBytes);
+    CHECK(last.completedBytes == servedBytes);
+    CHECK(std::filesystem::is_regular_file(finalDir / "normal-grids-complete.json"));
+    CHECK(std::filesystem::is_regular_file(finalDir / "yz" / "000002.grid"));
+    CHECK_FALSE(std::filesystem::exists(finalDir / "xy" / "000007.grid.missing"));
+    CHECK(vc::core::util::normalGridsRemoteUrl(finalDir) == info.url);
+    std::size_t objectGets = 0;
+    for (const auto& request : server.requests()) {
+        CHECK(request.signedV4());
+        if (request.method == "GET" && request.path.ends_with(".grid")) ++objectGets;
+    }
+    CHECK(objectGets == 9);  // every grid once across both runs
+    CHECK(server.requests().size() > requestsBefore);
+    const auto state = normalGridsCacheState(root, info.sampleId, vcr::catalog::OpenDataVolume{});
+    CHECK_FALSE(state.hasArtifact);  // a volume without the artifact
+
+    // Complete: no request at all.
+    const auto requestsAfter = server.requests().size();
+    CHECK(downloadOpenDataNormalGrids(info, root, 4, {}, &cancel, &error) == finalDir);
+    CHECK(server.requests().size() == requestsAfter);
+    for (const char* name : {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ENDPOINT_URL"}) unsetenv(name);
+    std::filesystem::remove_all(scratch);
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
