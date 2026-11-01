@@ -682,7 +682,10 @@ vcr::grid::Vertices QuadSurface::gridVertices(std::vector<std::uint8_t>& valid, 
     valid.assign(std::size_t(points->rows) * std::size_t(points->cols), 1);
     for (int j = 0; j < points->rows; ++j)
         for (int i = 0; i < points->cols; ++i)
-            if ((*points)(j, i) == cv::Vec3f(-1.f, -1.f, -1.f)) valid[std::size_t(j) * std::size_t(points->cols) + std::size_t(i)] = 0;
+        {
+            const auto& p = (*points)(j, i);
+            if (p == cv::Vec3f(-1.f, -1.f, -1.f) || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) valid[std::size_t(j) * std::size_t(points->cols) + std::size_t(i)] = 0;
+        }
     return {reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols, points->step1(), nullptr, valid.data()};
 }
 
