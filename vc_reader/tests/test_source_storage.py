@@ -412,6 +412,50 @@ class RemoteTests(RemoteFixtureCase):
                            'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com'):
                 self.assertEqual(resolve_access(public, 'aws').kind, 'anonymous')
 
+    def test_metadata_caching_obeys_the_floor_and_outlives_the_chunk_budget(self):
+        from vc_reader.reader import ZarrGroup
+        values = np.arange(12, dtype=np.uint8).reshape(3, 4)
+        for name in ('small', 'fits', 'floor'):
+            group = self.root/name
+            group.mkdir()
+            (group/'.zgroup').write_text('{"zarr_format": 2}')
+            (group/'.zattrs').write_text(json.dumps(dict(multiscales=[dict(datasets=[dict(path='0')])])))
+            array(group/'0', values)
+        def documents(name):
+            return sorted(p.relative_to(self.cache).as_posix() for p in self.cache.rglob('*')
+                          if p.is_file() and name in p.parts and p.name in ('.zgroup', '.zattrs', '.zarray'))
+        # A chunk budget too small for a chunk still keeps the documents: the group reopens
+        # offline, and only the chunks are missing there.
+        with ZarrGroup.open(self.url+'/small', cache_dir=self.cache, cache_max_bytes=1) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        self.assertTrue(any(d.endswith('small/.zgroup') for d in documents('small')), documents('small'))
+        self.assertEqual([p for p in self.cache.rglob('small/0/*') if p.name[0].isdigit()], [])
+        with ZarrGroup.open(self.url+'/small', cache_dir=self.cache, offline=True) as reader:
+            with self.assertRaises(CacheMissError):
+                reader.level(0)[:]
+        budget = disk_budget(str(self.cache), 2**63-1)
+        with ZarrGroup.open(self.url+'/fits', cache_dir=self.cache) as reader:
+            reader.level(0)[:]
+        kept = documents('fits')
+        self.assertTrue(any(d.endswith('fits/0/.zarray') for d in kept), kept)
+        with ZarrGroup.open(self.url+'/fits', cache_dir=self.cache, offline=True) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        # Under the floor another group's documents are refused and reported; the kept ones stay.
+        budget.set_min_free_bytes(2**62)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        self.assertTrue(budget.low_space)
+        self.assertEqual(documents('floor'), [])
+        self.assertEqual(documents('fits'), kept)
+        with self.assertRaises(CacheMissError):
+            ZarrGroup.open(self.url+'/floor', cache_dir=self.cache, offline=True)
+        budget.set_min_free_bytes(0)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache) as reader:
+            reader.level(0)[:]
+        self.assertFalse(budget.low_space)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache, offline=True) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+
     def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
         from vc_reader.reader import ZarrGroup
         group = self.root/'offline-group'

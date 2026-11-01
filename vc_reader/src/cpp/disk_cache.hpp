@@ -148,6 +148,20 @@ public:
         return number("SELECT max_bytes FROM budget WHERE id=1");
     }
 
+    // A cache's own metadata file (array and group documents, kept state): written atomically
+    // when the disk keeps its free-space floor. The byte limit bounds chunk bytes, which these
+    // documents never count toward: not accounted and never evicted, as reconcile() treats
+    // metadata. Whether it was written.
+    bool write_metadata(const std::string& path, const std::uint8_t* data, std::size_t size)
+    {
+        check_path(path);
+        std::lock_guard lock(mutex_);
+        if (!leaves_free_space(size))
+            return false;
+        atomic_write(path, data, size);
+        return true;
+    }
+
     // Whether the last write was skipped to keep the disk's free space.
     bool low_space() const noexcept { return low_space_.load(std::memory_order_relaxed); }
 

@@ -3,6 +3,7 @@
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -402,8 +403,9 @@ StoreMetadata volumeMetadata(const std::string& input, const OpenOptions& option
             const auto data = storeMetadataJson(metadata).dump();
             for (const auto& candidate : candidates) {
                 try {
-                    atomicWrite(candidate / kKeptMetadata, data);
-                    break;
+                    if (detail::writeCacheMetadata(candidate / kKeptMetadata, data, options.cacheDirs, options.vc3dVolumeDir,
+                                                   options.cacheMaxBytes, options.cacheMinFreeBytes))
+                        break;
                 } catch (const std::exception&) {
                     // Read-only: try the next; this process still remembers it.
                 }

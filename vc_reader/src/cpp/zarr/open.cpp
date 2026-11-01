@@ -2,6 +2,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/array.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -263,6 +264,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
             layerOptions.allowLossy = options.allowLossyCache;
             layerOptions.compress = options.compressCache;
             layerOptions.maxBytes = options.cacheMaxBytes;
+            layerOptions.minFreeBytes = options.cacheMinFreeBytes;
             auto layers = openLayers(options.cacheDirs, keyUrl, out.meta, layerOptions);
             out.layers = std::move(layers.layers);
             out.writer = layers.writer;
@@ -325,13 +327,15 @@ void OpenedArray::close()
 namespace {
 constexpr const char* kSourceAttributes = ".vc_reader_source_attrs.json";
 
-void keepAttributes(const OpenedArray& array)
+void keepAttributes(const OpenedArray& array, const OpenOptions& options)
 {
     if (array.writer < 0)
         return;
     try {
         // The .zattrs of a decoded cache belongs to the cache, not the source.
-        atomicWrite(fs::path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes, array.attributes.dump());
+        (void)detail::writeCacheMetadata(fs::path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes,
+                                         array.attributes.dump(), options.cacheDirs, options.vc3dVolumeDir,
+                                         options.cacheMaxBytes, options.cacheMinFreeBytes);
     } catch (const std::exception&) {
         // A read-only cache: the attributes are still known to this reader.
     }
@@ -359,7 +363,7 @@ const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options)
     const auto text = reader(options)(array.location, ".zattrs");
     array.attributes = text ? Json::parse(*text) : Json::object();
     array.attributesRead = true;
-    keepAttributes(array);
+    keepAttributes(array, options);
     return array.attributes;
 }
 
@@ -447,7 +451,9 @@ Group Group::open(const std::string& input, OpenOptions options)
                     if (!data) continue;
                     std::ifstream existing(target/name,std::ios::binary);
                     const std::string current((std::istreambuf_iterator<char>(existing)),{});
-                    if (!existing || current!=*data) atomicWrite(target/name,*data);
+                    if (!existing || current!=*data)
+                        (void)detail::writeCacheMetadata(target/name,*data,options.cacheDirs,options.vc3dVolumeDir,
+                                                         options.cacheMaxBytes,options.cacheMinFreeBytes);
                 }
             } catch (const std::exception&) {
                 // Read-only caches still allow online opens.
@@ -703,8 +709,9 @@ static void keepPyramid(Group& group, const std::vector<std::pair<int, std::stri
     const auto data = group.state().dump();
     for (const auto& dir : dirs)
         try {
-            atomicWrite(dir / kKeptGroup, data);
-            return;
+            if (detail::writeCacheMetadata(dir / kKeptGroup, data, options.cacheDirs, options.vc3dVolumeDir,
+                                           options.cacheMaxBytes, options.cacheMinFreeBytes))
+                return;
         } catch (const std::exception&) {
             // Read-only: try the next.
         }
@@ -855,7 +862,7 @@ OpenedArray Group::array(const std::string& key)
     if (const auto meta = consolidated()) {
         out.attributes = meta->value(key + "/.zattrs", Json::object());
         out.attributesRead = true;
-        keepAttributes(out);
+        keepAttributes(out, options_);
     }
     return out;
 }

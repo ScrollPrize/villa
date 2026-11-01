@@ -169,6 +169,7 @@ struct LayerOptions {
     std::optional<std::filesystem::path> vc3dVolumeDir;  // a VC3D cache directory named by its owner
     bool writable = true, allowLossy = false, compress = false;
     std::optional<std::int64_t> maxBytes;
+    std::optional<std::int64_t> minFreeBytes;  // the free-space floor new layer documents obey
 };
 
 // Every existing cache of `url` under `cacheDirs` (in order), and the index of the

@@ -165,8 +165,19 @@ std::optional<fs::path> vc3dDir(const fs::path& root, const std::string& groupUr
     return std::nullopt;
 }
 
+// The disk policy a cache's metadata writes obey (writeCacheMetadata).
+struct CachePolicy {
+    std::vector<std::string> cacheDirs;
+    std::optional<fs::path> vc3dVolumeDir;
+    std::optional<std::int64_t> maxBytes, minFreeBytes;
+    bool write(const fs::path& path, const std::string& data) const
+    {
+        return detail::writeCacheMetadata(path, data, cacheDirs, vc3dVolumeDir, maxBytes, minFreeBytes);
+    }
+};
+
 std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& source, const std::string& url,
-                                       bool create, bool compress = false, bool allowLossy = false)
+                                       bool create, const CachePolicy& policy, bool compress = false, bool allowLossy = false)
 {
     auto stored = readJson(root / ".zarray");
     if (!stored) {
@@ -177,8 +188,9 @@ std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& so
             throw std::invalid_argument("compress_cache needs 3-D uint8 or uint16 chunks");
         stored = compress ? source.delta3dZarray() : source.decodedZarray();
         const Json record{{"vc_reader", {{"source_url", url}, {"source_zarray", source.raw}}}};
-        atomicWrite(root / ".zattrs", record.dump(1));
-        atomicWrite(root / ".zarray", stored->dump(1));
+        // No layer without its documents: under the free-space floor nothing is cached here.
+        if (!policy.write(root / ".zattrs", record.dump(1)) || !policy.write(root / ".zarray", stored->dump(1)))
+            return std::nullopt;
         CacheLayer layer;
         layer.kind = "decoded";
         layer.root = root.string();
@@ -213,7 +225,7 @@ std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& so
 }
 
 std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string& levelKey, const ArrayMeta& source,
-                                    bool allowLossy, bool writable, std::vector<std::string>& busy)
+                                    bool allowLossy, bool writable, std::vector<std::string>& busy, const CachePolicy& policy)
 {
     if (source.v3)
         return std::nullopt;  // VC3D mirror layouts describe v2 source chunks
@@ -228,7 +240,8 @@ std::optional<CacheLayer> vc3dLayer(const fs::path& volumeDir, const std::string
     if (!stored && writable) {
         // VC3D publishes each level's metadata when it first touches the level; do the same.
         stored = delta3d ? source.delta3dZarray() : source.raw;
-        atomicWrite(root / ".zarray", stored->dump(2) + "\n");
+        if (!policy.write(root / ".zarray", stored->dump(2) + "\n"))
+            stored.reset();  // the policy refused: no layer here
     }
     if (!stored)
         return std::nullopt;
@@ -358,6 +371,33 @@ std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std
     else if (maxBytes)
         budget->set_max_bytes(*maxBytes);
     return budget;
+}
+
+bool detail::writeCacheMetadata(const fs::path& path, const std::string& data, const std::vector<std::string>& cacheDirs,
+                                const std::optional<fs::path>& vc3dVolumeDir, std::optional<std::int64_t> maxBytes,
+                                std::optional<std::int64_t> minFreeBytes)
+{
+    const auto under = [](const fs::path& file, const fs::path& dir) {
+        std::error_code ec;
+        const auto rel = fs::weakly_canonical(file, ec).lexically_relative(fs::weakly_canonical(dir, ec));
+        return !rel.empty() && rel.native() != "." && *rel.begin() != "..";
+    };
+    std::optional<fs::path> root;
+    for (const auto& candidate : cacheRoots(cacheDirs))
+        if (under(path, candidate)) {
+            root = candidate;
+            break;
+        }
+    if (!root && vc3dVolumeDir && under(path, *vc3dVolumeDir))
+        root = vc3dVolumeDir->parent_path();
+    if (!root) {
+        atomicWrite(path, data);
+        return true;
+    }
+    auto budget = diskBudget(root->string(), maxBytes);
+    if (minFreeBytes)
+        budget->set_min_free_bytes(*minFreeBytes);
+    return budget->write_metadata(fs::weakly_canonical(path).string(), reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
 }
 
 void atomicWrite(const fs::path& path, const std::string& data)
@@ -521,18 +561,19 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
     }
     Layers out;
     const bool vc3dWritable = options.writable;
+    const CachePolicy policy{cacheDirs, options.vc3dVolumeDir, options.maxBytes, options.minFreeBytes};
     if (options.vc3dVolumeDir && options.levelKey) {
         std::error_code ec;
         if (fs::is_directory(*options.vc3dVolumeDir, ec))
-            if (auto layer = vc3dLayer(*options.vc3dVolumeDir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy))
+            if (auto layer = vc3dLayer(*options.vc3dVolumeDir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy, policy))
                 out.layers.push_back(std::move(*layer));
     }
     for (const auto& root : roots) {
         if (options.groupUrl && options.levelKey && !options.vc3dVolumeDir)
             if (const auto vdir = vc3dDir(root, *options.groupUrl))
-                if (auto layer = vc3dLayer(*vdir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy))
+                if (auto layer = vc3dLayer(*vdir, *options.levelKey, source, options.allowLossy, vc3dWritable, out.busy, policy))
                     out.layers.push_back(std::move(*layer));
-        if (auto layer = decodedLayer(decodedCachePath(root, url), source, url, false, false, options.allowLossy))
+        if (auto layer = decodedLayer(decodedCachePath(root, url), source, url, false, policy, false, options.allowLossy))
             out.layers.push_back(std::move(*layer));
     }
     if (!options.writable)
@@ -574,9 +615,13 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
         auto writer = std::find_if(out.layers.begin(), out.layers.end(),
                                    [&](const CacheLayer& l) { return l.kind == "decoded" && l.root == target; });
         if (writer == out.layers.end()) {
-            auto layer = decodedLayer(target, source, url, true, options.compress, options.allowLossy);
-            if (!layer)
-                throw std::invalid_argument("bounded cache " + target + " is lossy; use a different cache directory");
+            auto layer = decodedLayer(target, source, url, true, policy, options.compress, options.allowLossy);
+            if (!layer) {
+                std::error_code ec;
+                if (fs::is_regular_file(fs::path(target) / ".zarray", ec))
+                    throw std::invalid_argument("bounded cache " + target + " is lossy; use a different cache directory");
+                return out;  // the disk policy refused the layer's documents: nothing is cached here
+            }
             out.layers.push_back(std::move(*layer));
             writer = std::prev(out.layers.end());
         }
@@ -590,8 +635,10 @@ Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& 
     }
     if (roots.empty())
         return out;
-    out.layers.push_back(*decodedLayer(decodedCachePath(roots.front(), url), source, url, true, options.compress));
-    out.writer = 0;
+    if (auto layer = decodedLayer(decodedCachePath(roots.front(), url), source, url, true, policy, options.compress)) {
+        out.layers.push_back(std::move(*layer));
+        out.writer = 0;
+    }
     return out;
 }
 
