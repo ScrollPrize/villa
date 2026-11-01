@@ -211,7 +211,8 @@ if __name__ == "__main__":
         # Define your value mapping here
         value_map = {
             0: 0,      # keep 0 as 0
-            1: 255    # map 1 to 255
+            1: 255,    # map 1 to 255
+            255: 255   # keep 255 (apply_thresholds.py writes 0/255 masks)
         }
     
     if map == False: 
