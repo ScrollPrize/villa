@@ -412,8 +412,9 @@ bool sameLasagnaSamplingGrid(
 {
     const double spacingTolerance =
         1.0e-12 * std::max({1.0, std::abs(a.spacing), std::abs(b.spacing)});
+    // One grid is one shape and spacing; how each channel is chunked does not change where
+    // its voxels lie, so differently chunked channels still group.
     return a.shapeZYX == b.shapeZYX &&
-           a.chunksZYX == b.chunksZYX &&
            std::abs(a.spacing - b.spacing) <= spacingTolerance;
 }
 
