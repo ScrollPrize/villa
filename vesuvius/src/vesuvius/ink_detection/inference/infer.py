@@ -43,6 +43,7 @@ from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
     open_volume,
     open_volume_root,
+    require_pyramid_depth_scale,
     select_volume_level,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -1214,6 +1215,8 @@ def infer_single_zarr(
 
     root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    if not hasattr(root, "shape"):
+        require_pyramid_depth_scale(root, resolution, source=str(input_zarr))
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
     patch_size = configured_model.patch_size
