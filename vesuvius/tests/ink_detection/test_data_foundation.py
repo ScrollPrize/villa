@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import json
 import os
 import pickle
 import random
@@ -443,7 +444,7 @@ def test_default_patch_finding_reads_each_mask_surface_once(tmp_path):
     assert len(_patch_search_counting_mask_reads(tmp_path)[2]) == 2
 
 
-def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
+def test_patch_cache_round_trip_and_stale_rejection(tmp_path):
     config = _config(tmp_path)
     segment = replace(
         _segment(config, tmp_path),
@@ -466,10 +467,54 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     assert loaded[0].is_validation
     assert loaded[0].supervision_mask == str(segment.validation_mask)
     assert replace(patch, supervision_mask_override="").supervision_mask == ""
-    assert "v6" in patch_finding_cache_token(config)
+    assert "labeled-default-v7" in patch_finding_cache_token(config)
 
     changed = _config(tmp_path, patch_overlap=0.25)
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
+
+
+def test_default_cache_rejects_old_mixed_depth_coverage(tmp_path):
+    config = _config(tmp_path, patch_overlap=1.0, patch_min_labeled_coverage=0.1)
+    image = np.ones((7, 2, 4), dtype=np.uint8)
+    labels = np.zeros((65, 2, 4), dtype=np.uint8)
+    labels[32] = 255
+    supervision = np.zeros_like(image)
+    supervision[3] = 255
+    validation = np.zeros_like(image)
+    validation[3, :, :2] = 255
+    paths = {}
+    for name, value in (
+        ("image", image),
+        ("labels", labels),
+        ("supervision", supervision),
+        ("validation", validation),
+    ):
+        paths[name] = tmp_path / f"{name}.zarr"
+        _write_pyramid(paths[name], value)
+    segment = replace(
+        _segment(config, tmp_path, image_volume=paths["image"]),
+        inklabels=paths["labels"],
+        supervision_mask=paths["supervision"],
+        validation_mask=paths["validation"],
+    )
+    training, held_out = find_segment_patches(
+        segment, lambda path, scale: open_volume(path, resolution=scale)
+    )
+    assert len(training) == len(held_out) == 1
+
+    # v6 read ink at the supervision midpoint (Z=3), so only validation survived.
+    path = tmp_path / "patches.json"
+    save_patch_cache(path, held_out)
+    records = json.loads(path.read_text())
+    for record in records:
+        record["patch_finding_key"] = "labeled-default-v6-po-1.0-mlc-0.1-pfs-"
+    path.write_text(json.dumps(records))
+    assert load_patch_cache(path, config=config, segments=[segment]) is None
+
+    save_patch_cache(path, training + held_out)
+    loaded = load_patch_cache(path, config=config, segments=[segment])
+    assert loaded is not None
+    assert [patch.is_validation for patch in loaded] == [False, True]
 
 
 def _write_mask(path: Path, chunks: dict[str, bytes]) -> None:
