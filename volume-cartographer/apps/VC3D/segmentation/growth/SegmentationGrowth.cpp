@@ -241,15 +241,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
     ensureNormalsInward(context.resumeSurface, context.volume);
 
-    if (!context.cacheRoot.isEmpty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(context.cacheRoot.toStdString(), ec);
-        if (ec) {
-            result.error = QStringLiteral("Failed to create cache directory: %1").arg(QString::fromStdString(ec.message()));
-            return result;
-        }
-    }
-
     utils::Json params = buildTracerParams(request);
 
     int startGen = 0;
@@ -312,7 +303,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     if (!params.contains("rewind_gen")) {
         params["rewind_gen"] = -1;
     }
-    params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }
@@ -333,7 +323,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
     try {
         qCInfo(lcSegGrowth) << "Calling tracer()";
-        qCInfo(lcSegGrowth) << "  cacheRoot:" << context.cacheRoot;
         qCInfo(lcSegGrowth) << "  voxelSize:" << context.voxelSize;
         qCInfo(lcSegGrowth) << "  resumeSurface:" << (context.resumeSurface ? context.resumeSurface->id.c_str() : "<null>");
         const auto collectionCount = correctionCollection.getAllCollections().size();
@@ -359,7 +348,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       1.0f,
                                       origin,
                                       params,
-                                      context.cacheRoot.toStdString(),
                                       static_cast<float>(context.voxelSize),
                                       context.resumeSurface,
                                       std::filesystem::path(),

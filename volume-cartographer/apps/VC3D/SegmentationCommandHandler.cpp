@@ -1553,7 +1553,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     paramsJson.insert(QStringLiteral("generations"), iterations);
     paramsJson.insert(QStringLiteral("thread_limit"), 1);
     paramsJson.insert(QStringLiteral("normal_grid_path"), normalGridPath);
-    paramsJson.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
     if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
         paramsJson.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
     }

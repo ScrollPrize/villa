@@ -64,8 +64,7 @@ TEST_CASE("vc_grow_seg_from_seed grows into and resumes from an object store")
     writeSheets(dir, {64});
     OpenOptions options; options.author = "grow-store-test";
     { auto store = ObjectStore::create(dir / "objects.vcobj", options); }
-    std::ofstream(dir / "params.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0},
-                                                          {"cache_root", (dir / "cache").string()}}.dump();
+    std::ofstream(dir / "params.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0}}.dump();
     const std::string base = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
         "\" --params \"" + (dir / "params.json").string() + "\" --rng-seed 1 --seed 64 64 64";
     const std::string common = base + " --store \"" + (dir / "objects.vcobj").string() + "\" --volume-uuid test-volume --tag paths";
@@ -105,13 +104,10 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     writeSheets(dir, {40, 90});
     OpenOptions options; options.author = "grow-store-test";
     { auto store = ObjectStore::create(dir / "objects.vcobj", options); }
-    const auto cache = (dir / "cache").string();
-    std::ofstream(dir / "grow.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0},
-                                                        {"cache_root", cache}}.dump();
+    std::ofstream(dir / "grow.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0}}.dump();
     std::ofstream(dir / "copy.json") << nlohmann::json{
-        {"mode", "gen_neighbor"}, {"neighbor_dir", "out"}, {"neighbor_max_distance", 80}, {"cache_root", cache},
-        {"refine", {{"max_gen", 1}, {"generations", 1}, {"thread_limit", 1}, {"min_area_cm", 0},
-                    {"cache_root", cache}}}}.dump();
+        {"mode", "gen_neighbor"}, {"neighbor_dir", "out"}, {"neighbor_max_distance", 80},
+        {"refine", {{"max_gen", 1}, {"generations", 1}, {"thread_limit", 1}, {"min_area_cm", 0}}}}.dump();
     const std::string common = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
         "\" --store \"" + (dir / "objects.vcobj").string() + "\" --volume-uuid test-volume --tag paths";
 

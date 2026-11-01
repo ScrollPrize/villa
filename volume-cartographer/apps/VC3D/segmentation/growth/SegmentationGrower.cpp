@@ -51,16 +51,6 @@ const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 
 namespace
 {
-QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
-{
-    if (!pkg) {
-        return QString();
-    }
-
-    const QString base = QString::fromStdString(pkg->directory().string());
-    return QDir(base).filePath(QStringLiteral("cache"));
-}
-
 // The valid grid vertex nearest `worldPos` on `surface` (stored, or a draft):
 // the vertex at its nearest point, else the nearest valid one around it.
 std::optional<std::pair<int, int>> locateGridIndex(QuadSurface* surface, ViewerManager* viewerManager,
@@ -668,24 +658,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.resumeSurface = segmentationSurface.get();
     ctx.volume = growthVolume.get();
     ctx.level = 0;
-    ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
     ctx.allowedGrowthMask = request.allowedGrowthMask;
 
     ctx.growthVolumeId = growthVolumeId;
-
-    if (ctx.cacheRoot.isEmpty()) {
-        const auto volumePath = growthVolume->path();
-        ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string()))
-                            .filePath(QStringLiteral("cache"));
-    }
-
-    if (ctx.cacheRoot.isEmpty()) {
-        qCInfo(lcSegGrowth) << "Tracer growth aborted because cache root is empty";
-        showStatus(tr("Cache root unavailable for tracer growth."), kStatusLong);
-        return false;
-    }
 
     if (method == SegmentationGrowthMethod::Corrections) {
         if (usingCorrections) {

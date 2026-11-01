@@ -391,13 +391,6 @@ static int run_main(int argc, char *argv[])
         voxelsize = static_cast<float>(params_voxelsize);
     }
     
-    std::filesystem::path cache_root;
-    if (params.contains("cache_root") && params["cache_root"].is_string()) {
-        cache_root = params["cache_root"].get_string();
-    } else if (params.contains("cache_root") && !params["cache_root"].is_null()) {
-        std::cerr << "WARNING: cache_root must be a string; ignoring" << std::endl;
-    }
-
     std::string mode = params.value("mode", std::string("seed"));
     
     std::cout << "mode: " << mode << std::endl;
@@ -1529,7 +1522,7 @@ static int run_main(int argc, char *argv[])
         add_target_context(refine_meta, vol_path);
         std::unique_ptr<QuadSurface> refined;
         try {
-            refined.reset(tracer(tracing_volume, 1.0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
+            refined.reset(tracer(tracing_volume, 1.0, {0, 0, 0}, refine, voxelsize,
                                  out_surf.get(),
                                  store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
         } catch (const std::exception& e) {
@@ -1543,7 +1536,7 @@ static int run_main(int argc, char *argv[])
 
     QuadSurface *surf = nullptr;
     try {
-        surf = tracer(tracing_volume, 1.0, origin, params, cache_root.string(), voxelsize, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+        surf = tracer(tracing_volume, 1.0, origin, params, voxelsize, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
     } catch (const std::exception& e) {
         // A growth failure (e.g. a remote normal-grid store whose metadata
         // could not be fetched) must exit as a normal tool failure, not crash

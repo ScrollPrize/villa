@@ -109,7 +109,6 @@ struct TracerGrowthContext {
     QuadSurface* resumeSurface{nullptr};
     class Volume* volume{nullptr};
     int level{0};
-    QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
     cv::Mat allowedGrowthMask;

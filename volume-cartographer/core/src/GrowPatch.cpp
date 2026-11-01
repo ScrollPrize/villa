@@ -1868,7 +1868,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const utils::Json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
     if (volume.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
