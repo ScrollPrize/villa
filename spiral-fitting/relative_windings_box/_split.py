@@ -1,5 +1,6 @@
 """The label-free split rule: cut winding chains at every step where Lasagna's grad_mag counts more than one
-sheet (split rule v2, params digest cd273aed7673; v1, c6d2eecbebc2), and export the pieces. Needs numpy and scipy.
+sheet (split rule v2, params digest cd273aed7673; v1, c6d2eecbebc2; none cuts nothing and marks those steps as
+places to check), and export the pieces. Needs numpy and scipy.
 """
 
 import hashlib
@@ -21,7 +22,18 @@ PARAMS = {
 PARAMS_V2 = dict(PARAMS, version="split-v2", abs_own=1.0)
 
 
-SPLIT_RULES = {"v1": PARAMS, "v2": PARAMS_V2}
+PARAMS_NONE = dict(PARAMS, version="split-none", q_own=None, abs_own=None)
+
+
+SPLIT_RULES = {"v1": PARAMS, "v2": PARAMS_V2, "none": PARAMS_NONE}
+
+
+GM_CUT_V2 = PARAMS_V2["abs_own"]
+
+
+SPLIT_CHECK = ("windlabel-check-split-step", [0.25, 0.55, 1.0],
+               "a step this run kept (the v2 grad_mag cut would remove it: gm_x above 1.0): check the winding "
+               "count there")
 
 
 CHAIN_RULE_V1 = "0e53e0ae5016"          # the chain rule (version 1) the split rule was tested on
@@ -159,9 +171,12 @@ def split_doc(doc, feats, params=None, features_file=None):
     new, info = split_chains(doc["chains"], feats, params)
     out = dict(doc)
     out["chains"] = new
+    cut = params.get("abs_own") is not None or params.get("q_own") is not None
     out["split_rule"] = {"params": params, "params_digest": digest(params),
                          "features_file": str(features_file), "input_rule_digest": doc.get("rule_digest"), **info,
-                         "note": "label-free split of windlabel chains at flagged steps; Model output"}
+                         "note": ("label-free split of windlabel chains at flagged steps" if cut else
+                                  "label-free windlabel chains kept whole: the grad_mag cut is off")
+                         + "; Model output"}
     out["split_rule"]["output_digest"] = digest([[ch["points"], ch["counts"]] for ch in new])
     return out
 
@@ -287,9 +302,10 @@ def _sha_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def add_split_flags(flags_doc, chains, feats, params=None, affine=None, scale=1.0, max_flags=None):
+def add_split_flags(flags_doc, chains, feats, params=None, affine=None, scale=1.0, max_flags=None, flags_def=None):
     """Add one collection to an export flags file: the midpoint of every step the split rule cut, in the same
-    frame as the other flags (affine, then scale). Returns the number added."""
+    frame as the other flags (affine, then scale). `flags_def` names the collection (default: the split cut).
+    Returns the number added."""
     np = _np()
     from . import _chains as wl
     st, f, gm, _ = flags(chains, feats, dict(PARAMS) if params is None else params)
@@ -308,7 +324,7 @@ def add_split_flags(flags_doc, chains, feats, params=None, affine=None, scale=1.
     cols = flags_doc["collections"]
     fmeta = flags_doc.setdefault("relative_windings_box", {}).setdefault("points", {})
     fid = max([int(p) for c in cols.values() for p in c["points"]] or [0])
-    nm, color, why = SPLIT_FLAG
+    nm, color, why = flags_def or SPLIT_FLAG
     pts = {}
     for c_t, (xyz, it) in enumerate(zip(tf([it["p"] for it in items]), items), 1):
         fid += 1
@@ -337,8 +353,10 @@ def export_split(chains_doc, feats, out, params=None, chains_file=None, features
                                                             "chains_in", "output_digest")}}
     rel, fl, summ = wl.export(sd["chains"], min_points=min_points, affine=affine, scale=scale, meta=meta,
                               max_flags=max_flags)
-    n_split = add_split_flags(fl, chains_doc["chains"], feats, params, affine=affine, scale=scale,
-                              max_flags=max_flags)
+    check = params["abs_own"] is None and params["q_own"] is None
+    n_split = add_split_flags(fl, chains_doc["chains"], feats, dict(PARAMS_V2) if check else params,
+                              affine=affine, scale=scale, max_flags=max_flags,
+                              flags_def=SPLIT_CHECK if check else None)
     summ["flags"]["split"] = n_split
     (out / "relative_windings.json").write_text(json.dumps(rel, indent=1))
     (out / "flags.json").write_text(json.dumps(fl, indent=1))
@@ -360,6 +378,21 @@ def export_split(chains_doc, feats, out, params=None, chains_file=None, features
     summ["note"] = "Model output from a surface prediction and lasagna grad_mag; not a reading."
     (out / "export.json").write_text(json.dumps(summ, indent=2))
     return summ
+
+
+def gm_stats(steps):
+    """Median and p90 of a run's gm_x (the k_s-scaled grad_mag integral per step) and how many read above
+    the v2 cut of 1.0: a per-scroll look at where the cut sits. Empty fields with no finite gm_x."""
+    np = _np()
+    vals = [s["gm_x"] for s in steps if s is not None and s.get("gm_x") is not None]
+    out = {"n": len(vals), "median": None, "p90": None, "above_v2": None}
+    if vals:
+        v = np.asarray(vals, float)
+        n_above = int((v > GM_CUT_V2).sum())
+        out["median"] = round(float(np.median(v)), 4)
+        out["p90"] = round(float(np.quantile(v, 0.9)), 4)
+        out["above_v2"] = {"count": n_above, "share": round(n_above / len(v), 4)}
+    return out
 
 
 def features_doc(chains_file, chains_doc, source, base_affine=None, scaledown=None, decode=None, workers=2):

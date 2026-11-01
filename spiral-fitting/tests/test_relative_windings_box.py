@@ -117,7 +117,7 @@ class TestRelativeWindingsBox(unittest.TestCase):
         cls.d = d = Path(cls._tmp.name)
         write_inputs(d)
         cls.res = {}
-        for rule in ("v1", "v2"):
+        for rule in ("v1", "v2", "none"):
             rc, out, err = run(["--prediction", str(d / "pred.zarr"), "--grad-mag", str(d / "las/run.lasagna.json"),
                                 "--point", "120,120,24", "--box", "140", "--seeds", "30",
                                 "--umbilicus", str(d / "umbilicus.json"), "--split-rule", rule,
@@ -188,10 +188,54 @@ class TestRelativeWindingsBox(unittest.TestCase):
         self.assertEqual({k for k in _split.PARAMS if _split.PARAMS[k] != _split.PARAMS_V2[k]},
                          {"version", "abs_own"})
 
+    def test_split_rule_none_keeps_every_step(self):
+        d = self.d
+        rc, out, err = self.res["none"]
+        self.assertEqual(rc, 0, err[-1500:])
+        res = json.loads(out)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["split_steps"], 0)
+        sd = json.loads((d / "none/split.json").read_text())
+        sr = sd["split_rule"]
+        self.assertIsNone(sr["params"]["abs_own"])
+        self.assertIsNone(sr["params"]["q_own"])
+        self.assertEqual(sr["pieces"], sr["chains_in"])
+        self.assertIn("kept whole", sr["note"])
+        # the steps kept with the cut off are still marked, where the v2 cut would act
+        cols = lambda doc, tag: sorted(p["p"] for c in json.loads((d / doc).read_text())["collections"].values()
+                                       if tag in c["name"] for p in c["points"].values())  # noqa: E731
+        self.assertEqual(cols("none/flags.json", "check-split-step"), cols("v2/flags.json", "split-step"))
+        self.assertTrue(cols("none/flags.json", "check-split-step"))
+        # the gm_x stats point at where the v2 threshold sits
+        gx = res["gm_x"]
+        self.assertGreater(gx["n"], 20)
+        self.assertGreater(gx["above_v2"]["count"], 0)
+        self.assertLess(gx["median"], 1.0)
+        # every exported winding difference is still the true one, with the cut's pairs back in
+        pw = json.loads((d / "none/relative_windings.json").read_text())
+
+        def claims(name):
+            doc = json.loads((d / name).read_text())
+            pairs = right = 0
+            for c in doc["collections"].values():
+                pts_ = list(c["points"].values())
+                for a_, b_ in zip(pts_, pts_[1:]):
+                    pairs += 1
+                    right += (b_["wind_a"] - a_["wind_a"]) == (true_wrap(b_["p"]) - true_wrap(a_["p"]))
+            return pairs, right
+
+        none_pairs, none_right = claims("none/relative_windings.json")
+        v2_pairs, v2_right = claims("v2/relative_windings.json")
+        self.assertGreater(none_pairs, 20)
+        self.assertGreaterEqual(none_right / none_pairs, 0.95)
+        self.assertGreater(none_pairs, v2_pairs)
+        self.assertGreaterEqual(none_right, v2_right)
+
     def test_rule_digests(self):
         self.assertTrue(_chains.rule_digest(_chains.RULES[1]).startswith("0e53e0ae5016"))
         self.assertEqual(_split.digest(_split.SPLIT_RULES["v1"]), "c6d2eecbebc2")
         self.assertEqual(_split.digest(_split.SPLIT_RULES["v2"]), "cd273aed7673")
+        self.assertEqual(_split.digest(_split.SPLIT_RULES["none"]), "6e3aff82495f")
 
     def test_zarr_v3_reads_like_v2(self):
         with tempfile.TemporaryDirectory() as t:

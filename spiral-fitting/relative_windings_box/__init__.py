@@ -3,7 +3,8 @@
 Run from spiral-fitting/:
 
     uv run python -m relative_windings_box --prediction PRED --grad-mag GM --umbilicus UMB.json --point X,Y,Z
-        --out RUN [--base-affine identity|M.json] [--box 512] [--seeds 200] [--rng 0] [--split-rule v2] [--json]
+        --out RUN [--base-affine identity|M.json] [--box 512] [--seeds 200] [--rng 0]
+        [--split-rule v2|v1|none] [--json]
 
 In order, stopping at the first refusal (exit 2, nothing computed):
   1. checks the inputs: a surface prediction and a grad_mag source must both open (their metadata is read), and
@@ -11,9 +12,10 @@ In order, stopping at the first refusal (exit 2, nothing computed):
   2. grows chains of sheet crossings (chain rule version 1, digest 0e53e0ae5016) on the prediction, from seeds
      drawn in a cube of --box voxels centered on the point, counting outward from the umbilicus: RUN/chains.json;
   3. samples gm_x per step from the grad_mag (RUN/features.json), cuts every chain at the steps the split rule
-     flags (v2, params digest cd273aed7673; v1, c6d2eecbebc2) (RUN/split.json) and writes
-     RUN/relative_windings.json (relative-winding point collections, winding_is_absolute false), RUN/flags.json
-     (places to check, the cut steps among them) and RUN/export.json;
+     flags (v2, params digest cd273aed7673; v1, c6d2eecbebc2; none, no cut: flags.json marks the steps v2 would
+     cut as places to check, and export.json reports the run's gm_x median, p90 and share above 1.0)
+     (RUN/split.json) and writes RUN/relative_windings.json (relative-winding point collections,
+     winding_is_absolute false), RUN/flags.json (places to check, the cut steps among them) and RUN/export.json;
   4. prints a summary (with --json, one JSON object on stdout).
 
 Exit codes: 0 written and both point collection files pass the checks, 1 written but a check failed (for example
@@ -163,7 +165,8 @@ def run(a):
     (out / "features.json").write_text(json.dumps(fd))
     summ = ws.export_split(d, fd["steps"], out, params=dict(ws.SPLIT_RULES[a.split_rule]), chains_file=chains_path,
                            features_file=out / "features.json",
-                           extra={"grad_mag": fd["grad_mag"], "features_seconds": fd["seconds"]})
+                           extra={"grad_mag": fd["grad_mag"], "features_seconds": fd["seconds"],
+                                  "gm_x": ws.gm_stats(fd["steps"])})
     files = dict(summ["files"], **{"chains.json": str(chains_path), "features.json": str(out / "features.json")})
     summ["files"] = files
     summ["run"] = {"tool": f"relative_windings_box {VERSION}", "point": point, "box_edge": edge, "seeds": seeds,
@@ -172,7 +175,8 @@ def run(a):
     (out / "export.json").write_text(json.dumps(summ, indent=2))
     res = {"ok": summ["ok"], "files": files, "collections": summ["collections"], "points": summ["points"],
            "pieces": summ["pieces"], "steps": summ["steps"], "split_steps": summ["split_rule"]["flagged_steps"],
-           "flags": summ["flags"], "checks": summ["checks"], "run": summ["run"], "note": NOTE}
+           "flags": summ["flags"], "checks": summ["checks"], "run": summ["run"], "gm_x": summ["gm_x"],
+           "note": NOTE}
     if a.json:
         print(json.dumps(res, indent=1))
     else:
@@ -200,8 +204,9 @@ def build_parser(p=None):
     p.add_argument("--box", default="512", help="box edge in voxels (default 512)")
     p.add_argument("--seeds", default="200", help="seed count (default 200)")
     p.add_argument("--rng", type=int, default=0, help="seed RNG (default 0)")
-    p.add_argument("--split-rule", default="v2", choices=("v1", "v2"),
-                   help="split rule: v2 cuts at gm_x above 1.0, v1 at 0.95 (default v2)")
+    p.add_argument("--split-rule", default="v2", choices=("v2", "v1", "none"),
+                   help="split rule: v2 cuts at gm_x above 1.0, v1 at 0.95, none keeps every step (default v2; "
+                        "with none, flags.json marks the steps the v2 cut would remove as places to check)")
     p.add_argument("--umbilicus", help="umbilicus JSON in the prediction's level-0 voxels; it sets which way is "
                                        "outward")
     p.add_argument("--workers", type=int, default=2, help="threads for grad_mag reads (default 2)")
