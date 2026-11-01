@@ -13,9 +13,10 @@ In order, stopping at the first refusal (exit 2, nothing computed):
      drawn in a cube of --box voxels centered on the point, counting outward from the umbilicus: RUN/chains.json;
   3. samples gm_x per step from the grad_mag (RUN/features.json), cuts every chain at the steps the split rule
      flags (v2, params digest cd273aed7673; v1, c6d2eecbebc2; none, no cut: flags.json marks the steps v2 would
-     cut as places to check, and export.json reports the run's gm_x median, p90 and share above 1.0)
-     (RUN/split.json) and writes RUN/relative_windings.json (relative-winding point collections,
-     winding_is_absolute false), RUN/flags.json (places to check, the cut steps among them) and RUN/export.json;
+     cut as places to check). Every run's export.json also reports the run's gm_x median, p90 and share above
+     the v2 cut of 1.0 (RUN/split.json) and writes RUN/relative_windings.json (relative-winding point
+     collections, winding_is_absolute false), RUN/flags.json (places to check, the cut steps among them) and
+     RUN/export.json;
   4. prints a summary (with --json, one JSON object on stdout).
 
 Exit codes: 0 written and both point collection files pass the checks, 1 written but a check failed (for example
@@ -165,8 +166,7 @@ def run(a):
     (out / "features.json").write_text(json.dumps(fd))
     summ = ws.export_split(d, fd["steps"], out, params=dict(ws.SPLIT_RULES[a.split_rule]), chains_file=chains_path,
                            features_file=out / "features.json",
-                           extra={"grad_mag": fd["grad_mag"], "features_seconds": fd["seconds"],
-                                  "gm_x": ws.gm_stats(fd["steps"])})
+                           extra={"grad_mag": fd["grad_mag"], "features_seconds": fd["seconds"]})
     files = dict(summ["files"], **{"chains.json": str(chains_path), "features.json": str(out / "features.json")})
     summ["files"] = files
     summ["run"] = {"tool": f"relative_windings_box {VERSION}", "point": point, "box_edge": edge, "seeds": seeds,

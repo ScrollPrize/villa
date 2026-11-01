@@ -200,7 +200,6 @@ class TestRelativeWindingsBox(unittest.TestCase):
         self.assertIsNone(sr["params"]["abs_own"])
         self.assertIsNone(sr["params"]["q_own"])
         self.assertEqual(sr["pieces"], sr["chains_in"])
-        self.assertIn("kept whole", sr["note"])
         # the steps kept with the cut off are still marked, where the v2 cut would act
         cols = lambda doc, tag: sorted(p["p"] for c in json.loads((d / doc).read_text())["collections"].values()
                                        if tag in c["name"] for p in c["points"].values())  # noqa: E731

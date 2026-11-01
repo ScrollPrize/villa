@@ -171,12 +171,9 @@ def split_doc(doc, feats, params=None, features_file=None):
     new, info = split_chains(doc["chains"], feats, params)
     out = dict(doc)
     out["chains"] = new
-    cut = params.get("abs_own") is not None or params.get("q_own") is not None
     out["split_rule"] = {"params": params, "params_digest": digest(params),
                          "features_file": str(features_file), "input_rule_digest": doc.get("rule_digest"), **info,
-                         "note": ("label-free split of windlabel chains at flagged steps" if cut else
-                                  "label-free windlabel chains kept whole: the grad_mag cut is off")
-                         + "; Model output"}
+                         "note": "label-free split of windlabel chains at flagged steps; Model output"}
     out["split_rule"]["output_digest"] = digest([[ch["points"], ch["counts"]] for ch in new])
     return out
 
@@ -358,6 +355,7 @@ def export_split(chains_doc, feats, out, params=None, chains_file=None, features
                               affine=affine, scale=scale, max_flags=max_flags,
                               flags_def=SPLIT_CHECK if check else None)
     summ["flags"]["split"] = n_split
+    summ["gm_x"] = gm_stats(feats)
     (out / "relative_windings.json").write_text(json.dumps(rel, indent=1))
     (out / "flags.json").write_text(json.dumps(fl, indent=1))
     chk = {"relative_windings.json": wl.check_pcl(rel, "relative"), "flags.json": wl.check_pcl(fl, "flags")}

@@ -1189,11 +1189,11 @@ times 0.765, cut above 1.0).
 `--split-rule` picks the cut: v2 (default) cuts at gm_x above 1.0, v1 at 0.95,
 and `none` keeps every step. With `none`, `flags.json` marks the steps the v2
 cut would remove (a `windlabel-check-split-step` collection) without changing
-any winding, and `export.json` (and the `--json` summary) report the run's
-`gm_x` median and p90 and the share above 1.0, so the cut can be judged per
-scroll before switching it on: the cut was tested on PHerc0172, PHerc1667 and
-PHerc0139, but on PHerc Paris 4 its gm_x sits at a median of about 0.9, close
-to the threshold.
+any winding. Every run's `export.json` (and the `--json` summary) also reports
+the run's `gm_x` median and p90 and the share above 1.0, so the cut can be
+judged per scroll before switching it on: the cut was tested on PHerc0172,
+PHerc1667 and PHerc0139, but on PHerc Paris 4 its gm_x sits at a median of
+about 0.9, close to the threshold.
 
 Inputs: the prediction (binary, sheet above 127, read at level 0) and the
 grad_mag, as zarr v2 or v3, local or anonymous https; `--grad-mag` takes a
