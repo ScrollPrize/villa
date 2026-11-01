@@ -1039,22 +1039,39 @@ def _run_training(request: TrainingRequest) -> int:
                         ),
                     )
                     val_batches += 1.0
-                    batch_counts = confusion_metric.compute_batch(
-                        MetricBatch(
-                            logits=primary_val_predictions.detach(),
-                            targets=val_targets.detach(),
-                            valid_mask=(val_ignore <= 0).detach(),
+                    # Retain the helper's whole-batch shape checks before slicing.
+                    if primary_val_predictions.shape != val_targets.shape:
+                        raise ValueError(
+                            f"logits/targets shape mismatch: {tuple(primary_val_predictions.shape)} "
+                            f"vs {tuple(val_targets.shape)}"
                         )
-                    )
-                    gathered = accelerator.gather_for_metrics(
-                        torch.stack(
-                            (
-                                batch_counts.tp,
-                                batch_counts.fp,
-                                batch_counts.fn,
-                                batch_counts.tn,
+                    if val_ignore.shape != val_targets.shape:
+                        raise ValueError(
+                            f"valid_mask shape mismatch: {tuple(val_ignore.shape)} "
+                            f"vs {tuple(val_targets.shape)}"
+                        )
+                    # Keep one row per input sample until Accelerate removes
+                    # final-batch padding;rank aggregates lose that boundary.
+                    batch_counts = [
+                        confusion_metric.compute_batch(
+                            MetricBatch(
+                                logits=primary_val_predictions[sample_index].detach(),
+                                targets=val_targets[sample_index].detach(),
+                                valid_mask=(val_ignore[sample_index] <= 0).detach(),
                             )
-                        ).unsqueeze(0)
+                        )
+                        for sample_index in range(primary_val_predictions.shape[0])
+                    ]
+                    gathered = accelerator.gather_for_metrics(
+                        torch.stack([
+                            torch.stack((
+                                sample_counts.tp,
+                                sample_counts.fp,
+                                sample_counts.fn,
+                                sample_counts.tn,
+                            ))
+                            for sample_counts in batch_counts
+                        ])
                     )
                     counts = Confusion.add_counts(
                         counts,
