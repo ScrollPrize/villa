@@ -26,6 +26,12 @@ configure_file(vc/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/__init__.py"
     COPYONLY
 )
+configure_file(vc/fiber_chunk_volume.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_chunk_volume.py" COPYONLY)
+configure_file(vc/fiber_stream_volume.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_stream_volume.py" COPYONLY)
+install(FILES vc/fiber_stream_volume.py DESTINATION vc)
+configure_file(vc/fiber_chunk_benchmark.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_chunk_benchmark.py" COPYONLY)
+install(FILES vc/fiber_chunk_benchmark.py DESTINATION vc)
+install(FILES vc/fiber_chunk_volume.py DESTINATION vc)
 configure_file(vc/fiber_evaluation.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation.py" COPYONLY)
 install(FILES vc/fiber_evaluation.py DESTINATION vc)
 configure_file(vc/fiber_evaluation_vis.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation_vis.py" COPYONLY)
@@ -34,14 +40,6 @@ configure_file(vc/compression/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
     COPYONLY
 )
-# Removed native target migration: extension modules take precedence over the
-# forwarding .py module, so discard only stale generated vcz1 modules from an
-# existing build tree before copying the compatibility shim.
-file(GLOB VC_STALE_VCZ1_MODULES
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1*${CMAKE_SHARED_MODULE_SUFFIX}")
-if(VC_STALE_VCZ1_MODULES)
-    file(REMOVE ${VC_STALE_VCZ1_MODULES})
-endif()
 configure_file(vc/compression/vcz1_numcodecs.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
     COPYONLY
@@ -82,18 +80,6 @@ set_target_properties(vc_volume PROPERTIES
 target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_surface_index
-    vc/surface_index.cpp
-)
-set_target_properties(vc_surface_index PROPERTIES
-    OUTPUT_NAME surface_index
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    # See vc_volume above: libs are one dir up in site-packages root.
-    INSTALL_RPATH "${VC_PY_RPATH_SELF_AND_PARENT}"
-)
-target_link_libraries(vc_surface_index PRIVATE vc_core)
-target_compile_features(vc_surface_index PRIVATE cxx_std_23)
-
 nanobind_add_module(vc_grid_raycast
     NOMINSIZE
     vc/grid_raycast.cpp
@@ -116,11 +102,11 @@ nanobind_add_module(vc_fiber_trace
 set_target_properties(vc_fiber_trace PROPERTIES
     OUTPUT_NAME fiber_trace
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_SELF_AND_PARENT}"
 )
 target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
-set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
+set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "${VC_PY_RPATH_SELF}")
 
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
@@ -133,7 +119,7 @@ install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d uti
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
+install(TARGETS vc_volume vc_grid_raycast vc_fiber_trace
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

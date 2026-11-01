@@ -284,21 +284,7 @@
         }
 
         void load_remote_marker() {
-            const fs::path marker = fs::path(base_path) / kNormalGridsRemoteMarker;
-            std::error_code ec;
-            if (!fs::is_regular_file(marker, ec)) {
-                return;
-            }
-            try {
-                const auto json = utils::Json::parse_file(marker);
-                remote_url = json.value("url", std::string());
-            } catch (const std::exception& e) {
-                std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
-                return;
-            }
-            while (!remote_url.empty() && remote_url.back() == '/') {
-                remote_url.pop_back();
-            }
+            remote_url = normalGridsRemoteUrl(base_path).value_or(std::string());
             remote = !remote_url.empty();
         }
 
@@ -767,4 +753,49 @@
     const utils::Json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }
+std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir)
+{
+    const fs::path marker = dir / kNormalGridsRemoteMarker;
+    std::error_code ec;
+    if (!fs::is_regular_file(marker, ec)) {
+        return std::nullopt;
+    }
+    std::string url;
+    try {
+        url = utils::Json::parse_file(marker).value("url", std::string());
+    } catch (const std::exception& e) {
+        std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
+        return std::nullopt;
+    }
+    while (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+    return url;
+}
+
+bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url)
+{
+    if (normalGridsRemoteUrl(dir) == url) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+    auto marker = utils::Json::object();
+    marker["url"] = url;
+    std::ofstream out(dir / kNormalGridsRemoteMarker, std::ios::trunc);
+    out << marker.dump(2);
+    out.close();
+    return static_cast<bool>(out);
+}
+
+bool hasNormalGridFiles(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    return fs::is_directory(dir / "xy", ec) && fs::is_directory(dir / "xz", ec) &&
+           fs::is_directory(dir / "yz", ec) && fs::is_regular_file(dir / "metadata.json", ec);
+}
+
 } // namespace vc::core::util

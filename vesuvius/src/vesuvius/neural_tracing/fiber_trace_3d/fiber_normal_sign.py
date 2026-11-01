@@ -67,11 +67,11 @@ def prepare(config):
     meta = {k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
     if meta['schema_version']!=2 or not meta['complete']:
         raise ValueError('Signed schema2 database required')
-    fibers = np.asarray(db.execute('SELECT id,normal_sign FROM fibers ORDER BY source_index').fetchall(), dtype=np.int64)
-    ids = fibers[:,0]
-    if not np.all(fibers[:,1]==1) or not np.all(np.diff(ids)>0):
+    fibers = db.execute('SELECT id,normal_sign FROM fibers ORDER BY source_index').fetchall()
+    ids = np.asarray([f[0] for f in fibers], dtype=str)
+    if not all(f[1]==1 for f in fibers) or not np.all(ids[1:]>ids[:-1]):
         raise ValueError('Expected original +1 gauge multipliers and ascending source IDs')
-    if not np.array_equal(ids,np.asarray(prior['source_ids'],dtype=np.int64)):
+    if not np.array_equal(ids,np.asarray(prior['source_ids'],dtype=str)):
         raise ValueError('Prior/source fiber IDs differ')
     a = np.asarray(prior['agreement'],dtype=np.float32)
     if len(a)!=len(ids) or not np.isfinite(a).all() or np.any(abs(a)>1.000001):
@@ -85,14 +85,15 @@ def prepare(config):
     cursor = db.execute(f'SELECT id,fiber_a,fiber_b,{"+".join(terms)} FROM constraints WHERE {eligible} AND {valid} ORDER BY id')
     chunks=[]
     while rows:=cursor.fetchmany(65536):
-        chunks.append(np.asarray(rows,dtype=np.float64))
-    edges=np.concatenate(chunks) if chunks else np.empty((0,4),dtype=np.float64)
-    event_ids=edges[:,0].astype(np.int64)
-    endpoints=edges[:,1:3].astype(np.int64)
+        chunks.append((np.asarray([r[0] for r in rows],dtype=np.int64),np.asarray([r[1:3] for r in rows],dtype=str),
+                       np.asarray([r[3] for r in rows],dtype=np.float64)))
+    event_ids=np.concatenate([c[0] for c in chunks]) if chunks else np.empty(0,dtype=np.int64)
+    endpoints=np.concatenate([c[1] for c in chunks]) if chunks else np.empty((0,2),dtype=ids.dtype)
+    dot=np.concatenate([c[2] for c in chunks]) if chunks else np.empty(0,dtype=np.float64)
     indices=np.searchsorted(ids,endpoints)
     if np.any(indices>=len(ids)) or not np.array_equal(ids[indices],endpoints):
         raise ValueError('Unknown constraint fiber')
-    dot=edges[:,3].astype(np.float32)
+    dot=dot.astype(np.float32)
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
     dot=np.clip(dot,-1,1)
@@ -183,6 +184,73 @@ def run(config):
 
 
 
+
+
+def tensor_matrix_jobs(config,visible):
+    """Validate isolated lanes before starting any CUDA child."""
+    lanes=config['experiment_matrix']
+    if not config['gpu_manager'].get('exclusive'):
+        raise ValueError('Experiment matrix requires exclusive parent lease')
+    if len(lanes)>len(visible) or not lanes:raise ValueError('Insufficient matrix GPUs')
+    jobs=[];outputs=set()
+    for lane,items in enumerate(lanes):
+        if not items:raise ValueError('Empty experiment lane')
+        for item in items:
+            child=json.loads(Path(item).read_text())['fiber_uv_layout']
+            if 'experiment_matrix' in child:raise ValueError('Nested experiment matrix')
+            root=Path(child['output_root']).resolve()
+            if str(root) in outputs:raise ValueError('Duplicate matrix output')
+            if (root/'summary.json').exists():raise FileExistsError('Completed matrix child exists')
+            outputs.add(str(root));jobs.append((lane,visible[lane],child))
+    return jobs
+
+
+def solve_tensor_matrix(config,module):
+    """One exclusive manager lease, independent solver processes per GPU lane."""
+    from concurrent.futures import ThreadPoolExecutor,as_completed
+    import threading
+    visible=[v for v in os.environ.get('CUDA_VISIBLE_DEVICES','').split(',') if v]
+    jobs=tensor_matrix_jobs(config,visible)
+    active=[];lock=threading.Lock();stop=threading.Event();results=[]
+    def lane_run(lane):
+        completed=[]
+        for _,gpu,child in [j for j in jobs if j[0]==lane]:
+            root=Path(child['output_root']);root.mkdir(parents=True,exist_ok=True)
+            child=dict(child,code_provenance=config.get('code_provenance'),matrix_gpu=gpu,
+                       matrix_lane=lane,matrix_parent=config['output_root'],
+                       matrix_launcher_sha256=sha256_file(Path(__file__)))
+            frozen=root/'config.json';atomic_write(frozen,child,durable=False)
+            env=dict(os.environ,CUDA_VISIBLE_DEVICES=gpu)
+            with (root/'runner.log').open('w') as log:
+                with lock:
+                    if stop.is_set():return completed
+                    process=subprocess.Popen([sys.executable,'-m',module,'--config',str(frozen),'--unmanaged','--devices','0'],
+                        env=env,stdout=log,stderr=subprocess.STDOUT)
+                    active.append(process)
+                rc=process.wait()
+                with lock:active.remove(process)
+            record=dict(output_root=str(root),gpu=gpu,exit_code=rc)
+            atomic_write(root/'matrix_job.json',record,durable=False)
+            print('MATRIX '+json.dumps(record),flush=True)
+            if rc:raise RuntimeError(f'Matrix child failed: {root}, exit {rc}')
+            completed.append(record)
+        return completed
+    pool=ThreadPoolExecutor(max_workers=len(config['experiment_matrix']))
+    try:
+        futures=[pool.submit(lane_run,lane) for lane in range(len(config['experiment_matrix']))]
+        for future in as_completed(futures):results.extend(future.result())
+    finally:
+        with lock:
+            stop.set();running=list(active)
+            for process in running:
+                if process.poll() is None:process.terminate()
+        for process in running:
+            try:process.wait(timeout=10)
+            except subprocess.TimeoutExpired:process.kill();process.wait()
+        pool.shutdown(wait=True,cancel_futures=True)
+    summary=dict(config=config,jobs=results)
+    atomic_write(Path(config['output_root'])/'summary.json',summary,durable=False)
+    return summary
 
 
 def launch_tensor_solve(config,module,source):

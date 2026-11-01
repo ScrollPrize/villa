@@ -1,17 +1,13 @@
 """Batch independence and CUDA stage coverage."""
-import os
 from pathlib import Path
-import sys
 import unittest
 
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(ROOT / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import transforms as A, cuda
 

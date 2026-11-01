@@ -13,29 +13,19 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 #include "vc/fiber_tracer/FiberDisplay.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace vc::fiber_tracer
 {
 struct Vc3dFiberJson {
     double width = 0.0;
     double widthGapFraction = kDefaultFiberWidthGapFraction;
-    int version = 1;
+    int version = 4;
     std::string uuid;
     std::string optimizationMode = "lasagna";
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<nlohmann::json> segmentMetadata;
-};
-
-struct TaggedVc3dFiberJson {
-    std::filesystem::path path;
-    Vc3dFiberJson fiber;
-};
-
-struct TaggedVc3dFiberJsonSelection {
-    std::size_t scannedJsonFiles = 0;
-    std::vector<TaggedVc3dFiberJson> fibers;
 };
 
 namespace detail
@@ -54,11 +44,9 @@ inline void requireExactKeys(const nlohmann::json& value, const std::unordered_s
     }
 }
 
-// fiberVersion: the file's vc3d_fiber version. Version 4 adds an optional
-// span `tags` array of strings (omitted when empty); a version-3 span carrying
-// it is an unknown field, so the version stays a true signal.
-inline void validateSegmentMetadata(const nlohmann::json& value, int fiberVersion = 3)
+inline void validateSegmentMetadata(const nlohmann::json& value, int fiberVersion = 4)
 {
+    if (fiberVersion != 4) throw std::runtime_error("Fiber transfer requires version 4");
     if (!value.is_object())
         throw std::runtime_error("segment_to_next must be an object");
     std::unordered_set<std::string> keys{
@@ -68,7 +56,7 @@ inline void validateSegmentMetadata(const nlohmann::json& value, int fiberVersio
         "meeting_error_base_voxels", "meeting_error_ratio",
         "meeting_source", "failure_code", "failure_detail",
         "lasagna_failure_code", "lasagna_failure_detail", "config"};
-    const bool haveTags = fiberVersion >= 4 && value.contains("tags");
+    const bool haveTags = value.contains("tags");
     if (haveTags) {
         keys.insert("tags");
     }
@@ -214,6 +202,7 @@ inline cv::Vec3d pointFromJson(const nlohmann::json& value, const std::string& c
 
 inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& root, const std::string& key, int version, const std::string& context)
 {
+    if (version != 4) throw std::runtime_error(context + " requires fiber version 4");
     if (!root.contains(key) || !root.at(key).is_array()) {
         throw std::runtime_error(context + " is missing array " + key);
     }
@@ -222,12 +211,12 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
     points.reserve(array.size());
     for (size_t index = 0; index < array.size(); ++index) {
         const auto& value = array[index];
-        if (key != "control_points" || version == 1) {
+        if (key != "control_points") {
             points.push_back(detail::pointFromJson(value, context));
             continue;
         }
-        if ((version != 3 && version != 4) || !value.is_object()) {
-            throw std::runtime_error(context + " version-3/4 control point must be an object");
+        if (!value.is_object()) {
+            throw std::runtime_error(context + " version-4 control point must be an object");
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;
@@ -262,11 +251,7 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
             if (value.contains("segment_to_next")) {
                 throw std::runtime_error(context + " final control point cannot contain segment_to_next");
             }
-        } else {
-            if (!value.contains("segment_to_next")) {
-                throw std::runtime_error(
-                    context + " non-final control point is missing segment_to_next");
-            }
+        } else if (value.contains("segment_to_next")) {
             detail::validateSegmentMetadata(value.at("segment_to_next"), version);
         }
     }
@@ -280,22 +265,16 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
 
     Vc3dFiberJson fiber;
-    if (root.contains("uuid")) {
-        if (!root.at("uuid").is_string() ||
-            !vc::util::isUuid(root.at("uuid").get<std::string>())) {
-            throw std::runtime_error(context + " has an invalid uuid");
-        }
-        fiber.uuid = root.at("uuid").get<std::string>();
-    }
+    if (!root.contains("uuid") || !root.at("uuid").is_string() ||
+        !vc::objects::util::isUuid(root.at("uuid").get<std::string>()))
+        throw std::runtime_error(context + " requires an explicit valid uuid");
+    fiber.uuid = root.at("uuid").get<std::string>();
     fiber.width = fiberWidthFromJson(root);
     fiber.widthGapFraction = fiberWidthGapFromJson(root);
-    fiber.version = root.value("version", 1);
-    // Version 4 = version 3 plus optional span tags (see validateSegmentMetadata).
-    if (fiber.version != 1 && fiber.version != 3 && fiber.version != 4)
+    fiber.version = root.value("version", 0);
+    if (fiber.version != 4)
         throw std::runtime_error(context + " has unsupported vc3d_fiber version");
 
-    if (fiber.version >= 3 && !root.contains("optimization_mode"))
-        throw std::runtime_error(context + " version-3/4 fiber is missing optimization_mode");
     if (root.contains("optimization_mode")) {
         if (!root.at("optimization_mode").is_string())
             throw std::runtime_error(context + " optimization_mode must be a string");
@@ -311,11 +290,10 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
     fiber.controlPoints = vc3dFiberPointArrayFromJson(
         root, "control_points", fiber.version, context);
     fiber.segmentMetadata.resize(fiber.controlPoints.size());
-    if (fiber.version >= 3) {
-        const auto& controls = root.at("control_points");
-        for (size_t index = 0; index + 1 < controls.size(); ++index)
+    const auto& controls = root.at("control_points");
+    for (size_t index = 0; index + 1 < controls.size(); ++index)
+        if (controls.at(index).contains("segment_to_next"))
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
-    }
     return fiber;
 }
 
@@ -335,40 +313,6 @@ inline std::vector<size_t> vc3dControlPointLineIndices(const Vc3dFiberJson& fibe
         indices.push_back(index);
     }
     return indices;
-}
-
-// Collection coordinates must already be absolute native L0 voxels. Metadata
-// about an earlier conversion is provenance, never an additional transform.
-inline std::vector<Vc3dFiberJson> parseNativeVc3dFiberCollection(
-    const nlohmann::json& root, const std::string& context)
-{
-    if (root.value("type", std::string{}) != "vc3d_fiber_collection" ||
-        root.value("version", 0) != 1 || !root.contains("scale") ||
-        root.at("scale").get<double>() != 1.0 ||
-        root.value("vc_open_data_source_coordinate_level", 0) != 0 ||
-        root.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0 ||
-        !root.contains("point_collections") || !root.at("point_collections").is_array())
-        throw std::invalid_argument(context + " requires a scale-1 native L0 VC3D collection");
-    std::vector<Vc3dFiberJson> result;
-    for (const auto& entry : root.at("point_collections")) {
-        if (entry.value("vc_open_data_source_coordinate_level", 0) != 0 ||
-            entry.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0)
-            throw std::invalid_argument(context + " entry is not native L0");
-        auto fiber = parseVc3dFiberJson(entry, context + " entry " + std::to_string(result.size()));
-        if (fiber.linePoints.size() < 2)
-            throw std::invalid_argument(context + " entry has fewer than two points");
-        result.push_back(std::move(fiber));
-    }
-    return result;
-}
-
-inline nlohmann::json readNativeVc3dFiberCollectionJson(const std::filesystem::path& path)
-{
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open collection " + path.string());
-    nlohmann::json root;
-    input >> root;
-    return root;
 }
 
 // Canonical selection is shared by replay-set and its reference-prefetch export.
@@ -406,8 +350,9 @@ inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,
         begin.reset();
     };
     for (size_t i = 0; i + 1 < indices.size(); ++i) {
-        const auto mode = fiber.version >= 3 ? fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>()
-            : fiber.optimizationMode;
+        if (fiber.segmentMetadata.at(i).is_null())
+            throw std::runtime_error("evaluation requires per-span tracing metadata: " + context);
+        const auto mode = fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>();
         result["cp_spans"].push_back({{"control_point_indices", {i, i + 1}},
             {"line_indices", {indices[i], indices[i + 1]}}, {"actual_interp_mode", mode},
             {"eligible", mode != "lasagna"}});
@@ -418,66 +363,6 @@ inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,
     finish(indices.back());
     result["status"] = result["runs"].empty() ? "excluded" : "eligible";
     return result;
-}
-
-inline TaggedVc3dFiberJsonSelection loadTaggedVc3dFiberJsonDirectory(
-    const std::filesystem::path& directory,
-    const std::string& tag)
-{
-    if (tag.empty())
-        throw std::runtime_error("VC3D fiber tag must not be empty");
-    if (!std::filesystem::is_directory(directory)) {
-        throw std::runtime_error(
-            "VC3D fiber directory does not exist or is not a directory: " +
-            directory.string());
-    }
-
-    std::vector<std::filesystem::path> paths;
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".json")
-            paths.push_back(entry.path());
-    }
-    std::sort(paths.begin(), paths.end());
-
-    TaggedVc3dFiberJsonSelection selection;
-    selection.scannedJsonFiles = paths.size();
-    for (const auto& path : paths) {
-        nlohmann::json root;
-        try {
-            std::ifstream input(path);
-            if (!input)
-                throw std::runtime_error("failed to open file");
-            input >> root;
-        } catch (const std::exception& error) {
-            throw std::runtime_error(
-                path.string() + " is not valid JSON: " + error.what());
-        }
-
-        if (!root.is_object() || !root.contains("tags"))
-            continue;
-        const auto& tags = root.at("tags");
-        if (!tags.is_array() || std::any_of(
-                tags.begin(), tags.end(),
-                [](const nlohmann::json& value) { return !value.is_string(); })) {
-            throw std::runtime_error(
-                path.string() + " tags must be an array of strings");
-        }
-        const bool selected = std::any_of(
-            tags.begin(), tags.end(), [&](const nlohmann::json& value) {
-                return value.get_ref<const std::string&>() == tag;
-            });
-        if (!selected)
-            continue;
-
-        auto fiber = parseVc3dFiberJson(root, path.string());
-        if (fiber.linePoints.size() < 2) {
-            throw std::runtime_error(
-                path.string() +
-                " has fewer than two dense line points for visualization");
-        }
-        selection.fibers.push_back({path, std::move(fiber)});
-    }
-    return selection;
 }
 
 // VC3D's rule for the span tags derived from point tags, at the JSON level

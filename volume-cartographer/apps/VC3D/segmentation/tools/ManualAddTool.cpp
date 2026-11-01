@@ -1,6 +1,7 @@
 #include "ManualAddTool.hpp"
 
 #include "ThinPlateSpline3d.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -138,12 +139,6 @@ void ManualAddTool::setConfig(Config config)
     }
 }
 
-bool ManualAddTool::isInvalidPoint(const cv::Vec3f& value)
-{
-    return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
-           (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
-}
-
 bool ManualAddTool::inBounds(int row, int col) const
 {
     return !_entrySnapshotPoints.empty() &&
@@ -153,12 +148,12 @@ bool ManualAddTool::inBounds(int row, int col) const
 
 bool ManualAddTool::isInvalid(int row, int col) const
 {
-    return inBounds(row, col) && isInvalidPoint(_entrySnapshotPoints(row, col));
+    return inBounds(row, col) && !vc::geometry::validSurfacePoint(_entrySnapshotPoints(row, col));
 }
 
 bool ManualAddTool::isValid(int row, int col) const
 {
-    return inBounds(row, col) && !isInvalidPoint(_entrySnapshotPoints(row, col));
+    return inBounds(row, col) && vc::geometry::validSurfacePoint(_entrySnapshotPoints(row, col));
 }
 
 int ManualAddTool::flatIndex(int row, int col) const
@@ -194,7 +189,7 @@ void ManualAddTool::rebuildGridCache()
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
             const int index = flatIndex(row, col);
-            const bool invalid = isInvalidPoint(_entrySnapshotPoints(row, col));
+            const bool invalid = !vc::geometry::validSurfacePoint(_entrySnapshotPoints(row, col));
             _invalidMask[static_cast<std::size_t>(index)] = invalid ? 1 : 0;
             if (invalid) {
                 continue;

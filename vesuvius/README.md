@@ -29,12 +29,13 @@ _this package is in active development_
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
-| `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
-| `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
-| `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
-| `vesuvius.render_obj`         | `rendering.mesh_to_surface`        | renders `.obj` meshes and outputs their surface-volume layers                                                                                                                                             |
-| `vesuvius.flatten_obj`        | `rendering.slim_uv`                | flattens an `.obj` mesh using `slim_uv`                                                                                                                                                                   |
-| `vesuvius.train`              | `models.run.train`                 | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.voxelize_obj`       | `image_proc.run.voxelize_objs`     | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
+| `vesuvius.refine_labels`      | `image_proc.run.edt_frangi_label`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
+| `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
+| `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
+| `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
+| `vesuvius.zarr_tasks`         | `image_proc.run.zarr_tasks.__main__` | runs a Zarr processing task (threshold, scale, transpose, recompress, ...); `--list-tasks` lists them |
 
 
 
@@ -67,12 +68,19 @@ $ pip install vesuvius
 ```
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
-`uv sync --all-extras` build the local `volume-cartographer` Python bindings from
-C++ source. Install its [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
+`uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
+Python bindings from C++ source. Install their [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
 first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian,
 `qt` in Homebrew), even for headless use. `uv` does not install these system
 libraries. This requirement does not apply to the base `vesuvius` installation
 shown above.
+
+To run the neural Copy script (`vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps`)
+without building `volume-cartographer` (for example on Windows), skip that package:
+`uv sync --frozen --extra models --no-install-package volume-cartographer`. The script then
+reads the volume with zarr-python and keeps no disk chunk cache (`--volume-cache-dir` and
+`--volume-chunk-cache-gb` are not used). Without uv's monorepo sources, `vesuvius[models]`
+does not resolve, because `volume-cartographer` is not on PyPI.
 
 ## Data licence
 
@@ -123,8 +131,8 @@ ___
 
 ### Proofreading labels
 
-1. Update the config in `/utils/vc_proofreader/config.py` with the proper paths
-2. Run `vesuvius.proofreader`
+1. The proofreader is no longer a `vesuvius` entrypoint; it lives in [`segmentation/vc_proofreader`](../segmentation/vc_proofreader/main.py)
+2. Run `python segmentation/vc_proofreader/main.py --config <config.json or config.py>` from the repository root
 3. Select your desired patch size and min labeled percentage 
 4. Click `run` 
 5. Approve patches with `a` or by checking the box

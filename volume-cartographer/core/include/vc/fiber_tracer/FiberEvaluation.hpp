@@ -5,6 +5,12 @@
 
 namespace vc::fiber_tracer {
 
+// Shared prediction-peak restart search used by training and historical chunk replay.
+std::optional<PolylineArcSample> findFiberReplayRestartSeed(
+    const FiberPredictionSource&,const FiberTraceConfig&,double traceToBase,
+    const vc::lasagna::NormalSampler&,double normalToBase,
+    const PolylineArcGeometry&,double fromArc,double endArc,double stepBase);
+
 struct FiberEvaluationCase {
     std::vector<cv::Vec3d> referenceBase;
     double beginArcBase = 0;
@@ -13,6 +19,8 @@ struct FiberEvaluationCase {
 
 struct FiberEvaluationStatus {
     size_t total = 0, completed = 0;
+    size_t built = 0, reused = 0, annotated = 0;
+    bool chunkVolume = false;
     bool started = false, finished = false, cancelled = false;
     std::string error;
 };
@@ -37,6 +45,37 @@ private:
     FiberCaseQueue* queue_ = nullptr; // protected by mutex_, borrowed during run
 };
 
+// Continuous unique-key construction using the same cooperative scheduler as
+// replay. Only active jobs own geometry; output files are the resume state.
+void prepareFiberChunkVolume(const FiberPredictionSource&,const FiberTraceConfig&,
+    double,const vc::lasagna::NormalSampler&,const FiberChunkTraceConfig&,
+    const std::filesystem::path&,const std::string& sourceIdentity,
+    const std::vector<std::array<int,3>>&,FiberEvaluationControl&,
+    size_t workers=4,size_t contextsPerWorker=8);
+
+struct FiberChunkRouteVolumeConfig {
+    size_t cacheBytes=1024ULL*1024*1024;
+    double maximumDistanceBase=1000000;
+    int maximumSteps=100000;
+    size_t pagePoints=50000;
+    bool reduceDuplicatePaths=true;
+    bool rejectAmbiguousPaths=true;
+};
+// CPU-only continuation of completed cached paths. Caller holds writer locks on
+// both directories. keys is the complete sparse source inventory, not just seeds.
+// Cached arc intervals have a single exported owner. Independent potential-handoff
+// components run in parallel with deterministic ownership; distinct path IDs are
+// not geometrically deduplicated. A precomputed canonical endpoint graph permits
+// only connections with unique partners at BOTH ends; runtime checks may veto them.
+// Routes may span the entire supplied inventory.
+void exportFiberChunkRoutes(const FiberPredictionSource&,const FiberTraceConfig&,
+    double,const vc::lasagna::NormalSampler&,const FiberChunkTraceConfig&,
+    const std::filesystem::path& chunkDirectory,const std::filesystem::path& output,
+    const std::string& sourceIdentity,const std::vector<std::array<int,3>>& keys,
+    const std::vector<std::array<int,3>>& seedKeys,
+    const FiberChunkRouteVolumeConfig&,FiberEvaluationControl&,size_t workers=4,
+    size_t contextsPerWorker=1);
+
 // Ordered, all-or-error results. All admitted jobs are joined before throwing.
 // References/configs are copied before work starts. Dataset and cache lifetimes
 // must cover the call; they must not be mutated concurrently. Live publication
@@ -58,7 +97,7 @@ private:
     const vc::lasagna::NormalSampler& tracingNormals,
     const vc::lasagna::NormalSampler& evaluationNormals, double normalWorkingToBaseScale,
     const FiberEvaluationCase&, const FiberChunkReplayConfig&,
-    const FiberTraceProgressCallback& = {});
+    const FiberTraceProgressCallback& = {}, bool predictionBasedSeeding = false);
 
 // Direct beam backend, without building/caching chunk paths. Same reference
 // metric and scheduler; starts/restarts at the selected reference point.

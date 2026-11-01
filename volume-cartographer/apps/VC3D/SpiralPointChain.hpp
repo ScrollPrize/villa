@@ -19,8 +19,6 @@ struct PointChainAnchor {
 struct PointChainSample {
     QPointF surface;
     cv::Vec3f volume;
-    bool isAnchor = false;
-    std::size_t anchorIndex = 0;
 };
 
 enum class PointChainBuildError {

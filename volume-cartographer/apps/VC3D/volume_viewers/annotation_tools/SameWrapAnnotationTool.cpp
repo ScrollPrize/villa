@@ -556,13 +556,6 @@ void SameWrapAnnotationTool::setPathType(PathType pathType)
     _state.hasShortestPathSource = false;
 }
 
-void SameWrapAnnotationTool::setImageFilter(ImageFilterType filterType, int kernelSize)
-{
-    _state.imageFilterType = filterType;
-    _state.imageFilterKernelSize = std::max(3, kernelSize | 1);
-    _state.hasShortestPathSource = false;
-}
-
 void SameWrapAnnotationTool::setImageFilterType(ImageFilterType filterType)
 {
     _state.imageFilterType = filterType;

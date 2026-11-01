@@ -93,8 +93,8 @@ transport beyond loopback.
 From the checkout root, with an existing configured build:
 
 ```sh
-cmake --build volume-cartographer/build/pr-native --target vc_fiber_trace test_fiber_live_readiness test_fiber_case_queue -j 8
-ctest --test-dir volume-cartographer/build/pr-native -R 'test_fiber_(live_readiness|case_queue)' --output-on-failure
+cmake --build volume-cartographer/build/pr-native --target vc_fiber_trace test_fiber_case_queue -j 8
+ctest --test-dir volume-cartographer/build/pr-native -R test_fiber_case_queue --output-on-failure
 python -m pytest -q volume-cartographer/python/tests/test_fiber_live_bridge.py --vc-build-python volume-cartographer/build/pr-native/python
 ```
 

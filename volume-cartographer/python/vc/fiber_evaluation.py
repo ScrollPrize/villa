@@ -39,6 +39,31 @@ CHUNK_KEYS = (
     "tube_total_degrees", "rim_drop", "rim_normal_base", "rim_tangent_base",
     "join_distance_base", "join_angle_degrees", "join_minimum_base",
     "join_width_weight", "pin_sampling_region", "max_grid_samples",
+    "channel_hints", "worker_cache_bytes",
+    "initial_alignment_power",
+    "initial_normal_radius_base",
+    "initial_tangential_radius_base",
+    "joint_join_score",
+    "join_weights",
+    "conflict_normal_base",
+    "conflict_tangent_base",
+    "conflict_agreement_base",
+    "conflict_separation_base",
+    "cache_only",
+    "presence_peak_restarts",
+    "refine_seed",
+    "seed_movement_base",
+    "gpu_library",
+    "gpu_devices",
+    "online_refine_iterations",
+    "online_refine_window",
+    "online_refine_mode",
+    "beam_commit_mode",
+    "gpu_batch_halves",
+    "gpu_batch_memory_mib",
+    "online_refine_epsilon_base",
+    "online_refine_step_base",
+    "online_refine_cap_base",
 )
 REPLAY_KEYS = ("error_threshold_base", "excursion_grace_base",
                "tangential_threshold_factor", "match_refine_steps")
@@ -105,7 +130,7 @@ def replay_dict(result):
                      evaluator_point_base=f.evaluator_point_base,
                      segment_point_index=f.segment_point_index,
                      threshold_measurement=measurement(f.threshold_measurement)) for f in result.failures]
-    return dict(segments=segments, failures=failures, filtered_stops=result.filtered_stops,
+    output = dict(segments=segments, failures=failures, filtered_stops=result.filtered_stops,
                 reverse_checks=result.reverse_checks,
                 tangential_threshold_factor=result.tangential_threshold_factor,
                 reference_begin_arc_base=result.reference_begin_arc_base,
@@ -113,6 +138,12 @@ def replay_dict(result):
                 completed_reference_arc_base=result.completed_reference_arc_base,
                 seed_search_skipped_base=result.seed_search_skipped_base,
                 retained_trace_length_base=retained)
+    if result.reverse_diagnostics:
+        output['reverse_diagnostics'] = result.reverse_diagnostics
+    if result.reverse_stop_tail_checks or result.reverse_stop_tail_history_only:
+        output['reverse_stop_tail'] = dict(checks=result.reverse_stop_tail_checks,
+            passed=result.reverse_stop_tail_passed,history_only=result.reverse_stop_tail_history_only)
+    return output
 
 
 def evaluate(config, *, base_directory=".", control=None, progress=None):
@@ -180,8 +211,9 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
     field = ft.open_prediction_field(location(cfg["prediction_manifest"]), cache_bytes=cache_bytes,
         scaledown_power=cfg.get("scaledown_power", 0), remote_cache_root=remote,
         enable_width=cfg.get("enable_width", False))
-    normals = ft.open_normal_sampler(location(cfg["normal_manifest"]), field.trace_to_base_scale,
-        cache_bytes=cache_bytes, remote_cache_root=remote)
+    normals = (ft.open_normal_sampler(location(cfg["normal_manifest"]), field.trace_to_base_scale,
+        cache_bytes=cache_bytes, remote_cache_root=remote) if cfg.get("normal_manifest") else
+        ft.open_fiber_normal_sampler(field, cache_bytes=cache_bytes))
     evaluation_normals = normals
     if cfg.get("evaluation_normal_manifest"):
         evaluation_normals = ft.open_normal_sampler(location(cfg["evaluation_normal_manifest"]),

@@ -49,7 +49,7 @@ struct LasagnaChannelBinding {
     size_t channelIndex = 0;
     std::filesystem::path path;
     std::shared_ptr<utils::ZarrArray> array;
-    std::shared_ptr<vc::render::ChunkCache> chunkSource;
+    std::shared_ptr<vc::render::IChunkedArray> chunkSource;
     std::array<size_t, 3> shapeZYX{0, 0, 0};
     std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacing = 1.0;
@@ -166,12 +166,12 @@ private:
         const std::vector<const LasagnaChannelCornerSampler*>& samplers,
         const std::vector<cv::Vec3f>& volumePoints,
         std::vector<std::vector<LasagnaCornerSample>>& samples,
-        int parallelThreads);
+        int parallelThreads, const vc::render::PinnedChunkRegion* pinnedRegion);
     friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(
         const std::vector<const LasagnaChannelCornerSampler*>& samplers,
         const std::vector<cv::Vec3f>& volumePoints,
         LasagnaCornerBatch& samples,
-        int parallelThreads);
+        int parallelThreads, const vc::render::PinnedChunkRegion* pinnedRegion);
     friend NormalPrefetchReport visitLasagnaChannelCorners(
         const std::vector<const LasagnaChannelCornerSampler*>& samplers,
         const std::vector<cv::Vec3f>& volumePoints,
@@ -189,13 +189,15 @@ private:
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     std::vector<std::vector<LasagnaCornerSample>>& samples,
-    int parallelThreads = 0);
+    int parallelThreads = 0,
+    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
 
 [[nodiscard]] NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     LasagnaCornerBatch& samples,
-    int parallelThreads = 0);
+    int parallelThreads = 0,
+    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
 
 [[nodiscard]] NormalPrefetchReport visitLasagnaChannelCorners(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
@@ -209,6 +211,25 @@ private:
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
+// Storage-independent scalar interpolation, also used by owned dense ROIs.
+[[nodiscard]] double interpolateLasagnaScalarCorners(const std::array<double,8>&,
+    const cv::Vec3d& fraction);
+[[nodiscard]] std::optional<double> interpolateLasagnaMaskedScalarCorners(
+    const std::array<double,8>&, const cv::Vec3d&, const std::array<uint8_t,8>&);
+[[nodiscard]] std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx, const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction, const std::array<uint8_t,8>& mask);
+// Shared scalar stages; separate entrypoints also allow profiling actual tensor
+// accumulation versus principal-axis solving, without timers in the hot loop.
+struct LasagnaCompactTensor {
+    double t00=0,t01=0,t02=0,t11=0,t12=0,t22=0;
+    cv::Vec3d hint{0,0,0};
+    double totalWeight=0;
+};
+[[nodiscard]] LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx,const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction,const std::array<uint8_t,8>& mask);
+[[nodiscard]] std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor&);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
 [[nodiscard]] std::optional<std::array<uint8_t, 2>>
 encodeCompactNormalToRaw(const cv::Vec3d& normal);

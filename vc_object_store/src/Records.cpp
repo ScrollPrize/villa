@@ -49,17 +49,27 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
     return readObjectRows(db, s);
 }
 
+std::vector<std::string> ObjectStore::objectTags(const Txn& txn, const std::optional<std::string>& kind) const
+{
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    Statement s(db, "SELECT DISTINCT t.tag FROM object_tags t JOIN objects o ON o.id=t.object_id WHERE (?1 IS NULL OR o.kind=?1) AND " +
+                    activeObjectSql("o.id") + " ORDER BY t.tag");
+    if (kind) s.bind(1, *kind); else s.bindNull(1);
+    std::vector<std::string> tags;
+    while (s.row()) tags.push_back(s.text(0));
+    return tags;
+}
+
 void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    auto id = objectIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("object store: object not found: " + uuid);
-    Statement s(db, "DELETE FROM objects WHERE id=?");  // FK RESTRICT on edges refuses while referenced
-    s.bind(1, *id);
-    s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete");
+    Statement row(db, "SELECT id,kind FROM objects WHERE uuid=?", bytes);
+    if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
+    const auto kind = row.text(1);
+    execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));  // FK RESTRICT on edges refuses while referenced
+    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }
 

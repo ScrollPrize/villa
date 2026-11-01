@@ -1,14 +1,10 @@
 #include "CollapsibleSettingsGroup.hpp"
 
-#include <algorithm>
-
-#include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QSpinBox>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -18,8 +14,6 @@ CollapsibleSettingsGroup::CollapsibleSettingsGroup(const QString& title, QWidget
     , _contentWidget(new QFrame(this))
     , _contentLayout(nullptr)
     , _gridLayout(nullptr)
-    , _preferredColumns(1)
-    , _preferredRows(0)
     , _expanded(true)
 {
     auto* outerLayout = new QVBoxLayout(this);
@@ -67,48 +61,6 @@ void CollapsibleSettingsGroup::setExpanded(bool expanded)
     emit toggled(expanded);
 }
 
-void CollapsibleSettingsGroup::setColumns(int columns)
-{
-    const int normalized = std::max(1, columns);
-    if (_preferredColumns == normalized && _preferredRows == 0) {
-        return;
-    }
-    _preferredColumns = normalized;
-    _preferredRows = 0;
-    rebuildGrid();
-}
-
-void CollapsibleSettingsGroup::setRows(int rows)
-{
-    const int normalized = std::max(1, rows);
-    if (_preferredRows == normalized && _preferredColumns == 0) {
-        return;
-    }
-    _preferredRows = normalized;
-    _preferredColumns = 0;
-    rebuildGrid();
-}
-
-void CollapsibleSettingsGroup::setGrid(int rows, int columns)
-{
-    const int normalizedRows = std::max(0, rows);
-    const int normalizedColumns = std::max(0, columns);
-
-    int newRows = normalizedRows;
-    int newColumns = normalizedColumns;
-    if (newRows == 0 && newColumns == 0) {
-        newColumns = 1;
-    }
-
-    if (_preferredRows == newRows && _preferredColumns == newColumns) {
-        return;
-    }
-
-    _preferredRows = newRows;
-    _preferredColumns = newColumns;
-    rebuildGrid();
-}
-
 QWidget* CollapsibleSettingsGroup::addLabeledWidget(const QString& labelText,
                                                     QWidget* widget,
                                                     const QString& tooltip)
@@ -152,19 +104,6 @@ QWidget* CollapsibleSettingsGroup::addRow(const QString& label,
     return addLabeledWidget(label, container, tooltip);
 }
 
-QSpinBox* CollapsibleSettingsGroup::addSpinBox(const QString& label,
-                                               int minimum,
-                                               int maximum,
-                                               int step,
-                                               const QString& tooltip)
-{
-    auto* spin = new QSpinBox(_contentWidget);
-    spin->setRange(minimum, maximum);
-    spin->setSingleStep(step);
-    addLabeledWidget(label, spin, tooltip);
-    return spin;
-}
-
 QDoubleSpinBox* CollapsibleSettingsGroup::addDoubleSpinBox(const QString& label,
                                                            double minimum,
                                                            double maximum,
@@ -178,13 +117,6 @@ QDoubleSpinBox* CollapsibleSettingsGroup::addDoubleSpinBox(const QString& label,
     spin->setSingleStep(step);
     addLabeledWidget(label, spin, tooltip);
     return spin;
-}
-
-QCheckBox* CollapsibleSettingsGroup::addCheckBox(const QString& text, const QString& tooltip)
-{
-    auto* checkbox = new QCheckBox(text, _contentWidget);
-    addLabeledWidget(QString(), checkbox, tooltip);
-    return checkbox;
 }
 
 void CollapsibleSettingsGroup::addFullWidthWidget(QWidget* widget, const QString& tooltip)
@@ -218,51 +150,25 @@ void CollapsibleSettingsGroup::rebuildGrid()
         delete _gridLayout->takeAt(0);
     }
 
-    const int totalEntries = static_cast<int>(_entries.size());
-    if (totalEntries == 0) {
+    if (_entries.empty()) {
         return;
     }
 
-    const int entriesPerRow = std::max(1, slotsPerRow());
-
-    for (int slot = 0; slot < entriesPerRow; ++slot) {
-        _gridLayout->setColumnStretch(slot * 2, 0);
-        _gridLayout->setColumnStretch(slot * 2 + 1, 1);
-    }
+    _gridLayout->setColumnStretch(0, 0);
+    _gridLayout->setColumnStretch(1, 1);
 
     int row = 0;
-    int columnSlot = 0;
     for (const auto& entry : _entries) {
-        if (columnSlot >= entriesPerRow) {
-            columnSlot = 0;
-            ++row;
-        }
-
-        const int baseColumn = columnSlot * 2;
         if (entry.label) {
-            _gridLayout->addWidget(entry.label, row, baseColumn);
+            _gridLayout->addWidget(entry.label, row, 0);
         }
 
         if (entry.widget) {
-            const int widgetColumn = entry.label ? baseColumn + 1 : baseColumn;
+            const int widgetColumn = entry.label ? 1 : 0;
             const int span = entry.label ? 1 : 2;
             _gridLayout->addWidget(entry.widget, row, widgetColumn, 1, span);
         }
 
-        ++columnSlot;
+        ++row;
     }
-}
-
-int CollapsibleSettingsGroup::slotsPerRow() const
-{
-    if (_preferredColumns > 0) {
-        return _preferredColumns;
-    }
-
-    if (_preferredRows > 0 && !_entries.empty()) {
-        const int totalEntries = static_cast<int>(_entries.size());
-        return std::max(1, (totalEntries + _preferredRows - 1) / _preferredRows);
-    }
-
-    return 1;
 }

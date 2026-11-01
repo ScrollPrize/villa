@@ -1,7 +1,7 @@
 """Exact Z-clipped induced subgraphs of reference-selected original fibers.
 
 Reference labels only select this benchmark; they never become training losses.
-Original AFV/source arcs and the full-corpus radial prior are retained.
+Original fiber/source arcs and the full-corpus radial prior are retained.
 """
 import json
 from pathlib import Path
@@ -9,6 +9,7 @@ import time
 
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from . import fiber_uv_layout as uv
 
 
@@ -86,7 +87,7 @@ def audit_subset(d, parent, projection, z_range, winding_range):
         if not np.array_equal(d[key],parent[key][parents]):raise ValueError('Subset identity mismatch: '+key)
     if np.any(d['start']<parent['start'][parents]) or np.any(d['end']>parent['end'][parents]) or np.any(d['lengths']<=0):
         raise ValueError('Invalid clipped intervals')
-    if np.any(np.diff(d['source_id'])<0):raise ValueError('Unsorted subset sources')
+    if np.any(d['source_id'][1:]<d['source_id'][:-1]):raise ValueError('Unsorted subset sources')
     if not np.allclose(d['lengths'],d['end']-d['start'],rtol=0,atol=1e-8):raise ValueError('Wrong clipped lengths')
     directions=np.sign(d['node_ds'][:,2]-d['node_ds'][:,0])
     for key,ds in (('i','ds_a'),('j','ds_b')):
@@ -122,8 +123,8 @@ def validate_cache(config):
         raise ValueError('Subset tensor path mismatch')
     if int(config.get('winding_count',100))!=manifest['winding_count']:
         raise ValueError('Subset winding count mismatch')
-    for key in ('afv','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution'):
-        if sha256_file(config[key])!=manifest['signature']['inputs'][key]:
+    for key in ('fibers','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution'):
+        if (fibers_digest if key=='fibers' else sha256_file)(config[key])!=manifest['signature']['inputs'][key]:
             raise ValueError('Subset source provenance mismatch: '+key)
     if config.get('h_convention','ccw')!=manifest['h_convention'] or not uv.anchored(config):
         raise ValueError('Subset geometry convention mismatch')
@@ -135,17 +136,17 @@ def validate_cache(config):
 def run(settings):
     from . import fiber_reference_comparison as ref
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
     started=time.monotonic()
     source_path=Path(settings['source_config'])
     config=json.loads(source_path.read_text());config=config.get('fiber_uv_layout',config)
     if not uv.anchored(config):raise ValueError('Subset extraction requires aligned shared-anchor geometry')
     root=Path(settings['output_root']);manifest_path=root/'manifest.json'
     reference_selected=settings.get('winding_range') is not None
-    input_keys=('afv','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution','tensor_cache')
-    inputs={key:sha256_file(config[key]) for key in input_keys+(('reference_projection',) if reference_selected else ())}
+    input_keys=('fibers','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution','tensor_cache')
+    inputs={key:(fibers_digest if key=='fibers' else sha256_file)(config[key]) for key in input_keys+(('reference_projection',) if reference_selected else ())}
     parent_signature=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())['signature']
-    for key in ('afv','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution'):
+    for key in ('fibers','umbilicus','database','features','stage1','hv_solution','h_direction_solution','v_direction_solution'):
         if parent_signature.get(key)!=inputs[key]:raise ValueError('Parent tensor provenance mismatch: '+key)
     if parent_signature.get('h_convention')!=config.get('h_convention','ccw') or parent_signature.get('layout_mode')!='shared_anchor':
         raise ValueError('Parent tensor geometry convention mismatch')
@@ -167,14 +168,13 @@ def run(settings):
     selected=np.flatnonzero(np.isfinite(chosen)&(chosen>=wlo)&(chosen<=whi)) if reference_selected else np.arange(len(chosen))
     selected_ids=np.unique(d['source_id'][selected])
     if not len(selected_ids):raise ValueError('Empty reference selection')
-    with uv._ro(config['afv']) as db:meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    axis=load_umbilicus_frame(config['umbilicus'],meta['root'])
+    axis=load_umbilicus_frame(config['umbilicus'],fiber_volume(config['fibers']))
     directions=(d['node_ds'][:,2]-d['node_ds'][:,0])/d['lengths']
     if not np.allclose(abs(directions),1,atol=1e-5):raise ValueError('Invalid aligned direction')
     directions=np.sign(directions)
     centers,widths=uv.radial_initial_geometry(d,config)
     rows=[];curves=[];curve_arcs=[];nodes=[];parents=[]
-    geometry=read_afv_polylines(config['afv'],selected_ids)
+    geometry=read_polylines(config['fibers'],selected_ids)
     for row,xyz in geometry:
         sid=row['id'];first=np.searchsorted(d['source_id'],sid);last=np.searchsorted(d['source_id'],sid,side='right')
         intervals=clipped_intervals(xyz,settings['z_range'])
@@ -214,7 +214,7 @@ def run(settings):
     np.savez(root/'tensors.npz',**out)
     np.savez(root/'projection.npz',**projection_out)
     projection_signature=(json.loads(Path(config['reference_projection']).with_name('projection_signature.json').read_text())
-                          if reference_selected else dict(afv=inputs['afv'],reference_selected=False))
+                          if reference_selected else dict(fibers=inputs['fibers'],reference_selected=False))
     projection_signature['reference_subset']=signature
     atomic_write(root/'projection_signature.json',projection_signature,durable=False)
     np.savez(root/'clipped_curves.npz',xyz=np.concatenate(curves),arc=np.concatenate(curve_arcs),

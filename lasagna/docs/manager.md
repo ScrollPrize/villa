@@ -5,6 +5,12 @@ inference and whole-volume Fiberlet preprocessing. It provides global
 configuration, open-data and snapshot discovery, prefetch, durable tmux jobs,
 portable provenance, and atomic Atlas staging/ingestion.
 
+New inference outputs default to [compact schema v3](volume_schema_v3.md):
+one Zarr store with an embedded manifest and full-channel CZYX chunks grouped
+by resolution. Existing sidecar outputs remain resumable. Atlas staging and
+Fiberlet discovery below still require legacy output until those consumers
+support v3; append `-- --output-format legacy` when creating those runs.
+
 ## Configuration
 
 Initialize `${XDG_CONFIG_HOME:-~/.config}/las_manager/config.toml`:
@@ -188,7 +194,8 @@ portable inference provenance into manager run metadata. `--live-fetch` is
 full-volume only and rejects backend/configured `--no-download`.
 This includes output-format overrides such as `--ome-compressor none`; newly
 created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays
-always retain their persisted compressor, and `inference.json` inventories the
+retain their persisted compressor; compact resumes reject incompatible codec
+or layout requests. `inference.json` inventories the
 actual compressor of every generated level.
 The configured venv is used via its absolute `bin/python`; no interactive
 activation or `PYTHONPATH` is needed after the documented monorepo install.
@@ -217,10 +224,14 @@ revision, and UUID identity remain in structured metadata. The layout is:
   provenance_context.json
   run.log
   artifacts/
-    <run-name>.lasagna.json
+    <run-name>.zarr/
+      .zattrs                 # embedded Lasagna manifest
+      sd<N>/<L>/              # resolution-grouped multichannel arrays
     inference.json
-    ... generated OME-Zarrs ...
 ```
+
+Explicit legacy output instead contains `<run-name>.lasagna.json` and its
+separate per-channel OME-Zarr stores.
 
 `metadata.json` carries the immutable UUID, complete source and checkpoint
 identity, separate prefetch/inference/upload/Atlas lifecycle states, and private
@@ -240,8 +251,9 @@ OME group and observed scale relationship, effective output levels and crop,
 tile settings, checkpoint/config hashes and metadata, runtime/repository
 identity, and a structural inventory of every generated OME-Zarr level. The
 inventory hashes only bounded metadata/root files; it never walks millions of
-chunks. Paths in this document are bundle-relative. The `.lasagna.json`
-manifest links it as `provenance: inference.json`, and manifest load/save keeps
+chunks. Paths in this document are bundle-relative. The embedded manifest
+links it as `provenance: ../inference.json` (legacy sidecars use
+`provenance: inference.json`), and manifest load/save keeps
 that link plus unknown forward-compatible fields.
 
 Outside tmux, `tmux attach` attaches normally. Inside tmux, it links the run

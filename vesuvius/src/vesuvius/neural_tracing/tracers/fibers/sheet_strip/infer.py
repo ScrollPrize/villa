@@ -1,14 +1,14 @@
-"""Predict the sheet an AFV fiber lies on along the fiber and write it as a tifxyz strip.
+"""Predict the sheet a fiber-store fiber lies on along the fiber and write it as a tifxyz strip.
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --afv FIBERS.afv --fiber 469373 --out OUT \\
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --fibers FIBERS.vcobj --fiber UUID --out OUT \\
         [--checkpoint scrollprize/fiber_strip_small_v1] [--index INDEX_DIR] [--arc START END] [--step 8] [--blend 16] \\
         [--trim 75]
 
 ``--checkpoint``: a sheet-strip checkpoint file, or a Hugging Face model repo ``ORG/NAME[@REVISION]`` holding it
 (``fibers/tracing/runtime.py``: downloaded into the Hugging Face cache, with the frame model next to it); default
 ``DEFAULT_CHECKPOINT``. A checkpoint records its CT (read again here; ``--ct``, ``--cache-dir`` and the other volume
-options of runtime.py override it), its frame model, and its run's AFV fibers, umbilicus and sheet-strip index; a
-recorded file that is not on this machine must be given (``--afv``), is looked for next to the checkpoint (the
+options of runtime.py override it), its frame model, and its run's fiber store, umbilicus and sheet-strip index; a
+recorded file that is not on this machine must be given (``--fibers``), is looked for next to the checkpoint (the
 umbilicus, ``umbilicus.json``) or is skipped (the index: no scoring).
 
 Decisions are made every ``--step`` trace voxels along the fiber, each built as in training (data/samples.
@@ -58,7 +58,7 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_tar
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_volume_arguments, configure_volume, resolve_checkpoint)
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
@@ -264,7 +264,7 @@ def stitch_values(values, arcs, f, blend, weights=None):
 class Scorer:
     """Patch-sheet targets of decisions on a fiber of a sheet-strip index (StripBuilder.windows, strip_targets)."""
 
-    def __init__(self, index_dir, afv, catalog_index, cfg, spec, data):
+    def __init__(self, index_dir, fibers, catalog_index, cfg, spec, data):
         self.unit = None
         for split in ('validation', 'train', 'unused'):
             index = StripIndex(index_dir, split)
@@ -275,7 +275,7 @@ class Scorer:
         if self.unit is None:
             return
         trace_per_patch = spec.ct_grid_scale/spec.grid_scale
-        self.builder = StripBuilder(cfg, RunFibers(afv, index, spec.grid_scale), IdentitySampling(), augment=False,
+        self.builder = StripBuilder(cfg, RunFibers(fibers, index, spec.grid_scale), IdentitySampling(), augment=False,
                                     trace_per_patch=trace_per_patch, max_patches=data.get('max_patches', 4))
         self.options = dict(fold_tolerance=data.get('fold_tolerance', 2.), max_slope_deg=data.get('max_slope_deg', 70.),
                             max_height=(cfg.fine.width-1)*cfg.fine.spacing/2)
@@ -397,9 +397,9 @@ def render_saved(out, vol):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_checkpoint_arguments(ap)
-    ap.add_argument('--fiber', type=int, required=True, help='AFV fiber id')
+    ap.add_argument('--fiber', required=True, help='fiber UUID')
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--afv', help="AFV fibers (default: the checkpoint run's, when on this machine)")
+    ap.add_argument('--fibers', help="fiber store (default: the checkpoint run's, when on this machine)")
     ap.add_argument('--index', help="sheet-strip index for scoring (default: the checkpoint run's, when on this "
                                     "machine; 'none': skip)")
     ap.add_argument('--arc', type=float, nargs=2, help='fiber arclength range, patch voxels (default: all of it)')
@@ -425,14 +425,14 @@ def main(argv=None):
         raise SystemExit(str(error))
     cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec
     trace_per_patch, f, v = predictor.trace_per_patch, predictor.f, predictor.v
-    afv_path = args.afv or recorded_file(data.get('afv'))
-    if not afv_path:
-        raise SystemExit(f"Pass --afv: the checkpoint's AFV fibers {data.get('afv')} are not on this machine")
-    afv = AFVFibers(afv_path, spec.grid_scale, split='all')
-    if args.fiber not in afv.id_to_index:
-        raise SystemExit(f'Fiber {args.fiber} is not in {afv_path}')
-    catalog_index = afv.id_to_index[args.fiber]
-    fiber = afv[catalog_index]
+    fibers_path = args.fibers or recorded_file(data.get('fibers'))
+    if not fibers_path:
+        raise SystemExit(f"Pass --fibers: the checkpoint's fiber store {data.get('fibers')} is not on this machine")
+    fibers = FiberStore(fibers_path, fiber_volume(fibers_path), spec.grid_scale, split='all')
+    if args.fiber not in fibers.id_to_index:
+        raise SystemExit(f'Fiber {args.fiber} is not in {fibers_path}')
+    catalog_index = fibers.id_to_index[args.fiber]
+    fiber = fibers[catalog_index]
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
@@ -442,7 +442,7 @@ def main(argv=None):
         raise SystemExit('The arclength range holds no decision')
     arcs = np.arange(lo, hi+1e-9, args.step)
     index_dir = None if args.index == 'none' else (args.index or recorded_file(data.get('index')))
-    scorer = Scorer(index_dir, afv_path, catalog_index, cfg, spec, data) if index_dir else None
+    scorer = Scorer(index_dir, fibers_path, catalog_index, cfg, spec, data) if index_dir else None
     scorer = scorer if scorer is not None and scorer.unit is not None else None
     vol = predictor.vol
     targets, masks = [], []
@@ -463,7 +463,7 @@ def main(argv=None):
         raise SystemExit('No strip nodes remain after trimming; reduce --trim or choose a different --arc or fiber')
     row_step, column_step = df/trace_per_patch, (v[1]-v[0])/trace_per_patch
     args.out.mkdir(parents=True, exist_ok=True)
-    provenance = dict(checkpoint=predictor.source, step=ck.get('step'), afv=str(afv_path),
+    provenance = dict(checkpoint=predictor.source, step=ck.get('step'), fibers=str(fibers_path),
                       fiber=args.fiber, arc_trace=[float(arcs[0]), float(arcs[-1])], decision_step=args.step,
                       blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels',
                       trace_per_patch=trace_per_patch,
