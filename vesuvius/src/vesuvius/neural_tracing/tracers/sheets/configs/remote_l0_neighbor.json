@@ -42,9 +42,9 @@
    0.125
   ],
   "unpadded_blocks": true,
-  "fiber_runs": "/ephemeral/sean/sheet_tracing/data/afv/paris4_H_fiber_runs.jsonl",
+  "fiber_runs": "/ephemeral/sean/sheet_tracing/data/fiber_store/paris4_H_fiber_runs.jsonl",
   "fiber_fraction": 0.068,
-  "fiber_pool": "/ephemeral/sean/sheet_tracing/data/afv/paris4_fiber_pool",
+  "fiber_pool": "/ephemeral/sean/sheet_tracing/data/fiber_store/paris4_fiber_pool",
   "neighbor_fraction": 0.5
  },
  "model": {

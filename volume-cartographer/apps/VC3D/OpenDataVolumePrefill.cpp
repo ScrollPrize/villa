@@ -22,9 +22,20 @@ namespace vc3d::opendata {
 namespace {
 
 constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v2";
-constexpr const char* kLegacyMarkerVersion = "vc3d_open_data_prefill_v1";
 constexpr std::size_t kProgressIntervalChunks = 32;
 constexpr std::size_t kMaximumPrefillWorkers = 8;
+
+struct OpenDataVolumePrefillMarkerInfo {
+    std::string remoteUrl;
+    std::string remoteLocator;
+    std::string volumeId;
+    int level = kOpenDataVolumePrefillLevel;
+    int physicalLevel = kOpenDataVolumePrefillLevel;
+    std::array<int, 3> shape{};
+    std::array<int, 3> chunkShape{};
+    std::array<int, 3> chunkGridShape{};
+    std::size_t totalChunks = 0;
+};
 
 std::size_t chunkCountForGrid(const std::array<int, 3>& grid)
 {
@@ -81,23 +92,6 @@ bool markerMatchesJson(const nlohmann::json& marker,
     if (!marker.is_object()) {
         return false;
     }
-    if (marker.value("version", std::string{}) == kLegacyMarkerVersion &&
-        info.level == info.physicalLevel && info.remoteLocator == info.remoteUrl) {
-        for (const char* key : {
-                 "remote_url", "volume_id", "level", "shape", "chunk_shape",
-                 "chunk_grid_shape", "chunk_count"}) {
-            const auto found = marker.find(key);
-            if (found == marker.end())
-                return false;
-        }
-        return marker.at("remote_url") == info.remoteUrl &&
-               marker.at("volume_id") == info.volumeId &&
-               marker.at("level") == info.level &&
-               marker.at("shape") == info.shape &&
-               marker.at("chunk_shape") == info.chunkShape &&
-               marker.at("chunk_grid_shape") == info.chunkGridShape &&
-               marker.at("chunk_count") == info.totalChunks;
-    }
     const auto expected = markerJsonForInfo(info);
     for (const char* key : {
              "version",
@@ -136,8 +130,6 @@ std::filesystem::path markerDirectoryForLayout(
     return cacheDir;
 }
 
-} // namespace
-
 std::filesystem::path openDataVolumePrefillMarkerPath(
     const std::filesystem::path& cacheDir,
     int level)
@@ -165,15 +157,6 @@ bool openDataVolumePrefillMarkerMatches(const std::filesystem::path& cacheDir,
     }
 }
 
-bool openDataVolumePrefillMarkerMatches(const std::filesystem::path& cacheDir,
-                                        const Volume& volume,
-                                        int level)
-{
-    if (cacheDir.empty() || !volume.isRemote() || !volume.hasScaleLevel(level)) {
-        return false;
-    }
-    return openDataVolumePrefillMarkerMatches(cacheDir, markerInfoForVolume(volume, level));
-}
 
 bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
                                       const OpenDataVolumePrefillMarkerInfo& info,
@@ -246,15 +229,16 @@ bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
     }
 }
 
-bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
-                                      const Volume& volume,
-                                      int level,
-                                      std::size_t totalChunks,
-                                      std::string* errorOut)
+} // namespace
+
+bool openDataVolumePrefillMarkerMatches(const std::filesystem::path& cacheDir,
+                                        const Volume& volume,
+                                        int level)
 {
-    auto info = markerInfoForVolume(volume, level);
-    info.totalChunks = totalChunks;
-    return writeOpenDataVolumePrefillMarker(cacheDir, info, errorOut);
+    if (cacheDir.empty() || !volume.isRemote() || !volume.hasScaleLevel(level)) {
+        return false;
+    }
+    return openDataVolumePrefillMarkerMatches(cacheDir, markerInfoForVolume(volume, level));
 }
 
 OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(

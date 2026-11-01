@@ -61,16 +61,14 @@ dataset_config:
   skip_patch_validation: false
   targets:
     ink:
-      out_channels: 1
-      activation: "sigmoid"
+      out_channels: 2
+      activation: "none"
       losses:
-        - name: "BCEWithLogitsLoss"
-          weight: 0.5
-        - name: "SoftDiceLoss"
-          weight: 0.5
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0
 ```
 
-Expect labels with background `0` and any positive value for foreground. Store them either as a single-channel volume with values `{0, 1}` or the raw grayscale mask produced by annotation tools. The loader converts non-zero entries to foreground when it evaluates patch coverage.
+Store labels as a single-channel volume with background `0` and foreground `1`. Label values reach the loss unchanged (there is no binarization step), so convert a raw grayscale mask such as `{0, 255}` to `{0, 1}` first. The only other value with a meaning is a configured `ignore_label` (for example `ignore_label: 2` in the target, as in the shipped configs); those voxels are left out of the loss. Patch discovery is more lenient and counts any non-zero voxel as foreground.
 
 ### Multi-Class Segmentation
 
@@ -103,10 +101,10 @@ tr_setup:
 dataset_config:
   targets:
     ink:
-      out_channels: 1
-      activation: "sigmoid"
+      out_channels: 2
+      activation: "none"
       losses:
-        - name: "SoftDiceLoss"
+        - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0
     damage:
       out_channels: 1
@@ -174,7 +172,7 @@ Watch the log for messages about missing targets, unlabeled patches, or normaliz
 
 | Scenario | Data Layout | Target Config | Label Notes |
 |----------|-------------|---------------|-------------|
-| Binary segmentation | One label file per volume with `{0, 1}` values | `out_channels: 1`, `activation: sigmoid` | Any positive voxel counts as foreground |
+| Binary segmentation | One label file per volume with `{0, 1}` values | `out_channels: 2`, `activation: none`, `nnUNet_DC_and_CE_loss` | Convert `{0, 255}` masks to `{0, 1}`; other values only as `ignore_label` |
 | Multi-class segmentation | Single label map with integer class IDs | `out_channels: N`, `activation: softmax`, CE/Dice losses | Provide sequential integers `[0, N-1]` |
 | Multi-task | Separate label file per target | Multiple entries in `dataset_config.targets` | Targets share the same image volume |
 | Auxiliary regression | Primary label only | Configure under `auxiliary_tasks` | Auxiliary tensors are derived automatically |

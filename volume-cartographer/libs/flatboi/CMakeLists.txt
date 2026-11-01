@@ -1,8 +1,7 @@
 include(FetchContent)
 
 # libigl (igl::core) is provided by cmake/FetchLibigl.cmake, included from the
-# top-level CMakeLists — it is shared with apps/vc_obj_uv_lift and available
-# even when flatboi itself is not built.
+# top-level CMakeLists.
 
 # PaStiX 6.x — the SPD solver SLIM uses inside slim.cpp. CHOLMOD plateaus at
 # ~1.4× cores on SLIM-shaped sparse SPD systems; PaStiX's task scheduler hits
@@ -99,7 +98,7 @@ set_target_properties(flatboi PROPERTIES
 # SLIM caches sparse assembly and PaStiX symbolic analysis while the mesh
 # topology is fixed.
 target_compile_definitions(flatboi PRIVATE SLIM_CACHED PASTIX6)
-target_link_libraries(flatboi PRIVATE igl::core pastix spm OpenMP::OpenMP_CXX ${OpenCV_LIBS})
+target_link_libraries(flatboi PRIVATE igl::core pastix spm OpenMP::OpenMP_CXX ${OpenCV_LIBS} vc_core vc_inpaint)
 
 option(FLATBOI_BUILD_SLIM_TESTS "Build SLIM assembly and cache regression checks" ${VC_TESTING})
 if(FLATBOI_BUILD_SLIM_TESTS)

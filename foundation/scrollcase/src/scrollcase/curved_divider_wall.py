@@ -44,8 +44,32 @@ def divider_y(x, lining_outer_radius, wall_thickness_mm):
     return y
 
 
-def build_divider_solid(lining_outer_radius, case_max_radius, wall_thickness_mm):
-    """A solid that can be intersected or subtracted from a case to produce the right or left halves, respectively."""
+def build_divider_solid(
+    lining_outer_radius,
+    case_max_radius,
+    wall_thickness_mm,
+    rotation_deg=0,
+    cap_side_deg=0,
+    cap_half_width=None,
+):
+    """A solid that can be intersected or subtracted from a case to produce the right or left halves, respectively.
+
+    With rotation_deg, the divider curve is turned that far (anticlockwise) about Z.
+    Past the lining, the split then runs radially to a wall thickness beyond it and on,
+    straight, to the middle of the caps' side at cap_side_deg (a multiple of 90 within
+    45 degrees of rotation_deg) cap_half_width from the axis, and out along that side's
+    normal, where the caps' bolt protrusions straddle it. Along the divider's turned
+    direction it only ever advances, so the halves still part along its normal.
+    """
+    if rotation_deg != cap_side_deg:
+        return _build_turned_divider_solid(
+            lining_outer_radius,
+            case_max_radius,
+            wall_thickness_mm,
+            rotation_deg,
+            cap_side_deg,
+            cap_half_width,
+        )
     with BuildPart() as divider_solid:
         with BuildSketch():
             with BuildLine() as divider_ln:
@@ -74,12 +98,71 @@ def build_divider_solid(lining_outer_radius, case_max_radius, wall_thickness_mm)
             make_face()
         extrude(amount=1000)
 
+    if rotation_deg:
+        divider_solid.part = divider_solid.part.rotate(Axis.Z, rotation_deg)
+    return divider_solid
+
+
+def split_reaches_cap_side(lining_outer_radius, wall_thickness_mm, rotation_deg, cap_side_deg, cap_half_width):
+    """Whether build_divider_solid's split, from a wall thickness beyond the lining on a
+    divider turned by rotation_deg, can reach the middle of the caps' side at
+    cap_side_deg while advancing along the divider (so the halves part along its normal)."""
+    turn = np.radians(cap_side_deg - rotation_deg)
+    return cap_half_width * np.cos(turn) > lining_outer_radius + wall_thickness_mm
+
+
+def _build_turned_divider_solid(
+    lining_outer_radius,
+    case_max_radius,
+    wall_thickness_mm,
+    rotation_deg,
+    cap_side_deg,
+    cap_half_width,
+):
+    """build_divider_solid for a divider turned off the caps' sides."""
+    if abs(cap_side_deg - rotation_deg) > 45:
+        raise ValueError(f"Cap side at {cap_side_deg} deg is more than 45 deg from the divider at {rotation_deg} deg")
+    if not split_reaches_cap_side(lining_outer_radius, wall_thickness_mm, rotation_deg, cap_side_deg, cap_half_width):
+        raise ValueError(
+            f"A divider at {rotation_deg:.1f} deg cannot reach the middle of the caps' side at "
+            f"{cap_side_deg} deg, {cap_half_width:.1f} mm from the axis, without turning back"
+        )
+    turn = np.radians(cap_side_deg - rotation_deg)
+    curve_end = lining_outer_radius - wall_thickness_mm
+    elbow = lining_outer_radius + wall_thickness_mm
+    far = case_max_radius * 2
+    # In the divider's frame (its curve along X, its positive side +Y): the caps' side
+    # middles and far points along their normals, either end.
+    side = (cap_half_width * np.cos(turn), cap_half_width * np.sin(turn))
+    out = (far * np.cos(turn), far * np.sin(turn))
+    reach = max(far, abs(out[1]) + far)
+    with BuildPart() as divider_solid:
+        with BuildSketch():
+            with BuildLine():
+                points = [(-out[0], -out[1]), (-side[0], -side[1]), (-elbow, 0), (-curve_end, 0)]
+                for a, b in zip(points, points[1:]):
+                    Line(a, b)
+                divider_curve(lining_outer_radius, wall_thickness_mm)
+                points = [(curve_end, 0), (elbow, 0), side, out, (out[0], reach), (-out[0], reach), points[0]]
+                for a, b in zip(points, points[1:]):
+                    Line(a, b)
+            make_face()
+        extrude(amount=1000)
+
+    divider_solid.part = divider_solid.part.rotate(Axis.Z, rotation_deg)
     return divider_solid
 
 
 def divider_wall_and_solid(
-    lining_outer_radius, wall_thickness_mm, height, case_max_radius
+    lining_outer_radius,
+    wall_thickness_mm,
+    height,
+    case_max_radius,
+    rotation_deg=0,
+    cap_side_deg=0,
+    cap_half_width=None,
 ):
+    """The divider wall and build_divider_solid, both turned by rotation_deg about Z."""
     with BuildPart() as divider_wall:
         with BuildLine():
             ln = divider_curve(
@@ -113,10 +196,16 @@ def divider_wall_and_solid(
                 Circle(wall_thickness_mm)
         extrude(amount=height)
 
+    if rotation_deg:
+        divider_wall.part = divider_wall.part.rotate(Axis.Z, rotation_deg)
+
     divider_solid = build_divider_solid(
         lining_outer_radius,
         case_max_radius,
         wall_thickness_mm,
+        rotation_deg,
+        cap_side_deg,
+        cap_half_width,
     )
 
     return divider_wall, divider_solid

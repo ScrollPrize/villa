@@ -41,3 +41,11 @@ QT_QPA_PLATFORM=offscreen \
 
 The test copies one collection into its temporary workspace and changes its name;
 the source file remains unchanged.
+
+Fiber editing uses the attached object store. Opening a service-only fiber imports
+its linked component from the immutable service artifact; opening an existing
+object UUID uses the stored geometry. Staged exports preserve the service input ID
+through an explicit association with the object UUID. Fiber editors do not create
+writable service working copies. Discard removes the service draft and stops its
+automatic updates; it does not roll back durable object-store edits. Patch and PCL
+working-copy behavior is unchanged.

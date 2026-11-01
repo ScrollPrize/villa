@@ -1,0 +1,16 @@
+{
+  "checkpoint": "/home/sean/Documents/villa/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/sheet_strip_paris4_slim50k_v2_ft/last.pt",
+  "step": 15000,
+  "afv": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/paris4_fibers_ctz7000_17000_slim50k_20261012/fibers.afv",
+  "fiber": 132487,
+  "family": "H",
+  "decision_step": 8.0,
+  "blend": 16.0,
+  "units": "patch voxels",
+  "trace_per_patch": 0.5,
+  "first_row_arc_patch_voxels": -46.5,
+  "fiber_along": "columns",
+  "fiber_reversed": false,
+  "across_reversed": false,
+  "trim_patch_voxels": 75.0
+}
