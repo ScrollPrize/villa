@@ -492,13 +492,20 @@ def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
 
 def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):
     import fit_spiral
+    from fit_session import SpiralInputPaths
     from test_checkpoint_load import _checkpoint, _live_context
     inputs = load(store_path)
     context = _live_context()
     context.object_store_inputs = inputs
+    # A command-line fit records its resolved inputs (paths, fit volume,
+    # provenance) beside the object-store inputs.
     payload = fit_spiral.FitContext._checkpoint_input_manifest(
-        SimpleNamespace(interactive_driver=None, object_store_inputs=inputs))
+        SimpleNamespace(interactive_driver=None, object_store_inputs=inputs,
+                        paths=SpiralInputPaths(volume_uuid='volume-1',
+                                               provenance={'input_manifest': '/m.json'})))
     assert payload['object_store_digest'] == inputs.digest
+    assert payload['volume_uuid'] == 'volume-1'
+    assert payload['provenance'] == {'input_manifest': '/m.json'}
     verdict = fit_spiral.FitContext.inspect_checkpoint(
         context, _checkpoint(input_manifest=payload))
     assert verdict.accepted, verdict.message()

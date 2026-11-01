@@ -6,7 +6,7 @@ import pytest
 
 from lasagna_source import (LasagnaSource, LasagnaSourceError, array_shape_matches,
                             dataset_url, dyadic_coordinate_scale,
-                            find_dataset_manifest, lasagna_scale_for, load_lasagna_source,
+                            lasagna_scale_for, load_lasagna_source,
                             manifest_identity, read_lasagna_manifest, url_identity,
                             write_lasagna_source)
 
@@ -112,14 +112,6 @@ def test_packs_live_under_the_identity():
         source.arrays('grad_mag')
     with pytest.raises(LasagnaSourceError, match='identity'):
         LasagnaSource(identity='../x', location='', group='4')
-
-
-def test_a_dataset_s_one_manifest_is_found(tmp_path):
-    assert find_dataset_manifest(tmp_path) == ''
-    path = write_manifest(tmp_path)
-    assert find_dataset_manifest(tmp_path) == str(path)
-    write_manifest(tmp_path, name='t.lasagna.json')
-    assert find_dataset_manifest(tmp_path) == ''
 
 
 def test_the_link_refresh_reads_the_normals_pack_when_the_cache_has_it(tmp_path):
@@ -234,7 +226,7 @@ def test_a_stated_scale_is_derived_cross_checked_or_required(tmp_path):
         resolve_lasagna_scale(replace(spec, lasagna_scale=4), framed)
     # Underivable: the stated scale stands, and without one the fit is refused.
     assert resolve_lasagna_scale(replace(spec, lasagna_scale=4), bare).lasagna_scale == 4
-    with pytest.raises(ScrollSpecError, match='state lasagna_scale'):
+    with pytest.raises(ScrollSpecError, match='state scroll.lasagna_scale'):
         resolve_lasagna_scale(spec, bare)
     with pytest.raises(ScrollSpecError, match='base_shape_zyx'):
         resolve_lasagna_scale(replace(spec, base_shape_zyx=None), framed)

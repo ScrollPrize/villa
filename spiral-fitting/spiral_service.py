@@ -5,13 +5,15 @@ The service binds to loopback by default. Non-loopback binds are explicit and
 always carry bearer authentication; every client — including VC3D talking to a
 process it launched itself — uses the same authenticated HTTP protocol.
 
-Every service is bound to one dataset at startup: ``--dataset`` (inputs,
-resolved once and advertised through ``/dataset``) and ``--output`` (all
-generated state) are required; ``--cache`` defaults to the documented user
-cache (``$XDG_CACHE_HOME/vc3d/spiral``). Both --output and --cache must
-resolve outside the dataset root — the dataset holds inputs only.
+Every service binds its host paths once at startup and advertises them
+through ``/bindings``: ``--output`` (all generated state) is required;
+``--cache`` defaults to the documented user cache
+(``$XDG_CACHE_HOME/vc3d/spiral``); the optional ``--winding-inference`` is
+the winding-inference artifact winding-model supervision reads. There is no
+dataset: the scroll's facts, umbilicus, Lasagna dataset and fiber-inference
+dataset are the project's that each session request carries.
 
-The service starts ``Uninitialized``. Dataset and checkpoint discovery remain
+The service starts ``Uninitialized``. Binding and checkpoint discovery remain
 available without importing the fitting runtime; ``POST /session/initialize``
 creates the first resident session, and ``POST /session/rebuild`` replaces an
 existing one.
@@ -85,9 +87,8 @@ from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
                          SpiralProject, default_user_cache_dir,
                          fiber_directions_required, input_source_enabled,
                          lasagna_enabled,
-                         winding_inference_enabled,
-                         scroll_spec_config_defaults,
-                         parse_session_request, resolve_dataset_root,
+                         winding_inference_enabled, winding_inference_error,
+                         parse_session_request,
                          validate_session_request, write_project_umbilicus)
 from lasagna_source import load_lasagna_source, write_lasagna_source
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
@@ -120,7 +121,7 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
-# Upper bound on the checkpoint listing /dataset advertises. A client offers
+# Upper bound on the checkpoint listing /bindings advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
 MAX_LOG_ENTRY_CHARS = 8192
@@ -158,10 +159,16 @@ def input_upload_error():
         "reloaded.",
         payload={"code": INPUTS_IN_OBJECT_STORE})
 
-# Base input paths are owned by the service (every launch carries --dataset);
-# a load request may only choose among service-advertised values for these
-# keys.
-_DATASET_CLIENT_SELECTABLE = ("checkpoint",)
+# Input paths are the service's (its bindings) and the project's; a session
+# request may name only these, each among service-advertised values.
+_CLIENT_SELECTABLE_PATHS = ("checkpoint",)
+# Request paths of the dataset service, refused with what replaced them.
+_RETIRED_REQUEST_PATHS = {
+    "dataset_root": "the service has no dataset; the project block carries "
+                    "the scroll's inputs",
+    "winding_inference": "winding inference is the service's --winding-inference "
+                         "binding; restart the service to change it",
+}
 
 
 def parse_gpu_ids(value):
@@ -289,7 +296,7 @@ SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
                              "object_store_input_position")
 
 
-# What /dataset tells a client this service supports, so it can enable or
+# What /bindings tells a client this service supports, so it can enable or
 # explain controls before any session exists.
 SERVICE_CAPABILITIES = {
     # Patches, PCLs and fibers are read from the bound object store.
@@ -428,17 +435,62 @@ def bind_object_store(path, author=None, hub=None):
                               status["hub"], status["hub_replica"], status["hub_replica"])
 
 
-def bind_service_paths(resolution, output_directory, cache_directory):
-    """Attach the startup-resolved output/cache roots to the advertisement.
+class ServiceBindingError(ValueError):
+    """A launch path binding is unusable, and why."""
 
-    Dataset resolution describes inputs only; where generated state lives
-    (--output) and where derived host caches live (--cache) are service
-    startup decisions. /dataset advertises the bound result so clients see
-    one immutable set of paths.
-    """
-    resolution.resolved["output_directory"] = str(output_directory)
-    resolution.resolved["cache_directory"] = str(cache_directory)
-    return resolution
+
+@dataclasses.dataclass(frozen=True)
+class ServiceBindings:
+    """The host paths a service binds once at launch; no client can repoint
+    them. ``output_directory`` holds all generated state, ``cache_directory``
+    the derived host caches (prepared Lasagna packs and fiber directions),
+    and ``winding_inference`` ('' when unbound) the winding-inference
+    artifact winding-model supervision reads directly: a supervision input,
+    not a cache and not a project asset. /bindings advertises them."""
+
+    output_directory: str
+    cache_directory: str
+    winding_inference: str = ""
+
+    def winding_inference_status(self):
+        """``{bound, path, available, error}``: whether the bound artifact is
+        usable now (it is read when a fit needs it, so it is checked again)."""
+        if not self.winding_inference:
+            return {"bound": False, "path": None, "available": False,
+                    "error": "the service was launched without --winding-inference"}
+        error = winding_inference_error(self.winding_inference)
+        return {"bound": True, "path": self.winding_inference,
+                "available": not error, "error": error or None}
+
+    def advertisement(self):
+        return {"output_directory": self.output_directory,
+                "cache_directory": self.cache_directory,
+                "winding_inference": self.winding_inference_status()}
+
+    def provenance(self, project):
+        """Where a session's inputs come from: the client's project and
+        these bindings."""
+        result = {"project": project.name,
+                  "output_directory": self.output_directory,
+                  "cache_directory": self.cache_directory}
+        if self.winding_inference:
+            result["winding_inference"] = self.winding_inference
+        return result
+
+
+def bind_service_inputs(output_directory, cache_directory, winding_inference=None):
+    """Resolve the launch path bindings once. A named winding-inference
+    artifact must exist; one that is unusable for another reason is
+    advertised as unavailable (``ServiceBindings.winding_inference_status``)
+    and fails only the fits that need it."""
+    winding = ""
+    if winding_inference:
+        winding = str(Path(winding_inference).expanduser().resolve(strict=False))
+        if not Path(winding).is_dir():
+            raise ServiceBindingError(
+                f"--winding-inference {winding} is not a directory: name the "
+                "winding-inference artifact (the directory holding its manifest.json)")
+    return ServiceBindings(str(output_directory), str(cache_directory), winding)
 
 
 def _validate_dt_loss_schedule(value):
@@ -663,7 +715,7 @@ class ServiceState:
     command generations, artifacts, and uploads.
     """
 
-    def __init__(self, dataset_root=None, dataset_resolution=None,
+    def __init__(self, bindings=None,
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,), startup_run=None, object_store=None):
         self.lock = threading.RLock()
@@ -706,8 +758,9 @@ class ServiceState:
         # An input update of the resident session in flight (its build ID).
         self._input_update = None
         self.startup_run = dict(startup_run or {})
-        self.dataset_root = str(dataset_root) if dataset_root else None
-        self.dataset_resolution = dataset_resolution
+        # ServiceBindings of the launch; None only in tests that never build
+        # a fit.
+        self.bindings = bindings
         # ObjectStoreBinding of the launch --object-store; None only in
         # tests that never build a fit.
         self.object_store = object_store
@@ -1013,7 +1066,6 @@ class ServiceState:
         response.update({
             "ready": True,
             "process_id": os.getpid(),
-            "dataset_root": self.dataset_root,
             "session_state": state,
             "cuda_ready": (None if state == SessionState.Loading else
                            state not in {SessionState.Uninitialized,
@@ -1034,29 +1086,25 @@ class ServiceState:
             catalog["schema"] = {**catalog["schema"], "fields": fields}
             catalog["defaults"] = {**catalog["defaults"],
                                    **self.object_store.config()}
-        generic = self.config_catalog["defaults"]
-        scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
-        if scroll_defaults:
-            # The panel seeds its form from these, so a winding count in
-            # spiral-scroll.json reaches interactive fits as it reaches the
-            # CLI. A preset still holding the generic value inherits it; one
-            # that chose its own value keeps it.
-            catalog["defaults"] = {**catalog["defaults"], **scroll_defaults}
-            catalog["presets"] = {
-                name: {**preset, **{
-                    key: value for key, value in scroll_defaults.items()
-                    if preset.get(key) == generic.get(key)}}
-                for name, preset in self.config_catalog["presets"].items()}
         return catalog
 
-    def dataset(self):
+    def binding_advertisement(self):
+        """GET /bindings: the launch host bindings, what the service can do
+        with them, the checkpoints it can load and the bound store's
+        selection."""
         capabilities = dict(SERVICE_CAPABILITIES)
         positioned = self._positioned()
         capabilities["input_positions"] = positioned
         # A service with positions updates a resident fit's inputs in place.
         capabilities["inputs_frozen"] = not positioned
         capabilities["input_updates"] = positioned
-        response = {**self._base(), **self.dataset_resolution.to_dict(),
+        bindings = (self.bindings.advertisement() if self.bindings is not None
+                    else {"output_directory": None, "cache_directory": None,
+                          "winding_inference": {"bound": False, "path": None,
+                                                "available": False, "error": None}})
+        # Whether winding-model supervision can run here.
+        capabilities["winding_inference"] = bindings["winding_inference"]["available"]
+        response = {**self._base(), "bindings": bindings,
                     "session_checkpoints": self.session_checkpoints(),
                     "capabilities": capabilities}
         if self.object_store is not None:
@@ -1090,24 +1138,14 @@ class ServiceState:
             self._startup_inputs = (key, summary)
             return summary
 
-    @property
-    def scroll_spec(self):
-        """The fields the dataset's spiral-scroll.json states ({} without
-        one), or None if it is invalid. A session's scroll completes them with
-        its project's facts (session_request["scroll"])."""
-        if self.dataset_resolution is None:
-            return None
-        return self.dataset_resolution.scroll_spec
-
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
 
-        Between this and ``detected_checkpoints`` a client has the whole set
-        of checkpoints it may name: the dataset root holds the ones that came
-        with the dataset, and the output directory holds everything this
-        service wrote or received (saves, autosaves, uploads). Advertising
-        both is what lets a client offer a choice instead of asking the user
-        to type a path on a host it may never have seen.
+        These are the host checkpoints a client may name: everything this
+        service wrote or received (saves, autosaves, uploads) lives under the
+        output directory. Advertising them is what lets a client offer a
+        choice instead of asking the user to type a path on a host it may
+        never have seen.
         """
         root = self._output_root()
         if root is None or not root.is_dir():
@@ -1131,8 +1169,11 @@ class ServiceState:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def _dataset_session_request(self, request, project, *, include_input_config=False):
-        """Build a dataset-owned request and select its active inputs.
+    def _bound_session_request(self, request, project, *, include_input_config=False):
+        """Resolve a request's inputs from its project and this service's
+        bindings (the service adapter of the shared input contract; the
+        project's umbilicus and fiber directions join once the build knows
+        the fit volume, _resolve_session_scroll).
 
         A checkpoint-backed request intentionally carries no UI profile
         overrides: the checkpoint owns its durable configuration. Input
@@ -1142,24 +1183,26 @@ class ServiceState:
         erased, and only then does the fitter discover that the checkpoint
         requires it.
         """
-        resolution = self.dataset_resolution.to_dict()
+        bindings = self.bindings
         requested_paths = request.get("paths") or {}
         offending = sorted(
             key for key, value in requested_paths.items()
-            if key not in _DATASET_CLIENT_SELECTABLE
+            if key not in _CLIENT_SELECTABLE_PATHS
             and (value or (isinstance(value, list) and value))
         )
         if offending:
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "This service owns its base inputs; the load request must not "
-                "carry input paths",
-                [{"field": key, "message": "Base input paths are owned by the service"}
+                "This service owns its input paths; the request may name only "
+                "a checkpoint",
+                [{"field": f"paths.{key}",
+                  "message": _RETIRED_REQUEST_PATHS.get(
+                      key, "Input paths are the service's bindings and the project's")}
                  for key in offending])
-        paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
-        for key in (*(spec.key for spec in FIT_INPUT_CATALOG),
-                    "output_directory", "cache_directory"):
-            paths[key] = resolution["resolved"].get(key, "")
+        paths = {"output_directory": bindings.output_directory,
+                 "cache_directory": bindings.cache_directory,
+                 "winding_inference": bindings.winding_inference,
+                 "provenance": bindings.provenance(project)}
         # The Lasagna dataset is the project's selected one, written as the
         # source document the fit reads (its packs are this service's cache's).
         if project.lasagna is not None and not project.lasagna.error:
@@ -1168,14 +1211,12 @@ class ServiceState:
                 project.lasagna.source())
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
-            allowed = set(resolution.get("detected_checkpoints", []))
             resolved_checkpoint = str(Path(checkpoint).resolve(strict=False))
             output_root = Path(paths["output_directory"]).resolve(strict=False)
-            if resolved_checkpoint not in allowed and \
-                    not Path(resolved_checkpoint).is_relative_to(output_root):
+            if not Path(resolved_checkpoint).is_relative_to(output_root):
                 raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "Checkpoint must be one the service advertises or "
-                               "one under the session output directory",
+                               "Checkpoint must be one under the session output "
+                               "directory",
                                [{"field": "checkpoint", "message": "Not a service-advertised checkpoint"}])
             paths["checkpoint"] = resolved_checkpoint
 
@@ -1188,18 +1229,11 @@ class ServiceState:
             if checkpoint_config is not None:
                 config = {**checkpoint_config, **requested_config}
 
-        # The service owns conventional paths, while the session config owns
-        # which optional sources participate. Clear disabled paths before
-        # validating any client-selectable override so the manifest, validator,
-        # and fitter all describe the same source set.
-        selected_paths = {
-            "winding_inference": "winding_inference",
-        }
-        for path_key, source in selected_paths.items():
-            if not input_source_enabled(config, source):
-                paths[path_key] = ""
+        # The session config owns which optional sources participate. Clear
+        # disabled paths before validation so the manifest, validator, and
+        # fitter all describe the same source set.
         if not lasagna_enabled(config):
-            paths["lasagna"] = ""
+            paths.pop("lasagna", None)
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
 
@@ -1227,8 +1261,8 @@ class ServiceState:
                      for key in scroll_owned])
             request = self._bind_service_owned_config(request)
             project = self._request_project(request)
-            if self.dataset_resolution is not None:
-                request, input_config = self._dataset_session_request(
+            if self.bindings is not None:
+                request, input_config = self._bound_session_request(
                     request, project, include_input_config=True)
             paths, run, preview = parse_session_request(request)
         except (KeyError, TypeError, ValueError) as exc:
@@ -1256,9 +1290,13 @@ class ServiceState:
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
         # The project supplies the umbilicus once the fit volume is known.
-        errors = validate_session_request(paths, validation_run,
-                                          supplied=VOLUME_INPUT_KEYS,
-                                          build_lasagna_packs=False)
+        errors = validate_session_request(
+            paths, validation_run, supplied=VOLUME_INPUT_KEYS,
+            build_lasagna_packs=False,
+            missing={"winding_inference": (
+                "winding-model supervision reads the service's winding-inference "
+                "binding, and this service has none: restart it with "
+                "--winding-inference PATH and prepare a new fit")})
         # Lasagna stores the configuration needs and the project cannot give.
         if lasagna_error := project.lasagna_error():
             needed = [spec.key for spec in FIT_INPUT_CATALOG
@@ -1315,7 +1353,7 @@ class ServiceState:
         umbilicus = write_project_umbilicus(
             Path(paths.output_directory) / "project-inputs", volume,
             scroll.umbilicus(volume))
-        # Loaded whenever enabled, as the CLI loads its dataset's, so a later
+        # Loaded whenever enabled, as the CLI loads its manifest's, so a later
         # run with the loss on finds them resident; required with the loss.
         fiber_directions = ""
         if fiber_directions_required(config):
@@ -1325,7 +1363,7 @@ class ServiceState:
                 fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
             except ScrollSpecError:
                 pass
-        return dataclasses.replace(paths, umbilicus=umbilicus,
+        return dataclasses.replace(paths, volume_uuid=volume, umbilicus=umbilicus,
                                    fiber_directions=fiber_directions), spec
 
     def _bind_service_owned_config(self, request):
@@ -1673,11 +1711,11 @@ class ServiceState:
             # resident inputs, and the refusal would come after the model was
             # released. The full rebuild reads the checkpoint's position.
             return "all"
-        # The project supplies VOLUME_INPUT_KEYS once the build knows the fit
-        # volume; they and the scroll change with the project's facts of that
-        # volume.
+        # The project supplies VOLUME_INPUT_KEYS (and the build the fit
+        # volume itself) once the build knows the fit volume; they and the
+        # scroll change with the project's facts of that volume.
         live_paths = dict(current.get("paths") or {})
-        live_paths.update(dict.fromkeys(VOLUME_INPUT_KEYS, ""))
+        live_paths.update(dict.fromkeys(VOLUME_INPUT_KEYS, ""), volume_uuid="")
         if (paths.manifest() != live_paths
                 or preview.manifest() != current.get("preview")):
             return "all"
@@ -2611,7 +2649,7 @@ class ServiceState:
         if input_manifest is not None and input_manifest != current_manifest:
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                "Static dataset inputs cannot be changed by a run")
+                "Static fit inputs cannot be changed by a run")
         run_config = changes
         with self.lock:
             current_iteration = int(
@@ -2750,7 +2788,7 @@ class ServiceState:
 
         A load names exactly one of two things, and both are strings this
         service handed out: ``host_checkpoint`` is one of the checkpoints
-        ``/dataset`` advertises, and ``uploaded_checkpoint`` is the path a
+        ``/bindings`` advertises, and ``uploaded_checkpoint`` is the path a
         checkpoint upload returned. Neither asks the client to reason about a
         filesystem it may never have seen — that is why they are separate
         fields rather than one free path: they are checked against different
@@ -2764,13 +2802,10 @@ class ServiceState:
                 "A load names exactly one of host_checkpoint or "
                 "uploaded_checkpoint")
         if host:
-            advertised = set(
-                self.dataset_resolution.to_dict()["detected_checkpoints"])
-            advertised.update(self.session_checkpoints())
-            if host not in advertised:
+            if host not in set(self.session_checkpoints()):
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "host_checkpoint must be one of the checkpoints /dataset "
+                    "host_checkpoint must be one of the checkpoints /bindings "
                     "advertises",
                     [{"field": "host_checkpoint",
                       "message": "Not a service-advertised checkpoint"}])
@@ -2863,8 +2898,9 @@ class ServiceState:
                 "config_revision": result.get("config_revision")}
 
     def _checkpoint_durable_cfg(self, path):
-        """The durable configuration, dataset, z window and input manifest a
-        checkpoint records: ``(cfg, dataset_root, z_range, input_manifest)``.
+        """The durable configuration, fit volume, z window and input manifest
+        a checkpoint records: ``(cfg, volume_uuid, z_range, input_manifest)``
+        (``volume_uuid`` '' when its manifest does not record one).
 
         CPU-only and read afresh: the same bytes an escalated rebuild would
         apply, so nothing here can go stale between the refusal and the
@@ -2910,7 +2946,7 @@ class ServiceState:
                 except (TypeError, ValueError):
                     pass
             return (dict(cfg) if isinstance(cfg, Mapping) else None,
-                    str(manifest.get("dataset_root") or ""), z_range,
+                    str(manifest.get("volume_uuid") or ""), z_range,
                     dict(manifest) if isinstance(manifest, Mapping) else {})
         finally:
             # A refusal must not leave a whole model + optimiser archive
@@ -2931,23 +2967,23 @@ class ServiceState:
         z_begin/z_end on this same path rather than through a special case.
         """
         reasons = [line for line in str(cause).splitlines() if line.strip()]
-        checkpoint_cfg, checkpoint_dataset, _, checkpoint_inputs = \
+        checkpoint_cfg, checkpoint_volume, _, checkpoint_inputs = \
             self._checkpoint_durable_cfg(path)
         with self.lock:
             status = self.session.status() if self.session else {}
-            dataset_root = str(
-                getattr(self.session_paths, "dataset_root", "") or "")
+            volume_uuid = str(
+                getattr(self.session_paths, "volume_uuid", "") or "")
         live = dict(status.get("applied_config") or {})
         inputs = (None if live.get("object_store_allow_changed_inputs")
                   else self._checkpoint_input_refusal(checkpoint_inputs, status))
-        # What no rebuild can fix: a checkpoint from another dataset, or one
+        # What no rebuild can fix: a checkpoint fitted in another volume, or one
         # whose configuration is not this schema's at all.
         if checkpoint_cfg is None or set(checkpoint_cfg) != set(live):
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
-        if checkpoint_dataset and dataset_root \
-                and checkpoint_dataset != dataset_root:
+        if checkpoint_volume and volume_uuid \
+                and checkpoint_volume != volume_uuid:
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
@@ -3055,18 +3091,18 @@ class ServiceState:
         current.pop("scroll", None)
         current["project"] = project.to_mapping()
         paths = dict(current.get("paths") or {})
-        if self.dataset_resolution is not None:
+        if self.bindings is not None:
             # ``session_request`` is the canonical manifest the service built,
-            # so it contains every resolved base-input path.  ``rebuild``
-            # deliberately accepts the narrower client request shape in
-            # dataset mode and rejects those same service-owned paths.  Turn
-            # the canonical manifest back into that shape before re-entering
-            # request validation; the dataset resolver will restore the base
-            # inputs.  This matters especially after a failed checkpoint
-            # build, when this is the recovery path for trying another one.
+            # so it contains every resolved input path.  ``rebuild``
+            # deliberately accepts the narrower client request shape and
+            # rejects those same service-owned paths.  Turn the canonical
+            # manifest back into that shape before re-entering request
+            # validation; the bindings and the project restore the inputs.
+            # This matters especially after a failed checkpoint build, when
+            # this is the recovery path for trying another one.
             paths = {
                 key: value for key, value in paths.items()
-                if key in _DATASET_CLIENT_SELECTABLE and value
+                if key in _CLIENT_SELECTABLE_PATHS and value
             }
         paths["checkpoint"] = path
         run = dict(current.get("run") or {})
@@ -3192,13 +3228,11 @@ class ServiceState:
         return self.checkpoint_uploads.uploads
 
     def _output_root(self):
-        """Output directory known before any session in dataset mode."""
+        """Output directory known before any session: the bound one."""
         if self.session_paths is not None and self.session_paths.output_directory:
             return Path(self.session_paths.output_directory)
-        if self.dataset_resolution is not None:
-            output = self.dataset_resolution.resolved.get("output_directory")
-            if output:
-                return Path(output)
+        if self.bindings is not None and self.bindings.output_directory:
+            return Path(self.bindings.output_directory)
         return None
 
     def _staging_root(self):
@@ -3438,8 +3472,8 @@ ROUTES = (
     Route("GET", "/session/status", "session_status",
           lambda ctx: ctx.state.status(), Idempotency.NONE),
     Route("GET", "/events", "events", _route_events, Idempotency.NONE),
-    Route("GET", "/dataset", "dataset",
-          lambda ctx: ctx.state.dataset(), Idempotency.NONE),
+    Route("GET", "/bindings", "bindings",
+          lambda ctx: ctx.state.binding_advertisement(), Idempotency.NONE),
     Route("GET", re.compile(r"/artifacts/([A-Za-z0-9._-]+)/manifest"),
           "artifact_manifest",
           lambda ctx: ctx.state.artifacts.manifest(ctx.args[0]),
@@ -3658,7 +3692,7 @@ class SpiralHandler(BaseHTTPRequestHandler):
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
         lease = state.session_lease
-        if (state.dataset_root is not None and lease is None
+        if (state.bindings is not None and lease is None
                 and self.command != "GET"
                 and route.operation not in _LEASE_OPERATIONS):
             raise ApiError(403, "Claim the session lease first")
@@ -3756,6 +3790,17 @@ def _is_loopback(bind):
         return False
 
 
+class _RetiredDatasetFlag(argparse.Action):
+    """``--dataset``, refused with what replaced it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--dataset is retired: the service has no dataset. The scroll's "
+            "facts, umbilicus, Lasagna and fiber-inference datasets come from "
+            "the VC3D project; bind winding inference with --winding-inference "
+            "PATH, and prepared Lasagna packs and fiber directions live in --cache")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="127.0.0.1",
@@ -3769,15 +3814,18 @@ def main(argv=None):
     parser.add_argument("--nonce", default=None,
                         help="Ephemeral credential for a VC3D-owned local process")
     parser.add_argument("--parent-pid", type=int, default=0)
-    parser.add_argument("--dataset", required=True,
-                        help="Dataset root owned by this service (inputs only; "
-                             "resolved once at startup and advertised through "
-                             "/dataset). Clients cannot repoint base inputs.")
+    parser.add_argument("--dataset", nargs="?", action=_RetiredDatasetFlag,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--output", required=True,
                         help="Root for all generated state (run directories, "
                              "autosaves, previews, input revisions, upload "
-                             "staging, uploaded checkpoints). Must resolve "
-                             "outside the dataset root.")
+                             "staging, uploaded checkpoints)")
+    parser.add_argument("--winding-inference", default=None, metavar="PATH",
+                        help="Winding-inference artifact (a directory holding "
+                             "its manifest.json) that winding-model supervision "
+                             "reads directly. Bound at launch: clients cannot "
+                             "repoint it, and changing it needs a restart and a "
+                             "new fit. Without it, fits needing it are refused.")
     parser.add_argument("--object-store", required=True, metavar="STORE",
                         help="Object store (.vcobj) this service reads patch, "
                              "PCL and fiber inputs from, and writes startup "
@@ -3793,8 +3841,8 @@ def main(argv=None):
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
     parser.add_argument("--cache", default=None,
-                        help="Directory for derived host caches; must resolve "
-                             "outside the dataset root (default: "
+                        help="Directory for derived host caches: prepared "
+                             "Lasagna packs and fiber directions (default: "
                              "$XDG_CACHE_HOME/vc3d/spiral, i.e. "
                              "~/.cache/vc3d/spiral)")
     parser.add_argument("--service-name", default=None)
@@ -3848,21 +3896,18 @@ def main(argv=None):
         parser.error("--nonce is only for VC3D-owned loopback processes; use the "
                      "API key file for network binds")
 
-    # Deployment roots are bound once at startup. --output owns every piece
-    # of generated state; the dataset root holds inputs only, so both the
-    # output and cache roots must resolve (realpath) outside it.
-    dataset_root = Path(args.dataset).expanduser().resolve(strict=False)
+    # Host paths are bound once at startup. --output owns every piece of
+    # generated state.
     output_root = Path(args.output).expanduser().resolve(strict=False)
-    if output_root == dataset_root or output_root.is_relative_to(dataset_root):
-        parser.error(f"--output must resolve outside the dataset root: "
-                     f"{output_root} is inside {dataset_root}")
     if args.session_name:
         output_root = output_root / args.session_name
     cache_root = Path(args.cache).expanduser().resolve(strict=False) \
         if args.cache else Path(default_user_cache_dir())
-    if cache_root == dataset_root or cache_root.is_relative_to(dataset_root):
-        parser.error(f"--cache must resolve outside the dataset root: "
-                     f"{cache_root} is inside {dataset_root}")
+    try:
+        bindings = bind_service_inputs(output_root, cache_root,
+                                       args.winding_inference)
+    except ServiceBindingError as exc:
+        parser.error(str(exc))
 
     credentials = []
     if args.nonce:
@@ -3885,19 +3930,6 @@ def main(argv=None):
         return 2
 
     session_lease = None
-    dataset_resolution = resolve_dataset_root(args.dataset)
-    if not dataset_resolution.ok:
-        print("Refusing to start: the launch dataset is incomplete.",
-              file=sys.stderr, flush=True)
-        for key in dataset_resolution.missing_required:
-            print(f"  missing required: {key}", file=sys.stderr, flush=True)
-        for key, options in dataset_resolution.ambiguities.items():
-            print(f"  ambiguous {key}: {', '.join(options)}",
-                  file=sys.stderr, flush=True)
-        return 2
-    for warning in dataset_resolution.warnings:
-        print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
-    bind_service_paths(dataset_resolution, output_root, cache_root)
     if args.session_name:
         # The named-session exclusive lease lives under the corresponding
         # output namespace (<output>/<session-name>).
@@ -3924,8 +3956,7 @@ def main(argv=None):
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(original_stdout, logs, "stdout")
     sys.stderr = _TeeStream(original_stderr, logs, "stderr")
-    state = ServiceState(dataset_root=str(dataset_root),
-                         dataset_resolution=dataset_resolution,
+    state = ServiceState(bindings=bindings,
                          service_name=args.service_name,
                          session_name=args.session_name or "",
                          logs=logs,
@@ -3965,7 +3996,6 @@ def main(argv=None):
     # remote attach validate compatibility through one code path.
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
-    print(f"Spiral dataset root: {dataset_root}", flush=True)
     print(f"Spiral object store: {object_store.path} ({object_store.uuid})",
           flush=True)
     if object_store.hosted:
@@ -3976,6 +4006,11 @@ def main(argv=None):
               f"{object_store.positions}", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
+    winding = bindings.winding_inference_status()
+    print(f"Spiral winding inference: "
+          + (f"{winding['path']}" + ("" if winding["available"]
+                                     else f" (unavailable: {winding['error']})")
+             if winding["bound"] else "not bound"), flush=True)
     if args.session_name:
         print(f"Spiral session name: {args.session_name}", flush=True)
     print(f"Spiral z-range: [{args.z_begin}, {args.z_end})", flush=True)

@@ -56,7 +56,7 @@ def _live_context():
         spiral_outward_sense="CW",
         z_direction_is_top_to_bottom=False,
         base_shape_zyx=(100, 200, 300),
-        paths=SimpleNamespace(dataset_root="/data/scroll1"),
+        paths=SimpleNamespace(volume_uuid="volume-1"),
         winding_model_mode=False,
         winding_inference=None,
         config=dict(CONFIG),
@@ -84,7 +84,7 @@ def _checkpoint(**overrides):
         "spiral_outward_sense": "CW",
         "z_begin": 1000,
         "z_end": 2000,
-        "input_manifest": {"dataset_root": "/data/scroll1"},
+        "input_manifest": {"volume_uuid": "volume-1"},
     }
     payload.update(overrides)
     return payload
@@ -162,14 +162,14 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(missing.accepted)
         self.assertIn("'optimiser'", missing.message())
 
-    def test_scroll_and_dataset_identity_invariants(self):
+    def test_scroll_and_input_identity_invariants(self):
         for override, expected in (
                 ({"lasagna_scale": 2}, "lasagna_scale"),
                 ({"lasagna_group": "8"}, "Lasagna group"),
                 ({"spiral_outward_sense": "CCW"}, "outward sense"),
                 ({"z_direction_is_top_to_bottom": True}, "z direction"),
-                ({"input_manifest": {"dataset_root": "/data/other"}},
-                 "written against dataset"),
+                ({"input_manifest": {"volume_uuid": "volume-2"}},
+                 "inputs are in the volume"),
         ):
             with self.subTest(override=override):
                 verdict = _inspect(_checkpoint(**override))

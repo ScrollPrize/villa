@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from config import Config, FitConfig
-from fit_session import ScrollSpec, SpiralInputPaths, conventional_input_paths
+from fit_session import ScrollSpec, SpiralInputPaths
 from fit_spiral import FitContext
 import losses
 
@@ -43,16 +43,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.winding_inference_path is None
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234
-
-
-def test_cli_paths_name_no_patch_fiber_or_pcl_files(tmp_path):
-    # The CLI reads patches, fibers and point collections from an object
-    # store; the conventional dataset layout no longer names them.
-    paths = conventional_input_paths(
-        tmp_path, ScrollSpec(name="test", voxel_size_um=1.0,
-                             spiral_outward_sense="CW"))
-    assert not {"verified_patches", "fibers", "pcls"} & set(paths.manifest())
-    assert paths.umbilicus == f"{tmp_path}/umbilicus.json"
 
 
 def test_empty_patch_sets_have_no_sampling_distribution():

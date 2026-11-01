@@ -7,7 +7,7 @@ from runners import run_sweep
 
 def test_child_command_forwards_optional_wandb_group(tmp_path):
     args = run_sweep.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
         "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),
@@ -27,7 +27,7 @@ def test_child_command_forwards_optional_wandb_group(tmp_path):
 
 def test_sweep_parser_supports_opt_in_overwrite(tmp_path):
     args = run_sweep.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
         "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config-folder", str(tmp_path / "configs"),

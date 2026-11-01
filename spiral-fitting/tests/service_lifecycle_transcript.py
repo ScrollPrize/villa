@@ -11,8 +11,9 @@ compare protocol behaviour across a port:
     PYTHONPATH=<checkout>/spiral-fitting python service_lifecycle_transcript.py \\
         --out transcript.json
 
-It adapts to the ownership protocol it finds: the editing-workspace claim
-of the file-input service or the session lease that replaced it.
+It adapts to the protocol it finds: the editing-workspace claim of the
+file-input service or the session lease that replaced it, and a dataset
+root (GET /dataset) or the host bindings that replaced it (GET /bindings).
 """
 import argparse
 import inspect
@@ -28,8 +29,8 @@ from pathlib import Path
 import spiral_runtime
 import spiral_service
 from config import Config
-from fit_session import SessionState, resolve_dataset_root
-from service_project import with_project
+from fit_session import SessionState
+from service_project import VOLUME, with_project
 
 
 class FakeRuntime:
@@ -151,11 +152,12 @@ class Client:
             return json.loads(response.read())
 
 
-# The dataset has no Lasagna stores or shell, so the run turns off the losses
-# that need them.
+# The inputs have no Lasagna stores or shell, so the run turns off the losses
+# that need them; the store is empty, so no object names the fit volume.
 _RUN = {"z_begin": 0, "z_end": 10, "config": {
     "dense_spacing_mode": "grad_mag", "loss_weight_dense_spacing": 0,
-    "loss_weight_dense_normals": 0, "loss_weight_shell_outer": 0}}
+    "loss_weight_dense_normals": 0, "loss_weight_shell_outer": 0,
+    "fit_volume_uuid": VOLUME}}
 
 
 def _claim_route():
@@ -165,20 +167,30 @@ def _claim_route():
     return "/session/editing/claim"
 
 
+def _advertisement_route():
+    paths = {route.path for route in spiral_service.ROUTES if route.path}
+    return "/bindings" if "/bindings" in paths else "/dataset"
+
+
 def _service_state(root):
-    dataset = root / "dataset"
-    dataset.mkdir()
-    (dataset / "spiral-scroll.json").write_text(json.dumps({
-        "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
-        "spiral_outward_sense": "CW"}))
-    (dataset / "umbilicus.json").write_text("{}")
-    (dataset / "verified_patches").mkdir()
     output, cache = root / "output", root / "cache"
     output.mkdir()
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(dataset), output, cache)
-    kwargs = dict(dataset_root=str(dataset), dataset_resolution=resolution,
-                  startup_run=dict(_RUN))
+    if hasattr(spiral_service, "bind_service_inputs"):
+        kwargs = dict(bindings=spiral_service.bind_service_inputs(output, cache))
+    else:
+        # A checkout whose service is bound to a dataset root.
+        from fit_session import resolve_dataset_root
+        dataset = root / "dataset"
+        dataset.mkdir()
+        (dataset / "spiral-scroll.json").write_text(json.dumps({
+            "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
+            "spiral_outward_sense": "CW"}))
+        (dataset / "umbilicus.json").write_text("{}")
+        (dataset / "verified_patches").mkdir()
+        resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(dataset), output, cache)
+        kwargs = dict(dataset_root=str(dataset), dataset_resolution=resolution)
+    kwargs["startup_run"] = dict(_RUN)
     if "object_store" in inspect.signature(spiral_service.ServiceState).parameters:
         kwargs["object_store"] = spiral_service.bind_object_store(
             _empty_store(root / "inputs.vcobj"))
@@ -202,7 +214,7 @@ def record(out):
         try:
             client = Client(server.server_port, "owner-token")
             client.call("GET", "/health")
-            client.call("GET", "/dataset")
+            client.call("GET", _advertisement_route())
             client.call("POST", _claim_route(), {"command_id": "claim-1"},
                         label="POST claim")
             client.command("/session/initialize", with_project({"run": _RUN}))

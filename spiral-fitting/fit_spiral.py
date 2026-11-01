@@ -45,7 +45,7 @@ from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS,
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
-from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS,
+from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, check_fit_volume,
                          input_source_enabled, lasagna_enabled,
                          lasagna_normal_inputs, outer_shell_required,
                          resolve_lasagna_scale, shell_losses_enabled,
@@ -67,8 +67,7 @@ def _startup_resource_suffix(started_at=None):
 
 
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
-from lasagna_source import (LasagnaSourceError, load_lasagna_source,
-                            read_lasagna_manifest, write_lasagna_source)
+from lasagna_source import load_lasagna_source
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
@@ -973,10 +972,11 @@ class FitContext:
         # scroll (name, voxel size, outward sense, umbilicus coordinate
         # scale, Lasagna scale). paths is the resolved
         # SpiralInputPaths for this fit: the interactive runtime passes the
-        # service's per-session selection; the CLI resolves the conventional
-        # dataset layout (fit_session.conventional_input_paths). Its patch,
-        # fiber and PCL entries are not read: those inputs come from the
-        # object store (config object_store_path).
+        # service's per-session selection; the CLI resolves its input
+        # manifest (fit_session.load_input_manifest). Patches, PCLs, fibers,
+        # tracks and the outer shell are not paths: they come from the object
+        # store (config object_store_path), whose selected objects must be in
+        # paths.volume_uuid (check_fit_volume).
         #
         # cache_dir / storage_backend / render_volume_scale are deployment
         # and presentation values, deliberately not part of the scroll file:
@@ -1390,6 +1390,8 @@ class FitContext:
                     'patches, fibers and point collections are read from an '
                     'object store: set object_store_path')
             self.object_store_inputs = self._load_object_store_inputs()
+        check_fit_volume(self.paths, self.object_store_inputs.manifest.get('volume_uuid')
+                         if self.object_store_inputs.manifest is not None else None)
         # The store's surface tagged spiral-outer-shell; the object-store
         # request refused a store without one when the fit needs it.
         shell_patch = (self.object_store_inputs.outer_shell
@@ -2629,9 +2631,11 @@ class FitContext:
         }
 
     def _checkpoint_input_manifest(self):
-        """The interactive input manifest, plus the frozen object-store
-        inputs' manifest and digest when the fit holds them."""
-        manifest = dict(getattr(self.interactive_driver, 'input_manifest', {}))
+        """The inputs read by path (the interactive input manifest, or the
+        command line's resolved inputs and their provenance), plus the frozen
+        object-store inputs' manifest and digest when the fit holds them."""
+        manifest = dict(getattr(self.interactive_driver, 'input_manifest', None)
+                        or self.paths.manifest())
         inputs = getattr(self, 'object_store_inputs', None)
         if inputs is not None and inputs.manifest is not None:
             manifest['object_store'] = inputs.manifest
@@ -2724,7 +2728,7 @@ class FitContext:
             if checkpoint.get(key) is None:
                 reasons.append(f'checkpoint has no {key!r} entry')
 
-        # --- scroll / dataset identity ------------------------------------
+        # --- scroll / input identity --------------------------------------
         # A fit that reads no Lasagna dataset has no downsampling to compare.
         if (self.lasagna_scale is not None
                 and checkpoint.get('lasagna_scale') != self.lasagna_scale):
@@ -2764,24 +2768,26 @@ class FitContext:
                 checkpoint_base_shape = tuple(checkpoint_base_shape)
                 if self.base_shape_zyx is None:
                     reasons.append(
-                        'checkpoint declares base_shape_zyx but this dataset scroll spec does not')
+                        'checkpoint declares base_shape_zyx but this fit\'s scroll does not')
                 elif checkpoint_base_shape != tuple(self.base_shape_zyx):
                     reasons.append(
                         f'checkpoint base_shape_zyx={list(checkpoint_base_shape)!r} '
-                        f'does not match this dataset ({list(self.base_shape_zyx)!r})')
+                        f'does not match this fit\'s scroll ({list(self.base_shape_zyx)!r})')
         inputs = getattr(self, 'object_store_inputs', None)
         if inputs is not None and inputs.manifest is not None:
             from object_store_inputs import resume_problems
             reasons.extend(resume_problems(
                 checkpoint.get('input_manifest'), inputs,
                 allow_changed=self.config['object_store_allow_changed_inputs']))
-        checkpoint_dataset = str(
-            (checkpoint.get('input_manifest') or {}).get('dataset_root') or '')
-        dataset_root = str(getattr(self.paths, 'dataset_root', '') or '')
-        if checkpoint_dataset and dataset_root and checkpoint_dataset != dataset_root:
+        # The reference volume the inputs were resolved in; a checkpoint from
+        # before inputs recorded it is identified by its object-store inputs.
+        checkpoint_volume = str(
+            (checkpoint.get('input_manifest') or {}).get('volume_uuid') or '')
+        volume_uuid = str(getattr(self.paths, 'volume_uuid', '') or '')
+        if checkpoint_volume and volume_uuid and checkpoint_volume != volume_uuid:
             reasons.append(
-                f'checkpoint was written against dataset {checkpoint_dataset!r}, '
-                f'not {dataset_root!r}')
+                f'checkpoint inputs are in the volume {checkpoint_volume!r}, '
+                f'not {volume_uuid!r}')
 
         # --- Winding-inference store identity ------------------------------
         if self.winding_model_mode:
@@ -4272,24 +4278,37 @@ def _finish_wandb_run():
 
 if __name__ == '__main__':
     import argparse
+    from dataclasses import replace
 
-    from fit_session import (conventional_input_paths, default_user_cache_dir,
-                             load_scroll_spec, scroll_spec_config_defaults)
+    from fit_session import (ScrollSpecError, default_user_cache_dir,
+                             load_input_manifest, scroll_spec_config_defaults,
+                             validate_fit_inputs)
+
+    # Flags of the dataset-directory CLI, refused with what replaced them.
+    retired_flags = {
+        '--dataset': 'name every input in an input manifest and pass --inputs '
+                     'MANIFEST; nothing is discovered in a dataset directory',
+        '--scroll-spec': 'spiral-scroll.json is retired: its scroll facts go in '
+                         'the input manifest\'s scroll block (pass --inputs MANIFEST)',
+        '--lasagna-url': 'state the remote URL as lasagna.original_url in the '
+                         'input manifest',
+    }
+
+    class RetiredFlag(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            parser.error(f'{option_string} is retired: {retired_flags[option_string]}')
 
     parser = argparse.ArgumentParser(
-        description='Headless Spiral fit over one dataset root.')
+        description='Headless Spiral fit of explicitly named inputs.')
     parser.add_argument(
-        '--dataset', required=True,
-        help='Dataset root holding the conventional Spiral layout and the '
-             'spiral-scroll.json scroll specification')
-    parser.add_argument(
-        '--scroll-spec', default=None,
-        help='Explicit scroll specification file '
-             '(default: <dataset>/spiral-scroll.json)')
+        '--inputs', required=True, metavar='MANIFEST',
+        help='Input manifest (JSON) naming the reference volume, the scroll '
+             'facts, the umbilicus and any supervision inputs; relative paths '
+             'resolve against its directory')
     parser.add_argument(
         '--object-store', required=True, metavar='STORE',
-        help='Object store (.vcobj) the fit reads patch, PCL and fiber '
-             'inputs from, and writes refreshed links to')
+        help='Object store (.vcobj) the fit reads patch, PCL, fiber, track and '
+             'outer-shell inputs from, and writes refreshed links to')
     parser.add_argument(
         '--object-store-author', default=None, metavar='NAME',
         help='Author of the links the startup refresh writes (required '
@@ -4299,11 +4318,9 @@ if __name__ == '__main__':
         help='Directory for derived host caches, shared with the interactive '
              'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
              '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
-    parser.add_argument(
-        '--lasagna-url', default=None, metavar='URL',
-        help='The remote manifest URL the dataset\'s Lasagna manifest is a '
-             'local copy of: its packs are that dataset\'s, shared with a '
-             'service fitting the URL')
+    for flag in retired_flags:
+        parser.add_argument(flag, nargs='?', action=RetiredFlag,
+                            help=argparse.SUPPRESS)
     cli_args = parser.parse_args()
     cache_dir = (cli_args.cache or os.environ.get('FIT_SPIRAL_CACHE_DIR')
                  or default_user_cache_dir())
@@ -4317,24 +4334,14 @@ if __name__ == '__main__':
             f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
             'use --object-store / --object-store-author')
     # The fit setting spiral_outward_sense stands in for a sense the
-    # specification does not decide, and must agree with one it does.
-    scroll_spec = load_scroll_spec(
-        cli_args.dataset, cli_args.scroll_spec,
-        outward_sense=overrides.get('spiral_outward_sense'))
-    input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)
-    if cli_args.lasagna_url:
-        # The fit reads the dataset as the copy of the URL's: its source
-        # document, written beside the packs, names that identity.
-        from dataclasses import replace
-        if not input_paths.lasagna:
-            parser.error('--lasagna-url names the remote dataset of a local '
-                         'manifest, and this dataset has none')
-        try:
-            source = read_lasagna_manifest(input_paths.lasagna, url=cli_args.lasagna_url)
-        except LasagnaSourceError as exc:
-            parser.error(str(exc))
-        input_paths = replace(input_paths, lasagna=write_lasagna_source(
-            source.dataset_directory(cache_dir), source))
+    # manifest's scroll does not decide, and must agree with one it does.
+    try:
+        scroll_spec, input_paths = load_input_manifest(
+            cli_args.inputs, cache_directory=cache_dir,
+            outward_sense=overrides.get('spiral_outward_sense'))
+    except ScrollSpecError as exc:
+        parser.error(str(exc))
+    input_paths = replace(input_paths, cache_directory=cache_dir)
 
     # The CLI is a torchrun rendezvous boundary: this is where RANK /
     # WORLD_SIZE / LOCAL_RANK are read, once, into an explicit context that is
@@ -4345,12 +4352,26 @@ if __name__ == '__main__':
     maybe_init_distributed(dist_context)
     try:
         config = Config().as_dict()
-        # A winding count in spiral-scroll.json replaces the generic default;
-        # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
+        # A winding count in the manifest's scroll replaces the generic
+        # default; FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(overrides)
         config['object_store_path'] = cli_args.object_store
         config['object_store_author'] = cli_args.object_store_author
+        # The inputs the configuration needs, checked before anything is
+        # built: a missing one is named, never looked for elsewhere.
+        input_errors = validate_fit_inputs(
+            input_paths, config, missing={
+                key: f'name it as {entry} in the input manifest'
+                for key, entry in (('umbilicus', 'umbilicus.path'),
+                                   ('lasagna', 'lasagna.manifest'),
+                                   ('fiber_directions', 'fiber_directions'),
+                                   ('winding_inference', 'winding_inference'))})
+        if input_errors:
+            raise SystemExit(
+                f'The inputs of {cli_args.inputs} cannot be fitted:\n  '
+                + '\n  '.join(f'{error["field"]}: {error["message"]}'
+                              for error in input_errors))
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',

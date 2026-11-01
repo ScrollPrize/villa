@@ -15,8 +15,8 @@ import torch
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA,
                          ScrollSpecError, SessionScroll, SessionState,
-                         SpiralInputPaths, SpiralProject, load_scroll_spec,
-                         resolve_dataset_root, validate_checkpoint_container)
+                         SpiralInputPaths, SpiralProject,
+                         validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
@@ -39,115 +39,6 @@ def _zip_checkpoint_bytes(payload=b"payload"):
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("data.pkl", payload)
     return buffer.getvalue()
-
-
-def write_scroll_spec(root, **extra):
-    document = {
-        "schema_version": 1,
-        "name": "s1",
-        "voxel_size_um": 9.6,
-        "spiral_outward_sense": "CW",
-        **extra,
-    }
-    (Path(root) / "spiral-scroll.json").write_text(json.dumps(document))
-
-
-class ScrollSpecTests(unittest.TestCase):
-    def test_missing_file_names_the_conventional_filename(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ScrollSpecError, "spiral-scroll.json"):
-                load_scroll_spec(temporary)
-
-    def test_schema_version_is_required(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "name": "s1", "voxel_size_um": 9.6,
-                "spiral_outward_sense": "CW"}))
-            with self.assertRaisesRegex(ScrollSpecError, "schema_version"):
-                load_scroll_spec(temporary)
-
-    def test_unknown_top_level_keys_are_ignored(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(
-                temporary,
-                base_shape_zyx=[18946, 8174, 8174],
-                future_extension={"enabled": True})
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.name, "s1")
-            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
-            self.assertNotIn("future_extension", spec.manifest())
-
-    def test_unknown_path_override_keys_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, paths={"scroll_zarr": "volume.zarr"})
-            with self.assertRaisesRegex(
-                    ScrollSpecError, r"unknown path override keys: \['scroll_zarr'\]"):
-                load_scroll_spec(temporary)
-
-    def test_required_physical_facts_and_defaults(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "schema_version": 1, "name": "s1"}))
-            with self.assertRaisesRegex(
-                    ScrollSpecError,
-                    r"missing required keys: \['spiral_outward_sense', "
-                    r"'voxel_size_um'\]"):
-                load_scroll_spec(temporary)
-            write_scroll_spec(temporary)
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.name, "s1")
-            self.assertEqual(spec.spiral_outward_sense, "CW")
-            self.assertIsNone(spec.base_shape_zyx)
-            self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
-            # No default: resolve_lasagna_scale derives or requires it.
-            self.assertIsNone(spec.lasagna_scale)
-            self.assertEqual(spec.path_overrides, ())
-
-    def test_base_shape_is_validated_and_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
-            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
-                write_scroll_spec(temporary, base_shape_zyx=invalid)
-                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
-                    load_scroll_spec(temporary)
-
-    def test_relative_path_overrides_resolve_against_dataset_root(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(
-                temporary,
-                paths={"umbilicus": "annotations/umbilicus.json",
-                       "fiber_directions": "/elsewhere/fiber_directions.npz"})
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(
-                spec.path_override("umbilicus"),
-                str(Path(temporary).resolve() / "annotations" / "umbilicus.json"))
-            self.assertEqual(spec.path_override("fiber_directions"),
-                             "/elsewhere/fiber_directions.npz")
-
-    def test_dataset_resolution_takes_an_optional_spec_and_honors_it(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "normals").mkdir()
-            # The project supplies the facts it knows: without a specification
-            # the dataset still resolves, stating none.
-            bare = resolve_dataset_root(root)
-            self.assertTrue(bare.ok)
-            self.assertEqual(bare.scroll_spec, {"path_overrides": {}})
-            (root / "spiral-scroll.json").write_text("{")
-            invalid = resolve_dataset_root(root)
-            self.assertIn("scroll_spec", invalid.missing_required)
-            self.assertTrue(any("spiral-scroll.json" in warning
-                                for warning in invalid.warnings))
-            write_scroll_spec(root, paths={"winding_inference": "normals"})
-            result = resolve_dataset_root(root)
-            self.assertTrue(result.ok)
-            self.assertEqual(result.scroll_spec["name"], "s1")
-            self.assertEqual(result.resolved["winding_inference"],
-                             str(root.resolve() / "normals"))
-            # The project supplies the umbilicus, never the dataset.
-            self.assertNotIn("umbilicus", result.resolved)
 
 
 class ProjectScrollTests(unittest.TestCase):
@@ -218,20 +109,8 @@ class ProjectScrollTests(unittest.TestCase):
             self.scroll({"location": "s3://b/p.lasagna.json", "error": "multichannel"},
                         voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
 
-    def test_the_cli_takes_the_sense_setting_where_its_spec_does_not_decide(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "schema_version": 1, "name": "s", "voxel_size_um": 2.0}))
-            self.assertEqual(load_scroll_spec(temporary, outward_sense="ACW")
-                             .spiral_outward_sense, "ACW")
-            with self.assertRaisesRegex(ScrollSpecError, "spiral_outward_sense"):
-                load_scroll_spec(temporary)
-            write_scroll_spec(temporary)  # states CW
-            with self.assertRaisesRegex(ScrollSpecError, "contradicts the fit setting"):
-                load_scroll_spec(temporary, outward_sense="ACW")
 
-
-class DatasetResolverTests(unittest.TestCase):
+class CheckpointContainerTests(unittest.TestCase):
     def test_truncated_torch_checkpoint_is_rejected_before_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "truncated.ckpt"
@@ -245,27 +124,6 @@ class DatasetResolverTests(unittest.TestCase):
             torch.save({"value": 1}, checkpoint, _use_new_zipfile_serialization=False)
             with self.assertRaisesRegex(ValueError, "Legacy pickle checkpoints are not supported"):
                 validate_checkpoint_container(checkpoint)
-
-    def test_conventional_resolution_reads_no_store_inputs(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            write_scroll_spec(root)
-            (root / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            (root / "fibers").mkdir()
-            (root / "tracks").mkdir()
-            (root / "tracks" / "only.dbm.db").write_bytes(b"")
-            (root / "abs_winding.json").write_text("{}")
-            (root / "relative_windings.json").write_text("{}")
-            (root / "same_windings.json").write_text("{}")
-            (root / "drawn_control_points.json").write_text("{}")
-            result = resolve_dataset_root(root)
-            self.assertTrue(result.ok)
-            # Patches, fibers, PCLs and tracks come from the object store:
-            # the dataset's files are not inputs any more.
-            self.assertFalse({"verified_patches", "fibers", "tracks_dbm"}
-                             & set(result.resolved))
-            self.assertFalse(hasattr(result, "pcl_inputs"))
 
 
 class HandoffTests(unittest.TestCase):
@@ -1138,7 +996,7 @@ class ProtocolTests(unittest.TestCase):
         session._status_callback = None
         session._autosave_on_pause = autosave_on_pause
         session.paths = SpiralInputPaths.from_mapping({
-            "dataset_root": "/datasets/scroll1",
+            "volume_uuid": "volume-1",
             "output_directory": str(output_path),
         })
 
@@ -1172,7 +1030,7 @@ class ProtocolTests(unittest.TestCase):
                 (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
             self.assertEqual(metadata["schema"], AUTOSAVE_METADATA_SCHEMA)
             self.assertEqual(metadata["session_namespace"], str(output))
-            self.assertEqual(metadata["dataset_root"], "/datasets/scroll1")
+            self.assertEqual(metadata["volume_uuid"], "volume-1")
             self.assertEqual(metadata["completed_iterations"], 10)
             self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
 

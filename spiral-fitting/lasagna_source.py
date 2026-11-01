@@ -371,14 +371,3 @@ def fiber_directions_path(cache_directory: str | os.PathLike[str], identity: str
         raise LasagnaSourceError(f"invalid fiber-direction scale {output_scale!r}")
     return os.path.join(str(cache_directory), "fiber-directions", check_identity(identity),
                         f"scale{float(output_scale):g}.npz")
-
-
-def find_dataset_manifest(directory: str | os.PathLike[str]) -> str:
-    """The one ``*.lasagna.json`` in ``directory``, or '' when there is none
-    or more than one."""
-    try:
-        found = sorted(entry for entry in os.listdir(directory)
-                       if entry.endswith(MANIFEST_SUFFIX))
-    except OSError:
-        return ""
-    return os.path.join(str(directory), found[0]) if len(found) == 1 else ""

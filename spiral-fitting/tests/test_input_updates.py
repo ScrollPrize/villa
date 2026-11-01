@@ -22,7 +22,7 @@ import spiral_runtime  # noqa: E402
 from object_store_fixture import put_patch  # noqa: E402
 from service_project import with_project  # noqa: E402
 from test_runtime_object_store import (  # noqa: E402,F401
-    RUN, cpu, device_stubs, settle, stub_device_stages, write_dataset)
+    RUN, cpu, device_stubs, settle, stub_device_stages, write_inputs)
 from test_object_store_startup import store_path  # noqa: E402,F401
 from test_service_hub_positions import (  # noqa: E402,F401
     REQUEST, _pinned_at_new_position, hub, state)
@@ -250,7 +250,7 @@ def _rank_update(rank, world_size, rendezvous, root, store, config, position, re
     stub_device_stages(fit_spiral)
     fit_spiral.FitContext._build_theta_crossing_map = lambda self: []
     session = InteractiveFitSession(
-        SpiralInputPaths(dataset_root=root, umbilicus=f'{root}/umbilicus.json',
+        SpiralInputPaths(umbilicus=f'{root}/umbilicus.json',
                          output_directory=f'{root}-out-{rank}'),
         SpiralRunConfig(0, 64, config=config), SpiralPreviewConfig(),
         reference.scroll_spec(), lambda status: None, publishes_outputs=rank == 0,
@@ -281,7 +281,7 @@ def test_two_ranks_install_the_same_inputs(state, hub, device_stubs, tmp_path):
     # service linked it), then updates to the new one.
     config = {**RUN, 'object_store_path': state.object_store.path, 'object_store_author': 'svc',
               'object_store_input_position': first}
-    root = str(write_dataset(tmp_path / 'ranks-dataset'))
+    root = str(write_inputs(tmp_path / 'ranks-inputs'))
     results = [str(tmp_path / f'rank{rank}.json') for rank in range(2)]
     rendezvous = tmp_path / 'rendezvous'
     rendezvous.mkdir()
@@ -311,8 +311,8 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     import spiral_service
     state.initialize(with_project(REQUEST))
     before = settle(state)
-    assert state.dataset()['capabilities']['input_updates'] is True
-    assert state.dataset()['capabilities']['inputs_frozen'] is False
+    assert state.binding_advertisement()['capabilities']['input_updates'] is True
+    assert state.binding_advertisement()['capabilities']['inputs_frozen'] is False
     session_id = state.session_id
     with ObjectStore.open(hub['editor'], author='editor') as db:
         db.hub_sync(pull=True, push=False)
@@ -456,7 +456,7 @@ def test_a_shared_plain_store_updates_in_place(store_path, tmp_path, device_stub
     from test_service_hub_positions import _service_state
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
-        assert state.dataset()['capabilities']['input_updates'] is True
+        assert state.binding_advertisement()['capabilities']['input_updates'] is True
         state.initialize(with_project(REQUEST))
         before = settle(state)
         identity = state.object_store.positions

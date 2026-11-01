@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import spiral_runtime  # noqa: E402
 import spiral_service  # noqa: E402
 from config import Config  # noqa: E402
-from fit_session import resolve_dataset_root  # noqa: E402
 from service_lifecycle_transcript import FakeRuntime  # noqa: E402
 
 NO_DENSE = {'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
@@ -93,16 +92,12 @@ def main(argv=None):
     parser.add_argument('--port-file', required=True)
     args = parser.parse_args(argv)
     root = Path(args.root)
-    dataset = root / 'dataset'
-    # The client's project gives the scroll and umbilicus: the dataset holds
-    # nothing this fixture reads.
-    dataset.mkdir(parents=True, exist_ok=True)
+    # The client's project gives the scroll and umbilicus; the service binds
+    # only its host paths.
     output = root / 'output'
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(dataset), output, root / 'cache')
     spiral_runtime.create_session = FrozenInputsRuntime
     state = spiral_service.ServiceState(
-        dataset_root=str(dataset), dataset_resolution=resolution,
+        bindings=spiral_service.bind_service_inputs(output, root / 'cache'),
         object_store=spiral_service.bind_object_store(args.store, 'protocol-test', args.hub),
         startup_run={'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)})
     server = spiral_service.SpiralServer(('127.0.0.1', 0), ['key'], state)

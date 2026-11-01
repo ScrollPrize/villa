@@ -1,24 +1,27 @@
 """The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
-from fit_session import (FIT_INPUT_CATALOG, RETIRED_PATH_OVERRIDE_KEYS,
-                         SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
-                         fit_input, input_source_enabled, lasagna_packs_required,
-                         outer_shell_required,
-                         parse_scroll_spec, winding_inference_enabled)
+from fit_session import (FIT_INPUT_CATALOG, INPUT_MANIFEST_KEYS,
+                         SpiralInputPaths, fit_input, input_source_enabled,
+                         lasagna_packs_required, outer_shell_required,
+                         winding_inference_enabled)
 
 
 def test_catalog_covers_every_fit_input_path_field():
     keys = {spec.key for spec in FIT_INPUT_CATALOG}
     input_fields = set(SpiralInputPaths.__dataclass_fields__) - {
-        # Not fit inputs: identity, deployment, and resume locations.
-        "dataset_root", "scroll_zarr", "checkpoint",
+        # Not fit inputs: identity, provenance, deployment, and resume
+        # locations.
+        "volume_uuid", "provenance", "scroll_zarr", "checkpoint",
         "output_directory", "cache_directory",
     }
     assert keys == input_fields
-    assert set(SCROLL_SPEC_PATH_OVERRIDE_KEYS) == keys
-    # Patches, fibers and point collections come from the object store.
-    assert not {"verified_patches", "fibers", "pcls"} & keys
+    # The command-line manifest names every one of them.
+    assert keys <= set(INPUT_MANIFEST_KEYS)
+    # Patches, fibers, point collections, tracks and the outer shell come
+    # from the object store.
+    assert not {"verified_patches", "fibers", "pcls", "tracks", "tracks_dbm",
+                "outer_shell"} & (keys | set(INPUT_MANIFEST_KEYS))
 
 
 def test_omitted_spacing_mode_uses_fitter_default():
@@ -75,17 +78,6 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
                "loss_weight_dense_normals": 0.0}
     assert not any(fit_input(key).required(invalid)
                    for key in ("lasagna", "winding_inference"))
-
-
-def test_a_specification_naming_retired_patch_or_fiber_paths_still_parses(tmp_path):
-    spec = parse_scroll_spec({
-        "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
-        "spiral_outward_sense": "CW",
-        "paths": {"verified_patches": "patches", "fibers": "fibers",
-                  "outer_shell": "shell", "tracks_dbm": "tracks/t.dbm"}}, tmp_path)
-    assert dict(spec.path_overrides) == {}
-    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {
-        "verified_patches", "fibers", "outer_shell", "tracks_dbm"}
 
 
 def test_source_toggles_and_dependencies_are_centralized():

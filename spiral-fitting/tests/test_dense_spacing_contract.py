@@ -67,7 +67,7 @@ class TestModeContract:
         paths = replace(paths, winding_inference=str(store))
         messages = {error['field']: error['message']
                     for error in validate_session_request(paths, run)}
-        assert messages['winding_inference'] == 'manifest.json is missing'
+        assert messages['winding_inference'].startswith('manifest.json is missing')
 
         (store / 'manifest.json').write_text(json.dumps({
             'artifact_type': 'winding_inference_crossings',

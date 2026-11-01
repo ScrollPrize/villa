@@ -144,7 +144,7 @@ def test_fit_environment_can_disable_wandb(tmp_path, monkeypatch):
 
 def test_parser_accepts_config_and_wandb_options(tmp_path):
     args = run_single.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
         "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config", str(tmp_path / "config.json"),
@@ -236,7 +236,7 @@ def test_parse_gpu_ids_rejects_duplicates(text):
 def test_parser_no_longer_accepts_overrides(tmp_path):
     with pytest.raises(SystemExit):
         run_single.build_parser().parse_args([
-            "--dataset", str(tmp_path / "dataset"),
+            "--inputs", str(tmp_path / "spiral-inputs.json"),
             "--object-store", str(tmp_path / "inputs.vcobj"),
             "--ink-volume", str(tmp_path / "ink"),
             "--overrides", str(tmp_path / "config.json"),
@@ -276,7 +276,7 @@ def test_run_id_rejects_unsafe_values(value):
 
 def _runner_args(tmp_path, *extra):
     return run_single.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
         "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),

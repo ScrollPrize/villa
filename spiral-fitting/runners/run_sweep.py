@@ -134,7 +134,7 @@ def child_command(
 ) -> list[str]:
     command = [
         sys.executable, str(Path(__file__).with_name("run_single.py")),
-        "--dataset", str(args.dataset), "--ink-volume", str(args.ink_volume),
+        "--inputs", str(args.inputs), "--ink-volume", str(args.ink_volume),
         "--object-store", str(args.object_store),
         "--output", str(args.output.resolve() / stem),
         "--config", str(config), "--resume", "--gpus",
@@ -217,7 +217,7 @@ def execute(args: argparse.Namespace) -> int:
         run_single.overwrite_output(
             args.output,
             protected_paths=(
-                args.dataset,
+                args.inputs,
                 args.ink_volume,
                 args.vc_render_bin,
                 args.config_folder,

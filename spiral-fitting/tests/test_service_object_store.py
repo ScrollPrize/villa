@@ -18,14 +18,14 @@ from vc_object_store import ObjectStore  # noqa: E402
 import spiral_service  # noqa: E402
 from config import Config  # noqa: E402
 from fit_session import (SessionState, SpiralInputPaths,  # noqa: E402
-                         SpiralRunConfig, resolve_dataset_root)
+                         SpiralRunConfig)
 from service_http import ApiError  # noqa: E402
 from service_project import UMBILICUS, project, with_project  # noqa: E402
 from object_store_fixture import VOLUME  # noqa: E402
 from test_object_store_startup import store_path  # noqa: E402,F401
 
-# The dataset has no Lasagna stores or shell, so runs turn off the losses
-# that would need them.
+# The project has no Lasagna stores and the store no shell, so runs turn off
+# the losses that would need them.
 NO_DENSE = {'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
             'loss_weight_dense_normals': 0, 'loss_weight_shell_outer': 0}
 
@@ -37,22 +37,18 @@ def store(store_path):
 
 
 @pytest.fixture()
-def dataset(tmp_path):
-    root = tmp_path / 'dataset'
-    root.mkdir()
-    (root / 'spiral-scroll.json').write_text(json.dumps({
-        'schema_version': 1, 'name': 's1', 'voxel_size_um': 9.6,
-        'spiral_outward_sense': 'CW'}))
+def host(tmp_path):
+    # The service's host paths: no dataset directory, no spiral-scroll.json.
     output = tmp_path / 'output'
     output.mkdir()
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(root), output, tmp_path / 'cache')
-    return SimpleNamespace(root=root, output=output, resolution=resolution)
+    return SimpleNamespace(output=output, cache=tmp_path / 'cache',
+                           bindings=spiral_service.bind_service_inputs(
+                               output, tmp_path / 'cache'))
 
 
-def service(dataset, store, **kwargs):
+def service(host, store, bindings=None, **kwargs):
     return spiral_service.ServiceState(
-        dataset_root=str(dataset.root), dataset_resolution=dataset.resolution,
+        bindings=bindings or host.bindings,
         object_store=spiral_service.bind_object_store(store, 'spiral-test'),
         startup_run={'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)},
         **kwargs)
@@ -96,34 +92,34 @@ def test_binding_fails_clearly_without_a_store_or_the_module(tmp_path,
         spiral_service.bind_object_store(garbage)
 
 
-def _launch(dataset, *extra):
-    return ['--dataset', str(dataset.root), '--output',
-            str(dataset.output / 'svc'), '--cache', str(dataset.output / 'cache'),
-            '--api-key-file', str(dataset.output / 'key'), *extra]
+def _launch(host, *extra):
+    return ['--output',
+            str(host.output / 'svc'), '--cache', str(host.output / 'cache'),
+            '--api-key-file', str(host.output / 'key'), *extra]
 
 
-def test_launch_requires_a_usable_object_store(dataset, tmp_path, capsys):
+def test_launch_requires_a_usable_object_store(host, tmp_path, capsys):
     with pytest.raises(SystemExit) as raised:
-        spiral_service.main(_launch(dataset))
+        spiral_service.main(_launch(host))
     assert raised.value.code == 2
     assert '--object-store' in capsys.readouterr().err
     assert spiral_service.main(_launch(
-        dataset, '--object-store', str(tmp_path / 'missing.vcobj'))) == 2
+        host, '--object-store', str(tmp_path / 'missing.vcobj'))) == 2
     assert 'Refusing to start: no object store at' in capsys.readouterr().err
 
 
-def test_launch_config_must_not_set_the_binding(dataset, store, capsys):
+def test_launch_config_must_not_set_the_binding(host, store, capsys):
     for key in spiral_service.SERVICE_OWNED_CONFIG_KEYS:
         with pytest.raises(SystemExit):
             spiral_service.main(_launch(
-                dataset, '--object-store', store,
+                host, '--object-store', store,
                 '--config', json.dumps({key: '/elsewhere.vcobj'})))
         assert f'--config must not set {key}' in capsys.readouterr().err
 
 
 def test_session_requests_refuse_client_bindings_and_receive_the_service_one(
-        dataset, store):
-    state = service(dataset, store)
+        host, store):
+    state = service(host, store)
     for key in spiral_service.SERVICE_OWNED_CONFIG_KEYS:
         with pytest.raises(ApiError) as raised:
             state._prepare_session_request(with_project(
@@ -144,8 +140,8 @@ def test_session_requests_refuse_client_bindings_and_receive_the_service_one(
         assert run.config['object_store_author'] == 'spiral-test'
 
 
-def test_configuration_marks_the_binding_service_owned(dataset, store):
-    catalog = service(dataset, store).configuration_catalog()
+def test_configuration_marks_the_binding_service_owned(host, store):
+    catalog = service(host, store).configuration_catalog()
     for key in spiral_service.SERVICE_OWNED_CONFIG_KEYS:
         assert catalog['schema']['fields'][key]['service_owned'] is True
     assert catalog['defaults']['object_store_path'] == str(Path(store).resolve())
@@ -155,7 +151,7 @@ def test_configuration_marks_the_binding_service_owned(dataset, store):
                    if key not in spiral_service.SERVICE_OWNED_CONFIG_KEYS)
 
 
-def test_the_binding_wins_over_a_resumed_checkpoints_store(dataset, store,
+def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store,
                                                            monkeypatch):
     import checkpoint_io
     from spiral_progress import NullProgressReporter
@@ -166,8 +162,8 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(dataset, store,
                   object_store_author='someone-else')
     monkeypatch.setattr(checkpoint_io, 'load_checkpoint_cpu',
                         lambda path: {'cfg': copy.deepcopy(stored)})
-    state = service(dataset, store)
-    checkpoint = dataset.output / 'resume.ckpt'
+    state = service(host, store)
+    checkpoint = host.output / 'resume.ckpt'
     checkpoint.write_bytes(b'PK\x03\x04')
     _, run, _, _ = state._prepare_session_request(with_project(state.startup_session_request()))
     # The checkpoint's model-shaping keys are untouched: the binding is no
@@ -185,8 +181,8 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(dataset, store,
     assert config['object_store_author'] == 'spiral-test'
 
 
-def test_a_run_keeps_the_resident_binding(dataset, store):
-    state = service(dataset, store)
+def test_a_run_keeps_the_resident_binding(host, store):
+    state = service(host, store)
     applied = Config().as_dict()
     applied.update(state.object_store.config())
 
@@ -201,7 +197,7 @@ def test_a_run_keeps_the_resident_binding(dataset, store):
 
     resident = state.session = Resident()
     state.session_id = 'spiral-1'
-    state.session_paths = SpiralInputPaths(output_directory=str(dataset.output))
+    state.session_paths = SpiralInputPaths(output_directory=str(host.output))
     state.session_request = {'run': SpiralRunConfig(0, 10).manifest()}
     configuration = Config().as_dict()
     configuration['object_store_path'] = None
@@ -252,7 +248,7 @@ class Http:
 
 
 @pytest.fixture()
-def http(dataset, store, monkeypatch):
+def http(host, store, monkeypatch):
     import spiral_runtime
     from service_lifecycle_transcript import FakeRuntime
     built = []
@@ -261,7 +257,7 @@ def http(dataset, store, monkeypatch):
         built.append(kwargs)
         return FakeRuntime()
     monkeypatch.setattr(spiral_runtime, 'create_session', create_session)
-    client = Http(service(dataset, store))
+    client = Http(service(host, store))
     client.built = built
     yield client
     client.close()
@@ -327,9 +323,9 @@ def test_releasing_the_lease_tears_the_session_down(http):
 
 
 @pytest.mark.parametrize('user', ['request', 'background', 'command'])
-def test_release_waits_for_every_user_of_the_service(dataset, store, user):
+def test_release_waits_for_every_user_of_the_service(host, store, user):
     from concurrent.futures import ThreadPoolExecutor
-    state = service(dataset, store)
+    state = service(host, store)
     lease = state.lease()
     lease.claim('owner', 'claim')
     entered, finish = threading.Event(), threading.Event()
@@ -379,11 +375,11 @@ def test_a_fitter_that_will_not_close_keeps_the_lease_for_a_retry(http, monkeypa
     assert http.state.session_lease is None
 
 
-def test_release_during_construction_closes_the_installed_fitter(dataset, store,
+def test_release_during_construction_closes_the_installed_fitter(host, store,
                                                                  monkeypatch):
     import sys
     import types
-    state = service(dataset, store)
+    state = service(host, store)
     state.lease().claim('owner', 'claim')
     entered, finish, closed = threading.Event(), threading.Event(), threading.Event()
 
@@ -431,9 +427,9 @@ def filled_store(tmp_path):
     return str(path)
 
 
-def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store):
-    state = service(dataset, filled_store)
-    advertised = state.dataset()
+def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
+    state = service(host, filled_store)
+    advertised = state.binding_advertisement()
     with ObjectStore.open(filled_store, read_only=True) as db:
         positions = db.store_positions()
     assert advertised['object_store'] == {
@@ -443,10 +439,11 @@ def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store)
                       'position_error': None}}
     assert advertised['capabilities'] == {
         'input_source': 'object_store', 'inputs_frozen': False,
-        'input_reload_rebuild': True, 'input_positions': True, 'input_updates': True}
-    # The dataset no longer resolves or advertises patch, fiber or PCL files.
+        'input_reload_rebuild': True, 'input_positions': True, 'input_updates': True,
+        'winding_inference': False}
+    # Nothing advertises patch, fiber or PCL files, or a host.
     assert 'pcl_inputs' not in advertised
-    assert not {'verified_patches', 'fibers'} & set(advertised['resolved'])
+    assert not {'root', 'resolved', 'detected_checkpoints', 'scroll_spec'} & set(advertised)
     inputs = advertised['inputs']
     assert inputs['ok'] and inputs['volume_uuid'] == '20260411134726'
     assert inputs['volume_source'] == 'inferred'
@@ -469,8 +466,8 @@ def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store)
         assert len(db.edges_by_kind('point-surface')) == 1
 
 
-def test_discovery_follows_store_changes_and_reports_refusals(dataset, filled_store):
-    state = service(dataset, filled_store)
+def test_discovery_follows_store_changes_and_reports_refusals(host, filled_store):
+    state = service(host, filled_store)
     first = state.startup_inputs()
     assert state.startup_inputs() is first
     with ObjectStore.open(filled_store, author='editor') as db:
@@ -482,14 +479,13 @@ def test_discovery_follows_store_changes_and_reports_refusals(dataset, filled_st
     assert 'selected objects declare different volumes' in refused['problems'][0]
 
 
-def test_validation_requires_no_patch_fiber_or_pcl_files(dataset, store):
-    state = service(dataset, store)
-    assert not (dataset.root / 'verified_patches').exists()
+def test_validation_requires_no_patch_fiber_or_pcl_files(host, store):
+    state = service(host, store)
     paths, run, _, _ = state._prepare_session_request(with_project(state.startup_session_request()))
     assert not {'verified_patches', 'fibers', 'pcls'} & set(paths.manifest())
 
 
-def test_starting_the_service_and_discovery_do_not_import_torch(dataset, filled_store,
+def test_starting_the_service_and_discovery_do_not_import_torch(host, filled_store,
                                                                 tmp_path):
     import os
     import socket
@@ -506,15 +502,15 @@ def probe():
     for _ in range(200):
         try:
             request = urllib.request.Request(
-                'http://127.0.0.1:{port}/dataset',
+                'http://127.0.0.1:{port}/bindings',
                 headers={{'Authorization': 'Bearer ' + open({str(tmp_path / 'key')!r}).read().strip()}})
             with urllib.request.urlopen(request, timeout=10) as response:
-                dataset = json.loads(response.read())
+                bindings = json.loads(response.read())
             break
         except Exception:
             time.sleep(0.05)
     print('RESULT', json.dumps({{'torch': 'torch' in sys.modules,
-                               'ok': dataset['inputs']['ok']}}), file=sys.stderr, flush=True)
+                               'ok': bindings['inputs']['ok']}}), file=sys.stderr, flush=True)
     os.kill(os.getpid(), signal.SIGTERM)
 
 threading.Thread(target=probe, daemon=True).start()
@@ -522,8 +518,8 @@ sys.exit(spiral_service.main(sys.argv[1:]))
 """
     result = subprocess.run(
         [sys.executable, '-c', script, '--port', str(port),
-         '--api-key-file', str(tmp_path / 'key'), '--dataset', str(dataset.root),
-         '--output', str(dataset.output / 'svc'), '--object-store', filled_store,
+         '--api-key-file', str(tmp_path / 'key'),
+         '--output', str(host.output / 'svc'), '--object-store', filled_store,
          # The store has no outer shell, so the shell losses are off.
          '--config', json.dumps(NO_DENSE)],
         cwd=str(Path(spiral_service.__file__).parent), capture_output=True,
@@ -551,21 +547,21 @@ def _built(state, request, timeout=60):
     return built[0] if built else state.status()['input_preparation_error']
 
 
-def test_a_request_must_carry_its_project(dataset, store):
-    state = service(dataset, store)
+def test_a_request_must_carry_its_project(host, store):
+    state = service(host, store)
     with pytest.raises(ApiError) as refused:
         state.initialize(initialize_body() | {'project': None})
     assert refused.value.status == 400
     assert [detail['field'] for detail in refused.value.details] == ['project']
 
 
-def test_the_build_reads_the_project_of_its_fit_volume(dataset, store):
-    state = service(dataset, store)
+def test_the_build_reads_the_project_of_its_fit_volume(host, store):
+    state = service(host, store)
     paths, scroll = _built(state, initialize_body())
     # The fit volume the store's inputs name selects the project's volume:
     # its umbilicus, written where the fit reads it, and the scroll.
     from umbilicus import json_umbilicus_z_to_yx
-    assert Path(paths.umbilicus).parent == dataset.output / 'project-inputs'
+    assert Path(paths.umbilicus).parent == host.output / 'project-inputs'
     assert json_umbilicus_z_to_yx(paths.umbilicus)(32.0).tolist() == [32.0, 32.0]
     assert (scroll.name, scroll.voxel_size_um, scroll.spiral_outward_sense) == (
         's1', 9.6, 'CW')
@@ -578,36 +574,31 @@ def test_the_build_reads_the_project_of_its_fit_volume(dataset, store):
     assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
 
 
-def test_the_scroll_is_the_projects_and_the_sense_a_fit_setting(dataset, store):
-    # The dataset's specification is the command-line fit's: a service
-    # session neither reads its facts nor needs the file.
-    (dataset.root / 'spiral-scroll.json').write_text(json.dumps({
-        'schema_version': 1, 'name': 'cli', 'voxel_size_um': 1.0,
-        'spiral_outward_sense': 'ACW'}))
+def test_the_scroll_is_the_projects_and_the_sense_a_fit_setting(host, store):
     facts = {'voxel_size_um': 7.91, 'base_shape_zyx': [100, 64, 64],
              'z_direction_is_top_to_bottom': None, 'left_handed_coordinates': None}
     body = initialize_body() | {'project': project(name='PHerc', **facts)}
-    failure = _built(service(dataset, store), body)
+    failure = _built(service(host, store), body)
     assert 'set the fit setting spiral_outward_sense' in failure['message']
     body['run']['config']['spiral_outward_sense'] = 'ACW'
-    _, scroll = _built(service(dataset, store), body)
+    _, scroll = _built(service(host, store), body)
     assert (scroll.name, scroll.voxel_size_um, scroll.base_shape_zyx,
             scroll.spiral_outward_sense) == ('PHerc', 7.91, (100, 64, 64), 'ACW')
     # A volume whose catalog orientation decides the sense refuses another.
-    failure = _built(service(dataset, store), initialize_body() | {
+    failure = _built(service(host, store), initialize_body() | {
         'run': {**body['run'], 'config': {**body['run']['config'],
                                           'spiral_outward_sense': 'ACW'}}})
     assert 'contradicts the catalog' in failure['message']
 
 
-def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
+def test_the_lasagna_dataset_is_the_projects(host, store, tmp_path):
     from lasagna_source import load_lasagna_source, url_identity
     # A remote dataset is identified by its URL, which VC3D sends alone.
     lasagna = {'location': 'https://data.example/p.lasagna.json', 'group': '3'}
     for key in ('normal_x', 'normal_y', 'gradient_magnitude'):
         lasagna[key] = f'https://data.example/{key}.ome.zarr'
     body = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
-    paths, scroll = _built(service(dataset, store), body)
+    paths, scroll = _built(service(host, store), body)
     # The fit reads the project's dataset by identity; its stores need not
     # be readable here.
     source = load_lasagna_source(paths.lasagna)
@@ -621,13 +612,13 @@ def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
     needs_normals = initialize_body() | {'project': project(lasagna=lasagna, lasagna_scale=2)}
     needs_normals['run']['config']['loss_weight_dense_normals'] = 1.0
     with pytest.raises(ApiError) as refused:
-        service(dataset, store).initialize(needs_normals)
+        service(host, store).initialize(needs_normals)
     [detail] = refused.value.details
     assert detail['field'] == 'lasagna' and 'not in the cache' in detail['message']
     pack = Path(source.pack_directory(paths.cache_directory, 'normals'))
     pack.mkdir(parents=True)
     (pack / 'meta.json').write_text('{}')
-    paths, _ = _built(service(dataset, store), needs_normals)
+    paths, _ = _built(service(host, store), needs_normals)
     assert load_lasagna_source(paths.lasagna) == source
 
     # A fit that needs normals the project cannot give is refused before
@@ -635,56 +626,56 @@ def test_the_lasagna_dataset_is_the_projects(dataset, store, tmp_path):
     body = initialize_body()
     body['run']['config']['loss_weight_dense_normals'] = 1.0
     with pytest.raises(ApiError) as refused:
-        service(dataset, store).initialize(body)
+        service(host, store).initialize(body)
     assert {(detail['field'], 'selects no Lasagna dataset' in detail['message'])
             for detail in refused.value.details} == {('lasagna', True)}
 
     # A local dataset's identity is VC3D's; a remote one's cannot be.
     local = {**lasagna, 'location': '/data/p.lasagna.json', 'identity': 'run-1'}
-    paths, _ = _built(service(dataset, store), initialize_body() | {
+    paths, _ = _built(service(host, store), initialize_body() | {
         'project': project(lasagna=local, lasagna_scale=2)})
     assert load_lasagna_source(paths.lasagna).identity == 'run-1'
     with pytest.raises(ApiError, match='identified by its URL'):
-        service(dataset, store).initialize(initialize_body() | {
+        service(host, store).initialize(initialize_body() | {
             'project': project(lasagna={**lasagna, 'identity': 'run-1'}, lasagna_scale=2)})
 
 
-def test_fiber_directions_are_the_project_datasets_cached_samples(dataset, store):
+def test_fiber_directions_are_the_project_datasets_cached_samples(host, store):
     from lasagna_source import fiber_directions_path, url_identity
     fibers = {'location': 'https://data.example/f.lasagna.json'}
     body = initialize_body() | {'project': project(fiber_inference=fibers, fiber_scale=4)}
     body['run']['config'].update(input_use_fiber_directions=True,
                                  loss_weight_fiber_directions=1.0)
     # The loss needs them: without the cache's samples the build is refused.
-    failure = _built(service(dataset, store), body)
+    failure = _built(service(host, store), body)
     assert 'no fiber directions of https://data.example/f.lasagna.json' in failure['message']
     # Enabled without the loss, they are read when the project can give them.
     optional = initialize_body() | {'project': project()}
     optional['run']['config'].update(input_use_fiber_directions=True)
-    paths, _ = _built(service(dataset, store), optional)
+    paths, _ = _built(service(host, store), optional)
     assert paths.fiber_directions == ''
 
     cached = Path(fiber_directions_path(paths.cache_directory,
                                         url_identity(fibers['location']), 4))
     cached.parent.mkdir(parents=True)
     cached.write_bytes(b'')
-    paths, _ = _built(service(dataset, store), body)
+    paths, _ = _built(service(host, store), body)
     assert paths.fiber_directions == str(cached)
     optional['project'] = project(fiber_inference=fibers, fiber_scale=4)
-    assert _built(service(dataset, store), optional)[0].fiber_directions == str(cached)
+    assert _built(service(host, store), optional)[0].fiber_directions == str(cached)
 
 
-def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(dataset, store):
-    failure = _built(service(dataset, store),
+def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(host, store):
+    failure = _built(service(host, store),
                      initialize_body() | {'project': project(volume='other-volume')})
     assert f'the fit volume {VOLUME} is not a volume of the project' in failure['message']
-    failure = _built(service(dataset, store),
+    failure = _built(service(host, store),
                      initialize_body() | {'project': project(umbilicus=None)})
     assert 'has no umbilicus for the fit volume' in failure['message']
 
 
-def test_a_changed_project_volume_rebuilds_everything(dataset, store):
-    state = service(dataset, store)
+def test_a_changed_project_volume_rebuilds_everything(host, store):
+    state = service(host, store)
     _built(state, initialize_body())
     state.session = SimpleNamespace(status=lambda: {'state': SessionState.Idle,
                                                     'input_generation': 0})
@@ -697,3 +688,115 @@ def test_a_changed_project_volume_rebuilds_everything(dataset, store):
         with state.lock:
             assert state._rebuild_stage_locked(paths, run, preview, scroll,
                                                SessionState.Idle) == stage
+
+
+# ---------------------------------------------------------------------------
+# Host bindings: no dataset, winding inference bound at launch
+# ---------------------------------------------------------------------------
+
+WINDING_MODEL = {**NO_DENSE, 'dense_spacing_mode': 'winding_model'}
+
+
+def winding_artifact(directory, valid=True):
+    directory.mkdir()
+    (directory / 'manifest.json').write_text(json.dumps({
+        'artifact_type': 'winding_inference_crossings' if valid else 'other',
+        'format_version': 1}))
+    return directory
+
+
+def test_bindings_advertise_the_winding_inference_binding(host, store, tmp_path):
+    unbound = service(host, store).binding_advertisement()
+    assert unbound['bindings']['output_directory'] == str(host.output)
+    assert unbound['bindings']['cache_directory'] == str(host.cache)
+    assert unbound['bindings']['winding_inference'] == {
+        'bound': False, 'path': None, 'available': False,
+        'error': 'the service was launched without --winding-inference'}
+    assert unbound['capabilities']['winding_inference'] is False
+
+    artifact = winding_artifact(tmp_path / 'winding')
+    bound = service(host, store, spiral_service.bind_service_inputs(
+        host.output, host.cache, artifact)).binding_advertisement()
+    assert bound['bindings']['winding_inference'] == {
+        'bound': True, 'path': str(artifact), 'available': True, 'error': None}
+    assert bound['capabilities']['winding_inference'] is True
+
+    # An artifact that cannot be read is bound but unavailable, and says why.
+    broken = winding_artifact(tmp_path / 'broken', valid=False)
+    unusable = service(host, store, spiral_service.bind_service_inputs(
+        host.output, host.cache, broken)).binding_advertisement()
+    status = unusable['bindings']['winding_inference']
+    assert (status['bound'], status['available']) == (True, False)
+    assert 'unexpected artifact_type' in status['error']
+    assert unusable['capabilities']['winding_inference'] is False
+
+
+def test_a_missing_winding_inference_binding_is_refused_at_launch(tmp_path):
+    with pytest.raises(spiral_service.ServiceBindingError, match='is not a directory'):
+        spiral_service.bind_service_inputs(tmp_path / 'out', tmp_path / 'cache',
+                                           tmp_path / 'missing')
+
+
+def test_launch_refuses_retired_and_unusable_bindings(host, store, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        spiral_service.main(_launch(host, '--object-store', store,
+                                    '--dataset', str(tmp_path)))
+    err = capsys.readouterr().err
+    assert '--dataset is retired' in err and '--winding-inference' in err
+    with pytest.raises(SystemExit):
+        spiral_service.main(_launch(host, '--object-store', store,
+                                    '--winding-inference', str(tmp_path / 'missing')))
+    assert '--winding-inference' in capsys.readouterr().err
+
+
+def test_requests_cannot_name_host_input_paths(host, store, tmp_path):
+    state = service(host, store)
+    for key in ('winding_inference', 'dataset_root', 'umbilicus'):
+        body = initialize_body()
+        body['paths'] = {key: str(tmp_path)}
+        with pytest.raises(ApiError) as refused:
+            state._prepare_session_request(body)
+        assert refused.value.status == 400
+        [detail] = refused.value.details
+        assert detail['field'] == f'paths.{key}'
+    body['paths'] = {'winding_inference': str(tmp_path)}
+    with pytest.raises(ApiError) as refused:
+        state._prepare_session_request(body)
+    assert 'restart the service' in refused.value.details[0]['message']
+
+
+def test_winding_model_supervision_reads_the_bound_artifact(host, store, tmp_path):
+    body = initialize_body()
+    body['run']['config'] = dict(WINDING_MODEL)
+    # Without a binding the fit that needs it fails preparation, saying how
+    # to provide one; nothing is built.
+    with pytest.raises(ApiError) as refused:
+        service(host, store).initialize(body)
+    [detail] = [detail for detail in refused.value.details
+                if detail['field'] == 'winding_inference']
+    assert '--winding-inference PATH' in detail['message']
+
+    artifact = winding_artifact(tmp_path / 'winding')
+    state = service(host, store, spiral_service.bind_service_inputs(
+        host.output, host.cache, artifact))
+    paths, _, _, _ = state._prepare_session_request(body)
+    assert paths.winding_inference == str(artifact)
+    assert paths.provenance['winding_inference'] == str(artifact)
+    # A fit that does not need it does not read it.
+    paths, _, _, _ = state._prepare_session_request(initialize_body())
+    assert paths.winding_inference == ''
+
+
+def test_a_service_initializes_from_project_and_store_alone(host, store, tmp_path):
+    # No dataset directory or spiral-scroll.json anywhere: the project and
+    # the bindings resolve every input, recorded with the fit volume.
+    assert not list(tmp_path.rglob('spiral-scroll.json'))
+    state = service(host, store)
+    paths, _ = _built(state, initialize_body())
+    assert paths.volume_uuid == VOLUME
+    recorded = state.session_request['paths']
+    assert recorded['volume_uuid'] == VOLUME
+    assert 'dataset_root' not in recorded
+    assert recorded['provenance'] == {'project': 's1',
+                                      'output_directory': str(host.output),
+                                      'cache_directory': str(host.cache)}

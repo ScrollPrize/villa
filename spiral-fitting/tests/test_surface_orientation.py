@@ -10,7 +10,7 @@ from PIL import Image
 import pytest
 import torch
 
-from fit_session import ScrollSpecError, parse_scroll_spec
+from fit_session import ScrollSpecError, parse_scroll
 from lasagna_publish import _raw_run_diff_rgba
 from loss_maps import LossMapRecorder, capture_loss_maps, record_loss_samples
 from render_ink import concat_meshes
@@ -45,8 +45,7 @@ def read_zyx(surface):
 
 
 def parse(**fields):
-    return parse_scroll_spec(
-        {"schema_version": 1, "name": "s", "voxel_size_um": 9.6, **fields}, "/d")
+    return parse_scroll({"name": "s", "voxel_size_um": 9.6, **fields})
 
 
 def test_sense_table():

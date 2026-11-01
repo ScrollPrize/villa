@@ -1,10 +1,10 @@
 """Input updates of a resident GPU fit, on real data (stage 2b acceptance).
 
-    python tests/input_update_driver.py STORE DATASET WORK [Z_BEGIN Z_END]
+    python tests/input_update_driver.py STORE WORK [Z_BEGIN Z_END]
 
-STORE is an ordinary object store (copied as a hub; never modified),
-DATASET a dataset directory (spiral-scroll.json, umbilicus.json, lasagna
-inputs, outer shell, ...), WORK an empty directory. Needs a GPU. Drives a
+STORE is an ordinary object store (copied as a hub; never modified; its
+outer shell is the surface tagged spiral-outer-shell), WORK an empty
+directory. The scroll and umbilicus are service_project's project. Needs a GPU. Drives a
 hub-bound ServiceState in this process (no HTTP), so the resident model and
 optimiser can be inspected around each update, and writes WORK/result.json:
 
@@ -40,10 +40,8 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import spiral_service  # noqa: E402
 from service_project import with_project  # noqa: E402
-from fit_session import resolve_dataset_root  # noqa: E402
-
-store, dataset, work = sys.argv[1:4]
-z_begin, z_end = (int(value) for value in sys.argv[4:6]) if len(sys.argv) > 5 else (8900, 9300)
+store, work = sys.argv[1:3]
+z_begin, z_end = (int(value) for value in sys.argv[3:5]) if len(sys.argv) > 4 else (8900, 9300)
 work = Path(work).resolve()
 work.mkdir(parents=True, exist_ok=True)
 result = {"steps": []}
@@ -63,14 +61,12 @@ editor = str(work / "editor.vcobj")
 vos.hub_clone(str(hub), editor, "editor")
 binding = spiral_service.bind_object_store(
     str(work / "service.vcobj"), "spiral-service-acceptance", str(hub))
-resolution = spiral_service.bind_service_paths(
-    resolve_dataset_root(dataset), work / "output", work / "cache")
 REQUEST = {"run": {"z_begin": z_begin, "z_end": z_end, "config": {
     "optimizer_num_training_steps": 2000, "dense_spacing_mode": "grad_mag",
     "loss_weight_dense_spacing_density": 0, "loss_weight_dense_normals": 0,
     "loss_weight_dense_spacing": 0}}}
 state = spiral_service.ServiceState(
-    dataset_root=str(Path(dataset).resolve()), dataset_resolution=resolution,
+    bindings=spiral_service.bind_service_inputs(work / "output", work / "cache"),
     object_store=binding, startup_run=REQUEST["run"])
 
 

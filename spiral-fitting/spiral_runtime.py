@@ -323,9 +323,10 @@ class RendezvousEndpoint:
 
 def external_input_manifest(paths):
     """The session's inputs read outside the object store, by path: the
-    umbilicus, shell, lasagna and track stores, fiber directions, winding
-    inference, the resumed checkpoint and the output roots. Patches, PCLs
-    and fibers are identified by the object-store digest instead."""
+    umbilicus, the Lasagna dataset, fiber directions, winding inference, the
+    resumed checkpoint and the output roots, with the fit volume they are in
+    and their provenance. Store objects are identified by the object-store
+    digest instead."""
     return paths.manifest()
 
 
@@ -877,8 +878,8 @@ class InteractiveFitSession:
 
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._transition(SessionState.Loading, "Loading fit inputs and model")
-            # The scroll specification is used exactly as the dataset root
-            # states it: its physical facts (name, resolution, outward sense)
+            # The scroll is used exactly as the session's resolved inputs
+            # state it: its physical facts (name, resolution, outward sense)
             # and its Lasagna scale. A session request may not restate
             # any of them, so there is nothing left here to override.
             scroll = self.scroll
@@ -886,7 +887,7 @@ class InteractiveFitSession:
             # it, drives every phase on this fitter thread, and closes it.
             # Configuration, the scroll facts, the resolved input paths, and
             # the fit controls (resume, output directory, run tag) are passed
-            # explicitly; fit_spiral holds no module-global dataset state.
+            # explicitly; fit_spiral holds no module-global input state.
             context = fitter.FitContext(
                 FitConfig(config),
                 scroll=scroll,
@@ -1834,12 +1835,12 @@ class InteractiveFitSession:
         checkpoint_state = self._record_checkpoint_state(autosave, self._completed)
         # Name the file beside itself. An always-loaded service picks its
         # startup autosave from these sidecars alone: the output root it
-        # belongs to, the dataset it was fit against, and how far it got.
+        # belongs to, the volume it was fitted in, and how far it got.
         # Without one the checkpoint is inert.
         write_autosave_metadata(
             autosave,
             session_namespace=self.paths.output_directory,
-            dataset_root=self.paths.dataset_root,
+            volume_uuid=self.paths.volume_uuid,
             completed_iterations=self._completed,
             model_state_sha256=(checkpoint_state or {}).get("model_state_sha256"),
             input_digest=getattr(self, "_input_digest", None),

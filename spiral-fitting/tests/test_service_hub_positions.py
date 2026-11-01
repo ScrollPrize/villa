@@ -19,10 +19,9 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
 from service_project import with_project  # noqa: E402
-from fit_session import resolve_dataset_root  # noqa: E402
 from test_object_store_startup import store_path  # noqa: E402,F401
 from test_runtime_object_store import (  # noqa: E402,F401
-    RUN, _checkpoint, cpu, device_stubs, settle, write_dataset)
+    RUN, _checkpoint, bindings, cpu, device_stubs, settle)
 
 
 @pytest.fixture()
@@ -36,11 +35,8 @@ def hub(store_path, tmp_path):
 
 
 def _service_state(binding, tmp_path):
-    root = write_dataset(tmp_path / 'dataset')
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(root), tmp_path / 'output', tmp_path / 'cache')
     return spiral_service.ServiceState(
-        dataset_root=str(root), dataset_resolution=resolution,
+        bindings=bindings(tmp_path),
         object_store=binding,
         startup_run={'z_begin': 0, 'z_end': 64, 'config': dict(RUN)})
 
@@ -165,7 +161,7 @@ def test_hub_addresses_compare_as_the_store_records_them(tmp_path):
 
 
 def test_initialize_links_and_pins_the_requested_position(state, hub, device_stubs):
-    advertised = state.dataset()
+    advertised = state.binding_advertisement()
     assert advertised['capabilities']['input_positions'] is True
     assert advertised['object_store']['hub']['identity'] == state.object_store.hub_identity
     walk = _names(hub['editor'])['walk']
@@ -263,7 +259,7 @@ def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
         'a checkpoint resume does not link'))
     position = {'hub': state.object_store.hub_identity, 'sequence': 7}
     path = _checkpoint(tmp_path / 'fit.ckpt', {}, {
-        'object_store': {'position': position}, 'dataset_root': state.dataset_root})
+        'object_store': {'position': position}})
     assert state._checkpoint_position(path) == 7
     other = _checkpoint(tmp_path / 'other.ckpt', {}, {
         'object_store': {'position': {**position, 'hub': 'another-hub'}}})
@@ -283,7 +279,7 @@ def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
 def test_a_shared_store_has_positions_of_its_own(store_path, tmp_path):
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
-        assert state.dataset()['capabilities']['input_positions'] is True
+        assert state.binding_advertisement()['capabilities']['input_positions'] is True
         with ObjectStore.open(store_path, read_only=True) as db:
             assert state.object_store.positions == db.store_positions()['store']
         with pytest.raises(spiral_service.ApiError, match='non-negative integer'):

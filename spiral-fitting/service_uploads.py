@@ -279,12 +279,12 @@ class UploadManager:
             with self._lock:
                 # Resume checkpoints are needed before a session exists, so
                 # they are service-scoped: allowed whenever an output
-                # directory is known (a --dataset launch or a live session).
+                # directory is known (a bound --output or a live session).
                 output_root = self.environment.output_root()
                 if output_root is None:
                     raise ApiError(HTTPStatus.CONFLICT,
-                                   "Checkpoint uploads need a --dataset service "
-                                   "or an active session")
+                                   "Checkpoint uploads need a service bound to "
+                                   "an --output directory or an active session")
                 if len(manifest) != 1:
                     raise ApiError(HTTPStatus.BAD_REQUEST,
                                    "A checkpoint upload must declare exactly one file")

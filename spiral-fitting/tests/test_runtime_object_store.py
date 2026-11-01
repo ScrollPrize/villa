@@ -20,7 +20,7 @@ import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 import spiral_service  # noqa: E402
 from service_project import with_project  # noqa: E402
-from fit_session import SessionState, resolve_dataset_root  # noqa: E402
+from fit_session import SessionState  # noqa: E402
 from test_object_store_startup import _edges, store_path  # noqa: E402,F401
 
 RUN = {key: value for key, value in reference.CONFIG_OVERRIDES.items()
@@ -59,26 +59,22 @@ def device_stubs(monkeypatch):
     return loads
 
 
-def write_dataset(root):
+def write_inputs(root):
+    """A directory holding the umbilicus a session built directly (not
+    through the service, whose project supplies it) reads."""
     root.mkdir()
-    spec = reference.scroll_spec()
-    (root / 'spiral-scroll.json').write_text(json.dumps({
-        'schema_version': 1, 'name': spec.name,
-        'voxel_size_um': spec.voxel_size_um,
-        'spiral_outward_sense': spec.spiral_outward_sense,
-        'base_shape_zyx': list(spec.base_shape_zyx)}))
     reference.write_umbilicus(str(root / 'umbilicus.json'))
     return root
 
 
+def bindings(tmp_path):
+    return spiral_service.bind_service_inputs(tmp_path / 'output', tmp_path / 'cache')
+
+
 @pytest.fixture()
 def state(store_path, tmp_path):
-    root = write_dataset(tmp_path / 'dataset')
-    output = tmp_path / 'output'
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(root), output, tmp_path / 'cache')
     state = spiral_service.ServiceState(
-        dataset_root=str(root), dataset_resolution=resolution,
+        bindings=bindings(tmp_path),
         object_store=spiral_service.bind_object_store(store_path, 'svc'),
         startup_run={'z_begin': 0, 'z_end': 64, 'config': dict(RUN)})
     yield state
@@ -217,7 +213,7 @@ def _rank_session(rank, world_size, rendezvous, root, store, config, results):
     stub_device_stages(fit_spiral)
     statuses = []
     session = InteractiveFitSession(
-        SpiralInputPaths(dataset_root=root, umbilicus=f'{root}/umbilicus.json',
+        SpiralInputPaths(umbilicus=f'{root}/umbilicus.json',
                          output_directory=f'{root}-out-{rank}'),
         SpiralRunConfig(0, 64, config=config), SpiralPreviewConfig(),
         reference.scroll_spec(), statuses.append, publishes_outputs=rank == 0,
@@ -240,7 +236,7 @@ def _rank_session(rank, world_size, rendezvous, root, store, config, results):
 
 def _two_rank_sessions(tmp_path, store, config):
     import torch.multiprocessing as mp
-    root = str(write_dataset(tmp_path / 'dataset'))
+    root = str(write_inputs(tmp_path / 'inputs'))
     results = [str(tmp_path / f'rank{rank}.json') for rank in range(2)]
     rendezvous = tmp_path / 'rendezvous'
     rendezvous.mkdir()
@@ -285,7 +281,7 @@ def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
     request = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
     state.initialize(with_project(request))
     first = settle(state)['input_digest']
-    walk = next(entry['uuid'] for entry in state.dataset()['inputs']['objects']
+    walk = next(entry['uuid'] for entry in state.binding_advertisement()['inputs']['objects']
                 if entry['name'] == 'walk')
     with ObjectStore.open(store_path, author='editor') as db:
         db.set_meta(walk, 'sampling_group', 'reviewed')
@@ -345,7 +341,7 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
     # Written against another store path: that is the binding's to decide.
     cfg = {**live, 'object_store_path': '/elsewhere.vcobj'}
     path = _checkpoint(tmp_path / 'changed.ckpt', cfg,
-                       {'object_store': changed, 'dataset_root': state.dataset_root})
+                       {'object_store': changed, 'volume_uuid': state.session_paths.volume_uuid})
     refusal = state._checkpoint_refusal(path, 'object-store inputs differ')
     assert refusal.status == 409
     assert refusal.payload['stage'] == 'all'
@@ -359,16 +355,23 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
     # store path the checkpoint names is no difference.
     path = _checkpoint(tmp_path / 'same.ckpt',
                        {**cfg, 'model_num_flow_stages': live['model_num_flow_stages'] + 1},
-                       {'object_store': manifest, 'dataset_root': state.dataset_root})
+                       {'object_store': manifest, 'volume_uuid': state.session_paths.volume_uuid})
     refusal = state._checkpoint_refusal(path, 'model shape differs')
     assert refusal.payload == {'reasons': ['model shape differs'], 'stage': 'model'}
 
     path = _checkpoint(tmp_path / 'legacy.ckpt', live,
-                       {'dataset_root': state.dataset_root})
+                       {'volume_uuid': state.session_paths.volume_uuid})
     refusal = state._checkpoint_refusal(path, 'no object-store inputs')
     assert refusal.payload['refused'] is True
     assert refusal.payload['inputs']['legacy'] is True
     assert 'object_store_allow_changed_inputs' in refusal.message
+
+    # A checkpoint fitted in another volume is what no rebuild can fix.
+    assert state.session_paths.volume_uuid
+    path = _checkpoint(tmp_path / 'foreign.ckpt', live,
+                       {'object_store': manifest, 'volume_uuid': 'another-volume'})
+    refusal = state._checkpoint_refusal(path, 'another volume')
+    assert refusal.payload == {'reasons': ['another volume'], 'refused': True}
 
 
 # ---------------------------------------------------------------------------
@@ -447,11 +450,8 @@ def _cli_inputs(store, tmp_path, config):
 ])
 def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
                                                         device_stubs, selection):
-    root = write_dataset(tmp_path / 'dataset')
-    resolution = spiral_service.bind_service_paths(
-        resolve_dataset_root(root), tmp_path / 'output', tmp_path / 'cache')
     state = spiral_service.ServiceState(
-        dataset_root=str(root), dataset_resolution=resolution,
+        bindings=bindings(tmp_path),
         object_store=spiral_service.bind_object_store(varied_store, 'svc'))
     config = {**RUN, 'object_store_refresh_links': False, **selection}
     try:

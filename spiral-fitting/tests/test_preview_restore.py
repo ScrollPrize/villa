@@ -291,7 +291,7 @@ class ServiceRestoreTests(unittest.TestCase):
         state = ServiceState()
         state.session_id = "session"
         state.session_paths = SpiralInputPaths.from_mapping({
-            "dataset_root": "", "output_directory": str(output)})
+            "output_directory": str(output)})
         return state
 
     def _published(self, output, generation, digest, iteration=40):

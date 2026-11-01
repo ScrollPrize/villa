@@ -1,8 +1,12 @@
-"""Session-facing configuration and dataset resolution for interactive Spiral fits.
+"""Session-facing configuration and input resolution for Spiral fits.
 
-This module intentionally has no Torch, Zarr, or VC imports.  VC3D can therefore
-resolve and validate a dataset before importing the comparatively expensive fitting
-stack in the service worker.
+This module intentionally has no Torch, Zarr, or VC imports, so the service
+and the command-line fit can resolve and validate their inputs before
+importing the comparatively expensive fitting stack. Both resolve into one
+input contract (SpiralInputPaths and a ScrollSpec, checked by
+validate_fit_inputs): the command line from an explicit input manifest
+(load_input_manifest), a service from the client's project (SessionScroll)
+and its own host bindings (spiral_service.ServiceBindings).
 """
 
 from __future__ import annotations
@@ -21,8 +25,9 @@ import zipfile
 from config import Config
 from lasagna_source import (LASAGNA_CHANNELS, LasagnaSource, LasagnaSourceError,
                             check_identity, fiber_directions_path,
-                            find_dataset_manifest, is_remote_location,
-                            lasagna_scale_for, load_lasagna_source, url_identity)
+                            is_remote_location, lasagna_scale_for,
+                            load_lasagna_source, read_lasagna_manifest,
+                            url_identity, write_lasagna_source)
 from surface_orientation import spiral_outward_sense_for
 
 
@@ -203,7 +208,20 @@ from surface_orientation import spiral_outward_sense_for
 # the selected tracks (object_store_track_uuids/_tags, input_use_tracks) and
 # their crossing links, which its link refresh makes. The input manifest lists
 # tracks and track_crossing relationships like any other input.
-API_VERSION = 44
+# 45: explicit inputs. A service has no dataset: --dataset, spiral-scroll.json
+# and conventional-directory discovery are gone. GET /dataset is replaced by
+# GET /bindings, which advertises the service's host bindings ("bindings":
+# output_directory, cache_directory and winding_inference {bound, path,
+# available, error}), capabilities.winding_inference, the session checkpoints,
+# the object store and its selection. There are no dataset-root checkpoints
+# (detected_checkpoints), and /health carries no dataset_root. Winding
+# inference is read from the host path bound at launch (--winding-inference),
+# never one a client names; a fit needing it without a usable binding fails
+# preparation. A request's paths carry only "checkpoint"; a session's paths
+# record the fit volume ("volume_uuid") and the inputs' "provenance" instead
+# of dataset_root. The configuration catalog takes no num_windings from a
+# host scroll specification.
+API_VERSION = 45
 
 
 class SessionState(str, Enum):
@@ -272,11 +290,11 @@ def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
 # Declarative fit-input catalog
 # ---------------------------------------------------------------------------
 #
-# One description of every fit input read from the dataset by path, consumed
-# by request validation (validate_session_request), dataset resolution
-# (resolve_dataset_root / conventional_input_paths) and run admission
-# (spiral_service.ServiceState.run). Patches, point collections and fibers
-# are not here: they come from the object store (object_store_inputs). Each entry records the input's path kind
+# One description of every fit input read by path, consumed by input
+# validation (validate_fit_inputs, for the command line and a service alike)
+# and run admission (spiral_service.ServiceState.run). Patches, point
+# collections, fibers, tracks and the outer shell are not here: they come
+# from the object store (object_store_inputs). Each entry records the input's path kind
 # and its enabling/required predicates over the run configuration. Fit-input
 # paths are static for the lifetime of a resident session, so an entry says
 # nothing about rebuild scope: changing any of them rebuilds the session.
@@ -370,11 +388,6 @@ class FitInputSpec:
     kind: str
     # File contents must parse as JSON.
     json_content: bool = False
-    # Conventional dataset-relative location ("" = none: the input is only
-    # reached through an explicit path or a scroll-spec override).
-    conventional_relative: str = ""
-    # A missing conventional path is missing_required at dataset resolution.
-    resolve_required: bool = False
     # enabled(config): the input participates at all; inactive inputs are
     # not validated even when a path is set.
     enabled: Callable[[Mapping[str, Any]], bool] = _always
@@ -388,19 +401,15 @@ class FitInputSpec:
 
 # Entries are ordered as validate_session_request reports them.
 FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
-    FitInputSpec("umbilicus", "file", json_content=True,
-                 conventional_relative="umbilicus.json",
-                 resolve_required=True, required=_always),
+    FitInputSpec("umbilicus", "file", json_content=True, required=_always),
     FitInputSpec("fiber_directions", "file",
-                 conventional_relative="fiber_directions.npz",
                  enabled=fiber_directions_required,
                  required=fiber_directions_required),
-    # The Lasagna dataset (lasagna_source): a *.lasagna.json manifest, by
-    # convention the one in lasagna_inputs/ (LASAGNA_MANIFEST_DIRECTORY).
+    # The Lasagna dataset (lasagna_source): a *.lasagna.json manifest, or the
+    # source document write_lasagna_source wrote for it.
     FitInputSpec("lasagna", "lasagna",
                  enabled=lasagna_enabled, required=_lasagna_required),
     FitInputSpec("winding_inference", "directory",
-                 conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
                  required=_winding_model_enabled),
 )
@@ -414,9 +423,17 @@ def fit_input(key: str) -> FitInputSpec | None:
 
 @dataclass(frozen=True)
 class SpiralInputPaths:
-    """The fit inputs read by path; the object store supplies the rest."""
+    """The resolved inputs a fit reads by path; the object store supplies the
+    rest. The command line (load_input_manifest) and a service (its project
+    and host bindings) resolve into this one structure, which session and
+    checkpoint metadata record.
 
-    dataset_root: str = ""
+    ``volume_uuid`` is the reference volume the inputs are in: the fit volume
+    the selected store objects must name (check_fit_volume). ``provenance``
+    says where the inputs came from (the manifest and its digest, or the
+    project and the service's bindings), for the record only."""
+
+    volume_uuid: str = ""
     umbilicus: str = ""
     fiber_directions: str = ""
     lasagna: str = ""
@@ -425,16 +442,27 @@ class SpiralInputPaths:
     checkpoint: str = ""
     output_directory: str = ""
     cache_directory: str = ""
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    # Fields that are not host paths.
+    _RECORD_FIELDS = ("volume_uuid", "provenance")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SpiralInputPaths":
-        # Unknown keys (an older manifest's patch, fiber and PCL paths) are
-        # not inputs any more.
-        return cls(**{name: _normalise_path(value.get(name))
-                      for name in cls.__dataclass_fields__})
+        # Unknown keys (an older manifest's dataset root, or its patch, fiber
+        # and PCL paths) are not inputs any more. URLs remain URLs.
+        fields = {name: (str(value[name]).strip()
+                         if is_remote_location(value.get(name) or "")
+                         else _normalise_path(value.get(name)))
+                  for name in cls.__dataclass_fields__
+                  if name not in cls._RECORD_FIELDS}
+        return cls(volume_uuid=str(value.get("volume_uuid") or ""),
+                   provenance=dict(value.get("provenance") or {}), **fields)
 
     def manifest(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result["provenance"] = json.loads(json.dumps(self.provenance))
+        return result
 
 
 def lasagna_normal_inputs(source: LasagnaSource | None, config: Mapping[str, Any], scale,
@@ -451,10 +479,11 @@ def lasagna_normal_inputs(source: LasagnaSource | None, config: Mapping[str, Any
     return {'pool': pack, 'scale': scale}
 
 
-# Run-block keys the scroll specification owns, mapped to the ScrollSpec field
-# each one used to shadow. A request that carries one is rejected rather than
-# ignored: silently dropping it would let a client believe it had renamed a
-# scroll, changed its resolution, or moved the Lasagna stores.
+# Run-block keys the scroll (a service session's project) owns, mapped to the
+# ScrollSpec field each one used to shadow. A request that carries one is
+# rejected rather than ignored: silently dropping it would let a client
+# believe it had renamed a scroll, changed its resolution, or moved the
+# Lasagna stores.
 SCROLL_SPEC_OWNED_RUN_KEYS = {
     "scroll_name": "name",
     "voxel_size_um": "voxel_size_um",
@@ -467,9 +496,9 @@ SCROLL_SPEC_OWNED_RUN_KEYS = {
 class SpiralRunConfig:
     """Deployment and presentation settings of one fit run.
 
-    Nothing spiral-scroll.json specifies is here — not the scroll's physical
-    facts (name, voxel size, outward sense) and not the dataset's Lasagna store
-    layout. That file is the single source for all of it (see ``ScrollSpec``).
+    Nothing the scroll specifies is here — not its physical facts (name,
+    voxel size, outward sense) and not the Lasagna dataset's layout. The
+    resolved inputs are the single source for all of it (see ``ScrollSpec``).
     """
 
     z_begin: int
@@ -505,74 +534,27 @@ class SpiralPreviewConfig:
         return asdict(self)
 
 
-@dataclass
-class SpiralDatasetResolution:
-    root: str
-    resolved: dict[str, str] = field(default_factory=dict)
-    missing_required: list[str] = field(default_factory=list)
-    missing_optional: list[str] = field(default_factory=list)
-    ambiguities: dict[str, list[str]] = field(default_factory=dict)
-    detected_checkpoints: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    # The fields spiral-scroll.json states (load_dataset_scroll_fields; path
-    # overrides as a mapping), {} without one; None when it is invalid, which
-    # is a missing_required condition ("scroll_spec"). A service session uses
-    # its path overrides and num_windings; its scroll is the project's
-    # (SessionScroll).
-    scroll_spec: dict[str, Any] | None = None
-
-    @property
-    def ok(self) -> bool:
-        return not self.missing_required and not self.ambiguities
-
-    def to_dict(self) -> dict[str, Any]:
-        result = asdict(self)
-        result["ok"] = self.ok
-        return result
-
-
 # ---------------------------------------------------------------------------
-# Versioned scroll specification (spiral-scroll.json)
+# Scroll facts and the command-line input manifest
 # ---------------------------------------------------------------------------
 
-SCROLL_SPEC_FILENAME = "spiral-scroll.json"
-SCROLL_SPEC_SCHEMA_VERSION = 1
-
-# Input keys whose paths may depart from the directory conventions. Values in
-# the spec file are resolved relative to the dataset root; conventional paths
-# need no entry at all.
-SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(spec.key for spec in FIT_INPUT_CATALOG)
-# Overrides of inputs that now come from the object store (the outer shell is
-# its surface tagged spiral-outer-shell). A specification written for the
-# file-input service may still name them; they are ignored.
-RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers", "outer_shell",
-                              "tracks_dbm")
-
-# The directory whose one *.lasagna.json is a dataset's Lasagna dataset.
-LASAGNA_MANIFEST_DIRECTORY = "lasagna_inputs"
-
-# Conventional dataset layout for the headless CLI, mirroring the historical
-# fit_spiral module-global defaults. resolve_dataset_root() shares the same
-# relative paths for the entries it discovers.
-_CONVENTIONAL_INPUT_RELATIVES = {
-    spec.key: spec.conventional_relative
-    for spec in FIT_INPUT_CATALOG
-    if spec.conventional_relative
-}
+# The command-line fit's explicit input manifest (load_input_manifest).
+INPUT_MANIFEST_SCHEMA_VERSION = 1
 
 
 class ScrollSpecError(ValueError):
-    """A missing, malformed, or out-of-contract spiral-scroll.json."""
+    """Missing, malformed or contradictory scroll facts or fit inputs."""
 
 
 @dataclass(frozen=True)
 class ScrollSpec:
-    """Physical/dataset facts of one scroll, parsed from spiral-scroll.json.
+    """Physical facts of one scroll: the input manifest's (command line) or
+    the project volume's (service).
 
     Torch-free and frozen: safe to resolve in the VC3D-facing service process
     and to pickle into GPU worker processes. Deployment and presentation
     values (output/cache roots, run tags, storage backend, render scale) are
-    deliberately not part of the scroll file.
+    deliberately not part of it.
     """
 
     name: str
@@ -581,31 +563,24 @@ class ScrollSpec:
     # The following are in the open-data catalog metadata; together they
     # fix spiral_outward_sense (surface_orientation.spiral_outward_sense_for);
     # the z direction also decides whether exported grids are flipped so row 0 is
-    # the scroll top. None when the spec leaves them out.
+    # the scroll top. None when the inputs leave them out.
     z_direction_is_top_to_bottom: bool | None = None
     left_handed_coordinates: bool | None = None
     # Shape of the volume coordinate domain used by Spiral surfaces. This is
-    # independent of physical voxel size and may be absent in legacy specs.
+    # independent of physical voxel size and may be unknown.
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     # The Lasagna arrays' downsampling relative to the fit volume; the arrays
     # themselves are the Lasagna dataset's (lasagna_source). None when the
-    # spec does not state it: resolve_lasagna_scale derives it from the
+    # inputs do not state it: resolve_lasagna_scale derives it from the
     # dataset's frame where it can, and requires it where it cannot.
     lasagna_scale: int | None = None
     # The scroll's winding count, when someone has estimated it. A default for
     # the fit, not a fact the scroll owns: see scroll_spec_config_defaults.
     num_windings: int | None = None
-    # Allow-listed absolute-path overrides, (key, resolved path) pairs.
-    path_overrides: tuple[tuple[str, str], ...] = ()
-
-    def path_override(self, key: str) -> str:
-        return dict(self.path_overrides).get(key, "")
 
     def manifest(self) -> dict[str, Any]:
-        result = asdict(self)
-        result["path_overrides"] = dict(self.path_overrides)
-        return result
+        return asdict(self)
 
 
 def _checked_voxel_size(value: Any, source: str) -> float:
@@ -632,24 +607,21 @@ def _checked_flag(value: Any, key: str, source: str) -> bool:
     return value
 
 
-def _scroll_spec_fields(document: Any, dataset_root: str | os.PathLike[str],
-                        source: str) -> dict[str, Any]:
-    """The ScrollSpec fields a spiral-scroll.json states, validated but none
-    required (``_scroll_spec_from_fields`` requires them): what a project's
-    facts complete in a service session (``SessionScroll``).
+# The keys of the input manifest's scroll block, as ScrollSpec fields.
+SCROLL_KEYS = ("name", "voxel_size_um", "base_shape_zyx", "spiral_outward_sense",
+               "z_direction_is_top_to_bottom", "left_handed_coordinates",
+               "lasagna_scale", "num_windings")
 
-    Unknown top-level keys are ignored for forward compatibility,
-    schema_version is required, and path overrides are resolved relative to
-    the dataset root.
-    """
+
+def _scroll_fields(document: Any, source: str) -> dict[str, Any]:
+    """The ScrollSpec fields a scroll block states, validated but none
+    required (``_scroll_spec_from_fields`` requires them)."""
     if not isinstance(document, Mapping):
-        raise ScrollSpecError(f"{source}: the scroll specification must be a JSON object")
-    if "schema_version" not in document:
-        raise ScrollSpecError(f"{source}: schema_version is required")
-    if document["schema_version"] != SCROLL_SPEC_SCHEMA_VERSION:
+        raise ScrollSpecError(f"{source} must be an object")
+    unknown = sorted(set(document) - set(SCROLL_KEYS))
+    if unknown:
         raise ScrollSpecError(
-            f"{source}: unsupported schema_version {document['schema_version']!r} "
-            f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
+            f"{source}: unknown keys {unknown} (allowed: {sorted(SCROLL_KEYS)})")
     fields: dict[str, Any] = {}
     for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
         if document.get(key) is not None:
@@ -664,55 +636,17 @@ def _scroll_spec_fields(document: Any, dataset_root: str | os.PathLike[str],
         fields["base_shape_zyx"] = _checked_base_shape(document["base_shape_zyx"], source)
     if "spiral_outward_sense" in document:
         fields["spiral_outward_sense"] = str(document["spiral_outward_sense"]).upper()
-
-    umbilicus = document.get("umbilicus", {})
-    if not isinstance(umbilicus, Mapping):
-        raise ScrollSpecError(f"{source}: umbilicus must be an object")
-    unknown = sorted(set(umbilicus) - {"coordinate_scale"})
-    if unknown:
-        raise ScrollSpecError(f"{source}: unknown umbilicus keys: {unknown}")
-    if "coordinate_scale" in umbilicus:
-        try:
-            fields["umbilicus_coordinate_scale"] = float(umbilicus["coordinate_scale"])
-        except (TypeError, ValueError):
-            raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
-
-    if "normal_zarr_group" in document:
-        raise ScrollSpecError(
-            f"{source}: normal_zarr_group is retired: the Lasagna manifest "
-            "(paths.lasagna) names the arrays")
     if "lasagna_scale" in document:
         lasagna_scale = document["lasagna_scale"]
         if type(lasagna_scale) is not int or lasagna_scale <= 0:
             raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
         fields["lasagna_scale"] = lasagna_scale
-
     num_windings = document.get("num_windings")
     # Same floor as shell_outer_winding_idx, which this value becomes.
     if num_windings is not None:
         if type(num_windings) is not int or num_windings < 2:
             raise ScrollSpecError(f"{source}: num_windings must be an integer >= 2")
         fields["num_windings"] = num_windings
-
-    paths = document.get("paths", {})
-    if not isinstance(paths, Mapping):
-        raise ScrollSpecError(f"{source}: paths must be an object")
-    paths = {key: value for key, value in paths.items()
-             if key not in RETIRED_PATH_OVERRIDE_KEYS}
-    unknown = sorted(set(paths) - set(SCROLL_SPEC_PATH_OVERRIDE_KEYS))
-    if unknown:
-        raise ScrollSpecError(
-            f"{source}: unknown path override keys: {unknown} "
-            f"(allowed: {sorted(SCROLL_SPEC_PATH_OVERRIDE_KEYS)})")
-    root = Path(_normalise_path(dataset_root))
-    overrides = []
-    for key in sorted(paths):
-        value = paths[key]
-        if not isinstance(value, str) or not value.strip():
-            raise ScrollSpecError(f"{source}: path override {key!r} must be a non-empty string")
-        overrides.append((key, _normalise_path(value, base=root)))
-    if overrides:
-        fields["path_overrides"] = tuple(overrides)
     return fields
 
 
@@ -762,19 +696,16 @@ def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str, *,
         umbilicus_coordinate_scale=fields.get("umbilicus_coordinate_scale", 1.0),
         lasagna_scale=fields.get("lasagna_scale"),
         num_windings=fields.get("num_windings"),
-        path_overrides=fields.get("path_overrides", ()),
     )
 
 
-def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
-                      *, source: str = SCROLL_SPEC_FILENAME,
-                      outward_sense: str | None = None) -> ScrollSpec:
-    """Validate known spiral-scroll.json fields and freeze them; the file
-    must state every physical fact except an outward sense the fit setting
+def parse_scroll(document: Any, *, source: str = "scroll",
+                 outward_sense: str | None = None) -> ScrollSpec:
+    """Validate an input manifest's scroll block and freeze it; it must state
+    every physical fact except an outward sense the fit setting
     ``outward_sense`` gives (``_scroll_spec_from_fields``)."""
-    return _scroll_spec_from_fields(
-        _scroll_spec_fields(document, dataset_root, source), source,
-        outward_sense=outward_sense)
+    return _scroll_spec_from_fields(_scroll_fields(document, source), source,
+                                    outward_sense=outward_sense)
 
 
 def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec:
@@ -789,8 +720,9 @@ def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec
         if spec.lasagna_scale is None:
             raise ScrollSpecError(
                 f"cannot derive the Lasagna arrays' downsampling relative to the fit "
-                f"volume: {how}; state lasagna_scale in {SCROLL_SPEC_FILENAME}, or "
-                "the volume's base_shape_zyx there and the dataset's in its manifest")
+                f"volume: {how}; state scroll.lasagna_scale in the input manifest, "
+                "or the volume's scroll.base_shape_zyx there and the dataset's in "
+                "its Lasagna manifest")
         return spec
     if spec.lasagna_scale is not None and spec.lasagna_scale != derived:
         raise ScrollSpecError(
@@ -799,55 +731,161 @@ def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec
     return replace(spec, lasagna_scale=derived)
 
 
-def _read_scroll_spec_document(path: Path) -> Any:
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, ValueError) as exc:
-        raise ScrollSpecError(f"{path}: invalid scroll specification: {exc}") from exc
+# The input manifest's top-level keys. Geometry (patches, point collections,
+# fibers, tracks and the outer shell) is the object store's alone: it has no
+# entry here.
+INPUT_MANIFEST_KEYS = ("schema_version", "volume_uuid", "scroll", "umbilicus",
+                       "lasagna", "fiber_directions", "winding_inference",
+                       "scroll_zarr")
+# Keys a manifest may carry by mistake, with what to do instead: a former
+# spiral-scroll.json's, and geometry the object store holds.
+_MISPLACED_MANIFEST_KEYS = {
+    **{key: "it belongs in the scroll block" for key in SCROLL_KEYS},
+    "umbilicus_coordinate_scale": "state it as umbilicus.coordinate_scale",
+    "paths": ("a spiral-scroll.json's path overrides are retired: name each "
+              "input at the top level, relative to the manifest"),
+    "normal_zarr_group": "the Lasagna manifest (lasagna.manifest) names the arrays",
+    **{key: "geometry is read from --object-store only"
+       for key in ("verified_patches", "patches", "fibers", "pcls",
+                   "point_collections", "outer_shell", "tracks", "tracks_dbm")},
+}
 
 
-def load_scroll_spec(dataset_root: str | os.PathLike[str],
-                     spec_path: str | os.PathLike[str] | None = None,
-                     *, outward_sense: str | None = None) -> ScrollSpec:
-    """Load the scroll specification for a dataset.
+def _manifest_path(value: Any, base: Path, key: str, source: str, *,
+                   remote: bool = False) -> str:
+    """One input-manifest location: a filesystem path, resolved against the
+    manifest's directory when relative, or (where ``remote``) a URL, kept
+    as it is."""
+    if not isinstance(value, str) or not value.strip():
+        raise ScrollSpecError(f"{source}: {key} must be a non-empty string")
+    if is_remote_location(value):
+        if not remote:
+            raise ScrollSpecError(
+                f"{source}: {key} must be a local path, not the URL {value.strip()}")
+        return value.strip()
+    return _normalise_path(value, base=base)
 
-    Discovers the single conventional file <dataset_root>/spiral-scroll.json
-    unless an explicit spec_path is given. A missing or invalid file raises
-    ScrollSpecError with instructions.
+
+def _manifest_block(document: Mapping[str, Any], key: str, allowed: tuple[str, ...],
+                    source: str) -> Mapping[str, Any] | None:
+    block = document.get(key)
+    if block is None:
+        return None
+    if not isinstance(block, Mapping):
+        raise ScrollSpecError(f"{source}: {key} must be an object")
+    unknown = sorted(set(block) - set(allowed))
+    if unknown:
+        raise ScrollSpecError(
+            f"{source}: unknown {key} keys {unknown} (allowed: {sorted(allowed)})")
+    return block
+
+
+def load_input_manifest(path: str | os.PathLike[str], *,
+                        cache_directory: str | os.PathLike[str],
+                        outward_sense: str | None = None,
+                        ) -> tuple[ScrollSpec, SpiralInputPaths]:
+    """Resolve a command-line fit's explicit input manifest into its scroll
+    and the inputs it reads by path (``(ScrollSpec, SpiralInputPaths)``).
+
+    Every input is named; nothing is discovered. Relative paths resolve
+    against the manifest's directory, so a fit does not depend on its working
+    directory. ``volume_uuid``, ``scroll`` and ``umbilicus`` are required;
+    the supervision inputs are optional here and required by
+    validate_fit_inputs when the configuration's losses read them. The scroll
+    must decide its outward sense, unless the fit setting ``outward_sense``
+    does (and then agree with it).
+
+    ``lasagna.manifest`` names the local Lasagna manifest. With
+    ``lasagna.original_url`` it is a local copy of the remote dataset there:
+    the fit reads it as that dataset (its identity, so its packs are the ones
+    a service fitting the URL shares), from a source document written under
+    ``cache_directory``. Nothing is downloaded.
     """
-    root = Path(_normalise_path(dataset_root)) if str(dataset_root or "").strip() else None
-    if spec_path is not None:
-        path = Path(_normalise_path(spec_path))
-    elif root is not None:
-        path = root / SCROLL_SPEC_FILENAME
-    else:
+    manifest_path = Path(_normalise_path(path))
+    source = str(manifest_path)
+    try:
+        data = manifest_path.read_bytes()
+        document = json.loads(data)
+    except (OSError, ValueError) as exc:
+        raise ScrollSpecError(f"{source}: cannot read the input manifest: {exc}") from exc
+    if not isinstance(document, Mapping):
+        raise ScrollSpecError(f"{source}: the input manifest must be a JSON object")
+    unknown = sorted(set(document) - set(INPUT_MANIFEST_KEYS))
+    if unknown:
         raise ScrollSpecError(
-            "No dataset root given: cannot discover the scroll specification "
-            f"({SCROLL_SPEC_FILENAME})")
-    if not path.is_file():
+            f"{source}: unknown input-manifest keys: "
+            + "; ".join(f"{key} ({_MISPLACED_MANIFEST_KEYS[key]})"
+                        if key in _MISPLACED_MANIFEST_KEYS else key
+                        for key in unknown)
+            + f" (allowed: {sorted(INPUT_MANIFEST_KEYS)})")
+    if document.get("schema_version") != INPUT_MANIFEST_SCHEMA_VERSION:
         raise ScrollSpecError(
-            f"No scroll specification found at {path}. Create {SCROLL_SPEC_FILENAME} "
-            "in the dataset root with schema_version, name, voxel_size_um, and "
-            "either the volume's catalog properties z_direction_is_top_to_bottom "
-            "and left_handed_coordinates or spiral_outward_sense (plus any "
-            "non-conventional path overrides).")
-    return parse_scroll_spec(_read_scroll_spec_document(path),
-                             root if root is not None else path.parent,
-                             source=str(path), outward_sense=outward_sense)
+            f"{source}: schema_version must be {INPUT_MANIFEST_SCHEMA_VERSION} "
+            f"(got {document.get('schema_version')!r})")
+    volume_uuid = document.get("volume_uuid")
+    if not isinstance(volume_uuid, str) or not volume_uuid.strip():
+        raise ScrollSpecError(
+            f"{source}: volume_uuid must name the reference volume the inputs "
+            "are in (the volume the selected store objects declare)")
+    if "scroll" not in document:
+        raise ScrollSpecError(f"{source}: the scroll block is required")
+    fields = _scroll_fields(document["scroll"], f"{source}: scroll")
+    base = manifest_path.parent
+
+    umbilicus = _manifest_block(document, "umbilicus", ("path", "coordinate_scale"),
+                                source)
+    if umbilicus is None:
+        raise ScrollSpecError(f"{source}: umbilicus (its path) is required")
+    umbilicus_path = _manifest_path(umbilicus.get("path"), base, "umbilicus.path", source)
+    if "coordinate_scale" in umbilicus:
+        scale = umbilicus["coordinate_scale"]
+        if (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                or not (math.isfinite(scale) and scale > 0)):
+            raise ScrollSpecError(
+                f"{source}: umbilicus.coordinate_scale must be a positive number")
+        fields["umbilicus_coordinate_scale"] = float(scale)
+    scroll = _scroll_spec_from_fields(fields, f"{source}: scroll",
+                                      outward_sense=outward_sense)
+
+    provenance = {"input_manifest": source,
+                  "sha256": hashlib.sha256(data).hexdigest()}
+    lasagna = ""
+    block = _manifest_block(document, "lasagna", ("manifest", "original_url"), source)
+    if block is not None:
+        lasagna = _manifest_path(block.get("manifest"), base, "lasagna.manifest", source)
+        url = block.get("original_url")
+        if url is not None:
+            if not isinstance(url, str) or not is_remote_location(url):
+                raise ScrollSpecError(
+                    f"{source}: lasagna.original_url must be the URL of the remote "
+                    "dataset the local manifest is a copy of")
+            provenance["lasagna_original_url"] = url.strip()
+            # A missing copy is reported, when the fit needs it, by
+            # validate_fit_inputs.
+            if os.path.isfile(lasagna):
+                try:
+                    copy = read_lasagna_manifest(lasagna, url=url.strip())
+                except LasagnaSourceError as exc:
+                    raise ScrollSpecError(f"{source}: lasagna: {exc}") from None
+                lasagna = write_lasagna_source(
+                    copy.dataset_directory(cache_directory), copy)
+    optional = {key: (_manifest_path(document[key], base, key, source,
+                                     remote=key == "scroll_zarr")
+                      if document.get(key) is not None else "")
+                for key in ("fiber_directions", "winding_inference", "scroll_zarr")}
+    return scroll, SpiralInputPaths(volume_uuid=volume_uuid.strip(),
+                                    umbilicus=umbilicus_path, lasagna=lasagna,
+                                    provenance=provenance, **optional)
 
 
-def load_dataset_scroll_fields(dataset_root: str | os.PathLike[str]) -> tuple[dict[str, Any], str]:
-    """A service dataset's spiral-scroll.json fields and the file, or ``({},
-    "")`` when it has none. The file is optional there: a service uses only
-    its path overrides and num_windings (the scroll's facts and the Lasagna
-    stores are the project's, ``SessionScroll``), and its other fields are the
-    command-line fit's. An invalid file raises ScrollSpecError."""
-    root = Path(_normalise_path(dataset_root))
-    path = root / SCROLL_SPEC_FILENAME
-    if not path.is_file():
-        return {}, ""
-    return _scroll_spec_fields(_read_scroll_spec_document(path), root, str(path)), str(path)
+def check_fit_volume(paths: SpiralInputPaths, volume_uuid: str | None) -> None:
+    """Refuse inputs resolved in another reference volume than the fit volume
+    ``volume_uuid`` the selected store objects name."""
+    if paths.volume_uuid and volume_uuid and paths.volume_uuid != volume_uuid:
+        raise ScrollSpecError(
+            f"the inputs are in the volume {paths.volume_uuid}, but the selected "
+            f"store objects are fitted in {volume_uuid}: name that volume's inputs, "
+            "or select objects of this one")
 
 
 # ---------------------------------------------------------------------------
@@ -861,8 +899,7 @@ PROJECT_VOLUME_FACTS = ("voxel_size_um", "base_shape_zyx",
                         "z_direction_is_top_to_bottom", "left_handed_coordinates")
 # The project's Lasagna dataset, by fit input.
 PROJECT_LASAGNA_INPUTS = ("lasagna",)
-# Fit inputs a service session reads from the project instead of the dataset:
-# the Lasagna dataset, and once the build knows the fit volume its umbilicus
+# Fit inputs a service session reads from the project: the Lasagna dataset, and once the build knows the fit volume its umbilicus
 # and the fiber directions extracted at its scale (VOLUME_INPUT_KEYS).
 VOLUME_INPUT_KEYS = ("umbilicus", "fiber_directions")
 PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
@@ -1127,8 +1164,8 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
 class SessionScroll:
     """A service session's scroll before its fit volume is known: the
     project's. ``resolve`` completes it once the inputs name the fit volume.
-    The dataset's spiral-scroll.json states the command-line fit's scroll; a
-    service session does not read its facts or Lasagna layout."""
+    The service adapter of the shared input contract, as load_input_manifest
+    is the command line's."""
 
     project: SpiralProject
 
@@ -1225,12 +1262,13 @@ def write_project_umbilicus(directory: str | os.PathLike[str], volume_uuid: str,
 
 def scroll_spec_config_defaults(spec: ScrollSpec | Mapping[str, Any] | None,
                                 base_config: Mapping[str, Any]) -> dict[str, Any]:
-    """Fit-config defaults a scroll specification supplies.
+    """Fit-config defaults the command-line input manifest's scroll supplies.
 
     The generic default for the outer winding and the exporters' physical
     winding estimate is Scroll 1's count (130), which on a scroll with fewer
     windings exports windings that lie outside the papyrus. An optional
-    num_windings in spiral-scroll.json replaces that default for this scroll.
+    scroll.num_windings in the input manifest replaces that default for this
+    scroll. A service takes winding counts from its fit configuration alone.
     The gap-lattice capacity is raised only when the count would not fit.
 
     Callers apply the result between the Python defaults and any explicit
@@ -1251,44 +1289,6 @@ def scroll_spec_config_defaults(spec: ScrollSpec | Mapping[str, Any] | None,
     if capacity is not None and capacity < num_windings + 3:
         defaults["model_gap_expander_capacity_windings"] = num_windings + 3
     return defaults
-
-def conventional_input_paths(
-        dataset_root: str | os.PathLike[str], spec: ScrollSpec, *,
-        output_directory: str = "", cache_directory: str = "",
-        checkpoint: str = "") -> SpiralInputPaths:
-    """Resolve the conventional dataset layout (plus spec overrides) for the
-    headless CLI, mirroring the historical fit_spiral module-global defaults.
-
-    Patches, fibers and point collections are not paths: the CLI reads them
-    from an object store (config object_store_path), never from the dataset.
-
-    Unlike resolve_dataset_root() this performs no existence probing: the CLI
-    fails on the specific missing input during loading, exactly as the module
-    globals did. The dataset root is kept verbatim (no symlink resolution) so
-    conventional paths read exactly as the caller spelled the root; explicit
-    spec overrides are already normalised against the root at parse time.
-    """
-    root = str(dataset_root)
-
-    def resolve(key):
-        override = spec.path_override(key)
-        if override:
-            return override
-        relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
-        return f"{root}/{relative}" if relative else ""
-
-    return SpiralInputPaths(
-        dataset_root=str(root),
-        umbilicus=resolve("umbilicus"),
-        fiber_directions=resolve("fiber_directions"),
-        lasagna=(spec.path_override("lasagna")
-                 or find_dataset_manifest(f"{root}/{LASAGNA_MANIFEST_DIRECTORY}")),
-        winding_inference=resolve("winding_inference"),
-        checkpoint=_normalise_path(checkpoint) if checkpoint else "",
-        output_directory=_normalise_path(output_directory) if output_directory else "",
-        cache_directory=_normalise_path(cache_directory) if cache_directory else "",
-    )
-
 
 def _normalise_path(value: Any, base: Path | None = None) -> str:
     if value is None or str(value).strip() == "":
@@ -1342,7 +1342,8 @@ class AutosaveCandidate:
     checkpoint: str
     metadata_path: str
     session_namespace: str
-    dataset_root: str
+    # The fit volume it was fitted in ('' when the sidecar does not say).
+    volume_uuid: str
     completed_iterations: int
     created: str
     sha256: str
@@ -1380,7 +1381,7 @@ def write_autosave_metadata(
     checkpoint_path: str | Path,
     *,
     session_namespace: str | Path,
-    dataset_root: str | Path,
+    volume_uuid: str | None,
     completed_iterations: int,
     model_state_sha256: str | None = None,
     input_digest: str | None = None,
@@ -1397,7 +1398,7 @@ def write_autosave_metadata(
     document = {
         "schema": AUTOSAVE_METADATA_SCHEMA,
         "session_namespace": _normalise_path(session_namespace),
-        "dataset_root": _normalise_path(dataset_root),
+        "volume_uuid": str(volume_uuid or ""),
         "checkpoint": checkpoint.name,
         "completed_iterations": int(completed_iterations),
         "created": datetime.datetime.now(datetime.timezone.utc)
@@ -1441,14 +1442,14 @@ def read_autosave_metadata(path: str | Path) -> AutosaveCandidate:
     name = str(document.get("checkpoint") or "")
     if not name or "/" in name or name in (".", ".."):
         raise ValueError("autosave metadata does not name a sibling checkpoint")
-    for key in ("session_namespace", "dataset_root", "sha256"):
+    for key in ("session_namespace", "sha256"):
         if not str(document.get(key) or "").strip():
             raise ValueError(f"autosave metadata is missing {key}")
     return AutosaveCandidate(
         checkpoint=str(metadata_path.parent / name),
         metadata_path=str(metadata_path),
         session_namespace=_normalise_path(document["session_namespace"]),
-        dataset_root=_normalise_path(document["dataset_root"]),
+        volume_uuid=str(document.get("volume_uuid") or ""),
         completed_iterations=int(document.get("completed_iterations", 0)),
         created=str(document.get("created") or ""),
         sha256=str(document["sha256"]),
@@ -1493,13 +1494,13 @@ def select_startup_autosave(
     output_root: str | Path,
     *,
     session_namespace: str | Path,
-    dataset_root: str | Path,
+    volume_uuid: str | None = None,
 ) -> AutosaveSelection:
     """Choose the newest matching autosave from validated metadata.
 
     Selection is by metadata: the sidecar must parse, must carry this
-    service's session namespace, and must have been written against this
-    dataset root. Among the survivors the one with the most completed
+    service's session namespace and, given ``volume_uuid``, must not have
+    been fitted in another volume. Among the survivors the one with the most completed
     iterations wins (ties broken by the recorded creation time), so the
     result never depends on filename ordering. Container and identity
     validation happens after selection, in ``validate_autosave``: a selected
@@ -1507,7 +1508,6 @@ def select_startup_autosave(
     an older one.
     """
     namespace = _normalise_path(session_namespace)
-    dataset = _normalise_path(dataset_root)
     candidates: list[AutosaveCandidate] = []
     rejected: list[tuple[str, str]] = []
     for metadata_path in discover_autosave_metadata(output_root):
@@ -1521,10 +1521,10 @@ def select_startup_autosave(
                 str(metadata_path),
                 f"belongs to session namespace {candidate.session_namespace}"))
             continue
-        if candidate.dataset_root != dataset:
+        if volume_uuid and candidate.volume_uuid and candidate.volume_uuid != volume_uuid:
             rejected.append((
                 str(metadata_path),
-                f"was written against dataset root {candidate.dataset_root}"))
+                f"was fitted in the volume {candidate.volume_uuid}"))
             continue
         candidates.append(candidate)
     if not candidates:
@@ -1540,67 +1540,14 @@ def select_startup_autosave(
 
 
 def default_user_cache_dir() -> str:
-    """The one documented user cache location, outside any dataset.
+    """The one documented user cache location.
 
     ``$XDG_CACHE_HOME/vc3d/spiral`` (``~/.cache/vc3d/spiral`` by default).
     Cache entries are content-addressed, so one shared directory serves every
-    dataset; ``--cache`` overrides it per service or CLI run.
+    scroll; ``--cache`` overrides it per service or CLI run.
     """
     base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
     return _normalise_path(base / "vc3d" / "spiral")
-
-
-def resolve_dataset_root(
-    root_value: str | os.PathLike[str],
-) -> SpiralDatasetResolution:
-    root = Path(_normalise_path(root_value))
-    result = SpiralDatasetResolution(root=str(root))
-    if not root.is_dir():
-        result.missing_required.append("dataset_root")
-        result.warnings.append(f"Dataset root is not a readable directory: {root}")
-        return result
-
-    # A service session's project supplies the physical facts it knows
-    # (SessionScroll), so the scroll specification is optional and may state
-    # only the rest; an invalid one does not resolve.
-    overrides = {}
-    try:
-        fields, _ = load_dataset_scroll_fields(root)
-    except ScrollSpecError as exc:
-        result.missing_required.append("scroll_spec")
-        result.warnings.append(str(exc))
-    else:
-        overrides = dict(fields.get("path_overrides", ()))
-        result.scroll_spec = {**fields, "path_overrides": overrides}
-
-    for input_spec in FIT_INPUT_CATALOG:
-        # The project supplies PROJECT_INPUT_KEYS.
-        if (not input_spec.conventional_relative
-                or input_spec.key in PROJECT_INPUT_KEYS):
-            continue
-        override = overrides.get(input_spec.key, "")
-        candidate = Path(override) if override \
-            else root / input_spec.conventional_relative
-        found = candidate.is_file() if input_spec.kind == "file" \
-            else candidate.is_dir()
-        if found and os.access(candidate, os.R_OK):
-            result.resolved[input_spec.key] = _normalise_path(candidate)
-        elif input_spec.resolve_required:
-            result.missing_required.append(input_spec.key)
-        else:
-            result.missing_optional.append(input_spec.key)
-
-    # Dataset resolution describes inputs only. The service binds the
-    # startup-resolved --output/--cache into the advertised resolution
-    # (spiral_service.bind_service_paths); nothing generated lives under
-    # the dataset root.
-    checkpoints = sorted(
-        _normalise_path(path)
-        for path in root.glob("*.ckpt")
-        if path.is_file()
-    )
-    result.detected_checkpoints = checkpoints
-    return result
 
 
 def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) -> None:
@@ -1611,52 +1558,68 @@ def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) ->
         errors.append({"field": label, "message": f"Invalid JSON: {exc}"})
 
 
-def validate_session_request(
+def validate_fit_inputs(
     paths: SpiralInputPaths,
-    run: SpiralRunConfig,
+    config: Mapping[str, Any],
     *,
     supplied: Iterable[str] = (),
     build_lasagna_packs: bool = True,
+    missing: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Perform cheap, aggregate validation before any GPU allocation.
+    """Check the inputs a fit of ``config`` reads by path, before any GPU
+    allocation: the shared validation of the command line's and a service's
+    resolved inputs.
 
     ``supplied`` names inputs another source provides once the fit volume is
-    known (a service session's PROJECT_INPUT_KEYS); they are not checked here.
-    Without ``build_lasagna_packs`` (a service) the Lasagna packs the fit
-    loads must already be in the cache directory.
+    known (a service session's VOLUME_INPUT_KEYS); they are not checked here.
+    ``missing`` maps an input to what its adapter says when one the
+    configuration needs is not named at all. Without ``build_lasagna_packs``
+    (a service) the Lasagna packs the fit loads must already be in the cache
+    directory.
     """
     supplied = frozenset(supplied)
+    missing = dict(missing or {})
     errors: list[dict[str, str]] = []
 
+    def unnamed(field_name: str, message: str) -> None:
+        hint = missing.get(field_name)
+        errors.append({"field": field_name,
+                       "message": f"{message}: {hint}" if hint else message})
+
     def require_file(value: str, field_name: str, *, json_file: bool = False) -> None:
-        path = Path(value) if value else None
-        if path is None or not path.is_file():
-            errors.append({"field": field_name, "message": "Required readable file is missing"})
+        if not value:
+            unnamed(field_name, "Required file is not named")
+            return
+        path = Path(value)
+        if not path.is_file():
+            errors.append({"field": field_name,
+                           "message": f"Required readable file is missing: {path}"})
             return
         if not os.access(path, os.R_OK):
-            errors.append({"field": field_name, "message": "File is not readable"})
+            errors.append({"field": field_name, "message": f"File is not readable: {path}"})
         elif json_file:
             _validate_json_file(path, field_name, errors)
 
     def optional_dir(value: str, field_name: str, required: bool = False) -> None:
-        if not value and not required:
+        if not value:
+            if required:
+                unnamed(field_name, "Required directory is not named")
             return
-        path = Path(value) if value else None
-        if path is None or not path.is_dir():
-            errors.append({"field": field_name, "message": "Required directory is missing" if required else "Path is not a directory"})
+        path = Path(value)
+        if not path.is_dir():
+            errors.append({"field": field_name, "message":
+                           f"{'Required directory is missing' if required else 'Path is not a directory'}: {path}"})
         elif not os.access(path, os.R_OK):
-            errors.append({"field": field_name, "message": "Directory is not readable"})
+            errors.append({"field": field_name, "message": f"Directory is not readable: {path}"})
 
     def check_lasagna(value: str, field_name: str, required: bool) -> None:
         if not value:
             if required:
-                errors.append({"field": field_name, "message":
-                               f"No Lasagna dataset: put its *.lasagna.json in "
-                               f"{LASAGNA_MANIFEST_DIRECTORY}/ or set paths.lasagna"})
+                unnamed(field_name, "No Lasagna dataset, and the configuration's losses read one")
             return
         try:
             source = load_lasagna_source(value)
-            packs = lasagna_packs_required(run.config)
+            packs = lasagna_packs_required(config)
             for kind in packs:
                 source.arrays(kind)
         except LasagnaSourceError as exc:
@@ -1673,17 +1636,17 @@ def validate_session_request(
                                f"pack_resident_pools.py and copy it to {pack}"})
 
     def check_catalog_input(spec: FitInputSpec) -> None:
-        if not spec.enabled(run.config) or spec.key in supplied:
+        if not spec.enabled(config) or spec.key in supplied:
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,
                          json_file=spec.json_content)
         elif spec.kind == "directory":
             optional_dir(getattr(paths, spec.key), spec.key,
-                         required=spec.required(run.config))
+                         required=spec.required(config))
         elif spec.kind == "lasagna":
             check_lasagna(getattr(paths, spec.key), spec.key,
-                          required=spec.required(run.config))
+                          required=spec.required(config))
 
     # The Lasagna store requirements (see the catalog's predicates) are
     # checked after the dense-spacing mode below, so an invalid mode errors
@@ -1692,7 +1655,7 @@ def validate_session_request(
         if spec.kind != "lasagna":
             check_catalog_input(spec)
 
-    if _dense_spacing_mode(run.config) is None:
+    if _dense_spacing_mode(config) is None:
         errors.append({"field": "dense_spacing_mode",
                        "message": "Must be grad_mag or winding_model"})
 
@@ -1700,21 +1663,49 @@ def validate_session_request(
         if spec.kind == "lasagna":
             check_catalog_input(spec)
 
-    if _winding_model_enabled(run.config) and paths.winding_inference:
-        manifest = Path(paths.winding_inference) / "manifest.json"
-        if not manifest.is_file():
-            errors.append({"field": "winding_inference",
-                           "message": "manifest.json is missing"})
-        else:
-            try:
-                metadata = json.loads(manifest.read_text())
-                if metadata.get("artifact_type") != "winding_inference_crossings":
-                    raise ValueError("unexpected artifact_type")
-                if int(metadata.get("format_version", -1)) != 1:
-                    raise ValueError("unsupported format_version")
-            except Exception as exc:
-                errors.append({"field": "winding_inference",
-                               "message": f"Invalid inference manifest: {exc}"})
+    if (_winding_model_enabled(config) and paths.winding_inference
+            and Path(paths.winding_inference).is_dir()):
+        error = winding_inference_error(paths.winding_inference)
+        if error:
+            errors.append({"field": "winding_inference", "message": error})
+
+    if _lasagna_required(config) and not paths.cache_directory:
+        errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
+    return errors
+
+
+def winding_inference_error(path: str | os.PathLike[str]) -> str:
+    """Why the winding-inference artifact at ``path`` cannot be read, or ''."""
+    manifest = Path(path) / "manifest.json"
+    if not Path(path).is_dir():
+        return f"Required directory is missing: {path}"
+    if not manifest.is_file():
+        return f"manifest.json is missing in {path}"
+    try:
+        metadata = json.loads(manifest.read_text())
+        if metadata.get("artifact_type") != "winding_inference_crossings":
+            raise ValueError("unexpected artifact_type")
+        if int(metadata.get("format_version", -1)) != 1:
+            raise ValueError("unsupported format_version")
+    except Exception as exc:
+        return f"Invalid inference manifest {manifest}: {exc}"
+    return ""
+
+
+def validate_session_request(
+    paths: SpiralInputPaths,
+    run: SpiralRunConfig,
+    *,
+    supplied: Iterable[str] = (),
+    build_lasagna_packs: bool = True,
+    missing: Mapping[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Perform cheap, aggregate validation of a service session request
+    before any GPU allocation: its inputs (validate_fit_inputs) and its run
+    block, output directory and checkpoint."""
+    errors = validate_fit_inputs(paths, run.config, supplied=supplied,
+                                 build_lasagna_packs=build_lasagna_packs,
+                                 missing=missing)
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
@@ -1735,9 +1726,6 @@ def validate_session_request(
             errors.append({"field": "output_directory", "message": "Output path is not a directory"})
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
-
-    if _lasagna_required(run.config) and not paths.cache_directory:
-        errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():
         errors.append({"field": "checkpoint", "message": "Checkpoint file does not exist"})

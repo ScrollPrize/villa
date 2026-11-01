@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit, render, and score one Spiral dataset sequentially."""
+"""Fit, render, and score one Spiral fit sequentially."""
 
 from __future__ import annotations
 
@@ -105,7 +105,13 @@ def add_common_arguments(
     parser: argparse.ArgumentParser, *, include_gpus: bool = True
 ) -> None:
     """Register operational arguments shared by the single and sweep runners."""
-    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument(
+        "--inputs",
+        required=True,
+        type=Path,
+        metavar="MANIFEST",
+        help="fit input manifest (fit_spiral.py --inputs)",
+    )
     parser.add_argument(
         "--object-store",
         required=True,
@@ -345,8 +351,8 @@ def fit_command(
 ) -> list[str]:
     script_args = [
         str(SPIRAL_DIR / "fit_spiral.py"),
-        "--dataset",
-        str(args.dataset),
+        "--inputs",
+        str(args.inputs),
         "--object-store",
         str(args.object_store),
     ]
@@ -736,7 +742,7 @@ def _resume_invocation(
             "wandb_entity": entity,
         },
         "inputs": {
-            "dataset": str(args.dataset.resolve()),
+            "input_manifest": str(args.inputs.resolve()),
             "ink_volume": str(args.ink_volume.resolve()),
         },
         "operational_args": {
@@ -1120,7 +1126,7 @@ def run(args: argparse.Namespace) -> None:
     if overwrite and getattr(args, "resume", False):
         raise ValueError("--overwrite cannot be combined with --resume")
     if overwrite:
-        protected_paths = [args.dataset, args.ink_volume, args.vc_render_bin]
+        protected_paths = [args.inputs, args.ink_volume, args.vc_render_bin]
         if args.config is not None:
             protected_paths.append(args.config)
         overwrite_output(args.output, protected_paths=protected_paths)

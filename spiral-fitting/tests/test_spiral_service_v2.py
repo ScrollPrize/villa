@@ -1,7 +1,7 @@
 """Tests for the Spiral service protocol.
 
-Covers bearer authentication, API-key auto-generation, launch-time dataset
-ownership, the artifact registry and its HTTP endpoints, session input
+Covers bearer authentication, API-key auto-generation, launch-time host
+path bindings, the artifact registry and its HTTP endpoints, session input
 uploads with immutable workspace staging, and checkpoint transfers. The resident fitter is
 faked; these tests exercise the service plumbing only.
 """
@@ -51,7 +51,7 @@ from lasagna_publish import (PreviewPublication, PublishedPreview,
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA, SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, SessionState, SpiralInputPaths,
-                         SpiralProject, resolve_dataset_root, select_startup_autosave,
+                         SpiralProject, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
 from config import Config
 from service_project import UMBILICUS, VOLUME, project, with_project
@@ -161,7 +161,7 @@ class FakeSession:
         self.closed = True
 
 
-# The minimal test dataset carries no Lasagna zarr groups, so the launch
+# The test project carries no Lasagna dataset, so the launch
 # defaults these fixtures start from zero-weight the dense losses that would
 # require them.
 _NO_DENSE_LOSSES = {
@@ -182,21 +182,12 @@ def _await_build(state, timeout=10.0):
     raise AssertionError("the session build did not settle")
 
 
-def _write_scroll_spec(root):
-    (Path(root) / "spiral-scroll.json").write_text(json.dumps({
-        "schema_version": 1,
-        "name": "s1",
-        "voxel_size_um": 9.6,
-        "spiral_outward_sense": "CW",
-    }))
-
-
-def _attach_fake_session(state, output_directory, dataset_root=""):
+def _attach_fake_session(state, output_directory, volume_uuid=""):
     state.session = FakeSession()
     state.session_generation += 1
     state.session_id = f"spiral-test-{state.session_generation}"
     state.session_paths = SpiralInputPaths.from_mapping({
-        "dataset_root": str(dataset_root),
+        "volume_uuid": str(volume_uuid),
         "output_directory": str(output_directory),
     })
     state.session_request = {
@@ -360,21 +351,16 @@ class NamedSessionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_session_name(value)
 
-    def test_resolution_describes_inputs_only_until_bound(self):
+    def test_bindings_are_the_launch_host_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "dataset"
-            root.mkdir()
-            _write_scroll_spec(root)
-            (root / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            resolution = resolve_dataset_root(root)
-            self.assertNotIn("output_directory", resolution.resolved)
-            self.assertNotIn("cache_directory", resolution.resolved)
             output = Path(temporary) / "output" / "alice"
             cache = Path(temporary) / "cache"
-            spiral_service.bind_service_paths(resolution, output, cache)
-            self.assertEqual(resolution.resolved["output_directory"], str(output))
-            self.assertEqual(resolution.resolved["cache_directory"], str(cache))
+            bindings = spiral_service.bind_service_inputs(output, cache)
+            self.assertEqual(bindings.advertisement(), {
+                "output_directory": str(output), "cache_directory": str(cache),
+                "winding_inference": {
+                    "bound": False, "path": None, "available": False,
+                    "error": "the service was launched without --winding-inference"}})
 
     def test_default_user_cache_dir_honours_xdg_and_is_stable(self):
         from fit_session import default_user_cache_dir
@@ -847,56 +833,59 @@ class ArtifactHttpTests(HttpServiceFixture):
         self.assertFalse(artifact_root.exists())
 
 
-class DatasetOwnershipTests(unittest.TestCase):
+class BindingOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
-        self.root = base / "dataset"
+        # Somewhere outside the service's bindings.
+        self.root = base / "elsewhere"
         self.root.mkdir()
-        _write_scroll_spec(self.root)
-        (self.root / "umbilicus.json").write_text("{}")
-        (self.root / "verified_patches").mkdir()
         self.output = base / "output"
         self.output.mkdir()
         self.cache = base / "cache"
-        self.resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.root), self.output, self.cache)
-        self.assertTrue(self.resolution.ok)
-        self.state = ServiceState(dataset_root=str(self.root),
-                                  dataset_resolution=self.resolution,
+        self.state = ServiceState(bindings=spiral_service.bind_service_inputs(
+                                      self.output, self.cache),
                                   startup_run={"z_begin": 0, "z_end": 10,
                                                "config": _NO_DENSE_LOSSES})
 
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_dataset_endpoint_advertises_resolution(self):
-        response = self.state.dataset()
-        self.assertEqual(response["root"], str(self.root))
-        # The project supplies the umbilicus, not the dataset.
-        self.assertNotIn("umbilicus", response["resolved"])
-        self.assertEqual(response["scroll_spec"]["name"], "s1")
-        # The startup-bound deployment roots are part of the advertisement.
-        self.assertEqual(response["resolved"]["output_directory"],
+    def test_bindings_endpoint_advertises_the_host_paths(self):
+        response = self.state.binding_advertisement()
+        # The project supplies the scroll and its inputs; there is no dataset.
+        self.assertFalse({"root", "resolved", "scroll_spec", "detected_checkpoints",
+                          "missing_required", "ok"} & set(response))
+        # The startup-bound deployment roots are the advertisement.
+        self.assertEqual(response["bindings"]["output_directory"],
                          str(self.output))
-        self.assertEqual(response["resolved"]["cache_directory"],
+        self.assertEqual(response["bindings"]["cache_directory"],
                          str(self.cache))
+        self.assertFalse(response["bindings"]["winding_inference"]["bound"])
+        self.assertFalse(response["capabilities"]["winding_inference"])
+        self.assertNotIn("dataset_root", self.state.health())
 
-    def test_dataset_endpoint_advertises_named_session(self):
-        resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.root), self.output / "alice", self.cache)
+    def test_bindings_endpoint_advertises_named_session(self):
         state = ServiceState(
-            dataset_root=str(self.root), dataset_resolution=resolution,
+            bindings=spiral_service.bind_service_inputs(
+                self.output / "alice", self.cache),
             session_name="alice")
-        response = state.dataset()
+        response = state.binding_advertisement()
         self.assertEqual(response["session_name"], "alice")
         self.assertEqual(
-            response["resolved"]["output_directory"],
+            response["bindings"]["output_directory"],
             str(self.output / "alice"))
 
+    def test_winding_counts_come_from_the_configuration_alone(self):
+        # No host scroll specification seeds the catalog's winding defaults.
+        catalog = self.state.configuration_catalog()
+        generic = Config().as_dict()
+        for key in ("shell_outer_winding_idx", "model_gap_expander_num_windings",
+                    "model_gap_expander_capacity_windings"):
+            self.assertEqual(catalog["defaults"][key], generic[key])
+
     def test_generated_state_roots_live_under_the_output_root(self):
-        # Every generated-state family hangs off the bound --output root and
-        # never off the dataset.
+        # Every generated-state family hangs off the bound --output root.
         self.assertEqual(self.state._output_root(), self.output)
         self.assertEqual(self.state._staging_root(),
                          self.output / ".spiral-upload-staging")
@@ -909,7 +898,7 @@ class DatasetOwnershipTests(unittest.TestCase):
                                    "run": {"z_begin": 0, "z_end": 10}}))
         self.assertEqual(caught.exception.status, 400)
         fields = {detail["field"] for detail in caught.exception.details}
-        self.assertEqual(fields, {"umbilicus"})
+        self.assertEqual(fields, {"paths.umbilicus"})
 
     def test_initialize_rejects_unadvertised_checkpoint(self):
         with self.assertRaises(ApiError) as caught:
@@ -919,7 +908,7 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def _attach_session_for_request(self, config=None):
         """Attach a fake session whose canonical request the service produced."""
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         _publish_request(self.state, {"run": {
             "z_begin": 0, "z_end": 10,
             "config": {**_NO_DENSE_LOSSES, **(config or {})}}})
@@ -980,8 +969,9 @@ class DatasetOwnershipTests(unittest.TestCase):
         run = self._base_request({"shell_num_theta_bins": 360})["run"]
         _, run_config, preview, scroll = self.state._prepare_session_request(with_project(
             {"run": run}))
-        # As the request validates them: the project supplies the umbilicus.
-        requested = dataclasses.replace(live, umbilicus="")
+        # As the request validates them: the project supplies the umbilicus
+        # and the build the fit volume.
+        requested = dataclasses.replace(live, umbilicus="", volume_uuid="")
         with self.state.lock:
             self.assertEqual(
                 self.state._rebuild_stage_locked(
@@ -1030,32 +1020,36 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.session_request["run"]["config"]
             ["model_linear_z_resolution"], 24)
 
-    def test_dataset_request_filters_resolved_paths_with_input_toggles(self):
-        request = self.state._dataset_session_request({
+    def test_bound_request_filters_paths_with_input_toggles(self):
+        request = self.state._bound_session_request({
             "run": {"z_begin": 0, "z_end": 10},
         }, _PROJECT)
         # Patches, fibers and PCLs come from the object store, never from
-        # dataset paths.
+        # paths.
         self.assertFalse({"verified_patches", "fibers", "pcls"} & set(request["paths"]))
+        self.assertNotIn("dataset_root", request["paths"])
 
         self.assertNotIn("tracks_dbm", request["paths"])
         with self.assertRaises(ApiError):
             # Tracks come from the store too: a request cannot name a database.
-            self.state._dataset_session_request({
+            self.state._bound_session_request({
                 "paths": {"tracks_dbm": "/a/store.dbm"},
                 "run": {"z_begin": 0, "z_end": 10},
             }, _PROJECT)
 
-    def test_omitted_spacing_mode_preserves_default_winding_input(self):
+    def _bind_winding_inference(self):
         winding = self.root / "winding_inference"
         winding.mkdir()
         (winding / "manifest.json").write_text(json.dumps({
             "artifact_type": "winding_inference_crossings",
             "format_version": 1,
         }))
-        (self.root / "outer_shell").mkdir()
-        self.state.dataset_resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.root), self.output, self.cache)
+        self.state.bindings = spiral_service.bind_service_inputs(
+            self.output, self.cache, winding)
+        return winding
+
+    def test_omitted_spacing_mode_preserves_default_winding_input(self):
+        winding = self._bind_winding_inference()
         config = {**_NO_DENSE_LOSSES,
                   "input_use_winding_inference": True,
                   "input_use_outer_shell": True}
@@ -1068,22 +1062,18 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(paths.winding_inference, str(winding))
         self.assertEqual(run.config, config)
 
-        # Missing default-mode inputs must fail preflight, before GPU work.
-        self.state.dataset_resolution.resolved["winding_inference"] = ""
+        # Missing default-mode inputs must fail preflight, before GPU work,
+        # saying how the service gets them.
+        self.state.bindings = spiral_service.bind_service_inputs(
+            self.output, self.cache)
         with self.assertRaises(ApiError) as caught:
             self.state._prepare_session_request(with_project(request))
-        self.assertIn("winding_inference",
-                      {detail["field"] for detail in caught.exception.details})
+        [detail] = [detail for detail in caught.exception.details
+                    if detail["field"] == "winding_inference"]
+        self.assertIn("--winding-inference PATH", detail["message"])
 
     def test_checkpoint_config_selects_winding_model_inputs(self):
-        winding = self.root / "winding_inference"
-        winding.mkdir()
-        (winding / "manifest.json").write_text(json.dumps({
-            "artifact_type": "winding_inference_crossings",
-            "format_version": 1,
-        }))
-        self.state.dataset_resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.root), self.output, self.cache)
+        winding = self._bind_winding_inference()
 
         checkpoint_config = Config({
             **_NO_DENSE_LOSSES,
@@ -1094,7 +1084,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         checkpoint = self._write_checkpoint(
             "winding-model.ckpt", checkpoint_config)
 
-        request, input_config = self.state._dataset_session_request({
+        request, input_config = self.state._bound_session_request({
             "paths": {"checkpoint": str(checkpoint)},
             "run": {"z_begin": 0, "z_end": 10, "config": {}},
         }, _PROJECT, include_input_config=True)
@@ -1156,7 +1146,9 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         attached = response["session_request"]
         self.assertEqual(attached, self.state.status()["session_request"])
-        self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
+        self.assertNotIn("dataset_root", attached["paths"])
+        self.assertEqual(attached["paths"]["volume_uuid"], VOLUME)
+        self.assertEqual(attached["paths"]["provenance"]["project"], "s1")
         self.assertFalse({"verified_patches", "fibers", "pcls"} & set(attached["paths"]))
         self.assertEqual(attached["run"]["z_begin"], 100)
         self.assertEqual(attached["run"]["z_end"], 900)
@@ -1166,7 +1158,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
         # The project's umbilicus, written where the fit reads it, and the
-        # scroll: the project's name with the dataset's specification.
+        # scroll: the project's name and facts.
         self.assertEqual(attached["project"]["volume"], VOLUME)
         self.assertEqual(attached["project"]["umbilicus"]["revision"],
                          UMBILICUS["revision"])
@@ -1235,7 +1227,7 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_save_checkpoint_names_a_file_the_service_places(self):
         """The client names the checkpoint; the service owns the location."""
-        _attach_fake_session(self.state, self.output, self.root)
+        _attach_fake_session(self.state, self.output, VOLUME)
         for name in ("", "   ", "../escape.ckpt", "sub/dir.ckpt", "..",
                      "/absolute.ckpt"):
             with self.assertRaises(ApiError) as caught:
@@ -1253,7 +1245,7 @@ class DatasetOwnershipTests(unittest.TestCase):
                          str(self.output / "checkpoints" / "second.ckpt"))
 
     def test_load_checkpoint_reads_only_service_owned_checkpoints(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         outside = self.root / "elsewhere.ckpt"
         outside.write_bytes(b"PK\x03\x04checkpoint")
         uploaded = self.output / "uploaded-checkpoints" / "a.ckpt"
@@ -1278,21 +1270,21 @@ class DatasetOwnershipTests(unittest.TestCase):
                 self.assertEqual(caught.exception.status, 400)
         self.assertEqual(session.loaded, [])
 
-    def test_dataset_advertises_the_checkpoints_a_load_may_name(self):
-        _attach_fake_session(self.state, self.output, self.root)
+    def test_bindings_advertise_the_checkpoints_a_load_may_name(self):
+        _attach_fake_session(self.state, self.output, VOLUME)
         saved = self.state.save_checkpoint({"name": "manual"})["checkpoint_path"]
         staging = self.output / ".spiral-artifacts" / "checkpoint-abc"
         staging.mkdir(parents=True, exist_ok=True)
         (staging / "checkpoint.ckpt").write_bytes(b"PK\x03\x04checkpoint")
 
-        listed = self.state.dataset()["session_checkpoints"]
+        listed = self.state.binding_advertisement()["session_checkpoints"]
 
         self.assertIn(saved, listed)
         # Artifact staging is transfer plumbing, not a user choice.
         self.assertNotIn(str(staging / "checkpoint.ckpt"), listed)
 
     def test_load_checkpoint_reports_the_restored_iteration(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         checkpoint = self.output / "uploaded-checkpoints" / "a.ckpt"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
@@ -1310,7 +1302,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self.state.session_revision, revision + 1)
 
     def test_a_refused_checkpoint_is_a_conflict_and_changes_nothing(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         session.load_refusal = "checkpoint model z-domain [0, 10) is not..."
         checkpoint = self.output / "a.ckpt"
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
@@ -1325,7 +1317,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self.state.session_paths.checkpoint, "")
 
     def test_autosave_on_pause_is_a_run_request_flag_defaulting_on(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
 
         _planned_run(self.state, {"iterations": 4})
         self.assertEqual(session.autosave_calls, [True])
@@ -1339,7 +1331,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 400)
 
     def test_preview_schedule_is_optional_validated_and_service_owned(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         _planned_run(self.state, {
             "iterations": 4,
             "preview_schedule": {
@@ -1367,7 +1359,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         a preview that succeeded was reported as a failure. The client
         follows preview_exporting in the status it already polls.
         """
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         release = threading.Event()
         session.preview_gate = release
 
@@ -1399,7 +1391,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(session.previews, 2)
 
     def test_a_failed_preview_export_is_reported_through_status(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         session.preview_failure = "OSError: no space left on device"
 
         self.state.export_preview()
@@ -1411,7 +1403,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertFalse(status["preview_exporting"])
         self.assertIn("no space left", status["preview_publish_error"])
 
-    def _write_checkpoint(self, name, cfg, dataset_root=None):
+    def _write_checkpoint(self, name, cfg, volume_uuid=None):
         """A checkpoint carrying the durable cfg a refusal is analysed from."""
         import torch
 
@@ -1421,8 +1413,7 @@ class DatasetOwnershipTests(unittest.TestCase):
             # refusal analysis compares key sets against exactly that schema.
             "schema_version": 2, "cfg": dict(cfg),
             "input_manifest": {
-                "dataset_root": str(
-                    self.root if dataset_root is None else dataset_root),
+                "volume_uuid": VOLUME if volume_uuid is None else volume_uuid,
                 # Object-store inputs of some fit: the fake session has no
                 # manifest to compare them with, so the cfg alone decides.
                 "object_store": {"objects": [], "relationships": []}},
@@ -1436,7 +1427,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         return caught.exception
 
     def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         live = Config().as_dict()
         session.applied_config = dict(live)
 
@@ -1484,13 +1475,13 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(error.payload["stage"], "all")
 
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         live = Config().as_dict()
         session.applied_config = dict(live)
 
-        # Another dataset entirely.
+        # Fitted in another volume entirely.
         error = self._refuse_load(session, self._write_checkpoint(
-            "foreign.ckpt", dict(live), dataset_root="/somewhere/else"))
+            "foreign.ckpt", dict(live), volume_uuid="another-volume"))
         self.assertTrue(error.payload["refused"])
         self.assertNotIn("stage", error.payload)
 
@@ -1507,7 +1498,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertTrue(error.payload["refused"])
 
     def test_allow_rebuild_rebuilds_onto_the_checkpoint_without_overrides(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         live = Config().as_dict()
         session.applied_config = dict(live)
         # A live session request carrying an advanced profile, as a client
@@ -1536,7 +1527,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(rebuilds[0]["run"]["z_end"], live["z_end"])
 
     def test_allow_rebuild_must_be_a_boolean(self):
-        _attach_fake_session(self.state, self.output, self.root)
+        _attach_fake_session(self.state, self.output, VOLUME)
         checkpoint = self.output / "a.ckpt"
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
         with self.assertRaises(ApiError) as caught:
@@ -1545,7 +1536,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 400)
 
     def test_a_rebuild_refuses_overrides_its_checkpoint_contradicts(self):
-        _attach_fake_session(self.state, self.output, self.root)
+        _attach_fake_session(self.state, self.output, VOLUME)
         live = Config().as_dict()
         checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
         request = {
@@ -1566,7 +1557,7 @@ class DatasetOwnershipTests(unittest.TestCase):
             str(checkpoint), request["run"]["config"])
 
     def test_load_checkpoint_requires_an_idle_session(self):
-        session = _attach_fake_session(self.state, self.output, self.root)
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         session.state = SessionState.Running
         checkpoint = self.output / "a.ckpt"
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
@@ -1576,7 +1567,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(session.loaded, [])
 
     def test_error_session_can_rebuild_from_a_different_checkpoint(self):
-        _attach_fake_session(self.state, self.output, self.root)
+        _attach_fake_session(self.state, self.output, VOLUME)
         # A failed build has a canonical request and identity to recover, but
         # no usable resident object on which an in-place load could operate.
         self.state.session = None
@@ -1588,7 +1579,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         torch.save({
             "schema_version": 2,
             "cfg": {**Config().as_dict(), **_NO_DENSE_LOSSES},
-            "input_manifest": {"dataset_root": str(self.root)},
+            "input_manifest": {"volume_uuid": VOLUME},
         }, checkpoint)
 
         with self.assertRaises(ApiError) as caught:
@@ -1599,7 +1590,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         # Exercise the real rebuild request parser.  The stored session
         # request contains all canonical service-owned paths, but retrying a
         # checkpoint must feed only client-selectable paths back through the
-        # dataset-mode boundary.
+        # binding boundary.
         with mock.patch.object(self.state, "_begin_build") as begin_build:
             response = self.state.load_checkpoint({
                 "uploaded_checkpoint": str(checkpoint),
@@ -1609,14 +1600,14 @@ class DatasetOwnershipTests(unittest.TestCase):
         begin_build.assert_called_once()
         rebuilt_paths, rebuilt_run = begin_build.call_args.args[:2]
         self.assertEqual(rebuilt_paths.checkpoint, str(checkpoint))
-        self.assertEqual(rebuilt_paths.dataset_root, str(self.root))
+        self.assertFalse(hasattr(rebuilt_paths, "dataset_root"))
         self.assertEqual(rebuilt_paths.output_directory, str(self.output))
         self.assertEqual(rebuilt_run.config, {})
         self.assertTrue(response["rebuilding"])
         self.assertEqual(response["checkpoint_path"], str(checkpoint))
 
 
-def _write_autosave(directory, *, iterations, namespace, dataset_root,
+def _write_autosave(directory, *, iterations, namespace, volume_uuid,
                     payload=b"payload", corrupt=False):
     """Write one autosave plus the metadata that makes it selectable."""
     directory = Path(directory)
@@ -1624,7 +1615,7 @@ def _write_autosave(directory, *, iterations, namespace, dataset_root,
     checkpoint = directory / AUTOSAVE_CHECKPOINT_NAME
     checkpoint.write_bytes(_zip_checkpoint_bytes(payload))
     write_autosave_metadata(checkpoint, session_namespace=namespace,
-                            dataset_root=dataset_root,
+                            volume_uuid=volume_uuid,
                             completed_iterations=iterations)
     if corrupt:
         # Truncate the archive after the sidecar recorded it: the metadata
@@ -1640,7 +1631,7 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.output = Path(self.temporary.name) / "output" / "session-a"
         self.output.mkdir(parents=True)
-        self.dataset = str(Path(self.temporary.name) / "dataset")
+        self.volume = VOLUME
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -1648,16 +1639,16 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
     def _select(self):
         return select_startup_autosave(
             self.output, session_namespace=self.output,
-            dataset_root=self.dataset)
+            volume_uuid=self.volume)
 
     def test_the_furthest_autosave_wins_regardless_of_filename_order(self):
         # "aaa-run" sorts first and "zzz-run" sorts last; neither ordering
         # decides anything. The completed iteration count does.
         _write_autosave(self.output / "zzz-run", iterations=40,
-                        namespace=self.output, dataset_root=self.dataset)
+                        namespace=self.output, volume_uuid=self.volume)
         winner = _write_autosave(self.output / "aaa-run", iterations=900,
                                  namespace=self.output,
-                                 dataset_root=self.dataset)
+                                 volume_uuid=self.volume)
         selection = self._select()
         self.assertEqual(selection.selected.checkpoint, str(winner))
         self.assertEqual(selection.selected.completed_iterations, 900)
@@ -1667,25 +1658,25 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
 
     def test_a_checkpoint_without_metadata_is_never_selected(self):
         # A bare autosave file is inert: nothing says which session
-        # namespace or dataset it belongs to, so it is not a candidate.
+        # namespace or volume it belongs to, so it is not a candidate.
         run = self.output / "run"
         run.mkdir()
         (run / AUTOSAVE_CHECKPOINT_NAME).write_bytes(_zip_checkpoint_bytes())
         self.assertIsNone(self._select().selected)
 
-    def test_another_namespace_or_dataset_is_rejected_not_selected(self):
+    def test_another_namespace_or_volume_is_rejected_not_selected(self):
         _write_autosave(self.output / "other-namespace", iterations=10,
                         namespace=Path(self.temporary.name) / "output" / "b",
-                        dataset_root=self.dataset)
-        _write_autosave(self.output / "other-dataset", iterations=20,
+                        volume_uuid=self.volume)
+        _write_autosave(self.output / "other-volume", iterations=20,
                         namespace=self.output,
-                        dataset_root=self.dataset + "-elsewhere")
+                        volume_uuid="another-volume")
         selection = self._select()
         self.assertIsNone(selection.selected)
         reasons = sorted(reason for _, reason in selection.rejected)
         self.assertEqual(len(reasons), 2)
         self.assertIn("belongs to session namespace", reasons[0])
-        self.assertIn("was written against dataset root", reasons[1])
+        self.assertIn("was fitted in the volume another-volume", reasons[1])
 
     def test_unreadable_metadata_is_rejected_with_its_reason(self):
         run = self.output / "run"
@@ -1703,7 +1694,7 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
 
     def test_a_selected_autosave_must_match_its_recorded_identity(self):
         _write_autosave(self.output / "run", iterations=10,
-                        namespace=self.output, dataset_root=self.dataset,
+                        namespace=self.output, volume_uuid=self.volume,
                         corrupt=True)
         selected = self._select().selected
         self.assertIsNotNone(selected)
@@ -1714,7 +1705,7 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
         # Same size, different content: the digest still catches it.
         checkpoint = _write_autosave(
             self.output / "run2", iterations=20, namespace=self.output,
-            dataset_root=self.dataset, payload=b"payload")
+            volume_uuid=self.volume, payload=b"payload")
         checkpoint.write_bytes(_zip_checkpoint_bytes(b"payloaX"))
         with self.assertRaises(AutosaveError) as caught:
             validate_autosave(self._select().selected)
@@ -1722,7 +1713,7 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
 
     def test_a_valid_autosave_passes_identity_validation(self):
         _write_autosave(self.output / "run", iterations=7,
-                        namespace=self.output, dataset_root=self.dataset)
+                        namespace=self.output, volume_uuid=self.volume)
         validate_autosave(self._select().selected)
 
 
@@ -1732,19 +1723,12 @@ class ExplicitInitializationTests(HttpServiceFixture):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
-        self.dataset = base / "dataset"
-        self.dataset.mkdir()
-        _write_scroll_spec(self.dataset)
-        (self.dataset / "umbilicus.json").write_text("{}")
-        (self.dataset / "verified_patches").mkdir()
+        self.volume = VOLUME
         self.output = base / "output" / "session-a"
         self.output.mkdir(parents=True)
         self.cache = base / "cache"
-        self.resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.dataset), self.output, self.cache)
         self.state = ServiceState(
-            dataset_root=str(self.dataset),
-            dataset_resolution=self.resolution,
+            bindings=spiral_service.bind_service_inputs(self.output, self.cache),
             startup_run={"z_begin": 0, "z_end": 10,
                          "config": _NO_DENSE_LOSSES})
         SpiralServer.allow_reuse_address = False
@@ -1770,7 +1754,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
         status, payload, _ = self.request("GET", "/session/status")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload)["state"], expected_state)
-        for path in ("/health", "/dataset", "/configuration"):
+        for path in ("/health", "/bindings", "/configuration"):
             status, payload, _ = self.request("GET", path)
             self.assertEqual(status, 200, path)
             self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
@@ -1829,9 +1813,9 @@ class ExplicitInitializationTests(HttpServiceFixture):
 
     def test_initialization_does_not_select_an_autosave(self):
         _write_autosave(self.output / "old-run", iterations=5,
-                        namespace=self.output, dataset_root=self.dataset)
+                        namespace=self.output, volume_uuid=self.volume)
         _write_autosave(self.output / "new-run", iterations=500,
-                        namespace=self.output, dataset_root=self.dataset)
+                        namespace=self.output, volume_uuid=self.volume)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
             self.state.initialize(with_project(self.state.startup_session_request()))
@@ -1841,7 +1825,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
 
     def test_a_corrupt_autosave_is_ignored_unless_selected(self):
         _write_autosave(self.output / "run", iterations=50,
-                        namespace=self.output, dataset_root=self.dataset,
+                        namespace=self.output, volume_uuid=self.volume,
                         corrupt=True)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
@@ -1919,9 +1903,6 @@ class UploadTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.dataset = self.root / "dataset"
-        (self.dataset / "verified_patches").mkdir(parents=True)
-        (self.dataset / "fibers").mkdir()
         self.output = self.root / "output"
         self.output.mkdir()
         self.state = ServiceState()
@@ -1931,8 +1912,10 @@ class UploadTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _session(self):
-        self.state.dataset_root = str(self.dataset)
-        session = _attach_fake_session(self.state, self.output, self.dataset)
+        # A bound service gates mutations on the session lease.
+        self.state.bindings = spiral_service.bind_service_inputs(
+            self.output, self.root / "cache")
+        session = _attach_fake_session(self.state, self.output, VOLUME)
         self.state.lease().claim('owner', 'claim')
         return session
 
@@ -2071,11 +2054,11 @@ class UploadTests(unittest.TestCase):
 
     def test_outer_shell_path_change_requires_session_reload(self):
         self._session()
-        shell = self.dataset / "outer_shell_v2"
+        shell = self.root / "outer_shell_v2"
         shell.mkdir()
         inputs = self.state.session_paths.manifest()
         inputs["outer_shell"] = str(shell)
-        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+        with self.assertRaisesRegex(ApiError, "Static fit inputs") as caught:
             self.state.run({
                 "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
@@ -2089,8 +2072,8 @@ class UploadTests(unittest.TestCase):
     def test_any_other_static_path_change_is_also_rejected(self):
         self._session()
         inputs = self.state.session_paths.manifest()
-        inputs["verified_patches"] = str(self.dataset / "other-patches")
-        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+        inputs["verified_patches"] = str(self.root / "other-patches")
+        with self.assertRaisesRegex(ApiError, "Static fit inputs") as caught:
             self.state.run({
                 "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
@@ -2115,18 +2098,10 @@ class CheckpointUploadTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
-        self.root = base / "dataset"
-        self.root.mkdir()
-        _write_scroll_spec(self.root)
-        (self.root / "umbilicus.json").write_text("{}")
-        (self.root / "verified_patches").mkdir()
         self.output = base / "output"
         self.output.mkdir()
-        self.resolution = spiral_service.bind_service_paths(
-            resolve_dataset_root(self.root), self.output, base / "cache")
-        self.assertTrue(self.resolution.ok)
-        self.state = ServiceState(dataset_root=str(self.root),
-                                  dataset_resolution=self.resolution,
+        self.bindings = spiral_service.bind_service_inputs(self.output, base / "cache")
+        self.state = ServiceState(bindings=self.bindings,
                                   startup_run={"z_begin": 0, "z_end": 10})
 
     def tearDown(self):
@@ -2151,14 +2126,14 @@ class CheckpointUploadTests(unittest.TestCase):
             upload_id, name, io.BytesIO(data), len(data))
         return self.state.finalize_upload(upload_id)["input"]
 
-    def test_checkpoint_upload_works_without_a_session_in_dataset_mode(self):
+    def test_checkpoint_upload_works_without_a_session(self):
         record = self._upload_checkpoint("resume.ckpt")
         published = Path(record["path"])
         self.assertTrue(published.is_file())
         self.assertIn("uploaded-checkpoints", str(published))
         # The published path lies under the output directory, so the
-        # dataset-mode load validation accepts it as a resume checkpoint.
-        request = self.state._dataset_session_request(
+        # bound load validation accepts it as a resume checkpoint.
+        request = self.state._bound_session_request(
             {"paths": {"checkpoint": str(published)},
              "run": {"z_begin": 0, "z_end": 10}}, _PROJECT)
         self.assertEqual(request["paths"]["checkpoint"], str(published))
@@ -2210,8 +2185,7 @@ class CheckpointUploadTests(unittest.TestCase):
 
     def test_checkpoint_deduplication_survives_service_restart(self):
         first = self._upload_checkpoint("resume.ckpt")
-        restarted = ServiceState(dataset_root=str(self.root),
-                                 dataset_resolution=self.resolution,
+        restarted = ServiceState(bindings=self.bindings,
                                  startup_run={"z_begin": 0, "z_end": 10})
         data = _zip_checkpoint_bytes()
         begin = restarted.begin_upload({
@@ -2754,20 +2728,13 @@ class ServiceProcessTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     @staticmethod
-    def _make_dataset(temporary):
-        """A minimal valid dataset plus a sibling output root."""
-        dataset = Path(temporary) / "dataset"
-        dataset.mkdir(exist_ok=True)
-        _write_scroll_spec(dataset)
-        (dataset / "umbilicus.json").write_text("{}")
-        (dataset / "verified_patches").mkdir(exist_ok=True)
+    def _make_output(temporary):
         output = Path(temporary) / "output"
         output.mkdir(exist_ok=True)
-        return dataset, output
+        return output
 
-    def _dataset_arguments(self, temporary):
-        dataset, output = self._make_dataset(temporary)
-        return ["--dataset", str(dataset), "--output", str(output),
+    def _launch_arguments(self, temporary):
+        return ["--output", str(self._make_output(temporary)),
                 "--object-store", self._make_store(temporary)]
 
     @staticmethod
@@ -2799,7 +2766,7 @@ class ServiceProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
             process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
-                                   + self._dataset_arguments(temporary),
+                                   + self._launch_arguments(temporary),
                                    temporary)
             try:
                 lines = self._read_until_ready(process)
@@ -2834,7 +2801,7 @@ class ServiceProcessTests(unittest.TestCase):
             process = self._launch([
                 "--port", "0", "--api-key-file", str(key_file),
                 "--gpus", "3,1",
-            ] + self._dataset_arguments(temporary), temporary)
+            ] + self._launch_arguments(temporary), temporary)
             try:
                 lines = self._read_until_ready(process)
                 ready = next(line for line in lines
@@ -2855,7 +2822,7 @@ class ServiceProcessTests(unittest.TestCase):
     def test_explicit_port_can_be_rebound_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            arguments = self._dataset_arguments(temporary)
+            arguments = self._launch_arguments(temporary)
             process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
                                    + arguments, temporary)
             try:
@@ -2875,100 +2842,75 @@ class ServiceProcessTests(unittest.TestCase):
                 process.terminate()
                 process.wait(10)
 
-    def test_dataset_service_refuses_to_start_with_an_invalid_scroll_spec(self):
+    def test_the_retired_dataset_flag_is_refused_with_guidance(self):
         with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "key"
-            invalid = Path(temporary) / "invalid-dataset"
-            invalid.mkdir()
-            # The specification is optional, but one that is there must parse.
-            (invalid / "spiral-scroll.json").write_text("{")
-            output_root = Path(temporary) / "output"
-            process = self._launch(["--port", "0", "--api-key-file", str(key_file),
-                                    "--dataset", str(invalid),
-                                    "--object-store", self._make_store(temporary),
-                                    "--output", str(output_root)], temporary)
+            process = self._launch(["--port", "0", "--dataset", temporary]
+                                   + self._launch_arguments(temporary), temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
-            self.assertIn("missing required", output)
+            self.assertIn("--dataset is retired", output)
+            self.assertIn("--winding-inference", output)
 
-    def test_dataset_and_output_are_required_arguments(self):
+    def test_output_and_object_store_are_required_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:
             process = self._launch(["--port", "0"], temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
-            self.assertIn("--dataset", output)
             self.assertIn("--output", output)
             self.assertIn("--object-store", output)
+            self.assertNotIn("--dataset", output)
 
-            dataset, _ = self._make_dataset(temporary)
-            process = self._launch(["--port", "0", "--dataset", str(dataset)],
-                                   temporary)
+    def test_a_missing_winding_inference_binding_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "winding_inference"
+            process = self._launch(["--port", "0", "--winding-inference", str(missing)]
+                                   + self._launch_arguments(temporary), temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
-            self.assertIn("--output", output)
+            self.assertIn(f"--winding-inference {missing} is not a directory", output)
 
-    def test_output_inside_the_dataset_is_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            dataset, _ = self._make_dataset(temporary)
-            for inside in (dataset, dataset / "spiral_output"):
-                process = self._launch(["--port", "0",
-                                        "--dataset", str(dataset),
-                                        "--object-store", self._make_store(temporary),
-                                        "--output", str(inside)], temporary)
-                output, _ = process.communicate(timeout=30)
-                self.assertEqual(process.returncode, 2)
-                self.assertIn("--output must resolve outside the dataset root",
-                              output)
-
-    def test_cache_inside_the_dataset_is_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            dataset, output_root = self._make_dataset(temporary)
-            process = self._launch(["--port", "0",
-                                    "--dataset", str(dataset),
-                                    "--object-store", self._make_store(temporary),
-                                    "--output", str(output_root),
-                                    "--cache", str(dataset / ".spiral-cache")],
-                                   temporary)
-            output, _ = process.communicate(timeout=30)
-            self.assertEqual(process.returncode, 2)
-            self.assertIn("--cache must resolve outside the dataset root",
-                          output)
-
-    def test_dataset_advertises_bound_output_and_default_cache(self):
+    def test_bindings_advertise_bound_output_default_cache_and_winding(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            dataset, output_root = self._make_dataset(temporary)
+            output_root = self._make_output(temporary)
+            winding = Path(temporary) / "winding_inference"
+            winding.mkdir()
+            (winding / "manifest.json").write_text(json.dumps({
+                "artifact_type": "winding_inference_crossings",
+                "format_version": 1}))
             xdg_cache = Path(temporary) / "xdg-cache"
             process = self._launch(
                 ["--port", "0", "--api-key-file", str(key_file),
-                 "--dataset", str(dataset), "--output", str(output_root),
-                 "--object-store", self._make_store(temporary)],
+                 "--output", str(output_root),
+                 "--object-store", self._make_store(temporary),
+                 "--winding-inference", str(winding)],
                 temporary, env={"XDG_CACHE_HOME": str(xdg_cache)})
             try:
                 lines = self._read_until_ready(process)
+                self.assertIn(f"Spiral winding inference: {winding.resolve()}", lines)
                 ready = next(line for line in lines
                              if line.startswith("SPIRAL_SERVICE_READY"))
                 port = int(ready.split("port=")[1].split()[0])
                 key = key_file.read_text().strip()
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/dataset",
+                    f"http://127.0.0.1:{port}/bindings",
                     headers={"Authorization": f"Bearer {key}"})
                 with urllib.request.urlopen(request, timeout=10) as response:
                     advertised = json.loads(response.read())
-                resolved = advertised["resolved"]
-                self.assertEqual(resolved["output_directory"],
+                bindings = advertised["bindings"]
+                self.assertEqual(bindings["output_directory"],
                                  str(output_root.resolve()))
                 self.assertEqual(
-                    resolved["cache_directory"],
+                    bindings["cache_directory"],
                     str(xdg_cache.resolve() / "vc3d" / "spiral"))
-                # The browse endpoint is gone: resolution happens once at
-                # startup and /dataset advertises the result.
+                self.assertEqual(bindings["winding_inference"], {
+                    "bound": True, "path": str(winding.resolve()),
+                    "available": True, "error": None})
+                self.assertTrue(advertised["capabilities"]["winding_inference"])
+                # The dataset endpoint is gone.
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/dataset/resolve",
-                    method="POST",
-                    data=json.dumps({"dataset_root": str(dataset)}).encode(),
-                    headers={"Authorization": f"Bearer {key}",
-                             "Content-Type": "application/json"})
+                    f"http://127.0.0.1:{port}/dataset",
+                    headers={"Authorization": f"Bearer {key}"})
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(request, timeout=10)
                 self.assertEqual(caught.exception.code, 404)
@@ -2978,14 +2920,14 @@ class ServiceProcessTests(unittest.TestCase):
                 process.wait(10)
                 process.stdout.close()
 
-    def test_named_dataset_service_has_exclusive_restartable_ownership(self):
+    def test_named_service_has_exclusive_restartable_ownership(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            dataset, output_root = self._make_dataset(temporary)
+            output_root = self._make_output(temporary)
             key_file = root / "key"
             arguments = [
                 "--port", "0", "--api-key-file", str(key_file),
-                "--dataset", str(dataset), "--output", str(output_root),
+                "--output", str(output_root),
                 "--object-store", self._make_store(temporary),
                 "--session-name", "alice",
             ]
