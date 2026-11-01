@@ -30,14 +30,13 @@ struct Fixture {
         channel<uint8_t>("sheet_grad_mag",std::vector<uint8_t>(8,255),"|u1");
         channel<float>("width",std::vector<float>(8,20),"<f4");
     }
-    std::filesystem::path write(const std::string& name){
-        auto path=root/("view_"+name);std::filesystem::create_directories(path);
+    std::filesystem::path write(const std::string& name,std::string dtype={}){
+        if(dtype.empty())dtype=name=="width"?"<f4":"|u1";
+        auto path=root/("view_"+name);
+        vcr::zarr::Writer::create(path,{.shape={1,1,1},.chunks={1,1,1},.dtype=dtype,.compressor="",.overwrite=true,.separator="/"});
         std::ofstream(path/".native_pool.json")<<nlohmann::json{
             {"revision",1},{"factor",2},{"mode","top2_spatial_comp"},{"source",root.string()},
             {"channels",channels},{"channel",name}};
-        std::ofstream(path/".zarray")<<nlohmann::json{
-            {"zarr_format",2},{"shape",{1,1,1}},{"chunks",{1,1,1}},{"dtype",name=="width"?"<f4":"|u1"},
-            {"fill_value",0},{"order","C"},{"dimension_separator","/"},{"compressor",nullptr},{"filters",nullptr}};
         return path;
     }
     vcr::zarr::OpenedArray view(const std::string& name){
@@ -57,8 +56,6 @@ TEST_CASE("native pooling accepts explicit source levels and shares one source b
 }
 TEST_CASE("native pooled views reject metadata with a wrong channel dtype"){
     Fixture f;f.setup();
-    const auto path=f.write("width");
-    nlohmann::json meta;std::ifstream(path/".zarray")>>meta;
-    meta["dtype"]="|u1";std::ofstream(path/".zarray")<<meta;
+    const auto path=f.write("width","|u1");
     CHECK_THROWS(vc::lasagna::openPooledPredictionArray(path,f.cache));
 }

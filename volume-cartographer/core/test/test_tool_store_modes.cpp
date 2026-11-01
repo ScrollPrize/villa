@@ -13,14 +13,11 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
-#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <cmath>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <regex>
 #include <tuple>
 #include <algorithm>
@@ -180,8 +177,8 @@ TEST_CASE("vc_render_tifxyz reads a stored surface through a registered volume l
     size_t files = 0, pixels = 0, differing = 0;
     double worst = 0;
     for (const auto& entry : fs::directory_iterator(f.dir / "file")) {
-        const auto file = cv::imread(entry.path().string(), cv::IMREAD_UNCHANGED);
-        const auto store = cv::imread((f.dir / "store" / entry.path().filename()).string(), cv::IMREAD_UNCHANGED);
+        const auto file = vc::core::util::readImageMat(entry.path());
+        const auto store = vc::core::util::readImageMat(f.dir / "store" / entry.path().filename());
         REQUIRE(file.size() == store.size());
         cv::Mat diff;
         cv::absdiff(file, store, diff);

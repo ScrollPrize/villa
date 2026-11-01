@@ -8,7 +8,7 @@
 #include <QTest>
 #include <QDir>
 #include <QImage>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <cmath>
 
 class SpiralBrushPatchTest : public QObject
@@ -83,9 +83,9 @@ private slots:
     {
         const QString source = qEnvironmentVariable("SPIRAL_PATCH_REAL_INPUT");
         if (source.isEmpty()) QSKIP("Set SPIRAL_PATCH_REAL_INPUT to validate a real scroll patch");
-        const cv::Mat1f x = cv::imread((source + "/x.tif").toStdString(), cv::IMREAD_UNCHANGED);
-        const cv::Mat1f y = cv::imread((source + "/y.tif").toStdString(), cv::IMREAD_UNCHANGED);
-        const cv::Mat1f z = cv::imread((source + "/z.tif").toStdString(), cv::IMREAD_UNCHANGED);
+        const cv::Mat1f x = vc::core::util::readImageMat((source + "/x.tif").toStdString());
+        const cv::Mat1f y = vc::core::util::readImageMat((source + "/y.tif").toStdString());
+        const cv::Mat1f z = vc::core::util::readImageMat((source + "/z.tif").toStdString());
         QVERIFY(!x.empty());
         QCOMPARE(x.size(), y.size());
         QCOMPARE(x.size(), z.size());

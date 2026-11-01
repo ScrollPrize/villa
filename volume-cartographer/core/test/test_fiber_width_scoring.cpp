@@ -24,7 +24,7 @@ TEST_CASE("packed uint8 base widths are converted into tracing coordinates") {
     std::fill(bytes.begin()+128, bytes.begin()+192, 128);
     std::fill(bytes.begin()+192, bytes.end(), 80);
     array.writeChunk({0,0,0,0}, bytes.data(), bytes.size());
-    { std::ofstream out(root / ".zattrs"); out << R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[8,8,8],"validity_channel":"presence","width_encoding":"uint8-base-voxels","groups":{"sd1":{"zarr":"sd1/1","scaledown":1,"channels":["presence","nx","ny","width"]}}}})"; }
+    vcr::zarr::writeAttributes(root, nlohmann::json::parse(R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[8,8,8],"validity_channel":"presence","width_encoding":"uint8-base-voxels","groups":{"sd1":{"zarr":"sd1/1","scaledown":1,"channels":["presence","nx","ny","width"]}}}})"));
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale = 2;
     const auto dataset = vc::lasagna::LasagnaDataset::open(root, open);

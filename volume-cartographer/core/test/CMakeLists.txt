@@ -475,12 +475,11 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
-    add_test(NAME test_render_zarr_output
-        COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_zarr_output.py"
-            $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_zarr_output PROPERTIES TIMEOUT 180)
-    vc_register_ctest(test_render_zarr_output vc_render_tifxyz)
+    vc_add_test(NAME test_render_zarr_output)
+    add_dependencies(test_render_zarr_output vc_render_tifxyz)
+    set_tests_properties(test_render_zarr_output PROPERTIES
+        TIMEOUT 180
+        ENVIRONMENT "VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>")
 endif()
 
 vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fiber_tracer)

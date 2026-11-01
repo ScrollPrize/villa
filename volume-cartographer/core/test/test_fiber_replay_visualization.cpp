@@ -103,9 +103,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     auto pyramid = Volume::New(volumeRoot1);
     REQUIRE(pyramid);
     pyramid.reset();
-    const auto attrsPath = directory / "ct/.zattrs";
-    nlohmann::json attrs;
-    std::ifstream(attrsPath) >> attrs;
+    auto attrs = vcr::zarr::readAttributes(directory / "ct");
     auto& datasets = attrs["multiscales"][0]["datasets"];
     datasets[0]["coordinateTransformations"] = {
         {{"type","scale"},{"scale",{1,2,3}}},
@@ -113,7 +111,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     datasets[1]["coordinateTransformations"] = {
         {{"type","scale"},{"scale",{2,4,6}}},
         {{"type","translation"},{"translation",{2,2,2}}}};
-    vcr::zarr::atomicWrite(attrsPath, attrs.dump(), vcr::zarr::Durability::Fsync);
+    vcr::zarr::writeAttributes(directory / "ct", attrs);
     const auto ct = openCtLevel(directory / "ct", "1");
     const auto source = validateFiberReplayStripCtVolume(ct);
     CHECK(source.locator == (directory / "ct/1").string());

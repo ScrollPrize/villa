@@ -75,9 +75,8 @@ TEST_CASE("validateSingleVolumeLocation requires exactly one zarr")
 {
     auto root = tmpDir("single_volume");
     auto volume = root / "volume";
-    fs::create_directories(volume / "0");
+    vcr::zarr::Writer::create(volume / "0", {.shape = {1, 1, 1}, .chunks = {1, 1, 1}, .compressor = ""});
     { std::ofstream(volume / "meta.json") << "{}"; }
-    { std::ofstream(volume / "0" / ".zarray") << "{}"; }
 
     CHECK(validateSingleVolumeLocation(volume.string()).empty());
     CHECK_FALSE(validateSingleVolumeLocation(root.string()).empty());
