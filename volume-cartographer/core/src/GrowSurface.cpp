@@ -1,7 +1,7 @@
 #include <omp.h>
 
 
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -3434,7 +3434,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         if (!tgt_dir.empty())
-            cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
+            vc::core::util::writeTiffMat(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area));
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);

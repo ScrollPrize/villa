@@ -22,7 +22,7 @@
 #include <vc_reader/zarr_write.hpp>
 #include <vc_reader/array.hpp>
 #include <opencv2/core/types.hpp>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 #include <ceres/tiny_solver.h>
 #include <ceres/tiny_solver_autodiff_function.h>
@@ -2212,14 +2212,13 @@ static void run_fit_normals(
 
     if (dbg_tif) {
         // Write float TIFFs into the current working directory.
-        // NOTE: OpenCV will write 32-bit float TIFFs when passed CV_32F mats.
-        cv::imwrite((fs::path("dbg_fit_rms.tif")).string(), dbg_rms);
-        cv::imwrite((fs::path("dbg_fit_used_radius.tif")).string(), dbg_used_radius);
-        cv::imwrite((fs::path("dbg_fit_sample_count_sum.tif")).string(), dbg_nsamp_sum);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xy.tif")).string(), dbg_nsamp_xy);
-        cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
-        cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
-        cv::imwrite((fs::path("dbg_fit_frac_used_short_paths.tif")).string(), dbg_frac_used_short_paths);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_rms.tif"), dbg_rms);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_used_radius.tif"), dbg_used_radius);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_sum.tif"), dbg_nsamp_sum);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_xy.tif"), dbg_nsamp_xy);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_xz.tif"), dbg_nsamp_xz);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_yz.tif"), dbg_nsamp_yz);
+        vc::core::util::writeTiffMat(fs::path("dbg_fit_frac_used_short_paths.tif"), dbg_frac_used_short_paths);
     }
 
     if (output_spool) {
