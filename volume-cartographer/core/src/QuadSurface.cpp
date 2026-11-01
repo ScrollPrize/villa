@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/ImageMat.hpp"
 
 #include "vc/core/util/Geometry.hpp"
@@ -59,23 +60,6 @@
 #endif
 
 namespace {
-
-void replaceFile(const std::filesystem::path& source,
-                 const std::filesystem::path& destination)
-{
-#ifdef _WIN32
-    if (!MoveFileExW(source.wstring().c_str(),
-                     destination.wstring().c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code ec(static_cast<int>(GetLastError()),
-                                 std::system_category());
-        throw std::filesystem::filesystem_error(
-            "cannot replace file", source, destination, ec);
-    }
-#else
-    std::filesystem::rename(source, destination);
-#endif
-}
 
 constexpr auto kSaveRollbackDir = ".vc-save-rollback";
 constexpr auto kSaveRollbackReady = ".ready";
@@ -138,7 +122,7 @@ void recoverIncompleteSave(const std::filesystem::path& destination)
         const auto staged = restoreDir / backup.filename();
         std::filesystem::copy_file(
             backup, staged, std::filesystem::copy_options::overwrite_existing);
-        replaceFile(staged, destination / backup.filename());
+        vc::core::util::replaceFileAtomically(staged, destination / backup.filename());
     }
     std::filesystem::remove_all(rollback);
 }
@@ -207,7 +191,7 @@ void replaceDirectoryContents(const std::filesystem::path& source,
     });
     try {
         for (const auto& file : files) {
-            replaceFile(file, destination / file.filename());
+            vc::core::util::replaceFileAtomically(file, destination / file.filename());
         }
 
         // Removing the marker commits the complete new generation. If cleanup
@@ -310,46 +294,23 @@ struct LazySurfaceGeometry {
 LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
                                             const utils::Json& metadata)
 {
-    auto readScale = [](const utils::Json& json) -> std::optional<cv::Vec2f> {
-        if (!json.contains("scale") || !json["scale"].is_array() ||
-            json["scale"].size() < 2) {
+    // The scale as vc_reader parses it (two positive finite numbers; the file's order is
+    // x, y, Metadata's rows, columns). The caller's metadata may be a partial override
+    // (second constructor), so a scale it lacks comes from the on-disk meta.json.
+    const auto scaleOf = [&](const vcr::zarr::Json& document) -> std::optional<cv::Vec2f> {
+        if (!document.contains("scale"))
             return std::nullopt;
-        }
-        const cv::Vec2f scale{json["scale"][0].get_float(),
-                              json["scale"][1].get_float()};
-        if (!std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
-            scale[0] <= 0.0f || scale[1] <= 0.0f) {
-            return std::nullopt;
-        }
-        return scale;
+        const auto parsed = vcr::tifxyz::parseMetadata(document, path.string()).scale;
+        return cv::Vec2f(float(parsed[1]), float(parsed[0]));
     };
-
-    // The caller's metadata may be a partial override (second constructor), so
-    // fall back to the on-disk meta.json for missing fields lazily if needed.
-    std::optional<utils::Json> diskMetadataStorage;
-    auto diskMetadata = [&]() -> const utils::Json& {
-        if (!diskMetadataStorage) {
-            diskMetadataStorage = vc::json::load_json_file(path / "meta.json");
-        }
-        return *diskMetadataStorage;
-    };
-
-    std::optional<cv::Vec2f> scale = readScale(metadata);
+    std::optional<cv::Vec2f> scale = scaleOf(vcr::zarr::Json::parse(metadata.dump()));
     if (!scale) {
-        scale = readScale(diskMetadata());
-    }
-    if (!scale) {
-        throw std::runtime_error("Missing or invalid surface scale in: " +
-                                 (path / "meta.json").string());
+        const auto disk = vcr::tifxyz::readMetadata(path.string()).scale;
+        scale = cv::Vec2f(float(disk[1]), float(disk[0]));
     }
 
-    vcr::sources::Source xSource;
-    xSource.id = (path / "x.tif").string();
-    xSource.storage.location = xSource.id;
-    xSource.storage.format = "tiff";
-    xSource.role = "scalar";
-    xSource.axes = std::vector<std::string>{"y", "x"};
-    vcr::sources::SourceReader xReader(vcr::sources::finished(std::move(xSource)), {});
+    // The grid's shape from x.tif alone, as a plain image source.
+    vcr::sources::SourceReader xReader(vcr::sources::imageSource((path / "x.tif").string()), {});
     const auto height = xReader.shape()[0];
     const auto width = xReader.shape()[1];
 
