@@ -8,7 +8,7 @@ import numpy as np
 import tifffile
 from vc_reader.reader import open_group
 
-from vesuvius.label_zarr import CHUNK_SHAPE, LABEL_SLICE, VOLUME_DEPTH
+from vesuvius.ink_detection.label_zarr import CHUNK_SHAPE, LABEL_SLICE, VOLUME_DEPTH
 from vesuvius.tifxyz_label_transfer.make_label_zarrs import (  # noqa: E402
     convert_label_tiff,
     write_label_zarr,

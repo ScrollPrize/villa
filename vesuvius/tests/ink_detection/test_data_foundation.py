@@ -14,7 +14,7 @@ import pytest
 import torch
 from vc_reader.reader import create_group
 
-from vesuvius import label_zarr
+from vesuvius.ink_detection import label_zarr
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (

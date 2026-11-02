@@ -12,12 +12,13 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 from vc_reader import images
 
-from vc_reader.reader import write_pyramid_level
-from vesuvius.label_zarr import (
+from vc_reader.reader import create_group, ome_multiscales, write_pyramid_level
+from vesuvius.ink_detection.label_zarr import (
+    ARRAY_DIMENSIONS,
+    CHUNK_SHAPE,
     DEFAULT_LEVELS,
+    LABEL_CODEC,
     LABEL_SLICE,
-    create_label_array,
-    create_label_group,
     pyramid_shapes,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -54,14 +55,31 @@ def write_label_zarr(
         shutil.rmtree(output_path)
 
     shapes = pyramid_shapes(image_2d.shape, levels)
-    group = create_label_group(output_path, levels=levels)
+    multiscales = ome_multiscales(
+        name=output_path.stem, levels=levels - 1, factors=(1, 2, 2), reduction="nearest"
+    )
+    group = create_group(
+        output_path, attrs={"multiscales": [multiscales]}, overwrite=True, auth=None
+    )
     if extra_attributes:
         group.attrs.update(extra_attributes)
 
-    datasets = [
-        create_label_array(group, str(level), shape=shape, dtype=image_2d.dtype)
-        for level, shape in enumerate(shapes)
-    ]
+    datasets = []
+    # Keep fixed chunks even for levels smaller than CHUNK_SHAPE.
+    for level, shape in enumerate(shapes):
+        array = group.create_array(
+            str(level),
+            shape=shape,
+            chunks=CHUNK_SHAPE,
+            dtype=image_2d.dtype,
+            fill_value=0,
+            separator="/",
+            overwrite=True,
+            skip_empty=True,
+            **LABEL_CODEC,
+        )
+        array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
+        datasets.append(array)
     height, width = image_2d.shape
     for y0 in range(0, height, BLOCK_SIZE):
         y1 = min(height, y0 + BLOCK_SIZE)

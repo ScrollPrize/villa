@@ -13,15 +13,16 @@ from typing import Iterable, Literal, Sequence
 import numpy as np
 from vc_reader import images
 from tqdm.auto import tqdm
-from vc_reader.reader import ZarrWriter, write_pyramid_level
+from vc_reader.reader import ZarrWriter, create_group, ome_multiscales, write_pyramid_level
 
 from vesuvius.ink_detection.data.segment import parse_label_asset_path
-from vesuvius.label_zarr import (
+from vesuvius.ink_detection.label_zarr import (
+    ARRAY_DIMENSIONS,
+    CHUNK_SHAPE,
     DEFAULT_LEVELS,
+    LABEL_CODEC,
     LABEL_SLICE as DEFAULT_LABEL_SLICE,
     VOLUME_DEPTH as DEFAULT_DEPTH,
-    create_label_array,
-    create_label_group,
     pyramid_shapes,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -185,11 +186,29 @@ def _create_ome_zarr_datasets(
         else:
             output_path.unlink()
     shapes = pyramid_shapes(image_shape, levels)
-    group = create_label_group(output_path, levels=len(shapes), reduction=reduction)
-    return [
-        create_label_array(group, str(level), shape=shape, dtype=np.dtype(dtype))
-        for level, shape in enumerate(shapes)
-    ]
+    multiscales = ome_multiscales(
+        name=output_path.stem, levels=levels - 1, factors=(1, 2, 2), reduction=reduction
+    )
+    group = create_group(
+        output_path, attrs={"multiscales": [multiscales]}, overwrite=True, auth=None
+    )
+    datasets = []
+    # Keep fixed chunks even for levels smaller than CHUNK_SHAPE.
+    for level, shape in enumerate(shapes):
+        array = group.create_array(
+            str(level),
+            shape=shape,
+            chunks=CHUNK_SHAPE,
+            dtype=np.dtype(dtype),
+            fill_value=0,
+            separator="/",
+            overwrite=True,
+            skip_empty=True,
+            **LABEL_CODEC,
+        )
+        array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
+        datasets.append(array)
+    return datasets
 
 
 def write_label_pyramid(
