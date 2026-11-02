@@ -327,3 +327,35 @@ def test_the_cli_reports_every_missing_input_before_fitting(tmp_path):
     assert 'absent.npz' in result.stderr
     assert 'lasagna: No Lasagna dataset' in result.stderr
     assert 'lasagna.manifest in the input manifest' in result.stderr
+
+
+def test_cli_directory_store_is_reported_before_loading_inputs(tmp_path):
+    directory = tmp_path / 'roi'
+    directory.mkdir()
+    (directory / 'dataset.vcobj').touch()
+    result = subprocess.run(
+        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'),
+         '--inputs', str(tmp_path / 'not-loaded.json'), '--object-store', str(directory)],
+        capture_output=True, text=True, timeout=300)
+    assert result.returncode == 2
+    assert '--object-store is a directory' in result.stderr
+    assert f'use --object-store {directory / "dataset.vcobj"}' in result.stderr
+    assert 'disk I/O error' not in result.stderr
+
+
+def test_cli_rejects_obsolete_store_before_loading_volumes(tmp_path):
+    import sqlite3
+    store = tmp_path / 'old.vcobj'
+    with sqlite3.connect(store) as db:
+        db.execute('PRAGMA application_id = 1447251778')
+        db.execute('PRAGMA user_version = 16')
+    manifest = write_manifest(tmp_path / 'inputs')
+    result = subprocess.run(
+        [sys.executable, str(SPIRAL_DIR / 'fit_spiral.py'), '--inputs', str(manifest),
+         '--object-store', str(store), '--cache', str(tmp_path / 'cache')],
+        capture_output=True, text=True, timeout=300,
+        env={**os.environ, 'WANDB_MODE': 'disabled',
+             'FIT_SPIRAL_CONFIG_OVERRIDES': json.dumps(NO_SUPERVISION)})
+    assert result.returncode == 2
+    assert 'cannot open --object-store' in result.stderr
+    assert 'unsupported database schema' in result.stderr

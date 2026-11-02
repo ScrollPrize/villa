@@ -4279,6 +4279,7 @@ def _finish_wandb_run():
 if __name__ == '__main__':
     import argparse
     from dataclasses import replace
+    from pathlib import Path
 
     from fit_session import (ScrollSpecError, default_user_cache_dir,
                              load_input_manifest, scroll_spec_config_defaults,
@@ -4322,6 +4323,11 @@ if __name__ == '__main__':
         parser.add_argument(flag, nargs='?', action=RetiredFlag,
                             help=argparse.SUPPRESS)
     cli_args = parser.parse_args()
+    if os.path.isdir(cli_args.object_store):
+        candidates = sorted(Path(cli_args.object_store).glob('*.vcobj'))
+        hint = (f'; use --object-store {candidates[0]}' if len(candidates) == 1
+                else '; pass the .vcobj database file')
+        parser.error(f'--object-store is a directory: {cli_args.object_store}{hint}')
     cache_dir = (cli_args.cache or os.environ.get('FIT_SPIRAL_CACHE_DIR')
                  or default_user_cache_dir())
 
@@ -4372,6 +4378,14 @@ if __name__ == '__main__':
                 f'The inputs of {cli_args.inputs} cannot be fitted:\n  '
                 + '\n  '.join(f'{error["field"]}: {error["message"]}'
                               for error in input_errors))
+        # Reject inaccessible or obsolete stores before packing/loading the
+        # much larger supervision volumes. This check never refreshes links.
+        from vc_object_store import ObjectStore
+        try:
+            with ObjectStore.open(cli_args.object_store, read_only=True):
+                pass
+        except Exception as exc:
+            parser.error(f'cannot open --object-store {cli_args.object_store}: {exc}')
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
