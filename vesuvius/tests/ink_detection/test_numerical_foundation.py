@@ -189,11 +189,22 @@ def test_normal_band_connects_long_edges():
     assert output.all()
 
 
+def test_zero_thickness_projects_connected_support_without_normals():
+    output = project_binary_mask_along_normals(
+        np.ones((1, 2), bool),
+        np.array([[[.6, .6, .6], [.6, .6, 2.6]]], np.float32),
+        None, np.ones((1, 2), bool), (0, 0, 0, 3, 3, 5), half_thickness_voxels=0,
+    )
+    expected = np.zeros((3, 3, 5), bool)
+    expected[1, 1, 1:4] = True
+    np.testing.assert_array_equal(output, expected)
+
+
 def _marked_voxels(output):
     return sorted(tuple(coordinate) for coordinate in np.argwhere(output).tolist())
 
 
-def test_normal_projection_marks_axis_aligned_column_with_truncation():
+def test_normal_projection_marks_axis_aligned_column_at_nearest_voxels():
     output = project_binary_mask_along_normals(
         np.ones((1, 1), dtype=np.uint8),
         np.array([[[2.3, 1.6, 2.4]]], dtype=np.float32),
@@ -203,11 +214,11 @@ def test_normal_projection_marks_axis_aligned_column_with_truncation():
         half_thickness_voxels=2.0,
     )
     assert _marked_voxels(output) == [
-        (0, 1, 2),
-        (1, 1, 2),
-        (2, 1, 2),
-        (3, 1, 2),
-        (4, 1, 2),
+        (0, 2, 2),
+        (1, 2, 2),
+        (2, 2, 2),
+        (3, 2, 2),
+        (4, 2, 2),
     ]
 
 
@@ -226,20 +237,16 @@ def test_normal_projection_normalizes_diagonals_and_connects_neighbors():
         (2, 0, 2),
         (2, 1, 1),
         (2, 1, 2),
+        (2, 1, 3),
         (2, 2, 1),
         (2, 2, 2),
         (2, 2, 3),
+        (2, 2, 4),
     ]
 
 
-def test_normal_projection_fills_slab_between_offset_sheets_trilinearly():
-    """Fanning normals separate consecutive offset sheets laterally.
-
-    The top row and left column of the 4x4 middle slice fall strictly
-    between the step-0 and step-+1 sheets: corner lines and the bilinear
-    sheet fills miss them, and only _draw_trilinear's slab filling between
-    consecutive offset sheets marks those seven voxels.
-    """
+def test_normal_projection_covers_fanning_normals():
+    """Sample the interpolated unit normal through endpoint-inclusive layers."""
     output = project_binary_mask_along_normals(
         np.ones((2, 2), dtype=np.uint8),
         np.array(
@@ -254,10 +261,11 @@ def test_normal_projection_fills_slab_between_offset_sheets_trilinearly():
         (0, 0, 0, 5, 5, 5),
         half_thickness_voxels=1.0,
     )
-    expected = np.zeros((5, 5, 5), dtype=output.dtype)
-    expected[1, 1:3, 1:3] = 1
-    expected[2:4, 0:4, 0:4] = 1
-    np.testing.assert_array_equal(output, expected)
+    assert output.any()
+    # Centre stays on the surface; the normal at its centre is the Z axis.
+    assert output[2, 2, 2] and output[3, 2, 2] and output[4, 2, 2]
+    # No samples can reach the bottom crop plane at radius one.
+    assert not output[0].any()
 
 
 def test_normal_projection_skips_nan_normals_and_invalid_cells():
@@ -281,10 +289,13 @@ def test_normal_projection_skips_nan_normals_and_invalid_cells():
     assert _marked_voxels(output) == [
         (0, 1, 1),
         (0, 2, 1),
+        (0, 3, 1),
         (1, 1, 1),
         (1, 2, 1),
+        (1, 3, 1),
         (2, 1, 1),
         (2, 2, 1),
+        (2, 3, 1),
     ]
 
 

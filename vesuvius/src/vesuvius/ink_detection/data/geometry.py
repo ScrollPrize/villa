@@ -700,12 +700,10 @@ def project_binary_mask_along_normals(
     if half_thickness_voxels < 0.0:
         raise ValueError("half_thickness_voxels must be >= 0")
     flat_mask = (np.asarray(flat_mask) > 0).astype(np.uint8, copy=False)
-    if half_thickness_voxels <= 0.0:
-        return project_flat_patch(
-            flat_mask, positions_zyx, valid_mask, crop_bbox_zyx
-        ) > 0
     if normals_zyx is None:
-        raise ValueError("normals_zyx is required when projecting with thickness")
+        if half_thickness_voxels > 0.0:
+            raise ValueError("normals_zyx is required when projecting with thickness")
+        normals_zyx = np.zeros_like(positions_zyx, dtype=np.float32)
     positions_zyx = np.asarray(positions_zyx, dtype=np.float32)
     normals_zyx = np.asarray(normals_zyx, dtype=np.float32)
     valid_mask = np.asarray(valid_mask, dtype=np.bool_)
