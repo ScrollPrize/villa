@@ -280,7 +280,7 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
 
                 if (hasU && hasV) {
                     // Left-hand rule: U x V gives normal pointing toward viewer
-                    // (consistent with grid_normal in Geometry.cpp)
+                    // (consistent with vcr::grid's patch normals)
                     cv::Vec3f normal = tangentU.cross(tangentV);
                     const float len2 = normal.dot(normal);
                     if (len2 > 1e-12f) {
@@ -437,7 +437,7 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
 
             if (hasU && hasV) {
                 // Left-hand rule: U x V gives normal pointing toward viewer
-                // (consistent with grid_normal in Geometry.cpp)
+                // (consistent with vcr::grid's patch normals)
                 cv::Vec3f normal = tangentU.cross(tangentV);
                 const float len2 = normal.dot(normal);
                 if (len2 > 1e-12f) {

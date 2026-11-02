@@ -63,65 +63,6 @@ TEST_CASE("at_int Vec3d overload")
     CHECK(v[1] == doctest::Approx(1.0));
 }
 
-TEST_CASE("grid_normal on a flat z=1 plane is +/- z")
-{
-    auto m = makePlanarGrid(10, 10);
-    cv::Vec3f n = grid_normal(m, cv::Vec3f(5.0f, 5.0f, 0.0f));
-    CHECK(std::abs(n[0]) < 1e-4f);
-    CHECK(std::abs(n[1]) < 1e-4f);
-    CHECK(std::abs(std::abs(n[2]) - 1.0f) < 1e-4f);
-}
-
-TEST_CASE("grid_normal clamps coords outside [1, dim-3] range")
-{
-    auto m = makePlanarGrid(10, 10);
-    // far outside — should still yield a unit normal, not NaN
-    cv::Vec3f n = grid_normal(m, cv::Vec3f(-100.0f, -100.0f, 0.0f));
-    CHECK(std::isfinite(n[2]));
-    CHECK(std::abs(std::abs(n[2]) - 1.0f) < 1e-4f);
-}
-
-TEST_CASE("grid_normal returns NaN when neighborhood has sentinel")
-{
-    auto m = makePlanarGrid(10, 10);
-    m(5, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
-    cv::Vec3f n = grid_normal(m, cv::Vec3f(5.0f, 5.0f, 0.0f));
-    CHECK(std::isnan(n[0]));
-}
-
-TEST_CASE("grid_normal_int on flat plane is unit-length")
-{
-    auto m = makePlanarGrid(8, 8);
-    cv::Vec3f n = grid_normal_int(m, 4, 4);
-    const float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
-    CHECK(len == doctest::Approx(1.0f));
-}
-
-TEST_CASE("grid_normal_int returns NaN with adjacent sentinel")
-{
-    auto m = makePlanarGrid(8, 8);
-    m(4, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
-    cv::Vec3f n = grid_normal_int(m, 4, 4);
-    CHECK(std::isnan(n[0]));
-}
-
-TEST_CASE("grid_normal_int returns NaN when degenerate (zero cross)")
-{
-    cv::Mat_<cv::Vec3f> m(5, 5, cv::Vec3f(0.f, 0.f, 0.f));
-    cv::Vec3f n = grid_normal_int(m, 2, 2);
-    CHECK(std::isnan(n[0]));
-}
-
-TEST_CASE("grid_normal rejects grids smaller than its stencil")
-{
-    auto twoByTwo = makePlanarGrid(2, 2);
-    auto threeByThree = makePlanarGrid(3, 3);
-    auto fourByFour = makePlanarGrid(4, 4);
-    CHECK(std::isnan(grid_normal(twoByTwo, cv::Vec3f(0.f, 0.f, 0.f))[0]));
-    CHECK(std::isnan(grid_normal(threeByThree, cv::Vec3f(1.f, 1.f, 0.f))[0]));
-    CHECK(std::isfinite(grid_normal(fourByFour, cv::Vec3f(1.f, 1.f, 0.f))[0]));
-}
-
 TEST_CASE("loc_valid Vec3f basic")
 {
     auto m = makePlanarGrid(5, 5);

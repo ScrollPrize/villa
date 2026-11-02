@@ -832,7 +832,7 @@ int main(int argc, char *argv[])
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
-        // The geometric normal is N = dP/dU x dP/dV (see grid_normal in Geometry.cpp),
+        // The geometric normal is N = dP/dU x dP/dV (as vcr::grid's patch normals),
         // so (U, V, N) is right-handed. With the standard segment orientation (V down-screen
         // aligned with +z, text readable, U winding outside->inside) that normal points toward
         // the OUTSIDE of the scroll, i.e. behind the surface as the reader views it. Our
