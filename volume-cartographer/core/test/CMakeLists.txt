@@ -86,6 +86,10 @@ vc_add_test(NAME test_read_interpolated_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
 
+# Repeated pool construction/destruction; hung on Windows before the
+# destructors held the pool mutex around request_stop() (#1686).
+vc_add_test(NAME test_thread_pool_lifecycle)
+
 vc_add_test(NAME test_volume_chunk_errors)
 
 vc_add_test(NAME test_segmentation_autosave_state

@@ -1,5 +1,7 @@
 #include "vc/core/render/ChunkRequestScheduler.hpp"
 
+#include "utils/process_shutdown.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -274,6 +276,15 @@ struct ChunkRequestScheduler::Impl {
 
     ~Impl()
     {
+        // Destroyed while the process exits (a scheduler reachable from a
+        // static): the OS has already terminated the workers, a join would
+        // never return (#1686).
+        if (utils::process_shutdown_in_progress()) {
+            for (auto& worker : workers)
+                if (worker.joinable())
+                    worker.detach();
+            return;
+        }
         {
             // Serialize the stop transition with the worker wait predicate.
             // Otherwise notify_all() can land after a worker's predicate check
