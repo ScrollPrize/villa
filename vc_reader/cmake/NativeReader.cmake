@@ -36,6 +36,7 @@ else()
 endif()
 target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/publication.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/pathfinding/pathfinding.cpp"
@@ -62,6 +63,7 @@ target_sources(vc_reader_native PRIVATE
 # CPU and CUDA composites evaluate the same unfused float32 formulas (the kernels
 # build with --fmad=false).
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/grid.cpp" PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")

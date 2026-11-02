@@ -1,3 +1,4 @@
+#include <vc_reader/slab.hpp>
 #include "VolumetricCompositor.hpp"
 
 #include <algorithm>
@@ -260,30 +261,6 @@ SlabMargins computeSlabMargins(const CameraParams& cam,
     return m;
 }
 
-std::array<float, 256> buildOpacityLut(float alphaMin,
-                                       float alphaMax,
-                                       float opacity,
-                                       float gamma,
-                                       uint8_t isoCutoff,
-                                       float segmentLength)
-{
-    std::array<float, 256> lut{};
-    const float lo = std::clamp(alphaMin, 0.0f, 1.0f) * 255.0f;
-    const float hi = std::clamp(alphaMax, 0.0f, 1.0f) * 255.0f;
-    const float range = std::max(hi - lo, 1e-3f);
-    const float g = std::max(gamma, 1e-3f);
-    const float scale = std::max(opacity, 0.0f) * std::max(segmentLength, 1.0f);
-    for (int v = 0; v < 256; ++v) {
-        if (v < int(isoCutoff)) {
-            lut[v] = 0.0f;
-            continue;
-        }
-        const float rho = std::clamp((float(v) - lo) / range, 0.0f, 1.0f);
-        lut[v] = std::min(scale * std::pow(rho, g), 1.0f);
-    }
-    return lut;
-}
-
 void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::vector<cv::Mat_<uint8_t>>& layerCoverage,
                          const CameraParams& cam,
@@ -327,139 +304,27 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                             float(outCols), float(outRows))
         : PerspectiveCamera{};
 
-    // Per-value emission premultiplied by alpha, so the inner loop is one
-    // multiply-add per channel.
-    std::array<std::array<float, 3>, 256> premul;
-    for (int v = 0; v < 256; ++v) {
-        const uint32_t c = colorLut[v];
-        const float a = opacityLut[v];
-        premul[v] = {a * float((c >> 16) & 0xFFu),
-                     a * float((c >> 8) & 0xFFu),
-                     a * float(c & 0xFFu)};
+    std::vector<vcr::display::SlabLayer> layers;
+    for (int i=0;i<numLayers;++i) {
+        if (layerValues[i].size()!=layerValues[0].size() || layerCoverage[i].size()!=layerValues[0].size())
+            throw std::invalid_argument("slab layer sizes differ");
+        layers.push_back({layerValues[i].ptr<uint8_t>(),layerCoverage[i].ptr<uint8_t>(),
+            layerValues[i].step1(),layerCoverage[i].step1()});
     }
-
-    constexpr float kEarlyOutT = 0.004f;
-
-    // Rows are independent; each writes only its own output row.
-    cv::parallel_for_(cv::Range(0, outRows), [&](const cv::Range& range) {
-    for (int y = range.start; y < range.end; ++y) {
-        auto* outRow = colorOut.ptr<cv::Vec3b>(y);
-        auto* covRow = coverageOut.ptr<uint8_t>(y);
-        const float py = float(y + margins.top);
-        for (int x = 0; x < outCols; ++x) {
-            const float px = float(x + margins.left);
-            float r = 0.0f, g = 0.0f, b = 0.0f;
-            float T = 1.0f;
-            bool anyValid = false;
-            // Orthographic: the linear part is shared by all layers; only the
-            // offset varies. Perspective: the pixel's ray direction and the
-            // 1/r_w division are per-pixel; per layer it's one multiply-add.
-            float baseU = 0.0f, baseV = 0.0f;
-            float rayU = 0.0f, rayV = 0.0f, invRayW = 0.0f;
-            if (perspective) {
-                const float s1 = px - pcam.centerU;
-                const float s2 = py - pcam.centerV;
-                rayU = pcam.rayBase[0] + s1 * pcam.e1OverF[0] + s2 * pcam.e2OverF[0];
-                rayV = pcam.rayBase[1] + s1 * pcam.e1OverF[1] + s2 * pcam.e2OverF[1];
-                const float rayW =
-                    pcam.rayBase[2] + s1 * pcam.e1OverF[2] + s2 * pcam.e2OverF[2];
-                if (rayW >= -1e-4f)
-                    continue;  // ray points away from the slab
-                invRayW = 1.0f / rayW;
-            } else {
-                baseU = proj.m00 * px + proj.m01 * py;
-                baseV = proj.m10 * px + proj.m11 * py;
-            }
-            // Near-to-far: the camera sits on the +w side, so highest w first.
-            for (int i = numLayers - 1; i >= 0; --i) {
-                float qu, qv;
-                if (perspective) {
-                    const float t = pcam.layerNum[i] * invRayW;
-                    qu = pcam.pos[0] + t * rayU;
-                    qv = pcam.pos[1] + t * rayV;
-                } else {
-                    qu = baseU + proj.layerOffsets[i][0];
-                    qv = baseV + proj.layerOffsets[i][1];
-                }
-                const int x0 = int(std::floor(qu));
-                const int y0 = int(std::floor(qv));
-                if (x0 < 0 || y0 < 0 || x0 + 1 >= cols || y0 + 1 >= rows)
-                    continue;
-                const float fx = qu - float(x0);
-                const float fy = qv - float(y0);
-                const auto& vals = layerValues[i];
-                const auto& cov = layerCoverage[i];
-                const uint8_t* v0 = vals.ptr<uint8_t>(y0) + x0;
-                const uint8_t* v1 = vals.ptr<uint8_t>(y0 + 1) + x0;
-                const uint8_t* c0 = cov.ptr<uint8_t>(y0) + x0;
-                const uint8_t* c1 = cov.ptr<uint8_t>(y0 + 1) + x0;
-                // Coverage-weighted bilinear: uncovered texels are fully
-                // transparent, not value 0 (avoids dark halos at patch
-                // borders under tilt).
-                const float w00 = c0[0] ? (1.0f - fx) * (1.0f - fy) : 0.0f;
-                const float w10 = c0[1] ? fx * (1.0f - fy) : 0.0f;
-                const float w01 = c1[0] ? (1.0f - fx) * fy : 0.0f;
-                const float w11 = c1[1] ? fx * fy : 0.0f;
-                const float wsum = w00 + w10 + w01 + w11;
-                if (wsum <= 1e-6f)
-                    continue;
-                const float value = (w00 * float(v0[0]) + w10 * float(v0[1]) +
-                                     w01 * float(v1[0]) + w11 * float(v1[1])) / wsum;
-                anyValid = true;
-                const int idx = std::clamp(int(value + 0.5f), 0, 255);
-                const float alpha = opacityLut[idx];
-                if (alpha <= 0.0f)
-                    continue;
-                const auto& e = premul[idx];
-                float shade = 1.0f;
-                const float lightAmount = std::clamp(lightingStrength, 0.0f, 1.0f);
-                if (lightAmount > 0.0f) {
-                    // Central differences in the already-extracted voxel
-                    // stack. Missing neighbours fall back to the center, so
-                    // coverage boundaries do not create artificial normals.
-                    auto sample = [&](int layer, int sx, int sy) {
-                        if (layer < 0 || layer >= numLayers)
-                            return value;
-                        const int xx = std::clamp(x0 + sx, 0, cols - 1);
-                        const int yy = std::clamp(y0 + sy, 0, rows - 1);
-                        if (!layerCoverage[layer](yy, xx))
-                            return value;
-                        return float(layerValues[layer](yy, xx));
-                    };
-                    const float gx = sample(i, 1, 0) - sample(i, -1, 0);
-                    const float gy = sample(i, 0, 1) - sample(i, 0, -1);
-                    const float gz = sample(i + 1, 0, 0) - sample(i - 1, 0, 0);
-                    const float len2 = gx * gx + gy * gy + gz * gz;
-                    if (len2 > 1e-6f) {
-                        const float invLen = 1.0f / std::sqrt(len2);
-                        // Fixed upper-left raking light, 35 degrees above the
-                        // slab. At maximum strength, 10% ambient preserves
-                        // some detail on back-facing sides.
-                        constexpr float lx = -0.579228f;
-                        constexpr float ly = -0.579228f;
-                        constexpr float lz =  0.573576f;
-                        const float diffuse = std::max(
-                            0.0f, (gx * lx + gy * ly + gz * lz) * invLen);
-                        const float fullyLit = 0.10f + 0.90f * diffuse;
-                        shade = 1.0f + lightAmount * (fullyLit - 1.0f);
-                    }
-                }
-                r += T * e[0] * shade;
-                g += T * e[1] * shade;
-                b += T * e[2] * shade;
-                T *= 1.0f - alpha;
-                if (T < kEarlyOutT)
-                    break;
-            }
-            if (anyValid) {
-                outRow[x] = cv::Vec3b(uint8_t(std::min(r, 255.0f)),
-                                      uint8_t(std::min(g, 255.0f)),
-                                      uint8_t(std::min(b, 255.0f)));
-                covRow[x] = 1;
-            }
-        }
-    }
-    });
+    vcr::display::Slab slab;
+    slab.layers=layers.data();slab.count=numLayers;slab.rows=rows;slab.cols=cols;
+    slab.left=margins.left;slab.top=margins.top;slab.width=outCols;slab.height=outRows;
+    slab.colors=colorLut.data();slab.opacity=opacityLut.data();slab.lighting=lightingStrength;
+    auto& projection=slab.projection;
+    projection.perspective=perspective;
+    projection.m00=proj.m00;projection.m01=proj.m01;projection.m10=proj.m10;projection.m11=proj.m11;
+    projection.layerOffsets=reinterpret_cast<const float*>(proj.layerOffsets.data());
+    std::copy_n(pcam.pos.data(),3,projection.pos);
+    std::copy_n(pcam.rayBase.data(),3,projection.rayBase);
+    std::copy_n(pcam.e1OverF.data(),3,projection.e1OverF);
+    std::copy_n(pcam.e2OverF.data(),3,projection.e2OverF);
+    projection.centerU=pcam.centerU;projection.centerV=pcam.centerV;projection.layerNum=pcam.layerNum.data();
+    vcr::display::compositeSlab(slab,colorOut.ptr<uint8_t>(),coverageOut.ptr<uint8_t>());
 }
 
 } // namespace vc3d::volumetric

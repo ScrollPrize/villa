@@ -1,4 +1,5 @@
 #include "pixels.hpp"
+#include "slab_pixel.hpp"
 #include "../cuda_buffer.hpp"
 namespace vcr::display::cuda {
 namespace {
@@ -41,4 +42,25 @@ void blend(const uint32_t* base,const uint32_t* over,std::size_t n,float opacity
 void windowLevelLut(std::array<uint32_t,256>& out,float low,float high) {lut(out,nullptr,low,high,0,false,false);}
 void paletteLut(std::array<uint32_t,256>& out,const std::array<uint32_t,256>& in,float low,float high,bool blackZero) {lut(out,in.data(),low,high,1,blackZero,false);}
 void overlayLut(std::array<uint32_t,256>& out,const std::array<uint32_t,256>& in,float low,float high,bool intensity,bool premultiplied) {lut(out,in.data(),low,high,2,intensity,premultiplied);}
+namespace {
+__global__ void opacityKernel(float* out,float low,float high,float opacity,float gamma,uint8_t cutoff,float length) {
+    out[threadIdx.x]=detail::opacityValue(threadIdx.x,low,high,opacity,gamma,cutoff,length);
+}
+__global__ void slabKernel(Slab slab,uint8_t* rgb,uint8_t* coverage) {
+    for(std::size_t i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<std::size_t(slab.width)*slab.height;i+=std::size_t(gridDim.x)*blockDim.x)
+        detail::slabPixel(slab,int(i%slab.width),int(i/slab.width),rgb+3*i,coverage+i);
+}
+}
+std::array<float,256> opacityLut(float low,float high,float opacity,float gamma,uint8_t cutoff,float length) {
+    int gpu;device::check(cudaGetDevice(&gpu));device::Buffer data(1024,gpu);
+    opacityKernel<<<1,256,0,device::stream()>>>(static_cast<float*>(data.ptr),low,high,opacity,gamma,cutoff,length);
+    device::check(cudaGetLastError());
+    std::array<float,256> out;
+    device::check(cudaMemcpyAsync(out.data(),data.ptr,1024,cudaMemcpyDeviceToHost,device::stream()));device::complete();return out;
+}
+void compositeSlab(const Slab& slab,uint8_t* rgb,uint8_t* coverage) {
+    if(slab.width<=0 || slab.height<=0)return;
+    slabKernel<<<blocks(std::size_t(slab.width)*slab.height),256,0,device::stream()>>>(slab,rgb,coverage);finish();
+}
+
 }

@@ -1439,7 +1439,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // artificially transparent (per-frame constant: parallel rays).
         const auto dir = vc3d::volumetric::viewDirection(cam);
         const float segLen = 1.0f / std::max(dir[2], 1e-3f);
-        const auto opacityLut = vc3d::volumetric::buildOpacityLut(
+        const auto opacityLut = vcr::display::opacityLut(
             cs.params.options.alphaMin, cs.params.options.alphaMax, cs.params.options.alphaOpacity,
             cs.params.tfGamma, uint8_t(std::clamp(cs.params.options.isoCutoff, 0.0f, 255.0f)), segLen);
 

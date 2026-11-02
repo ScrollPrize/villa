@@ -53,3 +53,33 @@ def test_bulk_display_kernels():
     _reader.blend(base, overlay, 1., result)
     np.testing.assert_array_equal(result, [0xff504040, 0xff204060])
 
+
+def test_slab_compositing_cpu_cuda():
+    import pytest
+    values = np.full((2, 8, 9), 200, np.uint8)
+    values[0] = 100
+    mask = np.ones_like(values)
+    colors = _reader.window_level_lut(0, 255)
+    opacity = [0.5] * 256
+    projection = _reader.SlabProjection()
+    offsets = np.zeros((2, 2), np.float32)
+    depths = np.zeros(2, np.float32)
+    rgb, coverage = _reader.composite_slab(values, mask, colors, opacity, projection, offsets, depths)
+    np.testing.assert_array_equal(rgb[:-1, :-1], 125)
+    assert coverage[:-1, :-1].all()
+    assert not coverage[-1].any() and not coverage[:, -1].any()
+    # Exercise lighting, masked neighbors and fractional layer positions.
+    values[1] = np.arange(72, dtype=np.uint8).reshape(8, 9) * 3
+    mask[1, 2:4, 3:5] = 0
+    offsets[1] = [0.25, -0.3]
+    cpu = _reader.composite_slab(values, mask, colors, opacity, projection, offsets, depths, lighting=.8)
+    try:
+        gpu = _reader.composite_slab(values, mask, colors, opacity, projection, offsets, depths, lighting=.8, cuda=True)
+    except RuntimeError as error:
+        if 'CUDA' in str(error) or 'cuda' in str(error) or 'driver' in str(error):
+            pytest.skip(str(error))
+        raise
+    np.testing.assert_array_equal(cpu[1], gpu[1])
+    np.testing.assert_allclose(cpu[0].astype(int), gpu[0].astype(int), atol=1)
+    np.testing.assert_allclose(_reader.opacity_lut(.2, .8, .7, gamma=1.7),
+                               _reader.opacity_lut(.2, .8, .7, gamma=1.7, cuda=True), atol=1e-6)

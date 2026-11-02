@@ -71,7 +71,7 @@ __all__ = [
 _NATIVE_EXPORTS = {
     'shortest_path', 'write_image', 'encode_png', 'encode_jpeg', 'snapshot',
     'window_level_lut', 'palette_lut', 'overlay_lut', 'display_to_uint8',
-    'apply_lut', 'blend', 'blend_argb',
+    'apply_lut', 'blend', 'blend_argb', 'SlabProjection', 'opacity_lut', 'composite_slab',
 }
 __all__ += sorted(_NATIVE_EXPORTS - set(__all__))
 

@@ -104,8 +104,11 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 #include "sheet_normal/bindings.hpp"
 #include "geometry/bindings.hpp"
 
+#include "display/bindings.hpp"
+
 NB_MODULE(_reader, m)
 {
+    vcr::display::python::bind(m);
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
     m.def("_local_points", [](HostPoints points, std::optional<vcr::Index> origin) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
