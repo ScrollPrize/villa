@@ -40,6 +40,19 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$50,000 First Letters: PHerc. 306B (2027)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/writing-seen-in-pherc-306b-for-the"
+    prizeAmount="$50,000"
+    title="Winners"
+    description="Liam Warner (@Prodigle) and Nicola Bodill (@polytrope) found writing in PHerc. 306B."
+  />
+</div>
+
 ### \$50,000 First Letters: PHerc. 343 (October, 2026)
 
 **Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
