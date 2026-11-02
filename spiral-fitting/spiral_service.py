@@ -121,6 +121,8 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
+# Parallel chunk reads when extracting missing fiber directions.
+FIBER_DIRECTION_WORKERS = 64
 # Upper bound on the checkpoint listing /bindings advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
@@ -1913,6 +1915,7 @@ class ServiceState:
         config = self._effective_config(paths, run)
         with ObjectStore.open(self.object_store.path, read_only=True) as store:
             volume = read_snapshot(store, request_from_config(config)).volume_uuid
+        self._prepare_fiber_directions(scroll, volume, paths, config)
         paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
         prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
         if pinned != volume:
@@ -1948,6 +1951,30 @@ class ServiceState:
             if not volume:
                 return prepared
             return prepared, fit_volume_at(store, request, prepared)
+
+    def _prepare_fiber_directions(self, scroll, volume, paths, config):
+        """Opted-in hosts extract the fiber directions a fit with the
+        fiber-direction loss reads, when the cache lacks them, from the
+        project's fiber-inference dataset (whose own problems the scroll's
+        resolution reports)."""
+        if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
+            return
+        try:
+            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory)
+        except ScrollSpecError:
+            return
+        if os.path.isfile(path):
+            return
+        from fiber_direction_samples import extract
+
+        def log(line):
+            self.events.append("log", f"Fiber directions: {line}", source="service",
+                               operation="preparing_inputs")
+        dataset = scroll.project.fiber_inference
+        log(f"extracting from {dataset.location} into {path}")
+        extract(dataset.location, None, path, identity=dataset.identity,
+                output_scale=scroll.volume(volume).fiber_scale,
+                workers=FIBER_DIRECTION_WORKERS, log=log)
 
     def _prepare_lasagna_packs(self, paths, config):
         """Opted-in hosts build missing pools from local arrays before linking."""
@@ -2011,6 +2038,7 @@ class ServiceState:
                 run = self._pin_run(run, checkpoint_position)
                 volume = self._unprepared_volume(paths, scroll)
                 config = self._effective_config(paths, run)
+                self._prepare_fiber_directions(scroll, volume, paths, config)
                 paths, scroll = self._resolve_session_scroll(scroll, volume, paths, config)
                 self._prepare_lasagna_packs(paths, config)
                 record = {"hub": self.object_store.positions,
@@ -3914,8 +3942,10 @@ def main(argv=None):
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
     parser.add_argument("--build-missing-lasagna-packs", action="store_true",
-                        help="Build missing Lasagna packs from accessible local arrays "
-                             "during input preparation (default: require prepared packs)")
+                        help="Build missing Lasagna packs from accessible local arrays, "
+                             "and extract missing fiber directions from the project's "
+                             "fiber-inference dataset, during input preparation "
+                             "(default: require both prepared in --cache)")
     parser.add_argument("--cache", default=None,
                         help="Directory for derived host caches: prepared "
                              "Lasagna packs and fiber directions (default: "

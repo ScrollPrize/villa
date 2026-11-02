@@ -563,8 +563,9 @@ are built only from accessible local arrays, with shared packing locks and
 progress reporting, before link refresh or replacement of the resident fit.
 Checkpoint resumes prepare missing packs too, retaining their recorded input
 position. Existing packs are reused without needing the source arrays. A packing
-failure leaves the resident session intact. This launch flag does not generate
-fiber-direction samples and cannot be enabled by a fit request.
+failure leaves the resident session intact. The same flag extracts missing
+fiber-direction samples (see "Fiber direction samples"). It cannot be enabled
+by a fit request.
 
 A remote Lasagna dataset (an open-data one, or any whose arrays are on S3)
 reaches a service on VC3D's host as its arrays' directories in VC3D's remote
@@ -1637,9 +1638,11 @@ tail -f /tmp/fit_metrics.jsonl
 ## Fiber direction samples
 
 The optional fiber-direction loss consumes one packed artifact extracted from a
-remote Lasagna fiber prediction. Extraction downloads only chunks intersecting
-the requested z ROI and keeps the highest-presence voxel in each fixed
-prediction-space cell:
+Lasagna fiber prediction: a remote manifest URL, or a local manifest whose
+arrays are Zarr v2 directories (VC3D's local copy of an open-data manifest,
+beside its `lasagna-remote.json` marker, reads its remote arrays). Extraction
+reads only chunks intersecting the requested z ROI and keeps the
+highest-presence voxel in each fixed prediction-space cell:
 
 ```bash
 ./.venv/bin/python fiber_direction_samples.py \
@@ -1657,12 +1660,14 @@ A fit refuses a z window outside the range an artifact was extracted over
 (its recorded `z_roi`).
 
 A service reads no `fiber_directions.npz` path: it reads the samples of the
-project's selected fiber-inference dataset, by that dataset's identity (its
-manifest URL's, see "Lasagna inputs must be packed first") and the fit
-volume's scale, from its
-cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. Extract
-them there over the prediction's whole height (no `--z-roi`), or place an
-existing artifact there, and copy the file to the service's cache:
+project's selected fiber-inference dataset, by that dataset's identity (see
+"Lasagna inputs must be packed first") and the fit volume's scale, from its
+cache: `<cache>/fiber-directions/<identity>/scale<output scale>.npz`. A service
+launched with `--build-missing-lasagna-packs` (as VC3D's owned local service
+is) extracts missing ones there itself during input preparation, over the
+prediction's whole height, logging its progress. For any other service,
+extract them over the whole height (no `--z-roi`), or place an existing
+artifact there, and copy the file to the service's cache:
 
 ```bash
 ./.venv/bin/python fiber_direction_samples.py \
@@ -1671,7 +1676,8 @@ existing artifact there, and copy the file to the service's cache:
   --adopt /path/to/fiber_directions.npz --cache ~/.cache/vc3d/spiral
 ```
 
-A build whose loss needs them refuses a cache without them before linking.
+A build whose loss needs them, on a service that does not extract them,
+refuses a cache without them before linking.
 
 Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
 to off/zero; set the toggle true and the weight above zero to enable the

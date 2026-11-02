@@ -169,6 +169,33 @@ def manifest_identity(manifest_bytes: bytes, manifest_name: str,
     return "sha256-" + hashlib.sha256(manifest_bytes).hexdigest()
 
 
+def _manifest_provenance(path: Path, document: Mapping[str, Any]) -> Any:
+    # A provenance record the manifest names but that cannot be read is an
+    # error, not a fallback: the identity must not depend on what was copied.
+    if not (isinstance(document.get("provenance"), str) and document["provenance"].strip()):
+        return None
+    record = path.parent / document["provenance"]
+    try:
+        return json.loads(record.read_text())
+    except (OSError, ValueError) as exc:
+        raise LasagnaSourceError(
+            f"{path}: cannot read its provenance record {record}: {exc}") from exc
+
+
+def local_manifest_identity(path: str | os.PathLike[str]) -> str:
+    """The identity of the local Lasagna dataset whose manifest is ``path``
+    (whatever its groups hold, e.g. a fiber-inference dataset's)."""
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+        document = json.loads(data)
+    except (OSError, ValueError) as exc:
+        raise LasagnaSourceError(f"{path}: cannot read the Lasagna manifest: {exc}") from exc
+    if not isinstance(document, Mapping):
+        raise LasagnaSourceError(f"{path}: not a Lasagna manifest")
+    return manifest_identity(data, path.name, _manifest_provenance(path, document))
+
+
 def read_lasagna_manifest(path: str | os.PathLike[str],
                           url: str | None = None) -> LasagnaSource:
     """A local ``*.lasagna.json`` manifest (version 1 or 2) as a
@@ -185,17 +212,7 @@ def read_lasagna_manifest(path: str | os.PathLike[str],
     if not isinstance(document, Mapping) or not isinstance(document.get("groups"), Mapping):
         raise LasagnaSourceError(f"{path}: not a Lasagna manifest (no groups)")
     base = path.parent
-
-    # A provenance record the manifest names but that cannot be read is an
-    # error, not a fallback: the identity must not depend on what was copied.
-    provenance = None
-    if url is None and isinstance(document.get("provenance"), str) and document["provenance"].strip():
-        record = base / document["provenance"]
-        try:
-            provenance = json.loads(record.read_text())
-        except (OSError, ValueError) as exc:
-            raise LasagnaSourceError(
-                f"{path}: cannot read its provenance record {record}: {exc}") from exc
+    provenance = None if url is not None else _manifest_provenance(path, document)
 
     stores, group, scaledown = {}, "", None
     for key, channel in LASAGNA_CHANNELS.items():

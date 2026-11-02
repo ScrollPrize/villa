@@ -1,9 +1,11 @@
 """Extract and load sparse, confidence-weighted fiber direction samples.
 
 The extractor reads only Zarr chunks intersecting a requested z range, across
-the full XY extent. Within each fixed prediction-space cell it retains the
-highest-presence voxel, avoiding a full-volume download and most duplicate
-samples across a fiber's thickness.
+the full XY extent, over HTTP(S) or from a local dataset's Zarr v2 directory
+arrays (VC3D's local copy of an open-data manifest reads its remote arrays).
+Within each fixed prediction-space cell it retains the highest-presence voxel,
+avoiding a full-volume download and most duplicate samples across a fiber's
+thickness.
 
 With ``--cache`` the artifact goes where a fit finds it by the fiber-inference
 dataset's identity (lasagna_source.fiber_directions_path), extracted over the
@@ -17,6 +19,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 import time
 from urllib.parse import unquote, urljoin, urlparse
 import xml.etree.ElementTree as ET
@@ -27,8 +30,36 @@ import numpy as np
 FORMAT_VERSION = 2
 
 
-def _get_json(session, url):
-    response = session.get(url, timeout=60)
+def _is_http(location):
+    return urlparse(str(location)).scheme in ("http", "https")
+
+
+def _manifest_location(location):
+    """Where the manifest at ``location`` is read: an HTTP(S) URL, a local
+    file, or, for VC3D's local copy of an open-data manifest (a
+    lasagna-remote.json marker beside it naming it), its remote original,
+    since the copy's arrays are remote."""
+    from lasagna_source import is_remote_location
+
+    location = str(location)
+    if is_remote_location(location):
+        if not _is_http(location):
+            raise ValueError(f"fiber directions are read over HTTP(S), not {location}")
+        return location
+    path = Path(location)
+    marker = path.parent / "lasagna-remote.json"
+    if marker.is_file():
+        remote = json.loads(marker.read_text())
+        artifact = str(remote.get("artifact_url") or "")
+        if remote.get("manifest_file") == path.name and artifact:
+            return _manifest_location(f"{artifact.rstrip('/')}/{path.name}")
+    return str(path)
+
+
+def _get_json(session, location):
+    if not _is_http(location):
+        return json.loads(Path(location).read_text())
+    response = session.get(location, timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -38,14 +69,18 @@ def _chunk_url(array_url, index, metadata):
     return f"{array_url.rstrip('/')}/{separator.join(map(str, index))}"
 
 
-def _read_chunk(session, array_url, metadata, index):
-    import numcodecs
+def _fetch(session, location):
+    """The bytes of the object at a URL or local path; None when absent."""
     import requests
 
-    url = _chunk_url(array_url, index, metadata)
+    if not _is_http(location):
+        try:
+            return Path(location).read_bytes()
+        except FileNotFoundError:
+            return None
     for attempt in range(6):
         try:
-            response = session.get(url, timeout=60)
+            response = session.get(location, timeout=60)
             if response.status_code < 500:
                 break
         except (requests.ConnectionError, requests.Timeout):
@@ -54,17 +89,26 @@ def _read_chunk(session, array_url, metadata, index):
         if attempt == 5:
             response.raise_for_status()
         time.sleep(min(2 ** attempt, 8))
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.content
+
+
+def _read_chunk(session, array_url, metadata, index):
+    import numcodecs
+
+    content = _fetch(session, _chunk_url(array_url, index, metadata))
     shape = np.asarray(metadata["shape"], dtype=np.int64)
     chunks = np.asarray(metadata["chunks"], dtype=np.int64)
     begin = np.asarray(index, dtype=np.int64) * chunks
     chunk_shape = tuple(np.minimum(chunks, shape - begin))
-    if response.status_code == 404:
+    if content is None:
         return np.full(chunk_shape, metadata.get("fill_value") or 0,
                        dtype=np.dtype(metadata["dtype"]))
-    response.raise_for_status()
     compressor = metadata.get("compressor")
-    decoded = (numcodecs.get_codec(compressor).decode(response.content)
-               if compressor is not None else response.content)
+    decoded = (numcodecs.get_codec(compressor).decode(content)
+               if compressor is not None else content)
     dtype = np.dtype(metadata["dtype"])
     values = np.frombuffer(decoded, dtype=dtype)
     edge_size = int(np.prod(chunk_shape))
@@ -161,23 +205,34 @@ def _cell_argmax(presence, global_begin, cell_size, threshold, valid_begin, vali
     return flat_indices[selected], coords[selected]
 
 
-def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
-            threshold=160, cell_size=2, overwrite=False, workers=1):
-    """Extract into ``output``, or with ``cache`` into the dataset's cached
-    artifact; a ``z_roi`` of None is the prediction's whole height."""
+def extract(location, z_roi, output=None, *, cache=None, identity=None,
+            output_scale=1.0, threshold=160, cell_size=2, overwrite=False,
+            workers=1, log=None):
+    """Extract from the dataset whose manifest is at ``location`` (a URL or
+    a local file) into ``output``, or with ``cache`` into the dataset's cached
+    artifact; a ``z_roi`` of None is the prediction's whole height.
+    ``identity`` is the dataset's (lasagna_source), computed from
+    ``location`` unless given."""
     import requests
-    from lasagna_source import fiber_directions_path, url_identity
+    from lasagna_source import (fiber_directions_path, is_remote_location,
+                                local_manifest_identity, url_identity)
 
-    identity = url_identity(manifest_url)
+    log = log or (lambda line: print(line, flush=True))
+    if identity is None:
+        identity = (url_identity(location) if is_remote_location(location)
+                    else local_manifest_identity(location))
+    manifest_location = _manifest_location(location)
     with requests.Session() as session:
-        manifest = _get_json(session, manifest_url)
+        manifest = _get_json(session, manifest_location)
         output = Path(fiber_directions_path(cache, identity, output_scale)
                       if cache is not None else output)
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists() and not overwrite:
             raise FileExistsError(f"output already exists: {output} (use --overwrite)")
         groups = manifest["groups"]
-        urls = {name: urljoin(manifest_url, groups[name]["zarr"])
+        urls = {name: (urljoin(manifest_location, groups[name]["zarr"])
+                       if _is_http(manifest_location) else
+                       str(Path(manifest_location).parent / groups[name]["zarr"]))
                 for name in ("presence", "nx", "ny")}
         metadata = {name: _get_json(session, f"{url.rstrip('/')}/.zarray")
                     for name, url in urls.items()}
@@ -218,7 +273,8 @@ def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
         extraction_identity = {
             "artifact_type": "fiber_direction_samples",
             "format_version": FORMAT_VERSION,
-            "manifest_url": manifest_url,
+            # Where the manifest was read: a URL, or a local file.
+            "manifest_url": manifest_location,
             "dataset_identity": identity,
             "z_roi": list(z_roi),
             "output_scale_base_voxels": float(output_scale),
@@ -231,8 +287,8 @@ def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
         available = _list_s3_chunk_indices(
             session, urls["presence"], reference, first_chunk, last_chunk)
         if available is not None:
-            print(f"S3 listing found {len(available):,} stored presence chunks "
-                  f"in the requested z ROI", flush=True)
+            log(f"S3 listing found {len(available):,} stored presence chunks "
+                f"in the requested z ROI")
         work = []
         for cz in range(first_chunk[0], last_chunk[0] + 1):
             for cy in range(first_chunk[1], last_chunk[1] + 1):
@@ -242,37 +298,48 @@ def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
                         continue
                     work.append(index)
 
+        # requests.Session is not documented as thread-safe, so each worker
+        # thread keeps its own, reusing its connections across chunks.
+        local = threading.local()
+        sessions = []
+
         def process(index):
-            # requests.Session is not documented as thread-safe. Each worker
-            # invocation therefore owns its short-lived connection context.
-            with requests.Session() as worker_session:
-                presence = _read_chunk(
-                    worker_session, urls["presence"], metadata["presence"], index)
-                chunk_begin = np.asarray(index, dtype=np.int64) * chunks
-                selected, prediction_zyx = _cell_argmax(
-                    presence, chunk_begin, cell_size, threshold, begin, end)
-                position_zyx = (prediction_zyx.astype(np.float32)
-                                * np.float32(prediction_to_output_scale))
-                if len(selected):
-                    nx = _read_chunk(worker_session, urls["nx"], metadata["nx"], index)
-                    ny = _read_chunk(worker_session, urls["ny"], metadata["ny"], index)
-                    nx_selected = nx.reshape(-1)[selected].astype(np.uint8)
-                    ny_selected = ny.reshape(-1)[selected].astype(np.uint8)
-                else:
-                    nx_selected = ny_selected = np.empty(0, dtype=np.uint8)
-                return (position_zyx, nx_selected, ny_selected,
-                        presence.reshape(-1)[selected].astype(np.uint8))
+            worker_session = getattr(local, "session", None)
+            if worker_session is None:
+                worker_session = local.session = requests.Session()
+                sessions.append(worker_session)
+            presence = _read_chunk(
+                worker_session, urls["presence"], metadata["presence"], index)
+            chunk_begin = np.asarray(index, dtype=np.int64) * chunks
+            selected, prediction_zyx = _cell_argmax(
+                presence, chunk_begin, cell_size, threshold, begin, end)
+            position_zyx = (prediction_zyx.astype(np.float32)
+                            * np.float32(prediction_to_output_scale))
+            if len(selected):
+                nx = _read_chunk(worker_session, urls["nx"], metadata["nx"], index)
+                ny = _read_chunk(worker_session, urls["ny"], metadata["ny"], index)
+                nx_selected = nx.reshape(-1)[selected].astype(np.uint8)
+                ny_selected = ny.reshape(-1)[selected].astype(np.uint8)
+            else:
+                nx_selected = ny_selected = np.empty(0, dtype=np.uint8)
+            return (position_zyx, nx_selected, ny_selected,
+                    presence.reshape(-1)[selected].astype(np.uint8))
 
         positions, nxs, nys, presences = [], [], [], []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for completed, arrays in enumerate(executor.map(process, work), 1):
-                position, nx, ny, presence = arrays
-                positions.append(position)
-                nxs.append(nx)
-                nys.append(ny)
-                presences.append(presence)
-                if completed % 100 == 0 or completed == len(work):
-                    print(f"downloaded {completed:,}/{len(work):,} chunks", flush=True)
+        report_every = max(100, len(work) // 100)
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for completed, arrays in enumerate(executor.map(process, work), 1):
+                    position, nx, ny, presence = arrays
+                    positions.append(position)
+                    nxs.append(nx)
+                    nys.append(ny)
+                    presences.append(presence)
+                    if completed % report_every == 0 or completed == len(work):
+                        log(f"read {completed:,}/{len(work):,} chunks")
+        finally:
+            for worker_session in sessions:
+                worker_session.close()
 
     metadata_out = {
         **extraction_identity,
@@ -288,13 +355,14 @@ def extract(manifest_url, z_roi, output=None, *, cache=None, output_scale=1.0,
     temporary = output.with_name(f".{output.name}.tmp.npz")
     np.savez_compressed(temporary, **arrays)
     temporary.replace(output)
-    print(f"wrote {metadata_out['sample_count']:,} samples from "
-          f"{len(work):,} chunks to {output}")
+    log(f"wrote {metadata_out['sample_count']:,} samples from "
+        f"{len(work):,} chunks to {output}")
 
 
 def adopt(artifact, cache, *, overwrite=False):
     """Place an existing artifact where a fit finds it by its fiber-inference
-    dataset's identity (its manifest_url's) and scale: a hard link when the
+    dataset's identity (the one it was extracted under, else its
+    manifest_url's) and scale: a hard link when the
     cache is on the same filesystem, else a copy. Returns the cached path."""
     import os
     import shutil
@@ -303,7 +371,7 @@ def adopt(artifact, cache, *, overwrite=False):
 
     artifact = Path(artifact)
     metadata = _artifact_metadata(artifact)
-    identity = url_identity(metadata["manifest_url"])
+    identity = metadata.get("dataset_identity") or url_identity(metadata["manifest_url"])
     target = Path(fiber_directions_path(cache, identity,
                                         metadata["output_scale_base_voxels"]))
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -365,7 +433,7 @@ def load_fiber_direction_samples(path, z_begin, z_end):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", nargs="?",
-                        help="HTTP(S) Lasagna fiber manifest")
+                        help="Lasagna fiber manifest: an HTTP(S) URL or a local file")
     parser.add_argument("output", type=Path, nargs="?",
                         help="output packed .npz artifact (or --cache)")
     parser.add_argument("--cache", type=Path, default=None, metavar="DIR",

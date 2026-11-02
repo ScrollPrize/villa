@@ -1208,6 +1208,22 @@ class SessionScroll:
         """The fiber-direction samples a fit of ``volume_uuid`` reads: those
         extracted from the project's fiber-inference dataset at the volume's
         scale, in the cache (fiber_direction_samples.py --cache)."""
+        path = self.fiber_directions_cache_path(volume_uuid, cache_directory)
+        if not os.path.isfile(path):
+            dataset = self.project.fiber_inference
+            scale = self.volume(volume_uuid).fiber_scale
+            raise ScrollSpecError(
+                f"no fiber directions of {dataset.location} (dataset {dataset.identity}) "
+                f"at scale {scale:g} in the cache: extract them with "
+                f"fiber_direction_samples.py {dataset.location} --cache <cache> "
+                f"--output-scale {scale:g} (or --adopt an existing artifact) and "
+                f"copy them to {path}")
+        return path
+
+    def fiber_directions_cache_path(self, volume_uuid: str,
+                                    cache_directory: str | os.PathLike[str]) -> str:
+        """Where the cache keeps the fiber-direction samples of a fit of
+        ``volume_uuid``, present or not."""
         dataset = self.project.fiber_inference
         if dataset is None:
             raise ScrollSpecError(
@@ -1221,15 +1237,7 @@ class SessionScroll:
                 f"the fiber-inference dataset {dataset.location} has no scale relative "
                 f"to the fit volume {volume_uuid} (neither it nor the volume declares "
                 "its full-resolution shape)")
-        path = fiber_directions_path(cache_directory, dataset.identity, scale)
-        if not os.path.isfile(path):
-            raise ScrollSpecError(
-                f"no fiber directions of {dataset.location} (dataset {dataset.identity}) "
-                f"at scale {scale:g} in the cache: extract them with "
-                f"fiber_direction_samples.py {dataset.location} --cache <cache> "
-                f"--output-scale {scale:g} (or --adopt an existing artifact) and "
-                f"copy them to {path}")
-        return path
+        return fiber_directions_path(cache_directory, dataset.identity, scale)
 
     def umbilicus(self, volume_uuid: str) -> ProjectUmbilicus:
         umbilicus = self.volume(volume_uuid).umbilicus

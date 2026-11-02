@@ -665,6 +665,33 @@ def test_fiber_directions_are_the_project_datasets_cached_samples(host, store):
     assert _built(service(host, store), optional)[0].fiber_directions == str(cached)
 
 
+def test_a_local_service_extracts_missing_fiber_directions(host, store, tmp_path):
+    from fiber_direction_samples import load_fiber_direction_samples
+    from lasagna_source import fiber_directions_path
+    from test_fiber_direction_samples import _fiber_volumes, write_fiber_dataset
+
+    manifest = write_fiber_dataset(tmp_path / 'fibers', *_fiber_volumes())
+    fibers = {'location': str(manifest), 'identity': 'fibers-test'}
+    body = initialize_body() | {'project': project(fiber_inference=fibers, fiber_scale=4)}
+    body['run']['config'].update(input_use_fiber_directions=True,
+                                 loss_weight_fiber_directions=1.0)
+    paths, _ = _built(service(host, store, build_missing_lasagna_packs=True), body)
+    # Under the identity VC3D sent, at the volume's scale.
+    assert paths.fiber_directions == fiber_directions_path(host.cache, 'fibers-test', 4)
+    samples = load_fiber_direction_samples(paths.fiber_directions, 0, 2)
+    assert len(samples['position_zyx']) == 2
+    before = Path(paths.fiber_directions).stat().st_mtime_ns
+    _built(service(host, store, build_missing_lasagna_packs=True), body)
+    assert Path(paths.fiber_directions).stat().st_mtime_ns == before
+
+    # Without the loss nothing is extracted.
+    other = {**fibers, 'identity': 'fibers-unused'}
+    optional = initialize_body() | {'project': project(fiber_inference=other, fiber_scale=4)}
+    optional['run']['config'].update(input_use_fiber_directions=True)
+    paths, _ = _built(service(host, store, build_missing_lasagna_packs=True), optional)
+    assert paths.fiber_directions == ''
+
+
 def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(host, store):
     failure = _built(service(host, store),
                      initialize_body() | {'project': project(volume='other-volume')})
