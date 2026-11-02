@@ -3713,7 +3713,7 @@ public:
             options.chunks = meta.chunks;
             options.dtype = meta.dtype;
             options.fillValue = meta.raw.value("fill_value", nlohmann::json(0));
-            options.identity = "live:" + std::to_string(generation) + ":" + group->zarrPath.string();
+            options.identity = "live:" + std::to_string(generation) + ":" + vc::lasagna::lasagnaGroupSourceLocation(*group);
             options.memoryCache = arrays_.cache;
             // The gate waits on the sampling thread, where a case queue can
             // switch cases and cancel the wait.
