@@ -23,7 +23,7 @@ fi
 
 # shellcheck disable=SC1091
 source /etc/os-release
-if [[ " ${ID:-} ${ID_LIKE:-} " != *" debian "* ]]; then
+if [[ "${ID:-}" != debian && "${ID:-}" != ubuntu ]]; then
     echo "build_from_src_debian.sh requires a Debian-family distribution (found ${ID:-unknown})." >&2
     exit 1
 fi
@@ -41,57 +41,13 @@ else
     exit 1
 fi
 
-echo "Installing VC3D build dependencies from system packages..."
-"${sudo[@]}" apt-get update
-if [[ "${ID:-}" == ubuntu ]]; then
-    "${sudo[@]}" apt-get install -y --no-install-recommends software-properties-common
-    "${sudo[@]}" add-apt-repository -y universe
-    "${sudo[@]}" apt-get update
-fi
+"$source_dir/scripts/install_build_deps.sh" minimal-build
 
 cmake_version="$(cmake --version 2>/dev/null | sed -n '1s/^cmake version //p' || true)"
-if [[ -z "$cmake_version" ]] || ! dpkg --compare-versions "$cmake_version" ge 3.28; then
-    "${sudo[@]}" apt-get install -y --no-install-recommends cmake
-    hash -r
-    cmake_version="$(cmake --version 2>/dev/null | sed -n '1s/^cmake version //p' || true)"
-fi
 if [[ -z "$cmake_version" ]] || ! dpkg --compare-versions "$cmake_version" ge 3.28; then
     echo "VC3D requires CMake 3.28 or newer; this system provides ${cmake_version:-unknown}." >&2
     exit 1
 fi
-
-"${sudo[@]}" apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    gfortran \
-    git \
-    libavahi-client-dev \
-    libblosc-dev \
-    libboost-program-options-dev \
-    libceres-dev \
-    libcurl4-openssl-dev \
-    libhwloc-dev \
-    libjpeg-dev \
-    liblapack-dev \
-    liblapacke-dev \
-    liblz4-dev \
-    libopenblas-dev \
-    libpng-dev \
-    libopencv-contrib-dev \
-    libopencv-dev \
-    libscotch-dev \
-    libscotchmetis-dev \
-    libsqlite3-dev \
-    libssl-dev \
-    libsuitesparse-dev \
-    libtiff-dev \
-    libzstd-dev \
-    ninja-build \
-    nlohmann-json3-dev \
-    pkg-config \
-    python3 \
-    qt6-base-dev \
-    zlib1g-dev
 
 echo "Configuring VC3D..."
 cmake \

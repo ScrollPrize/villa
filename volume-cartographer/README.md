@@ -15,6 +15,15 @@ this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
 ### Installation Instructions
+
+Debian/Ubuntu builds use `scripts/install_build_deps.sh minimal-build` for the
+required system packages. The Docker CI builder uses the `ci-tooling` profile,
+which additionally installs compiler/debugging tools and AWS CLI. The installer
+requires root or sudo; in agent mode (`AGENTS_AGENT_MODE=1`) installation also
+requires `AGENTS_ALLOW_INSTALL=1`. `build_from_src_debian.sh` invokes the minimal
+profile, then configures, builds and installs VC3D. Validate installer behavior
+without provisioning with `python3 scripts/test_install_build_deps.py`.
+
 Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the release downloads described below (Linux, Windows, macOS) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
