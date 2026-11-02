@@ -183,7 +183,9 @@ SafeFocusProjection validateSafeFocusProjection(
         result.reason = "invalid_nearest_point";
         return result;
     }
-    const cv::Vec3f normal = surface.gridNormal(result.nearestRow, result.nearestCol);
+    cv::Vec3f normal;
+    const float normalGrid[]{float(result.nearestCol),float(result.nearestRow)};
+    surface.pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
     if (!finiteVec3(normal)) {
         result.reason = "non_finite_grid_normal";
         return result;

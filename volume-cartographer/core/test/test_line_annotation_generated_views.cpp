@@ -33,6 +33,22 @@
 #include <string>
 #include <vector>
 
+namespace {
+struct NativeSurfaceSample {
+    cv::Vec2d grid;
+    cv::Vec3f volume;
+    bool valid() const { return std::isfinite(cv::norm(volume)); }
+    explicit operator bool() const { return valid(); }
+};
+NativeSurfaceSample sampleNative(const QuadSurface& surface, const cv::Vec2d& uv) {
+    NativeSurfaceSample sample;
+    sample.grid=surface.surfaceToGrid(uv);
+    const cv::Vec2f xy(sample.grid);
+    surface.pointSurface()->pointsAt(xy.val,1,sample.volume.val,nullptr);
+    return sample;
+}
+}
+
 TEST_CASE("Strip context target: outer quarters of a span are its control points, the middle half the span")
 {
     using namespace vc3d::line_annotation;
@@ -1435,7 +1451,7 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
         surface->shiftSurfaceOrigin({123,-17});
         const double col=views.stripPositionMap.originalPositionToStripGridColumn(0.5);
         const auto uv=surface->gridToSurface({col,3});
-        const auto sample=surface->sampleAtSurface(uv);
+        const auto sample=sampleNative(*surface, uv);
         REQUIRE(sample.valid());
         const auto expected=cv::Vec3f(5,0,float(z));
         CHECK(cv::norm(sample.volume-expected)<1e-5);
@@ -1452,7 +1468,7 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
         CHECK(cv::norm(surface->coord(ptr)-sample.volume)<1e-4);
         CHECK(surface->pointTo(ptr,expected,0.01f)<0.001f);
         CHECK(cv::norm(surface->coord(ptr)-expected)<0.001f);
-        CHECK_FALSE(surface->sampleAtSurface(surface->gridToSurface({-1,3})).valid());
+        CHECK_FALSE(sampleNative(*surface, surface->gridToSurface({-1,3})).valid());
     }
 }
 

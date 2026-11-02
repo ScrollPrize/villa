@@ -331,7 +331,9 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
                 if (!loc_valid(original, cv::Vec2d(y, x))) {
                     continue;
                 }
-                const cv::Vec3f normal = surf.gridNormal(y, x);
+                cv::Vec3f normal;
+                const float normalGrid[]{float(x),float(y)};
+                surf.pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
                 if (!normal_is_valid(normal)) {
                     continue;
                 }

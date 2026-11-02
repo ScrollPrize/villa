@@ -6294,7 +6294,10 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
                 grid[1]<0 || grid[1]>surface->rawPointsPtr()->rows-1) return true;
             inserted.linePosition=_generatedViews.stripPositionMap.stripGridColumnToOriginalPosition(grid[0]);
             if (!controlPointPlacementAllowedAt(inserted.linePosition)) return true;
-            inserted.point=surface->sampleAtSurface(chosenUV).volume;
+            const cv::Vec2f sampleGrid(grid);
+            cv::Vec3f position;
+            surface->pointSurface()->pointsAt(sampleGrid.val, 1, position.val, nullptr);
+            inserted.point=position;
             if (!std::isfinite(cv::norm(inserted.point))) return true;
             chosen=&inserted;
         }

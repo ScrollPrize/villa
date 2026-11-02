@@ -792,7 +792,9 @@ static int run_main(int argc, char *argv[])
                     continue;
                 }
 
-                cv::Vec3f n = src_surface->gridNormal(r, c);
+                cv::Vec3f n;
+                const float nGrid[]{float(c),float(r)};
+                src_surface->pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
                 if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                     continue;
                 }

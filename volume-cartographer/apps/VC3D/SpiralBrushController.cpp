@@ -531,9 +531,10 @@ std::optional<cv::Vec3f> SpiralBrushController::volumePointOnSurface(
     const QPointF& surfacePos, const std::shared_ptr<QuadSurface>& source) const
 {
     if (!source) return std::nullopt;
-    const auto sample = source->sampleAtSurface(
-        {static_cast<double>(surfacePos.x()), static_cast<double>(surfacePos.y())});
-    return sample ? std::optional<cv::Vec3f>{sample.volume} : std::nullopt;
+    const cv::Vec2f grid(source->surfaceToGrid({surfacePos.x(), surfacePos.y()}));
+    cv::Vec3f position;
+    source->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    return std::isfinite(cv::norm(position)) ? std::optional<cv::Vec3f>{position} : std::nullopt;
 }
 
 bool SpiralBrushController::surfaceSegmentValid(

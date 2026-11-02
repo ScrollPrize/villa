@@ -145,7 +145,9 @@ TEST_CASE("Fixture: gridNormal yields a unit-length normal somewhere on the surf
             if ((*p)(r + 1, c)[0] == -1.f) continue;
             if ((*p)(r, c - 1)[0] == -1.f) continue;
             if ((*p)(r, c + 1)[0] == -1.f) continue;
-            auto n = qs.gridNormal(r, c);
+            cv::Vec3f n;
+            const float nGrid[]{float(c),float(r)};
+            qs.pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
             if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
                 float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
                 CHECK(len == doctest::Approx(1.0f).epsilon(1e-3));

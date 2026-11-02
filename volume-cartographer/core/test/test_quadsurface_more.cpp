@@ -45,7 +45,9 @@ TEST_CASE("gridNormal on a planar grid is z-axis (within sign)")
 {
     auto pts = makePlanarGrid(8, 8);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    auto n = qs.gridNormal(4, 4);
+    cv::Vec3f n;
+    const float nGrid[]{float(4),float(4)};
+    qs.pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
     CHECK(finiteVec(n));
     CHECK(std::abs(std::abs(n[2]) - 1.0f) < 1e-3f);
 }
@@ -55,7 +57,9 @@ TEST_CASE("gridNormal at sentinel neighborhood returns NaN")
     auto pts = makePlanarGrid(8, 8);
     pts(4, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    auto n = qs.gridNormal(4, 4);
+    cv::Vec3f n;
+    const float nGrid[]{float(4),float(4)};
+    qs.pointSurface()->pointsAt(nGrid,1,nullptr,n.val);
     CHECK(std::isnan(n[0]));
 }
 

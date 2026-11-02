@@ -118,8 +118,11 @@ std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     }
     const int nearestCol = static_cast<int>(std::lround(grid[0]));
     const int nearestRow = static_cast<int>(std::lround(grid[1]));
+    cv::Vec3f normal;
+    const float xy[]{float(nearestCol),float(nearestRow)};
+    segment.pointSurface()->pointsAt(xy,1,nullptr,normal.val);
     if (!segment.isPointValid(nearestRow, nearestCol) ||
-        !isFiniteVec3(segment.gridNormal(nearestRow, nearestCol))) {
+        !isFiniteVec3(normal)) {
         return std::nullopt;
     }
 

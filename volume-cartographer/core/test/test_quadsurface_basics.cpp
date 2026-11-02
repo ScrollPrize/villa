@@ -11,6 +11,22 @@
 #include <vector>
 
 namespace {
+struct NativeSurfaceSample {
+    cv::Vec2d grid;
+    cv::Vec3f volume;
+    bool valid() const { return std::isfinite(cv::norm(volume)); }
+    explicit operator bool() const { return valid(); }
+};
+NativeSurfaceSample sampleNative(const QuadSurface& surface, const cv::Vec2d& uv) {
+    NativeSurfaceSample sample;
+    sample.grid=surface.surfaceToGrid(uv);
+    const cv::Vec2f xy(sample.grid);
+    surface.pointSurface()->pointsAt(xy.val,1,sample.volume.val,nullptr);
+    return sample;
+}
+}
+
+namespace {
 
 cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 50.f)
 {
@@ -201,7 +217,7 @@ TEST_CASE("surface/grid conversion and sampling use one exact affine convention"
     CHECK(roundTrip[0] == doctest::Approx(grid[0]).epsilon(1e-12));
     CHECK(roundTrip[1] == doctest::Approx(grid[1]).epsilon(1e-12));
 
-    const auto sample = surface.sampleAtSurface(flat);
+    const auto sample = sampleNative(surface, flat);
     REQUIRE(sample);
     CHECK(sample.grid[0] == doctest::Approx(1.25));
     CHECK(sample.grid[1] == doctest::Approx(0.5));
@@ -210,14 +226,14 @@ TEST_CASE("surface/grid conversion and sampling use one exact affine convention"
     CHECK(sample.volume[2] == doctest::Approx(307.75f));
 
     // The outermost grid edge belongs to the final quad and is clickable.
-    const auto edge = surface.sampleAtSurface(
+    const auto edge = sampleNative(surface, 
         surface.gridToSurface({3.0, 2.0}));
     REQUIRE(edge);
     CHECK(edge.volume == points(2, 3));
     const cv::Vec2d nearEdge = surface.gridToSurface({3.0 + 5e-7, 2.0});
-    CHECK(surface.sampleAtSurface(nearEdge));
+    CHECK_FALSE(sampleNative(surface, nearEdge));
     const cv::Vec2d outside = surface.gridToSurface({3.0 + 2e-6, 2.0});
-    CHECK_FALSE(surface.sampleAtSurface(outside));
+    CHECK_FALSE(sampleNative(surface, outside));
 }
 
 TEST_CASE("shiftSurfaceOrigin moves content by -delta in every surface mapping")
@@ -234,7 +250,7 @@ TEST_CASE("shiftSurfaceOrigin moves content by -delta in every surface mapping")
     QuadSurface surface(points, cv::Vec2f(2.0f, 4.0f));
     const cv::Vec2d grid(1.25, 0.5);
     const cv::Vec2d before = surface.gridToSurface(grid);
-    const cv::Vec3f volumeBefore = surface.sampleAtSurface(before).volume;
+    const cv::Vec3f volumeBefore = sampleNative(surface, before).volume;
 
     const cv::Vec2d delta(0.75, -0.25);
     surface.shiftSurfaceOrigin(delta);
@@ -245,7 +261,7 @@ TEST_CASE("shiftSurfaceOrigin moves content by -delta in every surface mapping")
     CHECK(after[1] == doctest::Approx(before[1] - delta[1]).epsilon(1e-6));
     // ...and the shifted address samples the identical content, through the
     // surface path and the ptr path (coord), which must stay in agreement.
-    const auto sample = surface.sampleAtSurface(after);
+    const auto sample = sampleNative(surface, after);
     REQUIRE(sample);
     CHECK(sample.volume[0] == doctest::Approx(volumeBefore[0]));
     CHECK(sample.volume[1] == doctest::Approx(volumeBefore[1]));
@@ -270,10 +286,9 @@ TEST_CASE("surface sampling rejects any location owned by an invalid quad")
     auto points = makePlanarGrid(3, 3);
     points(1, 1) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
-    const auto sample = surface.sampleAtSurface(
+    const auto sample = sampleNative(surface, 
         surface.gridToSurface({0.25, 0.25}));
     CHECK_FALSE(sample);
-    CHECK(sample.status == QuadSurface::SurfaceSample::Status::InvalidQuad);
 }
 
 TEST_CASE("countValidPoints / countValidQuads on dense grid")

@@ -1142,8 +1142,10 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
         modifiers != Qt::NoModifier || !_flattenedViewer ||
         _lineAnnotationDraft->surface.get() != _flattenedViewer->currentSurface()) return;
     const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(scenePoint);
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1]) ||
-        !_lineAnnotationDraft->surface->sampleAtSurface({surface[0], surface[1]})) {
+    const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({surface[0], surface[1]}));
+    cv::Vec3f position;
+    _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    if (!std::isfinite(cv::norm(position))) {
         statusBar()->showMessage(tr("Point must lie on valid Spiral surface data"), 5000);
         return;
     }
@@ -1380,15 +1382,17 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
     std::vector<cv::Vec3d> controls;
     controls.reserve(_lineAnnotationDraft->surfacePoints.size());
     for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
-        const auto sample = _lineAnnotationDraft->surface->sampleAtSurface({point.x(), point.y()});
-        if (!sample) {
+        const cv::Vec2f grid(_lineAnnotationDraft->surface->surfaceToGrid({point.x(), point.y()}));
+        cv::Vec3f position;
+        _lineAnnotationDraft->surface->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+        if (!std::isfinite(cv::norm(position))) {
             statusBar()->showMessage(tr(
                 "A saved control no longer samples valid preview geometry"), 10000);
             return;
         }
-        controls.emplace_back(sample.volume[0] * previewToFiberBase,
-                              sample.volume[1] * previewToFiberBase,
-                              sample.volume[2] * previewToFiberBase);
+        controls.emplace_back(position[0] * previewToFiberBase,
+                              position[1] * previewToFiberBase,
+                              position[2] * previewToFiberBase);
     }
     for (size_t i = 0; i < controls.size(); ++i) {
         for (size_t j = 0; j < i; ++j) {

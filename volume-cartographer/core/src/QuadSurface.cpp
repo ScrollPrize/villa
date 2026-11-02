@@ -492,68 +492,6 @@ cv::Vec2d QuadSurface::gridToSurface(const cv::Vec2d& grid) const
     };
 }
 
-QuadSurface::SurfaceSample QuadSurface::sampleAtSurface(
-    const cv::Vec2d& surface) const
-{
-    SurfaceSample result;
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
-        result.status = SurfaceSample::Status::NonFinite;
-        return result;
-    }
-    if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])
-        || _scale[0] <= 0.0f || _scale[1] <= 0.0f) {
-        result.status = SurfaceSample::Status::InvalidScale;
-        return result;
-    }
-
-    const_cast<QuadSurface*>(this)->ensureLoaded();
-    if (!_points || _points->cols < 2 || _points->rows < 2) {
-        result.status = SurfaceSample::Status::MissingPoints;
-        return result;
-    }
-
-    result.grid = surfaceToGrid(surface);
-    const double maxCol = static_cast<double>(_points->cols - 1);
-    const double maxRow = static_cast<double>(_points->rows - 1);
-    constexpr double gridTolerance = 1e-6;
-    if (result.grid[0] < -gridTolerance || result.grid[1] < -gridTolerance
-        || result.grid[0] > maxCol + gridTolerance
-        || result.grid[1] > maxRow + gridTolerance) {
-        result.status = SurfaceSample::Status::OutsideGrid;
-        return result;
-    }
-    result.grid[0] = std::clamp(result.grid[0], 0.0, maxCol);
-    result.grid[1] = std::clamp(result.grid[1], 0.0, maxRow);
-
-    const int col = std::min(
-        static_cast<int>(std::floor(result.grid[0])), _points->cols - 2);
-    const int row = std::min(
-        static_cast<int>(std::floor(result.grid[1])), _points->rows - 2);
-    const cv::Vec3f& p00 = (*_points)(row, col);
-    const cv::Vec3f& p01 = (*_points)(row, col + 1);
-    const cv::Vec3f& p10 = (*_points)(row + 1, col);
-    const cv::Vec3f& p11 = (*_points)(row + 1, col + 1);
-    if (!isValidPointSample(p00) || !isValidPointSample(p01)
-        || !isValidPointSample(p10) || !isValidPointSample(p11)) {
-        result.status = SurfaceSample::Status::InvalidQuad;
-        return result;
-    }
-
-    const float colFraction =
-        static_cast<float>(result.grid[0] - static_cast<double>(col));
-    const float rowFraction =
-        static_cast<float>(result.grid[1] - static_cast<double>(row));
-    const cv::Vec3f top = p00 * (1.0f - colFraction) + p01 * colFraction;
-    const cv::Vec3f bottom = p10 * (1.0f - colFraction) + p11 * colFraction;
-    result.volume = top * (1.0f - rowFraction) + bottom * rowFraction;
-    if (!isValidPointSample(result.volume)) {
-        result.status = SurfaceSample::Status::NonFinite;
-        return result;
-    }
-    result.status = SurfaceSample::Status::Valid;
-    return result;
-}
-
 cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
 {
     return {ptr[0] + _center[0] * _scale[0],
@@ -571,21 +509,6 @@ cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
     ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
     const float xy[2] = {p[0], p[1]};
-    cv::Vec3f point, normal;
-    pointSurface()->pointsAt(xy, 1, point.val, normal.val);
-    return normal;
-}
-
-cv::Vec3f QuadSurface::gridNormal(int row, int col) const
-{
-    const_cast<QuadSurface*>(this)->ensureLoaded();
-    if (!_points) {
-        return {NAN, NAN, NAN};
-    }
-    if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
-        return {NAN, NAN, NAN};
-
-    const float xy[2] = {static_cast<float>(col), static_cast<float>(row)};
     cv::Vec3f point, normal;
     pointSurface()->pointsAt(xy, 1, point.val, normal.val);
     return normal;

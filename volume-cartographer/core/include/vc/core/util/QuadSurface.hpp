@@ -274,29 +274,6 @@ private:
 class QuadSurface : public Surface
 {
 public:
-    struct SurfaceSample {
-        enum class Status {
-            Valid,
-            NonFinite,
-            InvalidScale,
-            MissingPoints,
-            OutsideGrid,
-            InvalidQuad,
-        };
-
-        Status status = Status::MissingPoints;
-        cv::Vec2d grid{
-            std::numeric_limits<double>::quiet_NaN(),
-            std::numeric_limits<double>::quiet_NaN()};
-        cv::Vec3f volume{
-            std::numeric_limits<float>::quiet_NaN(),
-            std::numeric_limits<float>::quiet_NaN(),
-            std::numeric_limits<float>::quiet_NaN()};
-
-        [[nodiscard]] bool valid() const { return status == Status::Valid; }
-        explicit operator bool() const { return valid(); }
-    };
-
     QuadSurface() = default;
     // points will be cloned in constructor
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
@@ -317,7 +294,6 @@ public:
     cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) const override;
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
-    cv::Vec3f gridNormal(int row, int col) const;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfaceQuerySet* surfaceIndex = nullptr) override;
     cv::Size size();
@@ -339,7 +315,6 @@ public:
     // invalidation recomputes _center, so use it only on in-memory derived
     // surfaces, never on disk-backed ones.
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
-    [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
     // The vertex grid as vcr::grid sees it: the options of a vcr::grid::Surface over
     // rawPointsPtr() (its pieces; linear patches), and the raster of `size` pixels whose
     // top-left pixel sits at surface coordinate (u0, v0), `scale` pixels per unit.
@@ -447,7 +422,7 @@ public:
     void writeValidMask();
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
-    // What coord(), normal() and gridNormal() evaluate; built on first use.
+    // Immutable geometry retained by sampling consumers; built on first use.
     mutable std::shared_ptr<const vcr::grid::Surface> _pointSurface;
     [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> pointSurface() const;
     void dropPointSurface() const;

@@ -393,7 +393,9 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    const float normalGrid[]{float(col),float(row)};
+    surface.pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
