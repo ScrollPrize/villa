@@ -22,10 +22,12 @@ std::optional<VertexIndex::Hit> VertexIndex::nearest(const cv::Vec3f& p,float ma
     double distanceSquared=double(maxDistance)*maxDistance;
     std::optional<Hit> hit;
     bounds_.nearest({p[0],p[1],p[2]},distanceSquared,[&](std::size_t i) {
-        const auto delta=points_[i]-p;
-        const float d=delta.dot(delta);
+        // Use the same precision as bounds traversal so pruning cannot discard
+        // a closer vertex after a candidate distance rounded down to float.
+        const cv::Vec3d delta=cv::Vec3d(points_[i])-cv::Vec3d(p);
+        const double d=delta.dot(delta);
         if (d<distanceSquared || (d==distanceSquared && (!hit || indices_[i]<hit->index))) {
-            distanceSquared=d; hit=Hit{indices_[i],points_[i],d};
+            distanceSquared=d; hit=Hit{indices_[i],points_[i],float(d)};
         }
     });
     return hit;

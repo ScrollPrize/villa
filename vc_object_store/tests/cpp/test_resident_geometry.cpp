@@ -21,6 +21,11 @@ int main() {
         }
         const auto hit=index.nearest(query);CHECK(hit && hit->index==chosen && hit->distanceSq==best);
     }
+    // Large finite coordinates must not overflow float distance comparisons.
+    cv::Mat_<cv::Vec3f> huge(1,2);
+    huge(0,0)={2e20f,0,1}; huge(0,1)={1e20f,0,1};
+    index.rebuild(huge);
+    CHECK(index.nearest({0,0,1})->index==1);
     cv::Mat_<cv::Vec3f> grid(2,2);
     grid(0,0)={0,0,0};grid(0,1)={1,0,0};grid(1,0)={0,1,0};grid(1,1)={1,1,2};
     valid.assign(4,1);
