@@ -10,7 +10,11 @@
 #include "../element_type.hpp"
 #include "../rounding.hpp"
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -400,7 +404,13 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
     static std::atomic<unsigned long long> sequence{0};
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto temporary = parent / (".tifxyz_tmp_" + path.filename().string() + "." +
-        std::to_string(::getpid()) + "." + std::to_string(stamp) + "." + std::to_string(sequence++));
+        std::to_string(
+#ifdef _WIN32
+        ::_getpid()
+#else
+        ::getpid()
+#endif
+        ) + "." + std::to_string(stamp) + "." + std::to_string(sequence++));
     if (!fs::create_directory(temporary)) throw std::runtime_error("cannot create tifxyz staging directory");
     try {
         sources::TiffOptions tiff;

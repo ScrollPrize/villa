@@ -788,15 +788,23 @@ Result dispatch(const Request& request, Host&& host, Device&& device)
 Result sample(const Surface& surface, const Raster& raster, const Request& request)
 {
     checkRequest(request, raster.width, raster.height);
+#ifdef VC_READER_CUDA
     return dispatch(request, [&] { return sampleHost(surface, raster, request); },
                     [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(surface, raster, request, readers); });
+#else
+    return sampleHost(surface, raster, request);
+#endif
 }
 
 Result sample(const Plane& plane, const Request& request)
 {
     checkRequest(request, plane.width, plane.height);
+#ifdef VC_READER_CUDA
     return dispatch(request, [&] { return sampleHost(plane, request); },
                     [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(plane, request, readers); });
+#else
+    return sampleHost(plane, request);
+#endif
 }
 
 }  // namespace vcr::grid
