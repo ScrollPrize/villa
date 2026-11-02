@@ -1,6 +1,6 @@
 # Automated Fiber Volumes from CT
 
-`vesuvius.afv_spline_generator` predicts papyrus fibers in a zone of a CT
+`vesuvius.fiber_spline_generator` predicts papyrus fibers in a zone of a CT
 volume block by block, fits smooth polylines to them, stitches the blocks
 together, optionally extends the fibers across gaps, cleans them and writes
 a native `vc_object_store` database (`.vcobj`) with editable fiber geometry.
@@ -14,7 +14,7 @@ of PHerc0813:
 
 ```bash
 uv sync --extra models
-uv run --extra models vesuvius.afv_spline_generator \
+uv run --extra models vesuvius.fiber_spline_generator \
   --volume https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr \
   --origin 3720 4776 6592 --size 512 512 512 \
   --volume-uuid 20250821151723 --voxel-size 9.362 \
@@ -135,7 +135,7 @@ strongly recommended: predicting on the CPU is very slow.
 With existing model and native object-store dependencies installed, from `villa/`:
 
 ```bash
-PYTHONPATH=vesuvius/src vesuvius/.venv/bin/python -m pytest vesuvius/tests/afv_spline_generator
+PYTHONPATH=vesuvius/src vesuvius/.venv/bin/python -m pytest vesuvius/tests/fiber_spline_generator
 ninja -C volume-cartographer/build VC3D test_fiber_collection_generator
 QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build -R '^fiber_collection_generator$' --output-on-failure
 ```
@@ -150,7 +150,7 @@ To validate the writer on existing real fiber JSONs (without model inference):
 
 ```bash
 VC_FIBER_TEST_SOURCE=/path/to/fiber-jsons PYTHONPATH=vesuvius/src \
-  vesuvius/.venv/bin/python -m pytest -q -s vesuvius/tests/afv_spline_generator/test_store.py
+  vesuvius/.venv/bin/python -m pytest -q -s vesuvius/tests/fiber_spline_generator/test_store.py
 ```
 
 This also checks native coordinates, catalog summaries, family filters and a

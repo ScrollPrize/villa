@@ -1,9 +1,9 @@
 import numpy as np
 
-from vesuvius.afv_spline_generator.cli import GAP_MODEL
-from vesuvius.afv_spline_generator.extend.ct_support import CTSupport
-from vesuvius.afv_spline_generator.extend.gap_model import Predictor, geometry_features
-from vesuvius.afv_spline_generator.extend.stitch import Stitcher
+from vesuvius.fiber_spline_generator.cli import GAP_MODEL
+from vesuvius.fiber_spline_generator.extend.ct_support import CTSupport
+from vesuvius.fiber_spline_generator.extend.gap_model import Predictor, geometry_features
+from vesuvius.fiber_spline_generator.extend.stitch import Stitcher
 
 SHAPE_XYZ = (320, 96, 96)
 

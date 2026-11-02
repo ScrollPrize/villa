@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from vc_object_store import ObjectStore, RegionSlice, RegionOptions
 from vc3d_fiber_format import parse_vc3d_fiber_format
-from vesuvius.afv_spline_generator.store import Fiber, write_store
+from vesuvius.fiber_spline_generator.store import Fiber, write_store
 
 COORDINATES = {"volume_uuid": "20250101000000", "scale_factor": 1}
 
@@ -129,7 +129,7 @@ def test_rejects_invalid_collections(tmp_path, arguments):
 def test_real_fiber_output(tmp_path):
     import json
     from pathlib import Path
-    from vesuvius.afv_spline_generator.cli import afv_fibers
+    from vesuvius.fiber_spline_generator.cli import afv_fibers
 
     paths = sorted(Path(os.environ["VC_FIBER_TEST_SOURCE"]).glob("*.json"))
     assert paths, "The real-data fixture contains no fiber JSONs"

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.afv_spline_generator.predict import MIN_STD, normalize, predict_fibers, window_starts
+from vesuvius.fiber_spline_generator.predict import MIN_STD, normalize, predict_fibers, window_starts
 
 
 CPU = torch.device("cpu")

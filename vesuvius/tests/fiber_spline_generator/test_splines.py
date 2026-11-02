@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.spatial import cKDTree
 
-from vesuvius.afv_spline_generator.splines import MAX_DEVIATION, chain_order, extract_splines, family_probability, threshold_to_u8
+from vesuvius.fiber_spline_generator.splines import MAX_DEVIATION, chain_order, extract_splines, family_probability, threshold_to_u8
 
 
 SHAPE = (40, 64, 112)
