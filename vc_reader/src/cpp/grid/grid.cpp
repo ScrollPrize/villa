@@ -3,6 +3,7 @@
 
 #include "../array.hpp"
 #include "points.hpp"
+#include "derivatives.hpp"
 #include "../sample_point.hpp"
 #include "level_map.hpp"
 #include "../composite/reducer.hpp"
@@ -121,71 +122,11 @@ struct Surface::Impl {
     // and holes, never across a piece's columns.
     void buildDerivatives()
     {
-        const int rows = v.rows, cols = v.cols;
-        const std::size_t n = std::size_t(rows) * std::size_t(cols) * 3;
-        du.assign(n, 0.0f);
-        dv.assign(n, 0.0f);
-        duv.assign(n, 0.0f);
-        const auto ok = [&](int r, int c) { return r >= 0 && r < rows && c >= 0 && c < cols && valid[index(r, c)]; };
-        const auto same = [&](int c, int d) { return piece.empty() || piece[std::size_t(c)] == piece[std::size_t(d)]; };
-        const auto put = [&](std::vector<float>& d, int r, int c, geometry::V value) { geometry::store(&d[3 * index(r, c)], value); };
-        const auto get = [&](const std::vector<float>& d, int r, int c) { return geometry::vector(&d[3 * index(r, c)]); };
-        for (int r = 0; r < rows; ++r)
-            for (int c = 0; c < cols; ++c) {
-                if (!ok(r, c))
-                    continue;
-                const auto p = at(r, c);
-                const bool left = ok(r, c - 1) && same(c - 1, c), right = ok(r, c + 1) && same(c, c + 1);
-                if (left && right)
-                    put(du, r, c, (at(r, c + 1) - at(r, c - 1)) * 0.5f);
-                else if (right)
-                    put(du, r, c, at(r, c + 1) - p);
-                else if (left)
-                    put(du, r, c, p - at(r, c - 1));
-                const bool up = ok(r - 1, c), down = ok(r + 1, c);
-                if (up && down)
-                    put(dv, r, c, (at(r + 1, c) - at(r - 1, c)) * 0.5f);
-                else if (down)
-                    put(dv, r, c, at(r + 1, c) - p);
-                else if (up)
-                    put(dv, r, c, p - at(r - 1, c));
-            }
-        for (int r = 0; r < rows; ++r)
-            for (int c = 0; c < cols; ++c) {
-                if (!ok(r, c))
-                    continue;
-                const bool left = ok(r, c - 1) && same(c - 1, c), right = ok(r, c + 1) && same(c, c + 1);
-                const bool up = ok(r - 1, c), down = ok(r + 1, c);
-                if (left && right && up && down && ok(r - 1, c - 1) && ok(r - 1, c + 1) && ok(r + 1, c - 1) &&
-                    ok(r + 1, c + 1)) {
-                    put(duv, r, c, (at(r + 1, c + 1) - at(r + 1, c - 1) - at(r - 1, c + 1) + at(r - 1, c - 1)) * 0.25f);
-                    continue;
-                }
-                geometry::V sum{0, 0, 0};
-                int count = 0;
-                if (up && down) {
-                    sum = sum + (get(du, r + 1, c) - get(du, r - 1, c)) * 0.5f;
-                    ++count;
-                } else if (down) {
-                    sum = sum + (get(du, r + 1, c) - get(du, r, c));
-                    ++count;
-                } else if (up) {
-                    sum = sum + (get(du, r, c) - get(du, r - 1, c));
-                    ++count;
-                }
-                if (left && right) {
-                    sum = sum + (get(dv, r, c + 1) - get(dv, r, c - 1)) * 0.5f;
-                    ++count;
-                } else if (right) {
-                    sum = sum + (get(dv, r, c + 1) - get(dv, r, c));
-                    ++count;
-                } else if (left) {
-                    sum = sum + (get(dv, r, c) - get(dv, r, c - 1));
-                    ++count;
-                }
-                if (count)
-                    put(duv, r, c, sum * (1.0f / float(count)));
-            }
+        const std::size_t n = std::size_t(v.rows) * v.cols;
+        du.resize(n*3); dv.resize(n*3); duv.resize(n*3);
+        Derivatives d{view(), v.rows, v.cols};
+        for(std::size_t i=0;i<n;++i)d.firstAt(int(i),du.data(),dv.data());
+        for(std::size_t i=0;i<n;++i)d.mixedAt(int(i),duv.data());
     }
 
     // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into

@@ -47,6 +47,7 @@ struct GridView {
     const float* du = nullptr;
     const float* dv = nullptr;
     const float* duv = nullptr;
+    bool triangles = false;
 };
 
 namespace detail {
@@ -87,7 +88,10 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
     for (int k = 0; k < 4; ++k)
         p[k] = vector(v.xyz + 3 * at[k]);
     V position, du, dv;
-    if (v.du) {
+    if (v.triangles) {
+        if(u+w<=1.f){position=p[0]+(p[1]-p[0])*u+(p[2]-p[0])*w;du=p[1]-p[0];dv=p[2]-p[0];}
+        else {position=p[1]*(1-w)+p[3]*(u+w-1)+p[2]*(1-u);du=p[3]-p[2];dv=p[3]-p[1];}
+    } else if (v.du) {
         const detail::Hermite bx = detail::hermite(u), by = detail::hermite(w);
         const auto D = [&](const float* d, int k) { return vector(d + 3 * at[k]); };
         const V q0 = p[0] * bx.p0 + D(v.du, 0) * bx.m0 + p[1] * bx.p1 + D(v.du, 1) * bx.m1;

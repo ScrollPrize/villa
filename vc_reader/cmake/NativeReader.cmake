@@ -36,6 +36,9 @@ else()
     add_library(vc_reader_native STATIC)
 endif()
 target_sources(vc_reader_native PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/mask.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/transfer.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sampling/resident.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/publication.cpp"
@@ -81,7 +84,7 @@ target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl P
 
 if(VC_READER_ENABLE_CUDA)
     add_library(vc_reader_reader_cuda STATIC
-        src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/projection/kernels.cu
+        src/cpp/sampling/kernels.cu src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/projection/kernels.cu
         src/cpp/sheet_normal/kernels.cu src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu
         src/cpp/grid/kernels.cu src/cpp/pathfinding/kernels.cu src/cpp/display/kernels.cu)
     add_library(vc_reader::reader_cuda ALIAS vc_reader_reader_cuda)

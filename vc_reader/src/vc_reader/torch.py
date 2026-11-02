@@ -13,7 +13,7 @@ import torch
 
 from .cuda import DeviceArray
 
-__all__ = ["CudaLoader", "normalize", "structure_tensor"]
+__all__ = ["CudaLoader", "normalize", "structure_tensor", "sample_array", "surface_points", "surface_derivatives"]
 
 
 def _main_process():
@@ -349,3 +349,136 @@ class CudaLoader:
         finally:
             if pending is not None:
                 pending.close()
+
+
+def _resident_forward(values, points, order, boundary, fill):
+    from . import _reader, cuda
+    out = values.new_empty((values.shape[0], values.shape[1], points.shape[1]))
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    _reader._sample_dense(view(values), view(points), view(out), order, boundary, fill)
+    return out
+
+
+def _resident_backward(values, points, cotangent, need_values, need_points, order, boundary, fill):
+    from . import _reader, cuda
+    vg = torch.empty_like(values) if need_values else values.new_empty(0)
+    pg = torch.empty_like(points) if need_points else points.new_empty(0)
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    _reader._sample_dense_backward(view(values), view(points), view(cotangent.contiguous()), view(vg), view(pg), order, boundary, fill)
+    return vg, pg
+
+
+# Dispatcher schemas keep native calls opaque to Dynamo/AOTAutograd. Meta kernels
+# describe allocations, so compiled training retains surrounding tensor graphs.
+_resident_ops = torch.library.Library("vc_reader", "FRAGMENT")
+_resident_ops.define("resident_sample(Tensor values, Tensor points, int order, str boundary, float fill) -> Tensor")
+_resident_ops.define("resident_sample_backward(Tensor values, Tensor points, Tensor cotangent, bool need_values, bool need_points, int order, str boundary, float fill) -> (Tensor, Tensor)")
+for _dispatch in ("CPU", "CUDA"):
+    _resident_ops.impl("resident_sample", _resident_forward, _dispatch)
+    _resident_ops.impl("resident_sample_backward", _resident_backward, _dispatch)
+_resident_ops.impl("resident_sample", lambda values, points, order, boundary, fill:
+                   values.new_empty((values.shape[0], values.shape[1], points.shape[1])), "Meta")
+_resident_ops.impl("resident_sample_backward", lambda values, points, cotangent, need_values, need_points, order, boundary, fill:
+                   (torch.empty_like(values) if need_values else values.new_empty(0),
+                    torch.empty_like(points) if need_points else points.new_empty(0)), "Meta")
+
+
+class _SampleArray(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, points, order, boundary, fill):
+        ctx.save_for_backward(values, points)
+        ctx.options = order, boundary, fill
+        return torch.ops.vc_reader.resident_sample(values, points, order, boundary, fill)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, cotangent):
+        values, points = ctx.saved_tensors
+        vg, pg = torch.ops.vc_reader.resident_sample_backward(
+            values, points, cotangent, ctx.needs_input_grad[0], ctx.needs_input_grad[1], *ctx.options)
+        return vg if ctx.needs_input_grad[0] else None, pg if ctx.needs_input_grad[1] else None, None, None, None
+
+
+def sample_array(values, points, *, order=1, boundary="zeros", fill=0):
+    """Sample B,C,[Z,]Y,X at B,...,D array indices; return B,C,... float32.
+
+    Native CPU/CUDA forward and first-order gradients for values and coordinates.
+    CUDA value gradients use atomic addition, like torch grid_sample. Coordinate
+    gradients and forward values have no competing floating-point writes.
+    MPS stages through CPU and retains autograd. Double backward is unsupported.
+    """
+    if values.ndim not in (4, 5) or points.ndim < 3 or points.shape[0] != values.shape[0] or points.shape[-1] != values.ndim-2:
+        raise ValueError('expected B,C,[Z,]Y,X values and B,...,D points')
+    if values.device != points.device:
+        raise ValueError('values and points must be on the same device')
+    device = values.device
+    if device.type == 'mps':
+        return sample_array(values.cpu(), points.cpu(), order=order, boundary=boundary, fill=fill).to(device)
+    shape = points.shape[1:-1]
+    result = _SampleArray.apply(values.float().contiguous(), points.float().reshape(values.shape[0], -1, points.shape[-1]).contiguous(), int(order), boundary, float(fill))
+    return result.reshape(values.shape[:2] + shape)
+
+
+def _surface_derivatives_impl(xyz, valid):
+    """Prepare reusable bicubic derivatives for fixed B,H,W,3 surface grids."""
+    from . import _reader, cuda
+    xyz, valid = xyz.float().contiguous(), valid.bool().contiguous()
+    if xyz.device.type == "mps":
+        return surface_derivatives(xyz.cpu(), valid.cpu()).to(xyz.device)
+    out = xyz.new_empty((xyz.shape[0], 3, *xyz.shape[1:]))
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    _reader._prepare_surfaces(view(xyz), view(valid), view(out))
+    return out
+
+
+def surface_points(xyz, valid, rc, *, derivatives=None, border=False):
+    """Bicubic positions, row/column tangents and support for B,H,W,3 grids.
+
+    Queries B,Q,2 use row,column indices. Invalid queries return zero vectors
+    and false support. This operation builds fixed supervision: inputs requiring
+    gradients must instead use a differentiable field sampling operation.
+    """
+    if any(t.requires_grad for t in (xyz, rc)):
+        raise ValueError('surface_points takes fixed supervision grids and queries')
+    device = xyz.device
+    if device.type == 'mps':
+        return tuple(t.to(device) for t in surface_points(xyz.cpu(), valid.cpu(), rc.cpu(), border=border))
+    xyz, valid, rc = xyz.float().contiguous(), valid.bool().contiguous(), rc.float().contiguous()
+    if derivatives is None:
+        derivatives = surface_derivatives(xyz, valid)
+    return torch.ops.vc_reader.resident_surface(xyz, valid, rc, derivatives, border)
+
+
+def _surface_points_impl(xyz, valid, rc, derivatives, border):
+    from . import _reader, cuda
+    view = lambda x: cuda._StreamInput(x, _reader._get_stream() or 1) if x.is_cuda else x.numpy()
+    device = xyz.device
+    shape = (*rc.shape[:-1], 3)
+    p, row, col = (xyz.new_empty(shape) for _ in range(3))
+    ok = torch.empty(rc.shape[:-1], device=device, dtype=torch.bool)
+    _reader._sample_surfaces(view(xyz), view(valid), view(derivatives), view(rc), view(p), view(row), view(col), view(ok), 2, border)
+    return p, row, col, ok
+
+
+def _surface_meta(xyz, valid, rc, derivatives, border):
+    shape = (*rc.shape[:-1], 3)
+    return (xyz.new_empty(shape), xyz.new_empty(shape), xyz.new_empty(shape),
+            torch.empty(rc.shape[:-1], device=xyz.device, dtype=torch.bool))
+
+
+_resident_ops.define("resident_derivatives(Tensor xyz, Tensor valid) -> Tensor")
+_resident_ops.define("resident_surface(Tensor xyz, Tensor valid, Tensor rc, Tensor derivatives, bool border) -> (Tensor, Tensor, Tensor, Tensor)")
+for _dispatch in ("CPU", "CUDA"):
+    _resident_ops.impl("resident_derivatives", _surface_derivatives_impl, _dispatch)
+    _resident_ops.impl("resident_surface", _surface_points_impl, _dispatch)
+_resident_ops.impl("resident_derivatives", lambda xyz, valid: xyz.new_empty((xyz.shape[0], 3, *xyz.shape[1:])), "Meta")
+_resident_ops.impl("resident_surface", _surface_meta, "Meta")
+
+
+def surface_derivatives(xyz, valid):
+    """Reusable bicubic derivatives for fixed B,H,W,3 supervision grids."""
+    if xyz.requires_grad:
+        raise ValueError('surface_derivatives takes fixed supervision grids')
+    if xyz.device.type == 'mps':
+        return surface_derivatives(xyz.cpu(), valid.cpu()).to(xyz.device)
+    return torch.ops.vc_reader.resident_derivatives(xyz.float().contiguous(), valid.bool().contiguous())

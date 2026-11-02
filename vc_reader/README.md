@@ -105,6 +105,32 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Reduce layers to one value per pixel: mean, max, min, median, min-abs, alpha, Beer-Lambert | `composite.hpp`: `composite::reduce` | `composite/` | `_reader.composite_reduce` |
 | Render surface layers; project a label patch into CT | `aligned_reader.hpp`: `sources::SampleReader`, `SurfaceProjection` | `sources/surface_reader.cpp`, `projection/` | `SampleReader.render_surface`, `.project_surface`, `.iter_project_surface` |
 
+### Resident arrays and surface transfer
+
+| Need | C++ API | Implementation | Python |
+| --- | --- | --- | --- |
+| Nearest/linear samples of resident batched 2D/3D float32 arrays, with value and coordinate gradients; CPU/CUDA | `resident_sampling.hpp`: `sampling::Dense`, `sampleDense`, `backwardDense` | `sampling/resident.cpp`, `sampling/kernels.cu` | `resident.sample_array`, `torch.sample_array` |
+| Batched bicubic surface positions/tangents, linear or triangle fields, explicit validity; CPU/CUDA | `resident_sampling.hpp`: `sampling::prepareSurfaces`, `sampleSurfaces` | `grid/derivatives.hpp`, `grid/points.hpp`, `sampling/` | `resident.GridField`, `torch.surface_derivatives`, `torch.surface_points` |
+| Pixel-centre field tiles with border replication; CPU/CUDA | `resident_sampling.hpp`: `sampling::Tile`, `sampleFieldTile`, `sampleSurfaceTile` | `sampling/` | `resident.sample_field_tile` |
+| Label lookup through a surface correspondence, distance rejection and seam provenance; CPU/CUDA | `sampling.hpp`: `projection::RasterRequest`, `transfer` | `projection/transfer.cpp`, `projection/kernels.cu` | `resident.SurfaceTransfer` |
+| Binary support swept through a surface normal band; CPU/CUDA | `sampling.hpp`: `projection::MaskBand`, `projectMask` | `projection/mask.cpp`, `projection/kernels.cu` | `resident.project_mask` |
+
+Resident array queries use array indices (ZYX or YX), without normalized Torch
+coordinates. `zeros` interpolates with the fill value outside the array,
+`border` replicates its boundary, and `constant` rejects out-of-bounds queries.
+Nearest ties round up. Surface queries use row/column indices and require valid
+corners; bicubic Hermite derivatives are shared with `tifxyz.Surface`.
+`GridField` copies its input into fixed storage; CUDA copies remain resident.
+Torch sampling supports first-order gradients; CUDA value gradients use atomic
+addition and may differ slightly between runs. MPS tensors stage through CPU.
+Surface supervision queries do not support autograd.
+
+Surface transfer uses bicubic target geometry, triangle source geometry matching
+the correspondence mesh, and linear UV maps to avoid overshooting seams.
+Categorical labels are selected by index. Normal-band projection fills linear
+swept cells between supplied positions and normals; occupancy uses deterministic
+integer writes. All these operations use float32 on CPU and CUDA.
+
 ### Geometry and analysis
 
 | Need | C++ API | Implementation | Python |
