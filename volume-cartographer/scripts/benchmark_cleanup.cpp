@@ -9,8 +9,8 @@
 #include <iostream>
 #include <random>
 #include <vector>
-int main(){
- for(int side:{32,128,512}) {
+int main(int argc,char** argv){
+ if(argc<2 || std::string(argv[1])!="spatial") for(int side:{32,128,512}) {
   std::mt19937 rng(42);std::vector<float> weights(side*side);for(auto& w:weights)w=1+rng()%20;
   for(bool gpu:{false,true}) {
    std::vector<double> times;std::vector<uint32_t> path;
@@ -21,12 +21,19 @@ int main(){
    std::sort(times.begin(),times.end());std::cout<<side<<" "<<(gpu?"cuda":"cpu")<<" min/median/max ms "<<times.front()<<" "<<times[2]<<" "<<times.back()<<" path "<<path.size()<<std::endl;
   }
  }
+#if defined(__linux__) || defined(__APPLE__)
+ rusage before{};getrusage(RUSAGE_SELF,&before);
+#endif
  const int side=256;
  cv::Mat_<cv::Vec3f> points(side,side);
  for(int r=0;r<side;++r)for(int c=0;c<side;++c)points(r,c)={float(c),float(r),100.f+float((r*c)%31)};
  auto start=std::chrono::steady_clock::now();
  vc::geometry::VertexIndex index;index.rebuild(points);
  std::cout<<"index build ms "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<std::endl;
+#if defined(__linux__) || defined(__APPLE__)
+ rusage after{};getrusage(RUSAGE_SELF,&after);
+ std::cout<<"input grid plus resident index peak RSS increase (platform units) "<<after.ru_maxrss-before.ru_maxrss<<std::endl;
+#endif
  std::mt19937 rng(42);std::vector<cv::Vec3f> queries(10000);
  for(auto& q:queries)q={float(rng()%256),float(rng()%256),float(100+rng()%31)};
  start=std::chrono::steady_clock::now();std::uint64_t checksum=0;

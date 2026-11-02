@@ -83,3 +83,20 @@ def test_slab_compositing_cpu_cuda():
     np.testing.assert_allclose(cpu[0].astype(int), gpu[0].astype(int), atol=1)
     np.testing.assert_allclose(_reader.opacity_lut(.2, .8, .7, gamma=1.7),
                                _reader.opacity_lut(.2, .8, .7, gamma=1.7, cuda=True), atol=1e-6)
+
+
+def test_cuda_bulk_display_matches_cpu():
+    import pytest
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    pixels = np.arange(256, dtype=np.uint8).reshape(16,16)
+    palette = np.arange(256, dtype=np.uint32) | np.uint32(0xff000000)
+    output = torch.empty((16,16), dtype=torch.uint32, device='cuda')
+    _reader.apply_lut(torch.from_numpy(pixels).cuda(), torch.from_numpy(palette).cuda(), output)
+    np.testing.assert_array_equal(output.cpu().numpy(), palette[pixels])
+    base = torch.tensor([0xff204060,0xff204060],dtype=torch.uint32,device='cuda')
+    over = torch.tensor([0x80402010,0],dtype=torch.uint32,device='cuda')
+    mixed = torch.empty_like(base)
+    _reader.blend(base, over, 1., mixed)
+    np.testing.assert_array_equal(mixed.cpu().numpy(),[0xff504040,0xff204060])
