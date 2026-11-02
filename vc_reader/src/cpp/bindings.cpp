@@ -1,3 +1,7 @@
+#ifdef VC_READER_CUDA
+#include "cuda_buffer.hpp"
+#endif
+#include "vc_reader/display.hpp"
 #include "vc_reader/pathfinding.hpp"
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
@@ -351,6 +355,98 @@ NB_MODULE(_reader, m)
        "metadata"_a.none() = nb::none(), "attributes"_a.none() = nb::none());
 
     using vcr::zarr::Group;
+    m.def("window_level_lut", [](float low, float high, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::windowLevelLut(out, low, high);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::windowLevelLut(out, low, high);
+        return out;
+    }, "low"_a, "high"_a, "cuda"_a = false);
+    m.def("palette_lut", [](const std::array<std::uint32_t,256>& palette, float low, float high, bool black_zero, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::paletteLut(out, palette, low, high, black_zero);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::paletteLut(out, palette, low, high, black_zero);
+        return out;
+    }, "palette"_a, "low"_a, "high"_a, "black_zero"_a = true, "cuda"_a = false);
+    m.def("overlay_lut", [](const std::array<std::uint32_t,256>& color, float low, float high, bool intensity, bool premultiplied, bool cuda) {
+        std::array<std::uint32_t,256> out;
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            vcr::display::cuda::overlayLut(out, color, low, high, intensity, premultiplied);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        } else vcr::display::overlayLut(out, color, low, high, intensity, premultiplied);
+        return out;
+    }, "color"_a, "low"_a, "high"_a, "intensity_as_alpha"_a, "premultiplied"_a, "cuda"_a = false);
+    m.def("display_to_uint8", [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> input,
+                                nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig> output,
+                                nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig> coverage) {
+        if (input.size()!=output.size() || input.size()!=coverage.size() ||
+            input.device_type()!=output.device_type() || input.device_type()!=coverage.device_type() ||
+            input.device_id()!=output.device_id() || input.device_id()!=coverage.device_id())
+            throw nb::value_error("display buffers must have matching size and device");
+        nb::gil_scoped_release release;
+        if (input.device_type()==nb::device::cpu::value)
+            vcr::display::toUint8(input.data(),input.size(),output.data(),coverage.data());
+#ifdef VC_READER_CUDA
+        else if (input.device_type()==nb::device::cuda::value) {
+            vcr::device::Guard guard(input.device_id());
+            vcr::display::cuda::toUint8(input.data(),input.size(),output.data(),coverage.data());
+        }
+#endif
+        else throw std::invalid_argument("unsupported display device");
+    }, "input"_a.noconvert(), "output"_a.noconvert(), "coverage"_a.noconvert());
+    m.def("apply_lut", [](nb::ndarray<const std::uint8_t, nb::ndim<2>, nb::c_contig> input,
+                            nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> lut,
+                            nb::ndarray<std::uint32_t, nb::ndim<2>, nb::c_contig> output) {
+        if (lut.size()!=256 || input.shape(0)!=output.shape(0) || input.shape(1)!=output.shape(1) ||
+            input.device_type()!=output.device_type() || input.device_type()!=lut.device_type() ||
+            input.device_id()!=output.device_id() || input.device_id()!=lut.device_id())
+            throw nb::value_error("palette requires 256 entries; buffers must have matching shape and device");
+        nb::gil_scoped_release release;
+        if (input.device_type()==nb::device::cpu::value)
+            vcr::display::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
+#ifdef VC_READER_CUDA
+        else if (input.device_type()==nb::device::cuda::value) {
+            vcr::device::Guard guard(input.device_id());
+            vcr::display::cuda::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
+        }
+#endif
+        else throw nb::value_error("unsupported display device");
+    }, "input"_a.noconvert(), "lut"_a.noconvert(), "output"_a.noconvert());
+    m.def("blend", [](nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> base,
+                        nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> overlay, float opacity,
+                        nb::ndarray<std::uint32_t, nb::ndim<1>, nb::c_contig> output) {
+        if (base.size()!=overlay.size() || base.size()!=output.size() ||
+            base.device_type()!=output.device_type() || base.device_type()!=overlay.device_type() ||
+            base.device_id()!=output.device_id() || base.device_id()!=overlay.device_id())
+            throw nb::value_error("blend buffers must have matching size and device");
+        nb::gil_scoped_release release;
+        if (base.device_type()==nb::device::cpu::value)
+            vcr::display::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
+#ifdef VC_READER_CUDA
+        else if (base.device_type()==nb::device::cuda::value) {
+            vcr::device::Guard guard(base.device_id());
+            vcr::display::cuda::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
+        }
+#endif
+        else throw nb::value_error("unsupported display device");
+    }, "base"_a.noconvert(), "overlay"_a.noconvert(), "opacity"_a, "output"_a.noconvert());
+    m.def("blend_argb", &vcr::display::blendArgb, "base"_a, "overlay"_a, "opacity"_a);
+
     m.def("shortest_path", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> costs,
                               std::uint32_t source, std::uint32_t target, bool cuda) {
         nb::gil_scoped_release release;
