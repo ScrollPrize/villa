@@ -83,6 +83,21 @@ def test_distance_transform_scipy_boundaries(shape, fill):
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("shape", [(37, 41), (9, 23, 29)])
+@pytest.mark.parametrize("density", [0, .02, .5, 1])
+def test_distance_transform_indices_match_scipy(shape, density):
+    scipy = pytest.importorskip("scipy.ndimage")
+    mask = (np.random.default_rng(5).random(shape) < density).astype(np.uint8)
+    distance, expected = scipy.distance_transform_edt(1 - mask, return_indices=True)
+    for backend in _backends():
+        pipeline = A.Pipeline([A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)],
+                              targets={"label": A.Label()}, backend=backend)
+        out = pipeline({"label": mask[None]}, seed=0)
+        assert out["label_nearest"].dtype == np.int32
+        np.testing.assert_array_equal(out["label_nearest"], expected)
+        np.testing.assert_allclose(out["label_sdt"][0], distance, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("shape", [(17, 19), (9, 11, 13)])
 def test_morphology_footprints_match_scipy_iterations(shape):
     scipy = pytest.importorskip("scipy.ndimage")
