@@ -2,7 +2,7 @@
 
 #include "vc/ui/VCCollection.hpp"
 
-#include "dijkstra3d.hpp"
+#include <vc_reader/pathfinding.hpp>
 
 #include <QBrush>
 #include <QColor>
@@ -837,17 +837,15 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             }
         }
 
-        std::vector<uint32_t> path = dijkstra::dijkstra2d<float, uint32_t>(
+        std::vector<uint32_t> path = vcr::pathfinding::shortestPath(
             weights.data(),
-            static_cast<size_t>(w),
             static_cast<size_t>(h),
+            static_cast<size_t>(w),
             static_cast<size_t>(sourceKey),
-            static_cast<size_t>(targetKey),
-            8);
+            static_cast<uint32_t>(targetKey));
         if (path.size() < 2) {
             return false;
         }
-        std::reverse(path.begin(), path.end());
 
         std::vector<QPointF> scenePath;
         scenePath.reserve(path.size());

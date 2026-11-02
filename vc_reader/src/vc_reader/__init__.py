@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .catalog import DEFAULT_METADATA_URL, default_cache_dir
+from ._reader import shortest_path
 from .affine import Affine
 from .artifacts import AccessRoot, Artifact, ArtifactType, Origin, to_https, to_s3
 from .catalog import DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS, Catalog, License, Model, Scan, VolumeCoverage
@@ -19,6 +20,7 @@ __version__ = "0.1.0"
 load = Catalog.load
 
 __all__ = [
+    "shortest_path",
     "DEFAULT_METADATA_URL",
     "DEFAULT_RESOLUTION_REL_TOL",
     "PYRAMID_LEVELS",

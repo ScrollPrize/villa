@@ -1,3 +1,4 @@
+#include "vc_reader/pathfinding.hpp"
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
 #include "cuda_available.hpp"
@@ -350,6 +351,19 @@ NB_MODULE(_reader, m)
        "metadata"_a.none() = nb::none(), "attributes"_a.none() = nb::none());
 
     using vcr::zarr::Group;
+    m.def("shortest_path", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> costs,
+                              std::uint32_t source, std::uint32_t target, bool cuda) {
+        nb::gil_scoped_release release;
+        if (cuda) {
+#ifdef VC_READER_CUDA
+            return vcr::pathfinding::cuda::shortestPath(costs.data(), costs.shape(0), costs.shape(1), source, target);
+#else
+            throw std::runtime_error("CUDA support is not built");
+#endif
+        }
+        return vcr::pathfinding::shortestPath(costs.data(), costs.shape(0), costs.shape(1), source, target);
+    }, "costs"_a.noconvert(), "source"_a, "target"_a, "cuda"_a = false);
+
     m.def("composite_reduce", [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> values, const std::string& method,
                                  float iso_cutoff, float alpha_min, float alpha_max, float alpha_opacity, float alpha_cutoff,
                                  float extinction, float emission, float ambient, nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> out) {

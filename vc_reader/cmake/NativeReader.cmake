@@ -36,6 +36,7 @@ else()
 endif()
 target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/pathfinding/pathfinding.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/computed.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/grid.cpp"
@@ -75,7 +76,7 @@ if(VC_READER_ENABLE_CUDA)
     add_library(vc_reader_reader_cuda STATIC
         src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/projection/kernels.cu
         src/cpp/sheet_normal/kernels.cu src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu
-        src/cpp/grid/kernels.cu)
+        src/cpp/grid/kernels.cu src/cpp/pathfinding/kernels.cu)
     add_library(vc_reader::reader_cuda ALIAS vc_reader_reader_cuda)
     set_target_properties(vc_reader_reader_cuda PROPERTIES EXPORT_NAME reader_cuda
         POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
