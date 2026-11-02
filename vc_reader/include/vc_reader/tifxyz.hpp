@@ -122,10 +122,13 @@ public:
     void resample(const grid::Raster& raster, grid::Interpolation interpolation, float* xyz, float* normals = nullptr) const;
     // tifxyz::fullRaster at this surface's scale.
     [[nodiscard]] grid::Raster fullRaster(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size) const;
+    // The grid surface these queries use (built once per interpolation), e.g. to sample a
+    // volume along it with grid::sample. It refers to this surface's vertices: valid while
+    // this Surface lives.
+    [[nodiscard]] const grid::Surface& interpolator(grid::Interpolation interpolation) const;
 
 private:
     struct Interpolators;
-    const grid::Surface& interpolator(grid::Interpolation interpolation) const;
     std::int64_t rows_ = 0, cols_ = 0;
     std::vector<float> xyz_;
     std::vector<std::uint8_t> valid_;

@@ -107,6 +107,20 @@ class ZarrReader:
         from .cuda import CudaReader
         return CudaReader(self, cache_bytes=cache_bytes, device=device)
 
+    def grid_level(self, *, working_scale=(1, 1, 1), working_offset=(0, 0, 0), cuda=None, map=None):
+        """This array as a :mod:`vc_reader.grid` level.
+
+        Points are XYZ in the voxels of the working placement (ZYX level-0 scale and
+        offset; level 0 by default), placed through this pyramid level's placement. A
+        row-major 3x4 ``map`` from XYZ points to ZYX indices replaces the placement (e.g.
+        a registration). ``cuda`` is this array's :meth:`cuda` reader, to sample on the GPU.
+        """
+        self._ready()
+        engine = None if cuda is None else cuda._engine
+        if map is not None:
+            return _reader.grid_level_from_map(self._opened, tuple(float(v) for v in np.ravel(map)), engine)
+        return _reader.grid_level(self._opened, tuple(working_scale), tuple(working_offset), engine)
+
     @classmethod
     def computed(
         cls,

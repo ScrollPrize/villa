@@ -102,7 +102,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Write tifxyz with channels and rollback | `tifxyz.hpp`: `tifxyz::write`, `WriteOptions`, `Channel` | `tifxyz/tifxyz.cpp` | `tifxyz.write` |
 | In-memory surface: bounds, retargeting to another level, positions, normals and tangents | `tifxyz.hpp`: `tifxyz::Surface` | `tifxyz/tifxyz.cpp` | `tifxyz.Surface` |
 | Bilinear or bicubic Hermite interpolation of a vertex grid, with normals and tangents | `grid.hpp`: `grid::Surface`, `resample`, `pointsAt`, `snapshot`, `Raster`, `Interpolation` | `grid/grid.cpp`, `grid/points.hpp` | `tifxyz.Surface.resample`, `.points_at` |
-| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
+| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `grid.sample_grid` (every request field); `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
 | Reduce layers to one value per pixel: mean, max, min, median, min-abs, alpha, Beer-Lambert | `composite.hpp`: `composite::reduce` | `composite/` | `_reader.composite_reduce` |
 | Render surface layers; project a label patch into CT | `aligned_reader.hpp`: `sources::SampleReader`, `SurfaceProjection` | `sources/surface_reader.cpp`, `projection/` | `SampleReader.render_surface`, `.project_surface`, `.iter_project_surface` |
 
@@ -158,6 +158,8 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | --- | --- | --- | --- |
 | Float to uint8/uint16 conversion, window/level, palette and overlay LUTs, ARGB blending | `display.hpp`: `display::toUint8`, `toUint16`, `windowLevelLut`, `paletteLut`, `overlayLut`, `applyLut`, `blend`, `blendArgb` | `display/` | `display_to_uint8`, `display_to_uint16`, `window_level_lut`, `palette_lut`, `overlay_lut`, `apply_lut`, `blend`, `blend_argb` |
 | Volumetric slab compositing, including perspective | `slab.hpp`: `display::compositeSlab`, `opacityLut`, `Slab` | `display/slab.cpp`, `display/slab_pixel.hpp` | `composite_slab`, `opacity_lut`, `SlabProjection` |
+| Views: the level for a zoom, fallback levels, a surface raster's pixels per voxel; progressive frames drawn from the caches with the reads they lacked | `grid.hpp`: `grid::levelForView`, `fallbackLevels`, `voxelExtent`, `pixelsPerVoxel`, `Frame`, `Pending`, `sampleCached`, `load` | `grid/view.cpp` | `grid.py`: `level_for_view`, `fallback_levels`, `pixels_per_voxel`, `Pending`, `sample_grid`, `sample_grid_cached`, `load`; levels from `ZarrReader.grid_level` |
+| The render engine from C or any language with a C FFI: volumes, surfaces, frames, progressive reads, composites, display tables | `vc_reader_c.h` (`vc_reader::c`, `libvc_reader_c`) | `c_api/c_api.cpp` | — |
 
 ### Transforms and training
 
@@ -1689,6 +1691,29 @@ CUDA backends. Python and C++ use the same implementations. Configure with
 See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
 array/cache configuration, transform pipelines and replay, device-buffer
 ownership, streams, and a complete CPU/CUDA CT-normal example.
+
+### C API
+
+`libvc_reader_c` (CMake target `vc_reader::c`, header `<vc_reader/vc_reader_c.h>`)
+exposes the render engine to C and to any language with a C FFI (Rust, C#, Swift,
+Go, Node, ctypes). It opens a volume's pyramid with its caches, chooses levels for a
+view, samples planes and vertex-grid or tifxyz surfaces with layers and composites,
+draws frames progressively (`vcr_sample_cached` now, `vcr_pending_load` on a worker,
+then draw again), and maps samples to display pixels. Handles are opaque, outputs go
+to caller buffers, every failure is a `vcr_status` with `vcr_last_error()`, and only
+`vcr_*` symbols are exported. A frontend's loop:
+
+```c
+vcr_request_init(&req); req.volume = volume;
+req.start_level = vcr_level_for_view(volume, zoom, 1.0f);
+req.fallback_levels = vcr_fallback_levels(volume, req.start_level, w, h, zoom, 5);
+vcr_sample_cached(&frame, &req, pending, &result);   /* draw result now */
+if (!vcr_pending_empty(pending))                      /* on a worker thread: */
+    vcr_pending_load(pending, redraw, ui);            /* then sample again */
+```
+
+`tests/c/test_c_api.c` builds as strict C99 and exercises each path, on the GPU too
+when one is available.
 
 ### Native catalog
 
