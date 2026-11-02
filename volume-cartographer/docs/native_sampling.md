@@ -6,8 +6,7 @@ through vc_reader. Each channel group's Zarr array is opened once with
 share one `vcr::MemoryCache`, whose size is the sampler's `maxCachedBytes`.
 Remote groups are cached on disk by vc_reader under the dataset's remote cache
 root, laid out by URL (`<root>/<scheme>/<bucket>/<path>`), so every tool and
-dataset using that root shares the cached chunks. Pooled prediction stores
-(`.native_pool.json`) are `vcr::computed` arrays.
+dataset using that root shares the cached chunks.
 
 Sampling reads the eight trilinear corners of each point with one
 `Array::read_points` call per channel and applies the Lasagna decoding in VC:

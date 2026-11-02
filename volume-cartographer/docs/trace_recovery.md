@@ -14,7 +14,6 @@ integration, not a new quality result or a prescribed experiment configuration.
 | Seed position/direction/width refinement | Recovered as optional native construction setting |
 | Normal-oriented path conflict filtering | Recovered into `FiberChunkFilter.cpp`, standalone and cache-load API |
 | Resident CUDA beam tracing and online fixed-plane refinement | Optional CUDA plugin; shared portable tensor/scoring primitives |
-| RAM-only top2 spatial-companion 2x prediction pooling | Native read-only Zarr view, explicit source channel mapping |
 | Generic evaluation | Existing callable `vc.fiber_evaluation` extended; native `replay-set` accepts `chunk-beam` |
 
 Historical parameter sweeps, model/checkpoint paths, cohort configurations,
@@ -126,26 +125,3 @@ The native C++ `benchmarkExport` option writes an explicit single-chunk fixture
 for the standalone CUDA benchmark. Use a distinct directory per chunk; it is
 not a shared export destination for concurrent builds. GPU execution is separate
 from the host-only refinement tests.
-
-## Native pooling views
-
-`openLasagnaChannelArray` recognizes `.native_pool.json` beside an output
-`.zarray`. Recipe revision 1, factor 2, mode `top2_spatial_comp` uses the original
-spatial-companion weighting, float widths and axial tensor direction/normal
-averaging. `source`, `source_level` and/or a `channels` mapping are explicit;
-channel paths may be relative to source. Compatibility default level is 1.
-Seven required channels: presence, nx, ny, width, sheet_nx, sheet_ny,
-sheet_grad_mag. Output width metadata must be `<f4`; other channels `|u1`.
-Output is raw, C-order, slash-separated chunks with half the source chunk size
-and ceiling-half shape. Source chunks must be even-sized and aligned.
-
-Views share a bounded 8 GiB RAM bundle cache and coalesce concurrent requests.
-No pooled chunk files or scratch files are written. Missing source data raises
-an error: readiness/inference belongs to the existing producer boundary.
-
-Eigen is portable. On supported Linux builds with LAPACK, the recovered rare
-degenerate/hemisphere-edge fallback uses DSYEVD. Without it, Eigen handles all
-cases. **Byte-identical pooling across these solver policies is not promised**;
-record the build/solver in prediction provenance when exporting or constructing
-path caches. Do not reuse one source identity for different numerical policies.
-macOS/arm64 runtime validation remains outstanding.

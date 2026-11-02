@@ -1,5 +1,4 @@
 #include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/PredictionPooling.hpp"
 
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
@@ -275,8 +274,6 @@ bool LasagnaDataset::hasNormalSource() const noexcept
 vcr::zarr::OpenedArray openLasagnaGroupArray(
     const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache)
 {
-    if (!group.isRemote() && std::filesystem::exists(group.zarrPath / ".native_pool.json"))
-        return openPooledPredictionArray(group.zarrPath, std::move(cache));
     if (!group.isRemote()) {
         vcr::zarr::OpenOptions options;
         options.memoryCache = std::move(cache);

@@ -53,9 +53,7 @@ private:
 };
 
 // A channel group's Zarr array opened through vc_reader, with `cache` as its
-// memory cache: a local array, the pooled view of a local prediction store
-// (.native_pool.json; see openPooledPredictionArray), or a remote array cached
-// under the group's remote cache root.
+// memory cache: a local array, or a remote array cached under the group's remote cache root.
 [[nodiscard]] vcr::zarr::OpenedArray openLasagnaGroupArray(
     const LasagnaChannelGroup& group, std::shared_ptr<vcr::MemoryCache> cache);
 
