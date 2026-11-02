@@ -85,12 +85,13 @@ struct LasagnaArrayCacheProgress {
 // Fetch every object of a remote group's Zarr array (an S3 listing of it)
 // through its read-through store, and copy its metadata beside the chunks, so
 // lasagnaChannelArrayCacheDirectory reads as a complete local directory Zarr
-// for readers that know nothing of the store. A marker there records the
-// objects; a later call that finds them all still cached fetches nothing, and
-// one that finds some evicted fetches those again. Returns false when
-// `cancelled` stops it; throws when an object cannot be listed, fetched or
-// kept (the cache's size limit can refuse chunks). `progress` is called from
-// worker threads.
+// for readers that know nothing of the store. The chunks are written outside
+// the cache budget's accounting, so its eviction cannot take them while this
+// process runs; a later startup scan accounts them as ordinary cached data. A
+// marker there records the objects; a later call that finds them all still
+// cached fetches nothing, and one that finds some evicted fetches those again.
+// Returns false when `cancelled` stops it; throws when an object cannot be
+// listed, fetched or kept. `progress` is called from worker threads.
 bool cacheLasagnaChannelArray(
     const LasagnaChannelGroup& group,
     const std::function<void(const LasagnaArrayCacheProgress&)>& progress = {},

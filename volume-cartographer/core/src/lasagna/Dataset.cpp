@@ -207,12 +207,16 @@ void resolveGroupLocations(
 class PersistentHttpStore final : public utils::Store {
 public:
     bool is_remote() const noexcept override { return true; }
+    // An unbudgeted store writes its chunks outside the cache budget's
+    // accounting, so its eviction cannot take them while this process runs;
+    // the next startup scan accounts them as ordinary cached data.
     PersistentHttpStore(std::string baseUrl,
                         std::filesystem::path cacheRoot,
                         vc::HttpAuth remoteAuth,
-                        bool discoverAwsCredentials)
+                        bool discoverAwsCredentials,
+                        bool budgeted = true)
         : cacheRoot_(std::move(cacheRoot)),
-          budget_(vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_))
+          budget_(budgeted ? vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_) : nullptr)
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
@@ -861,8 +865,9 @@ bool cacheLasagnaChannelArray(
         if (!cachedWhole(*directory, object)) missing.push_back(&object);
     if (marked && missing.empty()) return true;
 
+    // Unbudgeted: eviction must not take the array before it is read whole.
     PersistentHttpStore store(group.remoteZarrBaseUrl, group.remoteCacheRoot,
-                              group.remoteAuth, group.discoverAwsCredentials);
+                              group.remoteAuth, group.discoverAwsCredentials, false);
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
     std::atomic<bool> stop{false};
@@ -911,8 +916,7 @@ bool cacheLasagnaChannelArray(
     if (refused)
         throw std::runtime_error(
             "The remote cache kept " + std::to_string(missing.size() - refused) + " of " +
-            std::to_string(missing.size()) + " objects of " + directory->string() +
-            " (is its size limit too small?)");
+            std::to_string(missing.size()) + " objects of " + directory->string());
     if (!marked) {
         nlohmann::json listing = nlohmann::json::array();
         for (const auto& object : objects) listing.push_back({object.relative, object.size});

@@ -5,6 +5,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
 #include <nlohmann/json.hpp>
@@ -103,6 +104,35 @@ TEST_CASE("a remote Lasagna array is cached whole as a directory Zarr")
         group, [&](const vc::lasagna::LasagnaArrayCacheProgress& progress) { reported = progress.total; }));
     CHECK(reported == 1);
     CHECK(fs::is_regular_file(*directory / chunk));
+}
+
+TEST_CASE("a cached array is not evicted under the cache budget's pressure")
+{
+    using Budget = vc::render::PersistentZarrCacheBudget;
+    TempDir cache;
+    // No room at all: everything the budget accounts is evicted.
+    auto budget = Budget::configure(cache.path, {0, 0});
+    budget->waitForIdle();
+    vc::lasagna::LasagnaChannelGroup group;
+    group.name = "nx";
+    group.remoteZarrBaseUrl = kArtifactUrl;
+    group.remoteZarrKey = kArrayKey;
+    group.remoteCacheRoot = cache.path;
+    group.discoverAwsCredentials = false;
+    try {
+        REQUIRE(vc::lasagna::cacheLasagnaChannelArray(group));
+    } catch (const std::exception& error) {
+        Budget::resetRegistryForTesting();
+        if (requireNetwork()) FAIL(error.what());
+        MESSAGE("skipping, S3 unreachable: " << error.what());
+        return;
+    }
+    budget->waitForIdle();
+    std::size_t missing = 1;
+    REQUIRE(vc::lasagna::cacheLasagnaChannelArray(
+        group, [&](const vc::lasagna::LasagnaArrayCacheProgress& progress) { missing = progress.total; }));
+    CHECK(missing == 1);  // unchanged: nothing was missing, so nothing reported
+    Budget::resetRegistryForTesting();
 }
 
 TEST_CASE("caching stops when cancelled")
