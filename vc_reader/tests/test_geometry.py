@@ -8,7 +8,7 @@ from build_support import load_build
 load_build()
 
 from vc_reader import cuda, _reader
-from vc_reader.geometry import PolylineSet, VoxelSet, label_components, transform_points
+from vc_reader.geometry import PolylineSet, VoxelSet, fill_holes, label_components, transform_points
 
 
 def host(x):
@@ -369,6 +369,19 @@ def test_label_components_match_scipy(backend, connectivity, dims, structure):
             np.testing.assert_array_equal(host(labels), expected)
     with pytest.raises(ValueError, match='connectivity'):
         label_components(np.zeros((3,) * dims, bool), connectivity=26 if dims == 2 else 8)
+
+
+@pytest.mark.parametrize('connectivity,dims,structure', [(0,2,1),(8,2,2),(0,3,1),(18,3,2),(26,3,3)])
+def test_fill_holes_matches_scipy(backend, connectivity, dims, structure):
+    ndi = pytest.importorskip('scipy.ndimage')
+    rng = np.random.default_rng(connectivity + dims)
+    for trial in range(5):
+        shape = tuple(int(n) for n in rng.integers(1, 50 if dims == 3 else 300, dims))
+        mask = rng.random(shape) < (.4, .6, .75, .9, .5)[trial]
+        expected = ndi.binary_fill_holes(mask, structure=ndi.generate_binary_structure(dims, structure))
+        for threads in ((1, 0) if backend == 'cpu' else (0,)):
+            filled = fill_holes(upload(mask, backend), connectivity=connectivity, threads=threads)
+            np.testing.assert_array_equal(host(filled), expected)
 
 
 def test_pool_release_threshold():

@@ -225,4 +225,34 @@ std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, 
     });
     return count;
 }
+
+void fillHoles(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity,
+               std::uint8_t* filled, std::size_t threads) {
+    if (!connectivity) connectivity = shape.size() == 3 ? 6 : 4;
+    std::size_t n = 1; for (auto e : shape) n *= e;
+    if (!n) { label(mask, shape, connectivity, nullptr, threads); return; }  // validates shape and connectivity
+    if (!threads) threads = pool().size() + 1;
+    const std::size_t chunks = std::max<std::size_t>(1, std::min(threads, n / 65536 + 1));
+    const auto for_ranges = [&](const auto& fn) {
+        const auto each = [&](std::size_t c) { fn(n * c / chunks, n * (c + 1) / chunks); };
+        if (chunks == 1) each(0); else pool().parallel_for(chunks, each);
+    };
+    std::vector<std::uint8_t> background(n);
+    for_ranges([&](std::size_t a, std::size_t b) { for (auto i = a; i < b; ++i) background[i] = !mask[i]; });
+    std::vector<std::int32_t> labels(n);
+    const auto count = label(background.data(), shape, connectivity, labels.data(), threads);
+    // Background components with a voxel on the border are not holes.
+    std::vector<std::uint8_t> open(count + 1, 0);
+    const auto dim = shape.size();
+    const std::size_t nz = dim == 3 ? shape[0] : 1, ny = shape[dim - 2], nx = shape[dim - 1];
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        const auto* row = labels.data() + (z * ny + y) * nx;
+        if ((dim == 3 && (z == 0 || z + 1 == nz)) || y == 0 || y + 1 == ny) { for (std::size_t x = 0; x < nx; ++x) open[std::size_t(row[x])] = 1; }
+        else { open[std::size_t(row[0])] = 1; open[std::size_t(row[nx - 1])] = 1; }
+    }
+    open[0] = 1;  // foreground stays as it is
+    for_ranges([&](std::size_t a, std::size_t b) {
+        for (auto i = a; i < b; ++i) filled[i] = mask[i] || (labels[i] && !open[std::size_t(labels[i])]);
+    });
+}
 }

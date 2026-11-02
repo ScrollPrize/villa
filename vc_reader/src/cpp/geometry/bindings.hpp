@@ -174,5 +174,18 @@ inline void bind(nb::module_& m){
         });
         return count;
     },"mask"_a,"labels"_a,"connectivity"_a,"threads"_a=0);
+    m.def("_fill_holes",[](Array mask,Array filled,int connectivity,std::size_t threads){
+        if(mask.ndim()!=2&&mask.ndim()!=3)throw nb::value_error("fill_holes expects a 2D or 3D mask");
+        if(mask.dtype()!=nb::dtype<bool>()&&mask.dtype()!=nb::dtype<std::uint8_t>())throw nb::value_error("fill_holes mask must be bool or uint8");
+        const int id=array_device(mask);std::vector<std::size_t> shape;for(std::size_t a=0;a<mask.ndim();++a)shape.push_back(mask.shape(a));
+        check(filled,nb::dtype<bool>(),shape,id);
+        const auto* m=static_cast<const std::uint8_t*>(mask.data());auto* out=static_cast<std::uint8_t*>(filled.data());
+        execute(id,[&]{
+            if(id<0){components::fillHoles(m,shape,connectivity,out,threads);return;}
+#ifdef VC_READER_CUDA
+            components::cuda::fillHoles(m,shape,connectivity,out);
+#endif
+        });
+    },"mask"_a,"filled"_a,"connectivity"_a,"threads"_a=0);
 }
 }

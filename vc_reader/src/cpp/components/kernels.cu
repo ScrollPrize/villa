@@ -107,6 +107,21 @@ __global__ void number(int* labels, const int* ranks, long long n) {
     for (long long i = blockIdx.x * 256LL + threadIdx.x; i < n; i += 256LL * gridDim.x)
         labels[i] = labels[i] < 0 ? 0 : ranks[labels[i]];
 }
+__global__ void invert(const std::uint8_t* mask, std::uint8_t* background, long long n) {
+    for (long long i = blockIdx.x * 256LL + threadIdx.x; i < n; i += 256LL * gridDim.x) background[i] = !mask[i];
+}
+// Flags the background labels with a voxel on the array border.
+__global__ void mark_border(const int* labels, std::uint8_t* open, long long nz, long long ny, long long nx, bool three) {
+    const long long n = nz * ny * nx;
+    for (long long i = blockIdx.x * 256LL + threadIdx.x; i < n; i += 256LL * gridDim.x) {
+        const long long x = i % nx, y = i / nx % ny, z = i / (nx * ny);
+        if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || (three && (z == 0 || z + 1 == nz))) open[labels[i]] = 1;
+    }
+}
+__global__ void fill(const std::uint8_t* mask, const int* labels, const std::uint8_t* open, std::uint8_t* filled, long long n) {
+    for (long long i = blockIdx.x * 256LL + threadIdx.x; i < n; i += 256LL * gridDim.x)
+        filled[i] = mask[i] || (labels[i] && !open[labels[i]]);
+}
 unsigned blocks(long long n) { return unsigned(std::min<long long>((n + 255) / 256, 65535)); }
 }
 
@@ -144,5 +159,28 @@ std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, 
     device::check(cudaMemcpyAsync(&count, rank + (n - 1), sizeof(int), cudaMemcpyDeviceToHost, stream));
     device::complete();
     return std::size_t(count);
+}
+
+void fillHoles(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity, std::uint8_t* filled) {
+    if (!connectivity) connectivity = shape.size() == 3 ? 6 : 4;
+    std::size_t total = 1; for (auto e : shape) total *= e;
+    if (!total) { label(mask, shape, connectivity, nullptr); return; }  // validates shape and connectivity
+    const auto dim = shape.size();
+    const long long n = (long long)total, nz = dim == 3 ? (long long)shape[0] : 1, ny = (long long)shape[dim - 2], nx = (long long)shape[dim - 1];
+    int gpu = 0; device::check(cudaGetDevice(&gpu));
+    const auto stream = device::stream();
+    device::Buffer work(total * (1 + sizeof(int)), gpu);
+    auto* labels = static_cast<int*>(work.ptr);
+    auto* background = reinterpret_cast<std::uint8_t*>(labels + total);
+    invert<<<blocks(n), 256, 0, stream>>>(mask, background, n);
+    const auto count = label(background, shape, connectivity, labels);
+    device::Buffer flags(count + 1, gpu);
+    auto* open = static_cast<std::uint8_t*>(flags.ptr);
+    device::check(cudaMemsetAsync(open, 0, count + 1, stream));
+    device::check(cudaMemsetAsync(open, 1, 1, stream));  // foreground stays as it is
+    mark_border<<<blocks(n), 256, 0, stream>>>(labels, open, nz, ny, nx, dim == 3);
+    fill<<<blocks(n), 256, 0, stream>>>(mask, labels, open, filled, n);
+    device::check(cudaGetLastError());
+    device::complete();
 }
 }

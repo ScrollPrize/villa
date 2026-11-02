@@ -297,6 +297,27 @@ def label_components(mask, *, connectivity, threads=0, out=None):
     return result, count
 
 
+def fill_holes(mask, *, connectivity=0, threads=0, out=None):
+    """scipy.ndimage.binary_fill_holes of a 2D (Y, X) or 3D (Z, Y, X) mask.
+
+    Returns a bool mask: the input plus every background component not connected
+    to the array border. connectivity is the background's: 4 or 8 in 2D, 6, 18
+    or 26 in 3D; 0 is scipy's default structure (4 or 6). CUDA masks (bool or
+    uint8) give CUDA results; ``out`` may be the mask itself.
+    """
+    device = _device(mask)
+    if device >= 0:
+        mask = _cuda.wrap(mask)
+    else:
+        mask = np.asarray(mask)
+        if mask.dtype not in (np.bool_, np.uint8):
+            mask = mask != 0
+        mask = np.ascontiguousarray(mask)
+    result, filled = _output(out, mask.shape, np.bool_, device)
+    _reader._fill_holes(_array_view(mask), filled, int(connectivity), int(threads))
+    return result
+
+
 def rasterize_mesh_slice(vertices, triangles, labels, z, shape, *, vertex_normals=None, face_normals=None,
                          vertex_normal_flags=None, vertex_tangents=None, vertex_bitangents=None,
                          face_tangents=None, face_bitangents=None, vertex_tangent_flags=None):

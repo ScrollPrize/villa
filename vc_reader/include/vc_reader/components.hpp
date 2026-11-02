@@ -12,12 +12,21 @@ namespace vcr::components {
 // would exceed INT32_MAX.
 std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity,
                   std::int32_t* labels, std::size_t threads = 0);
+// scipy.ndimage.binary_fill_holes: `filled` is the mask plus every background
+// component not connected to the array border. `connectivity` is the background's
+// (4 or 8 in 2D, 6, 18 or 26 in 3D; 0 for scipy's default structure, 4 or 6).
+// mask and filled may alias. threads as for label.
+void fillHoles(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity,
+               std::uint8_t* filled, std::size_t threads = 0);
 #ifdef VC_READER_CUDA
 namespace cuda {
 // The same labels for device mask and label pointers, on the calling thread's
 // CUDA device and current vc_reader stream; returns once count is known.
 std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity,
                   std::int32_t* labels);
+// fillHoles for device mask and output pointers.
+void fillHoles(const std::uint8_t* mask, std::span<const std::size_t> shape, int connectivity,
+               std::uint8_t* filled);
 }
 #endif
 }
