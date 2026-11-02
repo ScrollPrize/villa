@@ -11,25 +11,18 @@ from itertools import repeat, product
 from vc_reader.reader import ZarrWriter, create_group, open_zarr
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing
-from numba import jit, set_num_threads
 import sys
 import argparse
 from tqdm import tqdm  # Progress bar
 
-from vesuvius.image_proc.mesh.affine import (
-    axis_perm,
-    load_transform_from_json,
-    compute_inv_transpose,
-    apply_affine_to_points,
-    transform_normals,
-)
+from vc_reader.affine import Affine
+from vc_reader.geometry import transform_points, rasterize_mesh_slice
 
 # Determine default number of workers: half of CPU count (at least 1)
 default_workers = max(1, multiprocessing.cpu_count() // 2)
 
 # We no longer need normals for expansion, but we still need to find
 # intersections of triangles with the z-plane.
-MAX_INTERSECTIONS = 3  # Maximum number of intersections per triangle
 PYRAMID_LEVELS = 6
 
 # Global store used to share immutable mesh data with forked worker processes
@@ -379,494 +372,6 @@ def _rechunk(zarr_array, chunk_size, desc, num_workers):
     return ZarrWriter.open(path, auth=None)
 
 
-@jit(nopython=True)
-def get_intersection_point_2d(start, end, z_plane):
-    """
-    Given two 3D vertices start/end, returns the 2D intersection (x,y)
-    on the plane z = z_plane, if it exists. Otherwise returns None.
-    """
-    z_s = start[2]
-    z_e = end[2]
-
-    # Check if one of the vertices is exactly on the plane
-    if abs(z_s - z_plane) < 1e-8:
-        return start[:2]
-    if abs(z_e - z_plane) < 1e-8:
-        return end[:2]
-
-    # If neither vertex is on the plane, check if we can intersect
-    denom = (z_e - z_s)
-    if abs(denom) < 1e-15:
-        return None  # Parallel or effectively so
-
-    t = (z_plane - z_s) / denom
-    # Only treat intersection if t is in [0,1], with slight relax
-    if not (0.0 - 1e-3 <= t <= 1.0 + 1e-3):
-        return None
-
-    # Compute intersection in xy
-    x = start[0] + t * (end[0] - start[0])
-    y = start[1] + t * (end[1] - start[1])
-    return np.array([x, y], dtype=np.float32)
-
-
-@jit(nopython=True)
-def rasterize_line_label(x0, y0, x1, y1, w, h, label_img, mesh_label):
-    """
-    Simple line rasterization in label_img with the integer mesh label.
-    Uses a basic DDA approach.
-    """
-    dx = x1 - x0
-    dy = y1 - y0
-
-    steps = int(max(abs(dx), abs(dy)))  # Use the larger magnitude as steps
-    if steps == 0:
-        # Single point (start == end)
-        ix = int(round(x0))
-        iy = int(round(y0))
-        if 0 <= ix < w and 0 <= iy < h:
-            label_img[iy, ix] = mesh_label
-        return
-
-    x_inc = dx / steps
-    y_inc = dy / steps
-    x_f = x0
-    y_f = y0
-
-    for i in range(steps + 1):
-        ix = int(round(x_f))
-        iy = int(round(y_f))
-        if 0 <= ix < w and 0 <= iy < h:
-            label_img[iy, ix] = mesh_label
-        x_f += x_inc
-        y_f += y_inc
-
-
-@jit(nopython=True)
-def process_slice_points_label(vertices, triangles, mesh_labels, zslice, w, h):
-    """
-    For the plane z=zslice, find the intersection lines of each triangle
-    and draw them into a 2D array (label_img) using the triangle's mesh label.
-    """
-    label_img = np.zeros((h, w), dtype=np.uint16)
-
-    for i in range(len(triangles)):
-        tri = triangles[i]
-        label = mesh_labels[i]
-        v0 = vertices[tri[0]]
-        v1 = vertices[tri[1]]
-        v2 = vertices[tri[2]]
-
-        # Quick check if the z-range of the triangle might intersect zslice
-        z_min = min(v0[2], v1[2], v2[2])
-        z_max = max(v0[2], v1[2], v2[2])
-        if not (z_min <= zslice <= z_max):
-            continue
-
-        # Find up to three intersection points
-        pts_2d = []
-        # Each edge
-        for (a, b) in [(v0, v1), (v1, v2), (v2, v0)]:
-            p = get_intersection_point_2d(a, b, zslice)
-            if p is not None:
-                # Check for duplicates in pts_2d
-                is_dup = False
-                for pp in pts_2d:
-                    dist2 = (p[0] - pp[0]) ** 2 + (p[1] - pp[1]) ** 2
-                    if dist2 < 1e-12:
-                        is_dup = True
-                        break
-                if not is_dup:
-                    pts_2d.append(p)
-
-        # If we have at least two unique intersection points, draw lines
-        n_inter = len(pts_2d)
-        if n_inter >= 2:
-            # Typically you expect 2 intersection points, but we’ll connect all pairs
-            for ii in range(n_inter):
-                for jj in range(ii + 1, n_inter):
-                    x0, y0 = pts_2d[ii]
-                    x1, y1 = pts_2d[jj]
-                    rasterize_line_label(x0, y0, x1, y1, w, h, label_img, label)
-
-    return label_img
-
-
-@jit(nopython=True)
-def rasterize_line_surface(x0, y0, x1, y1, bary0, bary1, w, h,
-                           label_img, mesh_label,
-                           include_normals, include_surface_frame,
-                           normal_sums, normal_counts,
-                           tri_vertex_normals,
-                           tangent_sums, bitangent_sums,
-                           tri_vertex_tangents, tri_vertex_bitangents):
-    dx = x1 - x0
-    dy = y1 - y0
-
-    steps = int(max(abs(dx), abs(dy)))
-    if steps == 0:
-        ix = int(round(x0))
-        iy = int(round(y0))
-        if 0 <= ix < w and 0 <= iy < h:
-            label_img[iy, ix] = mesh_label
-            if include_normals or include_surface_frame:
-                w0 = bary0[0]
-                w1 = bary0[1]
-                w2 = bary0[2]
-                nx = (w0 * tri_vertex_normals[0, 0] +
-                      w1 * tri_vertex_normals[1, 0] +
-                      w2 * tri_vertex_normals[2, 0])
-                ny = (w0 * tri_vertex_normals[0, 1] +
-                      w1 * tri_vertex_normals[1, 1] +
-                      w2 * tri_vertex_normals[2, 1])
-                nz = (w0 * tri_vertex_normals[0, 2] +
-                      w1 * tri_vertex_normals[1, 2] +
-                      w2 * tri_vertex_normals[2, 2])
-                normal_sums[iy, ix, 0] += nx
-                normal_sums[iy, ix, 1] += ny
-                normal_sums[iy, ix, 2] += nz
-                if include_surface_frame:
-                    tx = (w0 * tri_vertex_tangents[0, 0] +
-                          w1 * tri_vertex_tangents[1, 0] +
-                          w2 * tri_vertex_tangents[2, 0])
-                    ty = (w0 * tri_vertex_tangents[0, 1] +
-                          w1 * tri_vertex_tangents[1, 1] +
-                          w2 * tri_vertex_tangents[2, 1])
-                    tz = (w0 * tri_vertex_tangents[0, 2] +
-                          w1 * tri_vertex_tangents[1, 2] +
-                          w2 * tri_vertex_tangents[2, 2])
-                    bx = (w0 * tri_vertex_bitangents[0, 0] +
-                          w1 * tri_vertex_bitangents[1, 0] +
-                          w2 * tri_vertex_bitangents[2, 0])
-                    by = (w0 * tri_vertex_bitangents[0, 1] +
-                          w1 * tri_vertex_bitangents[1, 1] +
-                          w2 * tri_vertex_bitangents[2, 1])
-                    bz = (w0 * tri_vertex_bitangents[0, 2] +
-                          w1 * tri_vertex_bitangents[1, 2] +
-                          w2 * tri_vertex_bitangents[2, 2])
-                    tangent_sums[iy, ix, 0] += tx
-                    tangent_sums[iy, ix, 1] += ty
-                    tangent_sums[iy, ix, 2] += tz
-                    bitangent_sums[iy, ix, 0] += bx
-                    bitangent_sums[iy, ix, 1] += by
-                    bitangent_sums[iy, ix, 2] += bz
-                normal_counts[iy, ix] += 1
-        return
-
-    x_inc = dx / steps
-    y_inc = dy / steps
-    x_f = x0
-    y_f = y0
-
-    for i in range(steps + 1):
-        ix = int(round(x_f))
-        iy = int(round(y_f))
-        if 0 <= ix < w and 0 <= iy < h:
-            label_img[iy, ix] = mesh_label
-            if include_normals or include_surface_frame:
-                alpha = i / steps
-                w0 = bary0[0] * (1.0 - alpha) + bary1[0] * alpha
-                w1 = bary0[1] * (1.0 - alpha) + bary1[1] * alpha
-                w2 = bary0[2] * (1.0 - alpha) + bary1[2] * alpha
-                nx = (w0 * tri_vertex_normals[0, 0] +
-                      w1 * tri_vertex_normals[1, 0] +
-                      w2 * tri_vertex_normals[2, 0])
-                ny = (w0 * tri_vertex_normals[0, 1] +
-                      w1 * tri_vertex_normals[1, 1] +
-                      w2 * tri_vertex_normals[2, 1])
-                nz = (w0 * tri_vertex_normals[0, 2] +
-                      w1 * tri_vertex_normals[1, 2] +
-                      w2 * tri_vertex_normals[2, 2])
-                normal_sums[iy, ix, 0] += nx
-                normal_sums[iy, ix, 1] += ny
-                normal_sums[iy, ix, 2] += nz
-                if include_surface_frame:
-                    tx = (w0 * tri_vertex_tangents[0, 0] +
-                          w1 * tri_vertex_tangents[1, 0] +
-                          w2 * tri_vertex_tangents[2, 0])
-                    ty = (w0 * tri_vertex_tangents[0, 1] +
-                          w1 * tri_vertex_tangents[1, 1] +
-                          w2 * tri_vertex_tangents[2, 1])
-                    tz = (w0 * tri_vertex_tangents[0, 2] +
-                          w1 * tri_vertex_tangents[1, 2] +
-                          w2 * tri_vertex_tangents[2, 2])
-                    bx = (w0 * tri_vertex_bitangents[0, 0] +
-                          w1 * tri_vertex_bitangents[1, 0] +
-                          w2 * tri_vertex_bitangents[2, 0])
-                    by = (w0 * tri_vertex_bitangents[0, 1] +
-                          w1 * tri_vertex_bitangents[1, 1] +
-                          w2 * tri_vertex_bitangents[2, 1])
-                    bz = (w0 * tri_vertex_bitangents[0, 2] +
-                          w1 * tri_vertex_bitangents[1, 2] +
-                          w2 * tri_vertex_bitangents[2, 2])
-                    tangent_sums[iy, ix, 0] += tx
-                    tangent_sums[iy, ix, 1] += ty
-                    tangent_sums[iy, ix, 2] += tz
-                    bitangent_sums[iy, ix, 0] += bx
-                    bitangent_sums[iy, ix, 1] += by
-                    bitangent_sums[iy, ix, 2] += bz
-                normal_counts[iy, ix] += 1
-        x_f += x_inc
-        y_f += y_inc
-
-
-@jit(nopython=True)
-def process_slice_points_label_surface(vertices, triangles, mesh_labels,
-                                       vertex_normals, triangle_normals,
-                                       triangle_use_vertex_normals,
-                                       vertex_tangents, vertex_bitangents,
-                                       triangle_tangents, triangle_bitangents,
-                                       triangle_use_vertex_tangents,
-                                       include_normals, include_surface_frame,
-                                       zslice, w, h):
-    label_img = np.zeros((h, w), dtype=np.uint16)
-    normal_sums = np.zeros((h, w, 3), dtype=np.float32)
-    normal_counts = np.zeros((h, w), dtype=np.uint16)
-
-    if include_surface_frame:
-        tangent_sums = np.zeros((h, w, 3), dtype=np.float32)
-        bitangent_sums = np.zeros((h, w, 3), dtype=np.float32)
-    else:
-        tangent_sums = np.zeros((1, 1, 3), dtype=np.float32)
-        bitangent_sums = np.zeros((1, 1, 3), dtype=np.float32)
-
-    for i in range(len(triangles)):
-        tri = triangles[i]
-        label = mesh_labels[i]
-
-        idx0 = tri[0]
-        idx1 = tri[1]
-        idx2 = tri[2]
-        v0 = vertices[idx0]
-        v1 = vertices[idx1]
-        v2 = vertices[idx2]
-
-        z_min = min(v0[2], v1[2], v2[2])
-        z_max = max(v0[2], v1[2], v2[2])
-        if not (z_min <= zslice <= z_max):
-            continue
-
-        pts_2d = np.zeros((MAX_INTERSECTIONS, 2), dtype=np.float32)
-        bary_pts = np.zeros((MAX_INTERSECTIONS, 3), dtype=np.float32)
-        n_inter = 0
-
-        tri_vertices = (idx0, idx1, idx2)
-
-        for edge_idx in range(3):
-            a_idx = tri_vertices[edge_idx]
-            b_idx = tri_vertices[(edge_idx + 1) % 3]
-            a = vertices[a_idx]
-            b = vertices[b_idx]
-
-            z_a = a[2]
-            z_b = b[2]
-
-            if abs(z_a - zslice) < 1e-8:
-                p_x = a[0]
-                p_y = a[1]
-                bary = np.zeros(3, dtype=np.float32)
-                bary[edge_idx] = 1.0
-            elif abs(z_b - zslice) < 1e-8:
-                p_x = b[0]
-                p_y = b[1]
-                bary = np.zeros(3, dtype=np.float32)
-                bary[(edge_idx + 1) % 3] = 1.0
-            else:
-                denom = z_b - z_a
-                if abs(denom) < 1e-15:
-                    continue
-                t = (zslice - z_a) / denom
-                if not (-1e-3 <= t <= 1.0 + 1e-3):
-                    continue
-                p_x = a[0] + t * (b[0] - a[0])
-                p_y = a[1] + t * (b[1] - a[1])
-                bary = np.zeros(3, dtype=np.float32)
-                idx_a_local = -1
-                idx_b_local = -1
-                for k in range(3):
-                    if tri_vertices[k] == a_idx:
-                        idx_a_local = k
-                    if tri_vertices[k] == b_idx:
-                        idx_b_local = k
-                if idx_a_local == -1 or idx_b_local == -1:
-                    continue
-                bary[idx_a_local] = 1.0 - t
-                bary[idx_b_local] = t
-
-            is_dup = False
-            for prev in range(n_inter):
-                dx = p_x - pts_2d[prev, 0]
-                dy = p_y - pts_2d[prev, 1]
-                if dx * dx + dy * dy < 1e-12:
-                    is_dup = True
-                    break
-
-            if not is_dup and n_inter < MAX_INTERSECTIONS:
-                pts_2d[n_inter, 0] = p_x
-                pts_2d[n_inter, 1] = p_y
-                bary_pts[n_inter, 0] = bary[0]
-                bary_pts[n_inter, 1] = bary[1]
-                bary_pts[n_inter, 2] = bary[2]
-                n_inter += 1
-
-        if n_inter >= 2:
-            tri_vertex_normals = np.zeros((3, 3), dtype=np.float32)
-            if triangle_use_vertex_normals[i]:
-                tri_vertex_normals[0, 0] = vertex_normals[idx0, 0]
-                tri_vertex_normals[0, 1] = vertex_normals[idx0, 1]
-                tri_vertex_normals[0, 2] = vertex_normals[idx0, 2]
-                tri_vertex_normals[1, 0] = vertex_normals[idx1, 0]
-                tri_vertex_normals[1, 1] = vertex_normals[idx1, 1]
-                tri_vertex_normals[1, 2] = vertex_normals[idx1, 2]
-                tri_vertex_normals[2, 0] = vertex_normals[idx2, 0]
-                tri_vertex_normals[2, 1] = vertex_normals[idx2, 1]
-                tri_vertex_normals[2, 2] = vertex_normals[idx2, 2]
-            else:
-                tri_norm = triangle_normals[i]
-                tri_vertex_normals[0, 0] = tri_norm[0]
-                tri_vertex_normals[0, 1] = tri_norm[1]
-                tri_vertex_normals[0, 2] = tri_norm[2]
-                tri_vertex_normals[1, 0] = tri_norm[0]
-                tri_vertex_normals[1, 1] = tri_norm[1]
-                tri_vertex_normals[1, 2] = tri_norm[2]
-                tri_vertex_normals[2, 0] = tri_norm[0]
-                tri_vertex_normals[2, 1] = tri_norm[1]
-                tri_vertex_normals[2, 2] = tri_norm[2]
-
-            tri_vertex_tangents = np.zeros((3, 3), dtype=np.float32)
-            tri_vertex_bitangents = np.zeros((3, 3), dtype=np.float32)
-            if include_surface_frame:
-                if triangle_use_vertex_tangents[i]:
-                    tri_vertex_tangents[0, 0] = vertex_tangents[idx0, 0]
-                    tri_vertex_tangents[0, 1] = vertex_tangents[idx0, 1]
-                    tri_vertex_tangents[0, 2] = vertex_tangents[idx0, 2]
-                    tri_vertex_tangents[1, 0] = vertex_tangents[idx1, 0]
-                    tri_vertex_tangents[1, 1] = vertex_tangents[idx1, 1]
-                    tri_vertex_tangents[1, 2] = vertex_tangents[idx1, 2]
-                    tri_vertex_tangents[2, 0] = vertex_tangents[idx2, 0]
-                    tri_vertex_tangents[2, 1] = vertex_tangents[idx2, 1]
-                    tri_vertex_tangents[2, 2] = vertex_tangents[idx2, 2]
-
-                    tri_vertex_bitangents[0, 0] = vertex_bitangents[idx0, 0]
-                    tri_vertex_bitangents[0, 1] = vertex_bitangents[idx0, 1]
-                    tri_vertex_bitangents[0, 2] = vertex_bitangents[idx0, 2]
-                    tri_vertex_bitangents[1, 0] = vertex_bitangents[idx1, 0]
-                    tri_vertex_bitangents[1, 1] = vertex_bitangents[idx1, 1]
-                    tri_vertex_bitangents[1, 2] = vertex_bitangents[idx1, 2]
-                    tri_vertex_bitangents[2, 0] = vertex_bitangents[idx2, 0]
-                    tri_vertex_bitangents[2, 1] = vertex_bitangents[idx2, 1]
-                    tri_vertex_bitangents[2, 2] = vertex_bitangents[idx2, 2]
-                else:
-                    tri_tan = triangle_tangents[i]
-                    tri_bit = triangle_bitangents[i]
-                    for k in range(3):
-                        tri_vertex_tangents[k, 0] = tri_tan[0]
-                        tri_vertex_tangents[k, 1] = tri_tan[1]
-                        tri_vertex_tangents[k, 2] = tri_tan[2]
-                        tri_vertex_bitangents[k, 0] = tri_bit[0]
-                        tri_vertex_bitangents[k, 1] = tri_bit[1]
-                        tri_vertex_bitangents[k, 2] = tri_bit[2]
-
-            for ii in range(n_inter):
-                for jj in range(ii + 1, n_inter):
-                    x0 = pts_2d[ii, 0]
-                    y0 = pts_2d[ii, 1]
-                    x1 = pts_2d[jj, 0]
-                    y1 = pts_2d[jj, 1]
-                    bary0 = bary_pts[ii]
-                    bary1 = bary_pts[jj]
-                    rasterize_line_surface(
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        bary0,
-                        bary1,
-                        w,
-                        h,
-                        label_img,
-                        label,
-                        include_normals,
-                        include_surface_frame,
-                        normal_sums,
-                        normal_counts,
-                        tri_vertex_normals,
-                        tangent_sums,
-                        bitangent_sums,
-                        tri_vertex_tangents,
-                        tri_vertex_bitangents,
-                    )
-
-    normals_img = np.zeros((h, w, 3), dtype=np.float32)
-    frame_img = np.zeros((h, w, 3, 3), dtype=np.float32)
-
-    for y in range(h):
-        for x in range(w):
-            count = normal_counts[y, x]
-            if count > 0:
-                nx = normal_sums[y, x, 0] / count
-                ny = normal_sums[y, x, 1] / count
-                nz = normal_sums[y, x, 2] / count
-                length = np.sqrt(nx * nx + ny * ny + nz * nz)
-                if length <= 1e-12:
-                    raise ValueError("Normal magnitude collapsed during slice rasterization.")
-                nx /= length
-                ny /= length
-                nz /= length
-                normals_img[y, x, 0] = nx
-                normals_img[y, x, 1] = ny
-                normals_img[y, x, 2] = nz
-
-                if include_surface_frame:
-                    tx = tangent_sums[y, x, 0] / count
-                    ty = tangent_sums[y, x, 1] / count
-                    tz = tangent_sums[y, x, 2] / count
-                    t_dot_n = nx * tx + ny * ty + nz * tz
-                    tx -= nx * t_dot_n
-                    ty -= ny * t_dot_n
-                    tz -= nz * t_dot_n
-                    t_len = np.sqrt(tx * tx + ty * ty + tz * tz)
-                    if t_len <= 1e-12:
-                        raise ValueError("Tangent magnitude collapsed during slice rasterization.")
-                    tx /= t_len
-                    ty /= t_len
-                    tz /= t_len
-
-                    bx = bitangent_sums[y, x, 0] / count
-                    by = bitangent_sums[y, x, 1] / count
-                    bz = bitangent_sums[y, x, 2] / count
-                    bx_t = ny * tz - nz * ty
-                    by_t = nz * tx - nx * tz
-                    bz_t = nx * ty - ny * tx
-                    dot_sign = bx * bx_t + by * by_t + bz * bz_t
-                    if dot_sign < 0.0:
-                        bx_t *= -1.0
-                        by_t *= -1.0
-                        bz_t *= -1.0
-                    b_len = np.sqrt(bx_t * bx_t + by_t * by_t + bz_t * bz_t)
-                    if b_len <= 1e-12:
-                        raise ValueError("Bitangent magnitude collapsed during slice rasterization.")
-                    bx_t /= b_len
-                    by_t /= b_len
-                    bz_t /= b_len
-
-                    frame_img[y, x, 0, 0] = tx
-                    frame_img[y, x, 0, 1] = ty
-                    frame_img[y, x, 0, 2] = tz
-                    frame_img[y, x, 1, 0] = bx_t
-                    frame_img[y, x, 1, 1] = by_t
-                    frame_img[y, x, 1, 2] = bz_t
-                    frame_img[y, x, 2, 0] = nx
-                    frame_img[y, x, 2, 1] = ny
-                    frame_img[y, x, 2, 2] = nz
-            else:
-                normals_img[y, x, 0] = 0.0
-                normals_img[y, x, 1] = 0.0
-                normals_img[y, x, 2] = 0.0
-
-    return label_img, normals_img, frame_img
-
-
 def downsample_2x(array, axes):
     """Downsample array by a factor of 2 along the provided axes."""
     ndim = array.ndim
@@ -905,9 +410,8 @@ def process_mesh(
     triangles = np.asarray(mesh.faces, dtype=np.int32)
 
     if transform_info is not None:
-        vertices = apply_affine_to_points(
-            vertices, transform_info["matrix"], transform_info["perm"]
-        ).astype(np.float32, copy=False)
+        perm = transform_info["perm"]
+        vertices = transform_points(vertices[:, perm], transform_info["matrix"])[:, np.argsort(perm)]
 
     # Every triangle in this mesh gets the same label: mesh_index+1
     labels = np.full(len(triangles), mesh_index + 1, dtype=label_dtype)
@@ -923,15 +427,13 @@ def process_mesh(
         triangle_normals = np.asarray(mesh.face_normals, dtype=np.float32)
 
         if transform_info is not None:
-            linear = transform_info["matrix"][:3, :3]
             perm = transform_info["perm"]
-            inv_transpose = transform_info.get("inv_transpose")
-            vertex_normals = transform_normals(
-                vertex_normals, linear, perm=perm, inv_transpose=inv_transpose
-            ).astype(np.float32, copy=False)
-            triangle_normals = transform_normals(
-                triangle_normals, linear, perm=perm, inv_transpose=inv_transpose
-            ).astype(np.float32, copy=False)
+            inverse_order = np.argsort(perm)
+            normal_matrix = transform_info["normal_matrix"]
+            vertex_normals = transform_points(vertex_normals[:, perm], normal_matrix,
+                                              vectors=True, normalize=True)[:, inverse_order]
+            triangle_normals = transform_points(triangle_normals[:, perm], normal_matrix,
+                                                vectors=True, normalize=True)[:, inverse_order]
 
         if vertex_normals.shape[0] != len(vertices):
             raise ValueError("Unable to compute vertex normals required for surface processing.")
@@ -1084,29 +586,15 @@ def process_slice(args):
         triangle_use_vertex_tangents,
     ) = args
 
+    attributes = {}
     if include_normals or include_surface_frame:
-        img_label, normals_img, frame_img = process_slice_points_label_surface(
-            vertices,
-            triangles,
-            labels,
-            vertex_normals,
-            triangle_normals,
-            triangle_use_vertex_normals,
-            vertex_tangents,
-            vertex_bitangents,
-            triangle_tangents,
-            triangle_bitangents,
-            triangle_use_vertex_tangents,
-            include_normals,
-            include_surface_frame,
-            zslice,
-            w,
-            h,
-        )
-    else:
-        img_label = process_slice_points_label(vertices, triangles, labels, zslice, w, h)
-        normals_img = np.zeros((0, 0, 0), dtype=np.float32)
-        frame_img = np.zeros((0, 0, 0, 0), dtype=np.float32)
+        attributes.update(vertex_normals=vertex_normals, face_normals=triangle_normals,
+                          vertex_normal_flags=triangle_use_vertex_normals)
+    if include_surface_frame:
+        attributes.update(vertex_tangents=vertex_tangents, vertex_bitangents=vertex_bitangents,
+                          face_tangents=triangle_tangents, face_bitangents=triangle_bitangents,
+                          vertex_tangent_flags=triangle_use_vertex_tangents)
+    img_label, normals_img, frame_img = rasterize_mesh_slice(vertices, triangles, labels, zslice, (h, w), **attributes)
 
     return zslice, img_label, normals_img, frame_img
 
@@ -1197,33 +685,34 @@ def main():
             print(f"ERROR: transform file '{transform_path}' does not exist.")
             sys.exit(1)
         try:
-            transform_matrix = load_transform_from_json(transform_path)
+            transform = Affine.load_transform_json(str(transform_path), allow_singular=True)
         except Exception as exc:
             print(f"ERROR: failed to load transform: {exc}")
             sys.exit(1)
 
         if args.transform_invert:
             try:
-                transform_matrix = np.linalg.inv(transform_matrix)
+                transform = transform.inverse()
                 print("Applying inverse of provided affine (--transform-invert).")
-            except np.linalg.LinAlgError:
+            except ValueError:
                 print("ERROR: Provided affine transform is non-invertible.")
                 sys.exit(1)
 
         try:
-            perm, _ = axis_perm(args.transform_axis_order)
+            order = args.transform_axis_order.lower()
+            if sorted(order) != ["x", "y", "z"]:
+                raise ValueError("Transform axis order must be a permutation of xyz")
+            perm = tuple("xyz".index(c) for c in order)
         except ValueError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)
 
-        linear_part = transform_matrix[:3, :3]
-        inv_transpose = compute_inv_transpose(linear_part)
-
+        normal_transform = transform.normal_transform() if transform.determinant != 0 else transform
         transform_info = {
-            "matrix": transform_matrix,
+            "matrix": np.asarray(transform.matrix, dtype=np.float32),
+            "normal_matrix": np.asarray(normal_transform.matrix, dtype=np.float32),
             "perm": perm,
             "axis_order": args.transform_axis_order,
-            "inv_transpose": inv_transpose,
         }
 
         print(f"Loaded affine transform from {transform_path}")
@@ -1252,7 +741,6 @@ def main():
     # Use the provided number of worker processes.
     N_PROCESSES = args.num_workers
     print(f"Using {N_PROCESSES} worker processes")
-    set_num_threads(N_PROCESSES)
 
     # Folder where OBJ meshes are located.
     folder_path = args.folder

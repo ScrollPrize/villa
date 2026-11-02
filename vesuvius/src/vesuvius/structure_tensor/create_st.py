@@ -12,11 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
 from vesuvius.models.run.inference import Inferer
-from vesuvius.image_proc.geometry.structure_tensor import (
-    StructureTensorComputer,
-    _get_gaussian_kernel_3d,
-    _get_pavel_kernels_3d,
-)
+from vc_reader.torch import structure_tensor
 from ._compile_utils import _maybe_compile_function
 from .vf_format import zarr_codec
 
@@ -95,33 +91,10 @@ class StructureTensorInferer(Inferer, nn.Module):
             if self.verbose:
                 print(f"Inferred patch_size {self.patch_size} from input Zarr chunking")
 
-        self._st_computer = StructureTensorComputer(
-            sigma=self.sigma,
-            component_sigma=None,
-            smooth_components=self.smooth_components,
-            device=self.device,
-        )
-
-        dev = torch.device(self.device)
-        dtype = torch.float32
-
-        if self.sigma > 0:
-            _, radius = _get_gaussian_kernel_3d(dev, dtype, self.sigma)
-            self._pad = radius
-        else:
-            self._pad = 0
-
-        kz, ky, kx = _get_pavel_kernels_3d(dev, dtype)
-        pad_pz = kz.shape[2] // 2
-        pad_py = ky.shape[3] // 2
-        pad_px = kx.shape[4] // 2
-
-        extra = self._pad if (self.sigma > 0 and self.smooth_components) else 0
-        self._total_pad = (
-            self._pad + pad_pz + extra,
-            self._pad + pad_py + extra,
-            self._pad + pad_px + extra,
-        )
+        # Pavel derivatives have radius four; each Gaussian uses int(3*sigma).
+        self._pad = int(3 * self.sigma) if self.sigma > 0 else 0
+        halo = 4 + self._pad * (2 if self.smooth_components else 1)
+        self._total_pad = (halo, halo, halo)
         
     def _load_model(self):
         """
@@ -220,16 +193,8 @@ class StructureTensorInferer(Inferer, nn.Module):
         target_device = torch.device(self.device)
         if target_device.type == "cuda" and not torch.cuda.is_available():
             target_device = torch.device("cpu")
-        self._st_computer.device = target_device
-        component_sigma = sigma_val if self.smooth_components else None
-        return self._st_computer.compute(
-            x,
-            sigma=sigma_val,
-            component_sigma=component_sigma,
-            device=target_device,
-            smooth_components=self.smooth_components,
-            spatial_dims=3,
-        )
+        return structure_tensor(x.to(device=target_device, dtype=torch.float32), sigma=sigma_val,
+                                rho=sigma_val if self.smooth_components else 0.0)
 
     def _run_inference(self):
         """

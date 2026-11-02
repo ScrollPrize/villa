@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 from vesuvius.utils.utils import pad_or_crop_3d
 from .find_valid_patches import find_valid_patches
 from .intensity_properties import initialize_intensity_properties
-from ..training.normalization import get_normalization
+import vc_reader.transforms as A
 from ..augmentation.pipelines import create_training_transforms, sample_seed
 
 
@@ -343,7 +343,23 @@ class MutexAffinityDataset(Dataset):
                     mgr=self.mgr,
                 )
 
-        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        scheme = self.normalization_scheme
+        if scheme == "ct":
+            props = self.intensity_properties
+            required = ("mean", "std", "percentile_00_5", "percentile_99_5")
+            if not props or any(key not in props for key in required):
+                raise ValueError("CT normalization requires mean, std and percentile bounds")
+            op = A.Normalize("fixed", center=float(props["mean"]), scale=max(float(props["std"]), 1e-8),
+                             bounds=(float(props["percentile_00_5"]), float(props["percentile_99_5"])))
+        elif scheme == "zscore":
+            op = A.Normalize("zscore", nonzero=False, eps=1e-8)
+        elif scheme in ("minmax", "rescale_to_01", "robust"):
+            op = A.Normalize("minmax" if scheme == "rescale_to_01" else scheme)
+        elif scheme == "none":
+            op = None
+        else:
+            raise ValueError(f"Unknown normalization scheme: {scheme}")
+        self.normalizer = A.Pipeline([op], backend="cpu") if op is not None else None
 
     def _build_patch_index(self) -> None:
         """Build the index of valid patches."""
@@ -477,8 +493,11 @@ class MutexAffinityDataset(Dataset):
 
         # Extract image
         image_data = image_handle.read_window(start, size)
-        if self.normalizer is not None:
-            image_data = self.normalizer(image_data)
+        if self.normalizer is not None and image_data.size:
+            normalized = self.normalizer(
+                {"image": np.asarray(image_data, dtype=np.float32).reshape(1, 1, -1)}, seed=0
+            )["image"]
+            image_data = normalized.reshape(image_data.shape)
         if self.is_2d:
             from vesuvius.utils.utils import pad_or_crop_2d
             image_data = pad_or_crop_2d(image_data.astype(np.float32), size)

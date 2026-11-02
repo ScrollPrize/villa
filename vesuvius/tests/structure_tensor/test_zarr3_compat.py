@@ -36,7 +36,7 @@ def test_zarr_codec_names():
 
 
 def test_voxelize_rechunk_keeps_values_and_attributes(tmp_path):
-    from vesuvius.image_proc.run.voxelize_objs import _rechunk
+    from vesuvius.label_processing.voxelize_objs import _rechunk
 
     path = tmp_path / "labels.zarr"
     level0 = create_group(path).create_array("0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=np.uint16, cname="zstd")

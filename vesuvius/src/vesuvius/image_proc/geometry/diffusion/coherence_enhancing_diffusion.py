@@ -12,7 +12,7 @@ try:
 except Exception:  # pragma: no cover - tqdm is optional
     tqdm = None
 
-from vesuvius.image_proc.geometry.structure_tensor import StructureTensorComputer
+from vc_reader.torch import structure_tensor
 
 EPS = 2**-52
 GAMMA = 0.01
@@ -26,14 +26,10 @@ def _make_progress_iterator(steps: int, show_progress: bool) -> Iterable[int]:
 
 
 def _structure_tensor_components_2d(
-    img: torch.Tensor, st_computer: StructureTensorComputer
+    img: torch.Tensor, sigma: float, rho: float
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute 2D structure tensor components using the shared StructureTensorComputer."""
-    if st_computer.device != img.device:
-        st_computer.device = img.device
-    if st_computer.dtype != img.dtype:
-        st_computer.dtype = img.dtype
-    comps = st_computer.compute(img, device=img.device, spatial_dims=2)
+    """Compute 2D components with the central-plane Pavel kernel scaling."""
+    comps = structure_tensor(img, sigma=sigma, rho=max(rho, 0.0), scale=3.0 / 8.0)
     s22 = comps[:, 0:1]  # Jyy
     s12 = comps[:, 1:2]  # Jyx
     s11 = comps[:, 2:3]  # Jxx
@@ -204,19 +200,10 @@ def coherence_enhancing_diffusion(
     m = float(config["m"])
     num_steps = int(config["num_steps"])
 
-    component_sigma = rho if rho > 0 else None
-    st_computer = StructureTensorComputer(
-        sigma=sigma,
-        component_sigma=component_sigma,
-        smooth_components=component_sigma is not None,
-        device=tensor.device,
-        dtype=tensor.dtype,
-    )
-
     iterator = _make_progress_iterator(num_steps, show_progress)
 
     for _ in iterator:
-        s11, s12, s22 = _structure_tensor_components_2d(tensor, st_computer)
+        s11, s12, s22 = _structure_tensor_components_2d(tensor, sigma, rho)
         alpha = compute_alpha(s11, s12, s22)
         c2 = compute_c2(alpha, lambda_param, m)
         d11, d12, d22 = compute_diffusion_tensor(s11, s12, s22, alpha, c2)

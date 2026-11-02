@@ -30,7 +30,7 @@ from vesuvius.data import affine
 from vesuvius.utils.utils import pad_or_crop_3d
 
 from ..augmentation.pipelines import create_training_transforms, sample_seed
-from ..training.normalization import get_normalization
+import vc_reader.transforms as A
 from .zarr_dataset import PatchInfo
 
 
@@ -190,7 +190,23 @@ class CrossFrameZarrDataset(Dataset):
 
         self.normalization_scheme = getattr(mgr, "normalization_scheme", "zscore")
         self.intensity_properties = getattr(mgr, "intensity_properties", None) or {}
-        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        scheme = self.normalization_scheme
+        if scheme == "ct":
+            props = self.intensity_properties
+            required = ("mean", "std", "percentile_00_5", "percentile_99_5")
+            if not props or any(key not in props for key in required):
+                raise ValueError("CT normalization requires mean, std and percentile bounds")
+            op = A.Normalize("fixed", center=float(props["mean"]), scale=max(float(props["std"]), 1e-8),
+                             bounds=(float(props["percentile_00_5"]), float(props["percentile_99_5"])))
+        elif scheme == "zscore":
+            op = A.Normalize("zscore", nonzero=False, eps=1e-8)
+        elif scheme in ("minmax", "rescale_to_01", "robust"):
+            op = A.Normalize("minmax" if scheme == "rescale_to_01" else scheme)
+        elif scheme == "none":
+            op = None
+        else:
+            raise ValueError(f"Unknown normalization scheme: {scheme}")
+        self.normalizer = A.Pipeline([op], backend="cpu") if op is not None else None
 
         self.cache_dir = self._resolve_cache_dir(ds_cfg)
         # data_path is read by BaseTrainer._configure_dataloaders to decide
@@ -642,8 +658,11 @@ class CrossFrameZarrDataset(Dataset):
                 f"min={image_patch.min():.1f} max={image_patch.max():.1f})"
             )
 
-        if self.normalizer is not None:
-            image_patch = self.normalizer(image_patch)
+        if self.normalizer is not None and image_patch.size:
+            normalized = self.normalizer(
+                {"image": np.asarray(image_patch, dtype=np.float32).reshape(1, 1, -1)}, seed=0
+            )["image"]
+            image_patch = normalized.reshape(image_patch.shape)
         image_patch = image_patch.astype(np.float32, copy=False)
 
         # Resample labels through the forward affine into the image grid.

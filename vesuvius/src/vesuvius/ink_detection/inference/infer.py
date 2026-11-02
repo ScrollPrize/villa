@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vesuvius.ink_detection.data.normalization import normalize_image
+
 import argparse
 import json
 import logging
@@ -116,9 +118,7 @@ def normalize_flat_patch(
     """Normalize one reader-processed ZYX patch by the legacy flat contract."""
 
     if preprocessing == "tifxyz_robust":
-        from vesuvius.image_proc.intensity.normalization import normalize_robust
-
-        return np.ascontiguousarray(normalize_robust(patch_ZYX))
+        return normalize_image(patch_ZYX, NormalizationConfig(mode="robust_mad"))
     if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0

@@ -5,7 +5,13 @@ from __future__ import annotations
 import numpy as np
 
 from vesuvius.ink_detection.config import NormalizationConfig
-from vesuvius.image_proc.intensity.normalization import apply, normalize_robust
+import vc_reader.transforms as A
+from functools import lru_cache
+
+
+@lru_cache(maxsize=32)
+def _pipeline(mode, options):
+    return A.Pipeline([A.Normalize(mode, **dict(options))], backend="cpu")
 
 
 def normalize_image(
@@ -16,20 +22,19 @@ def normalize_image(
     if image_f32.size == 0 or config.mode == "none":
         return image_f32
     if config.mode == "divide":
-        return apply(image_f32, "fixed", scale=float(config.divisor))
-    if config.mode == "clip_zscore":
-        return apply(image_f32, "fixed", center=float(config.mean), scale=float(config.std),
-                     bounds=(float(config.clip_min), float(config.clip_max)))
-    if config.mode == "robust_mad":
-        return normalize_robust(
-            image_f32,
-            percentile_lower=config.percentile_lower,
-            percentile_upper=config.percentile_upper,
-        )
-    if config.mode == "minmax":
-        return apply(image_f32, "percentile", lower=0.0, upper=100.0)
-    return apply(image_f32, "percentile", lower=float(config.percentile_lower), upper=float(config.percentile_upper),
-                 median=config.mode == "robust_percentile_span")
+        mode, options = "fixed", dict(scale=float(config.divisor))
+    elif config.mode == "clip_zscore":
+        mode, options = "fixed", dict(center=float(config.mean), scale=float(config.std),
+                                     bounds=(float(config.clip_min), float(config.clip_max)))
+    elif config.mode == "robust_mad":
+        mode, options = "robust", dict(lower=float(config.percentile_lower), upper=float(config.percentile_upper))
+    elif config.mode == "minmax":
+        mode, options = "percentile", dict(lower=0.0, upper=100.0)
+    else:
+        mode, options = "percentile", dict(lower=float(config.percentile_lower), upper=float(config.percentile_upper),
+                                           median=config.mode == "robust_percentile_span")
+    pipeline = _pipeline(mode, tuple(sorted(options.items())))
+    return pipeline({"image": image_f32.reshape(1, 1, -1)}, seed=0)["image"].reshape(image_f32.shape)
 
 
 def exclude_validation_voxels(

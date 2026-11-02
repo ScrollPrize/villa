@@ -13,7 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from cachetools import LRUCache
 
 from vesuvius.neural_tracing.heatmap_single_point.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
-from vesuvius.image_proc.intensity.normalization import normalize_zscore
+import vc_reader.transforms as A
+
+_ZSCORE = A.Pipeline([A.Normalize("zscore", nonzero=False, eps=1e-8)], backend="cpu")
 from vesuvius.models.run.tta import infer_with_tta
 
 
@@ -524,7 +526,7 @@ class Inference:
                 )
 
             # Apply z-score normalization
-            volume_crop_zscore = torch.from_numpy(normalize_zscore(volume_crop_raw.numpy()))
+            volume_crop_zscore = _ZSCORE({"image": volume_crop_raw.float().reshape(1, 1, -1)}, seed=0)["image"].reshape(volume_crop_raw.shape)
 
             volume_crops.append(volume_crop_zscore)
             min_corner_zyxs.append(min_corner_zyx)

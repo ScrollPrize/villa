@@ -23,7 +23,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
-from vesuvius.image_proc.intensity.normalization import normalize_zscore
+import vc_reader.transforms as A
+
+_ZSCORE = A.Pipeline([A.Normalize("zscore", nonzero=False, eps=1e-8)], backend="cpu")
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
@@ -1663,7 +1665,8 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
 
     cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
-    vol_crop = normalize_zscore(volume_arr.read_region(min_corner, crop_size)).astype(np.float32, copy=False)
+    vol_crop = volume_arr.read_region(min_corner, crop_size).astype(np.float32, copy=False)
+    vol_crop = _ZSCORE({"image": vol_crop.reshape(1, 1, -1)}, seed=0)["image"].reshape(vol_crop.shape)
 
     return {
         "bbox_id": int(record.get("bbox_id", -1)),

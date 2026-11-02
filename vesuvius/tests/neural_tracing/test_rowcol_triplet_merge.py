@@ -181,7 +181,6 @@ def test_open_volume_level_falls_back_to_nearest_level(tmp_path):
 
 def test_prepare_bbox_item_reads_crop_with_zero_fill_outside_volume(tmp_path):
     import vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps as M
-    from vesuvius.image_proc.intensity.normalization import normalize_zscore
 
     data = _write_level_group(tmp_path / "v.zarr", [(10, 12, 14)])[0]
     reader, _ = M._open_volume_level(tmp_path / "v.zarr", volume_scale=0, chunk_cache_gb=0.01)
@@ -194,4 +193,6 @@ def test_prepare_bbox_item_reads_crop_with_zero_fill_outside_volume(tmp_path):
     expected = np.zeros(crop_size, dtype=np.uint8)
     expected[2:, :4, :] = data[0:4, 8:12, 5:11]
     assert item["volume"].dtype == np.float32
-    np.testing.assert_array_equal(item["volume"], normalize_zscore(expected).astype(np.float32))
+    expected = expected.astype(np.float32)
+    expected = (expected - expected.mean()) / max(float(expected.std()), 1e-8)
+    np.testing.assert_allclose(item["volume"], expected, rtol=1e-6, atol=1e-6)
