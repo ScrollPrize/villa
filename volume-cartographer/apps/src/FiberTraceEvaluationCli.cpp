@@ -1,3 +1,4 @@
+#include "vc/core/util/ImageMat.hpp"
 #include "FiberTraceEvaluationCli.hpp"
 #include "FiberTraceCli.hpp"
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
@@ -446,8 +447,8 @@ void writeRenderedOverview(const std::filesystem::path& output,
     std::filesystem::create_directories(output.parent_path());
     if (!std::filesystem::create_directory(output)) throw std::invalid_argument("render output already exists");
     for (size_t i = 0; i < overview.pages.size(); ++i)
-        if (!cv::imwrite((output / ("strips_" + std::to_string(i) + ".jpg")).string(), overview.pages[i].image))
-            throw std::runtime_error("failed writing replay strip image");
+        vcr::sources::writeImage(output / ("strips_" + std::to_string(i) + ".jpg"),
+            vc::core::util::imageBuffer(overview.pages[i].image).view());
     metadata["pages"] = overview.pages.size();
     metadata["rows"] = {"reference_top", "reference_side", "traced_top", "traced_side"};
     metadata["reference_color"] = "yellow";
@@ -1149,8 +1150,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     if (!std::filesystem::create_directory(writeDirectory))
                         throw std::runtime_error("render staging output already exists");
                     for (size_t p = 0; p < inspection.pages.size(); ++p)
-                        if (!cv::imwrite((writeDirectory / ("strips_" + std::to_string(p) + ".jpg")).string(), inspection.pages[p]))
-                            throw std::runtime_error("failed writing inspection image");
+                        vcr::sources::writeImage(writeDirectory / ("strips_" + std::to_string(p) + ".jpg"),
+                            vc::core::util::imageBuffer(inspection.pages[p]).view());
 
                     inspection.metadata.update({{"case_index", index}, {"provenance", provenance},
                         {"texture_source", textureSourceJson(source.renderSource)}});

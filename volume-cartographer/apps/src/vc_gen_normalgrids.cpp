@@ -1,3 +1,4 @@
+#include "vc/core/util/ImageMat.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -952,7 +953,7 @@ void run_pyramid(const po::variables_map& vm) {
                         if (level == 0) {
                             link_or_copy_file(src_path, dst_path, overwrite);
                         } else {
-                            cv::Mat img = cv::imread(src_path.string(), cv::IMREAD_UNCHANGED);
+                            cv::Mat img = vc::core::util::imageMat(vcr::sources::readImagePage(src_path.string(), 0));
                             if (img.empty()) {
                                 ++skipped;
                                 mark_progress();
@@ -967,10 +968,7 @@ void run_pyramid(const po::variables_map& vm) {
                                 0.0,
                                 0.0,
                                 cv::INTER_NEAREST);
-                            if (fs::exists(dst_path) && overwrite) {
-                                fs::remove(dst_path);
-                            }
-                            cv::imwrite(dst_path.string(), scaled);
+                            vcr::sources::writeImage(dst_path, vc::core::util::imageBuffer(scaled).view());
                         }
                         ++written;
                     } catch (const std::exception& e) {
@@ -1624,7 +1622,7 @@ void run_generate(const po::variables_map& vm) {
                     const size_t written_index = written_counter.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (preview_every > 0 && (written_index % static_cast<size_t>(preview_every)) == 0) {
                         const auto preview_start = std::chrono::steady_clock::now();
-                        cv::imwrite(task.previewPath.string(), assembled.binarySlice);
+                        vcr::sources::writeImage(task.previewPath, vc::core::util::imageBuffer(assembled.binarySlice).view());
                         record_timing(local_stats, "preview_image", seconds_since(preview_start));
                         ++local_stats.previewWrites;
                     }

@@ -2212,13 +2212,13 @@ static void run_fit_normals(
 
     if (dbg_tif) {
         // Write float TIFFs into the current working directory.
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_rms.tif"), dbg_rms);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_used_radius.tif"), dbg_used_radius);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_sum.tif"), dbg_nsamp_sum);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_xy.tif"), dbg_nsamp_xy);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_xz.tif"), dbg_nsamp_xz);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_sample_count_yz.tif"), dbg_nsamp_yz);
-        vc::core::util::writeTiffMat(fs::path("dbg_fit_frac_used_short_paths.tif"), dbg_frac_used_short_paths);
+        vcr::sources::writeTiff(fs::path("dbg_fit_rms.tif"), vc::core::util::imageBuffer(dbg_rms).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_used_radius.tif"), vc::core::util::imageBuffer(dbg_used_radius).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_sum.tif"), vc::core::util::imageBuffer(dbg_nsamp_sum).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xy.tif"), vc::core::util::imageBuffer(dbg_nsamp_xy).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_xz.tif"), vc::core::util::imageBuffer(dbg_nsamp_xz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_sample_count_yz.tif"), vc::core::util::imageBuffer(dbg_nsamp_yz).view());
+        vcr::sources::writeTiff(fs::path("dbg_fit_frac_used_short_paths.tif"), vc::core::util::imageBuffer(dbg_frac_used_short_paths).view());
     }
 
     if (output_spool) {

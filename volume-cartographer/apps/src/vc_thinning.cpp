@@ -1,7 +1,8 @@
 #include <iostream>
 #include <chrono>
 #include <fstream>
-#include <opencv2/imgcodecs.hpp>
+#include "vc/core/util/ImageMat.hpp"
+#include <opencv2/imgproc.hpp>
 #include <opencv2/ximgproc.hpp>
 #include "vc/core/util/Thinning.hpp"
 
@@ -25,11 +26,15 @@ int main(int argc, char** argv) {
     std::string inputPath = argv[1];
     std::string basePath = argv[2];
 
-    cv::Mat inputImage = cv::imread(inputPath, cv::IMREAD_GRAYSCALE);
+    cv::Mat inputImage = vc::core::util::imageMat(vcr::sources::readImagePage(inputPath, 0));
     if (inputImage.empty()) {
         std::cerr << "Error: Could not read input image at " << inputPath << std::endl;
         return 1;
     }
+
+    if (inputImage.channels() == 3) cv::cvtColor(inputImage, inputImage, cv::COLOR_BGR2GRAY);
+    else if (inputImage.channels() == 4) cv::cvtColor(inputImage, inputImage, cv::COLOR_BGRA2GRAY);
+    if (inputImage.depth() == CV_16U) inputImage.convertTo(inputImage, CV_8U, 1.0 / 256);
 
     // --- Custom Thinning ---
     cv::Mat customOutput;
@@ -39,7 +44,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double, std::milli> customTime = endCustom - startCustom;
     std::cout << "Custom thinning took: " << customTime.count() << " ms" << std::endl;
     std::string customOutputPath = getOutputPath(basePath, "custom");
-    cv::imwrite(customOutputPath, customOutput);
+    vcr::sources::writeImage(customOutputPath, vc::core::util::imageBuffer(customOutput).view());
     std::cout << "Custom thinning output saved to " << customOutputPath << std::endl;
 
     // --- OpenCV Thinning (Zhang-Suen) ---
@@ -50,7 +55,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double, std::milli> zhangTime = endZhang - startZhang;
     std::cout << "Zhang-Suen thinning took: " << zhangTime.count() << " ms" << std::endl;
     std::string zhangOutputPath = getOutputPath(basePath, "zhangsuen");
-    cv::imwrite(zhangOutputPath, zhangSuenOutput);
+    vcr::sources::writeImage(zhangOutputPath, vc::core::util::imageBuffer(zhangSuenOutput).view());
     std::cout << "Zhang-Suen output saved to " << zhangOutputPath << std::endl;
 
     // --- OpenCV Thinning (Guo-Hall) ---
@@ -61,7 +66,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double, std::milli> guoTime = endGuo - startGuo;
     std::cout << "Guo-Hall thinning took: " << guoTime.count() << " ms" << std::endl;
     std::string guoOutputPath = getOutputPath(basePath, "guohall");
-    cv::imwrite(guoOutputPath, guoHallOutput);
+    vcr::sources::writeImage(guoOutputPath, vc::core::util::imageBuffer(guoHallOutput).view());
     std::cout << "Guo-Hall output saved to " << guoOutputPath << std::endl;
 
     // --- OpenCV Thinning (Zhang-Suen then Guo-Hall) ---
@@ -73,7 +78,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double, std::milli> combinedTime = endCombined - startCombined;
     std::cout << "Zhang-Suen then Guo-Hall thinning took: " << combinedTime.count() << " ms" << std::endl;
     std::string combinedOutputPath = getOutputPath(basePath, "zhangsuen_guohall");
-    cv::imwrite(combinedOutputPath, combinedOutput);
+    vcr::sources::writeImage(combinedOutputPath, vc::core::util::imageBuffer(combinedOutput).view());
     std::cout << "Combined output saved to " << combinedOutputPath << std::endl;
 
     return 0;

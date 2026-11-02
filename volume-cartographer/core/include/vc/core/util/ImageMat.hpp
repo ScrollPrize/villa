@@ -3,6 +3,7 @@
 // VC's boundary. TIFF and PNG store RGB(A); Mats hold BGR(A).
 
 #include <vc_reader/image_write.hpp>
+#include <vc_reader/source_reader.hpp>
 
 #include <opencv2/core/mat.hpp>
 
@@ -22,10 +23,11 @@ namespace vc::core::util {
 // become 0 and 255. Empty when the block's dtype has no OpenCV depth.
 [[nodiscard]] cv::Mat imageMat(const vcr::sources::Block& block);
 
-// One page of an image file (vcr::sources::readImagePage); throws as vc_reader does.
-[[nodiscard]] cv::Mat readImageMat(const std::filesystem::path& path, std::int64_t page = 0);
-
-// A Mat of any OpenCV depth and channel count as a TIFF (vcr::sources::writeTiff).
-void writeTiffMat(const std::filesystem::path& path, const cv::Mat& mat, const vcr::sources::TiffOptions& options = {});
+// Owns the contiguous RGB(A) buffer passed to native image writers.
+struct ImageBuffer {
+    cv::Mat pixels;
+    [[nodiscard]] vcr::sources::ImageView view() const;
+};
+[[nodiscard]] ImageBuffer imageBuffer(const cv::Mat& mat);
 
 }  // namespace vc::core::util

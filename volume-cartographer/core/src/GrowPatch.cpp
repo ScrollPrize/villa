@@ -1715,7 +1715,6 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
 
     // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
 
-    // cv::imwrite("opt_mask.tif", mask);
 }
 
 struct LocalOptimizationConfig {
@@ -3008,7 +3007,6 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                     inpaint_skip++;
             }
 
-            // cv::imwrite("vis_inp_rect.tif", vis);
         }
     }
 

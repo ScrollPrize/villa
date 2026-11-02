@@ -1,3 +1,4 @@
+#include "vc/core/util/ImageMat.hpp"
 #include <vc_reader/publication.hpp>
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
@@ -4461,9 +4462,8 @@ void writeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirecto
             const auto mesh = presenceSliceMesh(report, plane, grid);
             const std::string obj = vc::core::util::texturedMeshObj(mesh, "vc_fiber_presence_slice version 1", mtlName, material, material);
             const std::string mtl = vc::core::util::textureMaterialMtl(material, pngName);
-            if (!cv::imwrite(paths.temporaryPng.string(), presenceSliceImage(plane), {cv::IMWRITE_PNG_COMPRESSION, 1})) {
-                throw std::runtime_error("failed to write fiber presence texture: " + paths.temporaryPng.string());
-            }
+            vcr::sources::writeImage(paths.temporaryPng,
+                vc::core::util::imageBuffer(presenceSliceImage(plane)).view());
             vcr::zarr::atomicWrite(paths.temporaryMtl, mtl, vcr::zarr::Durability::Fsync);
             vcr::zarr::atomicWrite(paths.temporaryObj, obj, vcr::zarr::Durability::Fsync);
             pending.push_back(paths);

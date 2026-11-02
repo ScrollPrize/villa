@@ -1015,7 +1015,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         bitwise_and(state, STATE_VALID, masked);
         cv::dilate(masked, masked, m, {-1,-1}, r);
         cv::erode(masked, masked, m, {-1,-1}, std::min(r,closing_r));
-        // cv::imwrite("masked.tif", masked);
 
         for(int j=used_area.y;j<used_area.br().y;j++)
             for(int i=used_area.x;i<used_area.br().x;i++)
@@ -3425,7 +3424,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         if (!tgt_dir.empty())
-            vc::core::util::writeTiffMat(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area));
+            vcr::sources::writeTiff(tgt_dir / "inliers_sum.tif", vc::core::util::imageBuffer(inliers_sum_dbg(used_area)).view());
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);

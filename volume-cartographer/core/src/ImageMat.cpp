@@ -47,21 +47,20 @@ cv::Mat imageMat(const vcr::sources::Block& block)
     return image;
 }
 
-cv::Mat readImageMat(const std::filesystem::path& path, std::int64_t page)
+vcr::sources::ImageView ImageBuffer::view() const
 {
-    return imageMat(vcr::sources::readImagePage(path.string(), page));
+    return {pixels.data,tiffDtype(pixels.depth()),pixels.rows,pixels.cols,pixels.channels()};
 }
 
-void writeTiffMat(const std::filesystem::path& path, const cv::Mat& mat, const vcr::sources::TiffOptions& options)
+ImageBuffer imageBuffer(const cv::Mat& mat)
 {
-    const char* dtype = tiffDtype(mat.depth());
-    if (mat.empty() || !dtype)
-        throw std::runtime_error("unsupported image for " + path.string());
+    if (mat.empty() || !tiffDtype(mat.depth()))
+        throw std::invalid_argument("unsupported image buffer");
     cv::Mat stored;
     if (mat.channels() == 3) cv::cvtColor(mat, stored, cv::COLOR_BGR2RGB);
     else if (mat.channels() == 4) cv::cvtColor(mat, stored, cv::COLOR_BGRA2RGBA);
     else stored = mat.isContinuous() ? mat : mat.clone();
-    vcr::sources::writeTiff(path, stored.data, dtype, stored.rows, stored.cols, stored.channels(), options);
+    return {std::move(stored)};
 }
 
 }  // namespace vc::core::util

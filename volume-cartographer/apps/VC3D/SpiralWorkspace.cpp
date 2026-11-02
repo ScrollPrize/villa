@@ -1962,7 +1962,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
         cv::Mat windingImage;
         try {
-            windingImage = vc::core::util::readImageMat(windingMapPath.toStdString());
+            windingImage = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(windingMapPath.toStdString()).string(), 0));
         } catch (const std::exception&) {
         }
         if (windingImage.empty() || windingImage.channels() != 1)

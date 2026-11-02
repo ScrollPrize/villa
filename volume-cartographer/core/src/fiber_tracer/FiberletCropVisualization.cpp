@@ -103,9 +103,8 @@ void writeFiberletCropBoxVisualization(
         }
         const std::string textureName = stem + "_" + face.name + ".tif";
         const std::string materialName = "fiberlet_crop_" + std::string(face.name);
-        vc::core::util::writeTiffMat(
-            directory / textureName,
-            [&]() {
+        vcr::sources::writeTiff(
+            directory / textureName, vc::core::util::imageBuffer([&]() {
                 const auto& vertices = coordinates;
                 const int factor = std::max(1, 1);
                 std::vector<uint8_t> valid(vertices.total(), 1);

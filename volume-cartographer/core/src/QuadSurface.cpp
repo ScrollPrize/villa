@@ -626,7 +626,7 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
                 try {
-                    channel = vc::core::util::readImageMat(channel_path);
+                    channel = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(channel_path).string(), 0));
                 } catch (const std::exception& error) {
                     Logger()->warn("cannot read channel {}: {}", channel_path.string(), error.what());
                 }
@@ -739,7 +739,7 @@ void QuadSurface::writeValidMask()
     auto options = tiffOptions(dpi_);
     options.compression = "lzw";
     options.tile = std::array<int, 2>{1024, 1024};
-    vc::core::util::writeTiffMat(path / "mask.tif", validMask(), options);
+    vcr::sources::writeTiff(path / "mask.tif", vc::core::util::imageBuffer(validMask()).view(), options);
 }
 
 void QuadSurface::invalidateCache()

@@ -405,7 +405,7 @@ void InkDetectionOverlayController::loadSelectedImage()
     // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
     cv::Mat src;
     try {
-        src = vc::core::util::readImageMat(_selectedPath);
+        src = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(_selectedPath).string(), 0));
     } catch (const std::exception&) {
     }
     if (src.empty()) {

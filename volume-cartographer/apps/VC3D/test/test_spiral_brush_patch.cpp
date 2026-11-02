@@ -83,9 +83,9 @@ private slots:
     {
         const QString source = qEnvironmentVariable("SPIRAL_PATCH_REAL_INPUT");
         if (source.isEmpty()) QSKIP("Set SPIRAL_PATCH_REAL_INPUT to validate a real scroll patch");
-        const cv::Mat1f x = vc::core::util::readImageMat((source + "/x.tif").toStdString());
-        const cv::Mat1f y = vc::core::util::readImageMat((source + "/y.tif").toStdString());
-        const cv::Mat1f z = vc::core::util::readImageMat((source + "/z.tif").toStdString());
+        const cv::Mat1f x = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path((source + "/x.tif").toStdString()).string(), 0));
+        const cv::Mat1f y = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path((source + "/y.tif").toStdString()).string(), 0));
+        const cv::Mat1f z = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path((source + "/z.tif").toStdString()).string(), 0));
         QVERIFY(!x.empty());
         QCOMPARE(x.size(), y.size());
         QCOMPARE(x.size(), z.size());

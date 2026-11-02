@@ -177,8 +177,8 @@ TEST_CASE("vc_render_tifxyz reads a stored surface through a registered volume l
     size_t files = 0, pixels = 0, differing = 0;
     double worst = 0;
     for (const auto& entry : fs::directory_iterator(f.dir / "file")) {
-        const auto file = vc::core::util::readImageMat(entry.path());
-        const auto store = vc::core::util::readImageMat(f.dir / "store" / entry.path().filename());
+        const auto file = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(entry.path()).string(), 0));
+        const auto store = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(f.dir / "store" / entry.path().filename()).string(), 0));
         REQUIRE(file.size() == store.size());
         cv::Mat diff;
         cv::absdiff(file, store, diff);
