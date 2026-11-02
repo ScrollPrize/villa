@@ -304,15 +304,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     bindInputStore();
     // A fit reads the open project's facts and umbilicus; the service
     // receives them with every build, as it cannot read the project file.
-    _service->setProjectSource([this]() {
-        const auto pkg = _state->vpkg();
-        if (!pkg) throw std::runtime_error("no project is open");
-        return vc3d::spiral::projectBlock(pkg->name(), vc3d::spiral::projectVolumeFacts(*pkg),
-                                          vc3d::spiral::projectLasagna(*pkg, vc3d::remoteCachePathFs()),
-                                          vc3d::spiral::projectFiberInference(*pkg, vc3d::remoteCachePathFs()),
-                                          _state->objectStoreSession().get(),
-                                          _state->storeFor("umbilicus"));
-    });
+    _service->setProjectSource(
+        [this]() {
+            const auto pkg = _state->vpkg();
+            if (!pkg) throw std::runtime_error("no project is open");
+            return vc3d::spiral::projectLasagna(*pkg, vc3d::remoteCachePathFs());
+        },
+        [this](const std::optional<vc3d::spiral::ProjectLasagna>& lasagna) {
+            const auto pkg = _state->vpkg();
+            if (!pkg) throw std::runtime_error("no project is open");
+            return vc3d::spiral::projectBlock(pkg->name(), vc3d::spiral::projectVolumeFacts(*pkg), lasagna,
+                                              vc3d::spiral::projectFiberInference(*pkg, vc3d::remoteCachePathFs()),
+                                              _state->objectStoreSession().get(),
+                                              _state->storeFor("umbilicus"));
+        });
 
     _pythonOutputDialog = new QDialog(this, Qt::Window);
     _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));

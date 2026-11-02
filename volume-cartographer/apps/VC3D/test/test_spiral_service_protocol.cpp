@@ -73,7 +73,7 @@ bool startService(ServiceProcess& service, const QString& python, const QTempora
 
 // What VC3D sends of a project of the objects' volume "vol": its voxel size,
 // a catalog orientation (an outward sense of CW) and its umbilicus.
-QJsonObject protocolProject()
+QJsonObject protocolProject(const std::optional<vc3d::spiral::ProjectLasagna>& = std::nullopt)
 {
     const QJsonObject umbilicus{
         {QStringLiteral("uuid"), QStringLiteral("6c1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e11")},
@@ -180,7 +180,8 @@ private slots:
         QVERIFY(startService(service, python, directory, QString::fromStdString(storePath.string())));
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
-        manager.setProjectSource(protocolProject);
+        manager.setProjectSource([]() { return std::optional<vc3d::spiral::ProjectLasagna>(); },
+                                 [](const auto& lasagna) { return protocolProject(lasagna); });
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
         QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
@@ -284,7 +285,8 @@ private slots:
 
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
-        manager.setProjectSource(protocolProject);
+        manager.setProjectSource([]() { return std::optional<vc3d::spiral::ProjectLasagna>(); },
+                                 [](const auto& lasagna) { return protocolProject(lasagna); });
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy errors(&manager, &SpiralServiceManager::errorOccurred);
         SpiralServiceProfile profile;
@@ -363,7 +365,8 @@ private:
                              QString::fromStdString(hubPath.string())));
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
-        manager.setProjectSource(protocolProject);
+        manager.setProjectSource([]() { return std::optional<vc3d::spiral::ProjectLasagna>(); },
+                                 [](const auto& lasagna) { return protocolProject(lasagna); });
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
         QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
@@ -508,7 +511,8 @@ private:
         QVERIFY(update.error.contains(QStringLiteral("attached object store changed")));
         QVERIFY(!manager.inputUpdateActive() && !session->hubStatus(attachment)->pushesHeld);
         manager.setObjectStore(session, attachment);
-        manager.setProjectSource(protocolProject);
+        manager.setProjectSource([]() { return std::optional<vc3d::spiral::ProjectLasagna>(); },
+                                 [](const auto& lasagna) { return protocolProject(lasagna); });
         QTest::qWait(500);
         QCOMPARE(updates.count(), 6);
 

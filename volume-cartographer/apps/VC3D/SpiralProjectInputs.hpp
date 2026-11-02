@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vc/lasagna/Manifest.hpp"
+
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QJsonObject>
@@ -10,12 +12,9 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 class VolumePkg;
-
-namespace vc::lasagna {
-struct LasagnaDatasetManifest;
-}
 
 // What a Spiral service reads of the VC3D project (spiral-fitting's
 // fit_session.SpiralProject). The project file need not be readable on the
@@ -47,6 +46,7 @@ std::map<std::string, ProjectVolumeFacts> projectVolumeFacts(const VolumePkg& pk
 // x 2^scaledown) and that volume's shape. The fit reads the packs a Spiral
 // cache holds for the identity, not the stores. `error` says why a fit cannot
 // read it: an unreadable dataset, or channels sharing a multichannel array.
+// `remoteGroups` are the channel groups of the remote stores, by fit input.
 struct ProjectLasagna {
     std::string location;
     std::string identity;
@@ -55,7 +55,23 @@ struct ProjectLasagna {
     double baseVoxelsPerArrayVoxel = 1;
     std::optional<std::array<std::size_t, 3>> baseShapeZYX;
     std::string error;
+    std::map<std::string, vc::lasagna::LasagnaChannelGroup> remoteGroups;
 };
+
+// `lasagna` as a service on this host that builds missing packs from local
+// arrays reads it: each remote store replaced by the store directory its
+// read-through cache keeps the array in (vc::lasagna::
+// lasagnaChannelArrayCacheDirectory, <store>/<group>). The service reads them
+// only to build a pack, after cacheLasagnaChannelArray has filled them.
+ProjectLasagna withCachedStores(ProjectLasagna lasagna);
+
+// The remote groups of `lasagna` a service with the Spiral cache
+// `spiralCache` would build packs from: the inputs of each pack kind (normals:
+// normal_x and normal_y; grad_mag: gradient_magnitude) the cache holds no pack
+// of. The cache keys packs by identity, so a dataset without one here (a
+// remote manifest, which the service identifies by its URL) needs all of them.
+std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
+    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache);
 
 // The identity a Spiral cache keys a local Lasagna dataset's packs by
 // (spiral-fitting's lasagna_source.manifest_identity): the run_uuid of the

@@ -7,6 +7,8 @@
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
+#include "vc/lasagna/Dataset.hpp"
+
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QCoreApplication>
@@ -33,6 +35,7 @@
 #include <QStandardPaths>
 #include <QUrl>
 #include <QUuid>
+#include <QPromise>
 #include <QtConcurrent/QtConcurrent>
 
 #include <cmath>
@@ -678,6 +681,10 @@ void SpiralServiceManager::abandonInputUpdate(const QString& reason)
 void SpiralServiceManager::disconnectFromService()
 {
     _waitingForLocalStore = false;
+    if (_lasagnaCacheCancel) {
+        _lasagnaCacheCancel->store(true);
+        _lasagnaCacheCancel.reset();
+    }
     abandonInputUpdate(tr("The connection to the Spiral service changed"));
     ++_connectionGeneration;
     _leaseOwner = false;
@@ -954,25 +961,25 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
         if (!body.isEmpty()) handleStatus(body);
         finishInputUpdate(update, serial);
     };
+    auto post = [this, route, requested, serial, failed](const QJsonObject& body) {
+        postWithRetry(route, body, Timeout::Load, kMutationRetries,
+                      [this, requested, serial](const QJsonObject& response) {
+                          handleStatus(response);
+                          const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
+                          InputUpdate update;
+                          update.requested = requested;
+                          update.head = position.value(QStringLiteral("head")).toInteger(-1);
+                          update.fitted = position.value(QStringLiteral("sequence")).toInteger(-1);
+                          if (update.fitted < 0) update.error = tr("The service reported no fitted position");
+                          finishInputUpdate(update, serial);
+                      },
+                      {}, failed);
+    };
     // A build (not an update of the resident fit) reads the project again.
-    if (!update) {
-        if (const QString error = addProject(body); !error.isEmpty()) {
-            failed(error, {});
-            return;
-        }
-    }
-    postWithRetry(route, body, Timeout::Load, kMutationRetries,
-                  [this, requested, serial](const QJsonObject& response) {
-                      handleStatus(response);
-                      const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
-                      InputUpdate update;
-                      update.requested = requested;
-                      update.head = position.value(QStringLiteral("head")).toInteger(-1);
-                      update.fitted = position.value(QStringLiteral("sequence")).toInteger(-1);
-                      if (update.fitted < 0) update.error = tr("The service reported no fitted position");
-                      finishInputUpdate(update, serial);
-                  },
-                  {}, failed);
+    if (update)
+        post(body);
+    else
+        withProject(body, post, [failed](const QString& error) { failed(error, {}); });
 }
 
 void SpiralServiceManager::finishInputUpdate(InputUpdate update, quint64 serial)
@@ -1045,39 +1052,130 @@ void SpiralServiceManager::rebuildWithDefaults()
                         {QStringLiteral("command_id"), commandId()}});
 }
 
-QString SpiralServiceManager::addProject(QJsonObject& body) const
+void SpiralServiceManager::withProject(QJsonObject body, std::function<void(QJsonObject)> send,
+                                       std::function<void(const QString&)> failed)
 {
+    std::optional<vc3d::spiral::ProjectLasagna> lasagna;
     try {
-        if (!_projectSource) return tr("No project is open");
-        body[QStringLiteral("project")] = _projectSource();
-        return {};
+        if (!_projectSource) {
+            failed(tr("No project is open"));
+            return;
+        }
+        lasagna = _projectLasagna();
     } catch (const std::exception& error) {
-        return tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what()));
+        failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+        return;
     }
+    auto finish = [this, send, failed](QJsonObject body,
+                                       const std::optional<vc3d::spiral::ProjectLasagna>& lasagna) {
+        try {
+            body[QStringLiteral("project")] = _projectSource(lasagna);
+        } catch (const std::exception& error) {
+            failed(tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what())));
+            return;
+        }
+        send(body);
+    };
+    // Only a service on this host reads the cache's arrays, and only one that
+    // builds missing packs reads arrays at all.
+    const bool localPacking =
+        _profile.isLocalhost()
+        && _advertisedBindings.value(QStringLiteral("capabilities")).toObject()
+               .value(QStringLiteral("build_missing_lasagna_packs")).toBool();
+    if (!localPacking || !lasagna || !lasagna->error.empty() || lasagna->remoteGroups.empty()) {
+        finish(body, lasagna);
+        return;
+    }
+    const auto cached = vc3d::spiral::withCachedStores(*lasagna);
+    const QString spiralCache = _advertisedBindings.value(QStringLiteral("bindings")).toObject()
+                                    .value(QStringLiteral("cache_directory")).toString();
+    const auto groups = cached.error.empty()
+        ? vc3d::spiral::lasagnaGroupsToCache(*lasagna, spiralCache.toStdString())
+        : std::vector<vc::lasagna::LasagnaChannelGroup>{};
+    if (groups.empty()) {
+        finish(body, cached);
+        return;
+    }
+    if (_lasagnaCacheCancel) {
+        failed(tr("The project's Lasagna arrays are already being cached for an earlier request"));
+        return;
+    }
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    _lasagnaCacheCancel = cancel;
+    emit logMessage(tr("Caching the remote Lasagna arrays the local service packs from (%1)…")
+                        .arg(QString::fromStdString(lasagna->location)));
+    const quint64 generation = _connectionGeneration;
+    auto* watcher = new QFutureWatcher<QString>(this);
+    auto lastLogged = std::make_shared<int>(-1);
+    connect(watcher, &QFutureWatcher<QString>::progressTextChanged, this,
+            [this, watcher, lastLogged](const QString& text) {
+                // One line per tenth of the arrays.
+                const int tenth = watcher->progressValue() / 100;
+                if (tenth == *lastLogged) return;
+                *lastLogged = tenth;
+                emit logMessage(text);
+            });
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, cancel, generation, body, cached, finish, failed]() {
+                watcher->deleteLater();
+                if (_lasagnaCacheCancel == cancel) _lasagnaCacheCancel.reset();
+                if (generation != _connectionGeneration || cancel->load()) return;
+                const QString error = watcher->result();
+                if (!error.isEmpty()) {
+                    failed(tr("The project's remote Lasagna arrays could not be cached: %1").arg(error));
+                    return;
+                }
+                emit logMessage(tr("The remote Lasagna arrays are cached"));
+                finish(body, cached);
+            });
+    watcher->setFuture(QtConcurrent::run([groups, cancel](QPromise<QString>& promise) {
+        promise.setProgressRange(0, 1000);
+        try {
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                const auto directory = *vc::lasagna::lasagnaChannelArrayCacheDirectory(groups[i]);
+                const bool done = vc::lasagna::cacheLasagnaChannelArray(
+                    groups[i],
+                    [&](const vc::lasagna::LasagnaArrayCacheProgress& progress) {
+                        const double share = (double(i) + double(progress.done) / double(progress.total))
+                                             / double(groups.size());
+                        promise.setProgressValueAndText(
+                            int(share * 1000),
+                            QObject::tr("Caching Lasagna array %1 of %2 (%3): %4 of %5 objects")
+                                .arg(i + 1).arg(groups.size())
+                                .arg(QString::fromStdString(directory.string()))
+                                .arg(progress.done).arg(progress.total));
+                    },
+                    [&]() { return cancel->load() || promise.isCanceled(); });
+                if (!done) {
+                    promise.addResult(QObject::tr("cancelled"));
+                    return;
+                }
+            }
+            promise.addResult(QString());
+        } catch (const std::exception& error) {
+            promise.addResult(QString::fromUtf8(error.what()));
+        }
+    }));
 }
 
 void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 {
-    if (const QString error = addProject(request); !error.isEmpty()) {
-        emit errorOccurred(error);
-        return;
-    }
-    postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
-                  [this](const QJsonObject& response) {
-                      handleStatus(response);
-                  });
+    withProject(std::move(request), [this](QJsonObject request) {
+        postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
+                      [this](const QJsonObject& response) {
+                          handleStatus(response);
+                      });
+    }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
 void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
 {
-    if (const QString error = addProject(request); !error.isEmpty()) {
-        emit errorOccurred(error);
-        return;
-    }
-    postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
-                  kMutationRetries, [this](const QJsonObject& response) {
-                      handleStatus(response);
-                  });
+    withProject(std::move(request), [this](QJsonObject request) {
+        postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
+                      kMutationRetries, [this](const QJsonObject& response) {
+                          handleStatus(response);
+                      });
+    }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
 void SpiralServiceManager::uploadCheckpointForResume(

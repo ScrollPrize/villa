@@ -566,7 +566,14 @@ position. Existing packs are reused without needing the source arrays. A packing
 failure leaves the resident session intact. This launch flag does not generate
 fiber-direction samples and cannot be enabled by a fit request.
 
-For remote arrays or a service without this flag, pack where the arrays are and
+A remote Lasagna dataset (an open-data one, or any whose arrays are on S3)
+reaches a service on VC3D's host as its arrays' directories in VC3D's remote
+cache. Before a build, VC3D fetches every object of the arrays whose packs the
+service's cache lacks into those directories (logging its progress), so the
+service packs them like local arrays; once packed, the cached arrays are no
+longer read.
+
+For a remote service, or one without this flag, pack where the arrays are and
 copy the packs over:
 
 ```sh
@@ -747,8 +754,9 @@ authenticated HTTP protocol:
   set up beyond the Python environment; the optional output, cache and
   winding-inference paths are chosen in the connection panel and VC3D
   launches the service bound to the project's store with those values and
-  `--build-missing-lasagna-packs`: accessible local Lasagna arrays are packed
-  automatically on first use. Changing a binding restarts the owned service.
+  `--build-missing-lasagna-packs`: local Lasagna arrays, and remote ones VC3D
+  first caches in full, are packed automatically on first use. Changing a
+  binding restarts the owned service.
   Automatic service startup waits until you first open the Spiral workspace.
   If no project is open then, it waits for the project's store. Disconnect
   cancels that wait; revisiting the workspace does not reconnect it.

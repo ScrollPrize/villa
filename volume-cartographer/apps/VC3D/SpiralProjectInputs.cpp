@@ -67,6 +67,7 @@ ProjectLasagna projectLasagna(const vc::lasagna::LasagnaDatasetManifest& manifes
         result.stores[input] = store;
         result.group = array;
         scaledown = group->scaledown;
+        if (group->isRemote()) result.remoteGroups[input] = *group;
     }
     if (result.stores.empty())
         result.error = location + " has no nx, ny or grad_mag channel";
@@ -137,6 +138,40 @@ std::optional<ProjectLasagna> projectLasagna(const VolumePkg& pkg,
         unreadable.error = "cannot read " + location + ": " + error.what();
         return unreadable;
     }
+}
+
+ProjectLasagna withCachedStores(ProjectLasagna lasagna)
+{
+    for (const auto& [input, group] : lasagna.remoteGroups) {
+        const auto directory = *vc::lasagna::lasagnaChannelArrayCacheDirectory(group);
+        if (directory.filename().string() != lasagna.group) {
+            lasagna.error = "the cache directory " + directory.string() + " of " + lasagna.stores[input] +
+                            " does not end in its array " + lasagna.group;
+            return lasagna;
+        }
+        lasagna.stores[input] = directory.parent_path().string();
+    }
+    return lasagna;
+}
+
+std::vector<vc::lasagna::LasagnaChannelGroup> lasagnaGroupsToCache(
+    const ProjectLasagna& lasagna, const std::filesystem::path& spiralCache)
+{
+    const std::pair<const char*, std::vector<const char*>> packs[] = {
+        {"normals", {"normal_x", "normal_y"}}, {"grad_mag", {"gradient_magnitude"}}};
+    std::vector<vc::lasagna::LasagnaChannelGroup> result;
+    for (const auto& [kind, inputs] : packs) {
+        std::error_code ec;
+        if (!lasagna.identity.empty()
+            && std::filesystem::is_regular_file(spiralCache / "lasagna" / lasagna.identity /
+                                                    (std::string(kind) + "_g" + lasagna.group) / "meta.json",
+                                                ec))
+            continue;
+        for (const char* input : inputs)
+            if (const auto it = lasagna.remoteGroups.find(input); it != lasagna.remoteGroups.end())
+                result.push_back(it->second);
+    }
+    return result;
 }
 
 std::optional<ProjectDataset> projectFiberInference(const VolumePkg& pkg,

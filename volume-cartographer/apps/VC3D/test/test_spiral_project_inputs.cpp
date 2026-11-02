@@ -14,6 +14,7 @@
 #include <QTemporaryDir>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 
 namespace fs = std::filesystem;
@@ -191,6 +192,46 @@ void describesARemoteDataset()
     require(lasagna.stores.at("normal_x") == "https://data.example/s/s_nx.ome.zarr" && lasagna.group == "4",
             "its stores are remote locations");
 }
+
+// A service on this host is given the arrays' read-through cache
+// directories, and caches only what a pack it lacks needs.
+void givesALocalServiceTheCachedArrays(const fs::path& directory)
+{
+    using vc::lasagna::LasagnaDatasetManifest;
+    auto manifest = LasagnaDatasetManifest::parseText(R"({
+        "version": 2, "groups": {
+            "nx": {"zarr": "s_nx.ome.zarr/4", "scaledown": 4, "channels": ["nx"]},
+            "ny": {"zarr": "s_ny.ome.zarr/4", "scaledown": 4, "channels": ["ny"]},
+            "gm": {"zarr": "s_gm.ome.zarr/4", "scaledown": 4, "channels": ["grad_mag"]}}})");
+    const fs::path cacheRoot = directory / "remote_cache" / "s";
+    for (auto& group : manifest.groups) {
+        group.sourceLocation = "https://data.example/s/" + group.relativeZarrKey;
+        group.remoteZarrBaseUrl = "https://data.example/s";
+        group.remoteZarrKey = group.relativeZarrKey;
+        group.remoteCacheRoot = cacheRoot;
+    }
+    const auto lasagna = vc3d::spiral::projectLasagna(manifest, "/project/s.lasagna.json", "run-4");
+    require(lasagna.remoteGroups.size() == 3, "the remote groups are kept by input");
+    const auto cached = vc3d::spiral::withCachedStores(lasagna);
+    require(cached.error.empty(), "the cached stores are readable: " + cached.error);
+    require(cached.stores.at("normal_x") == (cacheRoot / "s_nx.ome.zarr").string()
+                && cached.stores.at("gradient_magnitude") == (cacheRoot / "s_gm.ome.zarr").string()
+                && cached.group == "4",
+            "each store is its cache directory's");
+
+    const fs::path spiral = directory / "spiral";
+    require(vc3d::spiral::lasagnaGroupsToCache(lasagna, spiral).size() == 3,
+            "a cache without packs needs every array");
+    fs::create_directories(spiral / "lasagna" / "run-4" / "normals_g4");
+    std::ofstream(spiral / "lasagna" / "run-4" / "normals_g4" / "meta.json") << "{}";
+    const auto needed = vc3d::spiral::lasagnaGroupsToCache(lasagna, spiral);
+    require(needed.size() == 1 && needed.front().channels == std::vector<std::string>{"grad_mag"},
+            "a packed kind's arrays are not needed");
+    auto remote = lasagna;
+    remote.identity.clear();
+    require(vc3d::spiral::lasagnaGroupsToCache(remote, spiral).size() == 3,
+            "without an identity no pack can be found");
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -202,6 +243,7 @@ int main(int argc, char** argv)
         describesTheLasagnaDataset();
         identifiesTheDataset();
         describesARemoteDataset();
+        givesALocalServiceTheCachedArrays(directory.path().toStdString());
         describesTheFiberInferenceDataset();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << "\n";

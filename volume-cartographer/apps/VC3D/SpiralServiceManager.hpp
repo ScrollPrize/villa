@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SpiralProjectInputs.hpp"
 #include "SpiralServiceProfile.hpp"
 #include <QSet>
 #include <QJsonArray>
@@ -14,6 +15,7 @@
 #include <QTimer>
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -125,10 +127,17 @@ public:
     // --winding-inference artifact is bound on its host), and if not, why.
     bool windingInferenceAvailable(QString* reason = nullptr) const;
     // The "project" block every initialize and rebuild carries
-    // (SpiralProjectInputs): the service reads the project's facts and
-    // umbilicus from it, not from the project file. Throws when the project
+    // (SpiralProjectInputs), made from the project's Lasagna dataset that
+    // `lasagna` gives: the service reads the project's facts and umbilicus
+    // from it, not from the project file. Either throws when the project
     // cannot be described; the request is then not sent.
-    void setProjectSource(std::function<QJsonObject()> source) { _projectSource = std::move(source); }
+    void setProjectSource(
+        std::function<std::optional<vc3d::spiral::ProjectLasagna>()> lasagna,
+        std::function<QJsonObject(const std::optional<vc3d::spiral::ProjectLasagna>&)> block)
+    {
+        _projectLasagna = std::move(lasagna);
+        _projectSource = std::move(block);
+    }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
     qint64 displayedPreviewSourceIteration() const
@@ -362,7 +371,12 @@ private:
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     // Adds the project block to `body`; the error when it cannot be read.
-    QString addProject(QJsonObject& body) const;
+    // Add the project block to `body`, then `send` it. A service on this host
+    // that builds missing Lasagna packs is given the project's remote arrays
+    // as their read-through cache directories, filled first when a pack it
+    // lacks needs them; `failed` says why the request was not sent.
+    void withProject(QJsonObject body, std::function<void(QJsonObject)> send,
+                     std::function<void(const QString&)> failed);
     void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
@@ -400,7 +414,10 @@ private:
     int _eventFailures = 0;
     qint64 _lastEventCursor = 0;
     QJsonObject _advertisedBindings;
-    std::function<QJsonObject()> _projectSource;
+    std::function<std::optional<vc3d::spiral::ProjectLasagna>()> _projectLasagna;
+    std::function<QJsonObject(const std::optional<vc3d::spiral::ProjectLasagna>&)> _projectSource;
+    // Set to stop the Lasagna arrays being cached for a request; one at a time.
+    std::shared_ptr<std::atomic<bool>> _lasagnaCacheCancel;
     QJsonObject _configurationDefaults;
     QJsonObject _appliedConfiguration;
     qint64 _sessionRevision = 0;
