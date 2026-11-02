@@ -4,10 +4,10 @@ from pathlib import Path
 import sys
 
 
-def load_extensions(directory):
+def load_extensions(directory, names=("_catalog", "_reader", "_transforms")):
     import importlib.machinery
 
-    for name in ("_catalog", "_reader", "_transforms"):
+    for name in names:
         candidates = [directory / (name + suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:

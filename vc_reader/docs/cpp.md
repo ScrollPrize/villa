@@ -221,3 +221,39 @@ CUDA operations use the calling thread's `device::StreamScope`. Use
 `device::complete()` before reading asynchronous outputs on the host or passing
 them to work on another stream without an event dependency. CUDA objects must
 be created after a process fork.
+
+## Binary image analysis
+
+Link `vc_reader::thinning` (also linked by `vc_reader::reader` and
+`vc_reader::transforms`). It has no OpenCV or Python dependency. The public headers
+are `thinning.hpp`, `distance_transform.hpp`, and `components.hpp`.
+
+```cpp
+#include <vc_reader/thinning.hpp>
+#include <vc_reader/components.hpp>
+
+std::vector<std::uint8_t> output(rows * cols);
+vcr::thinning::skeleton(mask.data(), output.data(), rows, cols, 1,
+                       vcr::thinning::Algorithm::GuoHall);
+vcr::thinning::Scratch scratch;
+vcr::thinning::Traces paths;
+vcr::thinning::trace(mask.data(), rows, cols, output.data(), &paths, scratch);
+std::vector<std::uint32_t> labels(rows * cols);
+vcr::components::label(mask.data(), labels.data(), {rows, cols}, true);
+```
+
+`trace` accepts a padded input row stride and a `Backend::Cuda` option.
+`cuda::traceDevice`, `cuda::skeletonDevice`, `components::cuda::labelDevice`, and
+`distance::cuda::manhattanDevice` accept device pointers and complete on the
+calling thread's vc_reader stream. Host entry points include transfers. Skeleton
+calls accept a count of independent YX slices; components and distances take a
+2D/3D shape. Dimensions and pointer contracts are documented in the headers.
+CUDA trace grids require at most `UINT32_MAX` pixels (half that when returning
+polylines); connected components require at most `UINT32_MAX` voxels. All buffers
+must fit memory. CUDA tracing uses several image-sized work arrays and up to
+256 MiB of path proposals, plus final path storage when requested.
+
+`transforms::ConnectedComponents` produces uint32 label fields;
+`transforms::RidgeTrace` produces uint8 visit-index fields. `MedialSurface.method`
+selects the shared skeleton algorithm. These transforms accept explicit `on`
+fields or default to label targets and keep intermediate CUDA arrays resident.

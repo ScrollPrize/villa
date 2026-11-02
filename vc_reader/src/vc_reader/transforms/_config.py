@@ -80,7 +80,7 @@ _constructors = (
     "ClipOutliers GaussianBlur MedianFilter Sharpen BrightnessGradient LocalContrast "
     "LocalGamma LocalSmoothing BlankRectangle SliceIllumination Smear Flip Rotate90 "
     "Transpose CropPad Affine Elastic SheetCompression LowResolution ThickSlice "
-    "Morphology RandomBinaryOperator RemoveComponents ReplaceLabel Regions OneHot "
+    "Morphology RandomBinaryOperator RemoveComponents ConnectedComponents RidgeTrace ReplaceLabel Regions OneHot "
     "MaskImage DeepSupervision ToPseudo2D FromPseudo2D MedialSurface StripGeometry SurfacePerturb OrientedBlur "
     "DistanceTransform StructureTensor Ridges CoherenceEnhancingDiffusion "
     "BiasField PlasmaBrightnessContrast PlasmaShadow Illumination Vignetting RandomToneCurve "

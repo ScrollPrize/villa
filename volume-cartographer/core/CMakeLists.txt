@@ -36,7 +36,6 @@ add_library(vc_core
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp
-        src/Thinning.cpp
         src/Umbilicus.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )

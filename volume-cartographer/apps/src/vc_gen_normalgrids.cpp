@@ -41,7 +41,7 @@ inline uint32_t be32(uint32_t v) {
 #include <vc/core/util/GridStore.hpp>
 #include <vc_reader/zarr.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
-#include "vc/core/util/Thinning.hpp"
+#include <vc_reader/thinning.hpp>
 #include "vc/core/util/normalgridtools.hpp"
 #include "vc/core/util/LifeTime.hpp"
 
@@ -75,7 +75,7 @@ struct DirectionMetrics {
     size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
-    ThinningStats thinningStats;
+    vcr::thinning::Stats thinningStats;
 };
 
 struct RunMetrics {
@@ -131,12 +131,12 @@ struct ThreadSliceStats {
     size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
-    ThinningStats thinningStats;
+    vcr::thinning::Stats thinningStats;
 };
 
 struct ThreadScratch {
-    std::vector<std::vector<cv::Point>> traces;
-    ThinningScratch thinning;
+    vcr::thinning::Traces traces;
+    vcr::thinning::Scratch thinning;
 };
 
 // Anonymous-mapped buffer (mmap MAP_ANONYMOUS / VirtualAlloc). The kernel
@@ -1129,7 +1129,7 @@ void run_generate(const po::variables_map& vm) {
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
 
-    ThinningPruneParams prune_params;
+    vcr::thinning::PruneParams prune_params;
     prune_params.minLengthPx = vm["prune-min-length-px"].as<double>();
     if (prune_params.minLengthPx < 0.0) {
         throw std::runtime_error("--prune-min-length-px must be >= 0");
@@ -1576,11 +1576,9 @@ void run_generate(const po::variables_map& vm) {
 
                 std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
 
-                // Cap the team size to the batch — each ThinningScratch slot
-                // holds 5 slice-sized CV_8U mats once a thread touches it,
-                // and slots are never freed. Letting OMP scatter 4 work items
-                // across 15 tids leaks ~5 GiB of resident scratch per fresh
-                // tid that happens to grab a slice.
+                // Each worker retains image and path scratch buffers. Cap the
+                // team to the batch so idle workers do not accumulate large
+                // per-slice allocations across successive batches.
                 const int slice_team_threads = std::max<int>(
                     1,
                     std::min<int>(num_threads,
@@ -1610,9 +1608,11 @@ void run_generate(const po::variables_map& vm) {
 
                     scratch.traces.clear();
                     const auto thinning_start = std::chrono::steady_clock::now();
-                    ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces,
-                        &thinning_stats, scratch.thinning, prune_params);
+                    vcr::thinning::Stats thinning_stats;
+                    vcr::thinning::trace(assembled.binarySlice.data, assembled.binarySlice.rows,
+                        assembled.binarySlice.cols, nullptr, &scratch.traces, scratch.thinning,
+                        &thinning_stats, prune_params, vcr::thinning::Backend::Cpu,
+                        assembled.binarySlice.step);
                     const double thinning_seconds = seconds_since(thinning_start);
                     record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);

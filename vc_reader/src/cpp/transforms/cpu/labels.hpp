@@ -1,5 +1,7 @@
 #pragma once
 #include "../ops/labels.hpp"
+#include <vc_reader/thinning.hpp>
+#include <vc_reader/components.hpp>
 #include "spatial.hpp"
 #include "../shared/component_traversal.hpp"
 
@@ -252,25 +254,29 @@ inline Parameters sample(const FromPseudo2D&, const Sample& s, Random&) {
 inline void apply(const FromPseudo2D&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) { auto& f = s.at(c.key); auto& shape = f.array.shape; auto depth = shape[0] / c.channel; shape[0] = c.channel; shape.insert(shape.begin() + 1, depth); f.source.clear(); }
 }
-// Zhang-Suen thinning in each YX slice; simultaneous deletions within a subpass.
-inline void thin_slice(std::vector<double>& image, std::size_t height, std::size_t width) {
-    bool changed = true; std::vector<std::size_t> remove;
-    auto at = [&](std::int64_t y, std::int64_t x) { return y >= 0 && x >= 0 && y < std::int64_t(height) && x < std::int64_t(width) && image[std::size_t(y) * width + std::size_t(x)] != 0; };
-    while (changed) {
-        changed = false;
-        for (int phase = 0; phase < 2; ++phase) {
-            remove.clear();
-            for (std::int64_t y = 0; y < std::int64_t(height); ++y) for (std::int64_t x = 0; x < std::int64_t(width); ++x) {
-                if (!at(y, x)) continue;
-                bool n[8] = {at(y-1,x), at(y-1,x+1), at(y,x+1), at(y+1,x+1), at(y+1,x), at(y+1,x-1), at(y,x-1), at(y-1,x-1)};
-                int neighbors = 0, transitions = 0; for (int k = 0; k < 8; ++k) { neighbors += n[k]; transitions += !n[k] && n[(k + 1) % 8]; }
-                bool preserve = phase == 0 ? (n[0] && n[2] && n[4]) || (n[2] && n[4] && n[6]) : (n[0] && n[2] && n[6]) || (n[0] && n[4] && n[6]);
-                if (neighbors >= 2 && neighbors <= 6 && transitions == 1 && !preserve) remove.push_back(std::size_t(y) * width + std::size_t(x));
+inline Parameters sample(const ConnectedComponents&, const Sample&, Random&) { return {}; }
+inline Parameters sample(const RidgeTrace&, const Sample&, Random&) { return {}; }
+template<class T> inline void apply_label_analysis(const T& t, Sample& s) {
+    std::vector<std::pair<std::string,Field>> outputs;
+    for(const auto& [name,f]:s)if(selected_label(name,f,t.on)) {
+        const auto& a=f.array;const auto shape=a.spatial();const auto n=product(shape);
+        constexpr bool components=std::is_same_v<T,ConnectedComponents>;
+        Field out{Array::uninitialized(a.shape,'u',components?4:1),Target{Role::Label},name};
+        std::vector<std::uint8_t> mask(n);
+        for(std::size_t c=0;c<a.shape[0];++c) {
+            a.typed([&](const auto* values){for(std::size_t i=0;i<n;++i)mask[i]=values[c*n+i]!=0;});
+            if constexpr(components) vcr::components::label(mask.data(),static_cast<std::uint32_t*>(out.array.data())+c*n,shape,t.full_connectivity);
+            else {
+                const auto h=shape[shape.size()-2],w=shape.back();thinning::Scratch scratch;
+                for(std::size_t z=0;z<n;z+=h*w) thinning::trace(mask.data()+z,h,w,static_cast<std::uint8_t*>(out.array.data())+c*n+z,nullptr,scratch);
             }
-            changed |= !remove.empty(); for (auto i : remove) image[i] = 0;
         }
+        outputs.emplace_back(name+t.suffix,std::move(out));
     }
+    for(auto& [name,f]:outputs){require(!s.count(name),"derived label field already exists");s.emplace(name,std::move(f));}
 }
+inline void apply(const ConnectedComponents& t,Sample& s,const Parameters&) {apply_label_analysis(t,s);}
+inline void apply(const RidgeTrace& t,Sample& s,const Parameters&) {apply_label_analysis(t,s);}
 inline Parameters sample(const MedialSurface&, const Sample&, Random&) { return {}; }
 inline void apply(const MedialSurface& t, Sample& s, const Parameters&) {
     std::vector<std::pair<std::string, Field>> outputs;
@@ -279,8 +285,11 @@ inline void apply(const MedialSurface& t, Sample& s, const Parameters&) {
         Field out{Array(a.shape), Target{Role::Scalar}, name}; auto h = shape[d - 2], w = shape[d - 1];
         for (std::size_t c = 0; c < a.shape[0]; ++c) {
             auto values = a.channel(c); for (auto& v : values) if (t.ignore.count(name) && v == t.ignore.at(name)) v = 0;
-            auto skeleton = values; for (auto& v : skeleton) v = double(v > 0);
-            for (std::size_t start = 0; start < grid.size; start += h * w) { std::vector<double> slice(skeleton.begin() + start, skeleton.begin() + start + h * w); thin_slice(slice, h, w); std::copy(slice.begin(), slice.end(), skeleton.begin() + start); }
+            std::vector<std::uint8_t> binary(values.size());
+            for (std::size_t i=0;i<values.size();++i) binary[i]=values[i]>0;
+            thinning::skeleton(binary.data(),binary.data(),h,w,grid.size/(h*w),t.method,t.preserve_border);
+            std::vector<double> skeleton(binary.size());
+            for (std::size_t i=0;i<binary.size();++i) skeleton[i]=binary[i]!=0;
             if (t.tube) { skeleton = morphology(skeleton, grid, footprint, true); skeleton = morphology(skeleton, grid, footprint, true); }
             if (t.open) skeleton = morphology(skeleton, grid, footprint, Morph::Open, true);
             if (t.close) skeleton = morphology(skeleton, grid, footprint, Morph::Close, true);

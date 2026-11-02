@@ -90,7 +90,7 @@ add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
 
 add_executable(vc_thinning src/vc_thinning.cpp)
-target_link_libraries(vc_thinning vc_core opencv_ximgproc)
+target_link_libraries(vc_thinning vc_core vc_reader::thinning)
 
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.

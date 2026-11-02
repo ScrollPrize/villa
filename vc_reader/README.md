@@ -151,6 +151,11 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | Triangle slice labels, interpolated normals and surface frames (ordered DDA rasterization) | `sampling.hpp`: `geometry::MeshSlice`, `raster_slice` | `geometry/triangle_mesh.hpp`, `geometry/kernels.cu` | `geometry.rasterize_mesh_slice` |
 | Sheet normals from CT | `reader.hpp`: `sheetNormals`, `sheetNormalsCpu`; `cuda_reader.hpp`: `sheet_normal::sample_cuda` | `sheet_normal/`, `native_reader.cpp`, `symmetric_eigen.hpp` | `sheet_normal.py`: `sheet_normals`, `sample_sheet_normals` |
 | Shortest path over a 2D cost grid | `pathfinding.hpp`: `pathfinding::shortestPath` | `pathfinding/` | `shortest_path` |
+| Binary YX skeletons (Zhang–Suen, Guo–Hall, combined), independent slice batches, host/device buffers | `thinning.hpp`: `thinning::skeleton`, `cuda::skeleton`, `cuda::skeletonDevice` | `thinning/skeleton.cpp`, `thinning/kernels.cu` | `thinning.skeletonize`, `skeletonize_into`; `transforms.MedialSurface` |
+| Ordered distance-ridge traces, pruning, reusable CPU scratch; complete device-side tracing | `thinning.hpp`: `thinning::trace`, `prune`, `cuda::traceDevice` | `thinning/trace.cpp`, `thinning/trace_cuda.cu` | `thinning.trace_ridges`, `trace_ridges_into`, `TraceWorkspace`; `transforms.RidgeTrace` |
+| Exact uint8 Manhattan distance to background in 2D/3D, saturated at 255 | `distance_transform.hpp`: `distance::manhattan`, `cuda::manhattanDevice` | `distance/` | `thinning.manhattan_distance` |
+| Deterministic binary connected-component labels in 2D/3D, 4/6 or 8/26 neighbors | `components.hpp`: `components::label`, `cuda::labelDevice` | `components/`, shared transform component traversal | `thinning.connected_components`; `transforms.ConnectedComponents` |
+
 
 ### Display
 
@@ -1746,3 +1751,53 @@ Python, Qt, OpenCV, CUDA or the volume reader. Configure with
 Python requires the compiled `_catalog` extension but no NumPy or array backend
 for metadata browsing. Native regression tests are enabled by
 `VC_READER_BUILD_NATIVE_TESTS=ON`.
+
+### Skeletons, traces, and connected components
+
+```python
+from vc_reader import thinning, transforms as A
+
+# uint8 contiguous (Y,X), or any leading dimensions batching independent YX masks.
+skeleton = thinning.skeletonize(mask, method="guo_hall", backend="cuda")
+trace_image, xy_paths = thinning.trace_ridges(mask, backend="cuda", return_traces=True)
+labels = thinning.connected_components(mask, backend="cuda", full_connectivity=True)
+
+# Keep intermediate arrays on CUDA. Device inputs also produce device outputs.
+pipeline = A.Pipeline([
+    A.Morphology(on="mask", operation="close", radius=1),
+    A.ConnectedComponents(on="mask"),
+    A.RidgeTrace(on="mask"),
+    A.MedialSurface(on="mask", method="guo_hall", tube=False, close=False),
+], backend="cuda")
+result = pipeline({"mask": mask[None]}, seed=0)
+# mask_components, mask_traces, and mask_skel are added to the result.
+```
+
+Skeleton methods are `zhang_suen`, `guo_hall`, and `zhang_suen_guo_hall`.
+All nonzero input pixels are foreground; standalone skeleton outputs are 0/255.
+The standalone default preserves outer pixels; `preserve_border=False` treats
+outside pixels as background. `MedialSurface` defaults to the latter and retains
+input label values at skeleton pixels, with its existing optional morphology.
+Skeletons and ridge traces operate in YX planes; a stack is **not** a 3D skeleton.
+Components and Manhattan distances operate across the complete 2D or 3D grid.
+Component IDs are the first flat index in each component plus one, with zero for
+background. IDs are deterministic but not consecutive. Channels are independent.
+
+`RidgeTrace`/`trace_ridges` return visit-index pixels (seeds are 1, indices saturate
+at 255). `return_traces=True` also returns ordered XY polylines. `min_length` prunes
+polylines by pixel length and rasterizes survivors as 255. CPU `TraceWorkspace`
+buffers can be reused, with one workspace per thread. CUDA performs distance,
+seeds, components, and tracing on the device. Independent components run in
+parallel; within each component seed order is preserved. Short speculative path
+prefixes reduce serial work and are accepted only where the ordered visited mask
+allows them. Large single components can limit acceleration. Returning polylines
+copies the final paths to the host; optional pruning then runs on the host.
+
+For resident arrays, `skeletonize_into(input, output, backend="cuda")` and
+`trace_ridges_into(input, output)` use preallocated CUDA uint8 buffers. Calls
+complete on vc_reader's stream; finish external writes before calling.
+The transforms pipeline keeps intermediate images on device, including in
+`Pipeline.batch`; convergence/count checks can synchronize small scalars.
+CUDA initialization is a one-time cost, so repeated processing should keep a
+process/pipeline alive. See [the thinning benchmark](benchmarks/README.md#thinning)
+for reproducible latency and reference comparisons.
