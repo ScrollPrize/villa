@@ -1,10 +1,11 @@
 """Container adaptation, execution and replay for native transform pipelines."""
+from collections.abc import Mapping
 from copy import deepcopy
 
 import numpy as np
 
 from .. import _transforms
-from ._config import _unwrap
+from ._config import _Config, _unwrap
 
 
 def _as_array(value, inplace=False):
@@ -22,6 +23,73 @@ def _as_array(value, inplace=False):
     if inplace and (not array.flags.c_contiguous or not array.flags.writeable or not array.flags.aligned):
         raise ValueError("inplace transform requires writable contiguous aligned arrays")
     return np.require(array, requirements=["C", "A"]), converter
+
+
+def _is_torch(value):
+    return type(value).__module__.split(".")[0] == "torch"
+
+
+def _direct_setup(config, data, targets, compact):
+    """The pipeline, sample and bare-array field of a direct call; see ``_Config.__call__``."""
+    from .. import cuda
+    bare = not isinstance(data, Mapping)
+    key = None
+    if bare:
+        if targets is not None:
+            raise ValueError("targets apply to dict calls")
+        key, target = _transforms.direct_input(config._config)
+        sample, declared = {key: data}, {key: target}
+    else:
+        sample = data
+        declared = _transforms.default_targets() if targets is None else _unwrap(targets)
+    backend = "cuda" if any(cuda.is_device_array(v) for v in sample.values()) else "cpu"
+    if targets is not None and not all(isinstance(v, _Config) for v in targets.values()):
+        return Pipeline._direct(config, declared, compact, backend), sample, key
+    schema = None if targets is None else tuple(sorted((k, repr(v)) for k, v in targets.items()))
+    cache_key = (bare, backend, bool(compact), schema)
+    pipeline = config._direct_pipelines.get(cache_key)
+    if pipeline is None:
+        pipeline = config._direct_pipelines[cache_key] = Pipeline._direct(config, declared, compact, backend)
+    return pipeline, sample, key
+
+
+def _direct_result(out, key):
+    return out if key is None else out[_transforms.direct_output(key, list(out))]
+
+
+def _direct(config, data, targets, compact, inplace):
+    from .. import cuda
+    pipeline, sample, key = _direct_setup(config, data, targets, compact)
+    torch_cuda = [k for k, v in sample.items() if _is_torch(v) and getattr(v, "is_cuda", False)]
+    if torch_cuda:
+        sample = {k: cuda.wrap(v) if k in torch_cuda else v for k, v in sample.items()}
+    out = pipeline(sample, seed=_transforms.DIRECT_SEED, inplace=inplace)
+    if torch_cuda:
+        import torch
+        out = {k: torch.from_dlpack(v) if isinstance(v, cuda.DeviceArray) else v for k, v in out.items()}
+    return _direct_result(out, key)
+
+
+def _direct_batch(config, data, targets, compact):
+    pipeline, sample, key = _direct_setup(config, data, targets, compact)
+    arrays = {k: v for k, v in sample.items() if k in pipeline.targets and v is not None}
+    sizes = {len(v) for v in arrays.values()}
+    if len(sizes) != 1 or not (count := sizes.pop()):
+        raise ValueError("batch targets need one nonempty, shared leading dimension")
+    if pipeline.backend == "cuda":
+        return _direct_result(pipeline.batch(sample, seeds=[_transforms.DIRECT_SEED] * count), key)
+    results = [pipeline({k: v[i] if k in arrays else v for k, v in sample.items()}, seed=_transforms.DIRECT_SEED)
+               for i in range(count)]
+    out = dict(results[0])
+    for k in results[0]:
+        if k in arrays or k not in sample:
+            values = [r[k] for r in results]
+            if _is_torch(values[0]):
+                import torch
+                out[k] = torch.stack(values)
+            else:
+                out[k] = np.stack(values)
+    return _direct_result(out, key)
 
 
 class Plan:
@@ -68,6 +136,16 @@ class Pipeline:
         declared = _transforms.default_targets() if targets is None else _unwrap(self._declared_targets)
         self._engine = _transforms.Pipeline(_unwrap(self.transforms), declared, self.compact, backend)
         self.targets = self._engine.targets
+
+    @classmethod
+    def _direct(cls, config, targets, compact, backend):
+        """One transform outside a pipeline: always applied, run with DIRECT_SEED."""
+        self = cls.__new__(cls)
+        self.compact, self._requested_backend = bool(compact), backend
+        self.transforms, self._declared_targets = (config,), targets
+        self._engine = _transforms.direct_pipeline(config._config, targets, self.compact, backend)
+        self.targets = self._engine.targets
+        return self
 
     def __getstate__(self):
         return self.transforms, self._declared_targets, self.compact, self._requested_backend

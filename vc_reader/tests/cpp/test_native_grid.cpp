@@ -413,6 +413,72 @@ int main()
             require(near(r.values[64 + q], expected, 1e-3f), "surface layer along the normal");
         }
 
+        // Views: level choice by zoom, magnification over a surface raster.
+        {
+            const auto e1 = vcr::grid::voxelExtent(L1);
+            require(e1 == std::array<double, 3>{2, 2, 2}, "level 1 voxels span two working voxels");
+            const vcr::grid::Level sheared{a0.get(), u8, {}, {0, 0, 0}, std::array<double, 9>{0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0}};
+            require(vcr::grid::voxelExtent(sheared) == std::array<double, 3>{2, 2, 2}, "extent of a general level map");
+            const std::vector<vcr::grid::Level> both{L0, L1}, onlyCoarse{vcr::grid::Level{}, L1};
+            require(vcr::grid::levelForView(both, 1.0f) == 0 && vcr::grid::levelForView(both, 0.25f) == 1 &&
+                        vcr::grid::levelForView(both, 8.0f) == 0 && vcr::grid::levelForView(both, NAN) == 0,
+                    "level for a view's zoom");
+            require(vcr::grid::levelForView(onlyCoarse, 1.0f) == 1, "absent levels are skipped");
+            // A 16-pixel view at 1 px/voxel spans 16 voxels: only a level-1 chunk (16) covers it.
+            require(vcr::grid::fallbackLevels(both, 0, 16, 16, 1.0f) == 1 &&
+                        vcr::grid::fallbackLevels(both, 0, 16, 16, 4.0f) == 0 &&
+                        vcr::grid::fallbackLevels(both, 0, 16, 16, 1.0f, 0) == 0,
+                    "fallback levels up to one spanning the view");
+            // Vertices every 2 voxels in x and 3 in y; 4 pixels per vertex: x is the most
+            // magnified direction, 2 pixels per voxel.
+            auto grid = flatGrid(4, 6);
+            const vcr::grid::Surface flat({grid.data(), 4, 6, 18});
+            require(near(vcr::grid::pixelsPerVoxel(flat, {0.5, 0.5, 0.25, 0.25, 8, 8}), 2.0f), "pixels per voxel");
+            require(vcr::grid::pixelsPerVoxel(flat, {50, 50, 0.25, 0.25, 8, 8}) == 0.0f, "no surface under the view");
+        }
+
+        // Progressive frames: drawn from the caches alone; the reads they ask for complete them.
+        {
+            auto p0 = open(fine, 16), p1 = open(coarse, 8);
+            vcr::grid::Frame frame;
+            frame.plane = plane;
+            vcr::grid::Request view;
+            view.levels = {{p0.get(), u8, L0.scale, L0.offset}, {p1.get(), u8, L1.scale, L1.offset}};
+            vcr::grid::Pending pending;
+            r = vcr::grid::sampleCached(frame, view, &pending);
+            for (std::size_t q = 0; q < 32; ++q)
+                require(r.level[q] == vcr::grid::Result::kMissing, "an uncached frame is missing everywhere");
+            require(p0->stats().disk_hits == 0 && pending.coarse.size() == 1 && pending.target.size() == 1,
+                    "the frame read nothing and asks for a preview and its level");
+            require(r.missingChunks.size() == 2 && !r.missingChunks[0].empty() &&
+                        pending.target[0].chunks == r.missingChunks[0] && pending.coarse[0].chunks == r.missingChunks[1],
+                    "a CPU frame names the chunks its reads fetch");
+            int parts = 0;
+            require(vcr::grid::load(pending, [&] { ++parts; return false; }).empty() && parts == 1, "load stops when told");
+            vcr::grid::Pending rest;
+            r = vcr::grid::sampleCached(frame, view, &rest);
+            for (std::size_t q = 0; q < 32; ++q)
+                require(r.level[q] == 1 && near(r.values[q], 200.0f), "the preview fills the frame");
+            require(rest.coarse.empty() && rest.target.size() == 1, "only the view's level is still asked for");
+            const auto readsBefore = p0->stats().disk_hits.load();
+            vcr::grid::load(rest);
+            require(p0->stats().disk_hits.load() - readsBefore == rest.target[0].chunks.size(), "each lacking chunk is read once");
+            vcr::grid::Pending none;
+            r = vcr::grid::sampleCached(frame, view, &none);
+            require(none.empty() && r.level[9] == 0 && near(r.values[9], value(3, 4, 4)), "the loaded frame is complete");
+            // A surface frame keeps its surface alive.
+            auto xyz = flatGrid(4, 6);
+            vcr::grid::Frame along;
+            along.surface = vcr::grid::Surface::snapshot({xyz.data(), 4, 6, 18});
+            along.raster = {0.5, 0.5, 0.25, 0.25, 8, 8};
+            xyz.assign(xyz.size(), NAN);
+            vcr::grid::Pending more;
+            vcr::grid::sampleCached(along, view, &more);
+            vcr::grid::load(more);
+            r = vcr::grid::sampleCached(along, view, nullptr);
+            require(r.level[0] == 0 && near(r.values[0], value(1, 1.5f, 10), 1e-3f), "a surface frame completes too");
+        }
+
         // Placement maps: scale form when axis aligned, otherwise general.
         const auto scaled = vcr::grid::levelFromMap(*a0, u8, {0, 0, 2, 1, 0, 3, 0, 2, 4, 0, 0, 3});
         require(!scaled.linear && scaled.scale == std::array<double, 3>{2, 3, 4} &&

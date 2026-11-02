@@ -1,15 +1,17 @@
 import os
 import numpy as np
 import torch
-from vc_reader.torch import normalize
+import vc_reader.transforms as A
 import napari
 from pathlib import Path
 import torch.nn as nn
 from tqdm.auto import tqdm
 import contextlib
 from typing import Optional, List, Tuple, Dict, Any, Union, Callable
-from monai.inferers import SlidingWindowInferer, SaliencyInferer, Inferer
-from monai.transforms import AsDiscrete
+import itertools
+
+from vesuvius.models.run.blending import generate_gaussian_map
+from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
 
 # Model loader class
 class ModelLoader:
@@ -94,116 +96,93 @@ class ModelLoader:
                 
         return model, model_config
 
-class MonaiInferer:
-    def __init__(self, 
-                model: nn.Module,
-                roi_size: Union[List[int], Tuple[int, ...]], 
-                sw_batch_size: int = 1,
-                overlap: float = 0.25,
-                mode: str = "constant",
-                sigma_scale: float = 0.125,
-                padding_mode: str = "constant",
-                cval: float = 0.0,
-                sw_device = None,
-                device = None,
-                progress: bool = True,
-                cache_roi_weight_map: bool = False,
-                cpu_thresh = None,
-                buffer_steps = None,
-                buffer_dim: int = -1,):
-        
-        self.model = model
-        self.device = device or next(model.parameters()).device
-        self.model.to(self.device)
-        self.model.eval()
-        
-        self.sliding_window_inferer = SlidingWindowInferer(
-            roi_size=roi_size,
-            sw_batch_size=sw_batch_size,
-            overlap=overlap,
-            mode=mode,
-            sigma_scale=sigma_scale,
-            padding_mode=padding_mode,
-            cval=cval,
-            sw_device=sw_device,
-            device=self.device,
-            progress=progress,
-            cache_roi_weight_map=cache_roi_weight_map,
-            cpu_thresh=cpu_thresh,
-            buffer_steps=buffer_steps,
-            buffer_dim=buffer_dim,
-        )
-        
-    def infer(self, inputs: torch.Tensor, post_transform: Optional[Callable] = None) -> Dict[str, np.ndarray]:
-
-        if not isinstance(inputs, torch.Tensor):
-            inputs = torch.as_tensor(inputs)
-        
-        if inputs.dtype != torch.float32:
-            inputs = inputs.to(dtype=torch.float32)
-            
-        if inputs.ndim == 2:  # (H, W)
-            inputs = inputs.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        elif inputs.ndim == 3:  # (D, H, W) or (C, H, W)
-            # Assume channel dimension is missing
-            inputs = inputs.unsqueeze(0)  # (1, D, H, W) or (1, C, H, W)
-        elif inputs.ndim == 4:  # (C, D, H, W) - 3D with channels or (B, C, H, W) - 2D with batch
-            # Check if this is 3D data with channels or 2D data with batch
-            if len(self.sliding_window_inferer.roi_size) == 3:  # 3D inference
-                inputs = inputs.unsqueeze(0)  # (1, C, D, H, W)
-            # Otherwise, leave as is - already has batch dimension
-        
-
-        inputs = inputs.to(device=self.device)
-        
-        inputs = normalize(inputs.float(), "minmax", eps=1e-5)
-        
-        with torch.no_grad():
-            outputs = self.sliding_window_inferer(inputs, self.model)
-        
-        result = {}
-        
-        if isinstance(outputs, torch.Tensor):
-            # Single output tensor
-            outputs = {"output": outputs}
-        elif isinstance(outputs, tuple) and all(isinstance(o, torch.Tensor) for o in outputs):
-            # Tuple of tensors
-            outputs = {f"output_{i}": tensor for i, tensor in enumerate(outputs)}
-        elif not isinstance(outputs, dict):
-            raise ValueError(f"Unexpected output format: {type(outputs)}")
-        
-        for name, tensor in outputs.items():
-            if post_transform is not None:
-                tensor = post_transform(tensor)
-                
-            array = tensor.detach().cpu().numpy()
-            result[name] = array
-            
-        return result
+def _as_outputs(outputs) -> Dict[str, torch.Tensor]:
+    if isinstance(outputs, torch.Tensor):
+        return {"output": outputs}
+    if isinstance(outputs, tuple) and all(isinstance(o, torch.Tensor) for o in outputs):
+        return {f"output_{i}": tensor for i, tensor in enumerate(outputs)}
+    if isinstance(outputs, dict):
+        return outputs
+    raise ValueError(f"Unexpected output format: {type(outputs)}")
 
 
-def run_inference(viewer: napari.Viewer, 
-                       layer: napari.layers.Layer, 
-                       checkpoint_path: str,
-                       roi_size: Optional[Tuple[int, ...]] = None,
-                       overlap: float = 0.25,
-                       sw_batch_size: int = 2,
-                       mode: str = "constant",
-                       sigma_scale: float = 0.125,
-                       padding_mode: str = "constant",
-                       cval: float = 0.0,
-                       sw_device = None,
-                       progress: bool = True,
-                       cache_roi_weight_map: bool = False,
-                       cpu_thresh = None,
-                       buffer_steps = None,
-                       buffer_dim: int = -1,
-                       with_coord: bool = False,
-                       use_saliency: bool = False,
-                       target_layers: Optional[List[str]] = None,
-                       cam_name: str = "GradCAM",
-                       class_idx: Optional[int] = None,
-                       activation_type: str = "none") -> List[napari.layers.Layer]:
+def sliding_window_inference(model: nn.Module,
+                             image: np.ndarray,
+                             patch_size: Tuple[int, ...],
+                             overlap: float = 0.25,
+                             batch_size: int = 2,
+                             sigma_scale: float = 8.0,
+                             post_transform: Optional[Callable] = None) -> Dict[str, np.ndarray]:
+    """Gaussian-blended sliding-window prediction of an in-memory image.
+
+    Patch positions and blend weights are those of ``vesuvius.predict`` /
+    ``vesuvius.blend_logits``: per-axis steps from
+    ``compute_steps_for_sliding_window`` with step fraction ``1 - overlap``,
+    weights from ``generate_gaussian_map`` (sigma = patch / sigma_scale).
+    ``image`` is spatial ``(Y, X)`` / ``(Z, Y, X)`` or channel-first
+    ``(C, ...)``; spatial axes smaller than the patch are zero-padded.
+    Returns ``(1, C_out, ...)`` arrays per model output.
+    """
+    patch_size = tuple(int(p) for p in patch_size)
+    dims = len(patch_size)
+    if image.ndim == dims:
+        image = image[None]
+    elif image.ndim != dims + 1:
+        raise ValueError(f"{dims}D patch needs a {dims}D or channel-first {dims + 1}D image, got shape {image.shape}")
+
+    device = next(model.parameters()).device
+    model.eval()
+    inputs = A.Normalize("minmax", eps=1e-5)(torch.as_tensor(np.asarray(image), dtype=torch.float32, device=device))[None]
+
+    spatial = tuple(inputs.shape[2:])
+    padded = tuple(max(s, p) for s, p in zip(spatial, patch_size))
+    if padded != spatial:
+        pad = []
+        for s, p in reversed(list(zip(spatial, padded))):
+            pad += [0, p - s]
+        inputs = torch.nn.functional.pad(inputs, pad, mode="constant", value=0.0)
+
+    step = 1.0 - overlap
+    positions = list(itertools.product(*(compute_steps_for_sliding_window(s, p, step)
+                                          for s, p in zip(padded, patch_size))))
+    weight = torch.as_tensor(generate_gaussian_map(patch_size, sigma_scale=sigma_scale)[0], device=device)
+    weight_sum = torch.zeros(padded, dtype=torch.float32, device=device)
+    sums: Dict[str, torch.Tensor] = {}
+
+    with torch.no_grad():
+        for start in tqdm(range(0, len(positions), batch_size), desc="Sliding window"):
+            batch_pos = positions[start:start + batch_size]
+            windows = [tuple(slice(o, o + p) for o, p in zip(pos, patch_size)) for pos in batch_pos]
+            batch = torch.cat([inputs[(slice(None), slice(None)) + w] for w in windows])
+            for name, pred in _as_outputs(model(batch)).items():
+                acc = sums.get(name)
+                if acc is None:
+                    acc = sums[name] = torch.zeros((pred.shape[1],) + padded, dtype=torch.float32, device=device)
+                for i, w in enumerate(windows):
+                    acc[(slice(None),) + w] += pred[i].float() * weight
+            for w in windows:
+                weight_sum[w] += weight
+
+    crop = tuple(slice(0, s) for s in spatial)
+    weight_sum = weight_sum[crop]
+    result = {}
+    for name, acc in sums.items():
+        acc = acc[(slice(None),) + crop]
+        blended = torch.where(weight_sum > 0, acc / weight_sum, acc)[None]
+        if post_transform is not None:
+            blended = post_transform(blended)
+        result[name] = blended.cpu().numpy()
+    return result
+
+
+def run_inference(viewer: napari.Viewer,
+                  layer: napari.layers.Layer,
+                  checkpoint_path: str,
+                  roi_size: Optional[Tuple[int, ...]] = None,
+                  overlap: float = 0.25,
+                  batch_size: int = 2,
+                  sigma_scale: float = 8.0,
+                  activation_type: str = "none") -> List[napari.layers.Layer]:
 
     config_manager = None
     try:
@@ -213,93 +192,44 @@ def run_inference(viewer: napari.Viewer,
             print("Using global config manager from main_window")
     except (ImportError, AttributeError):
         print("No global config manager available")
-    
 
     loader = ModelLoader(checkpoint_path, config_manager=config_manager)
     model, model_config = loader.load()
-    checkpoint_path = Path(checkpoint_path)
-    model_name = checkpoint_path.stem
+    model_name = Path(checkpoint_path).stem
     image_data = layer.data
 
     if roi_size is None:
-        if 'patch_size' in model_config:
-            config_patch_size = model_config['patch_size']
-            print(f"Using patch_size from model_config: {config_patch_size}")
-            roi_size = tuple(config_patch_size)
-        elif 'train_patch_size' in model_config:
-            config_patch_size = model_config['train_patch_size']
-            print(f"Using train_patch_size from model_config: {config_patch_size}")
-            roi_size = tuple(config_patch_size)
+        for key in ('patch_size', 'train_patch_size'):
+            if key in model_config:
+                roi_size = tuple(model_config[key])
+                print(f"Using {key} from model_config: {roi_size}")
+                break
         else:
             raise ValueError("No patch_size or train_patch_size found in model config. Cannot proceed with inference.")
-    
-    # Determine inference dimensionality from model roi_size, not raw data shape.
-    # Many napari images are (C, H, W); that should be treated as 2D when roi_size is 2.
-    is_3d = len(roi_size) == 3
+
+    # Dimensionality comes from the model patch, not the raw data: napari
+    # images are often (C, H, W), which is 2D inference with a 2D patch.
+    if len(roi_size) not in (2, 3):
+        raise ValueError(f"roi_size must be 2D or 3D, got {roi_size}")
     print(f"Final roi_size for inference: {roi_size}")
-    print(f"Data shape: {image_data.shape}, Using {'3D' if is_3d else '2D'} inference")
-    
-    if is_3d and len(roi_size) != 3:
-        raise ValueError(f"3D data requires 3D roi_size, but got {roi_size}")
-    elif not is_3d and len(roi_size) != 2:
-        raise ValueError(f"2D data requires 2D roi_size, but got {roi_size}")
-    
-    # Sanity-check: roi_size must match intended dims
-    model_dims = len(roi_size)
-    data_dims = 3 if is_3d else 2
-    if model_dims != data_dims:
-        raise ValueError(f"Model dimensionality ({model_dims}D) must match data dimensionality ({data_dims}D)")
-    
-    # Create inferer with all sliding window parameters
-    inferer = MonaiInferer(
-        model=model,
-        roi_size=roi_size,
-        sw_batch_size=sw_batch_size,
-        overlap=overlap,
-        mode=mode,
-        sigma_scale=sigma_scale,
-        padding_mode=padding_mode,
-        cval=cval,
-        sw_device=sw_device,
-        progress=progress,
-        cache_roi_weight_map=cache_roi_weight_map,
-        cpu_thresh=cpu_thresh,
-        buffer_steps=buffer_steps,
-        buffer_dim=buffer_dim,
-    )
-    
-    # Set up post-processing
+    print(f"Data shape: {image_data.shape}, Using {len(roi_size)}D inference")
+
     post_transform = None
-    if activation_type.lower() == "sigmoid":
+    activation = activation_type.lower()
+    if activation == "sigmoid":
         post_transform = torch.sigmoid
-    elif activation_type.lower() == "softmax":
-        def softmax_transform(x):
-            return torch.softmax(x, dim=1)
-        post_transform = softmax_transform
-    elif activation_type.lower() == "argmax":
-        post_transform = AsDiscrete(argmax=True)
-    
-    # Run inference
+    elif activation == "softmax":
+        post_transform = lambda x: torch.softmax(x, dim=1)
+    elif activation == "argmax":
+        post_transform = lambda x: torch.argmax(x, dim=1, keepdim=True).float()
+
+    results = sliding_window_inference(model, np.asarray(image_data), roi_size, overlap=overlap,
+                                       batch_size=batch_size, sigma_scale=sigma_scale,
+                                       post_transform=post_transform)
     new_layers = []
-    
-    try:
-        results = inferer.infer(image_data, post_transform=post_transform)
-        
-        for output_name, result in results.items():
-            layer_name = f"{layer.name}_{model_name}_{output_name}"
-            
-            # Add as image layer
-            new_layer = viewer.add_image(
-                result,
-                name=layer_name,
-                colormap='gray',
-                blending='translucent'
-            )
-            new_layers.append(new_layer)
-            
-    except Exception as e:
-        print(f"Inference error: {str(e)}")
-        raise e
-    
+    for output_name, result in results.items():
+        new_layers.append(viewer.add_image(result, name=f"{layer.name}_{model_name}_{output_name}",
+                                           colormap='gray', blending='translucent'))
+
     print(f"Inference completed. Added {len(new_layers)} new layers to the viewer.")
     return new_layers

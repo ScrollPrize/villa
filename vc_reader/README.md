@@ -71,7 +71,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Level placement in level-0 coordinates; a level ready for `grid::sample` | `zarr.hpp`: `zarr::LevelPlacement`, `levelPlacement`, `declaredPlacement`, `gridLevel` | `zarr/open.cpp` | `ZarrGroup.placement` |
 | Parse `.zarray` / `zarr.json` | `zarr_array_meta.hpp`: `zarr::parseArrayMeta`, `ArrayMeta` | `zarr/meta.cpp` | `reader/zarr_meta.py`: `ArrayMeta` |
 | Region reads, integer point reads, nearest and linear sampling, affine grids, cache-only sampling, single chunks | `array.hpp`: `Array::read_many`, `read_points`, `sample_nearest`, `sample_linear`, `read_affine`, `sample_nearest_cached`, `sample_linear_cached`, `chunk`, `cached_chunk` | `array.hpp`, `chunk_io.hpp`, `zarr_storage.hpp`, `shard_index.hpp` | `ZarrReader` |
-| The same reads on the GPU | `cuda_reader.hpp`: `reader_cuda::Reader` | `reader_cuda/reader.hpp`, `reader_cuda/kernels.cu` | `reader/cuda.py`: `CudaReader` |
+| The same reads on the GPU; one device brick cache shared by several readers (e.g. a pyramid's levels) | `cuda_reader.hpp`: `reader_cuda::Reader`, `reader_cuda::Pool` | `reader_cuda/reader.hpp`, `reader_cuda/kernels.cu` | `reader/cuda.py`: `CudaReader`, `CudaPool` |
 | Chunks computed on demand, read and sampled like a stored array, with a persistent cache | `computed.hpp`: `computed::open` | `computed.cpp` | `_reader.open_computed` |
 | Credentials and access: anonymous, basic, signed S3, AWS profiles, bucket region | `zarr.hpp`: `zarr::resolveAccess`, `s3Access`, `basicAccess`, `awsCredentials`, `bucketRegion`, `loadBasicAuth` | `zarr/access.cpp`, `http.hpp`, `sigv4.hpp` | `reader/auth.py` |
 | List S3 prefixes; URL helpers | `zarr.hpp`: `zarr::listChildren`, `listObjects`, `listPage`, `isRemote`, `httpUrl`, `s3Location`, `levelGroupLocation`; `s3_listing.hpp`: `s3::listUrl`, `parseListPage` | `zarr/access.cpp`, `s3_listing.cpp` | `ObjectStore`, `reader/auth.py` |
@@ -102,7 +102,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Write tifxyz with channels and rollback | `tifxyz.hpp`: `tifxyz::write`, `WriteOptions`, `Channel` | `tifxyz/tifxyz.cpp` | `tifxyz.write` |
 | In-memory surface: bounds, retargeting to another level, positions, normals and tangents | `tifxyz.hpp`: `tifxyz::Surface` | `tifxyz/tifxyz.cpp` | `tifxyz.Surface` |
 | Bilinear or bicubic Hermite interpolation of a vertex grid, with normals and tangents | `grid.hpp`: `grid::Surface`, `resample`, `pointsAt`, `snapshot`, `Raster`, `Interpolation` | `grid/grid.cpp`, `grid/points.hpp` | `tifxyz.Surface.resample`, `.points_at` |
-| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
+| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `grid.sample_grid` (every request field); `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
 | Reduce layers to one value per pixel: mean, max, min, median, min-abs, alpha, Beer-Lambert | `composite.hpp`: `composite::reduce` | `composite/` | `_reader.composite_reduce` |
 | Render surface layers; project a label patch into CT | `aligned_reader.hpp`: `sources::SampleReader`, `SurfaceProjection` | `sources/surface_reader.cpp`, `projection/` | `SampleReader.render_surface`, `.project_surface`, `.iter_project_surface` |
 
@@ -163,6 +163,8 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | --- | --- | --- | --- |
 | Float to uint8/uint16 conversion, window/level, palette and overlay LUTs, ARGB blending | `display.hpp`: `display::toUint8`, `toUint16`, `windowLevelLut`, `paletteLut`, `overlayLut`, `applyLut`, `blend`, `blendArgb` | `display/` | `display_to_uint8`, `display_to_uint16`, `window_level_lut`, `palette_lut`, `overlay_lut`, `apply_lut`, `blend`, `blend_argb` |
 | Volumetric slab compositing, including perspective | `slab.hpp`: `display::compositeSlab`, `opacityLut`, `Slab` | `display/slab.cpp`, `display/slab_pixel.hpp` | `composite_slab`, `opacity_lut`, `SlabProjection` |
+| Views: the level for a zoom, fallback levels, a surface raster's pixels per voxel; progressive frames drawn from the caches with the reads they lacked | `grid.hpp`: `grid::levelForView`, `fallbackLevels`, `voxelExtent`, `pixelsPerVoxel`, `Frame`, `Pending`, `sampleCached`, `load` | `grid/view.cpp` | `grid.py`: `level_for_view`, `fallback_levels`, `pixels_per_voxel`, `Pending`, `sample_grid`, `sample_grid_cached`, `load`; levels from `ZarrReader.grid_level` |
+| The render engine from C or any language with a C FFI: volumes, surfaces, frames, progressive reads, composites, display tables | `vc_reader_c.h` (`vc_reader::c`, `libvc_reader_c`) | `c_api/c_api.cpp` | — |
 
 ### Transforms and training
 
@@ -170,7 +172,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | --- | --- | --- | --- |
 | Augmentation and processing pipelines with seeded replay, on CPU or CUDA ([catalog](#transforms)) | `transforms.hpp`: `transforms::Pipeline`, `Op`, `Sample`, `Plan`, `save_plan`, `load_plan` | `transforms/pipeline.hpp`, `transforms/ops/`, `transforms/cpu/`, `transforms/cuda/` | `vc_reader.transforms` |
 | Device buffers, streams, resident pipelines and batches | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap` |
-| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `normalize`, `structure_tensor` |
+| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `structure_tensor`; direct calls `A.Normalize(...).batch` |
 | Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
 | Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
 
@@ -398,6 +400,23 @@ Use fixed parameters for processing, such as `A.GaussianBlur(sigma=1.0)`, or
 sample parameters with `A.Uniform`, `A.Normal` and `A.Choice` for augmentation.
 Several constructors have random defaults; pipeline calls take an explicit
 `seed` for reproducibility, and `Plan` records sampled operations for replay.
+
+Every transform can also be called on its own. A transform is random only in a
+`Pipeline`: called directly it always applies (`p` is ignored) and draws
+anything else from a fixed seed, so the same input gives the same output. Pass
+plain values for processing. An array (NumPy, Torch CPU/CUDA or `DeviceArray`)
+stands for the field the transform reads by default and the call returns the
+field it creates, else the transformed input; a sample dict works like a
+pipeline call. `.batch` does the same over `(B, C, ...)` batches, CUDA ones in
+one launch.
+
+```python
+sdt = A.DistanceTransform(mode="outside")(mask)        # (1, Z, Y, X) label
+st = A.StructureTensor(sigma=1, rho=1.5)(image)          # created field
+z = A.Normalize("zscore", nonzero=False).batch(crops)    # (B, 1, Z, Y, X) CUDA
+out = A.Normalize("minmax", masked=True).batch(
+    {"image": x, "valid": v}, targets={"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()})
+```
 
 | Operation family | Examples |
 | --- | --- |
@@ -1694,6 +1713,29 @@ CUDA backends. Python and C++ use the same implementations. Configure with
 See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
 array/cache configuration, transform pipelines and replay, device-buffer
 ownership, streams, and a complete CPU/CUDA CT-normal example.
+
+### C API
+
+`libvc_reader_c` (CMake target `vc_reader::c`, header `<vc_reader/vc_reader_c.h>`)
+exposes the render engine to C and to any language with a C FFI (Rust, C#, Swift,
+Go, Node, ctypes). It opens a volume's pyramid with its caches, chooses levels for a
+view, samples planes and vertex-grid or tifxyz surfaces with layers and composites,
+draws frames progressively (`vcr_sample_cached` now, `vcr_pending_load` on a worker,
+then draw again), and maps samples to display pixels. Handles are opaque, outputs go
+to caller buffers, every failure is a `vcr_status` with `vcr_last_error()`, and only
+`vcr_*` symbols are exported. A frontend's loop:
+
+```c
+vcr_request_init(&req); req.volume = volume;
+req.start_level = vcr_level_for_view(volume, zoom, 1.0f);
+req.fallback_levels = vcr_fallback_levels(volume, req.start_level, w, h, zoom, 5);
+vcr_sample_cached(&frame, &req, pending, &result);   /* draw result now */
+if (!vcr_pending_empty(pending))                      /* on a worker thread: */
+    vcr_pending_load(pending, redraw, ui);            /* then sample again */
+```
+
+`tests/c/test_c_api.c` builds as strict C99 and exercises each path, on the GPU too
+when one is available.
 
 ### Native catalog
 

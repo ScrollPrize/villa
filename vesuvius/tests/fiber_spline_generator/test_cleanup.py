@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from vesuvius.afv_spline_generator import cleanup
+from vesuvius.fiber_spline_generator import cleanup
 
 
 def line(start, end, step=0.5):

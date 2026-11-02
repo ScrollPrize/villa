@@ -9,6 +9,9 @@ import tempfile
 import unittest
 
 import numpy as np
+from build_support import load_build
+load_build()
+
 from vc_reader import Affine, Catalog, Companion, Plane, Selection, Source, Storage, VolumeRegistration
 from test_source_storage import array
 from vc_reader.cuda import is_available

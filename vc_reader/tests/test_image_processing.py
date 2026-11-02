@@ -54,6 +54,9 @@ def test_structure_tensor_values_and_backward(dim, sigma, rho):
         reference = _torch_tensor_reference(image, sigma, rho)
         actual = structure_tensor(image, sigma=sigma, rho=rho)
         torch.testing.assert_close(actual, reference, atol=2e-6, rtol=2e-5)
+        pipeline = A.Pipeline([A.StructureTensor(sigma=sigma, rho=rho)], backend=device)
+        components = pipeline({"image": image[0].detach().cpu().numpy()}, seed=0)["image_st"]
+        np.testing.assert_allclose(components, reference[0].detach().cpu().numpy(), atol=2e-6, rtol=2e-5)
         cotangent = torch.tensor(np.random.default_rng(3).normal(size=actual.shape), dtype=image.dtype, device=device)
         expected_grad, = torch.autograd.grad(reference, image, cotangent)
         actual_grad, = torch.autograd.grad(actual, image, cotangent)
@@ -78,6 +81,37 @@ def test_distance_transform_scipy_boundaries(shape, fill):
         pipeline = A.Pipeline([A.DistanceTransform(implicit_background=True)], targets={"label": A.Label()}, backend=backend)
         actual = pipeline({"label": mask[None]}, seed=0)["label_sdt"][0]
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_direct_call_is_deterministic_and_keeps_containers():
+    """Outside a Pipeline a transform always applies with a fixed seed; arrays in, field out."""
+    rng = np.random.default_rng(3)
+    mask = (rng.random((1, 9, 11, 13)) < .05).astype(np.uint8)
+    image = rng.random((1, 16, 17), dtype=np.float32)
+
+    distance = A.DistanceTransform(mode="outside")
+    sdt = distance(mask)  # bare label array -> the field the transform creates
+    sample = distance({"label": mask}, targets={"label": A.Label()})
+    np.testing.assert_array_equal(sdt, sample["label_sdt"])
+    assert set(sample) == {"label", "label_sdt"}
+
+    noise = A.GaussianNoise(std=(.1, .2), p=.01)  # p is ignored and the seed fixed
+    assert not np.array_equal(noise(image), image)
+    np.testing.assert_array_equal(noise(image), noise(image))
+    blur = A.GaussianBlur(sigma=2)
+    expected = A.Pipeline([blur], targets={"image": A.Image(valid=None)})({"image": image}, seed=A._transforms.DIRECT_SEED)["image"]
+    np.testing.assert_array_equal(blur(image), expected)
+    with pytest.raises(ValueError, match="several fields"):
+        A.DistanceTransform(normals="_n")(mask)
+
+    torch = pytest.importorskip("torch")
+    np.testing.assert_array_equal(blur(torch.from_numpy(image)).numpy(), expected)
+    if "cuda" in _backends() and torch.cuda.is_available():
+        from vc_reader import cuda
+        on_device = blur(torch.from_numpy(image).cuda())
+        assert on_device.is_cuda
+        np.testing.assert_allclose(on_device.cpu().numpy(), expected, atol=1e-5)
+        assert isinstance(blur(cuda.asarray(image)), cuda.DeviceArray)
 
 
 def _ridge_reference(image):

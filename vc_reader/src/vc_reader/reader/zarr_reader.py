@@ -98,14 +98,29 @@ class ZarrReader:
 
     # -- construction -----------------------------------------------------------
 
-    def cuda(self, *, cache_bytes=512 << 20, device=0):
+    def cuda(self, *, cache_bytes=512 << 20, device=0, pool=None):
         """Optional CUDA adapter for 3-D uint8 CT; outputs remain on device.
 
-        Owns a bounded device chunk cache. Create one per worker/device and
-        reuse it across reads; close it or use it as a context manager.
+        Owns a bounded device chunk cache, or shares ``pool`` (a ``CudaPool``, e.g.
+        with the other levels of a pyramid). Create one per worker/device and reuse
+        it across reads; close it or use it as a context manager.
         """
         from .cuda import CudaReader
-        return CudaReader(self, cache_bytes=cache_bytes, device=device)
+        return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool)
+
+    def grid_level(self, *, working_scale=(1, 1, 1), working_offset=(0, 0, 0), cuda=None, map=None):
+        """This array as a :mod:`vc_reader.grid` level.
+
+        Points are XYZ in the voxels of the working placement (ZYX level-0 scale and
+        offset; level 0 by default), placed through this pyramid level's placement. A
+        row-major 3x4 ``map`` from XYZ points to ZYX indices replaces the placement (e.g.
+        a registration). ``cuda`` is this array's :meth:`cuda` reader, to sample on the GPU.
+        """
+        self._ready()
+        engine = None if cuda is None else cuda._engine
+        if map is not None:
+            return _reader.grid_level_from_map(self._opened, tuple(float(v) for v in np.ravel(map)), engine)
+        return _reader.grid_level(self._opened, tuple(working_scale), tuple(working_offset), engine)
 
     @classmethod
     def computed(

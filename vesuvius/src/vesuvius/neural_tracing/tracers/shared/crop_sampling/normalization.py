@@ -4,14 +4,12 @@ from pathlib import Path
 import numpy as np
 from vc_reader import transforms as A
 from vc_reader.reader import open_zarr
-from vc_reader.torch import normalize
 
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 
 ZSCORE_METHOD = 'crop_zscore_v1'
 ZSCORE_EPSILON = 1e-6
-_ZSCORE = A.Pipeline([A.Normalize('zscore', nonzero=False, eps=ZSCORE_EPSILON)],
-                     targets={'image': A.Image(valid=None)}, backend='cpu')
+_ZSCORE = A.Normalize('zscore', nonzero=False, eps=ZSCORE_EPSILON)
 
 
 def volume_key(spec):
@@ -79,9 +77,9 @@ def normalize_ct(image, record):
         raise ValueError('A z-score normalization record is required before sampling model inputs')
     if image.dtype != np.float32 or image.ndim != 3 or not image.flags.c_contiguous:
         raise ValueError('CT normalization requires a contiguous float32 3D crop')
-    _ZSCORE({'image': image[None]}, seed=0, inplace=True)
+    _ZSCORE(image[None], inplace=True)
 
 
 def zscore_crops(crops):
     """Per-crop z-score of torch crops (..., D, H, W): the GPU sampler's counterpart of ``normalize_ct``."""
-    return normalize(crops.reshape(-1, 1, *crops.shape[-3:]), eps=ZSCORE_EPSILON).view_as(crops)
+    return _ZSCORE.batch(crops.reshape(-1, 1, *crops.shape[-3:])).view_as(crops)

@@ -215,7 +215,7 @@ def load_network(folder: Path, device) -> tuple[Any, tuple[int, int, int]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="vesuvius.afv_spline_generator",
+        prog="vesuvius.fiber_spline_generator",
         description="Predict fibers in a zone of a CT volume and write them as a fiber object store (.vcobj) for VC3D.",
     )
     parser.add_argument("--volume", required=True, help="Zarr or OME-Zarr volume: local path, http(s):// or s3:// URL")
@@ -335,7 +335,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     from .extend.stitch import Stitcher
 
     generator = {
-        "name": "vesuvius.afv_spline_generator",
+        "name": "vesuvius.fiber_spline_generator",
         "source_path": args.source_path,
         "voxel_size_um": args.voxel_size,
         **provenance,

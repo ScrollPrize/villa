@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -174,6 +175,10 @@ struct Result {
     // What a GPU pass failed with, when the request was sampled on the CPU instead
     // (see sample); empty otherwise.
     std::string cudaFailure;
+    // Cached-only requests sampled on the CPU: per request level, the chunks (keys
+    // (z * grid[1] + y) * grid[2] + x over the level's chunk grid, ascending) a sample
+    // needed and no cache held. Empty otherwise.
+    std::vector<std::vector<std::int64_t>> missingChunks;
 };
 
 // Samples a request, on the GPU when every level has a CUDA reader (one device
@@ -184,6 +189,70 @@ struct Result {
 Result sample(const Surface& surface, const Raster& raster, const Request& request);
 Result sample(const Plane& plane, const Request& request);
 Result sample(const Points& points, const Request& request);
+
+// ---- views: choosing levels and drawing frames progressively ----------------------
+//
+// A view (any UI) draws each frame from the caches alone (sampleCached), shows it, and
+// reads what the frame lacked in the background (load); the next frame is complete.
+// Levels are in the view's working coordinates (as Request::levels): a Level with no
+// array is absent and skipped.
+
+// Working voxels one index of `level` spans along each index axis (ZYX).
+std::array<double, 3> voxelExtent(const Level& level);
+// The level a view at `pixelsPerVoxel` (view pixels per working voxel) samples: the
+// coarsest present level whose largest voxel extent is at most
+// 1 / (pixelsPerVoxel * qualityBias), else the finest present one. 0 when the zoom or
+// bias is not positive and finite.
+int levelForView(const std::vector<Level>& levels, float pixelsPerVoxel, float qualityBias = 1);
+// How many levels after `start` may fill a width x height view's holes: up to the first
+// level whose mean chunk edge spans the view's larger edge, at most `maximum`.
+int fallbackLevels(const std::vector<Level>& levels, int start, int width, int height, float pixelsPerVoxel,
+                   int maximum = 5);
+// The 3x3 (column, row) grid positions at which a raster's magnification is measured.
+std::array<float, 18> magnificationPoints(const Raster& raster);
+// View pixels per working voxel over a raster, from a surface's column and row tangents
+// at magnificationPoints(raster): the most magnified direction (smallest singular value
+// of the pixel-step Jacobian). 0 when no tangent pair is usable (holes, boundaries).
+float pixelsPerVoxel(const float* columnTangents, const float* rowTangents, std::size_t n, double sx, double sy);
+float pixelsPerVoxel(const Surface& surface, const Raster& raster);
+
+// What a frame samples: a plane, or a raster over a surface (kept alive by the frame).
+struct Frame {
+    std::optional<Plane> plane;
+    std::shared_ptr<const Surface> surface;
+    Raster raster;
+    int width() const { return plane ? plane->width : raster.width; }
+    int height() const { return plane ? plane->height : raster.height; }
+};
+Result sample(const Frame& frame, const Request& request);
+
+// The blocking reads frames could not sample from the caches, each at one level for
+// the pixels that lacked it: `coarse` (a quick preview from the coarsest level) is
+// read before `target` (the view's level). Requests hold Array pointers: keep their
+// arrays open until the reads ran (`owners` may hold whatever keeps them open).
+struct Pending {
+    struct Read {
+        Frame frame;
+        Request request;  // one level; sampled for the pixels set in `pixels`
+        std::vector<std::uint8_t> pixels;
+        // When set, the level's chunks to read (Result::missingChunks keys): load reads
+        // them and samples nothing.
+        std::vector<std::int64_t> chunks;
+    };
+    std::vector<Read> coarse, target;
+    std::vector<std::shared_ptr<const void>> owners;
+    bool empty() const { return coarse.empty() && target.empty(); }
+};
+
+// Samples `request` over `frame` from the caches alone (cachedOnly is forced).
+// request.levels[0] is the view's level; later levels (coarser) fill its holes. When
+// `pending` is given, adds the reads the frame lacked: pixels not from levels[0] read
+// it, and pixels no level held also read the last level first.
+Result sampleCached(const Frame& frame, Request request, Pending* pending);
+// Runs the reads, coarse then target, bringing their chunks into the caches.
+// `afterPart` runs after each part that had reads; returning false stops. Returns the
+// first GPU failure a read fell back from (Result::cudaFailure), else empty.
+std::string load(const Pending& pending, const std::function<bool()>& afterPart = {});
 
 }  // namespace vcr::grid
 

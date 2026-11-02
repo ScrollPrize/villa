@@ -93,13 +93,10 @@ def compute_structure_tensor(
         base = binary_mask.astype(np.float32)
     else:
         # Signed distance: positive outside, negative inside
-        distance = A.Pipeline([A.DistanceTransform(on="label", implicit_background=True)], targets={"label": A.Label()}, backend="cpu")
-        base = distance({"label": binary_mask[None]}, seed=0)["label_sdt"][0]
+        base = A.DistanceTransform(implicit_background=True)(binary_mask[None])[0]
 
-    pipeline = A.Pipeline([A.StructureTensor(
-        sigma=float(grad_sigma), rho=max(float(tensor_sigma or 0), 0.0),
-        scale=3.0 / 8.0 if is_2d else 1.0, output="tensor")], backend="cpu")
-    st = pipeline({"image": base[None]}, seed=0)["tensor"]
+    st = A.StructureTensor(sigma=float(grad_sigma), rho=max(float(tensor_sigma or 0), 0.0),
+                           scale=3.0 / 8.0 if is_2d else 1.0)(base[None])
     # Mask background for masked regression
     if ignore_index is not None:
         bg = (binary_mask == 0)

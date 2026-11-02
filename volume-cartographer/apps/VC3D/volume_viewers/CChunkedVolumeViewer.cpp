@@ -312,7 +312,11 @@ float scaleForRenderLevel(const vc3d::ViewerLevels* levels, int level, float lod
 {
     const int count = levels ? levels->count() : 1;
     const int clamped = std::clamp(level, 0, std::max(0, count - 1));
-    double extent = levels ? vc3d::maximumBaseVoxelExtent(*levels, clamped) : 1.0;
+    double extent = 1.0;
+    if (levels && levels->has(clamped)) {
+        const auto e = vcr::grid::voxelExtent(levels->gridLevel(clamped));
+        extent = *std::max_element(e.begin(), e.end());
+    }
     if (!std::isfinite(extent) || extent <= 0.0)
         extent = 1.0;
     return std::clamp(0.75f / (static_cast<float>(extent) * lodZoomBias), kMinScale, kMaxScale);
@@ -1150,7 +1154,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc3d::sourceLevelForView(*_levels, pixelsPerVoxel(), lodZoomBias);
+    int level = vcr::grid::levelForView(_levels->gridLevels(), pixelsPerVoxel(), lodZoomBias);
     // The surface renderer resamples volume data straight into the
     // framebuffer and benefits from one finer source level.
     if (preferSurfaceResolution)
@@ -1166,7 +1170,7 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc3d::sourceLevelForView(*_overlayLevels, pixelsPerVoxel(), lodZoomBias);
+    int level = vcr::grid::levelForView(_overlayLevels->gridLevels(), pixelsPerVoxel(), lodZoomBias);
     if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _overlayMaxDisplayedResolution);
@@ -1391,7 +1395,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             return;
         Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} sample_ms={} blit_ms={} load_coarse={} load_target={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
                        result.renderFrameElapsedMs, phaseSampleMs, phaseBlitMs,
-                       result.load.coarse.size(), result.load.target.size(),
+                       result.load.pending.coarse.size(), result.load.pending.target.size(),
                        ctx.profileReason, ctx.profileCaller,
                        result.serial, result.framebuffer.width(), result.framebuffer.height());
     };
@@ -1475,7 +1479,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     // The frame's geometry, grown by `margins` pixels on each side: the plane
     // through the view, or the raster of the view over the surface's grid.
     auto frameGeometry = [&](const vc3d::volumetric::SlabMargins& margins) {
-        vc3d::ViewerGeometry geometry;
+        vcr::grid::Frame geometry;
         const int width = ctx.fbW + margins.left + margins.right;
         const int height = ctx.fbH + margins.top + margins.bottom;
         if (planeView) {
@@ -1510,9 +1514,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         return offsets;
     };
     // Coarser levels fill holes until one source chunk spans the viewport.
-    vc3d::ViewerSample base{ctx.levels, ctx.startLevel,
-                            vc3d::fallbackLevelCountForViewport(*ctx.levels, ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale),
-                            ctx.samplingMethod, {zBase}, std::nullopt};
+    auto base = ctx.levels->request(ctx.startLevel,
+                                    vcr::grid::fallbackLevels(ctx.levels->gridLevels(), ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale));
+    base.order = ctx.samplingMethod;
+    base.offsets = {zBase};
     const auto& cs = ctx.compositeSettings;
     const bool baseComposite = planeView ? cs.planeEnabled : cs.enabled;
     const int front = planeView ? cs.planeLayersFront : cs.layersFront;
@@ -1532,9 +1537,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             ? vc3d::volumetric::computeSlabMargins(volumetricCamera(), numLayers, zStart, ctx.scale, ctx.fbW, ctx.fbH)
             : flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
         const auto stack = frameGeometry(margins);
-        base.sampling = 0;
+        base.order = 0;
         base.offsets = layerOffsets(front, behind, zStep);
-        const auto sampled = vc3d::sampleCached(stack, base, &result.load);
+        const auto sampled = vc3d::sampleCached(ctx.levels, stack, base, &result.load);
         std::vector<cv::Mat_<uint8_t>> layerValues, layerCoverage;
         for (int k = 0; k < numLayers; ++k) {
             layerValues.emplace_back(stack.height(), stack.width(), uint8_t(0));
@@ -1545,11 +1550,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         compositeVolumetricStack(layerValues, layerCoverage, zStart, !planeView, margins, colorValues, coverage);
     } else {
         if (baseComposite) {
-            base.sampling = 0;
+            base.order = 0;
             base.offsets = layerOffsets(front, behind, zStep);
             base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
-        const auto sampled = vc3d::sampleCached(geometry, base, &result.load);
+        const auto sampled = vc3d::sampleCached(ctx.levels, geometry, base, &result.load);
         missingBase = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
@@ -1557,10 +1562,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     if (overlayActive) {
         overlayValues = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
         overlayCoverage = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
-        vc3d::ViewerSample overlay{ctx.overlayLevels, ctx.overlayStartLevel,
-                                   vc3d::fallbackLevelCountForViewport(*ctx.overlayLevels, ctx.overlayStartLevel,
-                                                                       ctx.fbW, ctx.fbH, ctx.scale),
-                                   ctx.overlaySamplingMethod, {zBase}, std::nullopt};
+        auto overlay = ctx.overlayLevels->request(
+            ctx.overlayStartLevel,
+            vcr::grid::fallbackLevels(ctx.overlayLevels->gridLevels(), ctx.overlayStartLevel, ctx.fbW, ctx.fbH, ctx.scale));
+        overlay.order = ctx.overlaySamplingMethod;
+        overlay.offsets = {zBase};
         const auto& oc = ctx.overlayComposite;
         if (!planeView && oc.enabled && (oc.method == "max" || oc.method == "mean" || oc.method == "min") &&
             (oc.layersFront > 0 || oc.layersBehind > 0)) {
@@ -1570,7 +1576,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             overlay.offsets = layerOffsets(oc.layersFront, oc.layersBehind, cs.reverseDirection ? -1.0f : 1.0f);
             overlay.composite = (overlayParams.volumetric ? std::nullopt : std::optional(overlayParams.options));
         }
-        const auto sampled = vc3d::sampleCached(geometry, overlay, &result.load);
+        const auto sampled = vc3d::sampleCached(ctx.overlayLevels, geometry, overlay, &result.load);
         missingOverlay = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, overlayValues.ptr(), overlayCoverage.ptr());
@@ -1836,6 +1842,12 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.startLevel == b.startLevel && a.overlayStartLevel == b.overlayStartLevel &&
            a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
            a.gridSurface == b.gridSurface;
+}
+
+bool CChunkedVolumeViewer::renderSettled() const
+{
+    return !_renderWorkerBusy.load(std::memory_order_acquire) && !_pendingRenderJob &&
+           !_loadRunning && !_pendingLoad && (!_lastRenderResult || _lastRenderResult->load.empty());
 }
 
 bool CChunkedVolumeViewer::renderJobsSameView(const PendingRenderJob& a,

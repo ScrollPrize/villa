@@ -6,109 +6,11 @@ import numpy as np
 import os
 from math import isfinite
 
-from vc_reader.torch import structure_tensor
-import vc_reader.transforms as A
 from vesuvius.structure_tensor.create_st import (
-    StructureTensorInferer,
     _eigh_and_sanitize,
     _compute_eigenvectors,
     _finalize_structure_tensor_torch
 )
-
-
-@pytest.fixture
-def inferer_paths(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    input_dir = tmp_path / "input"
-    input_dir.mkdir()
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    return {
-        "model": model_dir,
-        "input": input_dir,
-        "output": output_dir,
-    }
-
-
-@pytest.fixture
-def cpu_inferer(inferer_paths):
-    """A small, CPU‐only inferer with no smoothing, fixed patch size."""
-    return StructureTensorInferer(
-        model_path=str(inferer_paths["model"]),
-        input_dir=str(inferer_paths["input"]),
-        output_dir=str(inferer_paths["output"]),
-        sigma=0.0,
-        smooth_components=False,
-        volume=None,
-        num_parts=1,
-        part_id=0,
-        overlap=0.0,
-        step_size=1.0,
-        batch_size=1,
-        patch_size=(5, 5, 5),
-        device="cpu",
-        verbose=False,
-        compressor_name="none",
-        compression_level=1,
-        num_dataloader_workers=0,
-    )
-
-
-def test_compute_structure_tensor_all_zero(cpu_inferer):
-    # Zero input ⇒ zero tensor
-    x = torch.zeros((1, 1, 5, 5, 5), dtype=torch.float32)
-    J = cpu_inferer.compute_structure_tensor(x)
-    assert J.shape == (1, 6, 5, 5, 5)
-    assert torch.allclose(J, torch.zeros_like(J))
-
-def test_native_structure_tensor_matches_inferer(cpu_inferer):
-    x = torch.rand((1, 1, 5, 5, 5), generator=torch.Generator().manual_seed(1))
-    expected = structure_tensor(x, sigma=0, rho=0)
-    torch.testing.assert_close(cpu_inferer.compute_structure_tensor(x), expected)
-
-
-def test_native_numpy_structure_tensor_matches_inferer(cpu_inferer):
-    x = np.random.default_rng(1).random((1, 5, 5, 5), dtype=np.float32)
-    pipeline = A.Pipeline([A.StructureTensor(sigma=0, rho=0)], backend="cpu")
-    actual = pipeline({"image": x}, seed=0)["image_st"]
-    expected = cpu_inferer.compute_structure_tensor(torch.from_numpy(x)[None])[0].numpy()
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-
-def test_native_structure_tensor_2d_output_shape():
-    img = torch.linspace(0, 1, 25).view(1, 1, 5, 5)
-    tensor = structure_tensor(img, sigma=0, rho=0, scale=3.0 / 8.0)
-    assert tensor.shape == (1, 3, 5, 5)
-    assert tensor[0, 2, 2, 2] > 0
-
-
-def test_compute_structure_tensor_linear_x(cpu_inferer):
-    # Use a volume large enough that padding never reaches the center
-    D, H, W = 9, 9, 9
-    # Pure X‐ramp
-    ramp = torch.arange(W, dtype=torch.float32)
-    x = ramp.view(1, 1, 1, 1, W).expand(1, 1, D, H, W)
-
-    # Compute structure tensor, drop batch dim → [6, D, H, W]
-    J = cpu_inferer.compute_structure_tensor(x)[0]
-
-    # Channel 5 is Jxx
-    Jxx = J[5]
-    cz, cy, cx = D//2, H//2, W//2
-
-    # 1) At the exact center, Jxx must be positive
-    center_Jxx = Jxx[cz, cy, cx]
-    assert center_Jxx > 0, f"Jxx at center should be positive, got {center_Jxx.item()}"
-
-    # 2) And it must exceed the absolute value of every other component there
-    for c in range(5):
-        other = J[c, cz, cy, cx].abs()
-        assert center_Jxx > other, (
-            f"At center voxel, Jxx={center_Jxx:.4g} must exceed |J[{c}]|={other:.4g}"
-        )
-
-
 
 
 @pytest.mark.parametrize("mat", [

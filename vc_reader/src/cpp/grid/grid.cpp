@@ -296,6 +296,7 @@ struct ChunkLookup {
     };
     std::array<Slot, 8> slots{};
     std::size_t last = 0, next = 0;
+    std::vector<std::int64_t> misses;  // cached-only: keys of chunks no cache held
 
     ChunkLookup(const Level& L, Load l, bool cached) : array(L.array), loader(l), cachedOnly(cached)
     {
@@ -341,6 +342,8 @@ struct ChunkLookup {
             auto [found, data] = array->cached_chunk(idx);
             slot.available = found;
             slot.chunk = std::move(data);
+            if (!found)
+                misses.push_back(key);
         } else {
             slot.available = true;
             slot.chunk = array->chunk(idx);
@@ -373,6 +376,9 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
     result.layers = int(layers);
     result.values.assign(request.composite ? pixels : pixels * layers, kNaN);
     result.level.assign(pixels, Result::kNone);
+    if (request.cachedOnly)
+        result.missingChunks.resize(request.levels.size());
+    std::mutex missesMutex;
     const int tilesX = (width + kTile - 1) / kTile, tilesY = (height + kTile - 1) / kTile;
     request.levels.front().array->parallel_for(std::size_t(tilesX) * std::size_t(tilesY), [&](std::size_t t) {
         const int i0 = int(t % std::size_t(tilesX)) * kTile, j0 = int(t / std::size_t(tilesX)) * kTile;
@@ -431,7 +437,17 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                     result.values[q] = reduce->result();
                 result.level[q] = missing ? Result::kMissing : level;
             }
+        if (request.cachedOnly) {
+            std::lock_guard lock(missesMutex);
+            for (std::size_t li = 0; li < lookups.size(); ++li)
+                result.missingChunks[li].insert(result.missingChunks[li].end(), lookups[li].misses.begin(),
+                                                lookups[li].misses.end());
+        }
     });
+    for (auto& keys : result.missingChunks) {
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    }
     return result;
 }
 
@@ -553,7 +569,7 @@ namespace vcr::grid::cuda {
 
 namespace {
 
-// f() with every reader's resident bricks pinned (locks taken in address order).
+// f() with every reader's resident bricks pinned (locks taken in lock order).
 template <class F>
 void withResident(const std::vector<reader_cuda::Reader*>& readers, std::size_t i, std::vector<reader_cuda::Source>& sources,
                   const std::vector<reader_cuda::Reader*>& order, F&& f)
@@ -663,11 +679,17 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     for (std::size_t li = 0; li < readers.size(); ++li)
         host[li].map = levelMap(request.levels[li].scale, request.levels[li].offset,
                                 request.levels[li].linear ? &*request.levels[li].linear : nullptr, centre);
-    // Blocking requests note the first level's lacking bricks, one bit each.
-    std::size_t words = 0;
+    // Blocking requests note the first level's lacking bricks in a set sized by the
+    // frame: at most one brick per pixel and corner is new to a pass, and a fuller set
+    // only defers its overflow to the next load.
+    constexpr unsigned kLackingCapacity = 1u << 18;
     device::Storage lacking;
+    cuda_detail::LackingSet lackingSet;
+    // Readers sharing a pool share its (recursive) lock: order by lock, then reader.
     std::vector<reader_cuda::Reader*> order = readers;
-    std::sort(order.begin(), order.end());
+    std::sort(order.begin(), order.end(), [](const reader_cuda::Reader* a, const reader_cuda::Reader* b) {
+        return std::pair(a->lock_id(), static_cast<const void*>(a)) < std::pair(b->lock_id(), static_cast<const void*>(b));
+    });
     order.erase(std::unique(order.begin(), order.end()), order.end());
     std::vector<reader_cuda::Source> sources(readers.size());
     const auto pass = [&] {
@@ -675,12 +697,17 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             for (std::size_t li = 0; li < readers.size(); ++li)
                 host[li].source = sources[li];
             if (!request.cachedOnly) {
+                const std::size_t table = std::size_t(kLackingCapacity) * sizeof(unsigned long long);
                 if (!lacking) {
-                    const auto& g = sources.front().grid;
-                    words = std::size_t(g[0] * g[1] * g[2] + 31) / 32;
-                    lacking = device::allocate(words * 4 + 4, deviceId);
+                    lacking = device::allocate(table + std::size_t(kLackingCapacity) * sizeof(long long) + 16, deviceId);
+                    auto* base = static_cast<unsigned char*>(lacking->ptr);
+                    lackingSet.table = reinterpret_cast<unsigned long long*>(base);
+                    lackingSet.keys = reinterpret_cast<long long*>(base + table);
+                    lackingSet.count = reinterpret_cast<unsigned*>(base + table + std::size_t(kLackingCapacity) * sizeof(long long));
+                    lackingSet.capacity = kLackingCapacity;
                 }
-                device::check(cudaMemsetAsync(lacking->ptr, 0, words * 4 + 4, device::stream()));
+                device::check(cudaMemsetAsync(lackingSet.table, 0xFF, table, device::stream()));
+                device::check(cudaMemsetAsync(lackingSet.count, 0, sizeof(unsigned), device::stream()));
             }
             const auto table = upload(host.data(), host.size() * sizeof(cuda_detail::DeviceLevel), deviceId);
             cuda_detail::Params P = base;
@@ -697,10 +724,11 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             P.levelCount = int(readers.size());
             P.values = static_cast<float*>(values->ptr);
             P.level = static_cast<std::int8_t*>(levels->ptr);
-            P.lacking = lacking ? static_cast<unsigned*>(lacking->ptr) : nullptr;
+            P.lacking = lackingSet;
             cuda_detail::launch(P);
-            device::complete();
         });
+        // Outside the readers' locks: other threads' passes enqueue while this one runs.
+        device::complete();
     };
     pass();
     if (lacking) {
@@ -708,22 +736,25 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
         // may evict bricks the last pass found resident, and a blocking result has no holes.
         constexpr int kLoads = 4;
         for (int loads = 0;; ++loads) {
-            std::vector<unsigned> bits(words);
-            device::check(cudaMemcpy(bits.data(), lacking->ptr, words * 4, cudaMemcpyDeviceToHost));
-            std::vector<std::int64_t> keys;
-            for (std::size_t w = 0; w < bits.size(); ++w)
-                for (unsigned b = bits[w]; b; b &= b - 1)
-                    keys.push_back(std::int64_t(w * 32 + std::size_t(std::countr_zero(b))));
+            unsigned noted = 0;
+            device::check(cudaMemcpyAsync(&noted, lackingSet.count, sizeof(unsigned), cudaMemcpyDeviceToHost, device::stream()));
+            device::complete();
+            std::vector<std::int64_t> keys(std::min(noted, kLackingCapacity));
             if (keys.empty())
                 break;
+            device::check(cudaMemcpyAsync(keys.data(), lackingSet.keys, keys.size() * sizeof(long long),
+                                          cudaMemcpyDeviceToHost, device::stream()));
+            device::complete();
             if (loads == kLoads)
                 throw std::runtime_error("a blocking request's bricks do not stay resident; increase the reader's budget");
             readers.front()->load_bricks(keys);
             pass();
         }
     }
-    device::check(cudaMemcpy(result.values.data(), values->ptr, result.values.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    device::check(cudaMemcpy(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost));
+    device::check(cudaMemcpyAsync(result.values.data(), values->ptr, result.values.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, device::stream()));
+    device::check(cudaMemcpyAsync(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost, device::stream()));
+    device::complete();
     return result;
 }
 

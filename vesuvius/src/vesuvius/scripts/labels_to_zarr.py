@@ -33,40 +33,15 @@ import numpy as np
 from vc_reader import images
 from vc_reader.reader import ObjectStore, ZarrWriter, create_group, ome_multiscales, open_zarr, write_pyramid
 from scipy.ndimage import label as label_components, find_objects
-from scipy.ndimage import distance_transform_edt as scipy_edt
+import vc_reader.transforms as A
 from tqdm import tqdm
 
-# Try to import edt package for fast multi-threaded EDT
-HAS_EDT = False
-try:
-    import edt as edt_package
-    HAS_EDT = True
-except ImportError:
-    HAS_EDT = False
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
-def distance_transform_edt(mask: np.ndarray) -> np.ndarray:
-    """Compute EDT using edt package if available, else scipy.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Binary mask (True where distance should be computed from).
-
-    Returns
-    -------
-    np.ndarray
-        Distance transform array.
-    """
-    if HAS_EDT:
-        # The edt package silently copies non-contiguous arrays, which can cause
-        # unexpected memory usage. Ensure contiguity explicitly.
-        if not mask.flags['C_CONTIGUOUS']:
-            mask = np.ascontiguousarray(mask)
-        # Use single thread since we parallelize over chunks via multiprocessing
-        return edt_package.edt(mask, parallel=1)
-    else:
-        return scipy_edt(mask)
+def distance_to_mask(mask: np.ndarray) -> np.ndarray:
+    """Euclidean distance from each voxel to the nearest True voxel of ``mask``."""
+    return _OUTSIDE_DISTANCE(mask[None])[0]
 
 from vc_reader import tifxyz
 
@@ -696,7 +671,7 @@ def expand_chunk_worker(args: Tuple) -> dict:
     if effective_expand_distance > 0:
         label_mask = (extended_data == label_value)
         if label_mask.any():
-            label_edt = distance_transform_edt(~label_mask)
+            label_edt = distance_to_mask(label_mask)
             label_expand_mask = (label_edt > 0) & (label_edt <= effective_expand_distance)
 
             # Expand into empty voxels OR padding voxels
@@ -1178,7 +1153,7 @@ def process_tile_worker(task: TileTask) -> int:
 
                 if labeled_mask.any():
                     # EDT: distance from each pixel to nearest labeled pixel
-                    edt = scipy_edt(~labeled_mask)
+                    edt = distance_to_mask(labeled_mask)
                     # Padding mask: within distance AND currently unlabeled (value 0)
                     is_padding = (edt > 0) & (edt <= padding) & (tile_labels == 0)
                     # Apply to values array (which corresponds to valid pixels)
@@ -1331,7 +1306,7 @@ def collect_tile_points(task: TileTask) -> Optional[Tuple[np.ndarray, np.ndarray
 
                 if labeled_mask.any():
                     # EDT: distance from each pixel to nearest labeled pixel
-                    edt = scipy_edt(~labeled_mask)
+                    edt = distance_to_mask(labeled_mask)
                     # Padding mask: within distance AND currently unlabeled (value 0)
                     is_padding = (edt > 0) & (edt <= padding) & (tile_labels == 0)
                     # Apply to values array (which corresponds to valid pixels)
@@ -1544,10 +1519,6 @@ def main() -> None:
 
     num_workers = args.num_workers or max(1, multiprocessing.cpu_count() // 2)
     print(f"Using {num_workers} worker processes")
-    if HAS_EDT:
-        print("Using edt package (multi-threaded) for EDT")
-    else:
-        print("Using scipy (CPU) for EDT")
 
     # Discover surfaces
     surfaces = discover_surfaces(input_folder, args.label_suffix)

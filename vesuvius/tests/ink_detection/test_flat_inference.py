@@ -40,7 +40,7 @@ from vesuvius.ink_detection.inference.infer import (
 )
 from vesuvius.ink_detection.models.model import make_model
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def test_temp_accumulation_array_is_explicit_v2(tmp_path):
@@ -391,7 +391,7 @@ def test_folder_mode_logs_existing_prediction_and_summary(
 
 
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
-    config_mapping = _config_mapping(
+    config_mapping = config_mapping(
         "vesuvius_unet_2p5d", depth=3, side=16
     )
     config_mapping["image_normalization"] = "robust_mad"
@@ -479,7 +479,7 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
 
     blocker = tmp_path / "embedded-io-blocker"
     blocker.write_bytes(b"")
-    config_mapping = _config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
+    config_mapping = config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
     config_mapping["volume_cache_dir"] = str(blocker / "cache")
     config_mapping["volume_cache_max_gb"] = 120.0
     config_mapping["volume_auth_json"] = str(blocker / "auth.json")

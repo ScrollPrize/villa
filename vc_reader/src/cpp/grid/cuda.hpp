@@ -10,6 +10,17 @@
 
 namespace vcr::grid::cuda_detail {
 
+// The bricks a blocking pass lacked, each noted once: an open-addressed set of brick
+// keys (empty slots hold kEmpty) and the keys in the order they were first noted.
+// Sized by the frame, not the volume: a level's brick grid can hold billions of bricks.
+struct LackingSet {
+    static constexpr unsigned long long kEmpty = ~0ull;
+    unsigned long long* table = nullptr;  // capacity slots
+    long long* keys = nullptr;            // capacity entries
+    unsigned* count = nullptr;            // keys noted; above capacity when the set overflowed
+    unsigned capacity = 0;                // a power of two
+};
+
 // One level on the device: its resident bricks and where its indices sit.
 struct DeviceLevel {
     reader_cuda::Source source;
@@ -36,8 +47,8 @@ struct Params {
     int levelCount = 0;
     float* values = nullptr;        // pixels, or layers * pixels (layer-major)
     std::int8_t* level = nullptr;   // per pixel
-    // Bricks of the first level a sample lacked, one bit per brick (blocking requests).
-    unsigned* lacking = nullptr;
+    // Bricks of the first level a sample lacked (blocking requests).
+    LackingSet lacking{};
 };
 
 // Samples every pixel on the current stream; returns when the launch is enqueued.

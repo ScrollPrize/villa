@@ -13,6 +13,7 @@ OpenedVolumes::OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes)
 {
     if (gpuCacheBytes && !gpuCacheBytes_)
         Logger()->warn("GPU viewer sampling is on, but there is no CUDA device: sampling on the CPU");
+    gpuPool_ = vc::cuda::makePool(gpuCacheBytes_);
 }
 
 OpenedVolumes::TransferStats OpenedVolumes::transferStats()
@@ -49,7 +50,7 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
     if (gpuCacheBytes_ && opened->meta.dtype == "|u1" && opened->meta.shape.size() == 3) {
         auto& shared = readers_[opened->array.get()];
         if (!shared)
-            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuCacheBytes_);
+            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_);
         reader = shared;
     }
     return {opened, open(volume, base)->placement, std::move(reader)};

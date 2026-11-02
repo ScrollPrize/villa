@@ -25,6 +25,9 @@
 #include <chrono>
 #include <vc_reader/native/cuda_available.hpp>
 #include "vc/core/util/CudaSampling.hpp"
+#ifdef VC_READER_CUDA
+#include <vc_reader/cuda_reader.hpp>
+#endif
 
 #include <cmath>
 #include <vector>
@@ -61,9 +64,9 @@ struct Fixture {
 };
 
 // The z plane through level-0 voxel centres, one pixel per voxel.
-vc3d::ViewerGeometry planeAt(float z, int width = 32, int height = 32)
+vcr::grid::Frame planeAt(float z, int width = 32, int height = 32)
 {
-    vc3d::ViewerGeometry g;
+    vcr::grid::Frame g;
     g.plane = vcr::grid::Plane{{0, 0, z}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, width, height};
     return g;
 }
@@ -71,6 +74,31 @@ vc3d::ViewerGeometry planeAt(float z, int width = 32, int height = 32)
 std::shared_ptr<const vc3d::ViewerLevels> openLevels(OpenedVolumes& opened, const Volume& volume)
 {
     return std::make_shared<const vc3d::ViewerLevels>(vc3d::openViewerLevels(opened, volume));
+}
+
+// What a frame samples of one volume: the start level with `fallback` coarser ones.
+// Its levels are taken when it samples, as the viewer does per frame (a GPU failure
+// in between moves them to the CPU).
+struct What {
+    std::shared_ptr<const vc3d::ViewerLevels> levels;
+    int start = 0, fallback = 0;
+    vcr::grid::Request request;
+};
+
+What sampleOf(std::shared_ptr<const vc3d::ViewerLevels> levels, int start, int fallback, int sampling,
+              std::vector<float> offsets = {0.0f})
+{
+    What what{std::move(levels), start, fallback, {}};
+    what.request.order = sampling;
+    what.request.offsets = std::move(offsets);
+    return what;
+}
+
+vcr::grid::Result sampleWhat(const vcr::grid::Frame& frame, const What& what, vc3d::ViewerLoad* load)
+{
+    auto request = what.request;
+    request.levels = what.levels->request(what.start, what.fallback).levels;
+    return vc3d::sampleCached(what.levels, frame, request, load);
 }
 
 }  // namespace
@@ -83,16 +111,17 @@ TEST_CASE("viewer levels and level choice")
     REQUIRE(levels.count() == 2);
     CHECK(levels.has(0));
     CHECK(levels.has(1));
-    CHECK(levels.voxelExtent(1)[0] == doctest::Approx(2.0));
-    CHECK(vc3d::maximumBaseVoxelExtent(levels, 1) == doctest::Approx(2.0));
+    const auto grid = levels.gridLevels();
+    CHECK(vcr::grid::voxelExtent(grid[1])[0] == doctest::Approx(2.0));
     // One screen pixel per voxel wants level 0; a quarter pixel per voxel takes level 1.
-    CHECK(vc3d::sourceLevelForView(levels, 1.0f, 1.0f) == 0);
-    CHECK(vc3d::sourceLevelForView(levels, 0.25f, 1.0f) == 1);
-    CHECK(vc3d::sourceLevelForView(levels, 8.0f, 1.0f) == 0);
+    CHECK(vcr::grid::levelForView(grid, 1.0f) == 0);
+    CHECK(vcr::grid::levelForView(grid, 0.25f) == 1);
     // 8-voxel chunks of level 0 do not span a 32-pixel viewport at 1 px/voxel; level 1's 16 do not either.
-    CHECK(vc3d::fallbackLevelCountForViewport(levels, 0, 32, 32, 1.0f) == 1);
+    CHECK(vcr::grid::fallbackLevels(grid, 0, 32, 32, 1.0f) == 1);
     // At 4 px/voxel the viewport spans 8 voxels: a level-0 chunk covers it.
-    CHECK(vc3d::fallbackLevelCountForViewport(levels, 0, 32, 32, 4.0f) == 0);
+    CHECK(vcr::grid::fallbackLevels(grid, 0, 32, 32, 4.0f) == 0);
+    CHECK(levels.request(0, 1).levels.size() == 2);
+    CHECK(levels.request(1, 3).levels.size() == 1);
     // Level-1 indices of level-0 voxel 4.5: its centre, 2.
     const auto g = levels.gridLevel(1);
     CHECK(g.scale[0] * 4.5 + g.offset[0] == doctest::Approx(2.0));
@@ -112,20 +141,20 @@ TEST_CASE("flattened LOD follows the actual voxel spacing of the surface")
     const auto raster = quad.gridRaster(-quad.center()[0], -quad.center()[1], 0.5, {12, 12});
     const auto zoom = vc3d::surfacePixelsPerVoxel(quad, raster, 0.5f);
     CHECK(zoom == doctest::Approx(2));
-    CHECK(vc3d::sourceLevelForView(*levels, 0.5f, 1) == 1);
-    CHECK(vc3d::sourceLevelForView(*levels, zoom, 1) == 0);
+    CHECK(vcr::grid::levelForView(levels->gridLevels(), 0.5f) == 1);
+    CHECK(vcr::grid::levelForView(levels->gridLevels(), zoom) == 0);
 
-    vc3d::ViewerGeometry geometry;
+    vcr::grid::Frame geometry;
     geometry.surface = vc3d::gridSurface(quad);
     geometry.raster = raster;
     vc3d::ViewerLoad preview;
-    vc3d::sampleCached(geometry, {levels, 1, 0, 0}, &preview);
+    sampleWhat(geometry, sampleOf(levels, 1, 0, 0), &preview);
     vc3d::loadPending(preview, [] { return true; });
     vc3d::ViewerLoad detail;
-    vc3d::sampleCached(geometry, {levels, 0, 1, 0}, &detail);
-    REQUIRE(detail.target.size() == 1);
+    sampleWhat(geometry, sampleOf(levels, 0, 1, 0), &detail);
+    REQUIRE(detail.pending.target.size() == 1);
     vc3d::loadPending(detail, [] { return true; });
-    const auto fine = vc3d::sampleCached(geometry, {levels, 0, 1, 0}, nullptr);
+    const auto fine = sampleWhat(geometry, sampleOf(levels, 0, 1, 0), nullptr);
     CHECK(fine.level[0] == 0);
     CHECK(fine.values[0] == float(f.at0(6, 0, 0)));
 }
@@ -137,20 +166,20 @@ TEST_CASE("frames sample the caches only; the background read completes them")
         CAPTURE(int(sampling));
         OpenedVolumes opened(64 << 20);
         const auto levels = openLevels(opened, *f.volume);
-        const vc3d::ViewerSample what{levels, 0, 1, sampling, {0.0f}, std::nullopt};
+        const auto what = sampleOf(levels, 0, 1, sampling, {0.0f});
         vc3d::ViewerLoad load;
-        auto r = vc3d::sampleCached(planeAt(5), what, &load);
+        auto r = sampleWhat(planeAt(5), what, &load);
         // Nothing is in memory: nothing is covered and the store was not read; the
         // frame asks for its start level and, for a preview, its coarsest one.
         for (const auto level : r.level)
             REQUIRE(level == vcr::grid::Result::kMissing);
         CHECK(levels->levels[0].array->array->stats().disk_hits == 0);
-        REQUIRE(load.target.size() == 1);
-        REQUIRE(load.coarse.size() == 1);
+        REQUIRE(load.pending.target.size() == 1);
+        REQUIRE(load.pending.coarse.size() == 1);
 
         vc3d::loadPending(load, [] { return true; });
         vc3d::ViewerLoad again;
-        r = vc3d::sampleCached(planeAt(5), what, &again);
+        r = sampleWhat(planeAt(5), what, &again);
         CHECK(again.empty());
         cv::Mat_<uint8_t> values(32, 32, uint8_t(0)), coverage(32, 32, uint8_t(0));
         vcr::display::toUint8(r.values.data(), std::size_t(r.width) * r.height, values.ptr(), coverage.ptr());
@@ -167,19 +196,19 @@ TEST_CASE("a coarser level in memory fills a frame while the start level loads")
     Fixture f;
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
-    const vc3d::ViewerSample what{levels, 0, 1, 0, {0.0f}, std::nullopt};
+    const auto what = sampleOf(levels, 0, 1, 0, {0.0f});
     {
         vc3d::ViewerLoad load;
-        vc3d::sampleCached(planeAt(4), what, &load);
-        load.target.clear();  // only the coarse preview arrives
+        sampleWhat(planeAt(4), what, &load);
+        load.pending.target.clear();  // only the coarse preview arrives
         vc3d::loadPending(load, [] { return true; });
     }
     vc3d::ViewerLoad load;
-    const auto r = vc3d::sampleCached(planeAt(4), what, &load);
+    const auto r = sampleWhat(planeAt(4), what, &load);
     for (const auto level : r.level)
         REQUIRE(level == 1);
-    CHECK(load.coarse.empty());
-    REQUIRE(load.target.size() == 1);
+    CHECK(load.pending.coarse.empty());
+    REQUIRE(load.pending.target.size() == 1);
     // Level-0 voxel (4, 6, 10) lies in level-1 voxel (2, 3, 5).
     CHECK(r.values[6 * 32 + 10] == float(f.level1[(2 * 16 + 3) * 16 + 5]));
 }
@@ -189,15 +218,15 @@ TEST_CASE("pixels outside the volume read as fill and are not read in the backgr
     Fixture f;
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
-    vc3d::ViewerGeometry g;
+    vcr::grid::Frame g;
     g.plane = vcr::grid::Plane{{28, 3, 3}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 8, 1};  // x 28 .. 35
-    const vc3d::ViewerSample what{levels, 0, 0, 0, {0.0f}, std::nullopt};
+    const auto what = sampleOf(levels, 0, 0, 0, {0.0f});
     vc3d::ViewerLoad load;
-    vc3d::sampleCached(g, what, &load);
-    REQUIRE(load.target.size() == 1);
-    CHECK(load.target[0].pixels == std::vector<std::uint8_t>{1, 1, 1, 1, 0, 0, 0, 0});
+    sampleWhat(g, what, &load);
+    REQUIRE(load.pending.target.size() == 1);
+    CHECK(load.pending.target[0].pixels == std::vector<std::uint8_t>{1, 1, 1, 1, 0, 0, 0, 0});
     vc3d::loadPending(load, [] { return true; });
-    const auto r = vc3d::sampleCached(g, what, nullptr);
+    const auto r = sampleWhat(g, what, nullptr);
     CHECK(r.level[3] == 0);
     CHECK(r.level[4] == 0);
     CHECK(r.values[4] == 0.0f);
@@ -216,14 +245,14 @@ TEST_CASE("a GPU frame that fails renders on the CPU")
     const auto expected = openLevels(cpu, *f.volume);
     const auto levels = openLevels(tooSmall, *f.volume);
     REQUIRE(levels->levels[0].cuda);
-    vc3d::ViewerGeometry g;
+    vcr::grid::Frame g;
     g.plane = vcr::grid::Plane{{0, 0, 6}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 16, 16};
     const auto rendered = [&](const std::shared_ptr<const vc3d::ViewerLevels>& from) {
-        vc3d::ViewerSample what{from, 0, 0, 0, {0.0f}, std::nullopt};
+        auto what = sampleOf(from, 0, 0, 0, {0.0f});
         vc3d::ViewerLoad load;
-        vc3d::sampleCached(g, what, &load);
+        sampleWhat(g, what, &load);
         vc3d::loadPending(load, [] { return true; });
-        return vc3d::sampleCached(g, what, nullptr).values;
+        return sampleWhat(g, what, nullptr).values;
     };
     const auto values = rendered(levels);
     CHECK(!values.empty());
@@ -312,14 +341,13 @@ TEST_CASE("a frame on an anisotropic level samples where the level's placement s
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
     REQUIRE(levels->has(1));
-    CHECK(levels->voxelExtent(1) == std::array<double, 3>{1, 2, 2});
-    CHECK(vc3d::maximumBaseVoxelExtent(*levels, 1) == doctest::Approx(2.0));
+    CHECK(vcr::grid::voxelExtent(levels->gridLevel(1)) == std::array<double, 3>{1, 2, 2});
     const auto frame = [&](int start, int fallback) {
-        const vc3d::ViewerSample what{levels, start, fallback, 1, {0.0f}, std::nullopt};
+        const auto what = sampleOf(levels, start, fallback, 1, {0.0f});
         vc3d::ViewerLoad load;
-        (void)vc3d::sampleCached(planeAt(5, 28, 28), what, &load);
+        (void)sampleWhat(planeAt(5, 28, 28), what, &load);
         vc3d::loadPending(load, [] { return true; });
-        return vc3d::sampleCached(planeAt(5, 28, 28), what, nullptr);
+        return sampleWhat(planeAt(5, 28, 28), what, nullptr);
     };
     const auto fine = frame(0, 0);
     const auto wide = frame(1, 0);
@@ -344,28 +372,28 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
         for (int c = 0; c < 9; ++c)
             points(r, c) = cv::Vec3f(4.0f * c, 4.0f * r, 6.0f);
     QuadSurface quad(points, cv::Vec2f(0.25f, 0.25f));
-    vc3d::ViewerGeometry g;
+    vcr::grid::Frame g;
     g.surface = vc3d::gridSurface(quad);
     REQUIRE(g.surface);
     g.raster = {0.25, 0.25, 0.25, 0.25, 30, 30};  // voxels 1 .. 30 in x and y
-    vc3d::ViewerSample what{levels, 0, 0, 0, {0.0f}, std::nullopt};
+    auto what = sampleOf(levels, 0, 0, 0, {0.0f});
     vc3d::ViewerLoad load;
-    vc3d::sampleCached(g, what, &load);
+    sampleWhat(g, what, &load);
     vc3d::loadPending(load, [] { return true; });
-    auto r = vc3d::sampleCached(g, what, nullptr);
+    auto r = sampleWhat(g, what, nullptr);
     CHECK(r.values[0] == float(f.at0(6, 1, 1)));
     CHECK(r.values[29 * 30 + 29] == float(f.at0(6, 30, 30)));
 
     // Max of the layers z = 5, 6, 7 (the surface normal is +-z).
     CompositeParams params;
     REQUIRE(setCompositeMethod(params, "max"));
-    what.offsets = {-1.0f, 0.0f, 1.0f};
-    what.composite = (params.volumetric ? std::nullopt : std::optional(params.options));
-    REQUIRE(what.composite);
+    what.request.offsets = {-1.0f, 0.0f, 1.0f};
+    what.request.composite = (params.volumetric ? std::nullopt : std::optional(params.options));
+    REQUIRE(what.request.composite);
     vc3d::ViewerLoad more;
-    vc3d::sampleCached(g, what, &more);
+    sampleWhat(g, what, &more);
     vc3d::loadPending(more, [] { return true; });
-    r = vc3d::sampleCached(g, what, nullptr);
+    r = sampleWhat(g, what, nullptr);
     REQUIRE(r.values.size() == 30 * 30);
     const float expected = float(std::max({f.at0(5, 10, 10), f.at0(6, 10, 10), f.at0(7, 10, 10)}));
     CHECK(r.values[9 * 30 + 9] == expected);
@@ -382,20 +410,20 @@ TEST_CASE("a frame ignores resident finer data and reads its requested level")
     const auto levels = openLevels(opened, *f.volume);
     // Level 0 in memory (as after zooming in); the frame wants level 1.
     {
-        const vc3d::ViewerSample fine{levels, 0, 0, 0, {0.0f}, std::nullopt};
+        const auto fine = sampleOf(levels, 0, 0, 0, {0.0f});
         vc3d::ViewerLoad load;
-        vc3d::sampleCached(planeAt(5), fine, &load);
+        sampleWhat(planeAt(5), fine, &load);
         vc3d::loadPending(load, [] { return true; });
     }
-    const vc3d::ViewerSample coarse{levels, 1, 0, 0, {0.0f}, std::nullopt};
+    const auto coarse = sampleOf(levels, 1, 0, 0, {0.0f});
     vc3d::ViewerLoad load;
-    auto r = vc3d::sampleCached(planeAt(5), coarse, &load);
+    auto r = sampleWhat(planeAt(5), coarse, &load);
     CHECK(r.level[0] == vcr::grid::Result::kMissing);
-    REQUIRE(load.target.size() == 1);
+    REQUIRE(load.pending.target.size() == 1);
     vc3d::loadPending(load, [] { return true; });
 
     vc3d::ViewerLoad again;
-    r = vc3d::sampleCached(planeAt(5), coarse, &again);
+    r = sampleWhat(planeAt(5), coarse, &again);
     CHECK(again.empty());
     CHECK(r.level[0] == 0);  // the first level of the request: level 1
 }
@@ -414,22 +442,26 @@ TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads l
         const auto cpuLevels = openLevels(cpu, *f.volume);
         const auto gpuLevels = openLevels(gpu, *f.volume);
         REQUIRE(gpuLevels->levels[0].cuda);
+        // Every level's bricks live in OpenedVolumes' one device cache.
+        REQUIRE(gpuLevels->levels[1].cuda);
+        CHECK(gpuLevels->levels[0].cuda->pool() == gpuLevels->levels[1].cuda->pool());
+        CHECK(gpuLevels->levels[0].cuda->pool()->budget() == std::size_t(64 << 20));
         const auto geometry = planeAt(5.25f);
-        const vc3d::ViewerSample cpuWhat{cpuLevels, 0, 1, sampling, {0.0f, 1.0f}, std::nullopt};
-        const vc3d::ViewerSample gpuWhat{gpuLevels, 0, 1, sampling, {0.0f, 1.0f}, std::nullopt};
+        const auto cpuWhat = sampleOf(cpuLevels, 0, 1, sampling, {0.0f, 1.0f});
+        const auto gpuWhat = sampleOf(gpuLevels, 0, 1, sampling, {0.0f, 1.0f});
 
         vc3d::ViewerLoad load;
-        for (const auto level : vc3d::sampleCached(geometry, gpuWhat, &load).level)
+        for (const auto level : sampleWhat(geometry, gpuWhat, &load).level)
             REQUIRE(level == vcr::grid::Result::kMissing);
-        REQUIRE(load.target.size() == 1);
+        REQUIRE(load.pending.target.size() == 1);
         vc3d::loadPending(load, [] { return true; });
 
         vc3d::ViewerLoad again, cpuLoad, cpuAgain;
-        const auto onGpu = vc3d::sampleCached(geometry, gpuWhat, &again);
+        const auto onGpu = sampleWhat(geometry, gpuWhat, &again);
         CHECK(again.empty());
-        vc3d::sampleCached(geometry, cpuWhat, &cpuLoad);
+        sampleWhat(geometry, cpuWhat, &cpuLoad);
         vc3d::loadPending(cpuLoad, [] { return true; });
-        const auto onCpu = vc3d::sampleCached(geometry, cpuWhat, &cpuAgain);
+        const auto onCpu = sampleWhat(geometry, cpuWhat, &cpuAgain);
         REQUIRE(onGpu.values.size() == onCpu.values.size());
         CHECK(onGpu.level == onCpu.level);
         float worst = 0.0f;
@@ -502,38 +534,25 @@ TEST_CASE("the background read stops when told to, and volumetric views have no 
     Fixture f;
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
-    const vc3d::ViewerSample what{levels, 0, 1, 0, {0.0f}, std::nullopt};
+    const auto what = sampleOf(levels, 0, 1, 0, {0.0f});
     vc3d::ViewerLoad load;
-    vc3d::sampleCached(planeAt(5), what, &load);
-    REQUIRE(load.coarse.size() == 1);
-    REQUIRE(load.target.size() == 1);
+    sampleWhat(planeAt(5), what, &load);
+    REQUIRE(load.pending.coarse.size() == 1);
+    REQUIRE(load.pending.target.size() == 1);
 
     int parts = 0;
     vc3d::loadPending(load, [&] { ++parts; return false; });
     CHECK(parts == 1);
     vc3d::ViewerLoad remaining;
-    vc3d::sampleCached(planeAt(5), what, &remaining);
-    CHECK(remaining.target.size() == 1);  // only the coarse part was read
-    CHECK(remaining.coarse.empty());
+    sampleWhat(planeAt(5), what, &remaining);
+    CHECK(remaining.pending.target.size() == 1);  // only the coarse part was read
+    CHECK(remaining.pending.coarse.empty());
 
     CompositeParams params;
     REQUIRE(setCompositeMethod(params, "max"));
     CHECK((params.volumetric ? std::nullopt : std::optional(params.options)));
     params.volumetric = true;
     CHECK_FALSE((params.volumetric ? std::nullopt : std::optional(params.options)));
-}
-
-TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer is asked for")
-{
-    vcr::grid::Result composite;
-    composite.width = 2;
-    composite.height = 1;
-    composite.values = {10.0f, std::numeric_limits<float>::quiet_NaN()};
-    uint8_t values[2] = {}, coverage[2] = {};
-    vcr::display::toUint8(composite.values.data(), std::size_t(composite.width) * composite.height, values, coverage);
-    CHECK(values[0] == 10);
-    CHECK(coverage[0] != 0);
-    CHECK(coverage[1] == 0);
 }
 
 TEST_CASE("a cursor's offset from a surface is the frame's layer offset, in physical units")

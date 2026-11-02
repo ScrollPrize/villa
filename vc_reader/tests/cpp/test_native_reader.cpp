@@ -34,6 +34,12 @@ int main(){
         auto ct=vcr::zarr::openPyramidLevel(path.string(),0,options);require(ct.meta.shape==vcr::Index{109,109,109},"shape");
         std::array<uint8_t,8> crop{};ct.array->read_many({{-1,-1,-1}},{{2,2,2}},{crop.data()});
         require(crop[0]==7&&crop[7]==data[0],"clipping/fill");
+        {   // A null output only brings the region's chunks into the caches.
+            auto cold=vcr::zarr::openPyramidLevel(path.string(),0,[&]{auto o=options;o.memoryCache=std::make_shared<vcr::MemoryCache>(64<<20);return o;}());
+            require(!cold.array->cached_chunk({0,0,0}).first,"a fresh memory cache holds nothing");
+            cold.array->read_many({{0,0,0}},{{4,4,4}},{nullptr});
+            require(cold.array->cached_chunk({0,0,0}).first,"read_many with a null output caches the chunk");
+        }
         std::array<std::array<double,3>,3> points{{{54,54,54},{55.25,56.5,54.125},{53.99,54,54}}};
         std::array<std::array<float,4>,3> result{};
         vcr::sheetNormals(ct,points.front().data(),points.size(),result.front().data());

@@ -1,4 +1,4 @@
-"""Training and CLI contracts after moving image operations to vc_reader."""
+"""Training losses, auxiliary targets and label refinement built on vc_reader image operations."""
 import numpy as np
 import pytest
 import torch
@@ -44,19 +44,3 @@ def test_label_refinement_tiff_roundtrip(tmp_path):
     result = images.read(output / source.name)
     assert result.shape == image.shape and result.dtype == np.uint8
     assert set(np.unique(result)) <= {0, 1}
-
-
-def test_affine_json_singular_and_permuted_mesh(tmp_path):
-    import json
-    from vc_reader.affine import Affine
-    from vc_reader.geometry import transform_points
-    path = tmp_path / "transform.json"
-    path.write_text(json.dumps({"transformation_matrix": [[2, 0, 0, 1], [0, 3, 0, 2], [0, 0, 0, 3]]}))
-    with pytest.raises(ValueError):
-        Affine.load_transform_json(str(path))
-    transform = Affine.load_transform_json(str(path), allow_singular=True)
-    assert transform.determinant == 0
-    vertices = np.array([[1, 2, 3]], np.float32)
-    perm = (2, 1, 0)
-    result = transform_points(vertices[:, perm], np.asarray(transform.matrix, np.float32))[:, np.argsort(perm)]
-    np.testing.assert_array_equal(result, [[3, 8, 7]])

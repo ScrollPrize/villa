@@ -39,6 +39,12 @@ std::map<std::string, ToolReader>& toolReaders()
     static auto* readers = new std::map<std::string, ToolReader>;
     return *readers;
 }
+// The device cache every tool reader shares (never destroyed, as the readers).
+std::shared_ptr<vcr::reader_cuda::Pool>& toolPool()
+{
+    static auto* pool = new std::shared_ptr<vcr::reader_cuda::Pool>;
+    return *pool;
+}
 
 #ifdef VC_READER_CUDA
 // Runs a point request on the reader's device and downloads its `bytes` of results.
@@ -80,6 +86,35 @@ std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vc
     (void)array, (void)type, (void)cacheBytes;
 #endif
     return nullptr;
+}
+
+std::shared_ptr<vcr::reader_cuda::Pool> makePool(std::size_t cacheBytes)
+{
+#ifdef VC_READER_CUDA
+    if (cacheBytes && vcr::cuda::available())
+        return std::make_shared<vcr::reader_cuda::Pool>(cacheBytes, 0);
+#else
+    (void)cacheBytes;
+#endif
+    return nullptr;
+}
+
+std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
+                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool)
+{
+#ifdef VC_READER_CUDA
+    if (!pool || array.ndim() != 3 || type.kind != 'u' || type.itemsize != 1)
+        return nullptr;
+    if (vcr::reader_cuda::Reader::brick_bytes(array) > pool->slot_bytes()) {
+        Logger()->warn("GPU sampling: {}'s bricks exceed the shared cache's slots; it gets a cache of its own",
+                       array.spec().identity);
+        return std::make_shared<vcr::reader_cuda::Reader>(array, pool->budget(), pool->device());
+    }
+    return std::make_shared<vcr::reader_cuda::Reader>(array, pool);
+#else
+    (void)array, (void)type, (void)pool;
+    return nullptr;
+#endif
 }
 
 void sampleLinear(vcr::Array& array, const vcr::ElementType& type, vcr::reader_cuda::Reader* reader,
@@ -169,7 +204,7 @@ void applyToolOptions(int& argc, char** argv)
 const char* toolOptionsHelp()
 {
     return "  --cuda                          sample uint8 3-D volumes on the GPU (fails without a device)\n"
-           "  --cuda-cache-gb N               device memory per opened level, implies --cuda [4]\n";
+           "  --cuda-cache-gb N               device memory shared by the opened levels, implies --cuda [4]\n";
 }
 
 vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level)
@@ -182,7 +217,9 @@ vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level)
     auto [entry, fresh] = toolReaders().try_emplace(spec.identity);
     if (fresh) {
         entry->second.array = std::make_unique<vcr::Array>(spec, level.array->memory_cache());
-        entry->second.reader = makeReader(*entry->second.array, level.meta.type, bytes);
+        if (!toolPool())
+            toolPool() = makePool(bytes);
+        entry->second.reader = makeReader(*entry->second.array, level.meta.type, toolPool());
         if (!entry->second.reader)
             Logger()->warn("--cuda: {} stays on the CPU: the GPU samples 3-D uint8 volumes, this is {}-D {}",
                            level.location, level.meta.shape.size(), level.meta.dtype);

@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 
-def load_extensions(directory, names=("_reader", "_transforms")):
+def load_extensions(directory, names=("_catalog", "_reader", "_transforms")):
     import importlib.machinery
 
     for name in names:

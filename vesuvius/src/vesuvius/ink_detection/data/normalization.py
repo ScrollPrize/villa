@@ -10,8 +10,8 @@ from functools import lru_cache
 
 
 @lru_cache(maxsize=32)
-def _pipeline(mode, options):
-    return A.Pipeline([A.Normalize(mode, **dict(options))], backend="cpu")
+def _normalizer(mode, options):
+    return A.Normalize(mode, **dict(options))
 
 
 def normalize_image(
@@ -33,8 +33,8 @@ def normalize_image(
     else:
         mode, options = "percentile", dict(lower=float(config.percentile_lower), upper=float(config.percentile_upper),
                                            median=config.mode == "robust_percentile_span")
-    pipeline = _pipeline(mode, tuple(sorted(options.items())))
-    return pipeline({"image": image_f32.reshape(1, 1, -1)}, seed=0)["image"].reshape(image_f32.shape)
+    normalize = _normalizer(mode, tuple(sorted(options.items())))
+    return normalize(image_f32.reshape(1, 1, -1)).reshape(image_f32.shape)
 
 
 def exclude_validation_voxels(

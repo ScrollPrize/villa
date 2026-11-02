@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 import vc_reader.transforms as A
 
-_DISTANCE = A.Pipeline([A.DistanceTransform(on="label", mode="outside", implicit_background=True)], targets={"label": A.Label()}, backend="cpu")
+_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 _RIDGES = A.Pipeline([A.GaussianBlur(sigma=2, boundary="reflect", truncate=4, full_width=False),
                       A.Normalize("minmax"), A.Ridges()], backend="cpu")
 
@@ -22,7 +22,7 @@ def process_file(file_path, output_folder, dilation_distance=3, ridge_threshold=
         if volume.ndim not in (2, 3):
             raise ValueError(f"Unsupported image dimensions: {volume.ndim}. Only 2D and 3D images are supported.")
         binary = (volume > 0).astype(np.uint8)
-        distance = _DISTANCE({"label": binary[None]}, seed=0)["label_sdt"][0]
+        distance = _DISTANCE(binary[None])[0]
         dilated = (1.0 / (distance.astype(np.float64) + 1e-6) > 1.0 / dilation_distance).astype(np.float32)
         ridges = _RIDGES({"image": dilated[None]}, seed=0)["image"][0]
         binary_ridges = (ridges > ridge_threshold).astype(np.uint8)

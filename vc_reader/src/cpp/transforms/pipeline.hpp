@@ -209,5 +209,69 @@ public:
         compact.flush(s);
         RunResult result; result.sample = std::move(s); return result;
     }
+    static Pipeline direct(const Op& op, std::map<std::string, Target> targets, bool compact = true, std::string backend = "cpu");
 };
+
+// Direct calls. A transform is random only inside a Pipeline. Called on its own
+// it always applies (p ignored) and draws everything else from direct_seed,
+// so the same input gives the same output.
+inline constexpr std::uint64_t direct_seed = 0;
+inline Op always(Op op) {
+    std::visit([](auto& t) {
+        using T = std::decay_t<decltype(t)>;
+        if constexpr (std::is_same_v<T, std::shared_ptr<OneOf>>) { auto copy = std::make_shared<OneOf>(*t); copy->p = 1; t = std::move(copy); }
+        else if constexpr (requires { t.options; }) t.options.p = 1;
+        else t.p = 1;
+    }, op);
+    return op;
+}
+inline Pipeline Pipeline::direct(const Op& op, std::map<std::string, Target> targets, bool compact, std::string backend) {
+    return Pipeline({always(op)}, std::move(targets), compact, std::move(backend));
+}
+// The field a bare array stands for: the op's own `on` default. A named field
+// (StructureTensor "image", OneHot "mask"), the first label of a label list
+// (DistanceTransform, Morphology, MedialSurface: "mask"), else "image".
+inline std::pair<std::string, Target> direct_input(const Op& op) {
+    return std::visit([](const auto& t) -> std::pair<std::string, Target> {
+        using T = std::decay_t<decltype(t)>;
+        Target target; target.valid = "";
+        if constexpr (std::is_same_v<T, std::shared_ptr<OneOf>>) {
+            require(!t->transforms.empty(), "OneOf needs transforms");
+            return direct_input(t->transforms.front());
+        } else if constexpr (requires { { t.on } -> std::convertible_to<std::string>; }) {
+            if (t.on == "mask") target.role = Role::Label;
+            if (t.on == "surface") target.role = Role::Points;
+            return {t.on, target};
+        } else if constexpr (requires { t.on.front(); }) {
+            target.role = Role::Label;
+            return {t.on.empty() ? "mask" : t.on.front(), target};
+        } else if constexpr (requires { t.options.on; }) {
+            return {t.options.on.empty() ? "image" : t.options.on.front(), target};
+        } else return {"image", target};
+    }, op);
+}
+// The result of a bare-array call: the one field the op created, else the
+// transformed input. Several created fields need a dict call.
+inline std::string direct_output(const std::string& input, const std::vector<std::string>& fields) {
+    std::string created;
+    for (const auto& name : fields) if (name != input) {
+        require(created.empty(), "transform creates several fields (" + created + ", " + name + "); call it with a dict");
+        created = name;
+    }
+    return created.empty() ? input : created;
+}
+// One transform on a sample whose fields carry their targets.
+inline Sample apply(const Op& op, Sample s, bool compact = true, std::string backend = "cpu") {
+    std::map<std::string, Target> targets;
+    for (const auto& [name, f] : s) targets[name] = f.target;
+    return Pipeline::direct(op, std::move(targets), compact, std::move(backend)).run(std::move(s), direct_seed, false).sample;
+}
+// One transform on a channel-first (C, Y, X) / (C, Z, Y, X) array.
+inline Array apply(const Op& op, Array a, bool compact = true, std::string backend = "cpu") {
+    auto [key, target] = direct_input(op);
+    Sample s; s.emplace(key, Field{std::move(a), target, key});
+    auto result = apply(op, std::move(s), compact, std::move(backend));
+    std::vector<std::string> fields; for (const auto& [name, f] : result) fields.push_back(name);
+    return std::move(result.at(direct_output(key, fields)).array);
+}
 } // namespace vcr::transforms

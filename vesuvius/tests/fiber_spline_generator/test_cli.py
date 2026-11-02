@@ -6,7 +6,7 @@ import pytest
 import torch
 from vc_reader.reader import ZarrWriter, create_group
 
-from vesuvius.afv_spline_generator import cli
+from vesuvius.fiber_spline_generator import cli
 
 
 def bright_voxels_are_vertical_fibers():

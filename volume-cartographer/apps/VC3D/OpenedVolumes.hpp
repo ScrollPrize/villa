@@ -14,7 +14,7 @@
 
 class Volume;
 
-namespace vcr::reader_cuda { class Reader; }
+namespace vcr::reader_cuda { class Reader; class Pool; }
 
 // The pyramid levels of volumes that VC3D's tools sample, each opened once and
 // shared, holding their decoded chunks in one memory cache.
@@ -28,8 +28,9 @@ public:
         std::shared_ptr<vcr::reader_cuda::Reader> cuda;
     };
 
-    // gpuCacheBytes > 0 samples on the GPU, keeping up to that many bytes of
-    // each level resident (builds with CUDA, when a device is present).
+    // gpuCacheBytes > 0 samples on the GPU, keeping up to that many bytes resident in
+    // one device cache that every level of every volume shares, as the memory cache
+    // (builds with CUDA, when a device is present).
     explicit OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes = 0);
 
     // Working level `level` of `volume` (physical level level + baseScaleLevel()),
@@ -65,6 +66,7 @@ private:
     std::mutex mutex_;
     std::shared_ptr<vcr::MemoryCache> cache_;
     std::size_t gpuCacheBytes_ = 0;
+    std::shared_ptr<vcr::reader_cuda::Pool> gpuPool_;  // before readers_: they release into it
     std::map<std::pair<std::string, int>, std::shared_ptr<vcr::zarr::OpenedArray>> levels_;  // (location, level)
     std::map<const vcr::Array*, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
     std::map<std::pair<std::string, int>, Pyramid> pyramids_;  // (location, working base): levels are renumbered from the base

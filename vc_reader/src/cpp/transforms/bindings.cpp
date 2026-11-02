@@ -2,6 +2,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
@@ -327,6 +328,10 @@ NB_MODULE(_transforms, m) {
             RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
             return export_result(std::move(result), false, inputs);
         });
+    m.def("direct_pipeline", &Pipeline::direct, "transform"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu");
+    m.def("direct_input", &direct_input, "transform"_a);
+    m.def("direct_output", &direct_output, "input"_a, "fields"_a);
+    m.attr("DIRECT_SEED") = direct_seed;
     m.def("seed", [](nb::args parts) {
         std::vector<SeedPart> values;
         for (auto part : parts) {
