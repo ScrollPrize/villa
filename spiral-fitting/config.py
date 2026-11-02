@@ -183,6 +183,7 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_lr_scale",
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
+    "fit_volume_level",
 )
 
 
@@ -296,6 +297,7 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_normal_ct_downsampling",
     "object_store_normal_ct_volume_uuid",
     "fit_volume_uuid",
+    "fit_volume_level",
 })
 
 NEW_FIT_KEYS = frozenset(
@@ -402,6 +404,7 @@ def _field_spec(key, default):
                     "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
+                     else 16 if key == "fit_volume_level"
                      else 1_000_000_000),
             step=1 if kind == "integer" else .01,
         )
@@ -690,6 +693,10 @@ class Config:
         # The reference volume every fit coordinate is a voxel of; None infers
         # it from the selected objects' declared frames.
         self.fit_volume_uuid = None
+        # The pyramid level of that volume the fit works in: a fit voxel is
+        # 2^level of its voxels. Inputs and scroll facts are converted to it,
+        # and exported surfaces back to the volume's own voxels.
+        self.fit_volume_level = 0
         # The direction ("CW" or "ACW") the spiral winds outwards, where the
         # fit volume's orientation (the catalog's z direction and handedness)
         # does not decide it; one that disagrees with it is refused. Read off

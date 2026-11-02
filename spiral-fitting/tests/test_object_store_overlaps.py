@@ -112,6 +112,23 @@ def test_non_unit_scales_land_in_fit_voxels(db, scales):
     assert 4.0 <= min(zs) and max(zs) <= 50.0
 
 
+def test_a_fit_level_converts_the_pairs_to_its_voxels(db):
+    _put(db, _plane())
+    _put(db, _plane(10.0))
+    [edge] = _detect(db)
+    inputs = materialize(db, fit_volume_level=1)
+    # The store's pairs are in the volume's voxels, the patches in the fit
+    # level's: the pairs must still sit on them.
+    assert_pairs_lie_on_their_patches(inputs)
+    zs = [pcl['points'][0]['zyx'][0] for pcl in inputs.patch_overlaps.values()]
+    assert 2.0 <= min(zs) and max(zs) <= 25.0
+    # The requested spacing is the fit level's.
+    store_pairs = db.overlap_correspondences([edge['uuid']], VOLUME, 16.0, 16)[0]['pairs']
+    assert len(_pairs(inputs)) + inputs.counts['overlap pairs off sampled quads'] \
+        == len(store_pairs)
+    assert all(pcl['metadata']['pair_distance'] < 1 for pcl in _pairs(inputs))
+
+
 def test_pairs_off_sampled_quads_are_dropped(db):
     a = _put(db, _plane())
     _put(db, _plane(10.0))

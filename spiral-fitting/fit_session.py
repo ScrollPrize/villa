@@ -708,6 +708,37 @@ def parse_scroll(document: Any, *, source: str = "scroll",
                                     outward_sense=outward_sense)
 
 
+def fit_level_scale(config: Mapping[str, Any]) -> int:
+    """Reference-volume voxels per fit voxel: 2^``fit_volume_level``."""
+    return 1 << int(config.get("fit_volume_level", 0))
+
+
+def scroll_at_fit_level(spec: ScrollSpec, level: int) -> ScrollSpec:
+    """``spec``, whose facts are in the reference volume's own voxels, in the
+    voxels of its pyramid level ``level`` (a fit voxel is 2^level of them):
+    the shape halved ``level`` times (ceil), the voxel size and the umbilicus
+    and Lasagna scales converted. The Lasagna arrays must be at that level
+    or coarser."""
+    if not level:
+        return spec
+    scale = 1 << int(level)
+    lasagna_scale = spec.lasagna_scale
+    if lasagna_scale is not None:
+        if lasagna_scale % scale:
+            raise ScrollSpecError(
+                f"the Lasagna arrays (downsampling {lasagna_scale} of the reference "
+                f"volume) are not a whole downsampling of fit level {level} "
+                f"({scale}x); fit at a finer level")
+        lasagna_scale //= scale
+    return replace(
+        spec,
+        voxel_size_um=spec.voxel_size_um * scale,
+        base_shape_zyx=(tuple(-(-int(extent) // scale) for extent in spec.base_shape_zyx)
+                        if spec.base_shape_zyx is not None else None),
+        umbilicus_coordinate_scale=spec.umbilicus_coordinate_scale / scale,
+        lasagna_scale=lasagna_scale)
+
+
 def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec:
     """``spec`` with the downsampling of the Lasagna dataset ``source``
     relative to the fit volume: derived from the volume's ``base_shape_zyx``
@@ -1204,14 +1235,15 @@ class SessionScroll:
             outward_sense=outward_sense)
 
     def fiber_directions(self, volume_uuid: str,
-                         cache_directory: str | os.PathLike[str]) -> str:
-        """The fiber-direction samples a fit of ``volume_uuid`` reads: those
-        extracted from the project's fiber-inference dataset at the volume's
-        scale, in the cache (fiber_direction_samples.py --cache)."""
-        path = self.fiber_directions_cache_path(volume_uuid, cache_directory)
+                         cache_directory: str | os.PathLike[str], level: int = 0) -> str:
+        """The fiber-direction samples a fit of ``volume_uuid`` at pyramid
+        level ``level`` (fit_volume_level) reads: those extracted from the
+        project's fiber-inference dataset at that level's scale, in the cache
+        (fiber_direction_samples.py --cache)."""
+        path = self.fiber_directions_cache_path(volume_uuid, cache_directory, level)
         if not os.path.isfile(path):
             dataset = self.project.fiber_inference
-            scale = self.volume(volume_uuid).fiber_scale
+            scale = self.fiber_scale(volume_uuid, level)
             raise ScrollSpecError(
                 f"no fiber directions of {dataset.location} (dataset {dataset.identity}) "
                 f"at scale {scale:g} in the cache: extract them with "
@@ -1221,9 +1253,10 @@ class SessionScroll:
         return path
 
     def fiber_directions_cache_path(self, volume_uuid: str,
-                                    cache_directory: str | os.PathLike[str]) -> str:
+                                    cache_directory: str | os.PathLike[str],
+                                    level: int = 0) -> str:
         """Where the cache keeps the fiber-direction samples of a fit of
-        ``volume_uuid``, present or not."""
+        ``volume_uuid`` at pyramid level ``level``, present or not."""
         dataset = self.project.fiber_inference
         if dataset is None:
             raise ScrollSpecError(
@@ -1231,13 +1264,19 @@ class SessionScroll:
                 "dataset: attach one and select it")
         if dataset.error:
             raise ScrollSpecError(dataset.error)
+        return fiber_directions_path(cache_directory, dataset.identity,
+                                     self.fiber_scale(volume_uuid, level))
+
+    def fiber_scale(self, volume_uuid: str, level: int = 0) -> float:
+        """Base voxels of the fiber-inference dataset per fit voxel of a fit
+        of ``volume_uuid`` at pyramid level ``level``."""
         scale = self.volume(volume_uuid).fiber_scale
         if scale is None:
             raise ScrollSpecError(
-                f"the fiber-inference dataset {dataset.location} has no scale relative "
-                f"to the fit volume {volume_uuid} (neither it nor the volume declares "
-                "its full-resolution shape)")
-        return fiber_directions_path(cache_directory, dataset.identity, scale)
+                f"the fiber-inference dataset {self.project.fiber_inference.location} "
+                f"has no scale relative to the fit volume {volume_uuid} (neither it "
+                "nor the volume declares its full-resolution shape)")
+        return scale * (1 << int(level))
 
     def umbilicus(self, volume_uuid: str) -> ProjectUmbilicus:
         umbilicus = self.volume(volume_uuid).umbilicus

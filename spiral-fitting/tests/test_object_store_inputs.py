@@ -8,6 +8,7 @@ pytest.importorskip('vc_object_store')
 from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
+from config import Config  # noqa: E402
 from object_store_fixture import (  # noqa: E402
     VOLUME, array, branch, frame, pcl_patch_edge, put_fiber, put_patch, put_pcl)
 
@@ -138,6 +139,23 @@ def test_frame_conversion_round_trips_mixed_scales(db, scale):
     assert (zyxs[0, 0] == -1).all()
     np.testing.assert_allclose(
         obj.frame.grid_scale_to_fit(attributes['scale']), [0.25, 0.5])
+
+
+def test_a_fit_level_converts_frames_to_its_voxels(db):
+    patch = put_patch(db, _grid(), scale=(0.25, 0.5), coordinates=frame(2))
+    config = Config().as_dict()
+    config.update(fit_volume_level=2, input_use_outer_shell=False,
+                  loss_weight_shell_outer=0, dense_spacing_mode='grad_mag')
+    request = osi.request_from_config(config)
+    assert request.fit_volume_level == 2 and request.fit_scale == 4
+    obj = osi.read_snapshot(db, request).objects[patch]
+    arrays, attributes = osi.read_geometry(db, obj.geometry_revision, ['points'])
+    # Stored at 2x the volume's voxels; the fit's are 4 of the volume's.
+    np.testing.assert_allclose(obj.frame.xyz_to_fit_zyx(arrays['points']),
+                               _grid() / 4, atol=1e-4)
+    # Grid steps per fit voxel: 4x those per volume voxel.
+    np.testing.assert_allclose(obj.frame.grid_scale_to_fit(attributes['scale']),
+                               [0.25 * 4, 0.5 * 4])
 
 
 def test_relationship_filtering_and_endpoint_order(db):

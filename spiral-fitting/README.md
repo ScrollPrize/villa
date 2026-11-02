@@ -481,6 +481,16 @@ in fit-volume voxels. Tracks declare their frames like every other object;
 their crossings are found on the stored integer voxels and their arclength
 positions and clearances converted to fit voxels.
 
+`fit_volume_level` (default 0) fits at a pyramid level of the reference
+volume instead: a fit voxel is 2^level reference voxels, so the z range and
+every setting above are in that level's voxels. Object frames, the scroll's
+facts (shape, voxel size, umbilicus and Lasagna scales), the store's overlap
+pairs and the fiber directions a service extracts are converted to it; link
+refresh still works in the reference volume's own voxels, and exported
+surfaces and previews are written back in them. The winding-inference
+artifact and a `scroll_zarr` array are read as they are, so they must already
+be at that level. A checkpoint resumes only at the level it was written at.
+
 ### Tests and smoke checks
 
 From the repository root, with `vc_object_store`'s Python module on the path

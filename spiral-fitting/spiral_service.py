@@ -1389,11 +1389,13 @@ class ServiceState:
         # Loaded whenever enabled, as the CLI loads its manifest's, so a later
         # run with the loss on finds them resident; required with the loss.
         fiber_directions = ""
+        level = config.get("fit_volume_level", 0)
         if fiber_directions_required(config):
-            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+            fiber_directions = scroll.fiber_directions(volume, paths.cache_directory, level)
         elif input_source_enabled(config, "fiber_directions"):
             try:
-                fiber_directions = scroll.fiber_directions(volume, paths.cache_directory)
+                fiber_directions = scroll.fiber_directions(
+                    volume, paths.cache_directory, level)
             except ScrollSpecError:
                 pass
         return dataclasses.replace(paths, volume_uuid=volume, umbilicus=umbilicus,
@@ -1981,7 +1983,8 @@ class ServiceState:
         if not self.build_missing_lasagna_packs or not fiber_directions_required(config):
             return
         try:
-            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory)
+            level = config.get("fit_volume_level", 0)
+            path = scroll.fiber_directions_cache_path(volume, paths.cache_directory, level)
         except ScrollSpecError:
             return
         if os.path.isfile(path):
@@ -1994,7 +1997,7 @@ class ServiceState:
         dataset = scroll.project.fiber_inference
         log(f"extracting from {dataset.location} into {path}")
         extract(dataset.location, None, path, identity=dataset.identity,
-                output_scale=scroll.volume(volume).fiber_scale,
+                output_scale=scroll.fiber_scale(volume, level),
                 workers=FIBER_DIRECTION_WORKERS, log=log)
 
     def _prepare_lasagna_packs(self, paths, config):

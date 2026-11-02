@@ -1,6 +1,7 @@
 """Exported surfaces put the outermost wrap in column 0 and the scroll top in
 row 0. Previews are exported from a synthetic spiral through the identity
 transform, so each vertex's radius and z say where it belongs."""
+from dataclasses import replace
 import json
 import math
 
@@ -10,7 +11,7 @@ from PIL import Image
 import pytest
 import torch
 
-from fit_session import ScrollSpecError, parse_scroll
+from fit_session import ScrollSpecError, parse_scroll, scroll_at_fit_level
 from lasagna_publish import _raw_run_diff_rgba
 from loss_maps import LossMapRecorder, capture_loss_maps, record_loss_samples
 from render_ink import concat_meshes
@@ -149,3 +150,55 @@ def test_render_ink_concatenates_outermost_winding_first(tmp_path):
     with pytest.raises(click.ClickException):
         concat_meshes([f"{tmp_path}/w11", f"{tmp_path}/legacy"])
 
+
+
+def test_scroll_facts_convert_to_a_fit_level():
+    spec = replace(parse(base_shape_zyx=[101, 64, 7], lasagna_scale=8,
+                         spiral_outward_sense="CW"),
+                   umbilicus_coordinate_scale=0.5)
+    assert scroll_at_fit_level(spec, 0) is spec
+    level = scroll_at_fit_level(spec, 2)
+    assert level.voxel_size_um == pytest.approx(9.6 * 4)
+    assert level.base_shape_zyx == (26, 16, 2)
+    assert level.umbilicus_coordinate_scale == 0.125
+    assert level.lasagna_scale == 2
+    # Lasagna arrays finer than the fit level are refused.
+    with pytest.raises(ScrollSpecError, match="fit at a finer level"):
+        scroll_at_fit_level(spec, 4)
+
+
+def test_a_fit_level_preview_is_written_in_the_volume_voxels(tmp_path):
+    def export(path, level):
+        cfg = {"shell_outer_winding_idx": WINDINGS[-1], "output_step_size": STEP,
+               "model_flow_bounds_z_margin": 0, "fit_volume_level": level}
+        return spiral_helpers.save_combined_preview(
+            IdentityTransform(), torch.tensor(DR), [], [], path, cfg,
+            z_begin=0, z_end=Z_END, voxel_size_um=9.6,
+            get_or_build_unattached_pcl_flat=lambda *_: None,
+            surface_id="surface", z_direction_is_top_to_bottom=True,
+            base_shape_zyx=[400, 400, 400])
+
+    fit = export(tmp_path / "fit", 0)
+    volume = export(tmp_path / "volume", 2)
+    fit_zyx, fit_valid = read_zyx(fit["surface_path"])
+    zyx, valid = read_zyx(volume["surface_path"])
+    np.testing.assert_array_equal(valid, fit_valid)
+    np.testing.assert_allclose(zyx[valid], fit_zyx[valid] * 4)
+    meta = json.loads(open(f"{volume['surface_path']}/meta.json").read())
+    fit_meta = json.loads(open(f"{fit['surface_path']}/meta.json").read())
+    assert meta["scale"] == [value / 4 for value in fit_meta["scale"]]
+    assert meta["voxel_size_um"] == volume["voxel_size_um"] == pytest.approx(2.4)
+    assert meta["area_cm2"] == pytest.approx(fit_meta["area_cm2"])
+    assert meta["base_shape_zyx"] == [400, 400, 400]
+
+
+def test_a_fit_level_mesh_winding_is_written_in_the_volume_voxels(tmp_path):
+    grid = np.full((3, 3, 3), -1.0, dtype=np.float32)
+    grid[1:, 1:] = [[[2.0, 3.0, 4.0], [2.0, 3.0, 5.0]], [[3.0, 3.0, 4.0], [3.0, 3.0, 5.0]]]
+    save_tifxyz(grid, tmp_path, "w", 1, 9.6, "t", coordinate_scale=4)
+    zyx, valid = read_zyx(tmp_path / "w")
+    np.testing.assert_allclose(zyx[valid], grid[1:, 1:].reshape(-1, 3) * 4)
+    assert (zyx[~valid] == -1).all()
+    meta = json.loads(open(tmp_path / "w" / "meta.json").read())
+    assert meta["scale"] == [0.25, 0.25]
+    assert meta["bbox"] == [[16.0, 12.0, 8.0], [20.0, 12.0, 12.0]]

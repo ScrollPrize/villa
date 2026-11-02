@@ -148,6 +148,14 @@ class InputRequest:
     # false), 'optional' (it filters tracks when present) or 'required' (shell
     # losses, winding-model supervision; a store without one is refused).
     outer_shell: str = 'optional'
+    # The pyramid level of the fit volume the fit works in (fit_volume_level):
+    # a fit voxel is 2^level of the volume's voxels.
+    fit_volume_level: int = 0
+
+    @property
+    def fit_scale(self):
+        """Volume voxels per fit voxel."""
+        return 1 << int(self.fit_volume_level)
 
     def __post_init__(self):
         # An unknown key would otherwise leave its kind unselected-by-default:
@@ -162,7 +170,9 @@ class InputRequest:
 
 @dataclasses.dataclass(frozen=True)
 class ObjectFrame:
-    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor."""
+    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor,
+    and fit XYZ = stored XYZ x to_fit (the fit voxels are those of a pyramid
+    level of the reference volume)."""
     volume_uuid: str
     scale_factor: float
     # stored -> fit multiplier from the store's shared coordinate helper.
@@ -423,13 +433,14 @@ def infer_fit_volume(records, configured=None):
     return next(iter(declared)), 'inferred'
 
 
-def object_frame(meta, volume_uuid):
-    """The object's ObjectFrame in ``volume_uuid``; raises ValueError when its
-    frame is unknown, invalid or in another volume."""
+def object_frame(meta, volume_uuid, fit_scale=1):
+    """The object's ObjectFrame in ``volume_uuid``, whose fit voxels are
+    ``fit_scale`` of its voxels; raises ValueError when its frame is unknown,
+    invalid or in another volume."""
     from vc_object_store import geometry_scale_to_frame, resolve_geometry_coordinates
     coordinates = resolve_geometry_coordinates(meta, volume_uuid)
     return ObjectFrame(volume_uuid, float(coordinates['scale_factor']),
-                       float(geometry_scale_to_frame(meta, volume_uuid)))
+                       float(geometry_scale_to_frame(meta, volume_uuid)) / fit_scale)
 
 
 def _relationship_family(record, kinds):
@@ -616,7 +627,7 @@ def read_snapshot(store, request, uuids=None):
     def stored(revision):
         record = revision['record']
         try:
-            frame = object_frame(record['meta'], volume_uuid)
+            frame = object_frame(record['meta'], volume_uuid, request.fit_scale)
         except ValueError as error:
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
@@ -1130,8 +1141,8 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
 
     The store materializes each consumed overlap edge's point pairs from its
     stored pose (``overlap_correspondences``); nothing is matched here. Pairs
-    follow the stored endpoint order, with (row, col) grids and XYZ already in
-    fit-volume voxels, so only the axes are reversed. Each pair becomes one
+    follow the stored endpoint order, with (row, col) grids and XYZ in the
+    fit volume's own voxels, converted to the fit level's. Each pair becomes one
     collection of two points, the pair's point on either patch, with zero
     relative winding: the relative-winding loss then compares exactly that
     correspondence along its own two-node chain. Every pair of an edge
@@ -1162,9 +1173,10 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                 'b_object_meta': json.dumps(snapshot.objects[b].meta),
                 'a_geometry_revision': snapshot.objects[a].geometry_revision,
                 'b_geometry_revision': snapshot.objects[b].geometry_revision}
+    fit_scale = snapshot.request.fit_scale
     results = store.overlap_correspondences_at(
         [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,
-        float(pair_spacing), int(max_pairs))
+        float(pair_spacing) * fit_scale, int(max_pairs))
     cid = first_id
     for result in results:
         rel = edges.pop(result['edge_uuid'], None)
@@ -1205,8 +1217,10 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
             collections[cid] = {
                 'id': cid, 'name': f'overlap {rel.uuid} pair {index}',
                 'points': {
-                    0: _overlap_point(cid, 0, a, pair['a_grid'], pair['a_xyz'], rel.uuid),
-                    1: _overlap_point(cid, 1, b, pair['b_grid'], pair['b_xyz'], rel.uuid)},
+                    0: _overlap_point(cid, 0, a, pair['a_grid'],
+                                      np.asarray(pair['a_xyz']) / fit_scale, rel.uuid),
+                    1: _overlap_point(cid, 1, b, pair['b_grid'],
+                                      np.asarray(pair['b_xyz']) / fit_scale, rel.uuid)},
                 'color': [0.0, 0.0, 0.0], 'source_file': None,
                 'sampling_group': group,
                 'sampling_member_weight': 1.0 / len(kept),
@@ -1217,7 +1231,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                     'resident_collection_id': cid,
                     'edge_uuid': rel.uuid,
                     'edge_revision': rel.revision,
-                    'pair_distance': float(pair['distance']),
+                    'pair_distance': float(pair['distance']) / fit_scale,
                 },
             }
             cid += 1
@@ -1662,7 +1676,8 @@ def request_from_config(config):
              else 'optional' if input_source_enabled(config, 'outer_shell') else 'off')
     return InputRequest(selectors, config['fit_volume_uuid'],
                         bool(config['object_store_approved_links_only']),
-                        outer_shell=shell)
+                        outer_shell=shell,
+                        fit_volume_level=int(config['fit_volume_level']))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2132,7 +2147,7 @@ MATERIALIZATION_KEYS = (
     'pcl_fiber_min_point_spacing', 'pcl_patch_overlap_pair_spacing',
     'pcl_patch_overlap_max_pairs', 'pcl_unattached_pcl_min_point_spacing',
     'pcl_use_fiber_links', 'pcl_vertical_fiber_min_z_fraction',
-    'pcl_vertical_fiber_min_auto_certainty',
+    'pcl_vertical_fiber_min_auto_certainty', 'fit_volume_level',
 )
 
 
