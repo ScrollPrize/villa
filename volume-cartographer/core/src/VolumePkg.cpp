@@ -320,9 +320,9 @@ std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::cat
     }
 }
 
-utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
+nlohmann::json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
 {
-    auto metadata = utils::Json::object();
+    auto metadata = nlohmann::json::object();
     const auto view = catalogVolumeView(catalog, location);
     if (!view) return metadata;
     // Identity only: the voxel size comes through vcr::zarr::volumeMetadata, where the

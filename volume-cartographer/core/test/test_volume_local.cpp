@@ -50,9 +50,9 @@ TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
     const vcr::zarr::CreateOptions levelZero{.shape = {32, 32, 32}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
     vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
     std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "test-vol-uuid"}, {"name", "test-vol"}, {"format", "zarr"}, {"width", 32}, {"height", 32}, {"slices", 32}, {"voxelsize", 1.0}}.dump();
-    const auto meta = vc::json::load_json_file(d / "meta.json");
+    const auto meta = nlohmann::json::parse(std::ifstream(d / "meta.json"));
     const auto metaWithVoxelSize = [&](const std::string& voxelsizeJson) {
-        std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get_string() +
+        std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get<std::string>() +
                            R"(", "width": 32, "height": 32, "slices": 32)";
         if (!voxelsizeJson.empty()) {
             text += R"(, "voxelsize": )" + voxelsizeJson;

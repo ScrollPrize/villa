@@ -26,7 +26,7 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include <vc_reader/tifxyz.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -46,7 +46,7 @@
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
-using utils::Json;
+using Json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
 // Grid: a tifxyz surface in memory.
@@ -815,7 +815,7 @@ int main(int argc, char** argv)
             QuadSurface result(P, g.scale);
             result.meta = stored->meta;  // a straightened copy keeps the input's metadata
             const std::string name = storeOptions->name.value_or(
-                (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight");
+                (stored->meta.contains("name") ? stored->meta["name"].get<std::string>() : stored->id) + "_straight");
             const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
                                                {"orthogonalize", doOrtho}, {"trim", doTrim}};
             const auto uuid = store->create(result, name, parameters, {stored->id}, storeOptions->tags);

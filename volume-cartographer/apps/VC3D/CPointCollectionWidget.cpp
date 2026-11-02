@@ -27,7 +27,7 @@
 
 #include <filesystem>
 #include <optional>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/ui/VCCollection.hpp"
 
@@ -920,30 +920,30 @@ void CPointCollectionWidget::showContextMenu(const QPoint& pos)
     }
 }
 
-void CPointCollectionWidget::loadCorrPointsResults(const utils::Json& results)
+void CPointCollectionWidget::loadCorrPointsResults(const nlohmann::json& results)
 {
     _corr_point_results.clear();
     _corr_collection_avgs.clear();
 
     try {
-        utils::Json j = results;
+        nlohmann::json j = results;
 
-        const auto readId = [](const utils::Json& value) -> std::optional<uint64_t> {
-            if (!value.is_number_integer() || value.get_double() < 0) return std::nullopt;
-            return value.get_uint64();
+        const auto readId = [](const nlohmann::json& value) -> std::optional<uint64_t> {
+            if (!value.is_number_integer() || value.get<double>() < 0) return std::nullopt;
+            return value.get<uint64_t>();
         };
-        const auto storeResult = [this](vc::PointRef ref, const utils::Json& val) {
+        const auto storeResult = [this](vc::PointRef ref, const nlohmann::json& val) {
             CorrPointResult r;
             if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
-                r.winding_obs = val["winding_obs"].get_float();
+                r.winding_obs = val["winding_obs"].get<float>();
             }
             if (val.contains("winding_err") && val["winding_err"].is_number()) {
-                r.winding_err = val["winding_err"].get_float();
+                r.winding_err = val["winding_err"].get<float>();
             }
             if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
-                r.p[0] = val["p"][0].get_float();
-                r.p[1] = val["p"][1].get_float();
-                r.p[2] = val["p"][2].get_float();
+                r.p[0] = val["p"][0].get<float>();
+                r.p[1] = val["p"][1].get<float>();
+                r.p[2] = val["p"][2].get<float>();
             }
             _corr_point_results[ref] = r;
         };
@@ -967,7 +967,7 @@ void CPointCollectionWidget::loadCorrPointsResults(const utils::Json& results)
                 uint64_t cid = 0;
                 try { cid = std::stoull(key); } catch (...) { continue; }
                 if (val.is_number()) {
-                    _corr_collection_avgs[cid] = val.get_float();
+                    _corr_collection_avgs[cid] = val.get<float>();
                 }
             }
         }

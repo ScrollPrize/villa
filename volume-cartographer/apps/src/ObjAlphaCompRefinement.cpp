@@ -1,4 +1,4 @@
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 
 #include <vc_reader/grid.hpp>
@@ -47,48 +47,48 @@ struct RefinementConfig {
     std::size_t cache_bytes = static_cast<std::size_t>(10e9);
 };
 
-static RefinementConfig parse_config(const utils::Json& params)
+static RefinementConfig parse_config(const nlohmann::json& params)
 {
     RefinementConfig cfg;
-    if (params.contains("refine")) cfg.refine = params.at("refine").get_bool();
-    if (params.contains("start")) cfg.start = params.at("start").get_float();
-    if (params.contains("stop")) cfg.stop = params.at("stop").get_float();
-    if (params.contains("step")) cfg.step = params.at("step").get_float();
-    if (params.contains("border_off")) cfg.border_off = params.at("border_off").get_float();
-    if (params.contains("r")) cfg.r = params.at("r").get_int();
-    if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get_bool();
-    if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get_bool();
-    if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get_float();
+    if (params.contains("refine")) cfg.refine = params.at("refine").get<bool>();
+    if (params.contains("start")) cfg.start = params.at("start").get<float>();
+    if (params.contains("stop")) cfg.stop = params.at("stop").get<float>();
+    if (params.contains("step")) cfg.step = params.at("step").get<float>();
+    if (params.contains("border_off")) cfg.border_off = params.at("border_off").get<float>();
+    if (params.contains("r")) cfg.r = params.at("r").get<int>();
+    if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get<bool>();
+    if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get<bool>();
+    if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get<float>();
     if (params.contains("cache_bytes")) {
-        const auto bytes = params.at("cache_bytes").get_uint64();
+        const auto bytes = params.at("cache_bytes").get<uint64_t>();
         cfg.cache_bytes = static_cast<std::size_t>(bytes);
     } else if (params.contains("cache_mb")) {
-        const auto mb = params.at("cache_mb").get_double();
+        const auto mb = params.at("cache_mb").get<double>();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(1.0, mb) * 1024.0 * 1024.0);
     } else if (params.contains("cache_gb")) {
-        const auto gb = params.at("cache_gb").get_double();
+        const auto gb = params.at("cache_gb").get<double>();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(0.001, gb) * 1024.0 * 1024.0 * 1024.0);
     }
 
     if (params.contains("low")) {
-        double v = params.at("low").get_double();
+        double v = params.at("low").get<double>();
         if (v > 1.0) v /= 255.0;
         cfg.low = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
     if (params.contains("high")) {
-        double v = params.at("high").get_double();
+        double v = params.at("high").get<double>();
         if (v > 1.0) v /= 255.0;
         cfg.high = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
 
     if (params.contains("scale_group")) {
         const auto& v = params.at("scale_group");
-        cfg.dataset_group = v.is_string() ? v.get_string()
-                                          : std::to_string(v.get_int());
+        cfg.dataset_group = v.is_string() ? v.get<std::string>()
+                                          : std::to_string(v.get<int>());
     } else if (params.contains("scale_level")) {
         const auto& v = params.at("scale_level");
-        cfg.dataset_group = v.is_string() ? v.get_string()
-                                          : std::to_string(v.get_int());
+        cfg.dataset_group = v.is_string() ? v.get<std::string>()
+                                          : std::to_string(v.get<int>());
     }
 
     return cfg;
@@ -462,7 +462,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const utils::Json params = utils::Json::parse_file(params_path);
+    const nlohmann::json params = nlohmann::json::parse(std::ifstream(params_path));
     const RefinementConfig cfg = parse_config(params);
 
     const int level = std::stoi(cfg.dataset_group);
@@ -492,7 +492,7 @@ int main(int argc, char *argv[])
 
     if (store) {
         StoreSurfaces surfaces(store->store, "vc_objrefine");
-        return process_stored(surfaces, *store, nlohmann::json::parse(params.dump()), reader, cfg);
+        return process_stored(surfaces, *store, params, reader, cfg);
     }
 
     int ret = EXIT_FAILURE;

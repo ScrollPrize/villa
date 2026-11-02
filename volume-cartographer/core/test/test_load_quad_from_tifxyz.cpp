@@ -39,7 +39,7 @@ TEST_CASE("load_quad_from_tifxyz: returns a valid surface for a real fixture")
     CHECK(qs->rawPointsPtr() != nullptr);
     CHECK(qs->rawPointsPtr()->rows == 129);
     CHECK(qs->rawPointsPtr()->cols == 129);
-    CHECK(qs->meta["uuid"].get_string() == "20241113070770");
+    CHECK(qs->meta["uuid"].get<std::string>() == "20241113070770");
 }
 
 TEST_CASE("load_quad_from_tifxyz: a negative coordinate marks the vertex invalid")
@@ -74,7 +74,7 @@ TEST_CASE("load_quad_from_tifxyz: works for the other fixtures too")
         REQUIRE(qs);
         qs->ensureLoaded();
         CHECK(qs->rawPointsPtr() != nullptr);
-        CHECK(qs->meta["uuid"].get_string() == std::string(name));
+        CHECK(qs->meta["uuid"].get<std::string>() == std::string(name));
     }
 }
 

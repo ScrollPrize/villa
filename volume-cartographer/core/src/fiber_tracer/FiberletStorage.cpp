@@ -2,7 +2,7 @@
 
 #include "vc/lasagna/ChannelSampler.hpp"
 
-#include <utils/hash.hpp>
+#include <vc/core/util/StableHash.hpp>
 
 #include <vc_reader/zarr_write.hpp>
 
@@ -177,12 +177,12 @@ void overwriteLittle(std::vector<std::byte>& output, std::size_t offset, std::ui
 
 std::uint64_t payloadChecksum(std::span<const std::byte> bytes)
 {
-    std::uint64_t hash = utils::fnv_offset_basis;
+    std::uint64_t hash = vc::fnv_offset_basis;
     for (std::size_t index = 0; index < bytes.size(); ++index) {
         const unsigned char value =
             index >= kChecksumOffset && index < kChecksumOffset + sizeof(std::uint64_t) ? 0 : std::to_integer<unsigned char>(bytes[index]);
         hash ^= value;
-        hash *= utils::fnv_prime;
+        hash *= vc::fnv_prime;
     }
     return hash;
 }

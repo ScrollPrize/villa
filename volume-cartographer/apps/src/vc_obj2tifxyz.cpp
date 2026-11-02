@@ -198,7 +198,7 @@ int main(int argc, char *argv[])
 
     // Source tifxyz (optional): provides the scale that sizes the output grid
     // to the input sampling density. Absent -> legacy metric sizing.
-    utils::Json sourceMeta = utils::Json::object();
+    nlohmann::json sourceMeta = nlohmann::json::object();
     if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
             std::unique_ptr<QuadSurface> src(source_surface.empty()

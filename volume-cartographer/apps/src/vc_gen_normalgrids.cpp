@@ -11,7 +11,7 @@
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -49,7 +49,7 @@ enum class SliceDirection { XY, XZ, YZ };
 
 namespace {
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 struct DirectionMetrics {
     std::string direction;
@@ -756,7 +756,7 @@ void run_pyramid(const po::variables_map& vm) {
         throw std::runtime_error("input normal_grids root is missing metadata.json: " + input_root.string());
     }
 
-    const Json source_metadata = Json::parse_file(input_root / "metadata.json");
+    const Json source_metadata = nlohmann::json::parse(std::ifstream(input_root / "metadata.json"));
     const int source_grid_step = source_metadata.value("grid-step", 64);
     const int source_sparse_volume = std::max(1, source_metadata.value("sparse-volume", 1));
     const double source_spiral_step = source_metadata.value("spiral-step", 20.0);

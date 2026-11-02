@@ -12,7 +12,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
-#include "utils/thread_pool.hpp"
+#include "vc/core/util/ThreadPool.hpp"
 
 
 #include <algorithm>
@@ -834,7 +834,7 @@ int runWholeVolumePreprocessing(
         FiberletPreprocessWork work;
         std::future<std::uint64_t> result;
     };
-    utils::ThreadPool workers(workerCount);
+    vc::ThreadPool workers(workerCount);
     std::vector<RunningWork> running;
     running.reserve(workerCount);
     const auto submit = [&](const FiberletPreprocessWork& work) {

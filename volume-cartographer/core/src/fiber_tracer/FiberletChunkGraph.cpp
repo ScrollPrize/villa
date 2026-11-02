@@ -1,7 +1,7 @@
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
-#include "utils/thread_pool.hpp"
+#include "vc/core/util/ThreadPool.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1122,7 +1122,7 @@ FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
         }
     };
     if (parallelThreads > 1 && !arcs.empty()) {
-        utils::ThreadPool pool(std::min(parallelThreads, arcs.size()));
+        vc::ThreadPool pool(std::min(parallelThreads, arcs.size()));
         pool.run_indexed_batch(arcs.size(), build);
     } else {
         for (std::size_t i = 0; i < arcs.size(); ++i)

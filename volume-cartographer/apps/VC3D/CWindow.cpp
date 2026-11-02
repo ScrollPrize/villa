@@ -72,7 +72,7 @@
 #include <QTreeWidget>
 #include <QStandardItemModel>
 #include <QPushButton>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <QPointer>
 #include <algorithm>
 #include <set>
@@ -2607,7 +2607,7 @@ void CWindow::loadLasagnaResults(Surface* surface)
     }
     if (_point_collection_widget) {
         if (corr) {
-            _point_collection_widget->loadCorrPointsResults(utils::Json::parse(corr->dump()));
+            _point_collection_widget->loadCorrPointsResults(*corr);
         } else {
             _point_collection_widget->clearCorrPointsResults();
         }

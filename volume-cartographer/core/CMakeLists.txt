@@ -56,9 +56,6 @@ target_link_libraries(vc_core
         OpenMP::OpenMP_CXX
 )
 
-target_link_libraries(vc_core PUBLIC
-    $<BUILD_INTERFACE:utils>
-)
 target_link_libraries(vc_core PRIVATE
     ${VC_LIBBACKTRACE}
 )

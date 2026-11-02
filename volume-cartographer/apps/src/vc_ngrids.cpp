@@ -17,7 +17,7 @@
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
 #include <vc_reader/array.hpp>
@@ -38,7 +38,7 @@ namespace po = boost::program_options;
 
 namespace {
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 template <typename Solver, typename = void>
 struct TinySolverParameterVector {
@@ -1300,19 +1300,19 @@ static void create_normals_output_zarr(
     }
 
     auto mk3i = [](auto a, auto b, auto c) {
-        utils::Json arr = utils::Json::array();
+        nlohmann::json arr = nlohmann::json::array();
         arr.push_back(static_cast<int64_t>(a));
         arr.push_back(static_cast<int64_t>(b));
         arr.push_back(static_cast<int64_t>(c));
         return arr;
     };
 
-    utils::Json encoding = utils::Json::object();
+    nlohmann::json encoding = nlohmann::json::object();
     encoding["type"] = "direction-field-u8";
     encoding["decode"] = "(u8-128)/127";
     encoding["fill_value"] = 128;
 
-    utils::Json attrs = utils::Json::object();
+    nlohmann::json attrs = nlohmann::json::object();
     attrs["source"] = "vc_ngrids";
     attrs["description"] = "Direction-field encoded normals: x/0,y/0,z/0 uint8 with decode (u8-128)/127";
     attrs["encoding"] = encoding;
@@ -1326,7 +1326,7 @@ static void create_normals_output_zarr(
         attrs["crop_shape_zyx"] = mk3i(
             crop_zyx->shape[0], crop_zyx->shape[1], crop_zyx->shape[2]);
     }
-    vcr::zarr::writeAttributes(out_zarr, vcr::zarr::Json::parse(attrs.dump()));
+    vcr::zarr::writeAttributes(out_zarr, attrs);
 }
 
 static std::vector<size_t> bounded_normals_output_chunks(
@@ -1598,7 +1598,7 @@ static void run_fit_normals(
     const int crop_off_z = sz0 / step;
     {
         auto mk3i = [](int a, int b, int c) {
-            utils::Json arr = utils::Json::array();
+            nlohmann::json arr = nlohmann::json::array();
             arr.push_back(a); arr.push_back(b); arr.push_back(c);
             return arr;
         };
@@ -2287,11 +2287,11 @@ static void run_fit_normals(
 
         materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
-        utils::Json attrs = utils::Json::parse(vcr::zarr::readAttributes(out_zarr).dump());
+        nlohmann::json attrs = vcr::zarr::readAttributes(out_zarr);
         attrs["radius"] = radius;
         {
             auto mk3 = [](auto a, auto b, auto c) {
-                utils::Json arr = utils::Json::array();
+                nlohmann::json arr = nlohmann::json::array();
                 arr.push_back(static_cast<int64_t>(a));
                 arr.push_back(static_cast<int64_t>(b));
                 arr.push_back(static_cast<int64_t>(c));
@@ -2310,7 +2310,7 @@ static void run_fit_normals(
         attrs["fit_frac_short_paths_decode"] = "v/255";
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
-        vcr::zarr::writeAttributes(out_zarr, vcr::zarr::Json::parse(attrs.dump()));
+        vcr::zarr::writeAttributes(out_zarr, attrs);
 
         std::error_code ec;
         fs::remove_all(spool_dir, ec);

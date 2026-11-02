@@ -52,7 +52,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         "20260102150214-2.399um-0.2m-78keV-masked.zarr";
     std::shared_ptr<Volume> untagged;
     try {
-        untagged = Volume::NewFromUrl(url, utils::Json::object(), false);
+        untagged = Volume::NewFromUrl(url, nlohmann::json::object(), false);
     } catch (const std::exception& e) {
         if (requireNetwork()) FAIL("PHerc0139 remote open failed: " << e.what());
         MESSAGE("Skipping (network unavailable?): " << e.what());

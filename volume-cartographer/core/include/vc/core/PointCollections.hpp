@@ -10,7 +10,7 @@
 #include <filesystem>
 #include <functional>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 namespace vc {
@@ -114,16 +114,16 @@ public:
 
    // Segment-specific corrections: the collections anchored on a surface
    // (anchor2d set), as collection JSON by collection id.
-   [[nodiscard]] std::map<uint64_t, utils::Json> anchoredCollections() const;
+   [[nodiscard]] std::map<uint64_t, nlohmann::json> anchoredCollections() const;
    // Replace the anchored collections with `collections` (collection JSON by
    // id). Parses every collection before installing any; collections without
    // anchor2d are skipped. Returns false (changing nothing) on malformed input.
-   bool replaceAnchoredCollections(const std::map<uint64_t, utils::Json>& collections);
+   bool replaceAnchoredCollections(const std::map<uint64_t, nlohmann::json>& collections);
    // Replace the collections without anchor2d (a volume's) with
    // `collections` (collection JSON, new runtime ids; points keep theirs).
    // Parses every collection before installing any; anchored ones are skipped.
    // Returns false (changing nothing) on malformed input.
-   bool replaceUnanchoredCollections(const std::vector<utils::Json>& collections);
+   bool replaceUnanchoredCollections(const std::vector<nlohmann::json>& collections);
 
    // Apply grid offset to all anchor2d values (for surface growth remapping)
    void applyAnchorOffset(float offsetX, float offsetY);
@@ -153,11 +153,11 @@ private:
     uint64_t _next_collection_id = 1;
 };
 
-void to_json(utils::Json& j, const ColPoint& p);
-void from_json(const utils::Json& j, ColPoint& p);
+void to_json(nlohmann::json& j, const ColPoint& p);
+void from_json(const nlohmann::json& j, ColPoint& p);
 
-void to_json(utils::Json& j, const CollectionMetadata& m);
-void from_json(const utils::Json& j, CollectionMetadata& m);
+void to_json(nlohmann::json& j, const CollectionMetadata& m);
+void from_json(const nlohmann::json& j, CollectionMetadata& m);
 
-void to_json(utils::Json& j, const PointCollections::Collection& c);
-void from_json(const utils::Json& j, PointCollections::Collection& c);
+void to_json(nlohmann::json& j, const PointCollections::Collection& c);
+void from_json(const nlohmann::json& j, PointCollections::Collection& c);

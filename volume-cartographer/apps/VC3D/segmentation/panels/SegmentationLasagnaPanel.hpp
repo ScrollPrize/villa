@@ -8,7 +8,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 class CollapsibleSettingsGroup;
 class CState;
@@ -52,7 +52,7 @@ public:
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
     /** Reads the selected config JSON file from disk and returns its contents. */
     [[nodiscard]] QString lasagnaConfigText() const;
-    [[nodiscard]] utils::Json lasagnaConfigJson() const;
+    [[nodiscard]] nlohmann::json lasagnaConfigJson() const;
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] double newModelWidth() const;
     [[nodiscard]] QString newModelWidthUnit() const;

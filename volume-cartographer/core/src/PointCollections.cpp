@@ -4,7 +4,7 @@
 #include <fstream>
 #include <iostream>
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 #define VC_POINTCOLLECTIONS_JSON_VERSION "1"
 
@@ -18,7 +18,7 @@ static Json vec3f_to_json(const cv::Vec3f& v) {
 }
 
 static cv::Vec3f vec3f_from_json(const Json& j) {
-    return {j.at(0).get_float(), j.at(1).get_float(), j.at(2).get_float()};
+    return {j.at(0).get<float>(), j.at(1).get<float>(), j.at(2).get<float>()};
 }
 
 static Json vec2f_to_json(const cv::Vec2f& v) {
@@ -29,7 +29,7 @@ static Json vec2f_to_json(const cv::Vec2f& v) {
 }
 
 static cv::Vec2f vec2f_from_json(const Json& j) {
-    return {j.at(0).get_float(), j.at(1).get_float()};
+    return {j.at(0).get<float>(), j.at(1).get<float>()};
 }
 
 // -- to_json / from_json --
@@ -58,12 +58,12 @@ void to_json(Json& j, const ColPoint& p) {
 void from_json(const Json& j, ColPoint& p) {
     p.p = vec3f_from_json(j.at("p"));
     if (j.contains("wind_a") && !j.at("wind_a").is_null()) {
-        p.winding_annotation = j.at("wind_a").get_float();
+        p.winding_annotation = j.at("wind_a").get<float>();
     } else {
         p.winding_annotation = std::nan("");
     }
     if (j.contains("creation_time")) {
-        p.creation_time = j.at("creation_time").get_int64();
+        p.creation_time = j.at("creation_time").get<int64_t>();
     } else {
         p.creation_time = 0;
     }
@@ -72,13 +72,13 @@ void from_json(const Json& j, ColPoint& p) {
         Json links = j.at("links");
         for (const auto& linked : links) {
             if (linked.is_number_integer()) {
-                p.links.push_back(linked.get_uint64());
+                p.links.push_back(linked.get<uint64_t>());
             }
         }
     }
     p.fiber_dir.clear();
     if (j.contains("fiber_dir") && j.at("fiber_dir").is_string()) {
-        const std::string dir = j.at("fiber_dir").get_string();
+        const std::string dir = j.at("fiber_dir").get<std::string>();
         if (dir == "h" || dir == "v") {
             p.fiber_dir = dir;
         }
@@ -93,7 +93,7 @@ void to_json(Json& j, const CollectionMetadata& m) {
 
 void from_json(const Json& j, CollectionMetadata& m) {
     if (j.contains("winding_is_absolute") && j.at("winding_is_absolute").is_boolean()) {
-        m.absolute_winding_number = j.at("winding_is_absolute").get_bool();
+        m.absolute_winding_number = j.at("winding_is_absolute").get<bool>();
     } else {
         m.absolute_winding_number = true;
     }
@@ -147,12 +147,12 @@ void to_json(Json& j, const PointCollections::Collection& c) {
 void from_json(const Json& j, PointCollections::Collection& c) {
     if (j.contains("uuid")) {
         if (!j.at("uuid").is_string() ||
-            !vc::objects::util::isUuid(j.at("uuid").get_string())) {
+            !vc::objects::util::isUuid(j.at("uuid").get<std::string>())) {
             throw std::runtime_error("Point collection has an invalid uuid");
         }
-        c.uuid = j.at("uuid").get_string();
+        c.uuid = j.at("uuid").get<std::string>();
     }
-    c.name = j.at("name").get_string();
+    c.name = j.at("name").get<std::string>();
 
     Json points_obj = j.at("points");  // copy — ref into at() cache gets evicted by nested at() calls
     if (points_obj.is_object()) {
@@ -181,20 +181,20 @@ void from_json(const Json& j, PointCollections::Collection& c) {
     }
 
     if (j.contains("autoFillMode") && j.at("autoFillMode").is_number()) {
-        int modeInt = j.at("autoFillMode").get_int();
+        int modeInt = j.at("autoFillMode").get<int>();
         if (modeInt >= 0 && modeInt <= 3) {
             c.autoFillMode = static_cast<PointCollections::WindingFillMode>(modeInt);
         }
     }
     if (j.contains("autoFillConstant") && j.at("autoFillConstant").is_number()) {
-        c.autoFillConstant = j.at("autoFillConstant").get_float();
+        c.autoFillConstant = j.at("autoFillConstant").get<float>();
     }
 
     if (j.contains("tags") && j.at("tags").is_object()) {
         Json tags_obj = j.at("tags");
         for (auto it = tags_obj.begin(); it != tags_obj.end(); ++it) {
             if ((*it).is_string()) {
-                c.tags[it.key()] = (*it).get_string();
+                c.tags[it.key()] = (*it).get<std::string>();
             }
         }
     }
@@ -204,7 +204,7 @@ void from_json(const Json& j, PointCollections::Collection& c) {
         Json linked = j.at("windings_linked");
         for (const auto& id : linked) {
             if (id.is_number_integer()) {
-                c.windings_linked.push_back(id.get_uint64());
+                c.windings_linked.push_back(id.get<uint64_t>());
             }
         }
     }
@@ -578,7 +578,7 @@ bool PointCollections::loadFromJSON(const std::string& filename)
 {
     Json j;
     try {
-        j = Json::parse_file(filename);
+        j = nlohmann::json::parse(std::ifstream(filename));
     } catch (const std::exception& e) {
         std::cerr << "Failed to parse JSON: " << e.what() << std::endl;
         return false;
@@ -588,7 +588,7 @@ bool PointCollections::loadFromJSON(const std::string& filename)
     // file (for example an invalid collection uuid) leaves it unchanged.
     std::unordered_map<uint64_t, Collection> collections;
     try {
-        if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+        if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
             throw std::runtime_error("JSON file has incorrect version or is missing version info.");
         }
 

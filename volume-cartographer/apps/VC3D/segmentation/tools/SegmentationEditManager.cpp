@@ -6,7 +6,7 @@
 
 #include <QLoggingCategory>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -25,7 +25,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = utils::Json::object();
+    surface->meta = nlohmann::json::object();
 }
 }
 

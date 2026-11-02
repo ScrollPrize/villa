@@ -4,14 +4,14 @@
 // their ids, one annotation per point (the point's other fields), and the rest
 // of the collection as the object's meta.source. Corrections attached to a
 // surface and a volume's own collections use the same form.
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
 
 namespace vc {
 
 // From to_json(PointCollections::Collection) form.
-vc::objects::AttachedCollection storedCollection(const utils::Json& collection);
+vc::objects::AttachedCollection storedCollection(const nlohmann::json& collection);
 // Back to that form (uuid, name, points by id and the rest).
-utils::Json collectionJson(const vc::objects::AttachedCollection& stored);
+nlohmann::json collectionJson(const vc::objects::AttachedCollection& stored);
 
 } // namespace vc

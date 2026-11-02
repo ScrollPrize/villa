@@ -25,7 +25,7 @@ inline std::optional<double> areaCm2FromVox2(double area_vx2, double voxelSize)
 
 // Record a surface's area. area_cm2 is written only when it is derivable, so an
 // unknown voxel size leaves the key absent instead of storing a bogus 0.
-inline void storeAreaMeta(utils::Json& meta, double area_vx2, double voxelSize)
+inline void storeAreaMeta(nlohmann::json& meta, double area_vx2, double voxelSize)
 {
     meta["area_vx2"] = area_vx2;
     if (const auto cm2 = areaCm2FromVox2(area_vx2, voxelSize)) {

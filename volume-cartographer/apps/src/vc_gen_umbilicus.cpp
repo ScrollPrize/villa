@@ -50,7 +50,7 @@
 #include <boost/program_options.hpp>
 #include <opencv2/core.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/normalgridtools.hpp"
@@ -58,7 +58,7 @@
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
-using utils::Json;
+using Json = nlohmann::json;
 using vc::core::util::GridStore;
 using vc::core::util::NormalGridVolume;
 using vc::core::util::align_and_extract_umbilicus;

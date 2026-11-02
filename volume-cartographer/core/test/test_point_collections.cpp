@@ -505,9 +505,9 @@ TEST_CASE("an invalid collection uuid leaves the store unchanged")
     fs::remove(tmp);
 
     // Anchored corrections fail the same way: nothing is half-loaded.
-    std::map<uint64_t, utils::Json> corrections;
-    corrections[1] = utils::Json::parse(R"({"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [1, 2]})");
-    corrections[2] = utils::Json::parse(R"({"uuid": "not-a-uuid", "name": "bad", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]})");
+    std::map<uint64_t, nlohmann::json> corrections;
+    corrections[1] = nlohmann::json::parse(R"({"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [1, 2]})");
+    corrections[2] = nlohmann::json::parse(R"({"uuid": "not-a-uuid", "name": "bad", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]})");
     CHECK_FALSE(c.replaceAnchoredCollections(corrections));
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getCollectionId("good") == std::nullopt);

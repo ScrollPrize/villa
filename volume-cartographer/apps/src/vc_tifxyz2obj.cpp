@@ -8,7 +8,7 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -19,7 +19,7 @@
 #include <limits>
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 // ---- small helpers ---------------------------------------------------------
 static inline bool finite3(const cv::Vec3f& v) {

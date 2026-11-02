@@ -3,7 +3,7 @@
 
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
-#include "utils/thread_pool.hpp"
+#include "vc/core/util/ThreadPool.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1304,7 +1304,7 @@ static FiberletCropTraceResult traceCropCandidates(
         double maximumAmbiguityThresholdRatio = 0.0;
     } completions;
 
-    std::optional<utils::ThreadPool> pool;
+    std::optional<vc::ThreadPool> pool;
     if (workerCount > 1)
         pool.emplace(workerCount);
     const std::size_t speculationWindow = workerCount == 1

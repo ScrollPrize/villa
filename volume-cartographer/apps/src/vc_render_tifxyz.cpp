@@ -12,7 +12,7 @@
 #include <vc_reader/zarr_write.hpp>
 #include <vc_reader/zarr_metadata.hpp>
 #include <vc_reader/array.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_reader/affine.hpp>
 
 #include <opencv2/imgproc.hpp>
@@ -41,7 +41,7 @@
 #endif
 
 namespace po = boost::program_options;
-using Json = utils::Json;
+using Json = nlohmann::json;
 using Affine = vcr::catalog::Affine;
 
 // ============================================================

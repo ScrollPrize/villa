@@ -21,7 +21,7 @@
 
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/tracer/Tracer.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -47,15 +47,7 @@ using vec2i_hash = std::vec2i_hash;
 
 namespace {
 
-static nlohmann::json json_from_utils(const utils::Json& json)
-{
-    return nlohmann::json::parse(json.dump());
-}
 
-static utils::Json json_to_utils(const nlohmann::json& json)
-{
-    return utils::Json::parse(json.dump());
-}
 
 static cv::Rect scaled_rect_trunc(const cv::Rect& rect, float scale)
 {
@@ -85,7 +77,7 @@ static bool looks_like_resume_surface(const QuadSurface* surf, const nlohmann::j
         return false;
     }
 
-    const nlohmann::json meta = json_from_utils(surf->meta);
+    const nlohmann::json meta = (surf->meta);
     if (meta.contains("vc_grow_seg_from_segments_params")) {
         return true;
     }
@@ -3060,14 +3052,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->setChannel("generations", generations_hr(used_area_hr));
-                dbg_surf->meta = utils::Json::object();
-                dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
+                dbg_surf->meta = nlohmann::json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = (params);
 
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
                 vc::surface::storeAreaMeta(dbg_surf->meta,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
-                dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+                dbg_surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
                 const std::filesystem::path snapshot_path = tgt_dir / uuid;
                 dbg_surf->saveAsNew(snapshot_path, true);
@@ -3141,15 +3133,15 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->setChannel("generations", generations_hr(used_area_hr));
-                dbg_surf->meta = utils::Json::object();
-                dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
+                dbg_surf->meta = nlohmann::json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = (params);
 
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt";
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
                 vc::surface::storeAreaMeta(dbg_surf->meta,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
-                dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+                dbg_surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 dbg_surf->saveAsNew(tgt_dir / uuid, true);
                 delete dbg_surf;
             }
@@ -3502,15 +3494,15 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
     surf->setChannel("generations", generations_hr(used_area_hr));
 
-    surf->meta = utils::Json::object();
+    surf->meta = nlohmann::json::object();
     vc::surface::storeAreaMeta(surf->meta,
                                static_cast<double>(area_est_vx2),
                                static_cast<double>(voxelsize));
-    surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+    surf->meta["used_approved_segments"] = (nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
     if (resume_growth) {
         const int offset_col = grid_margin + expanded_left - used_area.x;
         const int offset_row = grid_margin + expanded_up - used_area.y;
-        auto off_arr = utils::Json::array();
+        auto off_arr = nlohmann::json::array();
         off_arr.push_back(offset_col);
         off_arr.push_back(offset_row);
         surf->meta["grid_offset"] = std::move(off_arr);
@@ -3519,7 +3511,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     return surf;
 }
 
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize)
+QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize)
 {
     if (!seed)
         return nullptr;
@@ -3540,6 +3532,6 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         seed_surf = seed;
     }
 
-    nlohmann::json grow_params = json_from_utils(params);
+    nlohmann::json grow_params = (params);
     return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize);
 }

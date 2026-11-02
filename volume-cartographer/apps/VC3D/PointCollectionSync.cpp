@@ -90,7 +90,7 @@ bool PointCollectionSync::flush()
     for (const auto id : changed_) {
         const auto found = all.find(id);
         if (found == all.end() || found->second.anchor2d) continue;
-        utils::Json json;
+        nlohmann::json json;
         to_json(json, found->second);
         auto stored = vc::storedCollection(json);
         // Linked windings by UUID: runtime ids do not survive a reload.
@@ -151,7 +151,7 @@ void PointCollectionSync::reload()
     }
     attachment_ = attachment && volume ? attachment : std::nullopt;
     volume_ = volume.value_or(vc::project::AnnotationVolume{});
-    std::vector<utils::Json> collections;
+    std::vector<nlohmann::json> collections;
     std::map<std::string, std::vector<std::string>> linked;
     for (auto& collection : stored) {
         for (const auto& uuid : collection.source.value("windings_linked", nlohmann::json::array()))

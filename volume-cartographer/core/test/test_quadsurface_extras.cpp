@@ -12,7 +12,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include <vc_reader/image_write.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -67,19 +67,19 @@ TEST_CASE("QuadSurface(path, json) ctor with bbox + components fields")
         seed.save(d);
     }
     // Build a custom meta JSON for the second ctor.
-    auto j = utils::Json::object();
+    auto j = nlohmann::json::object();
     j["format"] = "tifxyz";
     j["type"] = "seg";
     j["uuid"] = "test-uuid";
-    j["bbox"] = utils::Json::array();
-    auto lo = utils::Json::array();
+    j["bbox"] = nlohmann::json::array();
+    auto lo = nlohmann::json::array();
     lo.push_back(0.0); lo.push_back(0.0); lo.push_back(0.0);
-    auto hi = utils::Json::array();
+    auto hi = nlohmann::json::array();
     hi.push_back(16.0); hi.push_back(16.0); hi.push_back(0.0);
     j["bbox"].push_back(lo);
     j["bbox"].push_back(hi);
-    auto comps = utils::Json::array();
-    auto c1 = utils::Json::array(); c1.push_back(1); c1.push_back(2);
+    auto comps = nlohmann::json::array();
+    auto c1 = nlohmann::json::array(); c1.push_back(1); c1.push_back(2);
     comps.push_back(c1);
     j["components"] = comps;
 
@@ -90,7 +90,7 @@ TEST_CASE("QuadSurface(path, json) ctor with bbox + components fields")
     CHECK_FALSE(qs.isLoaded());
     qs.ensureLoaded();
     CHECK(qs.rawPointsPtr() != nullptr);
-    CHECK(qs.meta["uuid"].get_string() == "test-uuid");
+    CHECK(qs.meta["uuid"].get<std::string>() == "test-uuid");
     fs::remove_all(root);
 }
 

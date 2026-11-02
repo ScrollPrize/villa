@@ -8,7 +8,7 @@
 #include <optional>
 #include <system_error>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <omp.h>
 #include <QLoggingCategory>
@@ -88,9 +88,9 @@ void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload
     }
 }
 
-utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
+nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
 {
-    utils::Json params = utils::Json::object();
+    nlohmann::json params = nlohmann::json::object();
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
@@ -146,11 +146,11 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
                              static_cast<int>(allowLeft) + static_cast<int>(allowRight);
     if (allowedCount > 0 && allowedCount < 4) {
-        utils::Json allowedArr = utils::Json::array();
-        if (allowDown) allowedArr.push_back(utils::Json("down"));
-        if (allowRight) allowedArr.push_back(utils::Json("right"));
-        if (allowUp) allowedArr.push_back(utils::Json("up"));
-        if (allowLeft) allowedArr.push_back(utils::Json("left"));
+        nlohmann::json allowedArr = nlohmann::json::array();
+        if (allowDown) allowedArr.push_back(nlohmann::json("down"));
+        if (allowRight) allowedArr.push_back(nlohmann::json("right"));
+        if (allowUp) allowedArr.push_back(nlohmann::json("up"));
+        if (allowLeft) allowedArr.push_back(nlohmann::json("left"));
         params["growth_directions"] = std::move(allowedArr);
     }
     if (!request.customParams.is_null()) {
@@ -198,7 +198,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         return result;
     }
 
-    utils::Json params = buildTracerParams(request);
+    nlohmann::json params = buildTracerParams(request);
 
     int startGen = 0;
     {
@@ -215,7 +215,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             if (meta.contains("max_gen")) {
                 const auto& v = meta["max_gen"];
                 if (v.is_number()) {
-                    const int metaGen = static_cast<int>(std::round(v.get_double()));
+                    const int metaGen = static_cast<int>(std::round(v.get<double>()));
                     startGen = std::max(startGen, metaGen);
                 }
             }
@@ -308,7 +308,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       static_cast<float>(context.voxelSize),
                                       context.resumeSurface,
                                       std::filesystem::path(),
-                                      utils::Json{},
+                                      nlohmann::json{},
                                       correctionCollection,
                                       context.allowedGrowthMask.empty() ? nullptr : &context.allowedGrowthMask);
 

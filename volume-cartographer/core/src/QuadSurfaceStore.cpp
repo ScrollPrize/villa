@@ -128,7 +128,7 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
         if (!vcr::tifxyz::vertexValid(p.val)) p = kInvalid;
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;
-    surface->meta = utils::Json::parse(object->meta);
+    surface->meta = nlohmann::json::parse(object->meta);
     surface->setComponents(surface_components(surface->meta));
     surface->meta["uuid"] = object->uuid;
     surface->meta["name"] = object->name;
@@ -160,7 +160,7 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
     const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
     const vc::objects::SurfaceProvenance& provenance)
 {
-    vc::objects::createSurface(db, txn, uuid, name, tags, coordinates, provenance, nlohmann::json::parse(surface.meta.dump()),
+    vc::objects::createSurface(db, txn, uuid, name, tags, coordinates, provenance, surface.meta,
                                quad_surface_geometry(surface));
 }
 

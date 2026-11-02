@@ -5,7 +5,7 @@
 #include "vc/core/util/ImageMat.hpp"
 #include <opencv2/core.hpp>
 #include <boost/program_options.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <fstream>
 #include <vector>

@@ -401,7 +401,7 @@ if(VC_USE_LTO AND NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debu
 endif()
 
 # ---- PIC for python bindings -----------------------------------------------------
-# Python bindings link the static libs (vc_core, utils, ...) into .so modules,
+# Python bindings link the static libs (vc_core, ...) into .so modules,
 # which requires every translation unit to be -fPIC (otherwise thread_local
 # statics emit local-exec TPOFF32 relocations that ld rejects).
 if(VC_BUILD_PYTHON)
@@ -559,7 +559,7 @@ if(VC_ENABLE_AMGX)
 endif()
 if(MSVC)
     # vcpkg ships CMake configs for these (no .pc/pkg-config on MSVC). Normalize
-    # whatever target each exports to the names the tree consumes: utils links
+    # whatever target each exports to the names the tree consumes: vc_core links
     # zstd::libzstd.
     find_package(zstd CONFIG REQUIRED)
     if(NOT TARGET zstd::libzstd)
@@ -661,7 +661,6 @@ endif()
 
 include(cmake/ObjectStore.cmake)
 
-add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)
 if(VC_BUILD_PYTHON)
@@ -679,7 +678,7 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs core utils)
+set(_vc_install_dirs core)
 if(VC_BUILD_APPS)
     list(APPEND _vc_install_dirs apps apps/VC3D)
 endif()

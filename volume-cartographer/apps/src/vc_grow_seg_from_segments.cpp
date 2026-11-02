@@ -1,6 +1,6 @@
 #include <iostream>
 #include "TargetContext.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <vc_reader/tifxyz.hpp>
 #include <vc_reader/zarr.hpp>
@@ -43,7 +43,7 @@
 using shape = std::vector<size_t>;
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 namespace po = boost::program_options;
 
 namespace {
@@ -334,15 +334,7 @@ static QuadSurface* find_source_surface_containing_point(const std::vector<QuadS
     return nullptr;
 }
 
-static nlohmann::json json_from_utils(const utils::Json& json)
-{
-    return nlohmann::json::parse(json.dump());
-}
 
-static utils::Json json_to_utils(const nlohmann::json& json)
-{
-    return utils::Json::parse(json.dump());
-}
 
 static double json_number_or(const nlohmann::json& json, const char* key, double fallback)
 {
@@ -910,13 +902,13 @@ static void delete_loaded_source_surfaces(std::vector<QuadSurface*>& surfaces, Q
 
 } // namespace
 
-static void add_internal_volume_shape(utils::Json& params, const std::vector<size_t>& shape)
+static void add_internal_volume_shape(nlohmann::json& params, const std::vector<size_t>& shape)
 {
     if (shape.size() != 3) {
         throw std::runtime_error("Expected zarr dataset shape [z, y, x]");
     }
 
-    auto volume_shape = utils::Json::array();
+    auto volume_shape = nlohmann::json::array();
     volume_shape.push_back(static_cast<int>(shape[0]));
     volume_shape.push_back(static_cast<int>(shape[1]));
     volume_shape.push_back(static_cast<int>(shape[2]));
@@ -1133,7 +1125,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    Json params = params_path.empty() ? Json::object() : Json::parse_file(params_path);
+    Json params = params_path.empty() ? Json::object() : nlohmann::json::parse(std::ifstream(params_path));
     if (cli_max_width > 0) {
         params["max_width"] = cli_max_width;
     }
@@ -1164,7 +1156,7 @@ int main(int argc, char *argv[])
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
     std::vector<std::string> published;
     auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
-        const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
+        const auto uuid = store->create(surface, name, params,
                                         source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
                                         output_tags, volume_voxels);
         published.push_back(uuid);
@@ -1253,7 +1245,7 @@ int main(int argc, char *argv[])
 
         std::vector<SweepRun> runs;
         try {
-            const nlohmann::json base_params = json_from_utils(params);
+            const nlohmann::json base_params = (params);
             if (sweep_strategy == "lhs") {
                 runs = sample_sweep_runs_latin_hypercube(
                     base_params,
@@ -1379,7 +1371,7 @@ int main(int argc, char *argv[])
             run_report["values"] = runs[i].values;
 
             try {
-                utils::Json run_utils_params = json_to_utils(run_params);
+                nlohmann::json run_utils_params = (run_params);
                 surf = grow_surf_from_surfs(seed.get(), surfaces, run_utils_params, voxelsize);
                 if (surf) {
                     SweepMetrics sweep_metrics = seed_only_sweep
@@ -1396,8 +1388,8 @@ int main(int argc, char *argv[])
                             sweep_max_distance_samples);
 
                     surf->meta["source"] = "vc_grow_seg_from_segments_sweep";
-                    surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(run_params);
-                    surf->meta["sweep_values"] = json_to_utils(runs[i].values);
+                    surf->meta["vc_grow_seg_from_segments_params"] = (run_params);
+                    surf->meta["sweep_values"] = (runs[i].values);
                     surf->meta["sweep_target"] = sweep_target_path.string();
                     surf->meta["sweep_seed_only"] = seed_only_sweep;
                     add_metric_meta(*surf, sweep_metrics);
@@ -1526,8 +1518,8 @@ int main(int argc, char *argv[])
             }
 
             surf->meta["source"] = "vc_grow_seg_from_segments_seed_coordinate";
-            surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
-            auto seed_coord = utils::Json::array();
+            surf->meta["vc_grow_seg_from_segments_params"] = params;
+            auto seed_coord = nlohmann::json::array();
             seed_coord.push_back(static_cast<double>(seed.point[0]));
             seed_coord.push_back(static_cast<double>(seed.point[1]));
             seed_coord.push_back(static_cast<double>(seed.point[2]));
@@ -1560,7 +1552,7 @@ int main(int argc, char *argv[])
         QuadSurface* surf = grow_surf_from_surfs(src, stored_source_pointers, params, voxelsize);
         if (surf) {
             surf->meta["source"] = "vc_grow_seg_from_segments";
-            surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+            surf->meta["vc_grow_seg_from_segments_params"] = params;
             add_target_context(surf->meta, vol_path);
             publish(*surf, "auto_trace_" + get_surface_time_str(), src);
             delete surf;
@@ -1586,7 +1578,7 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
 
     surf->meta["source"] = "vc_grow_seg_from_segments";
-    surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+    surf->meta["vc_grow_seg_from_segments_params"] = params;
     add_target_context(surf->meta, vol_path);
     std::string uuid = "auto_trace_" + get_surface_time_str();;
     std::filesystem::path seg_dir = tgt_dir / uuid;

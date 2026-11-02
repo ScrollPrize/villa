@@ -7,7 +7,7 @@
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc_reader/tifxyz.hpp"
 #include "vc_reader/zarr.hpp"
@@ -37,7 +37,7 @@ namespace po = boost::program_options;
 using shape = std::vector<size_t>;
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 // The tracer's Ceres solves go through CHOLMOD, whose BLAS calls land in the
 // process-wide OpenBLAS pool. The pthreads build of OpenBLAS sizes that pool
@@ -270,7 +270,7 @@ static int run_main(int argc, char *argv[])
             }
         }
         
-        params = Json::parse_file(params_path);
+        params = nlohmann::json::parse(std::ifstream(params_path));
 
         if (vm.count("rewind-gen")) {
             params["rewind_gen"] = vm["rewind-gen"].as<int>();
@@ -306,14 +306,14 @@ static int run_main(int argc, char *argv[])
     }
 
     if (params.empty()) {
-        params = Json::parse_file(params_path);
+        params = nlohmann::json::parse(std::ifstream(params_path));
     }
 
 
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = vcr::zarr::isRemote(volume_arg);
     const double requested_voxelsize = params.value("voxelsize", 0.0);
-    utils::Json remote_metadata;
+    nlohmann::json remote_metadata;
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
@@ -443,7 +443,7 @@ static int run_main(int argc, char *argv[])
                 if (!std::filesystem::exists(meta_fn))
                     continue;
 
-                auto meta = utils::Json::parse_file(meta_fn);
+                auto meta = nlohmann::json::parse(std::ifstream(meta_fn));
 
                 if (!meta.count("bbox"))
                     continue;
@@ -690,7 +690,7 @@ static int run_main(int argc, char *argv[])
 
     // Store mode output: a new surface object recording how it was made.
     auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
-        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
+        const auto uuid = store->create(output, name, meta, sources, output_tags,
                                         volume_voxels);
         store->objects().finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
@@ -1544,7 +1544,7 @@ static int run_main(int argc, char *argv[])
     if (min_area_cm > 0.0f) {
         // area_cm2 is guaranteed present here: the startup check rejects an
         // unusable voxel size, and storeAreaMeta() omits the key only then.
-        const double area_cm2 = surf->meta["area_cm2"].get_double();
+        const double area_cm2 = surf->meta["area_cm2"].get<double>();
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;

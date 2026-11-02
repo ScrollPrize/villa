@@ -2251,7 +2251,7 @@ int gmBlendAndRasterize(GMAlignState& st, int strip_cols)
         // The merge becomes a surface object; the OBJ and summary go to its artifact directory.
         // Named after the first input, as the directory name is in tifxyz mode.
         const auto& first = st.surfs.at(st.names.front()).qs->meta;
-        const std::string name = (first.contains("name") ? first["name"].get_string() : st.names.front()) + "_merged";
+        const std::string name = (first.contains("name") ? first["name"].get<std::string>() : st.names.front()) + "_merged";
         const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.storeOptions->tags);
         const auto artifacts = cfg.store->objects().session()->artifactDirectory(cfg.store->objects().attachment(), uuid);
         std::cout << "writing OBJ to " << artifacts / "merge.obj" << "\n";

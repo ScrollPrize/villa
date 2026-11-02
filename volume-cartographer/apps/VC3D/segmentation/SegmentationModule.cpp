@@ -42,7 +42,7 @@
 #include <utility>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -1267,8 +1267,8 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
     if (!surface->meta.is_null() && surface->meta.is_object() && surface->meta.contains("grid_offset")) {
         const auto& offset = surface->meta["grid_offset"];
         if (offset.is_array() && offset.size() >= 2 && offset[0].is_number() && offset[1].is_number()) {
-            offsetCol = offset[0].get_int();
-            offsetRow = offset[1].get_int();
+            offsetCol = offset[0].get<int>();
+            offsetRow = offset[1].get<int>();
         }
     }
 

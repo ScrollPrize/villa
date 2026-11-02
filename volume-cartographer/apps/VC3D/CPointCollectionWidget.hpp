@@ -2,7 +2,7 @@
 
 #include <QDockWidget>
 #include "vc/ui/VCCollection.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <QTreeView>
 #include <QStandardItemModel>
 #include <QPushButton>
@@ -39,7 +39,7 @@ public:
     ~CPointCollectionWidget();
 
     // Lasagna's results for the surface's correction points (points_list).
-    void loadCorrPointsResults(const utils::Json& results);
+    void loadCorrPointsResults(const nlohmann::json& results);
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);

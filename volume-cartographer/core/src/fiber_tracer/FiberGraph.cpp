@@ -3,7 +3,7 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
-#include <utils/thread_pool.hpp>
+#include <vc/core/util/ThreadPool.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1508,7 +1508,7 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
     double checkpointPredictionVoxels,
     const cv::Vec3d& initialDirection,
     size_t beamWidth,
-    utils::ThreadPool& expansionPool,
+    vc::ThreadPool& expansionPool,
     size_t maximumGeneratedStates,
     const GeometricReplayCostConfig& geometricCost,
     ExactPersistentSearchStats& stats)
@@ -3178,12 +3178,12 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             minimumAppliedLocalPruneLossCutoffPerPredictionVoxel,
         });
     };
-    std::unique_ptr<utils::ThreadPool> exactExpansionPool;
+    std::unique_ptr<vc::ThreadPool> exactExpansionPool;
     const size_t expansionThreads =
         graph.supportsConcurrentQueries() ? config.expansionThreads : 1;
     if (config.searchWidth == 0)
         exactExpansionPool =
-            std::make_unique<utils::ThreadPool>(expansionThreads);
+            std::make_unique<vc::ThreadPool>(expansionThreads);
 
     double resetArc = config.referenceBeginArcBase;
     for (size_t iteration = 0; iteration < maximumSegments && resetArc < referenceEndArcBase - kReplayEpsilon; ++iteration) {

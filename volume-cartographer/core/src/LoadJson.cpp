@@ -4,16 +4,9 @@
 
 namespace vc::json {
 
-utils::Json load_json_file(const std::filesystem::path& path)
-{
-    if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("JSON file not found: " + path.string());
-    }
-    return utils::Json::parse_file(path);
-}
 
 void require_fields(
-    const utils::Json& json,
+    const nlohmann::json& json,
     std::initializer_list<const char*> fields,
     const std::string& context)
 {
@@ -25,7 +18,7 @@ void require_fields(
 }
 
 void require_type(
-    const utils::Json& json,
+    const nlohmann::json& json,
     const char* field,
     const std::string& expected,
     const std::string& context)
@@ -33,27 +26,26 @@ void require_type(
     if (!json.contains(field)) {
         throw std::runtime_error(context + " missing required field: " + field);
     }
-    std::string actual = json[field].get_string();
+    std::string actual = json[field].get<std::string>();
     if (actual != expected) {
         throw std::runtime_error(context + " has type '" + actual + "', expected '" + expected + "'");
     }
 }
 
-double number_or(const utils::Json& m, const char* key, double def) {
+double number_or(const nlohmann::json& m, const char* key, double def) {
     if (m.is_null() || !m.is_object()) return def;
     if (!m.contains(key)) return def;
     const auto& v = m[key];
-    if (v.is_number_float())   return v.get_double();
-    if (v.is_number_integer()) return static_cast<double>(v.get_int64());
+    if (v.is_number()) return v.get<double>();
     if (v.is_string()) {
-        try { return std::stod(v.get_string()); } catch (...) { return def; }
+        try { return std::stod(v.get<std::string>()); } catch (...) { return def; }
     }
     return def;
 }
 
-std::string string_or(const utils::Json& m, const char* key, const std::string& def) {
+std::string string_or(const nlohmann::json& m, const char* key, const std::string& def) {
     if (m.is_null() || !m.is_object()) return def;
-    if (m.contains(key) && m[key].is_string()) return m[key].get_string();
+    if (m.contains(key) && m[key].is_string()) return m[key].get<std::string>();
     return def;
 }
 

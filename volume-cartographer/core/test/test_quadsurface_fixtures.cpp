@@ -59,9 +59,9 @@ TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
     CHECK(pts->cols == 129);
 
     CHECK(qs.meta.is_object());
-    CHECK(qs.meta["uuid"].get_string() == std::string(kSeg770));
-    CHECK(qs.meta["type"].get_string() == "seg");
-    CHECK(qs.meta["format"].get_string() == "tifxyz");
+    CHECK(qs.meta["uuid"].get<std::string>() == std::string(kSeg770));
+    CHECK(qs.meta["type"].get<std::string>() == "seg");
+    CHECK(qs.meta["format"].get<std::string>() == "tifxyz");
     // stretch_factor=128 -> scale = 1/128 = 0.0078125
     CHECK(qs.scale()[0] == doctest::Approx(0.0078125f).epsilon(1e-5));
     CHECK(qs.scale()[1] == doctest::Approx(0.0078125f).epsilon(1e-5));
@@ -100,8 +100,8 @@ TEST_CASE("Fixture: segment 880 and 990 also load")
         QuadSurface qs(segPath(name));
         qs.ensureLoaded();
         CHECK(qs.rawPointsPtr() != nullptr);
-        CHECK(qs.meta["uuid"].get_string() == std::string(name));
-        CHECK(qs.meta["format"].get_string() == "tifxyz");
+        CHECK(qs.meta["uuid"].get<std::string>() == std::string(name));
+        CHECK(qs.meta["format"].get<std::string>() == "tifxyz");
     }
 }
 

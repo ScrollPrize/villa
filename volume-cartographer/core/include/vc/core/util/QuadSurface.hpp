@@ -305,7 +305,7 @@ public:
     // Load from path with meta.json - lazy loading (only loads meta, loads points on first access)
     explicit QuadSurface(const std::filesystem::path &path_);
     // Load from path with provided meta json - lazy loading
-    QuadSurface(const std::filesystem::path &path_, const utils::Json &json);
+    QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json);
     ~QuadSurface() override;
 
     // Ensure points are loaded (for lazy loading constructors)
@@ -526,9 +526,9 @@ private:
 
 // Column ranges [c0, c1) of disconnected components recorded as meta
 // "components" (Lasagna multi-component fits); empty for one component.
-std::vector<std::pair<int, int>> surface_components(const utils::Json& meta);
+std::vector<std::pair<int, int>> surface_components(const nlohmann::json& meta);
 // The tags a tifxyz meta.json records: the keys of its "tags" object.
-std::vector<std::string> tifxyz_tags(const utils::Json& meta);
+std::vector<std::string> tifxyz_tags(const nlohmann::json& meta);
 
 // A surface object's geometry revision (default: its current one). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.
@@ -567,7 +567,7 @@ std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects:
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.
-utils::Json bbox_to_json(const Rect3D& bbox);
+nlohmann::json bbox_to_json(const Rect3D& bbox);
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(

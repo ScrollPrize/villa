@@ -14,7 +14,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "utils/hash.hpp"
+#include "vc/core/util/StableHash.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 
@@ -28,7 +28,7 @@ namespace
 // none, say so: a volume without one reports 0, and every physical measurement
 // derived from it -- surface areas, the min_area_cm gate, the scale bar --
 // silently becomes 0 too (#1603).
-void applyResolvedVoxelSize(utils::Json& metadata,
+void applyResolvedVoxelSize(nlohmann::json& metadata,
                             std::optional<double> resolved,
                             const std::string& description)
 {
@@ -47,13 +47,13 @@ void applyResolvedVoxelSize(utils::Json& metadata,
 
 // The first sidecar document a store has (meta.json, then metadata.json, as vc_reader read
 // them), with `scan` flattened into its root and `format` defaulting to zarr.
-std::optional<utils::Json> sidecarDocument(const vcr::zarr::StoreMetadata& store)
+std::optional<nlohmann::json> sidecarDocument(const vcr::zarr::StoreMetadata& store)
 {
     for (const auto& name : {METADATA_FILE.string(), METADATA_FILE_ALT.string()}) {
         const auto document = store.documents.find(name);
         if (document == store.documents.end() || !document->is_object())
             continue;
-        auto json = utils::Json::parse(document->dump());
+        auto json = *document;
         if (json.contains("scan") && json["scan"].is_object())
             json.update(json["scan"]);
         if (!json.contains("format"))
@@ -86,7 +86,7 @@ std::string deriveLocalVolumeId(const std::filesystem::path& path)
 {
     const std::string name = deriveLocalVolumeName(path);
     const std::string normalized = normalizeLocalVolumePathForId(path);
-    const auto hash = utils::fnv1a(std::string_view(normalized));
+    const auto hash = vc::fnv1a(std::string_view(normalized));
     std::ostringstream out;
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)
         << std::setfill('0') << hash;
@@ -184,9 +184,9 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
 {
     loadMetadata();
 
-    _width = metadata_["width"].get_int();
-    _height = metadata_["height"].get_int();
-    _slices = metadata_["slices"].get_int();
+    _width = metadata_["width"].get<int>();
+    _height = metadata_["height"].get<int>();
+    _slices = metadata_["slices"].get<int>();
 
     resolveLevelShapes();
 }
@@ -230,17 +230,17 @@ void Volume::loadMetadata()
 
 std::string Volume::id() const
 {
-    return metadata_["uuid"].get_string();
+    return metadata_["uuid"].get<std::string>();
 }
 
 std::string Volume::name() const
 {
-    return metadata_["name"].get_string();
+    return metadata_["name"].get<std::string>();
 }
 
 void Volume::resolveLevelShapes()
 {
-    if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
+    if (!metadata_.contains("format") || metadata_["format"].get<std::string>() != "zarr")
         return;
 
     const auto levels = vcr::zarr::pyramidLevels(path_.string(), {});
@@ -333,12 +333,12 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 }
 
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
-                                    const utils::Json& metadata)
+                                    const nlohmann::json& metadata)
 {
     auto volume = std::make_shared<Volume>(std::move(path));
     if (metadata.is_object()) {
         if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
-            const double value = metadata["voxelsize"].get_double();
+            const double value = metadata["voxelsize"].get<double>();
             volume->hasExplicitVoxelSizeOverride_ = std::isfinite(value) && value > 0.0;
         }
         volume->metadata_.update(metadata);
@@ -351,7 +351,7 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
-    const utils::Json& metadata,
+    const nlohmann::json& metadata,
     bool discoverAwsCredentials)
 {
     const auto spec = vc::parseRemoteVolumeSpec(url);
@@ -440,7 +440,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     if (metadata.is_object()) {
         if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
-            const double value = metadata["voxelsize"].get_double();
+            const double value = metadata["voxelsize"].get<double>();
             vol->hasExplicitVoxelSizeOverride_ = std::isfinite(value) && value > 0.0;
         }
         vol->metadata_.update(metadata);
@@ -453,7 +453,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         std::optional<double> logicalOverride;
         if (metadata.is_object() && metadata.contains("voxelsize") &&
             metadata["voxelsize"].is_number()) {
-            const double value = metadata["voxelsize"].get_double();
+            const double value = metadata["voxelsize"].get<double>();
             if (std::isfinite(value) && value > 0.0)
                 logicalOverride = value;
         }

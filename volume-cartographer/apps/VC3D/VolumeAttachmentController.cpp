@@ -193,7 +193,7 @@ bool VolumeAttachmentController::start(
                             vc3d::opendata::cachedCatalog().get(), location),
                         !anonymous);
                 } else {
-                    result.volume = Volume::New(std::filesystem::path(location), utils::Json::object());
+                    result.volume = Volume::New(std::filesystem::path(location), nlohmann::json::object());
                 }
             } catch (const std::exception& error) {
                 result.error = QString::fromUtf8(error.what());

@@ -1,7 +1,7 @@
 #include <iostream>
 #include <string>
 #include <cstring>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/util/UnixSocket.hpp"
 
 #include "vc/tracer/NeuralTracerConnection.h"
@@ -9,7 +9,7 @@
 
 namespace
 {
-    utils::Json process_json_request(const utils::Json& req, vc::unixsocket::Socket sock) {
+    nlohmann::json process_json_request(const nlohmann::json& req, vc::unixsocket::Socket sock) {
         std::string response_str;
 
 #pragma omp critical
@@ -34,7 +34,7 @@ namespace
             pos += 4; // move past "null"
         }
 
-        return utils::Json::parse(response_str);
+        return nlohmann::json::parse(response_str);
     }
 }
 
@@ -57,21 +57,21 @@ std::vector<NeuralTracerConnection::NextUvs> NeuralTracerConnection::get_next_po
     std::vector<std::optional<cv::Vec3f>> const &prev_v,
     std::vector<std::optional<cv::Vec3f>> const &prev_diag
 ) const {
-    utils::Json req;
+    nlohmann::json req;
 
-    utils::Json center_list = utils::Json::array();
+    nlohmann::json center_list = nlohmann::json::array();
     for (const auto& c : center) {
-        utils::Json pt = utils::Json::array();
+        nlohmann::json pt = nlohmann::json::array();
         pt.push_back(c[0]); pt.push_back(c[1]); pt.push_back(c[2]);
         center_list.push_back(std::move(pt));
     }
     req["center_xyz"] = center_list;
 
     auto convert_prev_coords = [](const std::vector<std::optional<cv::Vec3f>>& coords) {
-        utils::Json list = utils::Json::array();
+        nlohmann::json list = nlohmann::json::array();
         for (const auto& p : coords) {
             if (p.has_value()) {
-                utils::Json pt = utils::Json::array();
+                nlohmann::json pt = nlohmann::json::array();
                 pt.push_back(p.value()[0]); pt.push_back(p.value()[1]); pt.push_back(p.value()[2]);
                 list.push_back(std::move(pt));
             } else {
@@ -84,17 +84,17 @@ std::vector<NeuralTracerConnection::NextUvs> NeuralTracerConnection::get_next_po
     req["prev_v_xyz"] = convert_prev_coords(prev_v);
     req["prev_diag_xyz"] = convert_prev_coords(prev_diag);
 
-    utils::Json response = process_json_request(req, sock);
+    nlohmann::json response = process_json_request(req, sock);
 
     if (response.contains("error")) {
-        throw std::runtime_error("Neural tracer returned error: " + response["error"].get_string());
+        throw std::runtime_error("Neural tracer returned error: " + response["error"].get<std::string>());
     }
 
-    auto get_float_or_nan = [](const utils::Json& j) {
-        return j.is_null() ? std::numeric_limits<float>::quiet_NaN() : j.get_float();
+    auto get_float_or_nan = [](const nlohmann::json& j) {
+        return j.is_null() ? std::numeric_limits<float>::quiet_NaN() : j.get<float>();
     };
 
-    auto process_candidates = [&](const utils::Json& batch) {
+    auto process_candidates = [&](const nlohmann::json& batch) {
         std::vector<cv::Vec3f> candidates;
         assert(batch.is_array());
         for (auto const& candidate : batch) {

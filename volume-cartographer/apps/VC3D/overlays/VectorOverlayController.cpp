@@ -378,7 +378,7 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             if (segSurface->meta.contains("vc_grow_seg_from_segments_params")) {
                 const auto& p = segSurface->meta.at("vc_grow_seg_from_segments_params");
                 if (p.contains("step")) {
-                    stepVal = p.at("step").get_float();
+                    stepVal = p.at("step").get<float>();
                 }
             }
         } catch (...) {}

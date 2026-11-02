@@ -43,7 +43,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna utils PROPERTIES
+set_target_properties(vc_core vc_lasagna PROPERTIES
     INSTALL_RPATH "${VC_PY_RPATH_SELF}"
 )
 
@@ -103,7 +103,7 @@ if(TARGET vc_reader_native)
     endif()
 endif()
 
-install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils
+install(TARGETS vc_core vc_lasagna vc_fiber_tracer
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .

@@ -125,7 +125,7 @@ TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
 {
     // Regression for the normal-grid remote-streaming crash: the constructor
     // used to ignore ensure_local_file()'s return value and call
-    // Json::parse_file() unconditionally, so a failed metadata fetch surfaced
+    // nlohmann::json::parse(std::ifstream()) unconditionally, so a failed metadata fetch surfaced
     // as an uncaught std::runtime_error("Cannot open: <path>") that crashed
     // vc_grow_seg_from_seed. It must now throw an intentional error that names
     // the remote source. The marker points at a port that refuses connections
@@ -158,7 +158,7 @@ TEST_CASE("Constructor + metadata accessor")
     auto d = makeEmptyNgvDir("meta_access", 8);
     NormalGridVolume v(d.string());
     CHECK(v.metadata().is_object());
-    CHECK(v.metadata()["sparse-volume"].get_int64() == 8);
+    CHECK(v.metadata()["sparse-volume"].get<int64_t>() == 8);
     fs::remove_all(d);
 }
 

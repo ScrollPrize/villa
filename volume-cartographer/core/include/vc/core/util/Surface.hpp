@@ -5,7 +5,7 @@
 #include <string>
 
 #include <opencv2/core/mat.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 //base surface class
 class Surface
@@ -29,7 +29,7 @@ public:
     virtual cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) = 0;
     virtual float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 1000,
                           class SurfacePatchIndex* surfaceIndex = nullptr) = 0;
-    utils::Json meta;
+    nlohmann::json meta;
     std::filesystem::path path;
     std::string id;
 };

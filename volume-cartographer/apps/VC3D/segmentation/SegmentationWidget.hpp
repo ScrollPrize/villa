@@ -11,7 +11,7 @@
 #include "SegmentationCommon.hpp"
 #include "SegmentationPushPullConfig.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "growth/SegmentationGrowth.hpp"
 #include "tools/ManualAddTool.hpp"
@@ -50,7 +50,7 @@ public:
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
     [[nodiscard]] QString customParamsError() const;
-    [[nodiscard]] utils::Json customParamsJson() const;
+    [[nodiscard]] nlohmann::json customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;

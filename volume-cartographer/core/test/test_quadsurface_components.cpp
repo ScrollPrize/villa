@@ -7,7 +7,7 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
 #include <filesystem>
@@ -47,13 +47,13 @@ TEST_CASE("QuadSurface(path,json) with components: the grid is never interpolate
         seed.save(segDir);
     }
     // Build meta with two components covering [0,8) and [8,16).
-    auto j = utils::Json::object();
+    auto j = nlohmann::json::object();
     j["uuid"] = "test";
     j["type"] = "seg";
     j["format"] = "tifxyz";
-    auto comps = utils::Json::array();
-    auto c0 = utils::Json::array(); c0.push_back(0); c0.push_back(8);
-    auto c1 = utils::Json::array(); c1.push_back(8); c1.push_back(16);
+    auto comps = nlohmann::json::array();
+    auto c0 = nlohmann::json::array(); c0.push_back(0); c0.push_back(8);
+    auto c1 = nlohmann::json::array(); c1.push_back(8); c1.push_back(16);
     comps.push_back(c0); comps.push_back(c1);
     j["components"] = comps;
 
@@ -86,17 +86,17 @@ TEST_CASE("components-meta ranges are clamped to the grid and empty ones ignored
         QuadSurface seed(grid(8, 8, 5.f), cv::Vec2f(1.f, 1.f));
         seed.save(segDir);
     }
-    auto j = utils::Json::object();
+    auto j = nlohmann::json::object();
     j["uuid"] = "test";
     j["type"] = "seg";
     j["format"] = "tifxyz";
-    auto comps = utils::Json::array();
+    auto comps = nlohmann::json::array();
     // c0 < 0: invalid
-    auto bad1 = utils::Json::array(); bad1.push_back(-1); bad1.push_back(4);
+    auto bad1 = nlohmann::json::array(); bad1.push_back(-1); bad1.push_back(4);
     // c0 > c1: degenerate
-    auto bad2 = utils::Json::array(); bad2.push_back(6); bad2.push_back(3);
+    auto bad2 = nlohmann::json::array(); bad2.push_back(6); bad2.push_back(3);
     // Out of cols range
-    auto bad3 = utils::Json::array(); bad3.push_back(0); bad3.push_back(100);
+    auto bad3 = nlohmann::json::array(); bad3.push_back(0); bad3.push_back(100);
     comps.push_back(bad1); comps.push_back(bad2); comps.push_back(bad3);
     j["components"] = comps;
 
@@ -144,14 +144,14 @@ TEST_CASE("bbox stored in meta is read back via (path, json) ctor")
         QuadSurface seed(grid(8, 8), cv::Vec2f(1.f, 1.f));
         seed.save(segDir);
     }
-    auto j = utils::Json::object();
+    auto j = nlohmann::json::object();
     j["uuid"] = "test";
     j["type"] = "seg";
     j["format"] = "tifxyz";
-    auto bbox = utils::Json::array();
-    auto lo = utils::Json::array();
+    auto bbox = nlohmann::json::array();
+    auto lo = nlohmann::json::array();
     lo.push_back(1.0); lo.push_back(2.0); lo.push_back(3.0);
-    auto hi = utils::Json::array();
+    auto hi = nlohmann::json::array();
     hi.push_back(7.0); hi.push_back(8.0); hi.push_back(9.0);
     bbox.push_back(lo); bbox.push_back(hi);
     j["bbox"] = bbox;

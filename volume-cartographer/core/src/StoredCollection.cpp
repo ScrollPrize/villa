@@ -6,9 +6,9 @@
 
 namespace vc {
 
-vc::objects::AttachedCollection storedCollection(const utils::Json& json)
+vc::objects::AttachedCollection storedCollection(const nlohmann::json& json)
 {
-    const auto collection = nlohmann::json::parse(json.dump());
+    const auto collection = json;
     vc::objects::AttachedCollection stored;
     stored.uuid = collection.at("uuid").get<std::string>();
     stored.name = collection.value("name", std::string{});
@@ -26,7 +26,7 @@ vc::objects::AttachedCollection storedCollection(const utils::Json& json)
     return stored;
 }
 
-utils::Json collectionJson(const vc::objects::AttachedCollection& stored)
+nlohmann::json collectionJson(const vc::objects::AttachedCollection& stored)
 {
     auto collection = stored.source;
     collection["uuid"] = stored.uuid;
@@ -39,7 +39,7 @@ utils::Json collectionJson(const vc::objects::AttachedCollection& stored)
         entries[std::to_string(stored.points.ids[i])] = std::move(entry);
     }
     collection["points"] = std::move(entries);
-    return utils::Json::parse(collection.dump());
+    return collection;
 }
 
 } // namespace vc

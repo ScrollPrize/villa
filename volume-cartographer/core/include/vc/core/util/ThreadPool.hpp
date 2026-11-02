@@ -16,7 +16,7 @@
 #include <utility>
 #include <algorithm>
 
-namespace utils {
+namespace vc {
 
 // ---------------------------------------------------------------------------
 // ThreadPool
@@ -196,4 +196,4 @@ private:
     std::vector<std::jthread>            workers_;  // Must be last: destroyed first to join threads
 };
 
-} // namespace utils
+} // namespace vc

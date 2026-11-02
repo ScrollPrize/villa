@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace utils {
+namespace vc {
 
 // --- FNV-1a constants (64-bit) ---
 inline constexpr std::uint64_t fnv_offset_basis = 14695981039346656037ULL;
@@ -29,4 +29,4 @@ fnv1a(std::string_view sv) noexcept
     return fnv1a(sv.data(), sv.size());
 }
 
-} // namespace utils
+} // namespace vc

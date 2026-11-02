@@ -41,7 +41,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "../../SocketRequest.hpp"
 
@@ -325,12 +325,12 @@ struct CopyDisplacementJob
     TtaMode ttaMode{TtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
-    utils::Json customParams;
+    nlohmann::json customParams;
 };
 
-utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
+nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::json& request)
 {
-    return utils::Json::parse(vc3d::socketRequestLine(
+    return nlohmann::json::parse(vc3d::socketRequestLine(
         socketPath.toStdString(), request.dump(), 300, "displacement copy"));  // 5 minute timeout
 }
 
@@ -338,7 +338,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
 {
     TracerGrowthResult result;
 
-    utils::Json request = utils::Json::object();
+    nlohmann::json request = nlohmann::json::object();
     request["request_type"] = "displacement_copy_grow";
     request["store"] = job.store.toStdString();
     request["surface_uuid"] = job.surfaceUuid;
@@ -374,7 +374,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         }
     }
 
-    utils::Json response;
+    nlohmann::json response;
     try {
         response = sendSocketJsonRequest(job.socketPath, request);
     } catch (const std::exception& ex) {
@@ -385,7 +385,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     if (response.contains("error")) {
         QString serviceError;
         if (response["error"].is_string()) {
-            serviceError = QString::fromStdString(response["error"].get_string());
+            serviceError = QString::fromStdString(response["error"].get<std::string>());
         } else {
             serviceError = QString::fromStdString(response["error"].dump());
         }
@@ -408,7 +408,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         return result;
     }
 
-    result.createdSurfaces = {outputs["front"].get_string(), outputs["back"].get_string()};
+    result.createdSurfaces = {outputs["front"].get<std::string>(), outputs["back"].get<std::string>()};
     result.statusMessage = QStringLiteral("Displacement copy completed");
     return result;
 }
@@ -575,7 +575,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     if (method == SegmentationGrowthMethod::Tracer || method == SegmentationGrowthMethod::Corrections) {
         if (request.customParams.is_null()) {
-            request.customParams = utils::Json::object();
+            request.customParams = nlohmann::json::object();
         }
         const int growthScale = std::clamp(_context.widget->growthScale(), 0, 5);
         if (!request.customParams.contains("growth_scale")) {
@@ -621,7 +621,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
         // Add neural socket parameters to custom params
         if (request.customParams.is_null()) {
-            request.customParams = utils::Json::object();
+            request.customParams = nlohmann::json::object();
         }
         request.customParams["neural_socket"] = socketPath.toStdString();
         request.customParams["neural_batch_size"] = batchSize;
@@ -864,7 +864,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    utils::Json customParams = _context.widget->customParamsJson();
+    nlohmann::json customParams = _context.widget->customParamsJson();
 
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
@@ -1171,8 +1171,8 @@ void SegmentationGrower::onFutureFinished()
         if (result.surface->meta.contains("grid_offset") &&
             result.surface->meta["grid_offset"].is_array() &&
             result.surface->meta["grid_offset"].size() == 2) {
-            float offsetX = result.surface->meta["grid_offset"][static_cast<size_t>(0)].get_float();
-            float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get_float();
+            float offsetX = result.surface->meta["grid_offset"][static_cast<size_t>(0)].get<float>();
+            float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get<float>();
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
                 // The anchors moved with the grown grid.

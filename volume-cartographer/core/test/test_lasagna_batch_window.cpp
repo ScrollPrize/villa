@@ -1,3 +1,4 @@
+#include <nlohmann/json.hpp>
 #include <QApplication>
 #include <QDateTime>
 #include <QJsonArray>

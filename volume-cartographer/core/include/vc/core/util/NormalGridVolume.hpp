@@ -7,7 +7,7 @@
 #include <filesystem>
 
 #include <opencv2/core/types.hpp>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/GridStore.hpp"
 
@@ -70,7 +70,7 @@ namespace vc::core::util {
         int level() const;
 
     public:
-        const utils::Json& metadata() const;
+        const nlohmann::json& metadata() const;
 
     private:
         struct pimpl;

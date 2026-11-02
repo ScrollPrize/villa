@@ -908,13 +908,13 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     const auto metadataFor = [&](const std::string& id) {
         for (const auto& entry : pkg->volumeEntries()) {
             const auto metadata = vc::project::catalogVolumeMetadata(&manifest, entry.location);
-            if (metadata.contains("uuid") && metadata.at("uuid").get_string() == id) return metadata;
+            if (metadata.contains("uuid") && metadata.at("uuid").get<std::string>() == id) return metadata;
         }
         FAIL("no entry shows " << id);
-        return utils::Json::object();
+        return nlohmann::json::object();
     };
     CHECK_FALSE(metadataFor("volume-with-properties").contains("voxelsize"));
-    CHECK(metadataFor("volume-from-scan").at("uuid").get_string() == "volume-from-scan");
+    CHECK(metadataFor("volume-from-scan").at("uuid").get<std::string>() == "volume-from-scan");
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
@@ -963,7 +963,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     const auto source = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[0].location);
     REQUIRE(source);
     CHECK((source->volumeId == "scan-volume" && source->level == 0 && source->source));
-    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("uuid").get_string() ==
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("uuid").get<std::string>() ==
           "scan-volume");
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location));
     CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[2].location));

@@ -11,7 +11,7 @@
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
@@ -108,7 +108,7 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
 }
 
-static cv::Size growth_source_size_from_meta(const utils::Json& meta)
+static cv::Size growth_source_size_from_meta(const nlohmann::json& meta)
 {
     if (!meta.contains("_growth_source_width") ||
         !meta.contains("_growth_source_height") ||
@@ -117,8 +117,8 @@ static cv::Size growth_source_size_from_meta(const utils::Json& meta)
         return {};
     }
 
-    const int width = meta["_growth_source_width"].get_int();
-    const int height = meta["_growth_source_height"].get_int();
+    const int width = meta["_growth_source_width"].get<int>();
+    const int height = meta["_growth_source_height"].get<int>();
     if (width <= 0 || height <= 0) {
         return {};
     }
@@ -152,8 +152,8 @@ static cv::Size exact_growth_output_size(const QuadSurface* coarse,
         coarse->meta["grid_offset"].size() >= 2 &&
         coarse->meta["grid_offset"][0].is_number() &&
         coarse->meta["grid_offset"][1].is_number()) {
-        source_offset.x = coarse->meta["grid_offset"][0].get_int();
-        source_offset.y = coarse->meta["grid_offset"][1].get_int();
+        source_offset.x = coarse->meta["grid_offset"][0].get<int>();
+        source_offset.y = coarse->meta["grid_offset"][1].get<int>();
     }
 
     const cv::Size coarse_source_size = vc::core::util::scaledGridSize(source_size, factor);
@@ -296,8 +296,8 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
 
     if (output->meta.contains("grid_offset") && output->meta["grid_offset"].is_array() &&
         output->meta["grid_offset"].size() >= 2) {
-        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get_int() * factor;
-        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get_int() * factor;
+        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get<int>() * factor;
+        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get<int>() * factor;
     }
 
     for (const std::string& name : coarse->channelNames()) {
@@ -641,13 +641,13 @@ struct LossSettings {
         return reference_raycast.surface && w[LossType::REFERENCE_RAY] > 0.0f;
     }
 
-    void applyJsonWeights(const utils::Json& params) {
+    void applyJsonWeights(const nlohmann::json& params) {
         const auto set_weight = [&](const char* key, LossType type) {
             if (!params.contains(key) || params[key].is_null()) {
                 return;
             }
             if (params[key].is_number()) {
-                w[type] = static_cast<float>(params[key].get_double());
+                w[type] = static_cast<float>(params[key].get<double>());
             } else {
                 std::cerr << key << " must be numeric" << std::endl;
             }
@@ -682,7 +682,7 @@ struct LossSettings {
 
 };
 
-static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
+static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
 {
     static const std::vector<cv::Vec2i> kDefaultDirections = {
         {1, 0},    // down / +row
@@ -699,7 +699,7 @@ static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
         return kDefaultDirections;
     }
 
-    const utils::Json& directions = params["growth_directions"];
+    const nlohmann::json& directions = params["growth_directions"];
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
         return kDefaultDirections;
@@ -724,7 +724,7 @@ static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
             continue;
         }
 
-        const std::string value = entry.get_string();
+        const std::string value = entry.get<std::string>();
         std::string normalized;
         normalized.reserve(value.size());
         for (char ch : value) {
@@ -1838,7 +1838,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const utils::Json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlohmann::json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
     if (volume.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
@@ -1886,7 +1886,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
-        std::string socket_path = params["neural_socket"].get_string();
+        std::string socket_path = params["neural_socket"].get<std::string>();
         if (!socket_path.empty()) {
             try {
                 neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
@@ -1908,14 +1908,14 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
-        const utils::Json& ref_cfg = params["reference_surface"];
+        const nlohmann::json& ref_cfg = params["reference_surface"];
         std::string ref_path;
         if (ref_cfg.is_string()) {
-            ref_path = ref_cfg.get_string();
+            ref_path = ref_cfg.get<std::string>();
         } else if (ref_cfg.is_object()) {
             if (ref_cfg.contains("path")) {
                 if (ref_cfg["path"].is_string()) {
-                    ref_path = ref_cfg["path"].get_string();
+                    ref_path = ref_cfg["path"].get<std::string>();
                 } else if (!ref_cfg["path"].is_null()) {
                     std::cerr << "reference_surface.path must be a string" << std::endl;
                 }
@@ -1940,7 +1940,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
                     return current;
                 }
                 if (ref_cfg[key].is_number()) {
-                    return ref_cfg[key].get_double();
+                    return ref_cfg[key].get<double>();
                 }
                 std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
                 return current;
@@ -1989,7 +1989,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
             0,
             5);
         ngv = std::make_unique<vc::core::util::NormalGridVolume>(
-            params["normal_grid_path"].get_string(),
+            params["normal_grid_path"].get<std::string>(),
             normal_grid_level);
         std::cout << "Loaded normal grid level " << ngv->level()
                   << " (coordinate_scale=" << ngv->coordinateScale()
@@ -2251,7 +2251,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
         }
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
-        surf->meta = utils::Json::parse(meta_params.dump());
+        surf->meta = meta_params;
         if (resume_surf && !resume_surf->id.empty()) {
             surf->meta["seed_surface_id"] = resume_surf->objectUuid().empty()
                 ? resume_surf->id : resume_surf->objectUuid();
@@ -2360,12 +2360,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
 
-        surf->meta = utils::Json::parse(meta_params.dump());
+        surf->meta = meta_params;
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
         {
-            auto seed_arr = utils::Json::array();
+            auto seed_arr = nlohmann::json::array();
             seed_arr.push_back(origin[0]); seed_arr.push_back(origin[1]); seed_arr.push_back(origin[2]);
             surf->meta["seed"] = std::move(seed_arr);
         }
@@ -2377,7 +2377,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const uti
             // new_coord = old_coord + offset
             const int offset_row = resume_pad_y - used_area_safe.y;
             const int offset_col = resume_pad_x - used_area_safe.x;
-            auto off_arr = utils::Json::array();
+            auto off_arr = nlohmann::json::array();
             off_arr.push_back(offset_col); off_arr.push_back(offset_row);
             surf->meta["grid_offset"] = std::move(off_arr);
         }

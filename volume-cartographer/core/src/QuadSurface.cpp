@@ -287,7 +287,7 @@ struct LazySurfaceGeometry {
 };
 
 LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
-                                            const utils::Json& metadata)
+                                            const nlohmann::json& metadata)
 {
     // The scale as vc_reader parses it (two positive finite numbers; the file's order is
     // x, y, Metadata's rows, columns). The caller's metadata may be a partial override
@@ -298,7 +298,7 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
         const auto parsed = vcr::tifxyz::parseMetadata(document, path.string()).scale;
         return cv::Vec2f(float(parsed[1]), float(parsed[0]));
     };
-    std::optional<cv::Vec2f> scale = scaleOf(vcr::zarr::Json::parse(metadata.dump()));
+    std::optional<cv::Vec2f> scale = scaleOf(metadata);
     if (!scale) {
         const auto disk = vcr::tifxyz::readMetadata(path.string()).scale;
         scale = cv::Vec2f(float(disk[1]), float(disk[0]));
@@ -422,14 +422,14 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
 }
 
 namespace {
-static Rect3D rect_from_json(const utils::Json &json)
+static Rect3D rect_from_json(const nlohmann::json &json)
 {
-    return {{json[0][0].get_float(),json[0][1].get_float(),json[0][2].get_float()},
-            {json[1][0].get_float(),json[1][1].get_float(),json[1][2].get_float()}};
+    return {{json[0][0].get<float>(),json[0][1].get<float>(),json[0][2].get<float>()},
+            {json[1][0].get<float>(),json[1][1].get<float>(),json[1][2].get<float>()}};
 }
 } // anonymous namespace
 
-std::vector<std::string> tifxyz_tags(const utils::Json& meta)
+std::vector<std::string> tifxyz_tags(const nlohmann::json& meta)
 {
     std::vector<std::string> tags;
     if (!meta.is_object() || !meta.contains("tags") || !meta["tags"].is_object()) return tags;
@@ -438,13 +438,13 @@ std::vector<std::string> tifxyz_tags(const utils::Json& meta)
     return tags;
 }
 
-std::vector<std::pair<int, int>> surface_components(const utils::Json& meta)
+std::vector<std::pair<int, int>> surface_components(const nlohmann::json& meta)
 {
     std::vector<std::pair<int, int>> components;
     if (meta.contains("components") && meta["components"].is_array()) {
         for (const auto& c : meta["components"]) {
             if (c.is_array() && c.size() >= 2)
-                components.emplace_back(c[0].get_int(), c[1].get_int());
+                components.emplace_back(c[0].get<int>(), c[1].get<int>());
         }
     }
     return components;
@@ -456,7 +456,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
-    meta = vc::json::load_json_file(metaPath);
+    meta = nlohmann::json::parse(std::ifstream(metaPath));
 
     if (meta.contains("bbox"))
         _bbox = rect_from_json(meta["bbox"]);
@@ -471,7 +471,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     _needsLoad = true;  // Points will be loaded lazily
 }
 
-QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
+QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json)
 {
     recoverIncompleteSave(path_);
     path = path_;
@@ -1188,7 +1188,7 @@ std::string QuadSurface::objectUuid() const
 {
     if (!meta.is_object() || !meta.contains("uuid") || !meta["uuid"].is_string())
         return {};
-    return meta["uuid"].get_string();
+    return meta["uuid"].get<std::string>();
 }
 
 std::string QuadSurface::objectUuidOrNew() const
@@ -1500,11 +1500,11 @@ void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::st
         // Drop the cache so bbox() recomputes from the points actually being
         // saved (#1272).
         _bbox = {{-1, -1, -1}, {-1, -1, -1}};
-        auto lo = utils::Json::array();
+        auto lo = nlohmann::json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
+        auto hi = nlohmann::json::array();
         hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
+        auto bb = nlohmann::json::array();
         bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
         meta["bbox"] = std::move(bb);
     }
@@ -1512,7 +1512,7 @@ void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::st
     meta["uuid"] = uuid;
     meta["format"] = "tifxyz";
     {
-        auto sc = utils::Json::array();
+        auto sc = nlohmann::json::array();
         sc.push_back(_scale[0]); sc.push_back(_scale[1]);
         meta["scale"] = std::move(sc);
     }
@@ -1639,8 +1639,8 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     recoverIncompleteSave(path);
 
     // Read meta first (scale, uuid, etc.)
-    auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
-    cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
+    auto metadata = nlohmann::json::parse(std::ifstream(std::filesystem::path(path)/"meta.json"));
+    cv::Vec2f scale = {metadata["scale"][0].get<float>(), metadata["scale"][1].get<float>()};
 
     vcr::tifxyz::Reader reader(path.string(), !(flags & SURF_LOAD_IGNORE_MASK));
     const auto stored = requestedRegion ? reader.window({requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width}) : reader.whole();
@@ -1696,17 +1696,17 @@ Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)
     return res;
 }
 
-utils::Json bbox_to_json(const Rect3D& bbox)
+nlohmann::json bbox_to_json(const Rect3D& bbox)
 {
-    auto lo = utils::Json::array();
+    auto lo = nlohmann::json::array();
     lo.push_back(bbox.low[0]);
     lo.push_back(bbox.low[1]);
     lo.push_back(bbox.low[2]);
-    auto hi = utils::Json::array();
+    auto hi = nlohmann::json::array();
     hi.push_back(bbox.high[0]);
     hi.push_back(bbox.high[1]);
     hi.push_back(bbox.high[2]);
-    auto arr = utils::Json::array();
+    auto arr = nlohmann::json::array();
     arr.push_back(std::move(lo));
     arr.push_back(std::move(hi));
 

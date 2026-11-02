@@ -1,7 +1,7 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
 #include <vc_reader/source_reader.hpp>
@@ -72,7 +72,7 @@
      struct NormalGridVolume::pimpl {
          std::string base_path;
          int sparse_volume;
-         utils::Json metadata;
+         nlohmann::json metadata;
          double coordinate_scale = 1.0;
          double output_spiral_step = 20.0;
          int selected_level = 0;
@@ -222,7 +222,7 @@
             if (!ensure_local_file("metadata.json")) {
                 throw std::runtime_error(missing_file_error("metadata.json"));
             }
-            metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
+            metadata = nlohmann::json::parse(std::ifstream(fs::path(base_path) / "metadata.json"));
             multiscale = metadata.value("format", std::string()) == "normal-grid-multiscale";
             if (multiscale) {
                 const int min_level = metadata.value("min-level", 0);
@@ -235,13 +235,13 @@
                               << "; using level " << selected_level << std::endl;
                 }
 
-                utils::Json level_metadata;
+                nlohmann::json level_metadata;
                 const std::string level_metadata_name =
                     "metadata.level" + std::to_string(selected_level) + ".json";
                 const fs::path level_metadata_path = fs::path(base_path) / level_metadata_name;
                 const bool level_present = ensure_local_file(level_metadata_name);
                 if (level_present && fs::exists(level_metadata_path)) {
-                    level_metadata = utils::Json::parse_file(level_metadata_path);
+                    level_metadata = nlohmann::json::parse(std::ifstream(level_metadata_path));
                 } else if (metadata.contains("source-metadata")) {
                     level_metadata = metadata["source-metadata"];
                 } else if (remote && !level_present) {
@@ -726,7 +726,7 @@
     NormalGridVolume::~NormalGridVolume() = default;
     NormalGridVolume::NormalGridVolume(NormalGridVolume&&) noexcept = default;
     NormalGridVolume& NormalGridVolume::operator=(NormalGridVolume&&) noexcept = default;
-    const utils::Json& NormalGridVolume::metadata() const {
+    const nlohmann::json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }
 std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir)
@@ -738,7 +738,7 @@ std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir
     }
     std::string url;
     try {
-        url = utils::Json::parse_file(marker).value("url", std::string());
+        url = nlohmann::json::parse(std::ifstream(marker)).value("url", std::string());
     } catch (const std::exception& e) {
         std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
         return std::nullopt;
@@ -759,7 +759,7 @@ bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::s
     if (ec) {
         return false;
     }
-    auto marker = utils::Json::object();
+    auto marker = nlohmann::json::object();
     marker["url"] = url;
     std::ofstream out(dir / kNormalGridsRemoteMarker, std::ios::trunc);
     out << marker.dump(2);

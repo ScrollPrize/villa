@@ -1002,7 +1002,7 @@ static int run_store(const StoreToolOptions& output, const std::string& source, 
   if (!flat) return 3;
 
   const std::string name = output.name.value_or(
-      (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi");
+      (surface->meta.contains("name") ? surface->meta["name"].get<std::string>() : surface->id) + "_flatboi");
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
   const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
   for (const auto& entry : fs::directory_iterator(report_dir)) {

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <opencv2/core/mat.hpp>
 
@@ -99,7 +99,7 @@ struct SegmentationGrowthRequest {
     std::vector<SegmentationGrowthDirection> allowedDirections;
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
-    utils::Json customParams;
+    nlohmann::json customParams;
     cv::Mat allowedGrowthMask;
     bool manualAddPreview{false};
     bool inpaintOnly{false};

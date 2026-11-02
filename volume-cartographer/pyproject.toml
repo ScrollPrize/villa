@@ -39,7 +39,6 @@ cache-keys = [
     { file = "CMakeLists.txt" },
     { file = "cmake/**" },
     { file = "core/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
-    { file = "utils/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
     { file = "libs/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
     { file = "apps/CMakeLists.txt" },
     { file = "apps/src/**" },

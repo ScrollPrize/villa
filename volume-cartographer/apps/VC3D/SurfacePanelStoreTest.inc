@@ -147,7 +147,7 @@ int runSurfacePanelStoreTests()
             remote = util::newUuid();
             auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
             QuadSurface published(points, {1.f, 1.f});
-            published.meta = utils::Json::parse(nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}}.dump());
+            published.meta = nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}};
             create_quad_in_store(db, txn, shown, published, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
                                  {"catalog-test"});
             // As a catalog fetch records it.
