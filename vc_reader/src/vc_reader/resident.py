@@ -140,7 +140,8 @@ def project_mask(mask, positions, normals, valid, origin, shape, *, half_thickne
     """Rasterize binary surface support through a normal band into a ZYX crop.
 
     Positions/normals are H,W,3 in ZYX; output is uint32 (zero or one), on the
-    inputs' device. Integer normal layers are joined by filled swept cells.
+    inputs' device. Uses the label projector's nearest-voxel placement and
+    normal layers at most half a voxel apart, including the band endpoints.
     """
     device = _device(positions)
     positions, normals = (_input(a, np.float32, device) for a in (positions, normals))

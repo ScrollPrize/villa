@@ -2,7 +2,7 @@
 // Surface samples projected into a voxel crop, shared by the CPU loop and the CUDA
 // kernel. Points of the surface's quads (grid::point), offset through the band along
 // the normal, each land in one voxel; a voxel chooses, among the samples it holds, the
-// one whose surface point is nearest its centre, and reads the label at that sample's UV.
+// nearest nonzero label, or nearest zero when no nonzero label contributes.
 #include "../geometry/math.hpp"
 #include <cmath>
 #include <cstddef>
@@ -14,6 +14,47 @@
 #endif
 namespace vcr::projection {
 using geometry::nearest;
+// Shared sampling density and voxel placement for categorical and binary projection.
+constexpr int kSubdivisions = 64;
+VCR_PROJECTION_HD inline int subdivisions(double extent)
+{
+    int n = 1;
+    while (n < kSubdivisions && double(n) * .5 < extent) n *= 2;
+    return n;
+}
+template<class Real>
+VCR_PROJECTION_HD inline std::int64_t bandHalf(Real radius, Real voxelSize)
+{
+    const auto half=std::int64_t(std::ceil(radius / (Real(.5)*voxelSize)-Real(1e-9)));
+    return radius>0 ? (half>1?half:1) : 0;
+}
+template<class Real>
+VCR_PROJECTION_HD inline float bandOffset(Real radius, std::int64_t k, std::int64_t half)
+{
+    return half ? float(radius * Real(k) / Real(half)) : 0.f;
+}
+// Shape and coordinates have the same axis order. The caller chooses how samples
+// landing in one voxel are reduced (nearest categorical label or binary union).
+VCR_PROJECTION_HD inline bool bandVoxel(const float* p, const float* step, float offset,
+                                        const float* origin, const std::int64_t* shape, std::int64_t* index)
+{
+    for(int a=0;a<3;++a){
+        const float q=p[a]+step[a]*offset-origin[a];
+        if(!std::isfinite(q)||q<-.5f||q>=float(shape[a])+.5f)return false;
+        index[a]=nearest_index(q);
+        if(index[a]<0||index[a]>=shape[a])return false;
+    }
+    return true;
+}
+template<class Offset, class Emit>
+VCR_PROJECTION_HD inline void bandSamples(const float* point,const float* step,const float* origin,
+                                          const std::int64_t* shape,std::int64_t count,Offset offset,Emit emit)
+{
+    for(std::int64_t k=0;k<count;++k){
+        std::int64_t index[3];
+        if(bandVoxel(point,step,offset(k),origin,shape,index))emit(index,k);
+    }
+}
 // A crop's voxels and the label tile one target reads.
 struct Raster {
     std::size_t count = 0;  // voxels
@@ -37,7 +78,13 @@ VCR_PROJECTION_HD void raster(const Raster& g, const float* uv, const float* dis
         const auto ix = nearest(px, g.label_origin[1]) - g.label_origin[1], iy = nearest(py, g.label_origin[0]) - g.label_origin[0];
         if (ix < 0 || iy < 0 || ix >= g.label_w || iy >= g.label_h) continue;
         const auto pixel = iy * g.label_w + ix;
-        const bool choose = !coverage[i] || d < best[i] || (d == best[i] && ids[pos] < winner[i]);
+        bool nonzero=false,previousNonzero=false;
+        for(int ch=0;ch<g.channels;++ch){
+            nonzero |= label[std::size_t(ch)*g.label_h*g.label_w+pixel] != T(0);
+            previousNonzero |= coverage[i] && out[ch*g.count+i] != T(0);
+        }
+        const bool choose = !coverage[i] || (nonzero && !previousNonzero) ||
+            (nonzero == previousNonzero && (d < best[i] || (d == best[i] && ids[pos] < winner[i])));
         for (int ch = 0; ch < g.channels; ++ch) {
             const T value = label[std::size_t(ch) * g.label_h * g.label_w + pixel];
             if (coverage[i] && out[ch * g.count + i] != value) conflict[i] = true;

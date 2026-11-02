@@ -109,16 +109,20 @@ entry points, so also search `include/vc_reader/` before concluding something is
 
 | Need | C++ API | Implementation | Python |
 | --- | --- | --- | --- |
-| Nearest/linear samples of resident batched 2D/3D float32 arrays, with value and coordinate gradients; CPU/CUDA | `resident_sampling.hpp`: `sampling::Dense`, `sampleDense`, `backwardDense` | `sampling/resident.cpp`, `sampling/kernels.cu` | `resident.sample_array`, `torch.sample_array` |
+| Nearest/linear samples of resident batched 2D/3D float32 arrays, with value and coordinate gradients; CPU/CUDA | `resident_sampling.hpp`: `sampling::Dense`, `sampleDense`, `backwardDense` | `sample_point.hpp`, `sampling_math.hpp`, `sampling/` | `resident.sample_array`, `torch.sample_array` |
 | Batched bicubic surface positions/tangents, linear or triangle fields, explicit validity; CPU/CUDA | `resident_sampling.hpp`: `sampling::prepareSurfaces`, `sampleSurfaces` | `grid/derivatives.hpp`, `grid/points.hpp`, `sampling/` | `resident.GridField`, `torch.surface_derivatives`, `torch.surface_points` |
-| Pixel-centre field tiles with border replication; CPU/CUDA | `resident_sampling.hpp`: `sampling::Tile`, `sampleFieldTile`, `sampleSurfaceTile` | `sampling/` | `resident.sample_field_tile` |
+| Pixel-centre field tiles with border replication; CPU/CUDA | `resident_sampling.hpp`: `sampling::Tile`, `sampleFieldTile`, `sampleSurfaceTile` | `sampling_math.hpp`, `sampling/` | `resident.sample_field_tile` |
 | Label lookup through a surface correspondence, distance rejection and seam provenance; CPU/CUDA | `sampling.hpp`: `projection::RasterRequest`, `transfer` | `projection/transfer.cpp`, `projection/kernels.cu` | `resident.SurfaceTransfer` |
-| Binary support swept through a surface normal band; CPU/CUDA | `sampling.hpp`: `projection::MaskBand`, `projectMask` | `projection/mask.cpp`, `projection/kernels.cu` | `resident.project_mask` |
+| Binary support swept through a surface normal band; CPU/CUDA | `sampling.hpp`: `projection::MaskBand`, `projectMask` | `projection/common.hpp`, `grid/points.hpp`, `projection/mask.cpp`, `projection/kernels.cu` | `resident.project_mask` |
 
-Resident array queries use array indices (ZYX or YX), without normalized Torch
-coordinates. `zeros` interpolates with the fill value outside the array,
+Resident arrays are already loaded host or device buffers. Their forward samples
+use the same voxel-lookup sampler as stored arrays; the adapter supplies a contiguous
+block, batch/channel layout, and boundary policy. Queries use array indices (ZYX
+or YX), without normalized Torch coordinates. `zeros` interpolates with the fill value outside the array,
 `border` replicates its boundary, and `constant` rejects out-of-bounds queries.
-Nearest ties round up. Surface queries use row/column indices and require valid
+Nearest ties round up. Coordinate gradients use the shared corner weights,
+including all axes at integer queries. Field tiles and correspondence UV maps
+share the clamped array interpolation used by transforms. Surface queries use row/column indices and require valid
 corners; bicubic Hermite derivatives are shared with `tifxyz.Surface`.
 `GridField` copies its input into fixed storage; CUDA copies remain resident.
 Torch sampling supports first-order gradients; CUDA value gradients use atomic
@@ -127,8 +131,14 @@ Surface supervision queries do not support autograd.
 
 Surface transfer uses bicubic target geometry, triangle source geometry matching
 the correspondence mesh, and linear UV maps to avoid overshooting seams.
-Categorical labels are selected by index. Normal-band projection fills linear
-swept cells between supplied positions and normals; occupancy uses deterministic
+Categorical labels are selected by index. Surface-to-volume projection prefers
+nonzero labels over zero; between nonzero labels, the nearest surface sample wins,
+with sample ID breaking ties. A multichannel label is nonzero when any channel is
+nonzero, and all channels come from the same winning sample.
+Binary masks use the same surface interpolation, sampling-density policy,
+endpoint-inclusive normal layers (at most half a voxel apart), and nearest-voxel
+placement as label projection. Supplied normals allow isolated valid points and
+edges to contribute too. Binary occupancy accumulates by union using deterministic
 integer writes. All these operations use float32 on CPU and CUDA.
 
 ### Geometry and analysis

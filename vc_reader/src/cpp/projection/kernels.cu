@@ -50,10 +50,10 @@ void transferCuda(const RasterRequest& r,RasterResult& out,int id){
 
 #include "mask.hpp"
 namespace vcr::projection {
-struct MaskMark {MaskBand grid;std::uint32_t* output;
- __device__ void operator()(V p)const {auto i=maskIndex(grid,p);if(i>=0)atomicOr(output+i,1u);}
+struct MaskMark {std::uint32_t* output;
+ __device__ void operator()(std::int64_t i)const {atomicOr(output+i,1u);}
 };
-__global__ void maskKernel(MaskBand g,std::uint32_t* output){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<g.rows*g.cols)maskCell(g,i,MaskMark{g,output});}
+__global__ void maskKernel(MaskBand g,std::uint32_t* output){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<g.rows*g.cols)maskCell(g,i,MaskMark{output});}
 void projectMaskCuda(const MaskBand& g,std::uint32_t* output,int id){device::Guard guard(id);
     std::size_t n=std::size_t(g.shape[0])*g.shape[1]*g.shape[2];device::check(cudaMemsetAsync(output,0,n*4,device::stream()));
     maskKernel<<<(g.rows*g.cols+127)/128,128,0,device::stream()>>>(g,output);device::check(cudaGetLastError());device::complete();}

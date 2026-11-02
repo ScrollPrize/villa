@@ -160,8 +160,51 @@ class SurfaceTests(unittest.TestCase):
         for backend in self.backends():
             with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink},backend=backend) as reader:
                 result=reader.project_surface(surf,(2,2),(2,2),label_target='ink')
-                self.assertFalse(host(result['ink'].data).any())  # nearest tie: smaller triangle ID
+                self.assertTrue(host(result['ink'].data)[host(result['ink'].valid)].all())  # nonzero beats zero
                 self.assertTrue(host(result['ink'].masks['conflict']).any())  # remote fold carries ink
+                # In-memory binary projection and registered label projection both
+                # retain ink when zero and nonzero surface samples share a voxel.
+                from vc_reader.resident import project_mask
+                positions = np.ascontiguousarray(xyz[::-1].transpose(1, 2, 0))
+                normals = np.zeros_like(positions); normals[..., 0] = 1
+                support = (x >= 121)
+                inputs = (support, positions, normals, np.ones(support.shape, bool))
+                if backend == 'cuda':
+                    from vc_reader.cuda import asarray
+                    inputs = tuple(asarray(a) for a in inputs)
+                origin = result.metadata['projection']['origin_zyx']
+                union = host(project_mask(*inputs, origin, result['ink'].data.shape[1:], half_thickness=0))
+                np.testing.assert_array_equal(union > 0, host(result['ink'].data)[0] > 0)
+
+    def test_binary_band_matches_registered_projection_with_fanning_normals(self):
+        from vc_reader import ValueFrame
+        from vc_reader.resident import project_mask
+        xyz = np.array([[[1.2, 3.2], [1.2, 3.2]],
+                        [[1.2, 1.2], [3.2, 3.2]],
+                        [[2.5, 2.5], [2.5, 2.5]]], np.float32)
+        normals = np.array([[[-.8, .8], [-.8, .8]],
+                            [[-.8, -.8], [.8, .8]],
+                            [[1., 1.], [1., 1.]]], np.float32)
+        normal = self.source('fanning-normals', normals, ('c','y','x'), role='normal',
+            registration=SurfaceRegistration(self.surface, ((1,0,0),(0,1,0))),
+            value_frame=ValueFrame(sample_id='s', volume_id='v', level=0), component_order=('x','y','z'))
+        surface = self.surface.replace(geometry=self.source('fanning-xyz', xyz, ('c','y','x'), role='scalar').storage,
+                                       normals=normal)
+        positions = np.ascontiguousarray(xyz[::-1].transpose(1,2,0))
+        directions = np.ascontiguousarray(normals[::-1].transpose(1,2,0))
+        for values in (np.ones((2,2), np.uint8), np.array([[0,1],[1,0]], np.uint8)):
+            label = self.source('fanning-label', values, ('y','x'), role='label',
+                registration=SurfaceRegistration(surface, ((1,0,0),(0,1,0))))
+            for backend in self.backends():
+                with self.subTest(backend=backend, values=values.tolist()), open_sample(self.reference, {'ink':label}, backend=backend) as reader:
+                    projected = reader.project_surface(surface, (0,0), (2,2), label_target='ink', thickness_um=2)
+                    inputs = (values.astype(bool), positions, directions, np.ones((2,2), bool))
+                    if backend == 'cuda':
+                        from vc_reader.cuda import asarray
+                        inputs = tuple(asarray(a) for a in inputs)
+                    binary = project_mask(*inputs, projected.metadata['projection']['origin_zyx'],
+                                          projected['ink'].data.shape[1:], half_thickness=1)
+                    np.testing.assert_array_equal(host(binary)>0, host(projected['ink'].data)[0]>0)
 
     def test_validation_budget_worker_and_zero_labels(self):
         zero=self.label.replace(storage=self.source('zero',np.zeros((8,9),np.uint8),('y','x')).storage)

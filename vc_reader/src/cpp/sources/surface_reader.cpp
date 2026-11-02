@@ -557,15 +557,8 @@ struct Samples {
     [[nodiscard]] std::size_t count() const { return ids.size(); }
     [[nodiscard]] std::size_t bytes() const { return (xyz.size() + step.size() + uv.size()) * 4 + ids.size() * 8 + 128; }
 };
-// Points per grid cell along one direction whose spacing in reference voxels is `extent`: a
-// power of two, at most kSubdivisions, that puts them half a voxel apart or closer.
-constexpr int kSubdivisions = 64;
-int subdivisions(double extent)
-{
-    int n = 1;
-    while (n < kSubdivisions && double(n) * .5 < extent) n *= 2;
-    return n;
-}
+using projection::kSubdivisions;
+using projection::subdivisions;
 std::vector<std::pair<Triple, Triple>> tileRegions(const Triple& origin, const Triple& shape, const Triple& tile)
 {
     std::vector<std::pair<Triple, Triple>> out;
@@ -655,8 +648,8 @@ SurfaceProjection::Impl::Impl(AlignedEngine::Impl& r, const Surface& s, const Pa
         voxelUm = std::min(voxelUm, std::sqrt(metric(0, i) * metric(0, i) + metric(1, i) * metric(1, i) + metric(2, i) * metric(2, i)));
     }
     // The band's layers: at most half the smallest reference voxel apart, its two faces included.
-    const auto half = radius > 0 ? std::max<std::int64_t>(1, std::int64_t(std::ceil(radius / (.5 * voxelUm) - 1e-9))) : 0;
-    for (std::int64_t k = -half; k <= half; ++k) offsets.push_back(half ? float(radius * double(k) / double(half)) : 0.f);
+    const auto half = projection::bandHalf(radius, voxelUm);
+    for (std::int64_t k = -half; k <= half; ++k) offsets.push_back(projection::bandOffset(radius, k, half));
     const auto between = r.between(selecting->source, surfaceFrame(surface));
     destination = r.referenceMap.forward.inverse() * between.forward * surface.xyzToVolume->forward;
     labelToUv = pixelAffine(*surfaceOf(selecting->reader->registration())->pixelToUv).forward;
@@ -1064,14 +1057,9 @@ SampleResult SurfaceProjection::Impl::read(const Triple& at, const Triple& exten
         for (std::size_t i = 0; i < s->count(); ++i) {
             const float* p = &s->xyz[i * 3];
             const float* step = &s->step[i * 3];
-            for (std::size_t k = 0; k < offsets.size(); ++k) {
-                std::int64_t index3[3];
-                bool inside = true;
-                for (std::size_t a = 0; a < 3 && inside; ++a) {
-                    index3[a] = nearest_index(p[a] + step[a] * offsets[k] - origin[a]);
-                    inside = index3[a] >= 0 && index3[a] < extent[2 - a];
-                }
-                if (!inside) continue;
+            const std::int64_t shapeXYZ[3]{extent[2],extent[1],extent[0]};
+            projection::bandSamples(p,step,origin,shapeXYZ,std::int64_t(offsets.size()),
+                [&](std::int64_t k){return offsets[std::size_t(k)];},[&](const std::int64_t* index3,std::int64_t k){
                 float c[3];
                 for (std::size_t a = 0; a < 3; ++a) c[a] = float(index3[a]) + origin[a] - p[a];
                 float d2 = 0;
@@ -1079,8 +1067,8 @@ SampleResult SurfaceProjection::Impl::read(const Triple& at, const Triple& exten
                     const float v = metricLinear[row * 3] * c[0] + metricLinear[row * 3 + 1] * c[1] + metricLinear[row * 3 + 2] * c[2];
                     d2 += v * v;
                 }
-                batch.push_back({(index3[2] * extent[1] + index3[1]) * extent[2] + index3[0], {s->uv[i * 2], s->uv[i * 2 + 1]}, std::sqrt(d2), s->ids[i] + std::int64_t(k)});
-            }
+                batch.push_back({(index3[2] * extent[1] + index3[1]) * extent[2] + index3[0], {s->uv[i * 2], s->uv[i * 2 + 1]}, std::sqrt(d2), s->ids[i] + k});
+            });
         }
     }
     if (!batch.empty()) rasterize(batch, extent, states, targets);

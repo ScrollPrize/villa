@@ -1,5 +1,7 @@
 #include "mask.hpp"
 #include <algorithm>
+#include <atomic>
+#include "../thread_pool.hpp"
 #include <stdexcept>
 namespace vcr::projection {
 void projectMask(const MaskBand& g,std::uint32_t* output,int id){
@@ -11,7 +13,17 @@ void projectMask(const MaskBand& g,std::uint32_t* output,int id){
     if(id>=0)throw std::runtime_error("vc_reader built without CUDA projection");
 #endif
     std::fill_n(output,n,0u);
-    auto mark=[&](V p){auto i=maskIndex(g,p);if(i>=0)output[i]=1;};
-    for(int i=0;i<g.rows*g.cols;++i)maskCell(g,i,mark);
+    const int cells=g.rows*g.cols;
+    if(cells<64){
+        const auto mark=[&](std::int64_t i){output[i]=1;};
+        for(int i=0;i<cells;++i)maskCell(g,i,mark);
+        return;
+    }
+    // Every writer stores the same value. Atomic stores avoid data races without
+    // a read/modify/write operation; the pool joins before output is consumed.
+    const auto mark=[&](std::int64_t i){std::atomic_ref<std::uint32_t>(output[i]).store(1,std::memory_order_relaxed);};
+    samplingPool().parallel_for((std::size_t(cells)+15)/16,[&](std::size_t block){
+        for(int i=int(block)*16;i<std::min(cells,int(block+1)*16);++i)maskCell(g,i,mark);
+    });
 }
 }

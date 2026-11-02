@@ -1,4 +1,5 @@
 #include <vc_reader/array.hpp>
+#include <vc_reader/resident_sampling.hpp>
 #include <vc_reader/sampling.hpp>
 #include <chrono>
 #include <filesystem>
@@ -40,12 +41,46 @@ int main()
         reader.read_points(integerPoint, 1, reinterpret_cast<uint8_t*>(&nearest));
         require(nearest == 1014, "point read");
 
+        // Both storage interfaces must make the same interpolation and tie decisions.
+        std::vector<float> coordinates;
+        const float positions[]{-1.f,-.5f,-.25f,0.f,std::nextafter(.5f,0.f),.5f,.75f,1.f,1.25f,2.f};
+        for(float z:positions)for(float y:positions)for(float x:positions)
+            coordinates.insert(coordinates.end(),{z,y,x});
+        const auto count=coordinates.size()/3;
+        std::vector<double> query64(coordinates.begin(),coordinates.end());
+        std::vector<float> denseValues(data.begin(),data.end()), denseOut(count), arrayOut(count);
+        std::vector<std::uint16_t> nearestOut(count);
+        vcr::sampling::Dense denseSampling;
+        denseSampling.values=denseValues.data();denseSampling.points=coordinates.data();denseSampling.dimensions=3;
+        denseSampling.batches=denseSampling.channels=1;denseSampling.queries=count;
+        for(int axis=0;axis<3;++axis)denseSampling.shape[axis]=2;
+        vcr::sampling::sampleDense(denseSampling,denseOut.data());
+        reader.sample_linear(query64.data(),count,{'u',2,false},false,arrayOut.data());
+        for(std::size_t i=0;i<count;++i)require(std::abs(denseOut[i]-arrayOut[i])<.001f,"array and reader linear sampling agree");
+        denseSampling.order=0;vcr::sampling::sampleDense(denseSampling,denseOut.data());
+        reader.sample_nearest(query64.data(),count,reinterpret_cast<std::uint8_t*>(nearestOut.data()));
+        for(std::size_t i=0;i<count;++i)require(denseOut[i]==nearestOut[i],"array and reader nearest ties agree");
+
         vcr::aligned::Plan aligned({2,2,2}, {1,1,1}, {1,1,1}, {0,0,0}, {0,0,0},
             {.5f,.5f,.5f}, {1,0,0,0,1,0,0,0,1}, {2,2,2}, 1, 1, false, true);
         bool valid = false;
         uint16_t fill = 0;
         aligned.cpu({data.data()}, &fill, {'u',2,false}, &value, &valid, {});
         require(valid && value == 1007.f, "aligned sampling");
+        {
+            vcr::projection::Raster raster;raster.count=1;raster.label_h=1;raster.label_w=3;
+            raster.uv_to_label[0]=raster.uv_to_label[4]=1;
+            const float uv[]{0,0,1,0,2,0},distances[]{0,2,1};
+            const std::int64_t ids[]{0,1,2},offsets[]{0,3};
+            const std::uint8_t labels[]{0,4,8};std::uint8_t projected=0;
+            bool covered=false,conflict=false,geometry=false;float best=INFINITY,chosenUV[2];std::int64_t winner=-1;
+            vcr::projection::raster(raster,uv,distances,ids,offsets,labels,&projected,&covered,&conflict,&best,&winner,chosenUV,&geometry,0);
+            require(projected==8&&winner==2&&conflict,"nearest nonzero label wins over closer zero");
+            const float zeroUV[]{0,0},zeroDistance[]{0};const std::int64_t zeroId[]{0},one[]{0,1};
+            vcr::projection::raster(raster,zeroUV,zeroDistance,zeroId,one,labels,&projected,&covered,&conflict,&best,&winner,chosenUV,&geometry,0);
+            require(projected==8&&winner==2,"later zero batch cannot erase nonzero label");
+        }
+
         const float vertices[]{0,0,0, 2,0,0};
         const int64_t offsets[]{0,2};
         vcr::geometry::Curves curves(vertices, 2, offsets, 2, nullptr);
