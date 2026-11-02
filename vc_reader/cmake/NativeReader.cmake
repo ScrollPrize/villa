@@ -46,6 +46,7 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/caches.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/image_file.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/image_write.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/image_encode.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/resolution.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/source_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/surface_reader.cpp"

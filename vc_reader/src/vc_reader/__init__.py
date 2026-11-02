@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .catalog import DEFAULT_METADATA_URL, default_cache_dir
-from ._reader import shortest_path
 from .affine import Affine
 from .artifacts import AccessRoot, Artifact, ArtifactType, Origin, to_https, to_s3
 from .catalog import DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS, Catalog, License, Model, Scan, VolumeCoverage
@@ -67,3 +66,18 @@ __all__ = [
     "ValueFrame",
     "VolumeRegistration",
 ]
+
+
+_NATIVE_EXPORTS = {
+    'shortest_path', 'write_image', 'encode_png', 'encode_jpeg', 'snapshot',
+    'window_level_lut', 'palette_lut', 'overlay_lut', 'display_to_uint8',
+    'apply_lut', 'blend', 'blend_argb',
+}
+__all__ += sorted(_NATIVE_EXPORTS - set(__all__))
+
+
+def __getattr__(name):
+    if name in _NATIVE_EXPORTS:
+        from . import _reader
+        return getattr(_reader, name)
+    raise AttributeError(name)

@@ -81,6 +81,24 @@ inline nb::tuple rasterOut(const Surface& s, const grid::Raster& raster, grid::I
 
 inline void bind(nb::module_& m)
 {
+    auto imageView = [](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image) {
+        if (image.ndim()<2 || image.ndim()>3) throw nb::value_error("image must have rows, columns and optional channels");
+        return sources::ImageView{image.data(),typestrOf(image.dtype()),std::int64_t(image.shape(0)),
+            std::int64_t(image.shape(1)),image.ndim()==3?std::int64_t(image.shape(2)):1};
+    };
+    m.def("write_image", [imageView](const std::filesystem::path& path, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, int quality) {
+        const auto view=imageView(image);nb::gil_scoped_release release;sources::writeImage(path,view,quality);
+    }, "path"_a,"image"_a.noconvert(),"jpeg_quality"_a=95);
+    m.def("encode_png", [imageView](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image) {
+        std::vector<std::uint8_t> bytes;
+        {const auto view=imageView(image);nb::gil_scoped_release release;bytes=sources::encodePng(view);}
+        return nb::bytes(bytes.data(),bytes.size());
+    }, "image"_a.noconvert());
+    m.def("encode_jpeg", [imageView](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image,int quality) {
+        std::vector<std::uint8_t> bytes;
+        {const auto view=imageView(image);nb::gil_scoped_release release;bytes=sources::encodeJpeg(view,quality);}
+        return nb::bytes(bytes.data(),bytes.size());
+    }, "image"_a.noconvert(),"quality"_a=95);
     m.def("_write_tiff", [](const std::filesystem::path& path, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> image, const std::string& compression, std::optional<std::array<int, 2>> tile, std::optional<bool> stacked) {
         // Unasked, a third axis of up to 4 is channels and of more is pages.
         const bool pages = stacked.value_or(image.ndim() == 4 || (image.ndim() == 3 && image.shape(2) > 4));

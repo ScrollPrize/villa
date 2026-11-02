@@ -123,3 +123,20 @@ def test_resample_full_is_scaled_stored_positions():
     xyz, valid = surface.resample_full((2, 8), (3, 4))
     other, _ = surface.resample((1, 2), (.5, .25), (3, 4))
     assert valid.all() and np.array_equal(xyz, other)
+
+
+def test_extra_channels_and_sibling_artifacts(tmp_path):
+    surface = tifxyz.Surface(_grid())
+    path = tmp_path / 'surface'
+    labels = np.arange(600, dtype=np.uint16).reshape(20, 30)
+    tifxyz.write(path, surface, channels={'labels': labels})
+    np.testing.assert_array_equal(tifffile.imread(path / 'labels.tif'), labels)
+    (path / 'notes.txt').write_text('keep')
+    (path / 'artifacts').mkdir()
+    tifxyz.write(path, surface, overwrite=True, channels={'labels': labels + 1})
+    assert (path / 'notes.txt').read_text() == 'keep'
+    assert (path / 'artifacts').is_dir()
+    np.testing.assert_array_equal(tifffile.imread(path / 'labels.tif'), labels + 1)
+    from vc_reader import _reader
+    _reader.snapshot(path, force=True)
+    np.testing.assert_array_equal(tifffile.imread(tmp_path / 'backups/surface/0/labels.tif'), labels + 1)

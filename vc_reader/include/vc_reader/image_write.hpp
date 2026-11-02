@@ -6,8 +6,20 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vcr::sources {
+
+// Interleaved contiguous pixels; RGB(A) color order.
+struct ImageView {
+    const void* data;
+    std::string dtype;
+    std::int64_t rows, cols, channels = 1;
+};
+std::vector<std::uint8_t> encodePng(ImageView image);
+std::vector<std::uint8_t> encodeJpeg(ImageView image, int quality = 95);
+// PNG/JPEG use uint8 gray/RGB(A); TIFF retains the input type. Atomic publication.
+void writeImage(const std::filesystem::path& path, ImageView image, int jpegQuality = 95);
 
 struct TiffOptions {
     std::string compression = "none";  // none, lzw, deflate, packbits, zstd
@@ -52,4 +64,7 @@ private:
 void writeTiff(const std::filesystem::path& path, const void* data, const std::string& dtype, std::int64_t rows,
                std::int64_t cols, std::int64_t channels = 1, const TiffOptions& options = {});
 
+inline void writeTiff(const std::filesystem::path& path, ImageView image, const TiffOptions& options = {}) {
+    writeTiff(path,image.data,image.dtype,image.rows,image.cols,image.channels,options);
+}
 }  // namespace vcr::sources
