@@ -226,7 +226,7 @@ TEST_CASE("surface/grid conversion and sampling use one exact affine convention"
     CHECK(sample.volume[2] == doctest::Approx(307.75f));
 
     // The outermost grid edge belongs to the final quad and is clickable.
-    const auto edge = sampleNative(surface, 
+    const auto edge = sampleNative(surface,
         surface.gridToSurface({3.0, 2.0}));
     REQUIRE(edge);
     CHECK(edge.volume == points(2, 3));
@@ -286,7 +286,7 @@ TEST_CASE("surface sampling rejects any location owned by an invalid quad")
     auto points = makePlanarGrid(3, 3);
     points(1, 1) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
-    const auto sample = sampleNative(surface, 
+    const auto sample = sampleNative(surface,
         surface.gridToSurface({0.25, 0.25}));
     CHECK_FALSE(sample);
 }

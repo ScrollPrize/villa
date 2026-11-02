@@ -1001,6 +1001,11 @@ std::shared_ptr<Volume> VolumePkg::volume() const
     return loadedVolumes_.begin()->second;
 }
 
+std::vector<fs::path> VolumePkg::normalGridPaths() const
+{
+    return resolvedNormalGridPaths_;
+}
+
 std::vector<std::string> VolumePkg::volumeTags(const std::string& volumeId) const
 {
     auto it = volumeTagsByID_.find(volumeId);

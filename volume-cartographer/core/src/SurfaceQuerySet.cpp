@@ -8,7 +8,7 @@ void SurfaceQuerySet::rebuild(const std::vector<SurfacePtr>& surfaces) {
         const auto* points=surface->rawPointsPtr();
         if (!points || points->empty()) continue;
         std::vector<uint8_t> validity;
-        surface->gridVertices(validity,points);
+        (void)surface->gridVertices(validity,points);
         auto resident=std::make_shared<vc::object_links::SurfaceGrid>(*points,surface->scale(),validity);
         identities_.emplace(resident.get(),surface);
         geometry_.emplace(surface.get(),resident);

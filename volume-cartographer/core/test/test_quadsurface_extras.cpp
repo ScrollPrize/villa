@@ -247,7 +247,7 @@ TEST_CASE("countValid* on path-only (unloaded) construction lazily loads")
     fs::remove_all(root);
 }
 
-TEST_CASE("mapped SurfaceQuerySet rebuild keeps disk-backed surfaces lazy")
+TEST_CASE("resident SurfaceQuerySet loads disk-backed geometry once")
 {
     auto root = tmpDir("mapped_lazy_index");
     auto d = root / "seg";
@@ -263,22 +263,19 @@ TEST_CASE("mapped SurfaceQuerySet rebuild keeps disk-backed surfaces lazy")
     CHECK(lazy->center() == cv::Vec3f(4.f, 2.f, 0.f));
 
     SurfaceQuerySet index;
-    index.setSamplingStride(4);
-    index.rebuild({lazy}, 0.0f, /*useMappedSurfaces=*/true);
+    index.rebuild({lazy});
 
     CHECK_FALSE(index.empty());
-    CHECK(index.containsSurface(lazy));
-    CHECK_FALSE(lazy->isLoaded());
+    CHECK(lazy->isLoaded());
 
-    std::unordered_set<QuadSurface*> targets{lazy.get()};
     SurfaceQuerySet::PointQuery query;
     query.worldPoint = cv::Vec3f(4.f, 4.f, 5.f);
     query.tolerance = 1.f;
-    query.surfaces.includeRaw = &targets;
-    const auto hit = index.locateAny(query);
+    query.surfaces.only = lazy;
+    const auto hit = index.locate(query);
     REQUIRE(hit);
     CHECK(hit->surface == lazy);
-    CHECK_FALSE(lazy->isLoaded());
+    CHECK(lazy->isLoaded());
 
     fs::remove_all(root);
 }

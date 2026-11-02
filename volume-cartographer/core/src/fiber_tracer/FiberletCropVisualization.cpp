@@ -122,7 +122,7 @@ void writeFiberletCropBoxVisualization(
                 cv::Mat_<uint8_t> texture(raster.height, raster.width);
                 vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
                 return texture;
-            }());
+            }()).view());
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);
         vcr::zarr::atomicWrite(
             directory / (stem + "_" + face.name + ".obj"),
