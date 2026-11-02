@@ -31,6 +31,7 @@ from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
 from vc_reader.tifxyz import full_extent
+from vc_reader.resident import GridField, sample_field_tile as bilinear_field_tile
 
 
 FloatArray = NDArray[np.floating]
@@ -1211,51 +1212,6 @@ def iter_tiles(
             yield row_start, row_end, col_start, col_end
 
 
-def bilinear_field_tile(
-    field: FloatArray,
-    valid: BoolArray,
-    output_shape: Tuple[int, int],
-    row_start: int,
-    row_end: int,
-    col_start: int,
-    col_end: int,
-) -> Tuple[NDArray[np.float64], BoolArray]:
-    """Interpolate one stored-grid field at output pixel centres."""
-
-    source_height, source_width = field.shape
-    output_height, output_width = output_shape
-    grid_y = (
-        (np.arange(row_start, row_end, dtype=np.float64) + 0.5)
-        * source_height
-        / output_height
-    )
-    grid_x = (
-        (np.arange(col_start, col_end, dtype=np.float64) + 0.5)
-        * source_width
-        / output_width
-    )
-    y0 = np.clip(np.floor(grid_y).astype(np.int64), 0, source_height - 1)
-    x0 = np.clip(np.floor(grid_x).astype(np.int64), 0, source_width - 1)
-    y1 = np.minimum(y0 + 1, source_height - 1)
-    x1 = np.minimum(x0 + 1, source_width - 1)
-    wy = (grid_y - y0)[:, None]
-    wx = (grid_x - x0)[None, :]
-
-    v00 = valid[y0[:, None], x0[None, :]]
-    v01 = valid[y0[:, None], x1[None, :]]
-    v10 = valid[y1[:, None], x0[None, :]]
-    v11 = valid[y1[:, None], x1[None, :]]
-    interpolated_valid = v00 & v01 & v10 & v11
-    f00 = np.where(v00, field[y0[:, None], x0[None, :]], 0.0)
-    f01 = np.where(v01, field[y0[:, None], x1[None, :]], 0.0)
-    f10 = np.where(v10, field[y1[:, None], x0[None, :]], 0.0)
-    f11 = np.where(v11, field[y1[:, None], x1[None, :]], 0.0)
-    top = f00 * (1.0 - wx) + f01 * wx
-    bottom = f10 * (1.0 - wx) + f11 * wx
-    result = top * (1.0 - wy) + bottom * wy
-    interpolated_valid &= np.isfinite(result)
-    return result, interpolated_valid
-
 
 def _sample_mapper_surface_xyz(
     mapper: SurfaceMapper,
@@ -1265,56 +1221,10 @@ def _sample_mapper_surface_xyz(
 ) -> Tuple[NDArray[np.float64], BoolArray]:
     """Sample transformed source XYZ using the mapper's triangle split."""
 
-    source_height, source_width = mapper.source.shape
-    finite = valid & np.isfinite(rows) & np.isfinite(cols)
-    in_bounds = (
-        finite
-        & (rows >= 0.0)
-        & (rows <= source_height - 1)
-        & (cols >= 0.0)
-        & (cols <= source_width - 1)
-    )
-    safe_rows = np.clip(np.where(in_bounds, rows, 0.0), 0, source_height - 1)
-    safe_cols = np.clip(np.where(in_bounds, cols, 0.0), 0, source_width - 1)
-    row0 = np.minimum(
-        np.floor(safe_rows).astype(np.int64), source_height - 2
-    )
-    col0 = np.minimum(
-        np.floor(safe_cols).astype(np.int64), source_width - 2
-    )
-    row_fraction = safe_rows - row0
-    col_fraction = safe_cols - col0
-
-    assert mapper.source.valid is not None
-    quad_valid = (
-        in_bounds
-        & mapper.source.valid[row0, col0]
-        & mapper.source.valid[row0, col0 + 1]
-        & mapper.source.valid[row0 + 1, col0]
-        & mapper.source.valid[row0 + 1, col0 + 1]
-    )
-    xyz = np.full((*rows.shape, 3), np.nan, dtype=np.float64)
-    for coordinate, field in enumerate((mapper.tx, mapper.ty, mapper.tz)):
-        p00 = field[row0, col0]
-        p10 = field[row0, col0 + 1]
-        p01 = field[row0 + 1, col0]
-        p11 = field[row0 + 1, col0 + 1]
-        first_triangle = row_fraction + col_fraction <= 1.0
-        first_value = (
-            p00
-            + col_fraction * (p10 - p00)
-            + row_fraction * (p01 - p00)
-        )
-        second_value = (
-            (1.0 - row_fraction) * p10
-            + (row_fraction + col_fraction - 1.0) * p11
-            + (1.0 - col_fraction) * p01
-        )
-        xyz[..., coordinate] = np.where(
-            first_triangle, first_value, second_value
-        )
-    sampled_valid = quad_valid & np.all(np.isfinite(xyz), axis=-1)
-    return xyz, sampled_valid
+    if not hasattr(mapper, '_sampling_field'):
+        mapper._sampling_field = GridField(np.stack((mapper.tx, mapper.ty, mapper.tz), -1), mapper.source.valid, interpolation='triangles')
+    xyz, supported = mapper._sampling_field.sample(np.stack((rows, cols), -1))
+    return xyz, supported & valid
 
 
 def _fill_uv_field(
@@ -1489,7 +1399,7 @@ def transfer_array(
 
     With ``materialize_output=False``, ``tile_callback`` receives
     ``(bounds, labels, validity)`` in row-major order without full output arrays.
-    ``rasterizer="auto"`` uses a compatible native kernel or falls back to NumPy.
+    ``rasterizer="auto"`` uses vc_reader with prepared surface geometry.
     """
 
     label = np.asarray(source_label)
@@ -1831,6 +1741,7 @@ def transfer_array(
             row_end,
             col_start,
             col_end,
+            interpolation="bicubic",
         )
         target_y, target_y_valid = bilinear_field_tile(
             target.y,
@@ -1840,6 +1751,7 @@ def transfer_array(
             row_end,
             col_start,
             col_end,
+            interpolation="bicubic",
         )
         target_z, target_z_valid = bilinear_field_tile(
             target.z,
@@ -1849,6 +1761,7 @@ def transfer_array(
             row_end,
             col_start,
             col_end,
+            interpolation="bicubic",
         )
         target_pixel_valid &= target_y_valid & target_z_valid
         mapped_rows, rows_valid = bilinear_field_tile(

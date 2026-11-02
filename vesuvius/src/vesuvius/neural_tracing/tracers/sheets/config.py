@@ -178,7 +178,7 @@ class TrainConfig:
     jump_min: float = 7.  # push along the sheet normal, either sign, onto the brightest CT ridge in this range
     jump_max: float = 24.
     prefetch: int = 2  # loader batches in flight per worker (each holds batch x block bytes of shared memory)
-    compile_geometry: bool = False  # torch.compile the GT projection: ~1.4x faster, not bit-identical (geometry.py)
+    compile_geometry: bool = False  # torch.compile tensor operations around native GT queries (geometry.py)
     compile_model: bool = False  # torch.compile the model (model.compile_model): ~1.7x faster at level 0, not bit-identical
     points_per_batch: int = 0  # with data.front_points_range: front points per batch (0: train.batch * data.front_points)
     val_episodes: int = 64

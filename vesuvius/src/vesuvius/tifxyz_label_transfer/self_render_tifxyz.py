@@ -46,113 +46,17 @@ from .prepare_canvas_offset_evidence import (
 DEFAULT_SOURCE_RAW_ROOT: Optional[str] = None
 
 
-def _sample_grid_field(
-    field: np.ndarray,
-    valid: np.ndarray,
-    grid_y: np.ndarray,
-    grid_x: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Bilinearly sample a stored TIFXYZ field at arbitrary grid positions."""
-
-    height, width = field.shape
-    y0 = np.clip(np.floor(grid_y).astype(np.int64), 0, height - 1)
-    x0 = np.clip(np.floor(grid_x).astype(np.int64), 0, width - 1)
-    y1 = np.minimum(y0 + 1, height - 1)
-    x1 = np.minimum(x0 + 1, width - 1)
-    wy = grid_y - y0
-    wx = grid_x - x0
-    v00 = valid[y0, x0]
-    v01 = valid[y0, x1]
-    v10 = valid[y1, x0]
-    v11 = valid[y1, x1]
-    sampled_valid = v00 & v01 & v10 & v11
-    values = (
-        field[y0, x0] * (1.0 - wy) * (1.0 - wx)
-        + field[y0, x1] * (1.0 - wy) * wx
-        + field[y1, x0] * wy * (1.0 - wx)
-        + field[y1, x1] * wy * wx
-    )
-    sampled_valid &= np.isfinite(values)
-    return values.astype(np.float64, copy=False), sampled_valid
-
-
 def surface_tile_geometry(
     surface: Surface,
     output_shape: tuple[int, int],
     bounds: tuple[int, int, int, int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Generate XYZ, normal, and validity for one rendered canvas tile."""
-
-    row_start, row_end, col_start, col_end = bounds
-    assert surface.valid is not None
-    xyz_fields = []
-    valid = None
-    for field in (surface.x, surface.y, surface.z):
-        values, field_valid = bilinear_field_tile(
-            field,
-            surface.valid,
-            output_shape,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        )
-        xyz_fields.append(values)
-        valid = field_valid if valid is None else valid & field_valid
-    xyz = np.stack(xyz_fields, axis=-1)
-
-    stored_height, stored_width = surface.shape
-    output_height, output_width = output_shape
-    grid_y_1d = (
-        (np.arange(row_start, row_end, dtype=np.float64) + 0.5)
-        * stored_height
-        / output_height
-    )
-    grid_x_1d = (
-        (np.arange(col_start, col_end, dtype=np.float64) + 0.5)
-        * stored_width
-        / output_width
-    )
-    grid_y, grid_x = np.meshgrid(grid_y_1d, grid_x_1d, indexing="ij")
-    # grid_normal clamps its evaluation location before taking +/-1 samples.
-    normal_y = np.clip(grid_y, 1.0, max(float(stored_height - 3), 1.0))
-    normal_x = np.clip(grid_x, 1.0, max(float(stored_width - 3), 1.0))
-    plus_x = []
-    minus_x = []
-    plus_y = []
-    minus_y = []
-    normal_valid = np.ones(grid_y.shape, dtype=bool)
-    for field in (surface.x, surface.y, surface.z):
-        px, px_valid = _sample_grid_field(
-            field, surface.valid, normal_y, normal_x + 1.0
-        )
-        mx, mx_valid = _sample_grid_field(
-            field, surface.valid, normal_y, normal_x - 1.0
-        )
-        py, py_valid = _sample_grid_field(
-            field, surface.valid, normal_y + 1.0, normal_x
-        )
-        my, my_valid = _sample_grid_field(
-            field, surface.valid, normal_y - 1.0, normal_x
-        )
-        plus_x.append(px)
-        minus_x.append(mx)
-        plus_y.append(py)
-        minus_y.append(my)
-        normal_valid &= px_valid & mx_valid & py_valid & my_valid
-    x_vector = np.stack(plus_x, axis=-1) - np.stack(minus_x, axis=-1)
-    y_vector = np.stack(plus_y, axis=-1) - np.stack(minus_y, axis=-1)
-    x_norm = np.linalg.norm(x_vector, axis=-1)
-    y_norm = np.linalg.norm(y_vector, axis=-1)
-    normal_valid &= (x_norm > 1e-9) & (y_norm > 1e-9)
-    x_vector /= np.maximum(x_norm[..., None], 1e-9)
-    y_vector /= np.maximum(y_norm[..., None], 1e-9)
-    normals = np.cross(x_vector, y_vector)
-    normal_norm = np.linalg.norm(normals, axis=-1)
-    normal_valid &= normal_norm > 1e-9
-    normals /= np.maximum(normal_norm[..., None], 1e-9)
-    valid = valid & normal_valid & np.all(np.isfinite(xyz), axis=-1)
-    return xyz, normals, valid
+    """Bicubic XYZ and tangent normals for a rendered canvas tile."""
+    r0, r1, c0, c1 = bounds
+    rows = (np.arange(r0, r1, dtype=np.float32) + 0.5) * surface.shape[0] / output_shape[0]
+    cols = (np.arange(c0, c1, dtype=np.float32) + 0.5) * surface.shape[1] / output_shape[1]
+    rows, cols = np.meshgrid(rows, cols, indexing="ij")
+    return surface_geometry_at_uv(surface, rows, cols, np.ones(rows.shape, bool))
 
 
 def surface_geometry_at_uv(
@@ -161,56 +65,16 @@ def surface_geometry_at_uv(
     grid_x: np.ndarray,
     input_valid: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample source XYZ and vc_render-style normals at continuous UV."""
-
-    assert surface.valid is not None
-    xyz_fields: list[np.ndarray] = []
-    valid = np.asarray(input_valid, dtype=bool).copy()
-    for field in (surface.x, surface.y, surface.z):
-        values, field_valid = _sample_grid_field(
-            field, surface.valid, grid_y, grid_x
-        )
-        xyz_fields.append(values)
-        valid &= field_valid
-    xyz = np.stack(xyz_fields, axis=-1)
-
-    height, width = surface.shape
-    normal_y = np.clip(grid_y, 1.0, max(float(height - 3), 1.0))
-    normal_x = np.clip(grid_x, 1.0, max(float(width - 3), 1.0))
-    plus_x: list[np.ndarray] = []
-    minus_x: list[np.ndarray] = []
-    plus_y: list[np.ndarray] = []
-    minus_y: list[np.ndarray] = []
-    for field in (surface.x, surface.y, surface.z):
-        px, px_valid = _sample_grid_field(
-            field, surface.valid, normal_y, normal_x + 1.0
-        )
-        mx, mx_valid = _sample_grid_field(
-            field, surface.valid, normal_y, normal_x - 1.0
-        )
-        py, py_valid = _sample_grid_field(
-            field, surface.valid, normal_y + 1.0, normal_x
-        )
-        my, my_valid = _sample_grid_field(
-            field, surface.valid, normal_y - 1.0, normal_x
-        )
-        plus_x.append(px)
-        minus_x.append(mx)
-        plus_y.append(py)
-        minus_y.append(my)
-        valid &= px_valid & mx_valid & py_valid & my_valid
-    x_vector = np.stack(plus_x, axis=-1) - np.stack(minus_x, axis=-1)
-    y_vector = np.stack(plus_y, axis=-1) - np.stack(minus_y, axis=-1)
-    x_norm = np.linalg.norm(x_vector, axis=-1)
-    y_norm = np.linalg.norm(y_vector, axis=-1)
-    valid &= (x_norm > 1e-9) & (y_norm > 1e-9)
-    x_vector /= np.maximum(x_norm[..., None], 1e-9)
-    y_vector /= np.maximum(y_norm[..., None], 1e-9)
-    normals = np.cross(x_vector, y_vector)
-    normal_norm = np.linalg.norm(normals, axis=-1)
-    valid &= normal_norm > 1e-9
-    normals /= np.maximum(normal_norm[..., None], 1e-9)
-    valid &= np.all(np.isfinite(xyz), axis=-1)
+    """Sample bicubic positions and normals, clamping to the stored grid."""
+    from vc_reader import tifxyz
+    if not hasattr(surface, "_render_surface"):
+        surface._render_surface = tifxyz.Surface(
+            np.stack((surface.x, surface.y, surface.z), -1).astype(np.float32),
+            mask=surface.valid)
+    rows = np.clip(grid_y, 0, surface.shape[0]-1).astype(np.float32)
+    cols = np.clip(grid_x, 0, surface.shape[1]-1).astype(np.float32)
+    xyz, valid, normals = surface._render_surface.points_at(rows, cols, normals=True)
+    valid &= input_valid & np.isfinite(normals).all(-1)
     return xyz, normals, valid
 
 

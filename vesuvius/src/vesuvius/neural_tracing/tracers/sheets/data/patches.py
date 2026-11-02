@@ -5,7 +5,7 @@ nodes per voxel, so one grid cell spans ``1 / scale`` voxels. Where the nodes ar
 ``SCALE_TOLERANCE`` away from that (some patch families state twice their real cell size), the index uses the
 measured spacing (median distance between neighbouring valid nodes) instead. A window maps the canonical ``(u, v)`` lattice
 (voxel units: ``u`` advance, ``v`` along the front) onto patch rows/columns for one of eight orientations
-(advance along rows or columns, either sign, front either sign) and samples it bilinearly.
+(advance along rows or columns, either sign, front either sign) and samples it bicubically.
 """
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ class PatchStore:
 
     def __init__(self, max_open: int = 128):
         self.max_open = max_open
-        self._open: OrderedDict[Path, tuple] = OrderedDict()
+        self._open: OrderedDict[Path, tifxyz.Surface] = OrderedDict()
 
     def __getstate__(self):
         return dict(max_open=self.max_open)
@@ -130,18 +130,20 @@ class PatchStore:
     def __setstate__(self, state):
         self.__init__(state['max_open'])
 
-    def arrays(self, info: PatchInfo):
+    def surface(self, info: PatchInfo):
         path = info.path
         hit = self._open.get(path)
         if hit is None:
-            surface = tifxyz.read(path, mask=False)
-            hit = tuple(surface.xyz[..., axis] for axis in range(3))
+            hit = tifxyz.read(path, mask=False)
             self._open[path] = hit
             while len(self._open) > self.max_open:
                 self._open.popitem(last=False)
         else:
             self._open.move_to_end(path)
         return hit
+
+    def arrays(self, info: PatchInfo):
+        return tuple(self.surface(info).xyz[..., axis] for axis in range(3))
 
     def window(self, info: PatchInfo, spec: GridSpec, axis: int, sign_u: int, sign_v: int,
                base_adv: float, base_front: float):
@@ -162,21 +164,8 @@ class PatchStore:
         return self._sample(info, rows, cols)
 
     def _sample(self, info: PatchInfo, rows: np.ndarray, cols: np.ndarray):
-        """Bilinear patch coordinates at grid positions (Gu, Gv) and their validity (all four corners valid)."""
-        r0 = int(np.clip(np.floor(rows.min()), 0, info.rows-1))
-        r1 = int(np.clip(np.floor(rows.max())+2, 1, info.rows))
-        c0 = int(np.clip(np.floor(cols.min()), 0, info.cols-1))
-        c1 = int(np.clip(np.floor(cols.max())+2, 1, info.cols))
-        xyz = np.stack([np.asarray(a[r0:r1, c0:c1], np.float32) for a in self.arrays(info)], -1)
-        ok = np.all(xyz != -1, -1) & np.all(np.isfinite(xyz), -1)
-        h, w = ok.shape
-        rr, cc = rows-r0, cols-c0
-        inside = (rr >= 0) & (rr <= h-1) & (cc >= 0) & (cc <= w-1)
-        i0 = np.clip(np.floor(rr).astype(np.int64), 0, max(h-2, 0))
-        j0 = np.clip(np.floor(cc).astype(np.int64), 0, max(w-2, 0))
-        i1, j1 = np.minimum(i0+1, h-1), np.minimum(j0+1, w-1)
-        fr, fc = (rr-i0)[..., None], (cc-j0)[..., None]
-        out = ((1-fr)*((1-fc)*xyz[i0, j0]+fc*xyz[i0, j1])+fr*((1-fc)*xyz[i1, j0]+fc*xyz[i1, j1])).astype(np.float32)
-        valid = inside & ok[i0, j0] & ok[i0, j1] & ok[i1, j0] & ok[i1, j1]
-        out[~valid] = 0
-        return out, valid
+        """Bicubic patch coordinates at grid positions (Gu, Gv) and their validity (all four corners valid)."""
+        surface = self.surface(info)
+        positions, valid = surface.points_at(np.asarray(rows, np.float32), np.asarray(cols, np.float32))
+        positions[~valid] = 0
+        return positions, valid

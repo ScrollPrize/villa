@@ -9,7 +9,7 @@ Validated on the automated Paris4 fibers against manual annotations (output/pari
 manual fiber median 1.46 -> 0.68 trace voxels, within 1 voxel 25% -> 77% (radius 2.5, sigma 2, two passes).
 
 The presence volume is read in ``tile``-voxel blocks (plus a margin covering the disk) in spatial order on worker
-threads, so each block is read once per pass; all points of a block are sampled in one ``grid_sample`` call.
+threads, so each block is read once per pass; all points of a block are sampled in one vc_reader sampling call.
 """
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 import torch
-import torch.nn.functional as F
+from vc_reader.torch import sample_array
 
 
 @dataclass(frozen=True)
@@ -118,10 +118,8 @@ def point_offsets(points, tangents, tiles, cfg, device):
             g = slice(breaks[index], breaks[index+1])
             world = (p[g, None]+local_t[None, :, 0:1]*a[g, None]+local_t[None, :, 1:2]*b[g, None]
                      +local_t[None, :, 2:3]*t[g, None])  # (n, K, 3) xyz
-            scale = torch.tensor([2/(n-1) for n in block.shape[::-1]], device=device)
-            grid = (world-torch.tensor(lo[::-1].tolist(), dtype=torch.float32, device=device))*scale-1
-            values = F.grid_sample(volume, grid[None, :, :, None], mode='bilinear', padding_mode='border',
-                                   align_corners=True)[0, 0, :, :, 0]  # (n, K)
+            local_points = world.flip(-1)-torch.as_tensor(lo, dtype=torch.float32, device=device)
+            values = sample_array(volume, local_points[None], boundary='border')[0, 0]
             values = values.reshape(-1, slices, len(disk)).mean(1)
             floor = values.min(1, keepdim=True).values
             top = values.max(1, keepdim=True).values

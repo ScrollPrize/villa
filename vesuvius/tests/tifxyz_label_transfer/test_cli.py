@@ -18,7 +18,6 @@ from vesuvius.tifxyz_label_transfer import view_alignment_napari
 
 
 MODULES = (
-    "build_native",
     "transfer",
     "make_label_zarrs",
     "prepare_canvas_offset_evidence",

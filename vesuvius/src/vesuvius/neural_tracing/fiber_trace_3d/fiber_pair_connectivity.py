@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from vc_reader.reader import open_zarr
+from vc_reader.resident import sample_array
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
@@ -61,8 +62,7 @@ def _compact_normal(nx, ny):
 def _sample_scalar(volume, points_base_xyz, origin_zyx, scale, order):
     xyz = np.asarray(points_base_xyz, dtype=np.float64) / scale
     coordinates = np.vstack([xyz[:, 2] - origin_zyx[0], xyz[:, 1] - origin_zyx[1], xyz[:, 0] - origin_zyx[2]])
-    return ndimage.map_coordinates(volume, coordinates, order=order, mode="constant", cval=0.0,
-                                    prefilter=order > 1)
+    return sample_array(volume, coordinates.T, order=order, boundary="constant")
 
 
 def _sample_normals(nx, ny, points, origin_zyx, scale):

@@ -72,7 +72,7 @@ and code names therefore means masked output, not halted motion.
 | `train.ema` | Exponential moving average of the weights (e.g. 0.999). Validation, `best.pt`, evaluation and `--init` use the averaged weights. Checkpoints keep both (`model` raw, `ema` averaged); `evaluation/benchmark.py --raw NAME` benchmarks the raw ones. |
 | `train.max_minutes` | The cosine learning rate anneals to zero at the time budget. Resumed time counts. |
 | `train.keep_every` | Also keep `ckpt_ITER.pt` periodically, for benchmarking intermediate checkpoints. |
-| `train.compile_geometry` | `torch.compile` the GT projection: about 1.4x faster, but not bit-identical (foot points differ by about 1e-3 vx). |
+| `train.compile_geometry` | `torch.compile` the tensor operations around native bicubic GT queries; floating-point fusion can change foot points. |
 | `train.compile_model` | `torch.compile` the model: about 1.7x faster at level 0, not bit-identical. Checkpoints are unchanged. |
 | `train.live_chains` (+ `chain_steps`, `chain_on_sheet`, `chain_min_valid`, `chain_max_age`) | Live chains (`train/live.py`): a training front is not restarted from GT after its rollout, but continues in a later iteration from exactly where the model left it, on the next window of its patch. Needs `memory_rows <= data.steps`, and cannot be combined with `train.history_rows`. Use with `train.free_fraction=1`. |
 | `train.history_rows` | Before each training rollout, trace 0..N GT rows up to the seed without loss (the front is put back on GT after each step), so the grid memory starts out filled. |

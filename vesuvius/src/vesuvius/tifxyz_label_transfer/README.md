@@ -40,16 +40,11 @@ extras. The label-transfer extra does not install torch or napari:
 uv sync --extra label-transfer --extra tests
 ```
 
-Optionally build the dependency-free C++17 rasterizer once per machine; it
-accelerates the per-pixel stage roughly 8× and is verified against the
-NumPy reference by differential tests:
-
-```bash
-uv run --no-sync python -m vesuvius.tifxyz_label_transfer.build_native
-```
-
-NumPy remains the default when this library is absent. Nothing compiles during
-package installation or import. For the optional interactive viewer, install
+Surface sampling and the per-pixel rasterizer are provided by `vc_reader`.
+`--rasterizer auto` and `native` select its prepared kernel; `python` selects
+application-level orchestration of the same shared sampling primitives.
+Target geometry and rendering use bicubic positions and tangent normals.
+For the optional interactive viewer, install
 napari separately (and the Qt backend appropriate for your platform):
 
 ```bash
@@ -138,7 +133,7 @@ All are documented in [docs/reference.md](docs/reference.md).
 | `core.py` | production geometry: surfaces, nearest-triangle mapping, per-pixel 3D verification |
 | `io.py` | TIFXYZ, TIFF/PNG, and label-Zarr reading/writing |
 | `planar.py` | optional global planar approximation (weaker guarantees, kept separate) |
-| `native.py`, `native_rasterizer.cpp`, `build_native.py` | optional compiled rasterizer, differentially tested against NumPy |
+| `native.py` | application reporting over the vc_reader surface-transfer kernel |
 | `transfer.py` | `single` / `pipeline` CLI |
 | `make_label_zarrs.py` | convert transferred TIFFs to koine-style OME-Zarr labels |
 | `prepare_canvas_offset_evidence.py` | fetch offset evidence |

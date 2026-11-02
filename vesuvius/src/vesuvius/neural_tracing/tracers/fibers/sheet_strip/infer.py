@@ -302,13 +302,12 @@ def stitch(heights, frames, positions, arcs, f, v, blend, weights=None):
 
 
 def render_strip(ct, spec, rows, keep, row_step, column_step):
-    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bilinearly refined to one voxel; NaN off it."""
-    from scipy.ndimage import map_coordinates
-    r = np.arange(0, len(rows)-1+1e-9, 1./row_step)
-    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step)
-    grid = np.meshgrid(r, c, indexing='ij')
-    points = np.stack([map_coordinates(rows[..., i], grid, order=1) for i in range(3)], -1)
-    inside = map_coordinates(keep.astype(np.float32), grid, order=1) > .999
+    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bicubically refined to one voxel; NaN off it."""
+    from vc_reader import tifxyz
+    r = np.arange(0, len(rows)-1+1e-9, 1./row_step, dtype=np.float32)
+    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step, dtype=np.float32)
+    rr, cc = np.meshgrid(r, c, indexing='ij')
+    points, inside = tifxyz.Surface(np.asarray(rows, np.float32), mask=keep).points_at(rr, cc)
     image = np.full(points.shape[:2], np.nan, np.float32)
     zyx = points[inside][:, ::-1]*(spec.ct_grid_scale/spec.grid_scale)*spec.input_scale  # -> trace -> CT
     image[inside] = ct.sample(zyx, order=0)

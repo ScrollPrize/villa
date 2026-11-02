@@ -14,7 +14,6 @@ from vesuvius.ink_detection.data.augmentations import (
 )
 from vesuvius.ink_detection.config import InkDataConfig, NormalizationConfig
 from vesuvius.ink_detection.data.geometry import (
-    _draw_line,
     compute_native_crop_bbox,
     project_binary_mask_along_normals,
     project_flat_patch,
@@ -180,25 +179,14 @@ def test_surface_distance_matches_full_distance_transform(max_distance, points):
     assert actual.tobytes() == expected.tobytes()
 
 
-def test_line_projection_preserves_reciprocal_multiply_rounding():
-    """The unmarked voxel at index 5 is a parity contract, not a target.
-
-    _draw_line divides by a reciprocal multiply whose rounding skips one
-    lattice voxel on this span. The native full-3D reference pipeline
-    rasterized training labels with exactly this kernel, so parity with
-    checkpoints trained on those labels requires keeping the behavior.
-    """
-    output = np.zeros((1, 1, 8), dtype=np.uint8)
-    _draw_line(
-        output,
-        np.array([0, 0, 0], dtype=np.float32),
-        np.array([0, 0, 7], dtype=np.float32),
-        0,
-        0,
-        0,
+def test_normal_band_connects_long_edges():
+    output = project_binary_mask_along_normals(
+        np.ones((1, 2), bool),
+        np.array([[[0, 0, 0], [0, 0, 7]]], np.float32),
+        np.array([[[1, 0, 0], [1, 0, 0]]], np.float32),
+        np.ones((1, 2), bool), (0, 0, 0, 1, 1, 8), half_thickness_voxels=0.1,
     )
-    assert output[0, 0].tolist() == [1, 1, 1, 1, 1, 0, 1, 1]
-    assert output[0, 0, 5] == 0
+    assert output.all()
 
 
 def _marked_voxels(output):

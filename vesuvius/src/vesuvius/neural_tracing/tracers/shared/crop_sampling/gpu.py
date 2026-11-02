@@ -3,14 +3,14 @@ positions come from the model inside a training step (the sheet tracer's rollout
 vc_reader (crops.py).
 
 Same crop definition (``CropSpec``) and frame convention (columns ``u, v, f``) as the CPU sampler; crops are laid out
-``(D, H, W)`` = forward (f), v, u, trilinear with zeros outside the block (``grid_sample``, ``align_corners``). A block
+``(D, H, W)`` = forward (f), v, u, trilinear with zeros outside the block through vc_reader. A block
 is a ``(B, 1, D, H, W)`` tensor of one pyramid level with its level-voxel ``z, y, x`` origin; level voxel ``i`` is
 centred on level-0 coordinate ``(i + 0.5) * 2**level - 0.5`` (mean-pooled pyramid).
 """
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
+from vc_reader.torch import sample_array
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import zscore_crops
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
@@ -24,36 +24,16 @@ def crop_offsets(crop: CropSpec, device) -> torch.Tensor:
     return torch.stack([u, v, f], -1)
 
 
-def to_block_grid(points: torch.Tensor, origin: torch.Tensor, level: int, size) -> torch.Tensor:
-    """Level-0 ``xyz`` points (B, ..., 3) -> grid_sample coordinates of a block with ``zyx`` origin (B, 3)."""
-    scale = float(1 << level)
-    idx = (points+.5)/scale-.5-origin.flip(-1).to(points.dtype).view(origin.shape[0], *([1]*(points.ndim-2)), 3)
-    return 2*idx/(_extent(tuple(int(v) for v in size), points.device, points.dtype)-1)-1
-
-
-_EXTENTS: dict = {}
-
-
-def _extent(size, device, dtype) -> torch.Tensor:
-    """Block extent as a cached device tensor: creating it per call is a host-to-device copy that stalls the GPU
-    queue, and dividing by Python scalars instead would round differently (CUDA multiplies by the reciprocal)."""
-    key = (size, device, dtype)
-    if key not in _EXTENTS:
-        if len(_EXTENTS) > 4096:  # blocks of their own sizes bring new sizes every batch
-            _EXTENTS.clear()
-        _EXTENTS[key] = torch.tensor([size[2], size[1], size[0]], device=device, dtype=dtype)
-    return _EXTENTS[key]
-
-
 def sample_block(volume, origin: torch.Tensor, level: int, points: torch.Tensor) -> torch.Tensor:
     """Trilinear samples (B, C, d1, d2, d3) at level-0 points (B, d1, d2, d3, 3) of a batch of blocks: one
     (B, C, D, H, W) tensor, or a list of B (C, D, H, W) blocks of their own sizes, each sampled through its own extent
     (same values; padding to a common size can cost far more memory than the blocks)."""
+    def indices(p, o):
+        scale = float(1 << level)
+        return (p.flip(-1) + .5) / scale - .5 - o.to(p.dtype).view(o.shape[0], *([1]*(p.ndim-2)), 3)
     if isinstance(volume, torch.Tensor):
-        grid = to_block_grid(points, origin, level, volume.shape[2:])
-        return F.grid_sample(volume, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-    return torch.cat([F.grid_sample(v[None], to_block_grid(points[i:i+1], origin[i:i+1], level, v.shape[1:]),
-                                    mode='bilinear', padding_mode='zeros', align_corners=True)
+        return sample_array(volume, indices(points, origin))
+    return torch.cat([sample_array(v[None], indices(points[i:i+1], origin[i:i+1]))
                       for i, v in enumerate(volume)])
 
 
@@ -77,5 +57,4 @@ def sample_plane(block: torch.Tensor, origin: torch.Tensor, level: int, center: 
     ii = (torch.arange(h, device=block.device)-(h-1)/2)*spacing
     jj = (torch.arange(w, device=block.device)-(w-1)/2)*spacing
     pts = center+ii[:, None, None]*axes[0]+jj[None, :, None]*axes[1]
-    grid = to_block_grid(pts[None, None], origin[None], level, block.shape[1:])
-    return F.grid_sample(block[None], grid, mode='bilinear', padding_mode='zeros', align_corners=True)[0, 0, 0]
+    return sample_block(block[None], origin[None], level, pts[None, None])[0, 0, 0]

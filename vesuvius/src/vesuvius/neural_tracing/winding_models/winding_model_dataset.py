@@ -169,17 +169,14 @@ def _segment_block_bounds(
     )
 
 
-def _bilinear(
-    v00: np.ndarray, v10: np.ndarray, v01: np.ndarray, v11: np.ndarray,
-    u: np.ndarray, v: np.ndarray,
-) -> np.ndarray:
-    """Bilinear patch samples; u follows the row axis, v the column axis."""
-    return (
-        v00[:, None] * ((1.0 - u) * (1.0 - v))[None, :, None]
-        + v10[:, None] * (u * (1.0 - v))[None, :, None]
-        + v01[:, None] * ((1.0 - u) * v)[None, :, None]
-        + v11[:, None] * (u * v)[None, :, None]
-    )
+def _sample_quad_fields(v00, v10, v01, v11, u, v):
+    # These conservative raster cells use corner bounds for culling and carry
+    # winding phase values. Linear interpolation must stay inside those bounds.
+    from vc_reader.torch import sample_array
+    values = np.stack((v00, v01, v10, v11), axis=-1).reshape(len(v00), -1, 2, 2)
+    points = np.broadcast_to(np.stack((u, v), -1), (len(v00), len(u), 2)).copy()
+    result = sample_array(torch.from_numpy(values), torch.from_numpy(points), boundary="border")
+    return result.transpose(1, 2).numpy()
 
 
 class WindingModelDataset(torch.utils.data.Dataset):
@@ -1140,7 +1137,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
             u_grid, v_grid = (
                 grid.reshape(-1) for grid in np.meshgrid(steps, steps, indexing="ij")
             )
-            samples = _bilinear(
+            samples = _sample_quad_fields(
                 corners[0][select],
                 corners[1][select],
                 corners[2][select],
@@ -1148,7 +1145,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 u_grid,
                 v_grid,
             )
-            sample_winds = _bilinear(
+            sample_winds = _sample_quad_fields(
                 winds[0][select, None],
                 winds[1][select, None],
                 winds[2][select, None],

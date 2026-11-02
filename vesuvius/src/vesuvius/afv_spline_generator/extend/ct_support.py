@@ -8,7 +8,7 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
-from scipy.ndimage import map_coordinates
+from vc_reader.resident import sample_array
 
 CT_FEATURE_DIM = 32
 MAX_ROI = 128
@@ -80,10 +80,10 @@ class CTSupport:
                 metadata["status"] = "no_ct_support"
                 return metadata
             coarse = _coarsen(volume)
+            volume = volume.astype(np.float32, copy=False)
 
             def sample(points):
-                return map_coordinates(volume.astype(np.float32), (np.asarray(points)-low)[:, ::-1].T,
-                                       order=1, mode="nearest", prefilter=False)/255.
+                return sample_array(volume, (np.asarray(points)-low)[:, ::-1], boundary="border")/255.
 
             bridge_points = a[0] + np.linspace(0, 1, 33)[:, None]*(b[0]-a[0])
             bridge = sample(bridge_points)
@@ -100,7 +100,7 @@ class CTSupport:
             contrast = center-flanks.mean(axis=0)
             # The coarse field is box-averaged; coordinates identify cell centres.
             coarse_points = ((bridge_points-low+.5)/(high-low)*16-.5)[:, ::-1].T
-            coarse_bridge = map_coordinates(coarse, coarse_points, order=1, mode="nearest", prefilter=False)
+            coarse_bridge = sample_array(coarse, coarse_points.T, boundary="border")
             tip_a, tip_b = float(continuation_a[:3].mean()), float(continuation_b[:3].mean())
             tips = (tip_a+tip_b)/2
             q = lambda p, f: float(np.quantile(p, f))
