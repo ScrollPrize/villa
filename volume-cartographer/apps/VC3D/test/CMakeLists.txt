@@ -13,7 +13,7 @@ vc_register_ctest(volume_path_labels test_volume_path_labels)
 add_executable(test_catalog_project_dialog
     test_catalog_project_dialog.cpp
     ../OpenDataCatalogWindow.cpp
-    ../OpenDataManifest.cpp
+    ../OpenDataResourceSelection.cpp
     ../OpenDataSampleProject.cpp
     ../OpenDataLasagna.cpp
     ../OpenDataNormalGrids.cpp)
@@ -328,8 +328,8 @@ add_executable(test_open_data_volume_orientation
     test_open_data_volume_orientation.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.hpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.hpp)
 
 set_target_properties(test_open_data_volume_orientation PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -618,7 +618,7 @@ endif()
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
     ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
-    ../OpenDataManifest.cpp ../VolumeRegistrations.cpp)
+    ../OpenDataResourceSelection.cpp ../VolumeRegistrations.cpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)

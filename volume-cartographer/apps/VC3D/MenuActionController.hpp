@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "OpenDataVolumePrefill.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
 
 #include <functional>

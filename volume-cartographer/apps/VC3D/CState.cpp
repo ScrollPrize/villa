@@ -2,7 +2,7 @@
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
 #include "OpenedVolumes.hpp"
 

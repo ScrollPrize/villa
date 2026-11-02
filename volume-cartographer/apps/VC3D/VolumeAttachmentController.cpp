@@ -1,6 +1,6 @@
 #include "VolumeAttachmentController.hpp"
 #include <vc_reader/zarr.hpp>
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 
 #include <QFutureWatcher>
 #include <QtConcurrent>

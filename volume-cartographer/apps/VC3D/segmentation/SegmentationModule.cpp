@@ -1,7 +1,7 @@
 #include "SegmentationModule.hpp"
 #include "SurfaceStoreEdit.hpp"
 
-#include "../OpenDataManifest.hpp"
+#include "../OpenDataResourceSelection.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"

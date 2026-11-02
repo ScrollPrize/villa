@@ -1,3 +1,4 @@
+#include "vc/lasagna/Catalog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 
 #include "OpenDataLasagna.hpp"
@@ -244,7 +245,7 @@ bool canAttachRepresentation(const vcr::catalog::OpenDataSample& sample,
                            [&](const auto& info) { return info.artifactIndex == ref.artifactIndex; });
     }
     case vcr::catalog::OpenDataRepresentationKind::Lasagna: {
-        const auto lasagna = lasagnaArtifacts(volume);
+        const auto lasagna = vc::lasagna::catalogArtifacts(volume);
         return std::find(lasagna.begin(), lasagna.end(), ref.artifactIndex) != lasagna.end();
     }
     case vcr::catalog::OpenDataRepresentationKind::Prediction:

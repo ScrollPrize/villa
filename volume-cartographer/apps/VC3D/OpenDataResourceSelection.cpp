@@ -1,4 +1,6 @@
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
+
+#include <algorithm>
 
 namespace vc3d::opendata {
 bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const

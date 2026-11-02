@@ -95,7 +95,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
@@ -443,10 +443,10 @@ vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataResourceSelection.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.cpp

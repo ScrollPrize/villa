@@ -1,7 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 

@@ -1,6 +1,6 @@
 #include "OpenDataNormalGrids.hpp"
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"

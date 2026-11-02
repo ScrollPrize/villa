@@ -1,7 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <filesystem>
@@ -12,23 +12,6 @@
 namespace vc::lasagna { struct LasagnaDatasetManifest; }
 
 namespace vc3d::opendata {
-
-enum class OpenDataLasagnaDatasetKind {
-    Normal,
-    FiberInference,
-};
-
-// The volume's attachable Lasagna artifacts, by index: classified as Lasagna,
-// with a URL and parameters.level; one per published dataset.
-[[nodiscard]] std::vector<std::size_t> lasagnaArtifacts(const vcr::catalog::OpenDataVolume& volume);
-
-// Validates the catalog metadata against the authoritative inner manifest and
-// classifies the dataset by its channel schema. Catalog creation_info is
-// optional; when present, its values must agree with the inner manifest.
-[[nodiscard]] OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
-    const vcr::catalog::OpenDataVolume& volume,
-    const vcr::catalog::OpenDataArtifact& artifact,
-    const vc::lasagna::LasagnaDatasetManifest& manifest);
 
 // Returns the public manifest URL for a catalogue-backed entry and the stored
 // project location for an ordinary entry.

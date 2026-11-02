@@ -5,7 +5,7 @@
 #include "SurfaceCatalog.hpp"
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <functional>

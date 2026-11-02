@@ -12,7 +12,7 @@
 
 #include "CWindow.hpp"
 #include "MenuActionController.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 
 namespace {
 

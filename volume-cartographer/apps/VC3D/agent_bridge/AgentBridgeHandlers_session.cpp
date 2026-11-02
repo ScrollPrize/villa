@@ -29,7 +29,7 @@
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
-#include "OpenDataManifest.hpp"
+#include "OpenDataResourceSelection.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"

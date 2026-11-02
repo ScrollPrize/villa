@@ -99,10 +99,10 @@ set(srcs
     LineAnnotationGeneratedViews.hpp
     OpenDataCatalogWindow.cpp
     OpenDataCatalogWindow.hpp
-    OpenDataManifest.cpp
+    OpenDataResourceSelection.cpp
     OpenDataLasagna.cpp
     OpenDataLasagna.hpp
-    OpenDataManifest.hpp
+    OpenDataResourceSelection.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
     OpenDataVolumePrefill.cpp
