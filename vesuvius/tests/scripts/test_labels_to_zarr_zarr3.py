@@ -10,8 +10,11 @@ import sys
 
 import cv2
 import numpy as np
+import pytest
 import zarr
 from scipy.ndimage import distance_transform_edt
+
+pytest.importorskip("fastremap")
 
 from vesuvius.scripts import labels_to_zarr as l2z
 from vesuvius.tifxyz import Tifxyz, write_tifxyz
