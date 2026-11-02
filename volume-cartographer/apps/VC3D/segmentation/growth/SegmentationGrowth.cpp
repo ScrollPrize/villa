@@ -300,7 +300,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         auto options = context.volume->sourceOpenOptions();
         options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
         auto level = vcr::zarr::openPyramidLevel(
-            context.volume->sourceLocation(), context.level + context.volume->baseScaleLevel(), options);
+            context.volume->sourceLocation(), context.volume->baseScaleLevel(), options);
         QuadSurface* surface = tracer(*level.array,
                                       1.0f,
                                       origin,
