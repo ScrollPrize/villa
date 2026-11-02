@@ -57,10 +57,10 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     import pytest
     # Incompatible historical pages must never be treated as completed work.
     import msgpack
-    from numcodecs import Zstd
+    from vc_reader.reader import compress_bytes
     original=pages[0].read_bytes()
     old=read_page(pages[0]);old['version']=1
-    pages[0].write_bytes(Zstd().encode(msgpack.packb(old,use_bin_type=True)))
+    pages[0].write_bytes(compress_bytes(msgpack.packb(old,use_bin_type=True),dict(id='zstd',level=1)))
     with pytest.raises(ValueError,match='old outputs cannot be reused'):
         ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output))
     pages[0].write_bytes(original)

@@ -49,6 +49,16 @@ def vc3d_cache_root() -> Path | None:
     return Path(root) if root is not None else None
 
 
+def selected_vc3d_cache_root() -> Path:
+    """Where a writer puts VC3D's cache: the first of the order :func:`vc3d_cache_root` searches, existing or not."""
+    return Path(_reader.selected_vc3d_cache_root())
+
+
+def vc3d_config_directory() -> Path:
+    """``$VC3D_CONFIG_DIR``, else ``.VC3D`` in the home directory. Nothing is created."""
+    return Path(_reader.vc3d_config_directory())
+
+
 def decoded_cache_path(cache_dir: str | os.PathLike[str], url: str) -> str:
     """``cache_dir/<scheme>/<host or bucket>/<path>``; known public buckets are keyed by their s3:// form.
 
@@ -58,4 +68,4 @@ def decoded_cache_path(cache_dir: str | os.PathLike[str], url: str) -> str:
     return _reader.decoded_cache_path(os.fspath(cache_dir), url)
 
 
-__all__ = ["CacheLayer", "decoded_cache_path", "disk_budget", "vc3d_cache_root", "vc3d_volume_id"]
+__all__ = ["CacheLayer", "decoded_cache_path", "disk_budget", "selected_vc3d_cache_root", "vc3d_cache_root", "vc3d_config_directory", "vc3d_volume_id"]

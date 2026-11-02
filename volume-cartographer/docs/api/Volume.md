@@ -1,8 +1,8 @@
 # Volume Class API
 
-The `Volume` class is the main API for opening and reading 3D zarr volumes. It
-supports local OME-Zarr-like pyramids, remote HTTP/S3-backed zarr stores,
-cached sampling, typed region reads and raw chunk reads. Volumes are read-only.
+The `Volume` class holds a 3D zarr volume's identity, metadata and dimensions, and says
+where to open its source. It covers local OME-Zarr-like pyramids and remote HTTP/S3-backed
+stores. Reading and sampling are vc_reader's; see [Opening the Source](#opening-the-source).
 
 **Header:** `core/include/vc/core/types/Volume.hpp`
 **Implementation:** `core/src/Volume.cpp`
@@ -33,7 +33,7 @@ The `meta.json` dimension fields are:
 - `height` = Y
 - `width` = X
 
-Use `shape()` and `shape(level)` for storage order `{z, y, x}`. Use
+Use `shape()` for storage order `{z, y, x}`. Use
 `shapeXyz()` when UI or coordinate-order code needs `{x, y, z}`.
 
 ## Factory Methods
@@ -104,7 +104,7 @@ VC3D tools and viewers share opened levels and one memory cache through
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `skipShapeCheck` | `thread_local bool` | Debug/import escape hatch to skip zarr shape validation |
+| `skipShapeCheck` | `static std::atomic<bool>` | Debug/import escape hatch to skip zarr shape validation |
 
 ## Metadata Files
 

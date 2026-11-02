@@ -78,6 +78,9 @@ std::vector<std::uint8_t> compressBytes(const Json& compressor, std::span<const 
                                         const Index& shape = {});
 // The reverse, into exactly `out.size()` bytes; throws on any other decoded size.
 void decompressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::span<std::uint8_t> out);
+// One whole zstd frame that states its decoded size. Throws, allocating nothing, for a frame
+// without one, one decoding to more than `maxBytes`, or bytes beyond the frame.
+std::vector<std::uint8_t> decompressZstdFrame(std::span<const std::uint8_t> data, std::size_t maxBytes);
 
 // ---- writing --------------------------------------------------------------------------
 

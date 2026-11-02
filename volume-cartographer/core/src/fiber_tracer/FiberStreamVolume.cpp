@@ -5,7 +5,7 @@
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include "vc/core/types/Volume.hpp"
 #include <vc_reader/array.hpp>
-#include <vc_reader/native/memory_cache.hpp>
+#include <vc_reader/array.hpp>
 #include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
@@ -429,8 +429,7 @@ public:
         {std::lock_guard lock(admission);r["active_fibers"]=active.size();r["open_tiles"]=open.size();}
         {std::lock_guard lock(reasonMutex);for(const auto&[reason,count]:reasons)r["stop_"+reason]=count;}
         for(size_t i=0;i<4;++i){r["worker_tier_seconds"].push_back(pool.workSeconds[i].load());r["worker_tier_jobs"].push_back(pool.jobs[i].load());}
-        auto path=output/(complete?"summary.json":"progress.json"),tmp=path;tmp+=".partial";
-        {std::ofstream f(tmp);f<<r.dump(2)<<'\n';}std::filesystem::rename(tmp,path);std::cout<<r.dump()<<std::endl;return r;
+        vcr::zarr::atomicWrite(output/(complete?"summary.json":"progress.json"),r.dump(2)+'\n');std::cout<<r.dump()<<std::endl;return r;
     }
     Json run() {
         {std::lock_guard lock(admission);loadMore();}

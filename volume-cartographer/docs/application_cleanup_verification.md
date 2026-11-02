@@ -17,7 +17,7 @@ to explicit open workflows rather than directory watching.
 | ArcHermite | Retained unchanged: `LineOptimizer` uses `sampleLine` and `sampleField`; `hermite` and `arcDerivative` support those operations. Chord-arclength interpolation is distinct from the reader's surface patches. Analytic line/field tests pass. |
 | AtomicFile | Publication, recovery and snapshot mechanics moved to reader `publication.hpp`; `OutputDirectory` retains application locks and abandoned-temporary cleanup. Snapshot count/throttle remain application policy. |
 | Compositing | Reader `slab.hpp` implements opacity, masked bilinear sampling, lighting and front-to-back compositing on CPU/CUDA. VC3D retains camera projection, margins, settings and OpenCV output ownership. Python binds the native kernels. |
-| GlobalCacheRoot | Retained config/environment/mount selection in `core/include/vc/core/util/GlobalCacheRoot.hpp`; native open options receive the selected root. Cache-policy tests pass. |
+| GlobalCacheRoot | Deleted from VC. `vcr::zarr::selectedVc3dCacheRoot` is the one resolver, and `vc3dCacheRoot` searches the same order; VC keeps only directory creation and the write probe. |
 | InpaintSurface | Retained Ceres geometry optimization used by tifxyz2obj; it is not an image interpolation replacement. |
 | MemMap | Renamed to `AnonymousPages`, with lazy allocation and platform branches preserved. |
 | PlaneSurface | Retained editable orientation/frame and pointer coordinates. Viewer consumers construct native `grid::Plane`. |

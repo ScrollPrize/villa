@@ -619,6 +619,30 @@ LevelPlacement levelPlacement(const Json& attributes, const std::string& path)
     return p;
 }
 
+LevelPlacement declaredPlacement(const Json& attributes, const std::string& path)
+{
+    const auto ms = multiscalesOf(attributes);
+    if (ms.empty())
+        return {};
+    const auto datasets = ms.at(0).value("datasets", Json::array());
+    for (const auto& dataset : datasets) {
+        if (datasetPath(dataset) != path)
+            continue;
+        std::size_t rank = 3;
+        for (const auto& t : dataset.value("coordinateTransformations", Json::array()))
+            if (const auto type = t.value("type", std::string()); t.contains(type) && t.at(type).is_array())
+                rank = t.at(type).size();
+        const auto map = datasetMap(dataset, spatialAxes(ms.at(0), rank));
+        LevelPlacement placement;
+        for (int k = 0; k < 3; ++k) {
+            placement.scale[k] = map.axes[k].scale;
+            placement.offset[k] = map.axes[k].offset;
+        }
+        return placement;
+    }
+    return {};
+}
+
 namespace {
 
 // (level number, path) of a group's levels, in the group's order.

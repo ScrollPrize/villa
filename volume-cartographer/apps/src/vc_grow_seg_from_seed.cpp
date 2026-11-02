@@ -432,32 +432,29 @@ static int run_main(int argc, char *argv[])
             //after growing, check locations on the new seg agains all existing segs
 
         if (!store)
-        for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry)) {
-                std::string name = entry.path().filename().string();
-                if (name.compare(0, name_prefix.size(), name_prefix))
-                    continue;
-
-                std::cout << entry.path() << entry.path().filename() << std::endl;
-
-                std::filesystem::path meta_fn = entry.path() / "meta.json";
-                if (!std::filesystem::exists(meta_fn))
-                    continue;
-
-                auto meta = nlohmann::json::parse(std::ifstream(meta_fn));
-
-                if (!meta.count("bbox"))
-                    continue;
-
-                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
-                    continue;
-
-                QuadSurface *sm = new QuadSurface(entry.path(), meta);
-
-                surfs[name] = sm;
-                surfs_v.push_back(sm);
+        for (const auto& entry : vcr::tifxyz::list(tgt_dir.string(), false)) {
+            const std::filesystem::path location(entry.location);
+            std::string name = location.filename().string();
+            if (name.compare(0, name_prefix.size(), name_prefix))
+                continue;
+            if (!entry.error.empty()) {
+                std::cerr << "Skipping " << entry.location << ": " << entry.error << std::endl;
+                continue;
             }
-            
+
+            std::cout << location << location.filename() << std::endl;
+
+            if (!entry.metadata.bbox)
+                continue;
+            if (entry.metadata.extra.value("format", std::string{"NONE"}) != "tifxyz")
+                continue;
+
+            QuadSurface *sm = new QuadSurface(location, entry.metadata.document());
+
+            surfs[name] = sm;
+            surfs_v.push_back(sm);
+        }
+
         if (!store && !surfs.size()) {
             std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl; 
             return EXIT_FAILURE;

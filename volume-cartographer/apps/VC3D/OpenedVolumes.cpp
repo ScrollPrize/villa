@@ -2,10 +2,10 @@
 
 #include "vc/core/types/Volume.hpp"
 
-#include <vc_reader/native/cuda_available.hpp>
+#include <vc_reader/cuda_available.hpp>
 #include <vc_reader/array.hpp>
 #ifdef VC_READER_CUDA
-#include <vc_reader/native/reader_cuda/reader.hpp>
+#include <vc_reader/cuda_reader.hpp>
 #endif
 
 OpenedVolumes::OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes)

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberletStorage.hpp"
-#include "vc_reader/native/memory_cache.hpp"
+#include "vc_reader/array.hpp"
 
 #include <array>
 #include <atomic>

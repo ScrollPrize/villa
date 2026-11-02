@@ -46,7 +46,6 @@ target_link_libraries(vc_core
         PUBLIC
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
         ${VC_OPENCV_CALIB_TARGETS}
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
@@ -101,7 +100,6 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<string_view>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/core.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgproc.hpp>>"
-        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgcodecs.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<nlohmann/json.hpp>>"
         CACHE INTERNAL "PCH header list shared by vc_* and downstream targets")
 
@@ -114,7 +112,6 @@ if(VC_USE_PCH)
     target_link_libraries(vc_common_pch PRIVATE
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX)
     target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
@@ -193,7 +190,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
-target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)

@@ -544,7 +544,42 @@ void vc3dRoot(const fs::path& root)
     write_text(config / "cache.json", "{\"version\":1,\"root\":\"relative\"}");
     must_fail([] { vcr::zarr::vc3dCacheRoot(); }, "a relative cache.json root");
     fs::remove(config / "cache.json");
+    write_text(config / "cache.json", "{\"version\":1}");
+    must_fail([] { vcr::zarr::vc3dCacheRoot(); }, "a cache.json without a root");
+    must_fail([] { vcr::zarr::selectedVc3dCacheRoot(); }, "a writer sees a malformed cache.json too");
+    fs::remove(config / "cache.json");
     require(vcr::zarr::vc3dCacheRoot() == iniRoot, "without cache.json the INI again");
+    require(vcr::zarr::vc3dConfigDirectory() == config, "VC3D_CONFIG_DIR names the configuration directory");
+
+    // A writer gets the first choice even before it exists; nothing is created.
+    write_text(config / "cache.json", "{\"version\":1,\"root\":\"" + configured.string() + "\"}");
+    require(vcr::zarr::selectedVc3dCacheRoot() == configured.lexically_normal(), "a writer takes cache.json's root");
+    require(!fs::exists(configured), "selecting creates nothing");
+    fs::remove(config / "cache.json");
+    const auto uncreated = root / "ini cache \"quoted\"";
+    write_text(config / "VC3D.ini", "; settings\n[other]\nremote_cache_dir=/wrong\n[viewer]\nremote_cache_dir=\"" +
+                                        root.string() + "/ini cache \\\"quoted\\\"\"\n");
+    require(vcr::zarr::selectedVc3dCacheRoot() == uncreated, "a writer takes the INI's quoted, escaped directory");
+    require(!fs::exists(uncreated), "selecting creates nothing");
+    require(vcr::zarr::vc3dCacheRoot() != uncreated, "finding a cache skips what does not exist");
+}
+
+// declaredPlacement reports a level's own OME transform, which levelPlacement makes relative.
+void declaredOmePlacement()
+{
+    const auto attributes = vcr::zarr::Json::parse(R"({"multiscales":[{"axes":["z","y","x"],"datasets":[
+        {"path":"0","coordinateTransformations":[{"type":"scale","scale":[2,3,4]},{"type":"translation","translation":[5,6,7]}]},
+        {"path":"1","coordinateTransformations":[{"type":"scale","scale":[4,6,8]}]},
+        {"path":"2"}]}]})");
+    const auto level0 = vcr::zarr::declaredPlacement(attributes, "0");
+    require(level0.scale == std::array<double, 3>{2, 3, 4}, "level 0's declared scale");
+    require(level0.offset == std::array<double, 3>{5, 6, 7}, "level 0's declared translation");
+    require(vcr::zarr::declaredPlacement(attributes, "1").scale == std::array<double, 3>{4, 6, 8}, "a level's declared scale, not relative");
+    const vcr::zarr::LevelPlacement identity;
+    for (const auto& [document, path] : {std::pair(attributes, "2"), std::pair(attributes, "9"), std::pair(vcr::zarr::Json::object(), "0")}) {
+        const auto placement = vcr::zarr::declaredPlacement(document, path);
+        require(placement.scale == identity.scale && placement.offset == identity.offset, "the identity when nothing is declared");
+    }
 }
 
 int main(int argc, char** argv)
@@ -568,6 +603,7 @@ int main(int argc, char** argv)
         localShards(root);
         local(root, v);
         vc3dRoot(root);
+        declaredOmePlacement();
         sparseLevels(root);
         levelPlacement(root);
         if (!sftp_fixture::install(root)) {

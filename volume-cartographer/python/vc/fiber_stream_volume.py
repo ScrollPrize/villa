@@ -21,7 +21,7 @@ import time
 
 import msgpack
 import numpy as np
-from numcodecs import Zstd
+from vc_reader.reader import atomic_write, compress_bytes, decompress_zstd_frame
 
 from vc import fiber_trace as ft
 from vc.fiber_chunk_volume import open_inputs, job_keys, output_lock
@@ -29,21 +29,21 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.volume_policy import (
     Owned, LivePaths, deferred_owner, novel_parts, tangents, runs, outside_ct_cut)
 
 
+# Refuses a damaged frame that claims an absurd size; far above any real tile.
+MAX_PAGE_BYTES=1<<36
+
+
 def atomic_json(path, value):
-    tmp=path.with_suffix('.partial.json')
-    tmp.write_text(json.dumps(value,indent=2)+'\n')
-    tmp.replace(path)
+    atomic_write(path,(json.dumps(value,indent=2)+'\n').encode())
 
 
 def save_page(path, pieces):
     data=msgpack.packb(dict(version=1,coordinate_units='base_voxels',pieces=pieces),use_bin_type=True)
-    tmp=path.with_suffix('.partial')
-    tmp.write_bytes(Zstd(level=1).encode(data))
-    tmp.replace(path)
+    atomic_write(path,compress_bytes(data,dict(id='zstd',level=1)))
 
 
 def read_page(path):
-    return msgpack.unpackb(Zstd().decode(path.read_bytes()),raw=False)
+    return msgpack.unpackb(decompress_zstd_frame(path.read_bytes(),MAX_PAGE_BYTES),raw=False)
 
 
 def uniform_path(points, widths, losses, spacing=8.):

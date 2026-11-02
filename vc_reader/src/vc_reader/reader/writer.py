@@ -38,6 +38,16 @@ def decompress_bytes(data: Any, compressor: dict[str, Any] | None, size: int) ->
     return _reader.decompress_bytes(np.frombuffer(data, np.uint8), compressor, int(size))
 
 
+def decompress_zstd_frame(data: Any, max_bytes: int) -> bytes:
+    """One whole zstd frame that states its decoded size, of at most ``max_bytes``; anything else raises."""
+    return _reader.decompress_zstd_frame(np.frombuffer(data, np.uint8), int(max_bytes))
+
+
+def atomic_write(path: str | os.PathLike[str], data: Any, *, fsync: bool = False) -> None:
+    """Writes ``data``, any contiguous buffer, whole or not at all, creating parent directories."""
+    _reader.atomic_write(os.fspath(path), np.frombuffer(data, np.uint8), bool(fsync))
+
+
 class ObjectStore:
     """The objects below a local directory or an ``s3://`` prefix, by relative name.
 

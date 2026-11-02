@@ -5,8 +5,8 @@ This document covers file I/O utilities for image and volume data.
 ## Image files
 
 TIFF, PNG and JPEG are read and TIFF is written by vc_reader (`vc_reader/image_write.hpp`,
-`vcr::sources`). `vc/core/util/ImageMat.hpp` adapts them to `cv::Mat`: `readImageMat`,
-`writeTiffMat`.
+`vcr::sources`). `vc/core/util/ImageMat.hpp` converts buffers at that boundary: `imageMat` turns a read
+`vcr::sources::Block` into a `cv::Mat`, and `imageBuffer` turns a `cv::Mat` into what the writers take.
 
 ## Zarr volumes
 

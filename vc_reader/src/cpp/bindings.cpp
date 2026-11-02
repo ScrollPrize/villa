@@ -225,6 +225,12 @@ NB_MODULE(_reader, m)
         const auto root = vcr::zarr::vc3dCacheRoot();
         return root ? std::optional<std::string>(root->string()) : std::nullopt;
     });
+    m.def("declared_placement", [](const nb::object& attributes, const std::string& path) {
+        const auto placement = vcr::zarr::declaredPlacement(to_json(attributes), path);
+        return nb::make_tuple(placement.scale, placement.offset);
+    }, "attributes"_a, "path"_a);
+    m.def("selected_vc3d_cache_root", []() { return vcr::zarr::selectedVc3dCacheRoot().string(); });
+    m.def("vc3d_config_directory", []() { return vcr::zarr::vc3dConfigDirectory().string(); });
     m.def("disk_budget", &vcr::zarr::diskBudget, "root"_a, "max_bytes"_a.none(),
           nb::call_guard<nb::gil_scoped_release>());
 
@@ -637,6 +643,18 @@ NB_MODULE(_reader, m)
         }
         return decoded;
     }, "data"_a, "compressor"_a.none(), "size"_a);
+    m.def("decompress_zstd_frame", [](ConstBytes data, std::size_t maxBytes) {
+        std::vector<std::uint8_t> decoded;
+        {
+            nb::gil_scoped_release release;
+            decoded = vcr::zarr::decompressZstdFrame({static_cast<const std::uint8_t*>(data.data()), data.nbytes()}, maxBytes);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+    }, "data"_a, "max_bytes"_a);
+    m.def("atomic_write", [](const std::string& path, ConstBytes data, bool fsync) {
+        nb::gil_scoped_release release;
+        vcr::zarr::atomicWrite(path, data.data(), data.nbytes(), fsync ? vcr::zarr::Durability::Fsync : vcr::zarr::Durability::Fast);
+    }, "path"_a, "data"_a, "fsync"_a);
     nb::class_<Writer>(m, "Writer", "A Zarr array, local or on S3, opened for writing.")
         .def_static("create", [](const std::string& path, const vcr::Index& shape, const vcr::Index& chunks,
                                  const std::string& dtype, const std::string& compressor, int level, const std::string& cname,

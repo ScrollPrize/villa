@@ -17,7 +17,7 @@ dependencies = [
 license = { file = "LICENSE" }
 
 [dependency-groups]
-test = ["pytest", "vc-reader"]
+test = ["msgpack", "pytest", "vc-reader"]
 
 [tool.uv.sources]
 vc-reader = { path = "../vc_reader", editable = true }

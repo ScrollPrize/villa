@@ -177,6 +177,27 @@ def test_bytes_codecs_match_numcodecs():
         decompress_bytes(encoded, config, records.nbytes - 1)
 
 
+def test_zstd_frame_is_bounded_and_whole():
+    from vc_reader.reader import compress_bytes, decompress_zstd_frame
+
+    data = bytes(range(256)) * 16
+    frame = compress_bytes(data, {"id": "zstd", "level": 1})
+    assert decompress_zstd_frame(frame, len(data)) == data
+    for bad, limit in ((frame, len(data) - 1), (frame + b"x", len(data)), (b"not zstd at all", len(data))):
+        with pytest.raises(RuntimeError):
+            decompress_zstd_frame(bad, limit)
+
+
+def test_atomic_write_creates_parents_and_replaces(tmp_path):
+    from vc_reader.reader import atomic_write
+
+    path = tmp_path / "a" / "b" / "file.bin"
+    atomic_write(path, b"first")
+    atomic_write(path, b"second", fsync=True)
+    assert path.read_bytes() == b"second"
+    assert [p.name for p in path.parent.iterdir()] == ["file.bin"]
+
+
 def test_stored_chunks_list_the_store(tmp_path):
     w = ZarrWriter.create(tmp_path / "a.zarr", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1", compressor=None)
     assert w.stored_chunks() == []

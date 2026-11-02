@@ -1,13 +1,16 @@
-#include "vc/core/util/GlobalCacheRoot.hpp"
 #include <vc_reader/zarr.hpp>
+#include <nlohmann/json.hpp>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
+#include <stdexcept>
+#include <string_view>
 
 int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
-            std::cout << vc::core::util::globalCacheRoot().string() << '\n';
+            std::cout << vcr::zarr::selectedVc3dCacheRoot().string() << '\n';
             return 0;
         }
         if (argc != 3 || std::string_view(argv[1]) != "--set")
@@ -31,7 +34,7 @@ int main(int argc, char** argv)
             std::filesystem::remove(probe, ignored);
             throw;
         }
-        const auto directory = vc::core::util::vc3dConfigDirectory();
+        const auto directory = vcr::zarr::vc3dConfigDirectory();
         std::filesystem::create_directories(directory);
         const auto path = directory / "cache.json";
         if (std::filesystem::exists(path)) {
@@ -40,7 +43,7 @@ int main(int argc, char** argv)
         }
         vcr::zarr::atomicWrite(path, nlohmann::json{
             {"version", 1}, {"root", root.lexically_normal().string()}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
-        std::cout << vc::core::util::globalCacheRoot().string() << '\n';
+        std::cout << vcr::zarr::selectedVc3dCacheRoot().string() << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

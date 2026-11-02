@@ -11,7 +11,6 @@
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/OutputDirectory.hpp"
-#include "vc/core/util/GlobalCacheRoot.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include <vc_reader/grid.hpp>
 #include <vc_reader/display.hpp>
@@ -37,7 +36,6 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
-#include <opencv2/imgcodecs.hpp>
 
 namespace {
 
@@ -417,7 +415,7 @@ Json referencePlan(const Json& config, const std::filesystem::path& base)
         std::unique_ptr<vc::lasagna::LasagnaNormalSampler> proximityNormals;
         if(config.contains("self_proximity")) {
             vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot=vc::core::util::globalCacheRoot();
+            options.remoteCacheRoot=vcr::zarr::selectedVc3dCacheRoot();
             options.workingToBaseScale=1.0;
             proximityNormals=std::make_unique<vc::lasagna::LasagnaNormalSampler>(
                 vc::lasagna::LasagnaDataset::openLocation(sourceLocation(base,source.at("normal_manifest").get<std::string>()),options));
@@ -495,7 +493,7 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     normalOptions.workingToBaseScale = settings.at("normal_working_to_base").get<double>();
     normalOptions.remoteCacheRoot = settings.contains("remote_cache_dir")
         ? std::filesystem::path(settings.at("remote_cache_dir").get<std::string>())
-        : vc::core::util::globalCacheRoot();
+        : vcr::zarr::selectedVc3dCacheRoot();
     const auto normalLocation = sourceLocation(settingsPath.parent_path(), settings.at("normal_manifest").get<std::string>());
     if (normalLocation != document.at("provenance").at("normal_manifest").get<std::string>())
         throw std::invalid_argument("render normals differ from the evaluated source binding");
@@ -586,7 +584,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const auto output = localPath(configPath.parent_path(), config.at("output").get<std::string>());
     const auto cacheRoot = config.contains("remote_cache_dir")
         ? std::filesystem::path(config.at("remote_cache_dir").get<std::string>())
-        : vc::core::util::globalCacheRoot();
+        : vcr::zarr::selectedVc3dCacheRoot();
     std::vector<Source> sources;
     std::vector<Case> cases;
     std::set<std::string> ids;

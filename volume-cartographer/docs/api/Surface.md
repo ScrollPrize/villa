@@ -21,7 +21,6 @@ The Surface classes provide an abstraction for working with 2D surfaces embedded
 | `coord(ptr, offset)` | Returns the 3D world coordinate at the pointer location |
 | `normal(ptr, offset)` | Returns the surface normal at the pointer location |
 | `pointTo(ptr, coord, th, max_iters, ...)` | Finds the surface point closest to a target 3D coordinate |
-| `gen(coords, normals, size, ptr, scale, offset)` | Generates coordinate and normal maps for rendering |
 
 ### Members
 
@@ -66,14 +65,12 @@ QuadSurface(cv::Mat_<cv::Vec3f>* points, const cv::Vec2f& scale);
 | `coord(ptr, offset)` | Returns interpolated 3D world coordinate at the location |
 | `normal(ptr, offset)` | Computes surface normal via cross product of adjacent grid points |
 | `pointTo(ptr, tgt, th, ...)` | Searches for the closest surface point to target coordinate |
-| `gen(coords, normals, size, ptr, scale, offset)` | Generates coordinate/normal maps using affine warping |
 
 ### Additional Methods
 
 | Method | Description |
 |--------|-------------|
 | `loc_raw(ptr)` | Returns internal absolute coordinates (upper-left at 0,0) |
-| `gridNormal(row, col)` | Gets normal directly from grid indices (faster than `normal()`) |
 | `size()` | Returns the surface size in nominal coordinates |
 | `scale()` | Returns the scale factor `{x, y}` |
 | `center()` | Returns the center point in internal coordinates |
@@ -242,7 +239,6 @@ PlaneSurface(cv::Vec3f origin, cv::Vec3f normal);
 | `coord(ptr, offset)` | Generates the 3D coordinate on the plane |
 | `normal(ptr, offset)` | Returns the plane's normal vector |
 | `pointTo(...)` | Not implemented (calls `abort()`) |
-| `gen(coords, normals, size, ptr, scale, offset)` | Generates a grid of coordinates on the plane |
 
 ### Plane-Specific Methods
 

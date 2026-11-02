@@ -46,7 +46,8 @@ void preflightPredictionAndSource(const std::string& predictionUrl,
             throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + group.location());
         return *meta;
     };
-    const auto multiscales = predictionGroup.multiscales();
+    // Level 0's own OME transform: placements are only relative to it.
+    const auto declared = vcr::zarr::declaredPlacement(predictionGroup.attributes(), "0");
     const auto prediction = levelMeta(std::move(predictionGroup), 0);
     const auto source = levelMeta(vcr::zarr::Group::open(sourceUrl, options), sourceLevel);
     if (prediction.shape != source.shape)
@@ -54,16 +55,8 @@ void preflightPredictionAndSource(const std::string& predictionUrl,
                                  std::to_string(sourceLevel));
     if (prediction.dtype != source.dtype)
         throw std::runtime_error("prediction/source dtype mismatch");
-    // Level 0's own OME transform: placements are only relative to it.
-    if (!multiscales.empty()) {
-        for (const auto& transform : multiscales.at(0).at("datasets").at(0).value("coordinateTransformations", vcr::zarr::Json::array())) {
-            const bool identity = transform.value("type", "") == "scale"
-                ? std::all_of(transform.at("scale").begin(), transform.at("scale").end(), [](const auto& v) { return v.template get<double>() == 1.0; })
-                : std::all_of(transform.at("translation").begin(), transform.at("translation").end(), [](const auto& v) { return v.template get<double>() == 0.0; });
-            if (!identity)
-                throw std::runtime_error("prediction /0 coordinate scale must be identity");
-        }
-    }
+    if (declared.scale != vcr::zarr::LevelPlacement{}.scale || declared.offset != vcr::zarr::LevelPlacement{}.offset)
+        throw std::runtime_error("prediction /0 coordinate scale must be identity");
 }
 
 // An entry of the same Zarr, at any working level (#vc-base-scale).

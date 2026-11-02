@@ -3,7 +3,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
-#include <vc_reader/native/memory_cache.hpp>
+#include <vc_reader/array.hpp>
 #include <vc_reader/zarr_array_meta.hpp>
 
 #include <array>

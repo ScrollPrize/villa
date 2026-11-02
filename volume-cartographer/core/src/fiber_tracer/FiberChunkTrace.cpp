@@ -9,7 +9,6 @@
 #include <limits>
 #include <set>
 #include <opencv2/core.hpp>
-#include <zstd.h>
 
 namespace vc::fiber_tracer {
 std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig&,const FiberChunkWait&);

@@ -127,10 +127,17 @@ MetadataReader metadataReader(const Access& access, int connections = 4);
 
 // VC3D's cache directory name for a remote volume: <last path part>-<fnv1a64 hex>.
 std::string vc3dVolumeId(std::string url);
-// VC3D's remote cache root as VC3D resolves it: $VC3D_CONFIG_DIR/cache.json (default
-// ~/.VC3D/cache.json; throws when malformed), else VC3D.ini's remote_cache_dir, a
-// provisioned mount or ~/.VC3D/remote_cache where one exists; nullopt otherwise.
+// VC3D's configuration directory: $VC3D_CONFIG_DIR, else .VC3D in the home directory
+// (%USERPROFILE% first on Windows). Nothing is created; throws without a home directory.
+std::filesystem::path vc3dConfigDirectory();
+// VC3D's remote cache root, in order: cache.json in the configuration directory (throws when
+// malformed), VC3D.ini's [viewer] remote_cache_dir, the first of /volpkgs and /ephemeral that
+// is a directory (its remote_cache child), ~/.VC3D/remote_cache. Finding an existing cache:
+// cache.json's root, else the first of the others that exists; nullopt otherwise.
 std::optional<std::filesystem::path> vc3dCacheRoot();
+// Where a writer puts the cache: the first of that order, whether or not it exists. Nothing
+// is created.
+std::filesystem::path selectedVc3dCacheRoot();
 // A new VC3D cache directory for a volume (opened through OpenOptions::vc3dVolumeDir),
 // storing chunks as Delta3D when asked. An existing directory keeps its format.
 void createVc3dVolumeDir(const std::filesystem::path& volumeDir, bool delta3d);
@@ -308,6 +315,9 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& location, const O
 // holding it; the identity for paths that are not pyramid levels. Throws
 // std::invalid_argument for OME metadata that cannot place it.
 LevelPlacement levelPlacement(const Json& groupAttributes, const std::string& path);
+// What the OME metadata itself declares for the level at `path`, not relative to level 0:
+// its scale and translation in ZYX. The identity when it declares none or lists no such path.
+LevelPlacement declaredPlacement(const Json& groupAttributes, const std::string& path);
 
 struct StoreMetadata;
 // Drops the metadata kept with a remote volume's caches (see Group::open, volumeMetadata), so

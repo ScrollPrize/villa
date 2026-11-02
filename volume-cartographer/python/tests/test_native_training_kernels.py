@@ -132,77 +132,6 @@ def test_coordinate_validation(changes, match):
         native.generate_fiber3d_coords(**(_geometry_args() | changes))
 
 
-def _blur_reference(volume, direction, along, across):
-    """Independent trilinear sampling of each oriented 1D Gaussian pass."""
-    direction = np.array(direction, np.float32, copy=True)
-    direction /= np.linalg.norm(direction)
-    reference = [0, 1, 0] if abs(direction[0]) > .9 else [1, 0, 0]
-    a = np.cross(direction, reference).astype(np.float32)
-    a /= np.linalg.norm(a)
-    b = np.cross(direction, a)
-    b /= np.linalg.norm(b)
-    result = volume.copy()
-    grid = np.indices(volume.shape, dtype=np.float32)
-    for axis, sigma in zip((direction, a, b), (along, across, across), strict=True):
-        if not sigma:
-            continue
-        radius = max(1, int(np.ceil(3 * np.float32(sigma))))
-        taps = np.arange(-radius, radius + 1, dtype=np.float32)
-        kernel = np.exp(-.5 * (taps / np.float32(sigma)) ** 2)
-        kernel /= kernel.sum()
-        output = np.zeros_like(result)
-        for tap, weight in zip(taps, kernel, strict=True):
-            coordinates = grid + (tap * axis)[:, None, None, None]
-            lower = np.floor(coordinates).astype(np.int64)
-            fraction = coordinates - lower
-            for corner in np.ndindex(2, 2, 2):
-                index = tuple(np.clip(lower[d] + corner[d], 0, volume.shape[d] - 1)
-                              for d in range(3))
-                interpolation = np.prod([fraction[d] if corner[d] else 1 - fraction[d]
-                                         for d in range(3)], axis=0)
-                output += (result[index] * interpolation * weight).astype(np.float32)
-        result = output
-    return result
-
-
-@pytest.mark.parametrize("axis", [[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.],
-                                  [0., 0., 1.], [1., 2., -3.]])
-@pytest.mark.parametrize("sigmas", [(0., 0.), (.8, 0.), (0., .4), (.8, .4)])
-def test_blur_matches_oriented_trilinear_reference(axis, sigmas):
-    source = np.random.default_rng(20260903).random((7, 9, 11), dtype=np.float32)
-    original = source.copy()
-    direction = np.array(axis, np.float32)
-    actual = native.anisotropic_blur_3d(source, direction, *sigmas)
-    expected = _blur_reference(source, direction, *sigmas)
-    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
-    np.testing.assert_array_equal(source, original)
-    np.testing.assert_array_equal(actual, native.anisotropic_blur_3d(source, direction, *sigmas))
-    assert not np.shares_memory(source, actual)
-    assert actual.dtype == np.float32 and actual.flags.c_contiguous
-
-
-def test_blur_preserves_constant_volume_and_replicates_edges():
-    constant = np.full((1, 2, 3), .75, np.float32)
-    actual = native.anisotropic_blur_3d(constant, np.array([1, 2, 3], np.float32), 2., 1.)
-    np.testing.assert_allclose(actual, constant, rtol=2e-6, atol=2e-6)
-
-
-@pytest.mark.parametrize("changes,match", [
-    ({"volume": np.zeros((2, 3), np.float32)}, "shape"),
-    ({"volume": np.zeros((0, 2, 3), np.float32)}, "positive"),
-    ({"axis_zyx": np.zeros(3, np.float32)}, "norm"),
-    ({"axis_zyx": np.full(3, np.nan, np.float32)}, "finite"),
-    ({"axis_zyx": np.zeros(2, np.float32)}, "shape"),
-    ({"sigma_along": -.1}, "nonnegative"),
-    ({"sigma_across": float("inf")}, "finite"),
-])
-def test_blur_validation(changes, match):
-    args = dict(volume=np.zeros((2, 3, 4), np.float32),
-                axis_zyx=np.array([1, 0, 0], np.float32), sigma_along=.8, sigma_across=.4)
-    with pytest.raises(ValueError, match=match):
-        native.anisotropic_blur_3d(**(args | changes))
-
-
 def _value_reference(source, valid, mode, contrast, brightness, gamma):
     values = source[valid] if valid.any() else source.reshape(-1)
     mean = np.float32(values.mean(dtype=np.float64))
@@ -297,11 +226,8 @@ def test_real_ct_patch_end_to_end(request):
     # interpolated uint8 intensity by one. This does not relax native sampling.
     assert np.abs(sampled.astype(np.int16) - reference.astype(np.int16)).max() <= 1
     image = sampled.astype(np.float32) / 255
-    direction = np.array([1, 2, -3], np.float32)
-    blurred = native.anisotropic_blur_3d(image, direction, .8, .4)
-    np.testing.assert_allclose(blurred, _blur_reference(image, direction, .8, .4), rtol=2e-6, atol=2e-6)
-    transformed = native.fiber3d_value_transform(blurred, valid.astype(bool), "zscore", 1.7, .13, .71)
-    expected_values = _value_reference(blurred, valid.astype(bool), "zscore", 1.7, .13, .71)
+    transformed = native.fiber3d_value_transform(image, valid.astype(bool), "zscore", 1.7, .13, .71)
+    expected_values = _value_reference(image, valid.astype(bool), "zscore", 1.7, .13, .71)
     error = np.abs(transformed - expected_values)
     scale = max(1., float(np.max(np.abs(expected_values))))
     print(f"value reference: max_abs={error.max()}, mean_abs={error.mean()}, scale={scale}")

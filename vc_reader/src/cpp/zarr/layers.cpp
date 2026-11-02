@@ -21,6 +21,7 @@
 #include "../chunk_io.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -291,45 +292,122 @@ void createVc3dVolumeDir(const fs::path& volumeDir, bool delta3d)
         atomicWrite(volumeDir / kDelta3dMarker, kDelta3dMarkerContents);
 }
 
-std::optional<fs::path> vc3dCacheRoot()
+namespace {
+
+fs::path utf8Path(const std::string& value)
 {
-    const char* configured = std::getenv("VC3D_CONFIG_DIR");
-    const char* home = std::getenv("HOME");
-    const fs::path configDir = configured && *configured ? fs::path(configured) : fs::path(home ? home : "") / ".VC3D";
-    // VC3D's precedence: cache.json (an explicit host override, used whether or not the
-    // directory exists yet: VC3D creates it), then VC3D.ini's remote_cache_dir, then a
-    // provisioned mount, then ~/.VC3D/remote_cache, the last three only where they exist.
-    if (const auto config = readJson(configDir / "cache.json")) {
-        if (!config->is_object() || config->value("version", 0) != 1)
-            throw std::invalid_argument("unsupported VC3D cache configuration version in " + (configDir / "cache.json").string());
-        const fs::path root(config->at("root").get<std::string>());
-        if (root.empty() || !root.is_absolute())
-            throw std::invalid_argument("VC3D global cache root must be absolute: " + (configDir / "cache.json").string());
-        return root.lexically_normal();
-    }
-    std::vector<fs::path> candidates;
-    std::ifstream ini(configDir / "VC3D.ini");
-    std::string line, section;
-    while (std::getline(ini, line)) {
-        const auto b = line.find_first_not_of(" \t\r");
-        if (b == std::string::npos)
+    return fs::path(std::u8string(value.begin(), value.end()));
+}
+
+std::optional<fs::path> homeDirectory()
+{
+#ifdef _WIN32
+    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
+        return fs::path(profile);
+    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
+    const wchar_t* homePath = _wgetenv(L"HOMEPATH");
+    if (drive && *drive && homePath && *homePath)
+        return fs::path(std::wstring(drive) + homePath);
+#endif
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return utf8Path(home);
+    return std::nullopt;
+}
+
+std::optional<fs::path> configDirectory()
+{
+#ifdef _WIN32
+    if (const wchar_t* configured = _wgetenv(L"VC3D_CONFIG_DIR"); configured && *configured)
+        return fs::path(configured);
+#else
+    if (const char* configured = std::getenv("VC3D_CONFIG_DIR"); configured && *configured)
+        return utf8Path(configured);
+#endif
+    const auto home = homeDirectory();
+    return home ? std::optional<fs::path>(*home / ".VC3D") : std::nullopt;
+}
+
+std::string trimmed(const std::string& value)
+{
+    const auto first = value.find_first_not_of(" \t\r\n");
+    return first == std::string::npos ? std::string() : value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+// A value as QSettings writes it: optionally quoted, with backslash escapes.
+std::string decodedIniValue(std::string value)
+{
+    value = trimmed(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        value = value.substr(1, value.size() - 2);
+    std::string decoded;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '\\' || i + 1 == value.size()) {
+            decoded.push_back(value[i]);
             continue;
-        line = line.substr(b, line.find_last_not_of(" \t\r") - b + 1);
-        if (line.front() == '[' && line.back() == ']') {
-            section = line.substr(1, line.size() - 2);
-        } else if (const auto eq = line.find('='); section == "viewer" && eq != std::string::npos) {
-            auto key = line.substr(0, eq);
-            key.erase(key.find_last_not_of(" \t") + 1);
-            auto value = line.substr(eq + 1);
-            value.erase(0, value.find_first_not_of(" \t\""));
-            value.erase(value.find_last_not_of(" \t\"") + 1);
-            if (key == "remote_cache_dir" && !value.empty()) {
-                if (value.starts_with("~/") && home)
-                    value = std::string(home) + value.substr(1);
-                candidates.emplace_back(value);
-            }
+        }
+        const char escaped = value[++i];
+        if (escaped == '\\' || escaped == '"')
+            decoded.push_back(escaped);
+        else if (escaped == 'n')
+            decoded.push_back('\n');
+        else if (escaped == 'r')
+            decoded.push_back('\r');
+        else if (escaped == 't')
+            decoded.push_back('\t');
+        else {
+            decoded.push_back('\\');
+            decoded.push_back(escaped);
         }
     }
+    return decoded;
+}
+
+std::optional<fs::path> iniCacheRoot(const fs::path& configDir, const std::optional<fs::path>& home)
+{
+    std::ifstream ini(configDir / "VC3D.ini");
+    std::string line;
+    bool viewer = false;
+    while (std::getline(ini, line)) {
+        line = trimmed(line);
+        if (line.empty() || line.front() == ';' || line.front() == '#')
+            continue;
+        if (line.front() == '[' && line.back() == ']') {
+            viewer = line == "[viewer]";
+            continue;
+        }
+        const auto eq = line.find('=');
+        if (!viewer || eq == std::string::npos || trimmed(line.substr(0, eq)) != "remote_cache_dir")
+            continue;
+        const auto value = decodedIniValue(line.substr(eq + 1));
+        if (value.empty())
+            return std::nullopt;
+        return value.starts_with("~/") && home ? *home / utf8Path(value.substr(2)) : utf8Path(value);
+    }
+    return std::nullopt;
+}
+
+// cache.json's root, which counts whether or not it exists yet; throws when malformed.
+std::optional<fs::path> configuredCacheRoot(const fs::path& configDir)
+{
+    const auto config = readJson(configDir / "cache.json");
+    if (!config)
+        return std::nullopt;
+    if (!config->is_object() || config->value("version", 0) != 1)
+        throw std::invalid_argument("unsupported VC3D cache configuration version in " + (configDir / "cache.json").string());
+    const auto root = utf8Path(config->at("root").get<std::string>());
+    if (root.empty() || !root.is_absolute())
+        throw std::invalid_argument("VC3D global cache root must be absolute: " + (configDir / "cache.json").string());
+    return root.lexically_normal();
+}
+
+// The roots after cache.json, in order.
+std::vector<fs::path> cacheRootCandidates(const std::optional<fs::path>& configDir)
+{
+    const auto home = homeDirectory();
+    std::vector<fs::path> candidates;
+    if (configDir)
+        if (auto root = iniCacheRoot(*configDir, home))
+            candidates.push_back(std::move(*root));
     for (const char* base : {"/volpkgs", "/ephemeral"}) {
         std::error_code ec;
         if (fs::is_directory(base, ec)) {
@@ -337,13 +415,45 @@ std::optional<fs::path> vc3dCacheRoot()
             break;
         }
     }
-    candidates.push_back(fs::path(home ? home : "") / ".VC3D" / "remote_cache");
-    for (const auto& c : candidates) {
+    if (home)
+        candidates.push_back(*home / ".VC3D" / "remote_cache");
+    return candidates;
+}
+
+}  // namespace
+
+fs::path vc3dConfigDirectory()
+{
+    auto directory = configDirectory();
+    if (!directory)
+        throw std::runtime_error("cannot resolve the VC3D configuration directory: no home directory");
+    return std::move(*directory);
+}
+
+std::optional<fs::path> vc3dCacheRoot()
+{
+    const auto configDir = configDirectory();
+    if (configDir)
+        if (auto root = configuredCacheRoot(*configDir))
+            return root;
+    for (const auto& candidate : cacheRootCandidates(configDir)) {
         std::error_code ec;
-        if (fs::is_directory(c, ec))
-            return c;
+        if (fs::is_directory(candidate, ec))
+            return candidate;
     }
     return std::nullopt;
+}
+
+fs::path selectedVc3dCacheRoot()
+{
+    const auto configDir = configDirectory();
+    if (configDir)
+        if (auto root = configuredCacheRoot(*configDir))
+            return std::move(*root);
+    const auto candidates = cacheRootCandidates(configDir);
+    if (candidates.empty())
+        throw std::runtime_error("cannot resolve the VC3D cache root: no home directory");
+    return candidates.front();
 }
 
 fs::path decodedCachePath(const fs::path& cacheDir, const std::string& input)

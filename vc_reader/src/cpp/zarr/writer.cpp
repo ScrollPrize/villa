@@ -326,6 +326,24 @@ void decompressBytes(const Json& compressor, std::span<const std::uint8_t> data,
     decode(codec, data.data(), data.size(), out.data(), out.size());
 }
 
+std::vector<std::uint8_t> decompressZstdFrame(std::span<const std::uint8_t> data, std::size_t maxBytes)
+{
+    const auto size = ZSTD_getFrameContentSize(data.data(), data.size());
+    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN)
+        throw std::runtime_error("not a zstd frame stating its decoded size");
+    if (size > maxBytes)
+        throw std::runtime_error("zstd frame decodes to " + std::to_string(size) + " bytes, over the limit of " + std::to_string(maxBytes));
+    if (ZSTD_findFrameCompressedSize(data.data(), data.size()) != data.size())
+        throw std::runtime_error("zstd frame does not span its input");
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(size));
+    const auto decoded = ZSTD_decompress(out.data(), out.size(), data.data(), data.size());
+    if (ZSTD_isError(decoded))
+        throw std::runtime_error(std::string("zstd decode failed: ") + ZSTD_getErrorName(decoded));
+    if (decoded != out.size())
+        throw std::runtime_error("zstd frame decoded to another size than it states");
+    return out;
+}
+
 CreateOptions createOptionsLike(const ArrayMeta& meta)
 {
     CreateOptions options;

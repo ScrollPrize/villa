@@ -1,5 +1,5 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/GlobalCacheRoot.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <charconv>
 #include <algorithm>
@@ -76,21 +76,6 @@ std::string decodeIniValue(std::string value)
     return decoded;
 }
 
-fs::path homeDirectory()
-{
-#ifdef _WIN32
-    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
-        return profile;
-    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
-    const wchar_t* path = _wgetenv(L"HOMEPATH");
-    if (drive && *drive && path && *path)
-        return std::wstring(drive) + path;
-#endif
-    if (const char* home = std::getenv("HOME"); home && *home)
-        return pathFromUtf8(home);
-    throw std::runtime_error("Cannot determine the user home directory for VC3D settings");
-}
-
 std::string configuredIniValue(
     const fs::path& settingsPath,
     std::string_view section,
@@ -122,13 +107,6 @@ std::string configuredIniValue(
         return decodeIniValue(stripped.substr(separator + 1));
     }
     return {};
-}
-
-fs::path configuredRemoteCachePath(const fs::path& settingsPath)
-{
-    const auto configured = configuredIniValue(
-        settingsPath, "viewer", "remote_cache_dir");
-    return configured.empty() ? fs::path{} : pathFromUtf8(configured);
 }
 
 std::uint64_t configuredGiB(
@@ -203,35 +181,12 @@ fs::path ensureWritableDirectory(fs::path path)
 
 fs::path settingsFilePath()
 {
-#ifdef _WIN32
-    if (const wchar_t* configured = _wgetenv(L"VC3D_CONFIG_DIR");
-        configured && *configured) {
-        return ensureDirectory(configured) / "VC3D.ini";
-    }
-#else
-    if (const char* configured = std::getenv("VC3D_CONFIG_DIR");
-        configured && *configured) {
-        return ensureDirectory(pathFromUtf8(configured)) / "VC3D.ini";
-    }
-#endif
-    return ensureDirectory(homeDirectory() / ".VC3D") / "VC3D.ini";
+    return ensureDirectory(vcr::zarr::vc3dConfigDirectory()) / "VC3D.ini";
 }
 
 fs::path remoteCachePath()
 {
-    static const fs::path active = [] {
-        // cache.json (the explicit host override, also used by headless fiber tools and
-        // read by vc_reader's "vc3d" cache entry), then the INI, then globalCacheRoot's
-        // provisioned mounts and ~/.VC3D/remote_cache.
-        if (fs::exists(vc::core::util::vc3dConfigDirectory() / "cache.json")) {
-            return ensureWritableDirectory(vc::core::util::globalCacheRoot());
-        }
-        if (auto configured = configuredRemoteCachePath(settingsFilePath());
-            !configured.empty()) {
-            return ensureWritableDirectory(std::move(configured));
-        }
-        return ensureWritableDirectory(vc::core::util::globalCacheRoot());
-    }();
+    static const fs::path active = ensureWritableDirectory(vcr::zarr::selectedVc3dCacheRoot());
     return active;
 }
 

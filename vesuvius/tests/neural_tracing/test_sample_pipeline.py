@@ -15,7 +15,6 @@ from vc_reader.reader import ZarrReader
 from tests.zarr_utils import zarr_volume
 import torch
 
-from tests.neural_tracing.oriented_blur_reference import _anisotropic_blur_3d
 from tests.neural_tracing.test_fiber_trace_3d import _loader, _loader_with_mapping, _straight_fiber
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DConfig, FiberTrace3DLoader, FiberTrace3DSharedTensorSlots, config_from_mapping, load_config,
@@ -202,7 +201,7 @@ def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path,
     config = replace(native_loader.config, geometry_backend="eager", value_augmentation_backend="torch")
     loader = FiberTrace3DLoader(config)
     expected = loader.load_batch(0, sample_mode="flat", profile=True)
-    for name in ("generate_fiber3d_coords", "fiber3d_value_transform", "anisotropic_blur_3d"):
+    for name in ("generate_fiber3d_coords", "fiber3d_value_transform"):
         monkeypatch.delattr(vc.volume, name, raising=False)
     actual = FiberTrace3DLoader(config).load_batch(0, sample_mode="flat", profile=True)
     _assert_same_batch(actual, expected)
@@ -589,96 +588,6 @@ def test_native_geometry_preserves_sampled_patch() -> None:
     assert int(difference.max()) <= 1
 
 
-@pytest.mark.parametrize(
-    ("shape", "axis"),
-    (
-        ((17, 19, 23), np.asarray([0.31, 0.83, -0.46], dtype=np.float32)),
-        ((1, 13, 11), np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.8999, 0.436096, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.9001, 0.435683, 0.0], dtype=np.float32)),
-    ),
-)
-def test_native_anisotropic_blur_matches_torch_reference(
-    shape: tuple[int, int, int], axis: np.ndarray
-) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn(shape, generator=torch.Generator().manual_seed(23))
-    source_before = source.clone()
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual_array = blur(source.numpy(), axis, 1.5, 0.25)
-    actual = torch.from_numpy(actual_array)
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-    assert actual.shape == source.shape
-    assert actual.dtype == torch.float32
-    assert actual_array.flags.c_contiguous
-    assert torch.equal(source, source_before)
-
-
-def test_native_anisotropic_blur_matches_full_training_cube() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((128, 128, 128), generator=torch.Generator().manual_seed(41))
-    axis = np.asarray([0.31, 0.83, -0.46], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-
-
-def test_native_axis_aligned_blur_matches_torch_isotropic_reference() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((33, 35, 37), generator=torch.Generator().manual_seed(43))
-    sigma = 0.5
-    kernel = _gaussian_kernel1d(sigma, device=source.device)
-    radius = int((kernel.numel() - 1) // 2)
-    data = source.view(1, 1, *source.shape)
-    for axis in range(3):
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = int(kernel.numel())
-        padding = [0, 0, 0, 0, 0, 0]
-        padding[(2 - axis) * 2] = radius
-        padding[(2 - axis) * 2 + 1] = radius
-        data = torch.nn.functional.conv3d(
-            torch.nn.functional.pad(data, padding, mode="replicate"),
-            kernel.view(*shape),
-        )
-    expected = data[0, 0]
-    actual = torch.from_numpy(
-        blur(
-            source.numpy(),
-            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-            sigma,
-            sigma,
-        )
-    )
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 2.0e-6
-    assert float(error.mean()) <= 2.0e-7
-
-
 @pytest.mark.parametrize("mask_kind", ("all", "partial", "none", "constant"))
 def test_native_value_transform_matches_torch_reference(mask_kind: str) -> None:
     native_module = pytest.importorskip("vc.volume")
@@ -729,56 +638,6 @@ def test_native_value_transform_validates_contract() -> None:
         transform(source, valid, "other", 1.0, 0.0, 1.0)
     with pytest.raises(ValueError, match="must be positive"):
         transform(source, valid, "zscore", 0.0, 0.0, 1.0)
-
-
-@pytest.mark.parametrize("kind", ("ramp", "impulse", "high_contrast"))
-def test_native_anisotropic_blur_structured_inputs(kind: str) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    shape = (17, 19, 23)
-    if kind == "ramp":
-        z, y, x = torch.meshgrid(
-            *(torch.linspace(-2.0, 2.0, length) for length in shape),
-            indexing="ij",
-        )
-        source = (z + 0.3 * y - 0.7 * x).contiguous()
-    elif kind == "impulse":
-        source = torch.zeros(shape, dtype=torch.float32)
-        source[8, 9, 11] = 10.0
-    else:
-        source = 100.0 * torch.randn(
-            shape, generator=torch.Generator().manual_seed(47)
-        )
-    axis = np.asarray([-0.52, 0.17, 0.84], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-
-
-def test_native_anisotropic_blur_validates_input_and_zero_sigma() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
-    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    assert np.array_equal(blur(source, axis, 0.0, 0.0), source)
-    with pytest.raises(ValueError, match="positive finite norm"):
-        blur(source, np.zeros((3,), dtype=np.float32), 1.0, 0.0)
-    with pytest.raises(ValueError, match="nonnegative"):
-        blur(source, axis, -1.0, 0.0)
-    reversed_source = source[:, :, ::-1]
-    assert np.array_equal(blur(reversed_source, axis, 0.0, 0.0), reversed_source)
 
 
 def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -110,7 +110,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
             ${surface_catalog_ink_detection_moc}
-    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    LIBS opencv_imgcodecs vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
@@ -276,14 +276,14 @@ vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tra
 vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer zstd::libzstd)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_crop_trace LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_replay_visualization LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_visualization LIBS doctest::doctest vc_fiber_tracer opencv_imgcodecs)
 target_compile_definitions(test_fiber_replay_visualization PRIVATE VC_TESTING)
-vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer opencv_imgcodecs DEFS VC_TESTING)
 if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # The inline optimized/reference kernels assert bitwise operation-order
     # equality. Do not let the compiler contract just one expression into FMA.
@@ -425,7 +425,6 @@ set_tests_properties(test_normal_constraint_grid_change PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_surface_query_set)
 
 
-vc_add_test(NAME test_global_cache_root)
 
 
 vc_add_test(NAME test_geometry)
@@ -521,7 +520,7 @@ vc_add_test(NAME test_umbilicus)
 vc_add_test(NAME test_colormaps SOURCES test_colormaps.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_quadsurface_io)
+vc_add_test(NAME test_quadsurface_io LIBS doctest::doctest vc_core opencv_imgcodecs)
 
 vc_add_test(NAME test_quadsurface_pointto)
 vc_add_test(NAME test_surface_losses LIBS doctest::doctest vc_core Ceres::ceres)

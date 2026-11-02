@@ -14,7 +14,7 @@
 #include <iostream>
 #include <random>
 #include <set>
-#include <zstd.h>
+#include <vc_reader/zarr_write.hpp>
 
 using namespace vc::fiber_tracer;
 
@@ -91,11 +91,8 @@ namespace {
 nlohmann::json readPackedFixture(const std::filesystem::path& path) {
     std::ifstream in(path,std::ios::binary);
     const std::string data((std::istreambuf_iterator<char>(in)),{});
-    const auto size=ZSTD_getFrameContentSize(data.data(),data.size());
-    REQUIRE(size!=ZSTD_CONTENTSIZE_ERROR);REQUIRE(size!=ZSTD_CONTENTSIZE_UNKNOWN);
-    std::vector<uint8_t> decoded(size);
-    REQUIRE(ZSTD_decompress(decoded.data(),decoded.size(),data.data(),data.size())==size);
-    return nlohmann::json::from_msgpack(decoded);
+    return nlohmann::json::from_msgpack(vcr::zarr::decompressZstdFrame(
+        {reinterpret_cast<const std::uint8_t*>(data.data()),data.size()},1024ULL*1024*1024));
 }
 struct Temp {
     std::filesystem::path path=std::filesystem::temp_directory_path()/

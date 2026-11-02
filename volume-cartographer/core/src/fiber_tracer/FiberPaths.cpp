@@ -36,7 +36,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include <opencv2/imgcodecs.hpp>
 
 namespace vc::fiber_tracer
 {

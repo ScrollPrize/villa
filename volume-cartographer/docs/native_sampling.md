@@ -42,12 +42,13 @@ earlier gate are not reused.
 
 ## Cache location and authentication
 
-`globalCacheRoot()` resolves without creating directories:
+`vcr::zarr::selectedVc3dCacheRoot()` resolves without creating directories:
 
 1. Explicit `{"version": 1, "root": "/absolute/path"}` in
    `$VC3D_CONFIG_DIR/cache.json` (default `$HOME/.VC3D/cache.json`).
-2. Existing `/volpkgs`, then `/ephemeral`, using their `remote_cache` child.
-3. Caller suggestion, then `$HOME/.VC3D/remote_cache`.
+2. `[viewer] remote_cache_dir` in `VC3D.ini` beside it.
+3. Existing `/volpkgs`, then `/ephemeral`, using their `remote_cache` child.
+4. `$HOME/.VC3D/remote_cache`.
 
 Malformed explicit configuration fails rather than silently falling back.
 Remote groups with explicit keys sign `s3://` requests; otherwise public
