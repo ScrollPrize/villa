@@ -985,7 +985,7 @@ void QuadSurface::saveWithUuid(const std::filesystem::path& destination, const s
     metadata.extra = meta;
     metadata.extra["type"] = "seg";
     metadata.extra["format"] = "tifxyz";
-    vcr::tifxyz::Surface stored(_points->rows, _points->cols, std::move(xyz), std::move(valid), std::move(metadata));
+    vcr::tifxyz::Surface stored(_points->rows, _points->cols, std::move(xyz), std::move(valid), std::move(metadata), {}, true);
     vcr::tifxyz::WriteOptions options;
     options.overwrite = overwrite;
     options.compression = "none";

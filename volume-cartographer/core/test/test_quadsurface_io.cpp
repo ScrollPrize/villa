@@ -3,6 +3,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/util/ImageMat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
@@ -134,4 +135,17 @@ TEST_CASE("channel files round trip at their stored depth and colour order")
     const cv::Mat readGenerations = reader.channel("generations", SURF_CHANNEL_NORESIZE);
     REQUIRE(readGenerations.type() == CV_16UC1);
     CHECK(readGenerations.at<uint16_t>(3, 3) == 4000);
+}
+
+TEST_CASE("saving keeps non-finite placeholders as stored and negative valid coordinates")
+{
+    TmpSegDir t;
+    cv::Mat_<cv::Vec3f> points(8, 8, cv::Vec3f(1.f, 2.f, 3.f));
+    points(2, 2) = cv::Vec3f(NAN, NAN, NAN);
+    points(3, 3) = cv::Vec3f(-5.f, 2.f, 3.f);
+    QuadSurface writer(points, {1.f, 1.f});
+    writer.save(t.segDir.string());
+    const cv::Mat_<float> x = vc::core::util::imageMat(vcr::sources::readImagePage((t.segDir / "x.tif").string(), 0, {}));
+    CHECK(std::isnan(x(2, 2)));
+    CHECK(x(3, 3) == -5.f);
 }
