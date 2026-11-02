@@ -64,7 +64,7 @@ Each experiment is one full pipeline run, driven by `run_single.py`, which chain
 - `--gpus 0,1,2,3` — the GPU subset for this run: one fit rank per GPU, and the pin is passed straight through to every step. `CUDA_VISIBLE_DEVICES` alone is not enough: without `--gpus` the fit runs as a single process.
 - `--output <out_dir>/<tag>` — this run's output dir, which must be new or empty. The runner sets `FIT_SPIRAL_OUT_DIR` from it.
 - `--config <file>` — a JSON object of config overrides. The runner sets `FIT_SPIRAL_CONFIG_OVERRIDES` from it and drops that variable from its own environment.
-- `--inputs` (the fit's input manifest; see the README's "Input manifest"), `--object-store` (the fit's input store) and `--ink-volume` (required), `--object-store-author` (needed unless the config turns `object_store_refresh_links` off), and `--no-wandb`: the runner sets `WANDB_MODE` itself, so exporting `WANDB_MODE=disabled` does not turn W&B off.
+- `--inputs` (the fit's input manifest; see the README's "Input manifest"), `--object-store` (the fit's input store) and `--ink-volume` (required), `--object-store-author` (optional; defaults to `$USER`, then `$USERNAME`, then `spiral-fit`), and `--no-wandb`: the runner sets `WANDB_MODE` itself, so exporting `WANDB_MODE=disabled` does not turn W&B off.
 
 **Run two experiments at a time, each on four GPUs.** On an 8-GPU box that means one run with `--gpus 0,1,2,3` and one with `--gpus 4,5,6,7`, launched concurrently. Each run is fully self-contained on its four GPUs (fit, render, and score all stay within the pin), so the two never collide.
 

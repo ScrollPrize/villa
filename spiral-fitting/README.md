@@ -392,6 +392,10 @@ FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
   --object-store-author me
 ```
 
+`--object-store-author` is optional: it defaults to `$USER`, then `$USERNAME`,
+then `spiral-fit` if neither is set to a nonempty value. Pass it explicitly to
+override that identity. The service keeps its `spiral-service@<host>` default.
+
 At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber,track}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
 off select none), validates every selected object's frame, then refreshes the

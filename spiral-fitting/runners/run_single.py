@@ -121,7 +121,7 @@ def add_common_arguments(
     parser.add_argument(
         "--object-store-author",
         default=None,
-        help="author of the links the fit's startup refresh writes",
+        help="author of refreshed links (default: fit CLI's $USER / $USERNAME / spiral-fit)",
     )
     parser.add_argument(
         "--output",

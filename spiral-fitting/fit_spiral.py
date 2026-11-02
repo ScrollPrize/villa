@@ -4311,9 +4311,10 @@ if __name__ == '__main__':
         help='Object store (.vcobj) the fit reads patch, PCL, fiber, track and '
              'outer-shell inputs from, and writes refreshed links to')
     parser.add_argument(
-        '--object-store-author', default=None, metavar='NAME',
-        help='Author of the links the startup refresh writes (required '
-             'unless refresh_links is off)')
+        '--object-store-author', metavar='NAME',
+        default=os.environ.get('USER') or os.environ.get('USERNAME') or 'spiral-fit',
+        help='Author of the links the startup refresh writes '
+             '(default: $USER, then $USERNAME, then spiral-fit)')
     parser.add_argument(
         '--cache', default=None,
         help='Directory for derived host caches, shared with the interactive '
