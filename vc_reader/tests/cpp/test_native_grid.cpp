@@ -450,6 +450,9 @@ int main()
                 require(r.level[q] == vcr::grid::Result::kMissing, "an uncached frame is missing everywhere");
             require(p0->stats().disk_hits == 0 && pending.coarse.size() == 1 && pending.target.size() == 1,
                     "the frame read nothing and asks for a preview and its level");
+            require(r.missingChunks.size() == 2 && !r.missingChunks[0].empty() &&
+                        pending.target[0].chunks == r.missingChunks[0] && pending.coarse[0].chunks == r.missingChunks[1],
+                    "a CPU frame names the chunks its reads fetch");
             int parts = 0;
             require(vcr::grid::load(pending, [&] { ++parts; return false; }).empty() && parts == 1, "load stops when told");
             vcr::grid::Pending rest;
@@ -457,7 +460,9 @@ int main()
             for (std::size_t q = 0; q < 32; ++q)
                 require(r.level[q] == 1 && near(r.values[q], 200.0f), "the preview fills the frame");
             require(rest.coarse.empty() && rest.target.size() == 1, "only the view's level is still asked for");
+            const auto readsBefore = p0->stats().disk_hits.load();
             vcr::grid::load(rest);
+            require(p0->stats().disk_hits.load() - readsBefore == rest.target[0].chunks.size(), "each lacking chunk is read once");
             vcr::grid::Pending none;
             r = vcr::grid::sampleCached(frame, view, &none);
             require(none.empty() && r.level[9] == 0 && near(r.values[9], value(3, 4, 4)), "the loaded frame is complete");
