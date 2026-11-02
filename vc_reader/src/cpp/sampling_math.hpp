@@ -32,37 +32,51 @@ struct Cell {
 };
 
 template<class Coordinate, class C, class Base>
-VCR_SAMPLE_HD inline void cellOf(const Coordinate* q, std::size_t dimensions, C& cell, Base base)
+VCR_SAMPLE_HD inline void cellOf(const Coordinate* q, std::size_t dimensions, C& cell, Base base, bool allAxes = false)
 {
     cell.k = 0;
     for (std::size_t a = 0; a < dimensions; ++a) {
         splitCoordinate(q[a], base(a), cell.lo[a], cell.frac[a]);
-        if (cell.frac[a] != 0) cell.axes[cell.k++] = a;
+        if (allAxes || cell.frac[a] != 0) cell.axes[cell.k++] = a;
     }
 }
 
 // Dense multilinear sampling with edge replication. Corner order, intermediate
 // weight precision and zero-weight evaluation are explicit numerical policies.
-template<int D, class T, class Real, class Weight = Real, bool ReverseCorners = false, bool SkipZero = false, class Shape>
-VCR_SAMPLE_HD inline T clamped(const T* data, const Shape& shape, const Real* q)
+template<int D, class Real, class Weight = Real, bool ReverseCorners = false, class Shape, class Visit>
+VCR_SAMPLE_HD inline void clampedCorners(const Shape& shape, const Real* q, Visit visit)
 {
     std::int64_t lo[D]; Real f[D];
     for (int a = 0; a < D; ++a) {
         const Real x = q[a] < 0 ? 0 : q[a] > Real(shape[a] - 1) ? Real(shape[a] - 1) : q[a];
         splitCoordinate(x, 0, lo[a], f[a]);
     }
-    T value = 0;
     for (int corner = 0; corner < (1 << D); ++corner) {
         Weight weight = 1; std::size_t at = 0;
         for (int a = 0; a < D; ++a) {
             const int bit = (corner >> (ReverseCorners ? D - 1 - a : a)) & 1;
             weight *= bit ? f[a] : Real(1) - f[a];
-            const auto x = std::min(lo[a] + bit, std::int64_t(shape[a]) - 1);
+            const auto upper = std::int64_t(shape[a]) - 1;
+            const auto x = lo[a] + bit < upper ? lo[a] + bit : upper;
             at = at * shape[a] + std::size_t(x);
         }
-        if (!SkipZero || weight != 0) value += T(weight) * data[at];
+        visit(at, weight);
     }
+}
+
+template<int D, class T, class Real, class Weight = Real, bool ReverseCorners = false, bool SkipZero = false, class Shape>
+VCR_SAMPLE_HD inline T clamped(const T* data, const Shape& shape, const Real* q)
+{
+    T value = 0;
+    clampedCorners<D, Real, Weight, ReverseCorners>(shape, q, [&](std::size_t at, Weight weight) {
+        if (!SkipZero || weight != 0) value += T(weight) * data[at];
+    });
     return value;
+}
+
+VCR_SAMPLE_HD inline float pixelCenter(std::int64_t index, std::int64_t stored, std::int64_t output)
+{
+    return (float(index) + .5f) * float(stored) / float(output);
 }
 
 // Coordinates use separate float32 rounding on every architecture. Interpolation
@@ -79,12 +93,13 @@ VCR_SAMPLE_HD inline float affine(float origin, const float* axes, float z, floa
     return step(step(step(origin,axes[0],z),axes[1],y),axes[2],x);
 }
 template<class Real, class Axes>
-VCR_SAMPLE_HD inline Real cornerWeight(std::size_t corner, const Real* fractions, const Axes& axes, std::size_t dimensions)
+VCR_SAMPLE_HD inline Real cornerWeight(std::size_t corner, const Real* fractions, const Axes& axes, std::size_t dimensions, int derivative = -1)
 {
     Real weight = 1;
     for (std::size_t a = 0; a < dimensions; ++a) {
         const Real f = fractions[axes[a]];
-        weight *= (corner >> a & 1) ? f : Real(1) - f;
+        weight *= int(axes[a]) == derivative ? ((corner >> a & 1) ? Real(1) : Real(-1))
+                                            : ((corner >> a & 1) ? f : Real(1) - f);
     }
     return weight;
 }

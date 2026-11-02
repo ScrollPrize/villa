@@ -10,10 +10,6 @@ void check(const Dense& s) {
     for(int a=0;a<s.dimensions;++a)if(s.shape[a]<1||s.shape[a]>(1<<24))throw std::invalid_argument("invalid dense array extent");
 }
 void checkSurface(int b,int h,int w){if(b<1||h<2||w<2||std::int64_t(h)*w>INT32_MAX/3)throw std::invalid_argument("surface grids require B>=1,H,W>=2 and bounded vertex counts");}
-ThreadPool& samplingPool(){
-    static ThreadPool pool(std::min(8u,std::max(1u,std::thread::hardware_concurrency())));
-    return pool;
-}
 template<class F>void parallel(std::size_t n,F f){
     if(n<4096){for(std::size_t i=0;i<n;++i)f(i);return;}
     samplingPool().parallel_for((n+4095)/4096,[&](std::size_t block){for(auto i=block*4096;i<std::min(n,(block+1)*4096);++i)f(i);});

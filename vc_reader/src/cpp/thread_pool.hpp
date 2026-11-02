@@ -127,4 +127,12 @@ private:
     bool stopping_ = false;
 };
 
+// Sampling, transfer and projection share a bounded pool rather than each
+// retaining their own workers. Small callers can still execute synchronously.
+inline ThreadPool& samplingPool()
+{
+    static ThreadPool pool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+    return pool;
+}
+
 }  // namespace vcr

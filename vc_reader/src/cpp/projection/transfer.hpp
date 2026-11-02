@@ -49,77 +49,8 @@ struct RasterResult {
     std::int64_t inherited_filled_pixels;
 };
 
-struct BilinearPosition {
-    std::int64_t y0;
-    std::int64_t y1;
-    std::int64_t x0;
-    std::int64_t x1;
-    float wy;
-    float wx;
-};
-
-VCR_TRANSFER_HD inline std::int64_t flat_index(
-    const std::int64_t row,
-    const std::int64_t col,
-    const std::int64_t width
-) {
-    return row * width + col;
-}
-
-VCR_TRANSFER_HD inline BilinearPosition output_position(
-    const std::int64_t row,
-    const std::int64_t col,
-    const RasterRequest& request
-) {
-    const float grid_y =
-        (static_cast<float>(row) + 0.5) *
-        static_cast<float>(request.target_height) /
-        static_cast<float>(request.output_height);
-    const float grid_x =
-        (static_cast<float>(col) + 0.5) *
-        static_cast<float>(request.target_width) /
-        static_cast<float>(request.output_width);
-    auto y0 = static_cast<std::int64_t>(std::floor(grid_y));
-    auto x0 = static_cast<std::int64_t>(std::floor(grid_x));
-    if (y0 < 0) {
-        y0 = 0;
-    } else if (y0 >= request.target_height) {
-        y0 = request.target_height - 1;
-    }
-    if (x0 < 0) {
-        x0 = 0;
-    } else if (x0 >= request.target_width) {
-        x0 = request.target_width - 1;
-    }
-    const auto y1 =
-        y0 + 1 < request.target_height ? y0 + 1 : y0;
-    const auto x1 =
-        x0 + 1 < request.target_width ? x0 + 1 : x0;
-    return {y0, y1, x0, x1, grid_y - y0, grid_x - x0};
-}
-
-VCR_TRANSFER_HD inline bool corners_valid(
-    const std::uint8_t* valid,
-    const BilinearPosition& position,
-    const std::int64_t width
-) {
-    return
-        valid[flat_index(position.y0, position.x0, width)] != 0 &&
-        valid[flat_index(position.y0, position.x1, width)] != 0 &&
-        valid[flat_index(position.y1, position.x0, width)] != 0 &&
-        valid[flat_index(position.y1, position.x1, width)] != 0;
-}
-
-VCR_TRANSFER_HD inline float bilinear(
-    const float* field,
-    const BilinearPosition& position,
-    const std::int64_t width
-) {
-    const float f00 = field[flat_index(position.y0, position.x0, width)];
-    const float f01 = field[flat_index(position.y0, position.x1, width)];
-    const float f10 = field[flat_index(position.y1, position.x0, width)];
-    const float f11 = field[flat_index(position.y1, position.x1, width)];
-    return sampling::bilinear(f00,f01,f10,f11,position.wx,position.wy);
+VCR_TRANSFER_HD inline std::int64_t flat_index(std::int64_t row,std::int64_t col,std::int64_t width) {
+    return row*width+col;
 }
 
 VCR_TRANSFER_HD inline bool label_index(
@@ -158,18 +89,20 @@ VCR_TRANSFER_HD inline void transferPixel(const RasterRequest& request,RasterRes
     request.output_validity[local] = 0;
     request.output_distances[local] = invalid_distance;
 
-    const float gy=(row+.5f)*request.target_height/request.output_height;
-    const float gx=(col+.5f)*request.target_width/request.output_width;
-    const auto position=output_position(row,col,request);
+    const float gy=sampling::pixelCenter(row,request.target_height,request.output_height);
+    const float gx=sampling::pixelCenter(col,request.target_width,request.output_width);
+    const float rc[2]{gy,gx};const std::int64_t shape[2]{request.target_height,request.target_width};
+    const auto field=[&](const float* values){return sampling::clamped<2>(values,shape,rc);};
     float target[3]{},source[3]{};
     grid::PointMap targetMap;targetMap.height=int(request.target_height);targetMap.width=int(request.target_width);
     const bool target_pixel_valid=grid::point(targetMap,request.target,
         fminf(gx,request.target_width-1.f),fminf(gy,request.target_height-1.f),target);
     float target_x=target[0],target_y=target[1],target_z=target[2];
     if(target_pixel_valid)++result->target_surface_valid;
-    bool uv_corners_valid=corners_valid(request.uv_valid,position,request.target_width);
-    float mapped_row=bilinear(request.uv_rows,position,request.target_width);
-    float mapped_col=bilinear(request.uv_cols,position,request.target_width);
+    bool uv_corners_valid=true;
+    sampling::clampedCorners<2>(shape,rc,[&](std::size_t at,float){uv_corners_valid&=request.uv_valid[at]!=0;});
+    float mapped_row=field(request.uv_rows);
+    float mapped_col=field(request.uv_cols);
     grid::PointMap sourceMap;sourceMap.height=int(request.source_height);sourceMap.width=int(request.source_width);
     const bool source_xyz_valid=uv_corners_valid&&grid::point(sourceMap,request.source,mapped_col,mapped_row,source);
     float source_x=source[0],source_y=source[1],source_z=source[2];
@@ -209,11 +142,7 @@ VCR_TRANSFER_HD inline void transferPixel(const RasterRequest& request,RasterRes
     ) {
         // Reject seam fill beyond the selected anchor distance limit.
         if (request.has_seam_limit != 0) {
-            const float anchor_distance = bilinear(
-                request.filled_uv_anchor_distance,
-                position,
-                request.target_width
-            );
+            const float anchor_distance = field(request.filled_uv_anchor_distance);
             if (
                 !std::isfinite(anchor_distance) ||
                 anchor_distance > request.max_seam_distance
@@ -222,12 +151,8 @@ VCR_TRANSFER_HD inline void transferPixel(const RasterRequest& request,RasterRes
                 return;
             }
         }
-        const float seam_row = bilinear(
-            request.filled_uv_rows, position, request.target_width
-        );
-        const float seam_col = bilinear(
-            request.filled_uv_cols, position, request.target_width
-        );
+        const float seam_row = field(request.filled_uv_rows);
+        const float seam_col = field(request.filled_uv_cols);
         std::int64_t seam_index = -1;
         if (label_index(seam_row, seam_col, request, seam_index)) {
             const bool seam_source_valid =

@@ -11,9 +11,8 @@ void transfer(const RasterRequest& r,RasterResult& out,int device){
 #endif
     out={};auto n=(r.row_end-r.row_start)*(r.col_end-r.col_start);
     if(n<4096){for(std::int64_t i=0;i<n;++i)transferPixel(r,&out,i);return;}
-    static ThreadPool pool(std::min(8u,std::max(1u,std::thread::hardware_concurrency())));
     std::vector<RasterResult> counts((n+4095)/4096);
-    pool.parallel_for(counts.size(),[&](std::size_t block){
+    samplingPool().parallel_for(counts.size(),[&](std::size_t block){
         for(auto i=std::int64_t(block)*4096;i<std::min(n,std::int64_t(block+1)*4096);++i)transferPixel(r,&counts[block],i);
     });
     for(const auto& c:counts){

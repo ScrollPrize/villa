@@ -115,3 +115,26 @@ def test_compiled_sampling_and_surface_queries(device):
     compiled_surface = torch.compile(surface_points, backend='aot_eager', fullgraph=True)
     for a, b in zip(compiled_surface(xyz, mask, rc), surface_points(xyz, mask, rc)):
         torch.testing.assert_close(a, b)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_integer_and_singleton_coordinate_gradients(device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    values = torch.tensor([[[[2., 5., 9.]]]], device=device, requires_grad=True)
+    points = torch.tensor([[[0., 0.], [0., 1.], [0., 2.], [-1., 1.]]], device=device, requires_grad=True)
+    out = torch_sample(values, points, boundary='border')
+    out.sum().backward()
+    torch.testing.assert_close(out, torch.tensor([[[2., 5., 9., 5.]]], device=device))
+    torch.testing.assert_close(points.grad, torch.tensor([[[0., 0.], [0., 4.], [0., 0.], [0., 4.]]], device=device))
+    torch.testing.assert_close(values.grad, torch.tensor([[[[1., 2., 1.]]]], device=device))
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_nearest_just_below_half_does_not_round_up(device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    values = torch.tensor([[[[2., 5.]]]], device=device)
+    half = np.float32(.5)
+    points = torch.tensor([[[0., np.nextafter(half, np.float32(0))], [0., half]]], device=device)
+    torch.testing.assert_close(torch_sample(values, points, order=0), torch.tensor([[[2., 5.]]], device=device))
