@@ -731,6 +731,20 @@ def test_bindings_advertise_the_winding_inference_binding(host, store, tmp_path)
     assert unusable['capabilities']['winding_inference'] is False
 
 
+def test_configuration_defaults_follow_the_winding_inference_binding(
+        host, store, tmp_path):
+    def default(bindings=None):
+        return service(host, store, bindings).configuration_catalog()[
+            'defaults']['input_use_winding_inference']
+
+    assert default() is False
+    assert default(spiral_service.bind_service_inputs(
+        host.output, host.cache, winding_artifact(tmp_path / 'winding'))) is True
+    assert default(spiral_service.bind_service_inputs(
+        host.output, host.cache,
+        winding_artifact(tmp_path / 'broken', valid=False))) is False
+
+
 def test_a_missing_winding_inference_binding_is_refused_at_launch(tmp_path):
     with pytest.raises(spiral_service.ServiceBindingError, match='is not a directory'):
         spiral_service.bind_service_inputs(tmp_path / 'out', tmp_path / 'cache',

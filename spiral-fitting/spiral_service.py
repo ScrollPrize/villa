@@ -1088,6 +1088,13 @@ class ServiceState:
             catalog["schema"] = {**catalog["schema"], "fields": fields}
             catalog["defaults"] = {**catalog["defaults"],
                                    **self.object_store.config()}
+        if self.bindings is None \
+                or not self.bindings.winding_inference_status()["available"]:
+            # Winding-model supervision cannot run here, so a client starting
+            # from these defaults leaves the source out rather than having
+            # preparation refuse it.
+            catalog["defaults"] = {**catalog["defaults"],
+                                   "input_use_winding_inference": False}
         return catalog
 
     def binding_advertisement(self):
