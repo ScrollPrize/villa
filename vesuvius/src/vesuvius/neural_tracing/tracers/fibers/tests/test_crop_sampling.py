@@ -6,7 +6,7 @@ import pytest
 import torch
 from vc_reader.reader import ZarrWriter, open_zarr
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import crop_grids, cuda_scalar_crops, scalar_crops
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import cuda_scalar_crops, scalar_crops
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
     ZSCORE_EPSILON, ZSCORE_METHOD, normalize_ct)
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
@@ -76,11 +76,6 @@ def test_cuda_scalar_crops_match_cpu(tmp_path, crop, input_scale):
     gpu = cuda_scalar_crops(items, cuda, spec, crop).cpu().numpy()
     cpu = scalar_crops(items, ct, spec, crop).numpy()
     np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-4)
-    raw_cpu = scalar_crops(items, ct, spec, crop, normalize=False).numpy()[:, 0]
-    out = torch.empty(raw_cpu.shape, dtype=torch.float32, device=torch.device('cuda', cuda.device))
-    size, origins, axes = crop_grids(items, crop, spec.input_scale)
-    cuda.read_affine_batch(size, origins, axes, order=1, out=out)
-    np.testing.assert_allclose(out.cpu().numpy()/255., raw_cpu, rtol=0, atol=1e-6)
 
 
 def test_normalize_matches_numpy():

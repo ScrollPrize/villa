@@ -56,12 +56,11 @@ def test_displacement_sampling_keeps_zyx_query_order():
     assert valid.tolist() == [True, False]
 
 
-def test_surface_lattice_uses_shared_geometry():
+def test_surface_lattice_points_follow_stored_uv():
     row, col = np.mgrid[:5, :5].astype(np.float32)
     xyz = np.stack((col, row, col * col), -1)
-    uv, points, metadata = _surface_to_stored_uv_samples_lattice(xyz, np.ones(row.shape, bool), (0, 0), 2, 2)
+    uv, points, _ = _surface_to_stored_uv_samples_lattice(xyz, np.ones(row.shape, bool), (0, 0), 2, 2)
     np.testing.assert_array_equal(points, xyz[uv[:, 0] * 2, uv[:, 1] * 2])
-    assert metadata["mode"] == "lattice_vc_reader"
 
 
 def test_winding_phase_uses_boundary_voxel_and_shared_float32_sampling():

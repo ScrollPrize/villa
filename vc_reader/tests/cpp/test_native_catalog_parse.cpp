@@ -52,7 +52,9 @@ const char* kSample = R"({
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "surface-prediction-zarr", "parameters": {"level": 2}},
             {"type": "normal-grids", "parameters": {"level": 2.5}},
-            {"type": "lasagna", "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
+            {"type": "lasagna", "parameters": {"model_id": "model-7"},
+              "creation_info": {"lasagna_version": 2, "source_to_base": 1.0},
+              "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "ink_detection_3d_zarr"},
             {"type": "future-pred-zarr"}
@@ -145,6 +147,12 @@ int main()
         require(artifacts[1].levelParameterPresent && artifacts[1].sourceCoordinateLevel == 2, "integer level");
         require(artifacts[2].levelParameterPresent && !artifacts[2].sourceCoordinateLevel, "fractional level rejected");
         require(!artifacts[3].levelParameterPresent, "absent level");
+        require(artifacts[3].modelId == "model-7" && artifacts[3].lasagnaVersion == 2 &&
+                    artifacts[3].sourceToBase == 1.0 && !artifacts[1].lasagnaVersionPresent,
+                "Lasagna model and creation info");
+        require(artifacts[3].url() ==
+                    "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/representations/predictions/fibers/f1",
+                "directory artifact URL has no trailing slash");
         const auto representations = derivedRepresentations(*sample);
         require(representations.size() == 5 && representations[0].kind == OpenDataRepresentationKind::Prediction &&
                     representations[1].kind == OpenDataRepresentationKind::NormalGrids &&

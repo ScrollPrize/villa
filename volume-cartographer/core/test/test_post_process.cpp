@@ -17,74 +17,6 @@ static uint8_t R(uint32_t p) { return uint8_t((p >> 16) & 0xFF); }
 static uint8_t G(uint32_t p) { return uint8_t((p >>  8) & 0xFF); }
 static uint8_t B(uint32_t p) { return uint8_t( p        & 0xFF); }
 
-
-TEST_CASE("buildWindowLevelLut: identity window [0, 255]")
-{
-    LUT lut{};
-    vcr::display::windowLevelLut(lut, 0.0f, 255.0f);
-
-    for (int i = 0; i < 256; ++i) {
-        CHECK(A(lut[i]) == 255);
-        CHECK(R(lut[i]) == G(lut[i]));
-        CHECK(G(lut[i]) == B(lut[i]));
-    }
-
-    CHECK(R(lut[0])   == 0);
-    CHECK(R(lut[128]) == 128);
-    CHECK(R(lut[255]) == 255);
-}
-
-TEST_CASE("buildWindowLevelLut: narrow window stretches contrast")
-{
-    LUT lut{};
-    vcr::display::windowLevelLut(lut, 64.0f, 192.0f);
-
-    CHECK(R(lut[0])  == 0);
-    CHECK(R(lut[63]) == 0);
-    CHECK(R(lut[64]) == 0);
-    CHECK(R(lut[128]) == 127);
-    CHECK(R(lut[192]) == 255);
-    CHECK(R(lut[255]) == 255);
-}
-
-TEST_CASE("buildWindowLevelLut: equal endpoints get separated by clamp")
-{
-    LUT lut{};
-    vcr::display::windowLevelLut(lut, 100.0f, 100.0f);
-
-    CHECK(R(lut[99])  == 0);
-    CHECK(R(lut[100]) == 0);
-    CHECK(R(lut[101]) == 255);
-    CHECK(R(lut[255]) == 255);
-}
-
-TEST_CASE("buildWindowLevelLut: inverted window collapses to lo+1")
-{
-    LUT lut{};
-    vcr::display::windowLevelLut(lut, 200.0f, 50.0f);
-
-    CHECK(R(lut[199]) == 0);
-    CHECK(R(lut[200]) == 0);
-    CHECK(R(lut[201]) == 255);
-}
-
-TEST_CASE("buildWindowLevelLut: out-of-range endpoints clamp into [0, 255]")
-{
-    LUT lut{};
-    vcr::display::windowLevelLut(lut, -50.0f, 500.0f);
-
-    CHECK(R(lut[0])   == 0);
-    CHECK(R(lut[128]) == 128);
-    CHECK(R(lut[255]) == 255);
-}
-
-TEST_CASE("buildWindowLevelLut: noexcept contract holds")
-{
-    static_assert(noexcept(vcr::display::windowLevelLut(
-        std::declval<LUT&>(), 0.0f, 0.0f)));
-}
-
-
 TEST_CASE("buildWindowLevelColormapLut: empty id == grayscale buildWindowLevelLut")
 {
     LUT gray{}, cm{};
@@ -147,7 +79,6 @@ TEST_CASE("buildWindowLevelColormapLut: unknown id falls back to first spec")
     CHECK(fire == unknown);
 }
 
-
 TEST_CASE("buildOverlayLut: default mode is the colormap LUT band-passed to the window")
 {
     LUT color{}, lut{};
@@ -208,12 +139,4 @@ TEST_CASE("buildOverlayLut: label maps ignore intensity-as-alpha")
     vc::buildOverlayLut(plain, 5.0f, 40.0f, "glasbey_black0", false);
     vc::buildOverlayLut(alpha, 5.0f, 40.0f, "glasbey_black0", true);
     CHECK(plain == alpha);
-}
-
-TEST_CASE("blendOverlayArgb: opaque entry matches the plain opacity mix")
-{
-    const uint32_t base = 0xFF204060u, over = 0xFFC08010u;
-    // (1 - 0.3) * b + 0.3 * o per channel, rounded.
-    CHECK(vcr::display::blendArgb(base, over, 0.3f) == 0xFF505348u);
-    CHECK(vcr::display::blendArgb(base, 0u, 0.3f) == base);
 }

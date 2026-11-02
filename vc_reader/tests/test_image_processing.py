@@ -54,6 +54,9 @@ def test_structure_tensor_values_and_backward(dim, sigma, rho):
         reference = _torch_tensor_reference(image, sigma, rho)
         actual = structure_tensor(image, sigma=sigma, rho=rho)
         torch.testing.assert_close(actual, reference, atol=2e-6, rtol=2e-5)
+        pipeline = A.Pipeline([A.StructureTensor(sigma=sigma, rho=rho)], backend=device)
+        components = pipeline({"image": image[0].detach().cpu().numpy()}, seed=0)["image_st"]
+        np.testing.assert_allclose(components, reference[0].detach().cpu().numpy(), atol=2e-6, rtol=2e-5)
         cotangent = torch.tensor(np.random.default_rng(3).normal(size=actual.shape), dtype=image.dtype, device=device)
         expected_grad, = torch.autograd.grad(reference, image, cotangent)
         actual_grad, = torch.autograd.grad(actual, image, cotangent)

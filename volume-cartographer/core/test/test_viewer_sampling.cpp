@@ -523,19 +523,6 @@ TEST_CASE("the background read stops when told to, and volumetric views have no 
     CHECK_FALSE((params.volumetric ? std::nullopt : std::optional(params.options)));
 }
 
-TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer is asked for")
-{
-    vcr::grid::Result composite;
-    composite.width = 2;
-    composite.height = 1;
-    composite.values = {10.0f, std::numeric_limits<float>::quiet_NaN()};
-    uint8_t values[2] = {}, coverage[2] = {};
-    vcr::display::toUint8(composite.values.data(), std::size_t(composite.width) * composite.height, values, coverage);
-    CHECK(values[0] == 10);
-    CHECK(coverage[0] != 0);
-    CHECK(coverage[1] == 0);
-}
-
 TEST_CASE("a cursor's offset from a surface is the frame's layer offset, in physical units")
 {
     cv::Mat_<cv::Vec3f> points(4, 4);

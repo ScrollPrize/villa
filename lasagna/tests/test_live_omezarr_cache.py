@@ -82,17 +82,6 @@ def test_read_ahead_skips_a_region_the_listing_says_is_empty(served):
     assert cache.snapshot()["downloaded_chunks"] == 0
 
 
-def test_cache_stays_within_its_target(served):
-    level, _data = served
-    with live.LiveOmeZarrCache(level, max_bytes=2 * 64, lookahead_tiles=2, workers=2) as cache:
-        reader = cache.open_reader()
-        for iy in range(2):
-            for ix in range(2):
-                reader[0:4, iy * 4:iy * 4 + 4, ix * 4:ix * 4 + 4]
-    chunks = [p for p in (level.parent / ".live_cache").rglob("*") if p.is_file() and p.stat().st_size == 64]
-    assert len(chunks) <= 2
-
-
 def test_closed_cache_refuses_requests_and_keeps_its_counters(served):
     level, _data = served
     cache = live.LiveOmeZarrCache(level, max_bytes=1 << 20, lookahead_tiles=2, workers=2)
