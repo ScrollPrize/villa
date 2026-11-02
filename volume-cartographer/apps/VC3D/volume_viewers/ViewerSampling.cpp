@@ -89,6 +89,31 @@ int sourceLevelForView(const ViewerLevels& levels, float pixelsPerBaseVoxel, flo
     return std::max(selected, 0);
 }
 
+float surfacePixelsPerVoxel(const QuadSurface& surface, const vcr::grid::Raster& viewport,
+                            float nominalPixelsPerVoxel)
+{
+    const auto grid = surface.pointSurface();
+    double magnification = 0;
+    // Include off-center patches when the camera is over a hole or a boundary.
+    for (const double y : {0.25, 0.5, 0.75}) {
+        for (const double x : {0.25, 0.5, 0.75}) {
+            const float xy[] = {float(viewport.x0 + x * viewport.width * viewport.sx),
+                                float(viewport.y0 + y * viewport.height * viewport.sy)};
+            cv::Vec3f du, dv;
+            grid->pointsAt(xy, 1, nullptr, nullptr, du.val, dv.val);
+            const cv::Vec3d dx = cv::Vec3d(du) * viewport.sx;
+            const cv::Vec3d dy = cv::Vec3d(dv) * viewport.sy;
+            const double a = dx.dot(dx), b = dx.dot(dy), c = dy.dot(dy);
+            // Smaller singular value: resolve the most magnified direction,
+            // including grids whose row and column tangents are not orthogonal.
+            const double extent2 = 0.5 * (a + c - std::hypot(a - c, 2 * b));
+            if (std::isfinite(extent2) && extent2 > 0)
+                magnification = std::max(magnification, 1.0 / std::sqrt(extent2));
+        }
+    }
+    return magnification > 0 ? float(magnification) : nominalPixelsPerVoxel;
+}
+
 int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, int viewportWidth,
                                   int viewportHeight, float pixelsPerBaseVoxel, int maximumFallbackLevels)
 {
@@ -119,6 +144,8 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     const auto* points = surface.rawPointsPtr();
     if (!points || points->empty())
         return nullptr;
+    if (spacing == std::array<float, 3>{1, 1, 1})
+        return surface.pointSurface();
     auto options = surface.gridOptions();
     options.spacing = spacing;
     std::vector<std::uint8_t> valid;

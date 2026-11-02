@@ -132,6 +132,9 @@ public:
     SurfaceCatalog* catalog() const { return _catalog; }
     // The surface last opened by activation, pinned at the revisions it was read from.
     const std::optional<SurfaceCatalog::Opened>& opened() const { return _opened; }
+    // Replace the selected surface's materialization after a working-level
+    // change, without firing the user-selection/recenter path.
+    void replaceOpenedSurface(SurfaceCatalog::Opened opened);
     // Surfaces the filters show that can be drawn in the current volume.
     const std::vector<std::string>& visibleSurfaceIds() const { return _visibleSurfaceIds; }
 

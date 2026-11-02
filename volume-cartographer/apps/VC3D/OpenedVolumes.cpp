@@ -3,6 +3,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <vc_reader/native/cuda_available.hpp>
+#include <vc_reader/array.hpp>
 #ifdef VC_READER_CUDA
 #include <vc_reader/native/reader_cuda/reader.hpp>
 #endif
@@ -11,6 +12,19 @@ OpenedVolumes::OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes)
     : cache_(std::make_shared<vcr::MemoryCache>(cacheBytes))
     , gpuCacheBytes_(vcr::cuda::available() ? gpuCacheBytes : 0)
 {
+}
+
+OpenedVolumes::TransferStats OpenedVolumes::transferStats()
+{
+    std::lock_guard lock(mutex_);
+    TransferStats result;
+    for (const auto& [key, level] : levels_) {
+        if (!level) continue;
+        const auto& stats = level->array->stats();
+        result.chunks += stats.remote_fetches.load();
+        result.bytes += stats.remote_bytes.load();
+    }
+    return result;
 }
 
 std::shared_ptr<vcr::zarr::OpenedArray> OpenedVolumes::open(const Volume& volume, int physical)

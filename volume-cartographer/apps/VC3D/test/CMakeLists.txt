@@ -608,6 +608,11 @@ if(TARGET VC3D)
     set_tests_properties(surface_panel_store PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
     vc_register_ctest(surface_panel_store VC3D)
+    add_test(NAME viewer_regressions COMMAND VC3D --test-viewer-regressions)
+    set_tests_properties(viewer_regressions PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;VC3D_CONFIG_DIR=${CMAKE_CURRENT_BINARY_DIR}/viewer-regression-config"
+        TIMEOUT 90)
+    vc_register_ctest(viewer_regressions VC3D)
 endif()
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp

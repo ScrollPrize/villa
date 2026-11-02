@@ -55,6 +55,7 @@ class Volume;
 class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
 {
     Q_OBJECT
+    friend int runViewerRegressionTests();
 
 public:
     struct CameraState {
@@ -84,6 +85,7 @@ public:
         std::source_location caller = std::source_location::current()) override;
     void refreshStatus() override;
     void invalidateVis() override;
+    QString loadingStatus() const;
     void centerOnVolumePoint(const cv::Vec3f& point) override;
     void centerOnSurfacePoint(const cv::Vec2f& point) override;
     void adjustSurfaceOffset(float delta) override;
@@ -371,6 +373,10 @@ private:
         std::optional<Rect3D> focusBoundsBase;
         // The vertex grid of the QuadSurface shown (null for planes).
         std::shared_ptr<const vcr::grid::Surface> gridSurface;
+        // Camera geometry captured on the UI thread, never read from a mutable
+        // PlaneSurface/QuadSurface by the render worker.
+        std::optional<vcr::grid::Plane> plane;
+        vcr::grid::Raster raster;
         bool geometryDirty = false;
         std::string profileReason;
         std::string profileCaller;
@@ -394,11 +400,13 @@ private:
     // missing chunks in the other.
     static bool renderJobsSameGeometry(const PendingRenderJob& a,
                                        const PendingRenderJob& b);
+    static bool renderJobsSameView(const PendingRenderJob& a, const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
+    float pixelsPerVoxel() const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     // Sync the volumetric camera gizmo's visibility/state with the current
     // composite settings and surface type.
@@ -460,7 +468,6 @@ private:
     // background tab). We skip the work and set this; showEvent re-renders so the
     // viewer catches up on whatever went stale while invisible.
     bool _renderStaleWhileHidden = false;
-    bool _suppressNextSurfaceEditRender = false;
 
     bool _volumetricAzimuthInSurface = false;
     // Last-seen frame of a displayed PlaneSurface: when the plane is rotated

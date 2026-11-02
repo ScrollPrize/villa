@@ -48,6 +48,10 @@ ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume);
 // most 1 / (pixelsPerBaseVoxel * qualityBias), or the finest level when none is.
 int sourceLevelForView(const ViewerLevels& levels, float pixelsPerBaseVoxel, float qualityBias);
 double maximumBaseVoxelExtent(const ViewerLevels& levels, int level);
+// Convert flattened UV zoom to voxel zoom using the actual surface tangents.
+// UV units need not span one working voxel (scaled or stretched tifxyz grids).
+float surfacePixelsPerVoxel(const QuadSurface& surface, const vcr::grid::Raster& viewport,
+                            float nominalPixelsPerVoxel);
 // How many coarser levels may fill a viewport's holes: up to the first level one
 // of whose chunks spans the larger viewport edge.
 int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, int viewportWidth,

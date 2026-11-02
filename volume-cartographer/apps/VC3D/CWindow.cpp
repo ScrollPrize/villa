@@ -958,7 +958,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _sharedCacheStatsLabel = new GrowOnlyLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setToolTip(
-        tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
+        tr("Shared RAM cache, downloaded bytes/chunks for this session, and viewers loading volume levels.\n"
+           "Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
     updateSharedStatusLabel();
 
@@ -4446,7 +4447,36 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    if (_segmentationModule) {
+        const auto save = _segmentationModule->autosaveStatus();
+        if (save.saveInProgress || save.pending || save.dirtyAfterSave) {
+            if (!save.saveInProgress) _segmentationModule->flushAutosave();
+            statusBar()->showMessage(tr("Finishing the surface save before changing the working level…"), 2000);
+            QTimer::singleShot(100, this, [this, volume, level] {
+                if (_state->currentVolume() == volume && _volumeLevelSpin && _volumeLevelSpin->value() == level)
+                    setVolumeLevel(level);
+            });
+            return;
+        }
+        if (_segmentationModule->hasActiveSession()) _segmentationModule->endEditingSession();
+    }
+    const auto navigation = _viewerManager ? _viewerManager->captureNavigation() : nullptr;
+    const auto oldVoxels = _state->annotationVolume().value_or(
+        vc::project::annotationVolume(_state->vpkg().get(), *volume));
+    std::optional<SurfaceCatalog::Opened> reopened;
+    std::optional<vcr::catalog::Affine> transform;
     try {
+        // Prepare geometry before persisting the new level: a failed surface
+        // read must leave both the project and the current view untouched.
+        auto nextVoxels = vc::objects::VolumeVoxels(oldVoxels);
+        nextVoxels.scale *= std::ldexp(1.0, volume->baseScaleLevel() - level);
+        transform = volumeTransformForSwitch(oldVoxels, nextVoxels);
+        if (_surfacePanel && _surfacePanel->opened() && _state->surface("segmentation")) {
+            const auto& opened = *_surfacePanel->opened();
+            reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
+                                            nextVoxels, opened.surface->id,
+                                            opened.current ? std::nullopt : std::optional(opened.pin.objectRevision));
+        }
         _state->vpkg()->setVolumeLevel(volume->id(), level);
     } catch (const std::exception& error) {
         QMessageBox::warning(this, tr("Working Level"),
@@ -4455,7 +4485,18 @@ void CWindow::setVolumeLevel(int level)
         syncVolumeLevelControl();
         return;
     }
+    // Drop the old-frame draft before changing the frame it is declared in.
+    if (reopened) _state->setSurface("segmentation", nullptr);
     setVolume(_state->vpkg()->volume(volume->id()));
+    if (reopened) {
+        const auto surface = reopened->surface;
+        _surfacePanel->replaceOpenedSurface(std::move(*reopened));
+        _state->setActiveSurface(surface->id, surface);
+        _state->setSurface("segmentation", surface, false, true);
+        if (_segmentationModule) _segmentationModule->onActiveSegmentChanged(surface.get());
+        _axisAlignedSliceController->applyOrientation(surface.get());
+    }
+    if (navigation && transform) _viewerManager->restoreNavigation(navigation, *transform);
     refreshVolumeSelectionUi(QString::fromStdString(volume->id()));
 }
 

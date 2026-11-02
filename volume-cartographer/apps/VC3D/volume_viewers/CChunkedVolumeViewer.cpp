@@ -599,6 +599,8 @@ void CChunkedVolumeViewer::startPendingLoad()
     auto load = std::make_shared<const vc3d::ViewerLoad>(std::move(*_pendingLoad));
     _pendingLoad.reset();
     _loadRunning = true;
+    _sharedCacheStatsThrottle.invalidate();
+    updateStatusLabel();
     _loadSuperseded = std::make_shared<std::atomic<bool>>(false);
     QPointer<CChunkedVolumeViewer> guard(this);
     (void)QtConcurrent::run([guard, load, superseded = _loadSuperseded]() {
@@ -627,6 +629,8 @@ void CChunkedVolumeViewer::startPendingLoad()
             guard->_loadError = error;
             if (guard->_closing)
                 return;
+            guard->_sharedCacheStatsThrottle.invalidate();
+            guard->updateStatusLabel();
             if (error.isEmpty()) {
                 guard->startPendingLoad();
                 return;
@@ -661,6 +665,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
     _volume = std::move(vol);
     _pendingLoad.reset();
+    _loadError.clear();
     openLevels();
     if (!_volume) {
         // No volume means submitRender() below will skip; drop the previous
@@ -684,7 +689,11 @@ void CChunkedVolumeViewer::invalidateVis()
         return;
     }
     _geometryDirty = true;
+    ++_surfaceGeometryEpoch;
+    ++_surfaceEditEpoch;
     _gridSurface.reset();
+    if (auto* quad = dynamic_cast<QuadSurface*>(currentSurface()))
+        quad->dropPointSurface();
 }
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
@@ -717,6 +726,8 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
     if (isCurrentSurface)
         _gridSurface.reset();  // edited or replaced: its grid is rebuilt for the next frame
+    if (isCurrentSurface && isEditUpdate)
+        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) quad->dropPointSurface();
     if (!isCurrentSurface) {
         return;
     }
@@ -765,21 +776,12 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     if (isSameCurrentSurface && isEditUpdate) {
         _geometryDirty = true;
         ++_surfaceEditEpoch;
-        // A plane mutated in place (axis-aligned slice rotation/tilt, line
-        // annotation cut planes) leaves nothing for the render-job identity in
-        // renderJobsSameGeometry() to compare: same object, same camera. Without
-        // a fresh epoch the submit below is discarded as a duplicate of the
-        // displayed frame and the new orientation is never drawn.
-        if (dynamic_cast<PlaneSurface*>(surf.get())) {
-            ++_surfaceGeometryEpoch;
-        }
+        // Both planes and quads can mutate without changing their address.
+        // Every edit must differ from an in-flight or displayed render.
+        ++_surfaceGeometryEpoch;
         updateContentBounds();
         updateFocusMarker();
-        if (_suppressNextSurfaceEditRender) {
-            _suppressNextSurfaceEditRender = false;
-        } else {
-            submitRender("current surface edit update");
-        }
+        submitRender("current surface edit update");
         return;
     }
 
@@ -1099,9 +1101,6 @@ void CChunkedVolumeViewer::resizeFramebuffer()
 
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
 {
-    if (reason && std::string_view(reason) == "push/pull active viewer refresh") {
-        _suppressNextSurfaceEditRender = true;
-    }
     submitRender(reason, caller);
 }
 
@@ -1142,6 +1141,17 @@ void CChunkedVolumeViewer::requestDirectPaint()
     _view->viewport()->update();
 }
 
+float CChunkedVolumeViewer::pixelsPerVoxel() const
+{
+    auto* quad = dynamic_cast<QuadSurface*>(currentSurface());
+    if (!quad || !_view) return _scale;
+    const auto size = _view->viewport()->size();
+    const auto raster = quad->gridRaster(_surfacePtrX - size.width() * 0.5 / _scale,
+                                         _surfacePtrY - size.height() * 0.5 / _scale,
+                                         _scale, {size.width(), size.height()});
+    return vc3d::surfacePixelsPerVoxel(*quad, raster, _scale);
+}
+
 int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
 {
     if (!_levels || _levels->count() == 0)
@@ -1149,10 +1159,10 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc3d::sourceLevelForView(*_levels, _scale, lodZoomBias);
+    int level = vc3d::sourceLevelForView(*_levels, pixelsPerVoxel(), lodZoomBias);
     // The surface renderer resamples volume data straight into the
     // framebuffer and benefits from one finer source level.
-    if (preferSurfaceResolution && level < _levels->count() - 1)
+    if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _maxDisplayedResolution);
     return std::clamp(level, 0, _levels->count() - 1);
@@ -1165,8 +1175,8 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc3d::sourceLevelForView(*_overlayLevels, _scale, lodZoomBias);
-    if (preferSurfaceResolution && level < _overlayLevels->count() - 1)
+    int level = vc3d::sourceLevelForView(*_overlayLevels, pixelsPerVoxel(), lodZoomBias);
+    if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _overlayMaxDisplayedResolution);
     return std::clamp(level, 0, _overlayLevels->count() - 1);
@@ -1389,12 +1399,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
+    std::vector<std::int8_t> missingBase, missingOverlay;
     cv::Mat_<uint8_t> focusBoundsInside;
     if (ctx.renderJob.focusBoundsBase) {
         focusBoundsInside = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
     }
-    auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get());
-    const bool planeView = plane != nullptr;
+    const bool planeView = ctx.renderJob.plane.has_value();
     if (!planeView && !ctx.gridSurface) {
         finishRenderFrameProfile();
         return result;
@@ -1469,29 +1479,22 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const int width = ctx.fbW + margins.left + margins.right;
         const int height = ctx.fbH + margins.top + margins.bottom;
         if (planeView) {
-            const cv::Vec3f vx = plane->basisX();
-            const cv::Vec3f vy = plane->basisY();
-            const cv::Vec3f n = plane->normal({0, 0, 0});
-            const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
-            const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
-            const cv::Vec3f vxStep = vx / ctx.scale;
-            const cv::Vec3f vyStep = vy / ctx.scale;
-            const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW) + vy * (ctx.surfacePtrY - halfH) +
-                                     plane->origin() + n * ctx.zOff - vxStep * float(margins.left) -
-                                     vyStep * float(margins.top);
-            geometry.plane = vcr::grid::Plane{{origin[0], origin[1], origin[2]},
-                                              {vxStep[0], vxStep[1], vxStep[2]},
-                                              {vyStep[0], vyStep[1], vyStep[2]},
-                                              {n[0], n[1], n[2]}, width, height};
+            geometry.plane = ctx.renderJob.plane;
+            auto& plane = *geometry.plane;
+            for (int axis = 0; axis < 3; ++axis)
+                plane.origin[axis] -= plane.dx[axis] * margins.left + plane.dy[axis] * margins.top;
+            plane.width = width;
+            plane.height = height;
             return geometry;
         }
         // QuadSurface::gen's view: surface UV (ptr - half the viewport) at `scale`
         // framebuffer pixels per surface unit, in grid units.
-        auto* quad = static_cast<QuadSurface*>(ctx.surf.get());
-        const double u0 = double(ctx.surfacePtrX) - (double(ctx.fbW) * 0.5 + margins.left) / double(ctx.scale);
-        const double v0 = double(ctx.surfacePtrY) - (double(ctx.fbH) * 0.5 + margins.top) / double(ctx.scale);
         geometry.surface = ctx.gridSurface;
-        geometry.raster = quad->gridRaster(u0, v0, double(ctx.scale), {width, height});
+        geometry.raster = ctx.renderJob.raster;
+        geometry.raster.x0 -= margins.left * geometry.raster.sx;
+        geometry.raster.y0 -= margins.top * geometry.raster.sy;
+        geometry.raster.width = width;
+        geometry.raster.height = height;
         return geometry;
     };
     const auto geometry = frameGeometry({});
@@ -1545,6 +1548,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
         const auto sampled = vc3d::sampleCached(geometry, base, &result.load);
+        missingBase = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
     }
@@ -1565,6 +1569,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             overlay.composite = (overlayParams.volumetric ? std::nullopt : std::optional(overlayParams.options));
         }
         const auto sampled = vc3d::sampleCached(geometry, overlay, &result.load);
+        missingOverlay = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, overlayValues.ptr(), overlayCoverage.ptr());
     }
@@ -1597,11 +1602,15 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     // blank until it lands. Sampling above always runs first, so refined data
     // still replaces carried pixels as soon as it exists.
     if (const RenderResult* prev = ctx.prevResult.get();
-        prev && !ctx.geometryDirty &&
-        renderJobsSameGeometry(ctx.renderJob, prev->renderJob)) {
+        prev && renderJobsSameView(ctx.renderJob, prev->renderJob) &&
+        (ctx.gridSurface || renderJobsSameGeometry(ctx.renderJob, prev->renderJob))) {
+        const bool sameGeometry = renderJobsSameGeometry(ctx.renderJob, prev->renderJob);
+        // During an edit, keep old pixels only where a new valid point is waiting
+        // for chunks. Invalid/deleted geometry must still clear immediately.
         auto fillFromPrev = [](cv::Mat_<uint8_t>& dst, cv::Mat_<uint8_t>& cov,
                                const cv::Mat_<uint8_t>& prevDst,
-                               const cv::Mat_<uint8_t>& prevCov) {
+                               const cv::Mat_<uint8_t>& prevCov,
+                               const std::vector<std::int8_t>& missing) {
             if (dst.empty() || prevDst.empty() ||
                 dst.size() != prevDst.size() || cov.size() != prevCov.size())
                 return;
@@ -1611,7 +1620,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 const uint8_t* prevDstRow = prevDst.ptr<uint8_t>(y);
                 const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
                 for (int x = 0; x < dst.cols; ++x) {
-                    if (!covRow[x] && prevCovRow[x]) {
+                    const auto q = std::size_t(y) * dst.cols + x;
+                    if (!covRow[x] && prevCovRow[x] && q < missing.size() &&
+                        missing[q] == vcr::grid::Result::kMissing) {
                         dstRow[x] = prevDstRow[x];
                         covRow[x] = 1;
                     }
@@ -1639,12 +1650,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         };
         // Same geometry implies the same composite method (compositeSettings
         // compares ==), so exactly one of these applies per frame.
-        if (!colorValues.empty())
+        if (!colorValues.empty() && sameGeometry && !ctx.geometryDirty)
             fillFromPrevColor(colorValues, coverage, prev->colorValues, prev->coverage);
         else
-            fillFromPrev(values, coverage, prev->values, prev->coverage);
+            fillFromPrev(values, coverage, prev->values, prev->coverage, missingBase);
         fillFromPrev(overlayValues, overlayCoverage,
-                     prev->overlayValues, prev->overlayCoverage);
+                     prev->overlayValues, prev->overlayCoverage, missingOverlay);
     }
     result.values = values;
     result.coverage = coverage;
@@ -1760,6 +1771,21 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
         _gridSurfaceFor = nullptr;
     }
     job.gridSurface = _gridSurface;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        const cv::Vec3f vx = plane->basisX(), vy = plane->basisY();
+        const cv::Vec3f n = plane->normal({0, 0, 0});
+        const cv::Vec3f dx = vx / job.scale, dy = vy / job.scale;
+        const cv::Vec3f origin = plane->origin() + n * job.zOff +
+            vx * (job.surfacePtrX - float(fbW) * 0.5f / job.scale) +
+            vy * (job.surfacePtrY - float(fbH) * 0.5f / job.scale);
+        job.plane = vcr::grid::Plane{{origin[0], origin[1], origin[2]},
+                                    {dx[0], dx[1], dx[2]}, {dy[0], dy[1], dy[2]},
+                                    {n[0], n[1], n[2]}, fbW, fbH};
+    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        job.raster = quad->gridRaster(job.surfacePtrX - double(fbW) * 0.5 / job.scale,
+                                      job.surfacePtrY - double(fbH) * 0.5 / job.scale,
+                                      job.scale, {fbW, fbH});
+    }
     job.geometryDirty = _geometryDirty;
     job.profileReason = reason ? reason : "";
     if (ProfileLoggingEnabled()) {
@@ -1789,17 +1815,21 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
 bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
                                                   const PendingRenderJob& b)
 {
-    auto vecEqual = [](const cv::Vec3f& lhs, const cv::Vec3f& rhs) {
-        return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2];
-    };
+    return renderJobsSameView(a, b) &&
+           a.startLevel == b.startLevel && a.overlayStartLevel == b.overlayStartLevel &&
+           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
+           a.gridSurface == b.gridSurface;
+}
+
+bool CChunkedVolumeViewer::renderJobsSameView(const PendingRenderJob& a,
+                                            const PendingRenderJob& b)
+{
     return a.fbW == b.fbW &&
            a.fbH == b.fbH &&
            a.surfacePtrX == b.surfacePtrX &&
            a.surfacePtrY == b.surfacePtrY &&
            a.scale == b.scale &&
            a.zOff == b.zOff &&
-           a.startLevel == b.startLevel &&
-           a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
            a.overlaySamplingMethod == b.overlaySamplingMethod &&
            a.compositeSettings == b.compositeSettings &&
@@ -1815,8 +1845,7 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
            a.overlayIntensityAsAlpha == b.overlayIntensityAsAlpha &&
-           a.overlayComposite == b.overlayComposite &&
-           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch;
+           a.overlayComposite == b.overlayComposite;
 }
 
 void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
@@ -2021,6 +2050,12 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (!result) {
         submitPendingRenderJobIfNeeded();
         profile.setDetails("action=drop_empty_result");
+        return;
+    }
+    if (result->renderJob.surf != _surfWeak.lock() || result->renderJob.levels != _levels) {
+        // A level/surface switch can finish while this worker is still running.
+        // Never flash geometry from the old coordinate frame after the switch.
+        submitPendingRenderJobIfNeeded();
         return;
     }
 
@@ -3898,6 +3933,17 @@ const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() 
     return _surfaceOverlays;
 }
 
+QString CChunkedVolumeViewer::loadingStatus() const
+{
+    if (!_volume || _closing) return {};
+    if (!_loadError.isEmpty())
+        return QString::fromStdString(_surfName) + tr(": read failed: ") + _loadError;
+    if (!_loadRunning && !_pendingLoad) return {};
+    const int level = _volume ? _volume->baseScaleLevel() + renderStartLevel(
+        dynamic_cast<QuadSurface*>(currentSurface()) != nullptr) : 0;
+    return tr("%1: loading L%2").arg(QString::fromStdString(_surfName)).arg(level);
+}
+
 void CChunkedVolumeViewer::updateStatusLabel()
 {
     // Piggyback on the status refresh: it runs on every surface/settings
@@ -3950,11 +3996,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
             freshItems << QString("RAM %1/%2")
                 .arg(formatByteSize(cache.bytes))
                 .arg(formatByteSize(cache.capacity));
+            const auto transfer = _state->openedVolumes()->transferStats();
+            freshItems << tr("Downloaded %1 (%2 chunks)")
+                .arg(formatByteSize(transfer.bytes)).arg(transfer.chunks);
         }
-        if (_loadRunning)
-            freshItems << QStringLiteral("loading");
-        if (!_loadError.isEmpty())
-            freshItems << QStringLiteral("⚠ read failed: ") + _loadError;
         _cachedSharedCacheItems = std::move(freshItems);
     }
     sharedCacheItems = _cachedSharedCacheItems;

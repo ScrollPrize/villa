@@ -97,6 +97,38 @@ TEST_CASE("viewer levels and level choice")
     CHECK(g.scale[0] * 4.5 + g.offset[0] == doctest::Approx(2.0));
 }
 
+TEST_CASE("flattened LOD follows the actual voxel spacing of the surface")
+{
+    Fixture f;
+    OpenedVolumes opened(64 << 20);
+    const auto levels = openLevels(opened, *f.volume);
+    // UV units span only a quarter voxel: nominal zoom alone chooses L1,
+    // although the actual viewport requires L0.
+    cv::Mat_<cv::Vec3f> points(9, 9);
+    for (int r = 0; r < 9; ++r)
+        for (int c = 0; c < 9; ++c) points(r, c) = {float(c), float(r), 6};
+    QuadSurface quad(points, {0.25f, 0.25f});
+    const auto raster = quad.gridRaster(-quad.center()[0], -quad.center()[1], 0.5, {12, 12});
+    const auto zoom = vc3d::surfacePixelsPerVoxel(quad, raster, 0.5f);
+    CHECK(zoom == doctest::Approx(2));
+    CHECK(vc3d::sourceLevelForView(*levels, 0.5f, 1) == 1);
+    CHECK(vc3d::sourceLevelForView(*levels, zoom, 1) == 0);
+
+    vc3d::ViewerGeometry geometry;
+    geometry.surface = vc3d::gridSurface(quad);
+    geometry.raster = raster;
+    vc3d::ViewerLoad preview;
+    vc3d::sampleCached(geometry, {levels, 1, 0, 0}, &preview);
+    vc3d::loadPending(preview, [] { return true; });
+    vc3d::ViewerLoad detail;
+    vc3d::sampleCached(geometry, {levels, 0, 1, 0}, &detail);
+    REQUIRE(detail.target.size() == 1);
+    vc3d::loadPending(detail, [] { return true; });
+    const auto fine = vc3d::sampleCached(geometry, {levels, 0, 1, 0}, nullptr);
+    CHECK(fine.level[0] == 0);
+    CHECK(fine.values[0] == float(f.at0(6, 0, 0)));
+}
+
 TEST_CASE("frames sample the caches only; the background read completes them")
 {
     Fixture f;

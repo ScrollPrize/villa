@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,10 @@ public:
     };
     // The decoded bytes the shared memory cache holds, and its limit.
     CacheStats cacheStats() const { return {cache_->nbytes(), cache_->max_bytes()}; }
+    struct TransferStats {
+        std::uint64_t chunks = 0, bytes = 0;
+    };
+    TransferStats transferStats();
 
 private:
     std::shared_ptr<vcr::zarr::OpenedArray> open(const Volume& volume, int physical);

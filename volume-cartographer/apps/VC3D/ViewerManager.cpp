@@ -156,9 +156,9 @@ ViewerManager::ViewerManager(CState* state,
                 &ViewerManager::handleFocusPoiChanged);
     }
 
-    // Every viewer refreshes its status readout (download progress) every 5 s.
+    // Refresh transfer progress even while the pointer and camera are idle.
     _statusClock = new QTimer(this);
-    _statusClock->setInterval(5000);
+    _statusClock->setInterval(250);
     connect(_statusClock, &QTimer::timeout, this, &ViewerManager::onStatusTick);
     _statusClock->start();
 }
@@ -275,7 +275,16 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
                 this, &ViewerManager::handleVolumeClicked);
     }
     connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged,
-            this, &ViewerManager::sharedCacheStatsChanged);
+            this, [this](QStringList items) {
+                // The last idle viewer must not erase another viewer's load.
+                for (auto* base : _baseViewers) {
+                    const auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(base);
+                    if (!viewer) continue;
+                    const auto status = viewer->loadingStatus();
+                    if (!status.isEmpty()) items << status;
+                }
+                emit sharedCacheStatsChanged(items);
+            });
 
     if (auto* graphicsView = chunkedViewer->graphicsView()) {
         auto markActiveViewer = [this, baseViewer]() { _activeViewer = baseViewer; };
@@ -722,6 +731,9 @@ struct ViewerManager::ViewerNavigationSnapshot {
         CChunkedVolumeViewer::CameraState camera;
         cv::Vec3f center{0, 0, 0};
         bool hasCenter{false};
+        std::string surfaceId;
+        std::shared_ptr<Surface> surface;
+        std::optional<cv::Vec2d> grid;
     };
     std::vector<Entry> entries;
 };
@@ -729,7 +741,7 @@ struct ViewerManager::ViewerNavigationSnapshot {
 std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureNavigation() const
 {
     auto snapshot = std::make_shared<ViewerNavigationSnapshot>();
-    forEachBaseViewer([&snapshot](VolumeViewerBase* baseViewer) {
+    forEachBaseViewer([this, &snapshot](VolumeViewerBase* baseViewer) {
         auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
         if (!viewer || !viewer->graphicsView()) {
             return;
@@ -737,6 +749,11 @@ std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureN
         ViewerNavigationSnapshot::Entry captured;
         captured.viewer = viewer;
         captured.camera = viewer->cameraState();
+        if (auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface())) {
+            captured.surfaceId = quad->id;
+            captured.surface = _state->surface(viewer->surfName());
+            captured.grid = quad->surfaceToGrid({captured.camera.surfacePtrX, captured.camera.surfacePtrY});
+        }
         const QSize viewportSize = viewer->graphicsView()->viewport()->size();
         const QPointF centerScene(
             static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
@@ -772,13 +789,22 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
         if (captured.hasCenter) {
             transformedCenter = transformPoint(captured.center, transform);
         }
-        if (!transformedCenter) {
+        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        const bool sameGrid = quad && captured.grid && !captured.surfaceId.empty() &&
+                              quad->id == captured.surfaceId && quad != captured.surface.get();
+        if (!transformedCenter && !sameGrid) {
             continue;
         }
 
-        viewer->centerOnVolumePoint(
-            clampToVolumeBounds(*transformedCenter, _state->currentVolume()));
+        if (!sameGrid)
+            viewer->centerOnVolumePoint(
+                clampToVolumeBounds(*transformedCenter, _state->currentVolume()));
         auto camera = viewer->cameraState();
+        if (sameGrid) {
+            const auto uv = quad->gridToSurface(*captured.grid);
+            camera.surfacePtrX = float(uv[0]);
+            camera.surfacePtrY = float(uv[1]);
+        }
         camera.scale = captured.camera.scale;
         if (navigationScale) {
             camera.scale = CChunkedVolumeViewer::clampCameraScale(

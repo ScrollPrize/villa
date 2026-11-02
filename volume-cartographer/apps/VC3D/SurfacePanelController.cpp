@@ -255,6 +255,13 @@ void SurfacePanelController::syncTree()
     }
 }
 
+void SurfacePanelController::replaceOpenedSurface(SurfaceCatalog::Opened opened)
+{
+    if (!opened.surface || opened.surface->id != _currentSurfaceId)
+        throw std::invalid_argument("working-level surface differs from the selection");
+    _opened = std::move(opened);
+}
+
 void SurfacePanelController::activate(const std::string& id, bool preserveEditing,
                                       std::optional<SurfaceCatalog::Opened> opened)
 {

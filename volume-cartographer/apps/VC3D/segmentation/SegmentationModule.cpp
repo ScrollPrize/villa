@@ -2421,7 +2421,13 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     }
     const auto origin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
     // Saves continue from the edit's own revisions until the surface is reopened.
-    if (_storeEdit && _storeEdit->uuid() == surface->id && (!origin || origin->pin == _storeEdit->origin())) {
+    const auto sameView = [&] {
+        const auto& view = _storeEdit->view();
+        return view && view->volume == origin->view.volume && view->scale == origin->view.scale &&
+               view->mapping == origin->view.mapping;
+    };
+    if (_storeEdit && _storeEdit->uuid() == surface->id &&
+        (!origin || (origin->pin == _storeEdit->origin() && sameView()))) {
         return _storeEdit;
     }
     if (!origin || !_state) {
