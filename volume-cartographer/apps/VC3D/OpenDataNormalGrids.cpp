@@ -9,14 +9,10 @@
 
 #include <nlohmann/json.hpp>
 
-#include <vc_reader/s3_listing.hpp>
-#include <vc_reader/source_reader.hpp>
 #include <vc_reader/zarr.hpp>
 
 #include <algorithm>
 #include <fstream>
-#include <mutex>
-#include <thread>
 
 namespace vc3d::opendata {
 namespace {
@@ -217,109 +213,12 @@ std::filesystem::path downloadOpenDataNormalGrids(
     if (std::filesystem::is_regular_file(finalDir / kCompleteMarker, completeEc)) {
         return finalDir;
     }
-    const auto cancelled = [&] {
-        return cancelRequested && cancelRequested->load(std::memory_order_acquire);
-    };
-
-    NormalGridsDownloadProgress state;
-    state.status = "listing";
-    if (progress) {
-        progress(state);
-    }
-
-    const auto access = vcr::zarr::resolveAccess(info.url);
-    std::vector<vcr::s3::Object> objects;
-    try {
-        objects = vcr::zarr::listObjects(access, info.url);
-    } catch (const std::exception& e) {
-        if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
-        return {};
-    }
-    std::erase_if(objects, [](const vcr::s3::Object& object) {
-        return object.key.empty() || object.key.back() == '/';
-    });
-    if (objects.empty()) {
-        if (errorOut) *errorOut = "no objects found under " + info.url;
-        return {};
-    }
-    if (cancelled()) {
-        if (errorOut) *errorOut = "cancelled";
-        return {};
-    }
-
-    state.status = "downloading";
-    state.totalFiles = static_cast<int>(objects.size());
-    for (const auto& object : objects) {
-        state.totalBytes += object.size;
-    }
-    if (progress) {
-        progress(state);
-    }
-
-    // Each object is fetched by vc_reader's file cache to its place under the root, which
-    // is where streaming puts it too, under the root's byte limit and free-space floor.
-    // Files already there are kept, so a cancelled or failed download resumes next time,
-    // and one download serves every worker or tracer asking for the same file.
-    vcr::sources::EncodedFiles files([root = remoteCacheRoot, access](const std::string&) {
-        auto options = vc::settings::remoteOpenOptions(root);
-        options.access = access;
-        return options;
-    });
-
-    const int workerCount = std::clamp(workers, 1, kNormalGridsDownloadWorkers);
-    std::atomic<std::size_t> next{0};
-    std::atomic<int> completed{0};
-    std::atomic<int> failed{0};
-    std::atomic<std::uint64_t> completedBytes{0};
-    std::mutex progressMutex;
-    std::string firstError;
-
-    auto worker = [&]() {
-        while (!cancelled()) {
-            const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
-            if (index >= objects.size()) {
-                return;
-            }
-            const auto& object = objects[index];
-            try {
-                (void)files.open(info.url + "/" + object.key);
-                completed.fetch_add(1, std::memory_order_relaxed);
-                completedBytes.fetch_add(object.size, std::memory_order_relaxed);
-            } catch (const std::exception& e) {
-                failed.fetch_add(1, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lock(progressMutex);
-                if (firstError.empty()) {
-                    firstError = e.what();
-                }
-            }
-
-            if (progress) {
-                NormalGridsDownloadProgress update = state;
-                update.completedFiles = completed.load(std::memory_order_relaxed);
-                update.failedFiles = failed.load(std::memory_order_relaxed);
-                update.completedBytes = completedBytes.load(std::memory_order_relaxed);
-                update.fileName = object.key;
-                progress(update);
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(workerCount));
-    for (int i = 0; i < workerCount; ++i) {
-        threads.emplace_back(worker);
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    if (cancelled() || failed.load() > 0) {
-        if (errorOut) {
-            *errorOut = cancelled()
-                ? "cancelled"
-                : ("failed to download " + std::to_string(failed.load()) +
-                   " file(s): " + firstError);
-        }
+    auto options = vc::settings::remoteOpenOptions(remoteCacheRoot);
+    options.access = vcr::zarr::resolveAccess(info.url);
+    const auto downloaded = vcr::cache::downloadPrefix(
+        info.url, options, std::clamp(workers, 1, kNormalGridsDownloadWorkers), progress, cancelRequested);
+    if (!downloaded.error.empty()) {
+        if (errorOut) *errorOut = downloaded.error;
         return {};
     }
 
@@ -334,7 +233,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
     // Keep the dir streamable (harmless once complete) and record completion
     // so the catalog can report "all downloaded" without a remote listing.
     vc::core::util::writeNormalGridsRemoteMarker(finalDir, info.url);
-    writeCompleteMarker(finalDir, static_cast<int>(objects.size()), state.totalBytes);
+    writeCompleteMarker(finalDir, downloaded.progress.totalFiles, downloaded.progress.totalBytes);
 
     Logger()->info("Downloaded normal grids for {}/{} to {}",
                    info.sampleId, info.volumeId, finalDir.string());

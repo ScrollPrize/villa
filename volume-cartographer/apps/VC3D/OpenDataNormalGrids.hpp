@@ -1,5 +1,6 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
+#include <vc_reader/cache.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -60,17 +61,8 @@ struct NormalGridsCacheState {
     const std::string& sampleId,
     const vcr::catalog::OpenDataVolume& volume);
 
-struct NormalGridsDownloadProgress {
-    int totalFiles = 0;
-    int completedFiles = 0;
-    int failedFiles = 0;
-    std::uint64_t totalBytes = 0;
-    std::uint64_t completedBytes = 0;
-    std::string fileName;
-    std::string status;  // "listing" | "downloading"
-};
-using NormalGridsProgressCallback =
-    std::function<void(const NormalGridsDownloadProgress&)>;
+using NormalGridsDownloadProgress = vcr::cache::DownloadProgress;
+using NormalGridsProgressCallback = vcr::cache::DownloadCallback;
 
 // List the artifact's prefix and fetch every object with `workers` threads through
 // vc_reader's file cache into the volume's normal-grid cache directory, under the

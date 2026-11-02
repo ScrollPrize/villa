@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "OpenDataVolumePrefill.hpp"
+#include <vc_reader/cache.hpp>
 #include "OpenDataResourceSelection.hpp"
 #include "OpenDataSampleProject.hpp"
 
@@ -212,7 +212,12 @@ private:
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
-    std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    struct VolumePrefillResult : vcr::cache::PrefillResult {
+        std::string volumeId;
+        int level = 0;
+        int physicalLevel = 5;
+    };
+    std::vector<QFutureWatcher<VolumePrefillResult>*> _openDataPrefillWatchers;
     std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.

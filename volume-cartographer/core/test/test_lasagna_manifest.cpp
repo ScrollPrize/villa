@@ -5,6 +5,7 @@
 #include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/Catalog.hpp"
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
@@ -557,3 +558,58 @@ TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
     CHECK_FALSE(manifest.hasNormalSource());
 }
 
+
+TEST_CASE("Catalog Lasagna and direct manifests share one materialized file")
+{
+    const auto dir = makeTmpDir("catalog-materialization");
+    vc::test::LoopbackHttpServer server;
+    fs::create_directories(dir / "bucket" / "artifact");
+    fs::create_directories(dir / "config");
+    std::ofstream(dir / "config" / "VC3D.ini") << "[perf]\nremote_cache_min_free_gib=0\n";
+    setenv("VC3D_CONFIG_DIR", (dir / "config").c_str(), 1);
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() {
+            unsetenv("VC3D_CONFIG_DIR");
+            fs::remove_all(path);
+        }
+    } cleanup{dir};
+    nlohmann::json groups = nlohmann::json::object();
+    for (const auto* channel : {"grad_mag", "nx", "ny"}) {
+        const auto array = dir / (std::string(channel) + ".zarr");
+        fs::create_directories(array);
+        std::ofstream(array / ".zarray") << R"({"zarr_format":2,"shape":[2,2,2],"chunks":[2,2,2],"dtype":"|u1","compressor":null,"filters":null,"fill_value":0,"order":"C"})";
+        groups[channel] = {{"zarr", array.string()}, {"channels", {channel}}};
+    }
+    std::ofstream(dir / "bucket" / "artifact" / "data.lasagna.json") <<
+        nlohmann::json{{"version", 2}, {"source_to_base", 1}, {"base_shape_zyx", {2,2,2}}, {"groups", groups}};
+    server.serveDirectory(dir / "bucket");
+    vcr::catalog::OpenDataVolume volume;
+    volume.id = "volume";
+    volume.shapeZYX = {2,2,2};
+    vcr::catalog::OpenDataArtifact artifact;
+    artifact.type = "lasagna";
+    artifact.resolvedUrl = server.url() + "/artifact";
+    artifact.sourceCoordinateLevel = 0;
+    artifact.levelParameterPresent = true;
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = dir / "cache";
+    options.discoverAwsCredentials = false;
+    const auto location = artifact.resolvedUrl + "/data.lasagna.json";
+    const auto materialized = vc::lasagna::materializeLasagnaManifest(location, options);
+    CHECK_FALSE(materialized.cacheHit);
+    const auto first = vc::lasagna::cacheCatalogDataset("sample", volume, artifact, dir / "cache");
+    CHECK(first.kind == vc::lasagna::CatalogDatasetKind::Normal);
+    CHECK(first.dataset.manifest().groups.size() == 3);
+    CHECK(server.requestCount("/artifact/data.lasagna.json") == 1);
+    const auto requests = server.requests().size();
+    const auto second = vc::lasagna::cacheCatalogDataset("sample", volume, artifact, dir / "cache");
+    CHECK(first.manifest == second.manifest);
+    CHECK(server.requests().size() == requests);
+    const auto direct = vc::lasagna::materializeLasagnaManifest(location, options);
+    CHECK(direct.cacheHit);
+    CHECK(direct.path == first.manifest);
+    CHECK(server.requests().size() == requests);
+    artifact.sourceCoordinateLevel.reset();
+    CHECK_THROWS(vc::lasagna::cacheCatalogDataset("sample", volume, artifact, dir / "cache"));
+}

@@ -1,6 +1,4 @@
 #include "vc/lasagna/Catalog.hpp"
-#include "vc/core/util/RemoteCacheSettings.hpp"
-#include <vc_reader/source_reader.hpp>
 #include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
@@ -119,6 +117,8 @@ CachedCatalogDataset cacheCatalogDataset(
         throw std::runtime_error("No remote cache directory configured");
     const auto artifactUrl = artifact.url();
     const auto modelId = artifact.modelId.value_or(std::string{});
+    if (!artifact.sourceCoordinateLevel || *artifact.sourceCoordinateLevel < 0 || *artifact.sourceCoordinateLevel > 5)
+        throw std::runtime_error("Lasagna artifact has missing or invalid parameters.level");
     const int level = *artifact.sourceCoordinateLevel;
     const auto cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
     const auto finalDir = vcr::zarr::decodedCachePath(cacheRoot, artifactUrl);
@@ -162,13 +162,10 @@ CachedCatalogDataset cacheCatalogDataset(
     } else {
         const auto manifestUrl = discoverManifestUrl(artifactUrl);
         relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
-        // Fetched by vc_reader's file cache to its place under the root, which is finalDir.
-        vcr::sources::EncodedFiles files([cacheRoot](const std::string& location) {
-            auto options = vc::settings::remoteOpenOptions(cacheRoot);
-            options.access = vcr::zarr::resolveAccess(location, vcr::zarr::AuthMode::Anonymous);
-            return options;
-        });
-        (void)files.open(manifestUrl);
+        LasagnaDatasetOpenOptions options;
+        options.remoteCacheRoot = cacheRoot;
+        options.discoverAwsCredentials = false;
+        (void)materializeLasagnaManifest(manifestUrl, options);
         if (!std::filesystem::is_regular_file(finalDir / relativeName))
             throw std::runtime_error("Lasagna manifest did not cache at " + (finalDir / relativeName).string());
     }

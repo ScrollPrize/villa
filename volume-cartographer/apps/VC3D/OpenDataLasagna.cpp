@@ -20,8 +20,6 @@
 namespace vc3d::opendata {
 namespace {
 
-// Write a marker file whole or not at all.
-
 int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
                          const std::array<int, 3>& workingShape)
 {

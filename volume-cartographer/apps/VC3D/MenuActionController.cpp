@@ -11,7 +11,6 @@
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
-#include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -1010,8 +1009,9 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
 
 void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
 {
+    constexpr int physicalPrefillLevel = 5;
     const int logicalPrefillLevel = volume
-        ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
+        ? physicalPrefillLevel - volume->baseScaleLevel()
         : -1;
     if (!volume || !volume->isRemote() || logicalPrefillLevel < 0) {
         return;
@@ -1028,31 +1028,31 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
 
     auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
     _openDataPrefillCancelFlag = cancelFlag;
-    auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
+    auto* watcher = new QFutureWatcher<VolumePrefillResult>(this);
     _openDataPrefillWatchers.push_back(watcher);
     _openDataPrefillCancelFlags.push_back(cancelFlag);
 
     const QString volumeId = QString::fromStdString(volume->id());
     connect(watcher,
-            &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
+            &QFutureWatcher<VolumePrefillResult>::finished,
             this,
             [this, watcher, cancelFlag, volumeId]() {
-                vc3d::opendata::OpenDataVolumePrefillResult result;
+                VolumePrefillResult result;
                 // A canceled QFuture has no stored result. Check cancellation
                 // before result() when a stale finished signal arrives.
                 if (watcher->isCanceled()) {
-                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
+                    result.status = VolumePrefillResult::Status::Cancelled;
                     result.volumeId = volumeId.toStdString();
                     result.message = "cancelled before completion";
                 } else {
                     try {
                         result = watcher->result();
                     } catch (const std::exception& e) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = e.what();
                     } catch (...) {
-                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.status = VolumePrefillResult::Status::Failed;
                         result.volumeId = volumeId.toStdString();
                         result.message = "unknown error";
                     }
@@ -1077,7 +1077,7 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                     return;
                 }
 
-                using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
+                using Status = VolumePrefillResult::Status;
                 switch (result.status) {
                 case Status::Completed:
                     if (result.fetchedChunks > 0) {
@@ -1119,21 +1119,26 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                         result.resolvedChunks,
                         result.totalChunks);
                     break;
-                case Status::Skipped:
-                    Logger()->info(
-                        "Open-data volume prefill skipped for {} level {}: {}",
-                        result.volumeId,
-                        result.level,
-                        result.message);
-                    break;
                 }
             });
 
     watcher->setFuture(QtConcurrent::run([volume, cancelFlag, logicalPrefillLevel]() {
-        return vc3d::opendata::prefillOpenDataVolumeLevel(
-            volume,
-            logicalPrefillLevel,
-            cancelFlag.get());
+        VolumePrefillResult result;
+        result.volumeId = volume->id();
+        result.level = logicalPrefillLevel;
+        result.physicalLevel = volume->baseScaleLevel() + logicalPrefillLevel;
+        try {
+            // Populate disk only; opening without a memory cache keeps the level
+            // from displacing chunks the viewers are using.
+            auto opened = vcr::zarr::openPyramidLevel(
+                volume->sourceLocation(), result.physicalLevel, volume->sourceOpenOptions());
+            static_cast<vcr::cache::PrefillResult&>(result) =
+                vcr::cache::prefill(*opened.array, cancelFlag.get());
+        } catch (const std::exception& e) {
+            result.status = VolumePrefillResult::Status::Failed;
+            result.message = e.what();
+        }
+        return result;
     }));
 }
 

@@ -105,8 +105,6 @@ set(srcs
     OpenDataResourceSelection.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
-    OpenDataVolumePrefill.cpp
-    OpenDataVolumePrefill.hpp
     OpenDataVolumeOrientation.cpp
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
