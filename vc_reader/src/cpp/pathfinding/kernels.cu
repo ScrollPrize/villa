@@ -43,11 +43,15 @@ std::vector<std::uint32_t> shortestPath(const float* costs, std::size_t rows, st
     int change = 1;
     while (change) {
         device::check(cudaMemsetAsync(static_cast<int*>(changed.ptr), 0, sizeof(int), stream));
-        relax<<<blocks, 256, 0, stream>>>(static_cast<float*>(weights.ptr), rows, cols, input, output, static_cast<int*>(changed.ptr));
-        device::check(cudaGetLastError());
+        // Batch wavefront rounds to amortize host synchronization. The change flag
+        // accumulates across the batch, so termination still requires a stable round.
+        for (int round = 0; round < 8; ++round) {
+            relax<<<blocks, 256, 0, stream>>>(static_cast<float*>(weights.ptr), rows, cols, input, output, static_cast<int*>(changed.ptr));
+            device::check(cudaGetLastError());
+            std::swap(input, output);
+        }
         device::check(cudaMemcpyAsync(&change, static_cast<int*>(changed.ptr), sizeof(int), cudaMemcpyDeviceToHost, stream));
         device::complete();
-        std::swap(input, output);
     }
     device::check(cudaMemcpyAsync(labels.data(), input, n * sizeof(detail::Label), cudaMemcpyDeviceToHost, stream));
     device::complete();
