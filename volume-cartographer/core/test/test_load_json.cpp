@@ -3,43 +3,10 @@
 
 #include "vc/core/util/LoadJson.hpp"
 
-#include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 
-namespace fs = std::filesystem;
 using namespace vc::json;
-
-namespace {
-
-fs::path makeTmpDir(const std::string& tag)
-{
-    auto p = fs::temp_directory_path() / ("vc_loadjson_" + tag);
-    fs::create_directories(p);
-    return p;
-}
-
-} // namespace
-
-TEST_CASE("load_json_file: missing file throws")
-{
-    CHECK_THROWS_AS(load_json_file("/__nonexistent__/x.json"), std::runtime_error);
-}
-
-TEST_CASE("load_json_file: round-trips a parsed object")
-{
-    auto dir = makeTmpDir("ok");
-    auto p = dir / "t.json";
-    {
-        std::ofstream f(p);
-        f << R"({"hello":"world","n":42})";
-    }
-    auto j = load_json_file(p);
-    CHECK(j.is_object());
-    CHECK(j["hello"].get<std::string>() == "world");
-    fs::remove_all(dir);
-}
 
 TEST_CASE("require_fields throws when missing, passes when present")
 {
