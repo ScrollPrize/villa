@@ -122,9 +122,8 @@ class MutexAffinityDataset(Dataset):
 
     - ``image_dirname`` (default ``images``) holding volumetric intensities
       either as ``.zarr`` stores or 3D ``.tif/.tiff`` stacks.
-    - ``affinity_dirname`` (default ``affinity_graph``) containing the Zarr
-      stores produced by ``scripts/generate_mutex_graph.py``. Each store must
-      expose ``affinities/<name>`` and ``mask/<name>`` arrays.
+    - ``affinity_dirname`` (default ``affinity_graph``) containing Zarr stores
+      that expose ``affinities/<name>`` and ``mask/<name>`` arrays.
 
     Targets are declared in ``dataset_config.affinity_targets`` with entries of the form::
 
