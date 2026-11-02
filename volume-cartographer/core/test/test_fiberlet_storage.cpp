@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 #include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"

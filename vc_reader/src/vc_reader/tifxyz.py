@@ -64,12 +64,12 @@ def list_surfaces(folder, *, recursive=True, z_range=None, **reader_options):
     return out
 
 
-def write(path, surface, *, compression='lzw', tile=1024, mask=True, overwrite=False, pixel_um=None):
+def write(path, surface, *, compression='lzw', tile=1024, mask=True, overwrite=False, pixel_um=None, channels=None):
     """Writes the directory; a surface without a UUID gets one, kept on ``surface``.
 
     ``pixel_um`` is written as the TIFFs' resolution tags (micrometres per pixel).
     """
-    _reader._tifxyz_write(path, surface, compression, tile, mask, overwrite, pixel_um)
+    _reader._tifxyz_write(path, surface, compression, tile, mask, overwrite, pixel_um, {} if channels is None else channels)
 
 
 def full_extent(stored, scale):

@@ -1,3 +1,4 @@
+#include "vc_reader/publication.hpp"
 #include "vc_reader/image_write.hpp"
 #include "../chunk_io.hpp"
 
@@ -237,7 +238,7 @@ void TiffWriter::finish()
     }
     if (!TIFFFlush(s.tif.get())) throw std::runtime_error("writing a TIFF image failed");
     s.tif.reset();
-    std::filesystem::rename(s.temporary, s.path);
+    vcr::files::replaceFile(s.temporary, s.path);
 }
 
 void TiffWriter::abandon()

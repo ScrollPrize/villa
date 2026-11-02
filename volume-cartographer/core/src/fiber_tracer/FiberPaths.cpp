@@ -1,6 +1,7 @@
+#include <vc_reader/publication.hpp>
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 #include <vc_reader/zarr.hpp>
 #include "vc/core/util/TexturedMesh.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
@@ -4468,9 +4469,9 @@ void writeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirecto
             pending.push_back(paths);
         }
         for (const auto& paths : pending) {
-            vc::core::util::replaceFileAtomically(paths.temporaryPng, paths.png);
-            vc::core::util::replaceFileAtomically(paths.temporaryMtl, paths.mtl);
-            vc::core::util::replaceFileAtomically(paths.temporaryObj, paths.obj);
+            vcr::files::replaceFile(paths.temporaryPng, paths.png);
+            vcr::files::replaceFile(paths.temporaryMtl, paths.mtl);
+            vcr::files::replaceFile(paths.temporaryObj, paths.obj);
         }
     } catch (...) {
         for (const auto& plane : report.planes) {

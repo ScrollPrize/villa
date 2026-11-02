@@ -1,4 +1,4 @@
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -90,23 +90,6 @@ ExclusiveDirectoryLock::~ExclusiveDirectoryLock()
         (void)::flock(impl_->descriptor, LOCK_UN);
         ::close(impl_->descriptor);
     }
-#endif
-}
-
-void replaceFileAtomically(
-    const std::filesystem::path& source,
-    const std::filesystem::path& destination)
-{
-#if defined(_WIN32)
-    if (!::MoveFileExW(source.c_str(), destination.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code error(
-            static_cast<int>(::GetLastError()), std::system_category());
-        throw std::filesystem::filesystem_error(
-            "cannot replace file", source, destination, error);
-    }
-#else
-    std::filesystem::rename(source, destination);
 #endif
 }
 

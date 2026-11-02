@@ -8,7 +8,7 @@ set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
         src/PolylineObj.cpp
-        src/AtomicFile.cpp
+        src/OutputDirectory.cpp
         src/TexturedMesh.cpp
         src/SurfaceTexture.cpp
         src/GridStore.cpp

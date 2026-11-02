@@ -6,10 +6,6 @@
 
 namespace vc::core::util {
 
-void replaceFileAtomically(
-    const std::filesystem::path& source,
-    const std::filesystem::path& destination);
-
 // Callers must hold exclusive ownership of the tree while removing abandoned
 // writes; otherwise another process's live temporary file is indistinguishable
 // from one left by a crash.

@@ -2,14 +2,14 @@
 // - QuadSurface(path, json) ctor with components/bbox
 // - setChannel with 3- and 4-channel masks (normalizeMaskChannel branches)
 // - channel(name) on-demand loading via file
-// - pointTo with a SurfacePatchIndex hint
+// - pointTo with a SurfaceQuerySet hint
 // - load_quad_from_tifxyz with a mask.tif present
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 #include <vc_reader/image_write.hpp>
 
 #include <nlohmann/json.hpp>
@@ -168,11 +168,11 @@ TEST_CASE("channel: on-disk file load (no in-memory mat)")
     fs::remove_all(root);
 }
 
-TEST_CASE("pointTo with a SurfacePatchIndex hint")
+TEST_CASE("pointTo with a SurfaceQuerySet hint")
 {
     auto pts = makePlanarGrid(32, 32, 0.f);
     auto surf = std::make_shared<QuadSurface>(pts, cv::Vec2f(1.f, 1.f));
-    SurfacePatchIndex idx;
+    SurfaceQuerySet idx;
     idx.rebuild({surf});
 
     cv::Vec3f ptr(0, 0, 0);
@@ -247,7 +247,7 @@ TEST_CASE("countValid* on path-only (unloaded) construction lazily loads")
     fs::remove_all(root);
 }
 
-TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
+TEST_CASE("mapped SurfaceQuerySet rebuild keeps disk-backed surfaces lazy")
 {
     auto root = tmpDir("mapped_lazy_index");
     auto d = root / "seg";
@@ -262,7 +262,7 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
     CHECK(lazy->scale() == cv::Vec2f(2.f, 4.f));
     CHECK(lazy->center() == cv::Vec3f(4.f, 2.f, 0.f));
 
-    SurfacePatchIndex index;
+    SurfaceQuerySet index;
     index.setSamplingStride(4);
     index.rebuild({lazy}, 0.0f, /*useMappedSurfaces=*/true);
 
@@ -271,7 +271,7 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
     CHECK_FALSE(lazy->isLoaded());
 
     std::unordered_set<QuadSurface*> targets{lazy.get()};
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = cv::Vec3f(4.f, 4.f, 5.f);
     query.tolerance = 1.f;
     query.surfaces.includeRaw = &targets;

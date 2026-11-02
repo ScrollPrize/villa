@@ -498,12 +498,8 @@ protected:
 
 private:
 
-    // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
-    void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
     void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
     std::string objectUuidOrNew() const;
-    // Write a single ancillary channel as dir/<name>.tif.
-    void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path
     bool _needsLoad = false;
     // Mutex to protect lazy loading from concurrent access

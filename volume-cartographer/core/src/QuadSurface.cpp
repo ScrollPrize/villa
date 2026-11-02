@@ -1,5 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/publication.hpp>
 #include "vc/core/util/ImageMat.hpp"
 
 #include "vc/core/util/Geometry.hpp"
@@ -55,168 +55,6 @@
 #endif
 
 namespace {
-
-constexpr auto kSaveRollbackDir = ".vc-save-rollback";
-constexpr auto kSaveRollbackReady = ".ready";
-
-std::recursive_mutex& surfaceDirWriteMutex(const std::filesystem::path& dir)
-{
-    // Keyed by normalized dir string so separate QuadSurface objects pointing
-    // at the same segment dir share one lock. Recursive because saveOverwrite
-    // holds it across nested saveSnapshot()/save() calls, and Windows
-    // publication performs recovery while the save lock is already held.
-    static std::mutex mapMutex;
-    static std::unordered_map<std::string, std::recursive_mutex> locks;
-    const std::string key = dir.lexically_normal().string();
-    std::lock_guard<std::mutex> guard(mapMutex);
-    return locks[key];
-}
-
-void recoverIncompleteSave(const std::filesystem::path& destination)
-{
-    // Loading and publication must be mutually exclusive. In particular, a
-    // loader must not mistake an active Windows rollback journal for one left
-    // by an interrupted process and restore it while files are being replaced.
-    std::lock_guard<std::recursive_mutex> dirLock(
-        surfaceDirWriteMutex(destination));
-
-    const auto rollback = destination / kSaveRollbackDir;
-    if (!std::filesystem::exists(rollback)) {
-        return;
-    }
-
-    const auto ready = rollback / kSaveRollbackReady;
-    if (!std::filesystem::exists(ready)) {
-        // Publication never began, or it committed and only cleanup was
-        // interrupted. In either case the destination is already coherent.
-        std::filesystem::remove_all(rollback);
-        return;
-    }
-
-    std::vector<std::filesystem::path> backups;
-    std::set<std::filesystem::path> originalNames;
-    for (const auto& entry : std::filesystem::directory_iterator(rollback)) {
-        if (entry.is_regular_file() && entry.path().filename() != kSaveRollbackReady) {
-            backups.push_back(entry.path());
-            originalNames.insert(entry.path().filename());
-        }
-    }
-
-    // Remove files introduced by the interrupted generation before restoring
-    // every original. Keep the backups intact until recovery is complete so a
-    // second interruption can safely retry the same recovery.
-    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
-        if (entry.is_regular_file() && !originalNames.contains(entry.path().filename())) {
-            std::filesystem::remove(entry.path());
-        }
-    }
-
-    const auto restoreDir = rollback / ".restore";
-    std::filesystem::create_directories(restoreDir);
-    for (const auto& backup : backups) {
-        const auto staged = restoreDir / backup.filename();
-        std::filesystem::copy_file(
-            backup, staged, std::filesystem::copy_options::overwrite_existing);
-        vc::core::util::replaceFileAtomically(staged, destination / backup.filename());
-    }
-    std::filesystem::remove_all(rollback);
-}
-
-#ifdef _WIN32
-void createRollbackBackup(const std::filesystem::path& original,
-                          const std::filesystem::path& backup)
-{
-    // A same-volume hard link preserves the old file object when the live name
-    // is replaced, without copying multi-gigabyte TIFFs on every autosave.
-    // Fall back to a copy on filesystems that do not support hard links.
-    if (::CreateHardLinkW(backup.wstring().c_str(), original.wstring().c_str(), nullptr)) {
-        return;
-    }
-    std::filesystem::copy_file(
-        original, backup, std::filesystem::copy_options::overwrite_existing);
-}
-
-void replaceDirectoryContents(const std::filesystem::path& source,
-                              const std::filesystem::path& destination)
-{
-    std::filesystem::create_directories(destination);
-
-    // If a previous process stopped during publication, restore its complete
-    // prior generation before beginning another save.
-    recoverIncompleteSave(destination);
-
-    const auto rollback = destination / kSaveRollbackDir;
-    std::filesystem::create_directories(rollback);
-    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
-        if (entry.is_regular_file()) {
-            createRollbackBackup(entry.path(), rollback / entry.path().filename());
-        }
-    }
-
-    // This marker is created only after every original file is durable in the
-    // rollback directory. Its presence means publication may have begun.
-    const auto ready = rollback / kSaveRollbackReady;
-    {
-        std::ofstream marker(ready, std::ios::binary);
-        marker << "ready\n";
-        if (!marker) {
-            throw std::runtime_error("failed to prepare save rollback journal: " +
-                                     ready.string());
-        }
-    }
-
-    // Windows cannot reliably remove a directory while files from it are
-    // mapped by another QuadSurface. The mappings opt into FILE_SHARE_DELETE,
-    // so replace the completed files individually instead. The temporary
-    // directory already contains newly written x/y/z/meta files plus copies of
-    // every regular auxiliary file from the destination.
-    std::vector<std::filesystem::path> files;
-    for (const auto& entry : std::filesystem::directory_iterator(source)) {
-        if (entry.is_regular_file()) {
-            files.push_back(entry.path());
-        }
-    }
-    // Do not mutate a directory while iterating it: directory_iterator may
-    // otherwise skip entries on Windows. Publish metadata last so readers do
-    // not observe it before the corresponding data files are replaced.
-    std::sort(files.begin(), files.end(), [](const auto& lhs, const auto& rhs) {
-        const bool lhsMeta = lhs.filename() == "meta.json";
-        const bool rhsMeta = rhs.filename() == "meta.json";
-        return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
-    });
-    try {
-        for (const auto& file : files) {
-            vc::core::util::replaceFileAtomically(file, destination / file.filename());
-        }
-
-        // Removing the marker commits the complete new generation. If cleanup
-        // is interrupted after this point, recovery keeps the new files.
-        std::filesystem::remove(ready);
-    } catch (...) {
-        const auto error = std::current_exception();
-        try {
-            recoverIncompleteSave(destination);
-        } catch (const std::exception& recoveryError) {
-            Logger()->error("failed to roll back interrupted save for {}: {}",
-                            destination.string(), recoveryError.what());
-        }
-        std::rethrow_exception(error);
-    }
-
-    std::error_code cleanupEc;
-    std::filesystem::remove_all(rollback, cleanupEc);
-    if (cleanupEc) {
-        Logger()->warn("could not remove save rollback directory {}: {}",
-                       rollback.string(), cleanupEc.message());
-    }
-    cleanupEc.clear();
-    std::filesystem::remove_all(source, cleanupEc);
-    if (cleanupEc) {
-        Logger()->warn("could not remove completed save temp directory {}: {}",
-                       source.string(), cleanupEc.message());
-    }
-}
-#endif
 
 vcr::sources::TiffOptions tiffOptions(float dpi)
 {
@@ -452,7 +290,7 @@ std::vector<std::pair<int, int>> surface_components(const nlohmann::json& meta)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_)
 {
-    recoverIncompleteSave(path_);
+    vcr::files::recoverDirectory(path_);
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
@@ -473,7 +311,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json)
 {
-    recoverIncompleteSave(path_);
+    vcr::files::recoverDirectory(path_);
     path = path_;
     id = path_.filename().string();
     meta = json;
@@ -759,7 +597,7 @@ std::shared_ptr<const vcr::grid::Surface> QuadSurface::pointSurface() const
     std::lock_guard<std::mutex> lock(_cacheMutex);
     if (!_pointSurface) {
         std::vector<std::uint8_t> valid;
-        _pointSurface = std::make_shared<const vcr::grid::Surface>(gridVertices(valid, _points.get()), gridOptions());
+        _pointSurface = std::make_shared<vcr::grid::Surface>(gridVertices(valid, _points.get()), gridOptions());
     }
     return _pointSurface;
 }
@@ -1220,7 +1058,7 @@ void QuadSurface::saveEdited(const std::filesystem::path &source,
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
 {
-    return surfaceDirWriteMutex(dir);
+    return vcr::files::directoryMutex(dir);
 }
 
 void QuadSurface::saveOverwrite()
@@ -1267,38 +1105,6 @@ void QuadSurface::invalidateMask()
     }
 }
 
-// Any depth and channel count; uncompressed, except samples image tools do not
-// show (e.g. the two-component uv), which are LZW.
-void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat)
-{
-    if (mat.empty())
-        throw std::runtime_error("unsupported image for channel " + name);
-    auto options = tiffOptions(dpi_);
-    if (mat.channels() == 2 || mat.channels() > 4)
-        options.compression = "lzw";
-    vc::core::util::writeTiffMat(dir / (name + ".tif"), mat, options);
-}
-
-void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
-{
-    // Split the points matrix into x, y, z channels
-    std::vector<cv::Mat> xyz;
-    cv::split((*_points), xyz);
-
-    // QuadSurface tifxyz files are written as untiled, uncompressed TIFFs.
-    const auto options = tiffOptions(dpi_);
-    vcr::sources::writeTiff(dir / "x.tif", xyz[0].data, "<f4", xyz[0].rows, xyz[0].cols, 1, options);
-    vcr::sources::writeTiff(dir / "y.tif", xyz[1].data, "<f4", xyz[1].rows, xyz[1].cols, 1, options);
-    vcr::sources::writeTiff(dir / "z.tif", xyz[2].data, "<f4", xyz[2].rows, xyz[2].cols, 1, options);
-
-    // Save additional channels
-    for (auto const& [name, mat] : _channels) {
-        if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
-            writeChannelFile(dir, name, mat);
-        }
-    }
-}
-
 // Minimum wall-clock gap between rotating snapshots of the same segment.
 // saveOverwrite()/autosave/growth all snapshot; without this, edit-cadence
 // saves would copy the whole segment dir into backups/ many times a second.
@@ -1309,306 +1115,60 @@ static constexpr int kDefaultBackupCount = 10;
 
 void QuadSurface::saveSnapshot(int maxBackups, bool force)
 {
-    if (path.empty()) {
-        throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
-    }
-    std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
-    if (maxBackups < 0) {
-        maxBackups = kDefaultBackupCount;
-    }
-    if (maxBackups <= 0) {
-        return;  // backups disabled
-    }
-
-    // No on-disk state to back up yet — the first save will populate
-    // the directory; subsequent saveOverwrite calls will pick up the
-    // rolling history from then on. Treat this as a no-op rather than
-    // an error so the saveOverwrite call site doesn't have to special
-    // case it.
-    if (!std::filesystem::exists(path / "x.tif")) {
-        return;
-    }
-
-    // Backups live in a "backups/" dir beside the segment.
-    std::filesystem::path backupsDir = path.parent_path() / "backups" / path.filename();
-
-    std::error_code ec;
-    std::filesystem::create_directories(backupsDir, ec);
-    if (ec) {
-        throw std::runtime_error("Failed to create backups directory: " + ec.message());
-    }
-
-    // Find existing backup directories and determine next backup number.
-    // Also track the newest slot's mtime so we can throttle: many operations
-    // (autosave, push-pull edits, growth steps) snapshot via saveOverwrite,
-    // which at edit cadence would copy the whole segment dir multiple times a
-    // second. Skip if a backup was taken within the throttle window.
-    std::vector<int> existingBackups;
-    std::filesystem::file_time_type newestBackup{};
-    bool haveNewest = false;
-    if (std::filesystem::exists(backupsDir)) {
-        for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
-            if (entry.is_directory()) {
-                try {
-                    int backupNum = std::stoi(entry.path().filename().string());
-                    if (backupNum >= 0 && backupNum < maxBackups) {
-                        existingBackups.push_back(backupNum);
-                        std::error_code mtEc;
-                        const auto mt = std::filesystem::last_write_time(entry.path(), mtEc);
-                        if (!mtEc && (!haveNewest || mt > newestBackup)) {
-                            newestBackup = mt;
-                            haveNewest = true;
-                        }
-                    }
-                } catch (...) {
-                    // Skip non-numeric directories
-                }
-            }
-        }
-    }
-
-    // Throttle: at most one snapshot per segment per kSnapshotThrottle.
-    if (!force && haveNewest) {
-        const auto age = std::filesystem::file_time_type::clock::now() - newestBackup;
-        if (age < kSnapshotThrottle) {
-            return;
-        }
-    }
-
-    std::sort(existingBackups.begin(), existingBackups.end());
-
-    std::filesystem::path snapshot_dest;
-
-    if (existingBackups.size() < static_cast<size_t>(maxBackups)) {
-        // We have room for more backups, find the first available slot
-        int nextBackup = 0;
-        for (int i = 0; i < maxBackups; ++i) {
-            if (std::find(existingBackups.begin(), existingBackups.end(), i) == existingBackups.end()) {
-                nextBackup = i;
-                break;
-            }
-        }
-        snapshot_dest = backupsDir / std::to_string(nextBackup);
-    } else {
-        // We're at the limit, rotate backups
-        // Delete the oldest (0)
-        std::filesystem::remove_all(backupsDir / "0", ec);
-
-        // Rename all backups down by 1 (1->0, 2->1, etc.)
-        for (int i = 1; i < maxBackups; ++i) {
-            std::filesystem::path oldPath = backupsDir / std::to_string(i);
-            std::filesystem::path newPath = backupsDir / std::to_string(i - 1);
-            if (std::filesystem::exists(oldPath)) {
-                std::filesystem::rename(oldPath, newPath, ec);
-            }
-        }
-
-        // New backup goes in the last slot
-        snapshot_dest = backupsDir / std::to_string(maxBackups - 1);
-    }
-
-    // Create the snapshot directory
-    std::filesystem::create_directories(snapshot_dest, ec);
-    if (ec) {
-        throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
-    }
-
-    // Capture the LAST PERSISTED state — copy every regular file in
-    // path/ verbatim into the snapshot slot. This preserves x/y/z.tif,
-    // mask.tif, ancillary channels, meta.json, corrections.json, etc.
-    // without re-serializing in-memory data.
-    //
-    // The previous implementation called writeDataToDirectory(...)
-    // which serialized the current in-memory _points. That broke
-    // recovery for the saveOverwrite case: when the in-memory state
-    // is what we're trying to roll back FROM, persisting it as the
-    // backup snapshot leaves no good state to recover.
-    //
-    // Subdirectories (e.g. .tmp_* from in-flight saves) are skipped.
-    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        std::error_code copyEc;
-        std::filesystem::copy_file(
-            entry.path(),
-            snapshot_dest / entry.path().filename(),
-            std::filesystem::copy_options::overwrite_existing,
-            copyEc);
-        if (copyEc) {
-            Logger()->warn("saveSnapshot: copy failed for {}: {}",
-                           entry.path().string(), copyEc.message());
-        }
-    }
-    if (ec) {
-        Logger()->warn("saveSnapshot: directory iteration failed for {}: {}",
-                       path.string(), ec.message());
-    }
-
-    // e.g. "autosaved seg_1234/3 -> /path/to/paths/backups/seg_1234/3"
-    Logger()->info("autosaved {}/{} -> {}",
-                   path.filename().string(),
-                   snapshot_dest.filename().string(),
-                   snapshot_dest.string());
+    if (path.empty()) throw std::runtime_error("snapshot requires a surface path");
+    vcr::files::snapshot(path, maxBackups < 0 ? kDefaultBackupCount : maxBackups, kSnapshotThrottle, force);
 }
 
-
-void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::string &uuid, bool force_overwrite)
+void QuadSurface::saveWithUuid(const std::filesystem::path& destination, const std::string& uuid, bool overwrite)
 {
-    std::filesystem::path target_path = path_;
-    std::filesystem::path final_path = path_;
-
-    // Serialize on the TARGET dir (may differ from this->path for new-dir saves)
-    // so the atomic directory swap can't race another writer to the same dir.
-    std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(final_path));
-
-    if (!force_overwrite && std::filesystem::exists(final_path))
-        throw std::runtime_error("path already exists!");
-
-    // Save to temporary location first for atomic operation.
-    // Use a unique suffix so concurrent saves to the same path don't collide.
-    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
-    std::string tmp_dir_name = ".tmp_" + std::to_string(tid);
-    std::filesystem::path temp_path = target_path.parent_path() / tmp_dir_name / target_path.filename();
-    std::filesystem::create_directories(temp_path.parent_path());
-
-    // Temporarily set path for any operations that might need it
-    std::filesystem::path original_path = path;
-    path = temp_path;
-
-    if (!std::filesystem::create_directories(path)) {
-        if (!std::filesystem::exists(path)) {
-            path = original_path; // Restore on error
-            throw std::runtime_error("error creating dir for QuadSurface::save(): " + path.string());
-        }
+    ensureLoaded();
+    std::lock_guard<std::recursive_mutex> lock(vcr::files::directoryMutex(destination));
+    std::vector<std::uint8_t> valid;
+    (void)gridVertices(valid);
+    std::vector<float> xyz(_points->total() * 3);
+    for (int row = 0; row < _points->rows; ++row)
+        std::copy_n(reinterpret_cast<const float*>(_points->ptr(row)), _points->cols * 3,
+                    xyz.data() + std::size_t(row) * _points->cols * 3);
+    vcr::tifxyz::Metadata metadata;
+    metadata.uuid = uuid;
+    metadata.scale = {_scale[1], _scale[0]};
+    metadata.extra = meta;
+    metadata.extra["type"] = "seg";
+    metadata.extra["format"] = "tifxyz";
+    vcr::tifxyz::Surface stored(_points->rows, _points->cols, std::move(xyz), std::move(valid), std::move(metadata));
+    vcr::tifxyz::WriteOptions options;
+    options.overwrite = overwrite;
+    options.compression = "none";
+    options.tile = std::nullopt;
+    options.mask = false;
+    if (dpi_ > 0) options.pixelUm = 25400.0 / dpi_;
+    std::vector<cv::Mat> channelStorage;
+    channelStorage.reserve(_channels.size());
+    for (const auto& [name, ignored] : _channels) {
+        auto mat = channel(name);
+        if (mat.empty()) continue;
+        cv::Mat native;
+        if (mat.channels() == 3) cv::cvtColor(mat,native,cv::COLOR_BGR2RGB);
+        else if (mat.channels() == 4) cv::cvtColor(mat,native,cv::COLOR_BGRA2RGBA);
+        else native = mat.isContinuous() ? mat : mat.clone();
+        const char* dtype = vc::core::util::tiffDtype(native.depth());
+        if (!dtype) throw std::runtime_error("unsupported surface channel type");
+        channelStorage.push_back(native);
+        options.channels.push_back({name,native.data,dtype,native.rows,native.cols,native.channels()});
     }
-
-    // Write surface data to temp directory
-    try {
-        writeDataToDirectory(path);
-    } catch (const std::exception& e) {
-        path = original_path; // Restore on error
-        throw;
-    }
-
-    // Prepare and write metadata
-    {
-        // The cached _bbox can be stale here: it is seeded from meta.json at
-        // load time, and the point grid can be mutated directly afterwards
-        // (rawPointsPtr(), validPoints(), ...) without any invalidation hook.
-        // Drop the cache so bbox() recomputes from the points actually being
-        // saved (#1272).
-        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
-        auto lo = nlohmann::json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = nlohmann::json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = nlohmann::json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        meta["bbox"] = std::move(bb);
-    }
-    meta["type"] = "seg";
+    vcr::tifxyz::write(destination,stored,options);
+    const auto savedMetadata = vcr::tifxyz::readMetadata(destination.string());
+    meta = savedMetadata.extra;
+    if (savedMetadata.area) meta["area"] = *savedMetadata.area;
     meta["uuid"] = uuid;
-    meta["format"] = "tifxyz";
-    {
-        auto sc = nlohmann::json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        meta["scale"] = std::move(sc);
+    meta["scale"] = {_scale[0],_scale[1]};
+    if (const auto box=stored.bounds()) {
+        _bbox={{float((*box)[0]),float((*box)[1]),float((*box)[2])},
+               {float((*box)[3]),float((*box)[4]),float((*box)[5])}};
+        meta["bbox"]={{(*box)[0],(*box)[1],(*box)[2]},{(*box)[3],(*box)[4],(*box)[5]}};
     }
-
-    std::ofstream o(path / "meta.json.tmp");
-    o << meta.dump(4) << std::endl;
-    o.close();
-
-    // Rename to make creation atomic
-    std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
-
-    // Preserve auxiliary files from the existing directory before replacing.
-    // Lazy-loaded channels are tracked by name with an empty cv::Mat; if a
-    // geometry-only save skips serializing one of those channels, carry the
-    // existing file forward instead of dropping it from the replaced directory.
-    if (force_overwrite && std::filesystem::exists(final_path)) {
-        std::error_code iterEc;
-        for (const auto& entry : std::filesystem::directory_iterator(final_path, iterEc)) {
-            if (iterEc) {
-                break;
-            }
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-
-            const std::filesystem::path dst = temp_path / entry.path().filename();
-            if (std::filesystem::exists(dst)) {
-                continue;
-            }
-
-            std::error_code copyEc;
-            std::filesystem::copy_file(entry.path(), dst,
-                std::filesystem::copy_options::overwrite_existing, copyEc);
-            // Ignore errors for auxiliary files; x/y/z/meta were just written
-            // and remain the integrity-critical parts of the surface save.
-        }
-    }
-
-    // Atomically move the saved data to the final location
-    bool replacedExisting = false;
-    if (force_overwrite && std::filesystem::exists(final_path)) {
-#ifdef __linux__
-        if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
-            const int err = errno;
-            if (err == ENOSYS || err == EINVAL) {
-                // System doesn't support atomic exchange, fall back to remove + rename
-                std::filesystem::remove_all(final_path);
-                std::filesystem::rename(temp_path, final_path);
-                replacedExisting = true;
-            } else {
-                path = original_path; // Restore on error
-                const std::error_code ec(err, std::generic_category());
-                throw std::runtime_error("atomic exchange failed for " + temp_path.string() +
-                                       " and " + final_path.string() + ": " + ec.message());
-            }
-        } else {
-            // Atomic exchange succeeded, clean up the old data now in temp location
-            std::error_code cleanupErr;
-            std::filesystem::remove_all(temp_path, cleanupErr);
-            if (cleanupErr) {
-                path = original_path; // Restore on error
-                throw std::runtime_error("failed to clean up previous segmentation data at " +
-                                       temp_path.string() + ": " + cleanupErr.message());
-            }
-            replacedExisting = true;
-        }
-#elif defined(_WIN32)
-        try {
-            replaceDirectoryContents(temp_path, final_path);
-        } catch (...) {
-            path = original_path;
-            throw;
-        }
-        replacedExisting = true;
-#else
-        // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
-        std::filesystem::remove_all(final_path);
-        std::filesystem::rename(temp_path, final_path);
-        replacedExisting = true;
-#endif
-    }
-
-    if (!replacedExisting) {
-        std::filesystem::rename(temp_path, final_path);
-    }
-
-    // Clean up the per-thread temp parent directory if empty
-    {
-        std::error_code ec;
-        std::filesystem::remove(temp_path.parent_path(), ec);
-        // Ignore errors - directory might not be empty or might not exist
-    }
-
-    // Update the path to the final canonical location
-    path = final_path;
-    id = final_path.filename().string();
+    path=destination;
+    id=destination.filename().string();
 }
 
 Rect3D QuadSurface::bbox()
@@ -1636,7 +1196,7 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     const std::optional<cv::Rect> &requestedRegion,
     int flags)
 {
-    recoverIncompleteSave(path);
+    vcr::files::recoverDirectory(path);
 
     // Read meta first (scale, uuid, etc.)
     auto metadata = nlohmann::json::parse(std::ifstream(std::filesystem::path(path)/"meta.json"));

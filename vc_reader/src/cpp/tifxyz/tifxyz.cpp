@@ -1,3 +1,6 @@
+#include "vc_reader/publication.hpp"
+#include <atomic>
+#include <chrono>
 #include "vc_reader/tifxyz.hpp"
 
 #include "vc_reader/image_write.hpp"
@@ -229,7 +232,8 @@ Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, s
     valid_.resize(cells);
     for (std::size_t i = 0; i < cells; ++i) {
         float* p = xyz_.data() + i * 3;
-        valid_[i] = vertexValid(p) && (mask.empty() || mask[i]);
+        valid_[i] = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+            (mask.empty() ? vertexValid(p) : mask[i] != 0);
         if (!valid_[i]) p[0] = p[1] = p[2] = -1.f;
     }
 }
@@ -335,6 +339,7 @@ Metadata parseMetadata(const json& document, const std::string& location)
 
 Metadata readMetadata(const std::string& location, const sources::OptionsFor& options)
 {
+    if (!zarr::isRemote(location)) files::recoverDirectory(location);
     return parseMetadata(json::parse(readText(child(location, "meta.json"), options)), location);
 }
 
@@ -385,14 +390,18 @@ std::vector<Entry> list(const std::string& folder, bool recursive, const std::op
 void write(const std::filesystem::path& path, Surface& surface, const WriteOptions& options)
 {
     namespace fs = std::filesystem;
+    std::lock_guard<std::recursive_mutex> lock(files::directoryMutex(path));
+    files::recoverDirectory(path);
     if (fs::exists(path) && !options.overwrite) throw fs::filesystem_error("tifxyz directory already exists", path, std::make_error_code(std::errc::file_exists));
     auto& metadata = surface.metadata();
     if (metadata.uuid.empty()) metadata.uuid = newUuid();
     const auto parent = path.has_parent_path() ? path.parent_path() : fs::path(".");
     fs::create_directories(parent);
-    const auto temporary = parent / (".tifxyz_tmp_" + path.filename().string() + "." + std::to_string(::getpid()));
-    fs::remove_all(temporary);
-    fs::create_directories(temporary);
+    static std::atomic<unsigned long long> sequence{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto temporary = parent / (".tifxyz_tmp_" + path.filename().string() + "." +
+        std::to_string(::getpid()) + "." + std::to_string(stamp) + "." + std::to_string(sequence++));
+    if (!fs::create_directory(temporary)) throw std::runtime_error("cannot create tifxyz staging directory");
     try {
         sources::TiffOptions tiff;
         tiff.compression = options.compression;
@@ -412,14 +421,23 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
         if (!document.contains("type")) document["type"] = "seg";
         if (!document.contains("format")) document["format"] = "tifxyz";
         if (metadata.area) document["area"] = *metadata.area;
-        std::ofstream(temporary / "meta.json") << document.dump(2) << '\n';
+        zarr::atomicWrite(temporary / "meta.json", document.dump(2) + "\n");
         if (options.mask) {
             std::vector<std::uint8_t> mask(cells);
             for (std::size_t i = 0; i < cells; ++i) mask[i] = surface.valid()[i] ? 255 : 0;
             sources::writeTiff(temporary / "mask.tif", mask.data(), "|u1", rows, cols, 1, tiff);
         }
-        fs::remove_all(path);
-        fs::rename(temporary, path);
+        for (const auto& channel : options.channels) {
+            if (channel.name.empty() || channel.name == "." || channel.name == ".." ||
+                channel.name.find_first_of("/\\") != std::string::npos ||
+                channel.name == "x" || channel.name == "y" || channel.name == "z" || !channel.data)
+                throw std::invalid_argument("invalid tifxyz channel name or buffer");
+            auto settings = tiff;
+            if (channel.components == 2 || channel.components > 4) settings.compression = "lzw";
+            sources::writeTiff(temporary / (channel.name + ".tif"), channel.data, channel.dtype,
+                channel.rows, channel.cols, channel.components, settings);
+        }
+        files::publishDirectory(temporary,path,options.overwrite);
     } catch (...) {
         std::error_code ignored;
         fs::remove_all(temporary, ignored);

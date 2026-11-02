@@ -91,7 +91,16 @@ int main()
         tifxyz::WriteOptions options;
         options.overwrite = true;
         tifxyz::write(path, surface, options);
-        CHECK(!fs::exists(path / "old.txt"));
+        CHECK(fs::exists(path / "old.txt"));
+        fs::create_directories(path / "zz.tif");
+        std::vector<float> values(20, 7.f);
+        options.channels.push_back({"zz",values.data(),"<f4",4,5,1});
+        raised = false;
+        try { tifxyz::write(path, surface, options); } catch (const std::exception&) { raised = true; }
+        CHECK(raised);
+        CHECK(fs::exists(path / "old.txt"));
+        CHECK(fs::is_directory(path / "zz.tif"));
+        CHECK(tifxyz::read(path.string()).xyz() == surface.xyz());
         CHECK(fs::exists(path / "x.tif"));
     }
     // Validity: mask, negative and non-finite coordinates; all three coordinates of a missing vertex are -1.
@@ -101,8 +110,9 @@ int main()
         xyz[7] = NAN;
         std::vector<std::uint8_t> mask{1, 1, 1, 0};
         tifxyz::Surface surface(2, 2, std::move(xyz), std::move(mask), {});
-        CHECK((surface.valid() == std::vector<std::uint8_t>{1, 0, 0, 0}));
-        for (int a = 0; a < 3; ++a) CHECK(surface.xyz()[std::size_t(3 + a)] == -1.f);
+        CHECK((surface.valid() == std::vector<std::uint8_t>{1, 1, 0, 0}));
+        CHECK(surface.xyz()[3] == -2.f);
+        for (int a = 0; a < 3; ++a) CHECK(surface.xyz()[std::size_t(6 + a)] == -1.f);
     }
     // A -1 in a stored box is replaced by the real extent.
     {

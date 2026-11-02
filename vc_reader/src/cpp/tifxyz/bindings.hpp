@@ -2,6 +2,7 @@
 // Python access to vcr::tifxyz and vcr::sources::writeTiff.
 #include "vc_reader/image_write.hpp"
 #include "vc_reader/tifxyz.hpp"
+#include "vc_reader/publication.hpp"
 
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/filesystem.h>
@@ -257,8 +258,17 @@ inline void bind(nb::module_& m)
             out.append(nb::make_tuple(e.location, e.metadata.uuid, nb::make_tuple(e.metadata.scale[0], e.metadata.scale[1]), e.metadata.bbox, e.metadata.area, fromJson(e.metadata.extra), e.error));
         return out;
     }, "folder"_a, "recursive"_a, "z_range"_a, "options"_a);
-    m.def("_tifxyz_write", [](const std::filesystem::path& path, Surface& surface, const std::string& compression, std::optional<int> tile, bool mask, bool overwrite, std::optional<double> pixelUm) {
+    m.def("_tifxyz_write", [](const std::filesystem::path& path, Surface& surface, const std::string& compression, std::optional<int> tile, bool mask, bool overwrite, std::optional<double> pixelUm, nb::dict channels) {
         WriteOptions options;
+        using Array = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+        std::vector<Array> owners;
+        for (auto [key, value] : channels) {
+            auto array = nb::cast<Array>(value);
+            if (array.ndim() < 2 || array.ndim() > 3) throw nb::value_error("channels require 2D or 3D arrays");
+            options.channels.push_back({nb::cast<std::string>(key), array.data(), typestrOf(array.dtype()),
+                std::int64_t(array.shape(0)), std::int64_t(array.shape(1)), array.ndim() == 3 ? std::int64_t(array.shape(2)) : 1});
+            owners.push_back(std::move(array));
+        }
         options.compression = compression;
         options.tile = tile;
         options.mask = mask;
@@ -266,7 +276,11 @@ inline void bind(nb::module_& m)
         options.pixelUm = pixelUm;
         nb::gil_scoped_release release;
         write(path, surface, options);
-    }, "path"_a, "surface"_a, "compression"_a, "tile"_a, "mask"_a, "overwrite"_a, "pixel_um"_a = nb::none());
+    }, "path"_a, "surface"_a, "compression"_a, "tile"_a, "mask"_a, "overwrite"_a, "pixel_um"_a = nb::none(), "channels"_a = nb::dict());
+    m.def("snapshot", [](const std::filesystem::path& path, int count, int throttle, bool force) {
+        nb::gil_scoped_release release;
+        files::snapshot(path, count, std::chrono::seconds(throttle), force);
+    }, "path"_a, "count"_a = 10, "throttle_seconds"_a = 120, "force"_a = false);
 }
 
 }  // namespace vcr::tifxyz::python

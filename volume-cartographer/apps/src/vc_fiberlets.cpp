@@ -7,7 +7,7 @@
 
 #include "vc/fiber_tracer/FiberletOnDemand.hpp"
 #include "vc/fiber_tracer/FiberletPipeline.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"

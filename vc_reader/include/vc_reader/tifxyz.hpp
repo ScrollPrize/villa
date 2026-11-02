@@ -91,8 +91,9 @@ private:
 
 class Surface {
 public:
-    // `xyz` holds rows x cols x 3 XYZ floats. A vertex is valid when vertexValid says so and
-    // `mask` (nonzero; may be empty) allows it; all three coordinates of any other are set to -1.
+    // `xyz` holds rows x cols x 3 XYZ floats. An explicit mask supplies in-memory validity,
+    // including negative real coordinates; without it use the file-format vertex rule.
+    // Nonfinite vertices are always invalid; invalid coordinates are set to -1.
     Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location = {});
 
     [[nodiscard]] std::int64_t rows() const { return rows_; }
@@ -141,7 +142,15 @@ struct Entry {
 // the coordinates to filter on it. A surface with no box is not filtered out.
 [[nodiscard]] std::vector<Entry> list(const std::string& folder, bool recursive = true, const std::optional<std::array<double, 2>>& zRange = std::nullopt, const sources::OptionsFor& options = {});
 
+struct Channel {
+    std::string name;
+    const void* data = nullptr;
+    std::string dtype;
+    std::int64_t rows = 0, cols = 0, components = 1;
+};
 struct WriteOptions {
+    std::vector<Channel> channels;  // additional TIFFs; buffers live until write returns
+
     std::string compression = "lzw";  // as TiffOptions
     std::optional<int> tile = 1024;  // none: each image is one strip
     bool mask = true;  // write mask.tif (255 valid, 0 invalid)
@@ -149,7 +158,7 @@ struct WriteOptions {
     std::optional<double> pixelUm;  // the TIFFs' resolution tags (micrometres per pixel); none without
 };
 // Writes the directory through a temporary beside it. An existing `path` raises unless
-// `overwrite`, which replaces the whole directory. Metadata carries the extent of the valid
+// `overwrite`, which publishes new files with rollback while retaining sibling artifacts. Metadata carries the extent of the valid
 // vertices (zeros without any). A surface without a UUID gets one, kept on `surface`.
 void write(const std::filesystem::path& path, Surface& surface, const WriteOptions& options = {});
 

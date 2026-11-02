@@ -35,6 +35,7 @@ else()
     add_library(vc_reader_native STATIC)
 endif()
 target_sources(vc_reader_native PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/publication.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/pathfinding/pathfinding.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
