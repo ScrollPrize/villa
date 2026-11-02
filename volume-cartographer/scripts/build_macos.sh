@@ -79,6 +79,7 @@ fi
 
 brew_prefix="$(brew --prefix)"
 export HOMEBREW_PREFIX="$brew_prefix"
+deps_started=$SECONDS
 required_formulae=(
   llvm
   # As of Homebrew llvm 19+, ld64.lld no longer ships in the llvm formula;
@@ -92,7 +93,13 @@ required_formulae=(
   cmake
   ninja
   pkgconf
-  qt
+  # qtbase includes all linked Qt modules, qmake and macdeployqt. Retain SVG,
+  # image-format plugins and translations without pulling in the entire Qt
+  # suite (WebEngine, Quick3D, Charts, Virtual Keyboard, etc.).
+  qtbase
+  qtsvg
+  qtimageformats
+  qttranslations
   ceres-solver
   eigen
   opencv
@@ -141,6 +148,7 @@ if (( ${#missing[@]} > 0 )); then
     exit 1
   fi
 fi
+echo "macOS build: Homebrew dependency setup: $((SECONDS - deps_started))s"
 
 llvm_bin="$brew_prefix/opt/llvm/bin"
 lld_bin="$brew_prefix/opt/lld/bin"
@@ -219,11 +227,15 @@ else
   exit 1
 fi
 
+configure_started=$SECONDS
 cmake --preset macos-homebrew-llvm \
   -B "$build_dir" \
   "${extra_cmake_args[@]}"
+echo "macOS build: CMake configure: $((SECONDS - configure_started))s"
 
-cmake --build "$build_dir" -j "$jobs"
+build_started=$SECONDS
+ninja -C "$build_dir" -j "$jobs"
+echo "macOS build: Ninja build: $((SECONDS - build_started))s"
 
 if (( use_ccache )); then
   ccache --show-stats

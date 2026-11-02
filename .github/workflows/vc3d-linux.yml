@@ -72,22 +72,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build AppImage
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Restore AppImage compiler cache
+        id: ccache
+        uses: actions/cache@v4
+        with:
+          path: .cache/appimage-ccache
+          key: appimage-ccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/Dockerfile.appimage', 'volume-cartographer/CMakePresets.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            appimage-ccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/Dockerfile.appimage', 'volume-cartographer/CMakePresets.json') }}-
+
+      # BuildKit's layer-cache export does not include RUN cache mounts.
+      # The post step extracts ccache before actions/cache saves it.
+      - name: Restore Docker compiler cache mount
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          cache-map: '{".cache/appimage-ccache": "/var/cache/ccache"}'
+          skip-extraction: ${{ steps.ccache.outputs.cache-hit }}
+
+      - name: Read package revision
+        id: revision
         working-directory: volume-cartographer
         run: |
           # The repository-root context supplies the sibling spiral-fitting
           # service and vc3d_fiber_format package installed with VC3D. A
           # Dockerfile-specific ignore file excludes everything else, including
           # .git, so pass the checked-out revision in for package naming.
-          git_sha1="$(git rev-parse HEAD)"
-          git_date="$(git log -1 --format=%cs HEAD)"
-          DOCKER_BUILDKIT=1 docker build \
-            -o type=local,dest=dist \
-            --build-arg VC_GIT_SHA1="$git_sha1" \
-            --build-arg VC_GIT_COMMIT_DATE="$git_date" \
-            -f scripts/Dockerfile.appimage \
-            ..
-          ls -la dist/
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cs HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build AppImage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: volume-cartographer/scripts/Dockerfile.appimage
+          outputs: type=local,dest=volume-cartographer/dist
+          build-args: |
+            VC_GIT_SHA1=${{ steps.revision.outputs.sha }}
+            VC_GIT_COMMIT_DATE=${{ steps.revision.outputs.date }}
+          cache-from: type=gha,scope=vc3d-appimage-linux-amd64
+          cache-to: type=gha,mode=max,scope=vc3d-appimage-linux-amd64
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
