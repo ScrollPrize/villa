@@ -35,11 +35,11 @@ from vesuvius.ink_detection.training.train import (
     stage_training_request,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _training_mapping() -> dict:
-    authored = _config_mapping(depth=1, side=4)
+    authored = config_mapping(depth=1, side=4)
     authored.update(
         {
             "num_iterations": 6,
