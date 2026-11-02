@@ -851,6 +851,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
             return distance >= tolerance ? 0.0f : 1.0f - distance / tolerance;
         };
 
+        const auto gridPoints = quad ? viewer->surfaceForPoints(*quad) : nullptr;
         for (std::size_t index = 0; index < points.size(); ++index) {
             const cv::Vec3f& point = points[index];
             cv::Vec2f surfacePoint;
@@ -868,9 +869,20 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                         pointer = hit->ptr;
                         distance = hit->distance;
                         if (!nominalDepth) {
-                            const cv::Vec3f coord = quad->coord(pointer);
-                            const cv::Vec3f normal = quad->normal(pointer);
-                            if (std::isfinite(coord[0]) && std::isfinite(coord[1]) &&
+                            cv::Vec3f coord = quad->coord(pointer);
+                            cv::Vec3f normal = quad->normal(pointer);
+                            bool physical = false;
+                            if (gridPoints) {
+                                const cv::Vec2d grid = quad->surfaceToGrid({double(pointer[0]) / quad->scale()[0],
+                                                                            double(pointer[1]) / quad->scale()[1]});
+                                const float xy[]{float(grid[0]), float(grid[1])};
+                                gridPoints->pointsAt(xy, 1, coord.val, normal.val);
+                                physical = std::isfinite(coord[0]) && std::isfinite(normal[0]);
+                            }
+                            if (physical) {
+                                const float w = (point - coord).dot(normal) / normal.dot(normal);
+                                distance = float(cv::norm(point - (coord + normal * std::clamp(w, depthLo, depthHi))));
+                            } else if (std::isfinite(coord[0]) && std::isfinite(coord[1]) &&
                                 std::isfinite(coord[2]) && std::isfinite(normal[0]) &&
                                 std::isfinite(normal[1]) && std::isfinite(normal[2])) {
                                 distance =

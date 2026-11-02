@@ -26,6 +26,7 @@ class CVolumeViewerView;
 class QGraphicsItem;
 class Surface;
 class QuadSurface;
+namespace vcr::grid { class Surface; }
 class Volume;
 class VCCollection;
 
@@ -119,6 +120,9 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
+    // The grid surface frames of `quad` are drawn from, so overlays measure depth as frames
+    // place it; null when this viewer draws none.
+    [[nodiscard]] virtual std::shared_ptr<const vcr::grid::Surface> surfaceForPoints(const QuadSurface&) const { return nullptr; }
     virtual void setOverlaySamplingMethod(int method) = 0;
     virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
