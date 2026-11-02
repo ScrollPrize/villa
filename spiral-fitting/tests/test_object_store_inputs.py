@@ -224,6 +224,21 @@ def test_the_outer_shell_is_read_on_its_own_never_as_a_patch(db):
     assert float(inputs.outer_shell.zyxs[0, 0, 0]) == 31.0
 
 
+def test_a_committed_spiral_fit_is_never_a_fit_input(db):
+    patch = put_patch(db, _grid(10.0), tags=['keep'])
+    before = osi.read_snapshot(db, request())
+    fit = put_patch(db, _grid(30.0, size=8), tags=[osi.SPIRAL_FIT_TAG, 'keep'])
+    # Neither the default selection nor a tag it shares takes it in, so the
+    # inputs a commit recorded still match the session's after the commit...
+    for selected in (request(), request(surface={'tags': ('keep',)})):
+        snapshot = osi.read_snapshot(db, selected)
+        assert [obj.uuid for obj in snapshot.objects_of('surface')] == [patch]
+    assert osi.read_snapshot(db, request()).digest() == before.digest()
+    # ...and naming it is refused.
+    with pytest.raises(osi.ObjectStoreInputError, match='is a committed Spiral fit'):
+        osi.read_snapshot(db, request(surface={'uuids': (fit,)}))
+
+
 def test_the_outer_shell_is_one_surface_and_required_when_the_fit_needs_it(db):
     put_patch(db, _grid(10.0))
     required = osi.InputRequest(outer_shell='required')

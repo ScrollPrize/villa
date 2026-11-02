@@ -39,6 +39,9 @@ KINDS = ('surface', 'point_collection', 'fiber', 'track')
 # The tag of the scroll's outer shell: a surface the fit reads on its own
 # (InputSnapshot.outer_shell, FitInputs.outer_shell), never as a patch.
 OUTER_SHELL_TAG = 'spiral-outer-shell'
+# The tag of a committed Spiral fit (service_commits): a fit result, never a
+# fit input.
+SPIRAL_FIT_TAG = 'spiral-fit'
 KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
                'fiber': 'fibers', 'track': 'tracks'}
 
@@ -341,11 +344,23 @@ def outer_shell(record):
     return record['kind'] == 'surface' and OUTER_SHELL_TAG in (record.get('tags') or ())
 
 
+def spiral_fit(record):
+    """Whether an object is a committed Spiral fit (SPIRAL_FIT_TAG). Taking
+    one in would make a fit's own output its next input, and change the input
+    digest the commit recorded."""
+    return record['kind'] == 'surface' and SPIRAL_FIT_TAG in (record.get('tags') or ())
+
+
+def fit_input(record):
+    """Whether a default or tag selection may take this object in."""
+    return not attached_data(record) and not outer_shell(record) and not spiral_fit(record)
+
+
 def resolve_selector(store, kind, selector, records=None):
     """Explicit sorted UUIDs selected by ``selector`` among active objects.
 
-    Default and tag selections leave out attached data and the outer shell;
-    naming either by UUID is an error. ``records`` ({UUID: record} of every
+    Default and tag selections leave out attached data, the outer shell and
+    committed Spiral fits; naming any of them by UUID is an error. ``records`` ({UUID: record} of every
     object at a position, retired ones included) replaces the store's current
     objects."""
     def matching(tag=None):
@@ -353,11 +368,11 @@ def resolve_selector(store, kind, selector, records=None):
             return [uuid for uuid, record in records.items()
                     if record['kind'] == kind and not record.get('retired')
                     and (tag is None or tag in (record.get('tags') or ()))
-                    and not attached_data(record) and not outer_shell(record)]
+                    and fit_input(record)]
         query = {} if tag is None else {'tag': tag}
         return [record['uuid'] for record in store.select_objects(
             object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
-            if not attached_data(record) and not outer_shell(record)]
+            if fit_input(record)]
 
     if selector.is_default:
         return sorted(matching())
@@ -378,6 +393,9 @@ def resolve_selector(store, kind, selector, records=None):
         elif outer_shell(record):
             problems.append(f'selected {kind} {uuid} is the outer shell (tagged '
                             f'{OUTER_SHELL_TAG}), not a patch')
+        elif spiral_fit(record):
+            problems.append(f'selected {kind} {uuid} is a committed Spiral fit (tagged '
+                            f'{SPIRAL_FIT_TAG}), not a fit input')
         else:
             selected.add(record['uuid'])
     if problems:
