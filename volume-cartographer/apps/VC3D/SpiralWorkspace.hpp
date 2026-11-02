@@ -2,6 +2,7 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
+#include "SpiralPreviewWindings.hpp"
 #include "overlays/SpiralFiberOverlayController.hpp"
 
 #include <QMainWindow>
@@ -104,13 +105,7 @@ private:
     // routes differ or are unset.
     std::optional<vc::objects::AttachmentIdentity> inputStore() const;
     void bindInputStore();
-    struct PreviewComponent {
-        int rowBegin = 0;
-        int rowEnd = 0;
-        int columnBegin = 0;
-        int columnEnd = 0;
-        int winding = 0;
-    };
+    using PreviewComponent = vc3d::spiral::PreviewComponent;
     struct PreviewLoadResult {
         std::shared_ptr<QuadSurface> surface;
         QString surfaceId;

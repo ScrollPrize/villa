@@ -1,4 +1,5 @@
 #include "SpiralWorkspace.hpp"
+#include "SpiralPreviewWindings.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
@@ -1469,33 +1470,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         if (QFileInfo(QDir(localSurfacePath).filePath(QStringLiteral("meta.json"))).isFile())
             surfacePath = localSurfacePath;
 
-        const QJsonArray bounds = manifest.value(QStringLiteral("winding_bounds")).toArray();
-        const QJsonArray windingIds = manifest.value(QStringLiteral("winding_ids")).toArray();
-        if (bounds.isEmpty() || bounds.size() != windingIds.size()
-            || std::abs(manifest.value(QStringLiteral("output_step_vx")).toDouble()
-                        - 20.0) > 1.0e-9)
+        if (std::abs(manifest.value(QStringLiteral("output_step_vx")).toDouble() - 20.0) > 1.0e-9)
             return failure(QObject::tr("Invalid Spiral preview winding mapping"));
-        std::vector<PreviewComponent> previewComponents;
-        std::set<int> expectedWindingIds;
-        previewComponents.reserve(bounds.size());
-        for (int index = 0; index < bounds.size(); ++index) {
-            const QJsonObject entry = bounds[index].toObject();
-            const PreviewComponent component{
-                entry.value(QStringLiteral("row_begin")).toInt(-1),
-                entry.value(QStringLiteral("row_end")).toInt(-1),
-                entry.value(QStringLiteral("column_begin")).toInt(-1),
-                entry.value(QStringLiteral("column_end")).toInt(-1),
-                entry.value(QStringLiteral("winding")).toInt(-1),
-            };
-            if (component.rowBegin < 0 || component.rowEnd <= component.rowBegin
-                || component.columnBegin < 0
-                || component.columnEnd <= component.columnBegin
-                || component.winding != windingIds[index].toInt()
-                || component.winding < 0
-                || !expectedWindingIds.insert(component.winding).second)
-                return failure(QObject::tr("Invalid Spiral winding bounds"));
-            previewComponents.push_back(component);
-        }
+        QString windingError;
+        auto components = vc3d::spiral::parseWindingBounds(
+            manifest.value(QStringLiteral("winding_bounds")).toArray(),
+            manifest.value(QStringLiteral("winding_ids")).toArray(), &windingError);
+        if (!components) return failure(windingError);
+        std::vector<PreviewComponent> previewComponents = std::move(*components);
 
         const QString artifactRoot = QFileInfo(manifestPath).absolutePath();
         const QString windingMapName =
@@ -1505,61 +1487,12 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || windingMapName.startsWith(QStringLiteral("../")))
             return failure(QObject::tr("Invalid Spiral winding-ID map path"));
         const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
-        cv::Mat windingImage = cv::imread(
-            windingMapPath.toStdString(), cv::IMREAD_UNCHANGED);
-        if (windingImage.empty() || windingImage.channels() != 1)
-            return failure(QObject::tr("Cannot read Spiral winding-ID map"));
-        cv::Mat windingValues;
-        windingImage.convertTo(windingValues, CV_64F);
-        cv::Mat_<int32_t> mappedWindings;
-        mappedWindings.create(windingImage.rows, windingImage.cols);
-        std::map<int, PreviewComponent> actualBounds;
-        for (int row = 0; row < windingValues.rows; ++row) {
-            const double* values = windingValues.ptr<double>(row);
-            for (int column = 0; column < windingValues.cols; ++column) {
-                const double value = values[column];
-                const double rounded = std::nearbyint(value);
-                if (!std::isfinite(value) || std::abs(value - rounded) > 1.0e-6
-                    || rounded < -1.0
-                    || rounded > std::numeric_limits<int32_t>::max())
-                    return failure(QObject::tr(
-                        "Spiral winding-ID map contains a non-integer value"));
-                const int winding = static_cast<int>(rounded);
-                mappedWindings(row, column) = winding;
-                if (winding == -1) continue;
-                if (expectedWindingIds.find(winding)
-                    == expectedWindingIds.end())
-                    return failure(QObject::tr(
-                        "Spiral winding-ID map contains an undeclared winding"));
-                auto [found, inserted] = actualBounds.try_emplace(
-                    winding,
-                    PreviewComponent{
-                        row, row + 1, column, column + 1, winding});
-                if (!inserted) {
-                    found->second.rowBegin =
-                        std::min(found->second.rowBegin, row);
-                    found->second.rowEnd =
-                        std::max(found->second.rowEnd, row + 1);
-                    found->second.columnBegin =
-                        std::min(found->second.columnBegin, column);
-                    found->second.columnEnd =
-                        std::max(found->second.columnEnd, column + 1);
-                }
-            }
-        }
-        if (actualBounds.size() != previewComponents.size())
-            return failure(QObject::tr(
-                "Spiral winding-ID map omits a declared winding"));
-        for (const PreviewComponent& expected : previewComponents) {
-            const auto found = actualBounds.find(expected.winding);
-            if (found == actualBounds.end()
-                || found->second.rowBegin != expected.rowBegin
-                || found->second.rowEnd != expected.rowEnd
-                || found->second.columnBegin != expected.columnBegin
-                || found->second.columnEnd != expected.columnEnd)
-                return failure(QObject::tr(
-                    "Spiral winding bounds do not match the winding-ID map"));
-        }
+        auto windings = vc3d::spiral::windingIdsFromImage(
+            cv::imread(windingMapPath.toStdString(), cv::IMREAD_UNCHANGED), &windingError);
+        if (!windings) return failure(windingError);
+        cv::Mat_<int32_t> mappedWindings = std::move(*windings);
+        if (!vc3d::spiral::windingMapMatchesBounds(mappedWindings, previewComponents, &windingError))
+            return failure(windingError);
 
         QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
         if (!metadata.open(QIODevice::ReadOnly))
