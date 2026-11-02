@@ -922,8 +922,10 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return result;
         } catch (const std::exception& e) {
             qCWarning(lcSegPushPull) << "Alpha push/pull worker failed:" << e.what();
+            result.noMovementReason = std::string("Alpha push/pull failed: ") + e.what();
         } catch (...) {
             qCWarning(lcSegPushPull) << "Alpha push/pull worker failed with an unknown exception";
+            result.noMovementReason = "Alpha push/pull failed.";
         }
         return result;
     });
