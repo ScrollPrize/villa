@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from vc_reader import images
+import vc_reader.transforms as A
 from scipy import ndimage as ndi
 from tqdm import tqdm
 
@@ -38,6 +39,9 @@ except Exception:
     _HAS_CV2 = False
 
 TIFF_EXTS = {".tif", ".tiff"}
+
+# Voxels 26-adjacent to (or in) a mask: dilation by the full 3x3x3 neighbourhood.
+_TOUCHING = A.Morphology("dilate", radius=1, footprint="cube")
 
 
 def _find_label_file(folder: Path, pattern: str) -> Optional[Path]:
@@ -66,8 +70,7 @@ def _fix_2d_hole_fill(
     label_mask = (label == fg_value) & (~ignore_mask)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        struct = ndi.generate_binary_structure(label.ndim, 1)
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
 
     filled = np.zeros_like(label_mask, dtype=bool)
     for z in range(label_mask.shape[0]):
@@ -104,13 +107,11 @@ def _fix_morph_close(
 
     ignore_mask = (label == ignore_value) if ignore_value is not None else np.zeros(label.shape, dtype=bool)
     label_mask = (label == fg_value) & (~ignore_mask)
-    struct = ndi.generate_binary_structure(label.ndim, 1)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
-    if kernel > 1:
-        struct = ndi.iterate_structure(struct, kernel)
-    struct_conn = ndi.generate_binary_structure(label.ndim, label.ndim)  # 26-connectivity in 3D
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
+    # The six-connected cross iterated `kernel` times.
+    closing = A.Morphology("close", radius=kernel, footprint="cross")
 
     labels_cc, n_cc = cc3d.connected_components(label_mask.astype(np.uint8), connectivity=26, return_N=True)
     if n_cc == 0:
@@ -130,7 +131,7 @@ def _fix_morph_close(
         if not region.any():
             continue
 
-        closed = ndi.binary_closing(comp, structure=struct)
+        closed = closing(comp[None])[0]
         # Only add voxels (do not remove original component)
         proposed = comp | (closed & region)
         added = proposed & (~comp)
@@ -141,7 +142,7 @@ def _fix_morph_close(
         # Skip if this would merge with other components (26-neighborhood adjacency).
         others = label_mask[slc] & (~comp)
         if others.any():
-            if np.any(added & ndi.binary_dilation(others, structure=struct_conn)):
+            if np.any(added & _TOUCHING(others[None])[0]):
                 print(f"[WARN] Skipping close on component {comp_id}: would merge with neighbor")
                 continue
 
@@ -232,9 +233,7 @@ def _fix_alpha_wrap(
     label_mask = (label == fg_value) & (~ignore_mask)
     hole_mask = hole_mask.astype(bool)
     if mask_dilate and mask_dilate > 0:
-        struct = ndi.generate_binary_structure(label.ndim, 1)
-        hole_mask = ndi.binary_dilation(hole_mask, structure=struct, iterations=int(mask_dilate))
-    struct_conn = ndi.generate_binary_structure(label.ndim, label.ndim)  # 26-connectivity in 3D
+        hole_mask = A.Morphology("dilate", radius=int(mask_dilate), footprint="cross")(hole_mask[None])[0]
 
     labels_cc, n_cc = cc3d.connected_components(label_mask.astype(np.uint8), connectivity=26, return_N=True)
     if n_cc == 0:
@@ -280,7 +279,7 @@ def _fix_alpha_wrap(
         # Skip if this would merge with other components (26-neighborhood adjacency).
         others = label_mask[slc] & (~comp)
         if others.any():
-            if np.any(added & ndi.binary_dilation(others, structure=struct_conn)):
+            if np.any(added & _TOUCHING(others[None])[0]):
                 print(f"[WARN] Skipping alpha wrap on component {comp_id}: would merge with neighbor")
                 continue
 

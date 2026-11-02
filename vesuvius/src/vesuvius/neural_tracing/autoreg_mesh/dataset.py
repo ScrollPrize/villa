@@ -7,7 +7,7 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy import ndimage
+import vc_reader.transforms as A
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
@@ -251,7 +251,7 @@ def _apply_volume_only_augmentation(volume: np.ndarray, augmentation_cfg: dict, 
 
     if random.random() < float(augmentation_cfg.get("gaussian_blur_prob", 0.0)):
         sigma = random.uniform(0.35, 0.9)
-        vol = ndimage.gaussian_filter(vol, sigma=sigma, mode="nearest").astype(np.float32, copy=False)
+        vol = A.GaussianBlur(sigma=sigma, boundary="nearest", truncate=4, full_width=False)(vol[None])[0]
 
     if random.random() < float(augmentation_cfg.get("slice_illumination_prob", 0.0)) and int(vol.shape[0]) > 1:
         depth = int(vol.shape[0])

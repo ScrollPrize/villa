@@ -37,6 +37,7 @@ except Exception:
     _HAS_SKIMAGE = False
 import numpy as np
 from vc_reader import images
+import vc_reader.transforms as A
 from tqdm import tqdm
 
 from scipy import ndimage as ndi
@@ -313,9 +314,8 @@ def localize_holes(
             for c in hole_coords:
                 local = tuple(int(v - d) for v, d in zip(c, offset))
                 seed[local] = True
-            struct = ndi.generate_binary_structure(work_mask.ndim, 1)
             if dilation_radius > 0:
-                work_hole_mask = ndi.binary_dilation(seed, structure=struct, iterations=dilation_radius)
+                work_hole_mask = A.Morphology("dilate", radius=dilation_radius, footprint="cross")(seed[None])[0]
             else:
                 work_hole_mask = seed
     else:  # betti_matching
@@ -330,7 +330,6 @@ def localize_holes(
         )
 
         if cycles.matched_cycles:
-            struct = ndi.generate_binary_structure(work_mask.ndim, 1)
             shape = np.array(work_mask.shape, dtype=int)
             for cyc in cycles.matched_cycles:
                 if cyc.size == 0:
@@ -349,7 +348,7 @@ def localize_holes(
                     work_hole_mask[tuple(coords.T)] = True
 
             if work_hole_mask.any() and dilation_radius > 0:
-                work_hole_mask = ndi.binary_dilation(work_hole_mask, structure=struct, iterations=dilation_radius)
+                work_hole_mask = A.Morphology("dilate", radius=dilation_radius, footprint="cross")(work_hole_mask[None])[0]
         else:
             print("[INFO] betti_matching found 0 H1 features")
 

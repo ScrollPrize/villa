@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from scipy.ndimage import gaussian_filter
+import vc_reader.transforms as A
 
 from vesuvius.neural_tracing.tracers.fibers.data.targets import collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
@@ -199,7 +199,7 @@ def photometric_draw(sampling, rng):
 def augment_ct(image, params, rng, blur_sigma=0.):
     """Augment every z-scored CT value without a mask or clipping."""
     if blur_sigma > 0:
-        image[:] = gaussian_filter(image, blur_sigma, mode='reflect')
+        image[:] = A.GaussianBlur(sigma=blur_sigma, boundary="reflect", truncate=4, full_width=False)(image[None])[0]
     contrast, brightness, noise = params
     mean = float(image.mean())
     image[:] = (image-mean)*contrast+mean+brightness*8.

@@ -17,7 +17,7 @@ import re
 from typing import Any, Optional, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+import vc_reader.transforms as A
 from vc_reader import images
 from vc_reader.reader import ObjectStore
 
@@ -39,6 +39,9 @@ from .prepare_canvas_offset_evidence import (
     _remote_join,
     inspect_zarr,
 )
+
+_BLUR_1 = A.GaussianBlur(sigma=1.0, boundary="reflect", truncate=4, full_width=False)
+_BLUR_8 = A.GaussianBlur(sigma=8.0, boundary="reflect", truncate=4, full_width=False)
 
 
 # Raw scan volumes are not public: there is no usable default, callers
@@ -142,9 +145,8 @@ def select_tiles(
 
     height, width = image.shape
     tile = min(tile_size, height, width)
-    filtered = gaussian_filter(image.astype(np.float32), 1.0) - gaussian_filter(
-        image.astype(np.float32), 8.0
-    )
+    values = image.astype(np.float32)[None]
+    filtered = _BLUR_1(values)[0] - _BLUR_8(values)[0]
     candidates: list[tuple[float, int, int, int, int]] = []
     for row in range(0, height - tile + 1, tile):
         for col in range(0, width - tile + 1, tile):
@@ -198,9 +200,8 @@ def select_overlap_tiles(
 
     height, width = image.shape
     tile = min(tile_size, height, width)
-    filtered = gaussian_filter(image.astype(np.float32), 1.0) - gaussian_filter(
-        image.astype(np.float32), 8.0
-    )
+    values = image.astype(np.float32)[None]
+    filtered = _BLUR_1(values)[0] - _BLUR_8(values)[0]
     candidates: list[tuple[float, int, int, int, int]] = []
     for row in range(0, height - tile + 1, tile):
         for col in range(0, width - tile + 1, tile):

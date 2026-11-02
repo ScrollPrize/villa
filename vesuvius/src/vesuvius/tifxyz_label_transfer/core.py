@@ -32,6 +32,7 @@ from scipy.spatial import cKDTree
 
 from vc_reader.tifxyz import full_extent
 from vc_reader.resident import sample_field_tile as bilinear_field_tile
+import vc_reader.transforms as A
 
 
 FloatArray = NDArray[np.floating]
@@ -1284,8 +1285,6 @@ def _content_anchor_distance(
     so this distance cannot distinguish seam gaps from mesh mismatch.
     """
 
-    import scipy.ndimage
-
     valid = np.asarray(valid, dtype=bool)
     source_height, source_width = source_shape
     label_height, label_width = label_shape
@@ -1318,7 +1317,8 @@ def _content_anchor_distance(
     if not anchor.any():
         return np.full(valid.shape, np.inf, dtype=np.float64)
     return np.asarray(
-        scipy.ndimage.distance_transform_edt(~anchor), dtype=np.float64
+        A.DistanceTransform(mode="outside", implicit_background=True)(anchor[None])[0],
+        dtype=np.float64,
     )
 
 

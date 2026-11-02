@@ -155,7 +155,7 @@ def test_native_crop_scatter_surface_and_dense_normal_projection():
 def test_surface_distance_matches_full_distance_transform(max_distance, points):
     # Sparse sheets take the local search, dense ones the full transform; both
     # must give the bytes the full transform gives.
-    from scipy.ndimage import distance_transform_edt
+    import vc_reader.transforms as A
 
     rng = np.random.default_rng(points + int(max_distance * 8))
     crop = (3, 5, 7, 23, 37, 45)
@@ -170,7 +170,8 @@ def test_surface_distance_matches_full_distance_transform(max_distance, points):
         > 0
     )
     expected = np.clip(
-        1.0 - distance_transform_edt(~occupancy) / max_distance, 0.0, 1.0
+        1.0 - A.DistanceTransform(mode="outside", implicit_background=True)(occupancy[None])[0].astype(np.float64)
+        / max_distance, 0.0, 1.0
     ).astype(np.float32)
     actual = project_surface_distance(
         positions, valid, crop, max_distance_voxels=max_distance

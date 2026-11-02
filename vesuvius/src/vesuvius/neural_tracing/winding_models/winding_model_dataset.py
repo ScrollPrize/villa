@@ -13,12 +13,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-import scipy.ndimage
 import torch
 from skimage.restoration import unwrap_phase
 from vc.grid_raycast import GridRaycaster
 
 from vc_reader import tifxyz
+import vc_reader.transforms as A
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
     SlabFrame,
     VolumeSlabExtractor,
@@ -453,9 +453,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
         # before consuming them.
         valid_vertex = surface.valid
         if erode_cells > 0:
-            valid_vertex = scipy.ndimage.binary_erosion(
-                valid_vertex, iterations=erode_cells, border_value=0
-            )
+            valid_vertex = A.Morphology("erode", radius=erode_cells, footprint="cross")(valid_vertex[None])[0]
             xyz[~valid_vertex] = -1.0
         quad_mask = (
             valid_vertex[:-1, :-1]

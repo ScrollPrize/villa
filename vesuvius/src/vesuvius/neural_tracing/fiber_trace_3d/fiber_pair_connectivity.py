@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from vc_reader.reader import open_zarr
 from vc_reader.resident import sample_array
+import vc_reader.transforms as A
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
@@ -21,6 +22,7 @@ from .embedding import nearest_polyline_points
 
 _CONN6 = ndimage.generate_binary_structure(3, 1)
 _CONN26 = ndimage.generate_binary_structure(3, 3)
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
 def _read_box(array, begin_zyx, end_zyx):
@@ -94,13 +96,6 @@ def endpoint_ellipsoids(shape, origin_zyx, scale, endpoints_xyz, normals_xyz,
     return masks
 
 
-def _ball(radius):
-    if radius == 0:
-        return np.ones((1, 1, 1), dtype=bool)
-    grid = np.indices((2*radius+1,)*3) - radius
-    return np.sum(grid*grid, axis=0) <= radius*radius
-
-
 def connecting_component(mask, endpoint_masks, connectivity=_CONN26):
     labels, count = ndimage.label(mask, structure=connectivity)
     common = None
@@ -124,16 +119,16 @@ def _closed_mask(mask, settings):
         return mask
     # One iteration uses the full 3x3x3 neighborhood. Repeating it grows and
     # shrinks by one Chebyshev voxel per iteration.
-    return ndimage.binary_closing(mask, structure=_CONN26, iterations=iterations)
+    return A.Morphology("close", radius=iterations, footprint="cube")(mask[None])[0]
 
 
 def _transforms(presence, settings):
     yield {"kind": "raw", "sigma": 0.0, "amount": 0.0}, presence
     for sigma in settings["gaussian_sigmas_prediction"]:
-        blurred = ndimage.gaussian_filter(presence, float(sigma), mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         yield {"kind": "gaussian", "sigma": float(sigma), "amount": 0.0}, blurred
     for sigma in settings["unsharp_sigmas_prediction"]:
-        blurred = ndimage.gaussian_filter(presence, float(sigma), mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         for amount in settings["unsharp_amounts"]:
             sharpened = np.clip(presence + float(amount)*(presence-blurred), 0.0, 1.0)
             yield {"kind": "unsharp", "sigma": float(sigma), "amount": float(amount)}, sharpened
@@ -160,7 +155,7 @@ def search_connectivity(presence, endpoint_masks, settings, domain=None):
             raw = values >= float(threshold_u8)/255.0
             if domain is not None:
                 raw &= domain
-            distances = ndimage.distance_transform_edt(~raw) if radius else None
+            distances = _OUTSIDE_DISTANCE(raw[None])[0] if radius else None
             dilated = raw if radius == 0 else distances <= radius
             if domain is not None:
                 dilated &= domain
@@ -240,13 +235,13 @@ def _materialize_choice(presence, endpoint_masks, choice, domain=None):
     if kind == "raw":
         values = presence
     else:
-        blurred = ndimage.gaussian_filter(presence, sigma, mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         values = blurred if kind == "gaussian" else np.clip(presence + amount*(presence-blurred), 0, 1)
     raw = values >= choice["threshold_u8"]/255.0
     if domain is not None:
         raw &= domain
     radius = choice["dilation_radius_prediction"]
-    dilated = ndimage.binary_dilation(raw, structure=_ball(radius)) if radius else raw
+    dilated = A.Morphology("dilate", radius=radius)(raw[None])[0] if radius else raw
     if domain is not None:
         dilated &= domain
     base_component, _ = connecting_component(dilated, endpoint_masks)
@@ -651,7 +646,7 @@ def fiber_corridor(shape, origin_zyx, scale, fibers, radius_base):
         valid = np.all((index_xyz >= 0) & (index_xyz < np.asarray(shape)[::-1]), axis=1)
         index_zyx = index_xyz[valid, ::-1]
         seeds[index_zyx[:, 0], index_zyx[:, 1], index_zyx[:, 2]] = True
-    return ndimage.distance_transform_edt(~seeds) <= radius_base/scale
+    return _OUTSIDE_DISTANCE(seeds[None])[0] <= radius_base/scale
 
 
 def _frames(points, tangents, normals):

@@ -469,7 +469,6 @@ def create_band_mask(
     band_pct: float,
     band_padding: float,
     cc_structure_26: np.ndarray,
-    closing_structure_3: np.ndarray,
 ):
     """Build a dense slab mask between two wrap displacements for triplet band mode."""
     cond_bin = np.asarray(cond_bin_full, dtype=np.uint8)
@@ -508,11 +507,7 @@ def create_band_mask(
 
     dense_band = keep[labels]
     # Fill tiny holes inside the slab.
-    dense_band = ndimage.binary_closing(
-        dense_band,
-        structure=closing_structure_3,
-        iterations=1,
-    )
+    dense_band = A.Morphology("close", radius=1, footprint="cube")(dense_band[None])[0]
     if not dense_band.any():
         return None
 
@@ -567,12 +562,6 @@ def _compute_triplet_edt_bbox(
 
 
 @lru_cache(maxsize=5)
-def _small_spherical_footprint(radius: int):
-    offsets = np.arange(-radius, radius + 1, dtype=np.int32)
-    zz, yy, xx = np.meshgrid(offsets, offsets, offsets, indexing='ij')
-    return (zz * zz + yy * yy + xx * xx) <= (radius * radius)
-
-
 def edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray:
     """Dilate binary mask by EDT thresholding; returns a boolean mask."""
     radius = float(radius_voxels)
@@ -583,18 +572,15 @@ def edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray
     # integer radii (for example, triplet_gt_vector_dilation_radius=1.0).
     rounded_radius = int(round(radius))
     if abs(radius - rounded_radius) <= 1e-6 and rounded_radius <= 4:
-        footprint = _small_spherical_footprint(rounded_radius)
-        return ndimage.binary_dilation(mask_bool, structure=footprint, iterations=1)
-    dist = ndimage.distance_transform_edt(~mask_bool)
+        return A.Morphology("dilate", radius=rounded_radius)(mask_bool[None])[0]
+    dist = A.DistanceTransform(mode="outside", implicit_background=True)(mask_bool[None])[0]
     return dist <= radius
 
 
 def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
     """Signed distance using the legacy sign convention (positive inside)."""
     mask_bool = np.asarray(mask) > 0
-    dist_outside = ndimage.distance_transform_edt(~mask_bool)
-    dist_inside = ndimage.distance_transform_edt(mask_bool)
-    return (dist_inside - dist_outside).astype(np.float32, copy=False)
+    return -A.DistanceTransform(implicit_background=True)(mask_bool[None])[0]
 
 
 def _upsample_world_surface(x_s, y_s, z_s, scale_y: float, scale_x: float):

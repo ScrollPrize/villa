@@ -9,6 +9,8 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+import vc_reader.transforms as A
+
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
 
@@ -40,19 +42,6 @@ def _config_float(config: Mapping[str, object], key: str, default: float) -> flo
 
 def _config_int(config: Mapping[str, object], key: str, default: int) -> int:
     return int(config.get(key, default))
-
-
-def _ball_structure(radius: float) -> np.ndarray:
-    radius = float(radius)
-    if radius <= 0.0:
-        return np.ones((1, 1, 1), dtype=bool)
-    ceil_radius = int(math.ceil(radius))
-    zz, yy, xx = np.mgrid[
-        -ceil_radius : ceil_radius + 1,
-        -ceil_radius : ceil_radius + 1,
-        -ceil_radius : ceil_radius + 1,
-    ]
-    return (zz * zz + yy * yy + xx * xx) <= radius * radius
 
 
 def _finite_in_crop(surface: np.ndarray, crop_size: tuple[int, int, int]) -> np.ndarray:
@@ -143,9 +132,9 @@ def _connector_domain(
     debug["bridge_voxels_raw"] = int(bridge.sum())
 
     if dilation_radius > 0.0:
-        bridge = ndimage.binary_dilation(bridge, structure=_ball_structure(dilation_radius))
+        bridge = A.Morphology("dilate", radius=dilation_radius)(bridge[None])[0]
     if closing_radius > 0.0:
-        bridge = ndimage.binary_closing(bridge, structure=_ball_structure(closing_radius))
+        bridge = A.Morphology("close", radius=closing_radius)(bridge[None])[0]
     debug["bridge_voxels_after_morphology"] = int(bridge.sum())
 
     domain = bridge | source_mask | target_mask
@@ -380,8 +369,9 @@ def build_copy_neighbor_targets(
 
     source_points = source_surface[source_valid]
     target_points = target_surface[target_valid]
-    d_source = ndimage.distance_transform_edt(~source_mask).astype(np.float32, copy=False)
-    d_target = ndimage.distance_transform_edt(~target_mask).astype(np.float32, copy=False)
+    outside_distance = A.DistanceTransform(mode="outside", implicit_background=True)
+    d_source = outside_distance(source_mask[None])[0]
+    d_target = outside_distance(target_mask[None])[0]
     target_edt = d_target.astype(np.float32, copy=False)
 
     domain_builder = str(config.get("copy_neighbor_domain_builder", "connectors"))

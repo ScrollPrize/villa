@@ -63,6 +63,7 @@ import numpy as np
 import torch
 from scipy import ndimage
 from vc_reader.reader import open_zarr
+import vc_reader.transforms as A
 
 from .volume_policy import (KDForest, Owned, LivePaths, PARALLEL, unit, tangents, runs,
                             outside_scan, outside_ct_cut, novel_parts, seed_deferred)
@@ -146,7 +147,7 @@ def tile_dots(presence_array, lo, hi, args):
         return None
     raw = np.pad(raw, [(int(start[k]-want_lo[k]), int(want_hi[k]-stop[k])) for k in range(3)])
     raw = raw.astype(np.float32)
-    smooth = ndimage.gaussian_filter(raw, 1.0)
+    smooth = A.GaussianBlur(sigma=1.0, boundary="reflect", truncate=4, full_width=False)(raw[None])[0]
     size = 2*int(args.dot_radius)+1
     plans = (('z', 2, 0, 'V'), ('x', 0, 2, 'H'), ('y', 1, 1, 'H'))  # name, xyz axis, zyx axis, family
     out = []

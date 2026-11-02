@@ -1800,7 +1800,7 @@ class BaseTrainer:
                     target_tensor = targets_dict[target_name]
                     target_info = self.mgr.targets.get(target_name, {})
                     ignore_label = target_info.get("ignore_label", target_info.get("ignore_index", target_info.get("ignore_value")))
-                    targets_dict[target_name][i:i + 1] = dilate_label_batch_with_cucim(
+                    targets_dict[target_name][i:i + 1] = dilate_label_batch(
                         target_tensor[i:i + 1],
                         padding_mask[i:i + 1],
                         distance,

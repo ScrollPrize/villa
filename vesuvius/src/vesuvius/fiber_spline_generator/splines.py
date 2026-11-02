@@ -18,6 +18,8 @@ from scipy import ndimage as ndi
 from scipy.interpolate import splev, splprep
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
+from vc_reader.resident import sample_array
+import vc_reader.transforms as A
 
 
 MIN_LENGTH = 8.0
@@ -83,7 +85,7 @@ def fit_spline(chain: np.ndarray, probability: np.ndarray, threshold: int) -> np
         if np.any(dense < 0) or np.any(dense > upper):
             continue
         support = probability[tuple(np.rint(dense).astype(int).T)]
-        interpolated = ndi.map_coordinates(probability, dense.T, order=1, prefilter=False)
+        interpolated = sample_array(probability, dense, boundary="constant")
         if support.min() < threshold or interpolated.min() < max(0.0, threshold - 0.05 * 255):
             continue
         if tree.query(dense)[0].max() > MAX_DEVIATION:
@@ -120,7 +122,7 @@ def extract_family(probability: np.ndarray, threshold: int, progress: Progress |
     skeleton = skeletonize(probability >= threshold, method="lee").astype(bool)
     degree = ndi.convolve(skeleton.astype(np.uint8), np.ones((3, 3, 3), dtype=np.uint8), mode="constant") - skeleton
     junctions = skeleton & (degree > 2)
-    chains = skeleton & ~ndi.binary_dilation(junctions, structure=np.ones((3, 3, 3)))
+    chains = skeleton & ~A.Morphology("dilate", radius=1, footprint="cube")(junctions[None])[0]
     del skeleton, degree, junctions
     labels, _ = ndi.label(chains, structure=np.ones((3, 3, 3)))
     del chains

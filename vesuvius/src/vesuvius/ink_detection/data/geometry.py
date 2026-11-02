@@ -6,7 +6,10 @@ import cc3d
 import numpy as np
 from numba import njit
 from scipy import ndimage
-from scipy.ndimage import distance_transform_edt
+
+import vc_reader.transforms as A
+
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
 NATIVE_COARSE_PAD_LEVEL0_VOXELS = 20.0
@@ -679,9 +682,10 @@ def project_surface_distance(
         squared = _local_squared_distance(occupancy, offsets, _UNREACHED)
         distance = np.full(occupancy.shape, np.inf)
         reached = squared != _UNREACHED
-        distance[reached] = np.sqrt(squared[reached].astype(np.float64))
+        # float32 distances, as the full transform below returns.
+        distance[reached] = np.sqrt(squared[reached].astype(np.float64)).astype(np.float32)
     else:
-        distance = distance_transform_edt(~occupancy)
+        distance = _OUTSIDE_DISTANCE(occupancy[None])[0].astype(np.float64)
     return np.clip(1.0 - distance / max_distance_voxels, 0.0, 1.0).astype(
         np.float32, copy=False
     )
@@ -922,7 +926,7 @@ def filter_support_bands(
                 flat_components, flat_component_ids[flat_component_ids > 0]
             )
             if max_supervision_grid_distance is not None and np.any(group_seed):
-                group_filtered &= distance_transform_edt(~group_seed) <= max_distance
+                group_filtered &= _OUTSIDE_DISTANCE(group_seed[None])[0] <= max_distance
             for index, (y0, y1, x0, x1) in zip(group, group_boxes):
                 filtered[index] = filtered[index] & group_filtered[
                     y0 - group_bbox[0] : y1 - group_bbox[0],
