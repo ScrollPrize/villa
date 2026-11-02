@@ -259,8 +259,8 @@ class Reader {
     }
     // Refreshes a request's hits, evicts the oldest bricks outside it, and
     // assigns slots to its misses, which are entered now and filled by
-    // upload(). Publishes the request's device lookup table.
-    std::vector<Miss> admit(const std::set<std::int64_t>& needed) {
+    // upload(). Publishes the request's device lookup table unless told not to.
+    std::vector<Miss> admit(const std::set<std::int64_t>& needed, bool publish=true) {
         std::vector<std::int64_t> missing;
         for (auto key:needed) {
             auto it=cache_.find(key);
@@ -288,6 +288,7 @@ class Reader {
             lru.push_back({this,key}); cache_.emplace(key,Entry{slot,std::prev(lru.end())});
             misses.push_back({key,slot});
         }
+        if (!publish) return misses;
         std::size_t capacity=1; while (capacity<needed.size()*2) capacity*=2;
         const auto bytes=capacity*sizeof(Slot);
         table_host_.reserve(bytes); reserve(table_,bytes);
@@ -389,8 +390,10 @@ public:
     // Readers holding the same lock (one pool) share it; take several in this order.
     const void* lock_id() const { return &mutex_; }
     // Runs f(source) with the table of resident bricks, under this reader's lock, on its
-    // device and the current stream: bricks f's device work reads stay resident while
-    // f runs, so f completes that work before returning (e.g. device::complete()).
+    // device and the current stream. f enqueues device work that reads the bricks and
+    // may return with it in flight: the work is ordered (chain/mark) before any later
+    // request that evicts or replaces them, so the lock is not held while it runs.
+    // The caller completes its stream before reading the work's results.
     template<class F> void with_resident(F&& f) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         f(resident_source());
@@ -404,26 +407,56 @@ public:
         const std::int64_t total=source_.grid[0]*source_.grid[1]*source_.grid[2];
         for (auto key:keys) if (key>=0 && key<total) needed.insert(key);
         if (needed.size()>capacity()) throw std::invalid_argument("request exceeds CUDA brick-cache budget; increase cache_bytes");
-        // Fetch before locking: with_resident promises a frame the bricks already here,
-        // so it must not wait on the source. The chunks land in the array's caches.
-        fetch_ahead(needed);
-        std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
-        guarded([&] { upload(admit(needed),[](std::size_t) {}); });
-        mark();
-    }
-    void fetch_ahead(const std::set<std::int64_t>& needed) {
-        std::vector<std::int64_t> missing;
+        // Before locking, read the bricks this reader lacks and stage them on the device:
+        // with_resident promises a frame the bricks already here, so the lock is held
+        // only to assign slots and enqueue their scatter, never across a read or a sync.
+        std::vector<std::int64_t> staged;
         {
             std::lock_guard lock(mutex_);
-            for (auto key:needed) if (!cache_.count(key)) missing.push_back(key);
+            for (auto key:needed) if (!cache_.count(key)) staged.push_back(key);
         }
-        // Null outputs: read_many only brings the bricks' chunks into the caches.
-        std::vector<Index> starts, sizes(missing.size(),Index(source_.brick,source_.brick+3));
-        for (auto key:missing) {
-            auto idx=index(key); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
-            starts.push_back(std::move(idx));
+        device::Guard guard(device_);
+        device::Storage bricks;
+        if (!staged.empty()) {
+            std::vector<std::uint8_t> host(staged.size()*brick_bytes_);
+            std::vector<Index> starts, sizes(staged.size(),Index(source_.brick,source_.brick+3));
+            std::vector<std::uint8_t*> outputs;
+            for (std::size_t i=0;i<staged.size();++i) {
+                auto idx=index(staged[i]); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
+                starts.push_back(std::move(idx)); outputs.push_back(host.data()+i*brick_bytes_);
+            }
+            array_.read_many(starts,sizes,outputs);
+            bricks=device::allocate(host.size(),device_);
+            // Pageable: the host buffer is free once this returns.
+            device::check(cudaMemcpyAsync(bricks->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));
         }
-        array_.read_many(starts,sizes,std::vector<std::uint8_t*>(missing.size(),nullptr));
+        std::lock_guard lock(mutex_); chain();
+        try {
+            // Staged bricks another reader made resident meanwhile scatter into a spare
+            // brick; bricks evicted since staging upload as before.
+            std::unordered_map<std::int64_t,const unsigned char*> target;
+            std::vector<Miss> rest;
+            for (const auto& miss:admit(needed,false)) {
+                if (std::binary_search(staged.begin(),staged.end(),miss.key)) target.emplace(miss.key,slot_pointer(miss.slot));
+                else rest.push_back(miss);
+            }
+            if (!target.empty()) {
+                const auto spare=device::allocate(brick_bytes_,device_);
+                std::vector<const unsigned char*> targets(staged.size(),static_cast<const unsigned char*>(spare->ptr));
+                for (std::size_t i=0;i<staged.size();++i)
+                    if (auto it=target.find(staged[i]);it!=target.end()) targets[i]=it->second;
+                const auto table=device::allocate(targets.size()*sizeof(void*),device_);
+                device::check(cudaMemcpyAsync(table->ptr,targets.data(),targets.size()*sizeof(void*),cudaMemcpyHostToDevice,device::stream()));
+                scatter(bricks->ptr,static_cast<void* const*>(table->ptr),staged.size(),brick_bytes_);
+                uploads_+=target.size(); uploaded_+=target.size()*brick_bytes_;
+            }
+            upload(rest,[](std::size_t) {});
+        } catch (...) {
+            cudaStreamSynchronize(device::stream());
+            drop_all();
+            throw;
+        }
+        mark();
     }
     void clear() {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
@@ -556,10 +589,12 @@ private:
         if (!resident_dirty_) return resident_;
         std::size_t capacity=1; while (capacity<std::max<std::size_t>(1,cache_.size())*2) capacity*=2;
         std::vector<Slot> table(capacity); fill_table(table.data(),capacity,cache_);
-        reserve(resident_table_,capacity*sizeof(Slot));
-        // Synchronous: earlier resident kernels may still read the old table.
-        device::complete();
-        device::check(cudaMemcpyAsync(resident_table_->ptr,table.data(),capacity*sizeof(Slot),cudaMemcpyHostToDevice,device::stream()));
+        // A new table: earlier resident kernels may still read the old one, which is
+        // freed on this stream, after them (callers chain() first).
+        auto published=device::allocate(capacity*sizeof(Slot),device_);
+        device::check(cudaMemcpyAsync(published->ptr,table.data(),capacity*sizeof(Slot),cudaMemcpyHostToDevice,device::stream()));
+        if (resident_table_) resident_table_->stream=device::stream();
+        resident_table_=std::move(published);
         resident_=source_; resident_.mask=capacity-1; resident_.table=static_cast<const Slot*>(resident_table_->ptr);
         resident_dirty_=false; return resident_;
     }

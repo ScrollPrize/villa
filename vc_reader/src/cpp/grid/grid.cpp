@@ -726,8 +726,9 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             P.level = static_cast<std::int8_t*>(levels->ptr);
             P.lacking = lackingSet;
             cuda_detail::launch(P);
-            device::complete();
         });
+        // Outside the readers' locks: other threads' passes enqueue while this one runs.
+        device::complete();
     };
     pass();
     if (lacking) {
@@ -736,21 +737,24 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
         constexpr int kLoads = 4;
         for (int loads = 0;; ++loads) {
             unsigned noted = 0;
-            device::check(cudaMemcpy(&noted, lackingSet.count, sizeof(unsigned), cudaMemcpyDeviceToHost));
+            device::check(cudaMemcpyAsync(&noted, lackingSet.count, sizeof(unsigned), cudaMemcpyDeviceToHost, device::stream()));
+            device::complete();
             std::vector<std::int64_t> keys(std::min(noted, kLackingCapacity));
-            if (!keys.empty())
-                device::check(cudaMemcpy(keys.data(), lackingSet.keys, keys.size() * sizeof(long long),
-                                         cudaMemcpyDeviceToHost));
             if (keys.empty())
                 break;
+            device::check(cudaMemcpyAsync(keys.data(), lackingSet.keys, keys.size() * sizeof(long long),
+                                          cudaMemcpyDeviceToHost, device::stream()));
+            device::complete();
             if (loads == kLoads)
                 throw std::runtime_error("a blocking request's bricks do not stay resident; increase the reader's budget");
             readers.front()->load_bricks(keys);
             pass();
         }
     }
-    device::check(cudaMemcpy(result.values.data(), values->ptr, result.values.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    device::check(cudaMemcpy(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost));
+    device::check(cudaMemcpyAsync(result.values.data(), values->ptr, result.values.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, device::stream()));
+    device::check(cudaMemcpyAsync(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost, device::stream()));
+    device::complete();
     return result;
 }
 

@@ -177,7 +177,6 @@ Result sampleCached(const Frame& frame, Request request, Pending* pending)
         r.request.offsets = request.offsets;
         if (chunkReads) {
             r.chunks = result.missingChunks[index];
-            r.pixels.clear();
         }
         return r;
     };

@@ -1,10 +1,11 @@
 #pragma once
-// The CUDA stream vc_reader work uses on the calling thread. Null (the
-// default) is the legacy default stream: calls then behave as before streams.
+// The CUDA stream vc_reader work uses on the calling thread. By default the
+// thread's own default stream (cudaStreamPerThread): threads sampling at once do
+// not serialize on the legacy default stream, which still orders against it.
 #include <cuda_runtime.h>
 #include <cstdint>
 namespace vcr::device {
-inline cudaStream_t& current_stream() { thread_local cudaStream_t stream = nullptr; return stream; }
+inline cudaStream_t& current_stream() { thread_local cudaStream_t stream = cudaStreamPerThread; return stream; }
 inline cudaStream_t stream() { return current_stream(); }
 struct StreamScope {
     cudaStream_t previous;
