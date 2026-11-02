@@ -375,7 +375,7 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     CHECK(compositeMethodName(params) == "volumetric");
 }
 
-TEST_CASE("a zoomed-out frame takes resident finer data and does not read its own level")
+TEST_CASE("a frame ignores resident finer data and reads its requested level")
 {
     Fixture f;
     OpenedVolumes opened(64 << 20);
@@ -389,10 +389,15 @@ TEST_CASE("a zoomed-out frame takes resident finer data and does not read its ow
     }
     const vc3d::ViewerSample coarse{levels, 1, 0, 0, {0.0f}, std::nullopt};
     vc3d::ViewerLoad load;
-    const auto r = vc3d::sampleCached(planeAt(5), coarse, &load);
-    CHECK(load.empty());
-    CHECK(r.level[0] == 1);  // the second level of the request: level 0
-    CHECK(r.values[7 * 32 + 9] == float(f.at0(5, 7, 9)));
+    auto r = vc3d::sampleCached(planeAt(5), coarse, &load);
+    CHECK(r.level[0] == vcr::grid::Result::kMissing);
+    REQUIRE(load.target.size() == 1);
+    vc3d::loadPending(load, [] { return true; });
+
+    vc3d::ViewerLoad again;
+    r = vc3d::sampleCached(planeAt(5), coarse, &again);
+    CHECK(again.empty());
+    CHECK(r.level[0] == 0);  // the first level of the request: level 1
 }
 
 #ifdef VC_READER_CUDA

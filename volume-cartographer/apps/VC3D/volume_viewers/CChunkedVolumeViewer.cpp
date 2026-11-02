@@ -1029,14 +1029,6 @@ void CChunkedVolumeViewer::updateContentBounds()
 
 void CChunkedVolumeViewer::recalcPyramidLevel()
 {
-    const float lodZoomBias = _surfName == "segmentation"
-        ? kSegmentationResolutionLodZoomBias
-        : kResolutionLodZoomBias;
-    if (_levels) {
-        _dsScaleIdx = vc3d::sourceLevelForView(*_levels, _scale, lodZoomBias);
-    } else {
-        _dsScaleIdx = 0;  // no opened levels: this frame has only a nominal level 0
-    }
     updateScalebarScale();
 }
 
@@ -3989,7 +3981,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
     // The stats group (mip level, label, scale, framebuffer, composite) can be
     // routed to the right-anchored bar or dropped per viewer.
     QStringList statsItems;
-    statsItems << QString("L%1").arg(_dsScaleIdx);
+    statsItems << QString("L%1").arg(renderStartLevel(dynamic_cast<QuadSurface*>(currentSurface()) != nullptr));
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
         statsItems << viewerLabel;
     statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);

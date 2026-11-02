@@ -12,11 +12,6 @@
 
 namespace vc3d {
 
-namespace {
-// Finer levels a frame may take resident data from when its own level lacks it.
-constexpr int kFinerFallbackLevels = 2;
-}
-
 bool ViewerLevels::has(int level) const
 {
     return level >= 0 && level < count() && levels[std::size_t(level)].array;
@@ -173,16 +168,13 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
     request.offsets = what.offsets;
     request.composite = what.composite;
     request.cachedOnly = true;
-    // The view's level, then finer levels (resident after zooming in, and as good),
-    // then coarser ones filling holes.
+    // The requested level, then coarser ones filling holes until it is read.
     const auto add = [&](int level) {
         if (levels.has(level))
             request.levels.push_back(levels.gridLevel(level));
     };
     const int start = std::clamp(what.startLevel, 0, std::max(0, levels.count() - 1));
     add(start);
-    for (int level = start - 1; level >= std::max(0, start - kFinerFallbackLevels); --level)
-        add(level);
     const std::size_t firstCoarser = request.levels.size();
     const int last = std::min(levels.count() - 1, start + std::max(0, what.fallbackLevels));
     for (int level = start + 1; level <= last; ++level)

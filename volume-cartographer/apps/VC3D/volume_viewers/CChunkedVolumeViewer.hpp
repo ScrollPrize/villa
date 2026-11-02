@@ -524,7 +524,6 @@ private:
     float _surfacePtrY = 0.0f;
     std::optional<float> _pinnedSurfacePtrY;
     float _scale = 1.0f;
-    int _dsScaleIdx = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
