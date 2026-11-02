@@ -133,6 +133,10 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /data/predictions/pherc0139-w016.tif
 ```
 
+For one or a few segments, `--batch-size 8 --no-compile` runs about 2.7x
+faster than the default settings with an identical map (see "Throughput" in
+`docs/ink_detection.md`).
+
 Run native inference:
 
 ```bash

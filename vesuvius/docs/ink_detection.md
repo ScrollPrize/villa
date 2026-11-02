@@ -453,9 +453,11 @@ the second output.
 | `--output-prefix` | Folder-mode filename prefix, default empty. |
 | `--mask-path` | Optional 2D TIFF; nonzero pixels limit scheduled output. |
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
+| `--roi ROW_START ROW_STOP COL_START COL_STOP` | Half-open output rectangle at `--resolution`. Patches that overlap the rectangle keep their full CT context; only the output is clipped, so the pixels inside the rectangle match a full-segment run. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
 | `--chunk-cache-size` | Decoded source chunks retained per worker; default `0` disables caching. RAM use scales with chunk dimensions, dtype, selected depth, and worker count. Concurrent threads share pending reads. |
+| `--loader-threads` | Read patches with this many threads instead of spawned `--num-workers` processes; default `0` keeps the process loader. Avoids per-worker import cost on Windows. |
 | `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
@@ -474,6 +476,38 @@ Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
+
+### Throughput
+
+The default command runs batch size 1 with `torch.compile`. For a single
+segment, a larger batch without compilation is much faster, and the output is
+the same map. Measured on an RTX 4090 with one 8.64 µm surface volume of
+31 × 2980 × 3240 voxels (PHerc. 1447 segment 20250702235910, 7.2 cm² bounding
+box, overlap 0.5, Hann blending), using the reader-v2 checkpoint:
+
+| Settings | Wall time (s) | Peak VRAM (MiB) |
+|---|---|---|
+| default (`--batch-size 1`, compile), warm cache | 32.0 | 680 |
+| `--batch-size 4`, compile | 61.6 | 802 |
+| `--batch-size 8 --no-compile` | 11.6 to 11.9 | 980 |
+| `--batch-size 8 --no-compile --loader-threads 8 --chunk-cache-size 64` | 10.1 | 980 |
+
+The maps from all four settings agree to within 1/255 at every pixel
+(Pearson r = 1.0000). In this single-segment measurement the compiled runs
+were slower than eager mode at every batch size tried, because the compile
+cost is paid once per process and the run itself is short. For one or a few
+segments use:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
+  <labels_dir>/pherc0139-w016/surface-volume.zarr \
+  <checkpoint>.pth \
+  <out_dir>/pherc0139-w016.tif \
+  --batch-size 8 --no-compile
+```
+
+Peak VRAM stays under 1 GiB in every setting above, so the batch size is not
+limited by an 8 GB card.
 
 Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
