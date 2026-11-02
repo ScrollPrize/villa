@@ -82,22 +82,6 @@ jobs:
         with:
           version: v0.15.0
 
-      - name: Locate Homebrew bottle cache
-        id: homebrew-cache
-        run: |
-          echo "path=$(brew --cache)/downloads" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Homebrew bottle downloads
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.homebrew-cache.outputs.path }}
-          # Share main's downloads with PRs; retain the optimized package build.
-          key: homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}-${{ steps.homebrew-cache.outputs.date }}
-          restore-keys: |
-            homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}-
-            homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Install Homebrew dependencies + build
         run: ./scripts/build_macos.sh --install-deps --sccache
 
