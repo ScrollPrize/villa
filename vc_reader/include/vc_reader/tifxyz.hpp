@@ -93,8 +93,9 @@ class Surface {
 public:
     // `xyz` holds rows x cols x 3 XYZ floats. An explicit mask supplies in-memory validity,
     // including negative real coordinates; without it use the file-format vertex rule.
-    // Nonfinite vertices are always invalid; invalid coordinates are set to -1.
-    Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location = {});
+    // Nonfinite vertices are always invalid; invalid coordinates are set to -1, unless
+    // `keepCoordinates`, for writing stored data back with its placeholders as they are.
+    Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location = {}, bool keepCoordinates = false);
 
     [[nodiscard]] std::int64_t rows() const { return rows_; }
     [[nodiscard]] std::int64_t cols() const { return cols_; }

@@ -113,6 +113,13 @@ int main()
         CHECK((surface.valid() == std::vector<std::uint8_t>{1, 1, 0, 0}));
         CHECK(surface.xyz()[3] == -2.f);
         for (int a = 0; a < 3; ++a) CHECK(surface.xyz()[std::size_t(6 + a)] == -1.f);
+        // Asked to, it keeps stored placeholders as they are; valid() still says what counts.
+        std::vector<float> stored(4 * 3, 5.f);
+        stored[7] = NAN;
+        tifxyz::Surface kept(2, 2, std::move(stored), {1, 1, 1, 0}, {}, {}, true);
+        CHECK((kept.valid() == std::vector<std::uint8_t>{1, 1, 0, 0}));
+        CHECK(std::isnan(kept.xyz()[7]));
+        CHECK(kept.xyz()[6] == 5.f);
     }
     // A -1 in a stored box is replaced by the real extent.
     {

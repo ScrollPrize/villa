@@ -226,7 +226,7 @@ struct Surface::Interpolators {
     std::unique_ptr<grid::Surface> surfaces[2];
 };
 
-Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location)
+Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, std::vector<std::uint8_t> mask, Metadata metadata, std::string location, bool keepCoordinates)
     : rows_(rows), cols_(cols), xyz_(std::move(xyz)), metadata_(std::move(metadata)), location_(std::move(location)), interpolators_(std::make_shared<Interpolators>())
 {
     if (rows <= 0 || cols <= 0 || rows >= (1LL << 30) || cols >= (1LL << 30)) bad("tifxyz grid must have positive rows and columns");
@@ -238,7 +238,7 @@ Surface::Surface(std::int64_t rows, std::int64_t cols, std::vector<float> xyz, s
         float* p = xyz_.data() + i * 3;
         valid_[i] = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
             (mask.empty() ? vertexValid(p) : mask[i] != 0);
-        if (!valid_[i]) p[0] = p[1] = p[2] = -1.f;
+        if (!valid_[i] && !keepCoordinates) p[0] = p[1] = p[2] = -1.f;
     }
 }
 
