@@ -3,7 +3,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "formats/SurfaceInput.hpp"
-#include "spatial/SurfaceGrid.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
 #include <cmath>
 #include <bit>
 #include <set>

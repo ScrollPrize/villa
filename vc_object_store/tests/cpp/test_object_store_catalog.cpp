@@ -8,6 +8,8 @@
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
+#include <cstring>
+#include <vector>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -111,7 +113,7 @@ void writeSurface(const fs::path& directory, float z)
         "bbox":[[0,0,0],[1,1,1]],"name":"not the record"})";
 }
 
-std::string sampleJson(const FileServer& server, const std::string& tifxyz, const std::string& missing)
+std::string sampleJson(const FileServer& server, const std::string& tifxyz, const std::string& missing, int downscale = 1)
 {
     const auto origin = [&](const std::string& path) {
         return nlohmann::json::array({{{"path", path}, {"access_roots", {{{"type", "https"}, {"url", server.url("")},
@@ -121,7 +123,7 @@ std::string sampleJson(const FileServer& server, const std::string& tifxyz, cons
         {"id", "seg-a"}, {"long_id", "sample-seg-a"}, {"suffix", "w001"}, {"original_volume_id", "vol"},
         {"creation", {{"date", "2026-03-11T00:00:00Z"}, {"process", "surface_mesh_generation"},
                       {"derived_from", {{"type", "volume"}, {"id", "vol"}}}}},
-        {"properties", {{"original_volume_downscale", 1},
+        {"properties", {{"original_volume_downscale", downscale},
                         {"volume_coverage", {{"vol", {{"bbox_transformed", {{10, 10, 26}, {17, 15, 33}}},
                                                        {"overlap_ratio", 1.0}, {"computed_at", "x"}}}}}}},
         {"data", {{{"type", "tifxyz"}, {"origins", origin(tifxyz)}},
@@ -328,6 +330,30 @@ int main() try
     mustFail([&] { session.ensureGeometry(viewedUnfetched, uuid); });
     (void)regionAt(session, viewedUnfetched, 30);
     require(server.requests("seg-a.tifxyz/x.tif") == requests, "read-only attachments do not fetch");
+
+    // A surface authored at a downscale: stored * factor lands on the voxel centres it was
+    // drawn on, level voxel v being f * v + (f - 1) / 2 in the volume.
+    {
+        auto reduced = vcr::catalog::parseOpenDataManifest(sampleJson(server, "seg-a.tifxyz/", "missing.tifxyz/", 4))
+                           .samples.front();
+        const auto reducedUuid = catalogSurfaceUuid(reduced.surfaces(reduced.segments.front()).front());
+        const auto reducedPath = directory.path / "reduced.vcobj";
+        createProject(reducedPath, "sample", {{"open_data", {{"sample", "sample"}}}}, user);
+        const auto attached = session.attach(reducedPath, user);
+        addCatalogSample(session, attached, reduced);
+        session.ensureGeometry(attached, reducedUuid);
+        std::vector<float> xyz;
+        session.read(attached, [&](const auto& db, const auto& txn, const auto&) {
+            const auto stored = db.readGeometryData(txn, db.currentGeometry(txn, reducedUuid)->uuid);
+            for (const auto& array : stored.arrays)
+                if (array.name == "points") {
+                    xyz.resize(array.bytes.size() / sizeof(float));
+                    std::memcpy(xyz.data(), array.bytes.data(), array.bytes.size());
+                }
+        });
+        require(!xyz.empty() && xyz[0] == 10.375f && xyz[1] == 10.375f, "authored vertices shifted to block centres");
+        require(4 * xyz[0] == 4 * 10 + 1.5f, "scale alone reaches the voxel centre");
+    }
     std::cout << "ok\n";
     return 0;
 } catch (const std::exception& error) {

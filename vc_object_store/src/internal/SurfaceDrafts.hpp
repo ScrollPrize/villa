@@ -1,6 +1,6 @@
 #pragma once
 #include "internal/Spatial.hpp"
-#include "spatial/BoundsIndex.hpp"
+#include <vc_object_store/geometry/BoundsIndex.hpp>
 #include "spatial/SurfaceTiles.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"

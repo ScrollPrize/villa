@@ -1,6 +1,6 @@
 #pragma once
 #include "geometry/GeometryReader.hpp"
-#include "spatial/TriangleDistance.hpp"
+#include <vc_object_store/geometry/TriangleDistance.hpp>
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include <cstdint>
 #include <deque>

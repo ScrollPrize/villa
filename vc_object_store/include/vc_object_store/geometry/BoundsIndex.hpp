@@ -40,6 +40,32 @@ public:
         walk(walk, 0);
     }
 
+    // Visits nearest boxes first, pruning against the visitor's current best distance.
+    template<class Visitor>
+    void nearest(const std::array<double, 3>& point, double& bestSquared, Visitor visit) const
+    {
+        if (nodes_.empty()) return;
+        auto distance = [&](const Box& box) {
+            double total=0;
+            for (size_t a=0;a<3;++a) {
+                const double d=std::max({box[a]-point[a],0.0,point[a]-box[a+3]});
+                total+=d*d;
+            }
+            return total;
+        };
+        auto walk = [&](auto&& self,size_t index) -> void {
+            const auto& node=nodes_[index];
+            if(distance(node.box)>bestSquared) return;
+            if(node.left) {
+                auto first=node.left,second=node.right;
+                if(distance(nodes_[second].box)<distance(nodes_[first].box)) std::swap(first,second);
+                self(self,first); self(self,second);
+            } else for(size_t j=node.begin;j<node.end;++j)
+                if(distance(boxes_[order_[j]])<=bestSquared) visit(order_[j]);
+        };
+        walk(walk,0);
+    }
+
 private:
     struct Node {
         Box box;

@@ -102,6 +102,11 @@ find_package(TIFF REQUIRED)
 find_package(CURL REQUIRED)
 # vc_reader's HTTP client fetches remote sources; its Zarr reader is only needed
 # by the relationship detectors.
+add_library(vc_resident_geometry ${_vc_store_library_type} spatial/SurfaceIndex.cpp spatial/VertexIndex.cpp)
+add_library(vc_object_store::vc_resident_geometry ALIAS vc_resident_geometry)
+target_include_directories(vc_resident_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
+target_link_libraries(vc_resident_geometry PUBLIC vc_geometry opencv_core)
+target_compile_features(vc_resident_geometry PUBLIC cxx_std_20)
 add_library(vc_object_formats ${_vc_store_library_type} Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
 add_library(vc_object_store::vc_object_formats ALIAS vc_object_formats)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -125,9 +130,9 @@ target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_
 target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 add_library(vc_object_links STATIC
-    CtSheetNormal.cpp spatial/SurfaceIndex.cpp
+    CtSheetNormal.cpp
     linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
     linking/TrackSurface.cpp linking/PointCollectionSurface.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
