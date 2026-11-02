@@ -21,7 +21,7 @@ jobs:
             # Limit the test matrix to ubuntu-latest for now, as other platforms may not
             # support all dependencies yet.  Extend this list once the build scripts
             # for macOS and Windows are confirmed.
-            os: [ubuntu-latest]
+            os: [blacksmith-4vcpu-ubuntu-2404]
             zarr: ['2.18.7', '3.2.1']
     defaults:
       run:

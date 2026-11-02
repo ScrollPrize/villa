@@ -25,7 +25,7 @@ concurrency:
 jobs:
   changes:
     name: Detect changes
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
@@ -135,7 +135,7 @@ jobs:
     name: Skip (no volume-cartographer changes)
     needs: changes
     if: needs.changes.outputs.vc != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
@@ -144,7 +144,7 @@ jobs:
     name: Linux base tests (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -212,7 +212,7 @@ jobs:
     name: Linux Lasagna/fiber/GUI tests (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.test_specialized == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -273,7 +273,7 @@ jobs:
     name: Synthetic rendering regression (GCC Release / Valgrind replay)
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -354,7 +354,7 @@ jobs:
     name: Linux VC3D compile and smoke (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.vc3d == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -419,7 +419,7 @@ jobs:
     name: Linux CLI compile coverage (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.cli == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -490,7 +490,7 @@ jobs:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
     needs: changes
     if: needs.changes.outputs.flatboi == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
@@ -550,7 +550,7 @@ jobs:
     name: MCP unit tests
     needs: changes
     if: needs.changes.outputs.mcp == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Checkout Villa
@@ -605,7 +605,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15]
+        os: [blacksmith-6vcpu-macos-15]
     steps:
       - name: Checkout Villa
         id: checkout
@@ -649,7 +649,7 @@ jobs:
     name: CI
     needs: [changes, skip, test-core, test-specialized, render-benchmark, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Aggregate required-check result
