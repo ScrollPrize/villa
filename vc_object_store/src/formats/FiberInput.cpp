@@ -9,17 +9,28 @@ namespace vc::objects::formats {
 namespace {
 // A fiber file without a UUID (as VC3D wrote before fibers had identities) is
 // named from its file name, so every import of that file, and every branch
-// that names it by file, resolves to the same fiber.
-std::string fileUuid(const nlohmann::json& root, const std::filesystem::path& path)
+// that names it by file, resolves to the same fiber. With a namespace its key is
+// instead its stem, which is also how version-3 branches name their targets.
+nlohmann::json fiberIdentity(nlohmann::json root, const std::filesystem::path& path,
+    const std::optional<std::string>& uuidNamespace)
 {
-    if (root.contains("uuid")) return util::canonicalUuid(root.at("uuid").get<std::string>());
-    return util::nameUuid("vc3d_fiber/" + path.filename().string());
+    if (!uuidNamespace && !root.contains("uuid"))
+        root["uuid"] = util::nameUuid("vc3d_fiber/" + path.filename().string());
+    else
+        deriveSourceUuid(root, "fiber", path.stem().string(), uuidNamespace);
+    root["uuid"] = util::canonicalUuid(root.at("uuid").get<std::string>());
+    return root;
+}
+std::string fileUuid(const nlohmann::json& root, const std::filesystem::path& path,
+    const std::optional<std::string>& uuidNamespace)
+{
+    return fiberIdentity(root, path, uuidNamespace).at("uuid").get<std::string>();
 }
 
-Prepared fiberDocument(nlohmann::json root, const std::filesystem::path& path)
+Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& path,
+    const std::optional<std::string>& uuidNamespace = std::nullopt)
 {
-    root["uuid"] = fileUuid(root, path);
-    auto result = decodeFiberJson(root.dump());
+    auto result = decodeFiberJson(fiberIdentity(root, path, uuidNamespace).dump());
     if (result.object.name.empty()) result.object.name = path.stem().string();
     result.object.storageKind = "file";
     result.object.storageRef = std::filesystem::absolute(path).lexically_normal().string();
@@ -28,15 +39,17 @@ Prepared fiberDocument(nlohmann::json root, const std::filesystem::path& path)
 }
 Prepared fiber(const std::filesystem::path& path) { return fiberDocument(readJson(path), path); }
 
-std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available)
+std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available,
+    const SourceIngestOptions& options)
 {
+    const auto& uuidNamespace = options.uuidNamespace;
     namespace fs = std::filesystem;
     using Json = nlohmann::json;
     std::set<std::string> existing, incoming;
     for (const auto& uuid : available) existing.insert(util::canonicalUuid(uuid));
     std::vector<Prepared> batch;
     const auto add = [&](const Json& document, const fs::path& source) {
-        auto decoded = fiberDocument(document, source);
+        auto decoded = fiberDocument(document, source, uuidNamespace);
         if (!incoming.insert(decoded.object.uuid).second) throw std::runtime_error("duplicate fiber UUID in import");
         batch.push_back(std::move(decoded));
     };
@@ -87,7 +100,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 if (byFile) {
                     const auto peer = peerPath();
                     if (!fileUuids.contains(peer))
-                        fileUuids[peer] = fileUuid(readJson(peer), peer);
+                        fileUuids[peer] = fileUuid(readJson(peer), peer, uuidNamespace);
                     branch["target_uuid"] = fileUuids.at(peer);
                 }
                 const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
@@ -105,7 +118,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 kept.push_back(branch);
                 if (existing.contains(target) || incoming.contains(target)) continue;
                 const auto peer = readJson(peerPath());
-                if (fileUuid(peer, peerPath()) != target)
+                if (fileUuid(peer, peerPath(), uuidNamespace) != target)
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }
