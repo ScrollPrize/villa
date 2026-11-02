@@ -1,4 +1,6 @@
 #include "LineAnnotationDialog.hpp"
+#include "fibers3d/Fiber3DPanel.hpp"
+#include <QDockWidget>
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 
@@ -1196,7 +1198,16 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
     buttonLayout->addWidget(_fiberNameLabel, 1);
-    _layout->addWidget(buttonRow, 0);
+    _fibers3DButton = new QToolButton(buttonRow);
+    _fibers3DButton->setText(tr("Fibers 3D"));
+    _fibers3DButton->setObjectName(QStringLiteral("lineAnnotationFibers3D"));
+    _fibers3DButton->setCheckable(true);
+    _fibers3DButton->setEnabled(false);
+    _fibers3DButton->setToolTip(tr("Show the open fiber and current position in 3D"));
+    buttonLayout->addWidget(_fibers3DButton);
+    // Span the workspace header across its docks as well as the CT panes;
+    // its controls must not impose a wide minimum on the CT column alone.
+    setMenuWidget(buttonRow);
     _fiberTraceStatus = new QWidget(content);
     _fiberTraceStatus->setObjectName(QStringLiteral("fiberTraceStatus"));
     auto* traceLayout = new QVBoxLayout(_fiberTraceStatus);
@@ -2019,15 +2030,73 @@ vc3d::line_annotation::GeneratedOverviewGateState LineAnnotationDialog::overview
     return gate;
 }
 
+void LineAnnotationDialog::enableFibers3D(CState* state, LineAnnotationController* annotations,
+                                         FiberCollectionController* automated)
+{
+    if (_fibers3D) return;
+    auto* dock = new QDockWidget(tr("Fibers 3D"), this);
+    dock->setObjectName(QStringLiteral("lineAnnotationFibers3DDock"));
+    dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    _fibers3DDock = dock;
+    auto* panel = new vc3d::fibers3d::Fiber3DPanel(state, _viewerManager, annotations, automated, dock, true);
+    _fibers3D = panel;
+    dock->setWidget(panel);
+    addDockWidget(Qt::LeftDockWidgetArea, dock);
+    _fibers3DButton->setEnabled(true);
+    connect(_fibers3DButton, &QToolButton::toggled, this, [this, dock](bool visible) {
+        dock->setVisible(visible);
+        QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
+        prefs.setValue(QStringLiteral("lineAnnotation/fibers3DVisible"), visible);
+        if (visible) syncFibers3D();
+    });
+    connect(dock->toggleViewAction(), &QAction::toggled, this, [this](bool checked) {
+        // Parent-tab hide/show must not change the user's visibility preference.
+        const QSignalBlocker block(_fibers3DButton);
+        _fibers3DButton->setChecked(checked);
+    });
+    connect(panel, &vc3d::fibers3d::Fiber3DPanel::detachRequested, this, [dock] {
+        dock->setFloating(!dock->isFloating()); dock->show(); dock->raise();
+    });
+    connect(panel, &vc3d::fibers3d::Fiber3DPanel::linePositionPicked, this, [this](double position) {
+        if (!_hasGeneratedViews || _closing) return;
+        cancelArrowPan();
+        setCutFollowEnabled(false);
+        setCurrentLinePosition(position);
+        centerStripsOnLinePosition(position, true);
+    });
+    QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const bool visible = prefs.value(QStringLiteral("lineAnnotation/fibers3DVisible"), true).toBool();
+    dock->setVisible(visible);
+    { const QSignalBlocker block(_fibers3DButton); _fibers3DButton->setChecked(visible); }
+    QTimer::singleShot(0, this, [this, dock] {
+        resizeDocks({dock}, {std::max(300, width()/3)}, Qt::Horizontal);
+    });
+    syncFibers3D();
+}
+
+void LineAnnotationDialog::syncFibers3D()
+{
+    if (!_fibers3D || !_hasGeneratedViews) return;
+    if (_fibers3DDirty) {
+        _fibers3D->setLineAnnotationViews(_generatedViews, _fiberDisplayName, _fiberHvTag);
+        _fibers3DDirty = false;
+    }
+    _fibers3D->setLineAnnotationPosition(_currentLinePosition);
+}
+
 void LineAnnotationDialog::setFiberDisplayName(const QString& name)
 {
     _fiberDisplayName = name;
+    _fibers3DDirty = true;
+    syncFibers3D();
     updateFiberNameLabel();
 }
 
 void LineAnnotationDialog::setFiberHvTag(const QString& tag)
 {
     _fiberHvTag = tag.trimmed();
+    _fibers3DDirty = true;
+    syncFibers3D();
     updateFiberNameLabel();
 }
 
@@ -2494,6 +2563,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
 
+    _fibers3DDirty = true;
     // In-place update: every control-point placement re-materializes the views,
     // and the controller re-registers the new surfaces in CState under the SAME
     // names before calling us, so the live viewers have already adopted them via
@@ -6687,6 +6757,7 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
 
 void LineAnnotationDialog::updateOverviewBar()
 {
+    syncFibers3D();
     auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
     if (!bar || !_hasGeneratedViews) {
         return;
