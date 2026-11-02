@@ -1,5 +1,6 @@
 #pragma once
 #include "options.hpp"
+#include <vc_reader/thinning.hpp>
 
 namespace vcr::transforms {
 enum class Morph { Dilate, Erode, Open, Close };
@@ -13,5 +14,7 @@ struct MaskImage { std::string on = "image", mask = "mask"; std::size_t mask_cha
 struct DeepSupervision { std::string on = "mask", output; std::vector<std::vector<double>> scales; double p = 1; };
 struct ToPseudo2D { double p = 1; };
 struct FromPseudo2D { double p = 1; };
-struct MedialSurface { std::vector<std::string> on; std::string suffix = "_skel"; bool tube = true, open = false, close = true; std::map<std::string, double> ignore; double p = 1; };
+struct ConnectedComponents { std::vector<std::string> on; std::string suffix="_components"; bool full_connectivity=true; double p=1; };
+struct RidgeTrace { std::vector<std::string> on; std::string suffix="_traces"; double p=1; };
+struct MedialSurface { thinning::Algorithm method=thinning::Algorithm::ZhangSuen; bool preserve_border=false; std::vector<std::string> on; std::string suffix = "_skel"; bool tube = true, open = false, close = true; std::map<std::string, double> ignore; double p = 1; };
 } // namespace vcr::transforms

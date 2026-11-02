@@ -242,7 +242,9 @@ NB_MODULE(_transforms, m) {
     bind<DeepSupervision>(m, "DeepSupervision", [](auto& t, auto& a) { auto scales = a.take("scales", nb::tuple()); for (auto v : nb::borrow<nb::iterable>(scales)) { if (nb::isinstance<nb::tuple>(v) || nb::isinstance<nb::list>(v)) t.scales.push_back(nb::cast<std::vector<double>>(v)); else t.scales.push_back({nb::cast<double>(v)}); } t.on = a.get("on", t.on); t.output = a.get("output", t.output); });
     bind<ToPseudo2D>(m, "ToPseudo2D", [](auto&, auto&) {});
     bind<FromPseudo2D>(m, "FromPseudo2D", [](auto&, auto&) {});
-    bind<MedialSurface>(m, "MedialSurface", [](auto& t, auto& a) { t.on = names(a.take("on", nb::none())); t.suffix = a.get("suffix", t.suffix); t.tube = a.get("tube", t.tube); t.open = a.get("open", t.open); t.close = a.get("close", t.close); t.ignore = a.get("ignore", t.ignore); });
+    bind<ConnectedComponents>(m,"ConnectedComponents",[](auto& t,auto& a){t.on=names(a.take("on",nb::none()));t.suffix=a.get("suffix",t.suffix);t.full_connectivity=a.get("full_connectivity",t.full_connectivity);});
+    bind<RidgeTrace>(m,"RidgeTrace",[](auto& t,auto& a){t.on=names(a.take("on",nb::none()));t.suffix=a.get("suffix",t.suffix);});
+    bind<MedialSurface>(m, "MedialSurface", [](auto& t, auto& a) { t.method=vcr::thinning::algorithmFromName(a.get("method",std::string("zhang_suen"))); t.preserve_border=a.get("preserve_border",t.preserve_border); t.on = names(a.take("on", nb::none())); t.suffix = a.get("suffix", t.suffix); t.tube = a.get("tube", t.tube); t.open = a.get("open", t.open); t.close = a.get("close", t.close); t.ignore = a.get("ignore", t.ignore); });
     bind<StripGeometry>(m, "StripGeometry", [](auto& t, auto& a) {
         t.shift_x = parameter(a, "shift_x", t.shift_x); t.shift_y = parameter(a, "shift_y", t.shift_y); t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale);
         t.shear_x = parameter(a, "shear_x", t.shear_x); t.shear_y = parameter(a, "shear_y", t.shear_y); t.smooth_offset = parameter(a, "smooth_offset", t.smooth_offset); t.stride = parameter(a, "stride", t.stride);

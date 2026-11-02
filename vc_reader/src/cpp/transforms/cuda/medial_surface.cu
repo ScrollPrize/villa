@@ -11,38 +11,8 @@ template<class T> __device__ void binarize(KernelIndex vcr_launch, const T* labe
 struct binarize_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { binarize(index,args...); }
 };
-// Zhang-Suen thinning, one block per YX slice: each subpass marks every
-// deletable pixel of the slice before deleting any, as on the CPU.
-__device__ void thin_slices(KernelIndex vcr_launch, std::uint8_t* image, std::uint8_t* marks, long long height, long long width) {
-    auto* slice = image + vcr_launch.block*height*width; auto* mark = marks + vcr_launch.block*height*width;
-    const auto at = [&](long long y, long long x) { return y >= 0 && x >= 0 && y < height && x < width && slice[y*width+x] != 0; };
-    for (bool changed = true; changed;) {
-        changed = false;
-        for (int phase = 0; phase < 2; ++phase) {
-            int any = 0;
-            for (long long i = threadIdx.x; i < height*width; i += blockDim.x) {
-                const long long y = i/width, x = i%width; bool remove = false;
-                if (slice[i]) {
-                    const bool n[8] = {at(y-1,x), at(y-1,x+1), at(y,x+1), at(y+1,x+1), at(y+1,x), at(y+1,x-1), at(y,x-1), at(y-1,x-1)};
-                    int neighbors = 0, transitions = 0;
-                    for (int k = 0; k < 8; ++k) { neighbors += n[k]; transitions += !n[k] && n[(k+1)%8]; }
-                    const bool preserve = phase == 0 ? (n[0] && n[2] && n[4]) || (n[2] && n[4] && n[6]) : (n[0] && n[2] && n[6]) || (n[0] && n[4] && n[6]);
-                    remove = neighbors >= 2 && neighbors <= 6 && transitions == 1 && !preserve;
-                }
-                mark[i] = remove; any |= remove;
-            }
-            any = __syncthreads_or(any);
-            for (long long i = threadIdx.x; i < height*width; i += blockDim.x) if (mark[i]) slice[i] = 0;
-            __syncthreads();
-            changed |= bool(any);
-        }
-    }
-}
-struct thin_slices_launch {
-    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { thin_slices(index,args...); }
-};
 __device__ void multiply(KernelIndex vcr_launch, const std::uint8_t* skeleton, const float* values, float* out, std::size_t n) {
-    EACH_INDEX(n) out[i] = float(skeleton[i]) * values[i];
+    EACH_INDEX(n) out[i] = float(skeleton[i] != 0) * values[i];
 }
 struct multiply_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { multiply(index,args...); }
@@ -63,7 +33,8 @@ void apply_cuda(const MedialSurface& t, Sample& s, const Parameters&, Session& s
         };
         for (std::size_t c = 0; c < a.shape[0]; ++c) {
             a.typed([&](auto labels) { launch(blocks(grid.size),256,0,vcr::device::stream(), binarize_launch{}, labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });
-            launch(unsigned(grid.size/(h*w)),1024,0,vcr::device::stream(), thin_slices_launch{}, skeleton.ptr,scratch.ptr,(long long)h,(long long)w);
+            if(BatchQueue::current)BatchQueue::current->flush();
+            thinning::cuda::skeletonDevice(skeleton.ptr,skeleton.ptr,h,w,grid.size/(h*w),t.method,t.preserve_border);
             if (t.tube) { morph(true); morph(true); }
             if (t.open) { morph(false); morph(true); }
             if (t.close) { morph(true); morph(false); }

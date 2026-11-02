@@ -78,7 +78,7 @@ target_compile_features(vc_reader_native PUBLIC cxx_std_20)
 target_include_directories(vc_reader_native PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD PkgConfig::LZ4
+target_link_libraries(vc_reader_native PUBLIC vc_reader::thinning vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD PkgConfig::LZ4
     SQLite::SQLite3 vc_delta3d::vc_delta3d ZLIB::ZLIB vc_reader::volcomp vc_reader::sftp Threads::Threads nlohmann_json::nlohmann_json
     PRIVATE vc_reader::catalog TIFF::TIFF PNG::PNG JPEG::JPEG)
 

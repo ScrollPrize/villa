@@ -355,3 +355,41 @@ Use `--help` for workload and profiling options. Correctness coverage is in `tes
 Use `--help` for each harness. Keep validation/profiling separate from throughput
 runs, retain JSON reports with commands and build hashes, and report the input
 shape, dtype, batch size, worker/thread counts and cache policy with timings.
+
+## Thinning
+
+Build the optional native harness without Python or volume-reader dependencies:
+
+```bash
+cmake -S . -B build-thinning -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVC_READER_BUILD_READER=OFF -DVC_READER_BUILD_PYTHON=OFF \
+  -DVC_READER_ENABLE_CUDA=ON -DVC_READER_BUILD_THINNING_BENCHMARK=ON \
+  -DVC_READER_THINNING_REFERENCE_DIR=/path/to/unmodified/volume-cartographer
+cmake --build build-thinning --target bench_thinning -j 4
+python benchmarks/bench_thinning.py \
+  --array /path/to/cached/surface-predictions.zarr/0 \
+  --start 3840 1920 1920 --shape 4 2048 2048 \
+  --executable build-thinning/bench_thinning --cuda --repetitions 7 \
+  --output benchmarks/results/thinning.json
+```
+
+The Python command uses an existing `vc_reader` environment to read the crop;
+it does not install dependencies. The reference directory is optional and adds
+OpenCV only to the benchmark. With it, the harness checks every image pixel and
+ordered polyline against `customThinning`, compares all three skeleton methods
+with OpenCV, and tests pruning, random masks, borders, and plateaus. The production
+library does not link the reference implementation or OpenCV.
+
+Two warmups precede each set of repetitions. Reports include mean, median, p95,
+min/max, input coordinates, foreground count, and hardware. CUDA host timings
+include allocation and transfers; resident timings exclude upload/download and
+include completion. File reads and first-use CUDA initialization are excluded.
+CPU execution uses one thread. Compare Release builds while other builds and GPU
+jobs are idle. Cold CLI startup can be slower than these warmed measurements.
+
+Run native API checks with `VC_READER_BUILD_NATIVE_TESTS=ON`, then
+`ctest --test-dir build-thinning -R test_native_thinning --output-on-failure`.
+With Python enabled, build `_thinning` and `_transforms` and run
+`VC_READER_BUILD_DIR=$PWD/build-thinning python -m pytest tests/test_thinning.py`.
+The tests cover CPU/CUDA values, device buffers, 2D/3D component connectivity,
+Manhattan distance, pruning, and chained resident/batched transforms.
