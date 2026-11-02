@@ -103,7 +103,10 @@ endif()
 
 # The C API (include/vc_reader/vc_reader_c.h): a render engine for frontends in any
 # language. Only its vcr_* functions are exported.
-add_library(vc_reader_c SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/c_api/c_api.cpp")
-add_library(vc_reader::c ALIAS vc_reader_c)
-set_target_properties(vc_reader_c PROPERTIES EXPORT_NAME c CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
-target_link_libraries(vc_reader_c PUBLIC vc_reader::headers PRIVATE vc_reader::reader)
+option(VC_READER_BUILD_C_API "Build libvc_reader_c, the C API" ON)
+if(VC_READER_BUILD_C_API)
+    add_library(vc_reader_c SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/c_api/c_api.cpp")
+    add_library(vc_reader::c ALIAS vc_reader_c)
+    set_target_properties(vc_reader_c PROPERTIES EXPORT_NAME c CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+    target_link_libraries(vc_reader_c PUBLIC vc_reader::headers PRIVATE vc_reader::reader)
+endif()
