@@ -559,13 +559,13 @@ jobs:
           PYTHONWARNINGS: error::ResourceWarning
         run: python -m unittest discover -p 'test*.py'
 
-  # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
-  # Full packaging and packaged-app smoke checks run after merge and on releases.
+  # macOS QuickBuild compile is a hard PR gate. Optimized builds, packaging,
+  # and packaged-app smoke checks run after merge and on releases.
   macos-build:
     name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
     needs: changes
-    # The packaging workflow builds and seeds this same toolchain on main.
     # Keep the required compile gate on PRs without rebuilding it after merge.
+    # Compiler flags distinguish QuickBuild cache entries from packaging builds.
     if: needs.changes.outputs.vc == 'true' && github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -607,8 +607,25 @@ jobs:
         with:
           version: v0.15.0
 
-      - name: Install Homebrew dependencies + build
-        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache
+      - name: Locate Homebrew bottle cache
+        id: homebrew-cache
+        run: |
+          echo "path=$(brew --cache)/downloads" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Homebrew bottle downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.homebrew-cache.outputs.path }}
+          # Refresh daily for new bottle versions without re-uploading the
+          # entire download cache on every rerun. Homebrew verifies downloads.
+          key: homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}-${{ steps.homebrew-cache.outputs.date }}
+          restore-keys: |
+            homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}-
+            homebrew-bottles-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Homebrew dependencies + QuickBuild
+        run: volume-cartographer/scripts/build_macos.sh --install-deps --sccache --quickbuild
 
       - uses: actions/setup-python@v5
         with:
