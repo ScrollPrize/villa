@@ -17,8 +17,7 @@ add_library(vc_core
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ProjectDocument.cpp
-        src/SurfacePatchIndex.cpp
-        src/PointIndex.cpp
+        src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
@@ -45,7 +44,7 @@ add_library(vc_core
 )
 
 target_link_libraries(vc_core
-    PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog vc_reader::reader
+    PUBLIC vc_object_store::vc_resident_geometry vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog vc_reader::reader
         vc_reader::transforms
         PUBLIC
         opencv_core

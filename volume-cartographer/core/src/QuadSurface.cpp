@@ -5,7 +5,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 #include <vc_reader/source_reader.hpp>
 #include <vc_reader/tifxyz.hpp>
 #include <vc_object_store/Uuid.hpp>
@@ -1089,7 +1089,7 @@ float lookupDepthIndex(QuadSurface* surface, int row, int col)
 
 //search the surface point that is closest to the target coord
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
-                           SurfacePatchIndex* surfaceIndex)
+                           SurfaceQuerySet* surfaceIndex)
 {
     ensureLoaded();
     if (_points->cols < 2 || _points->rows < 2)
@@ -1116,8 +1116,8 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
-        SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
-        SurfacePatchIndex::PointQuery query;
+        SurfaceQuerySet::SurfacePtr targetSurface(this, [](QuadSurface*) {});
+        SurfaceQuerySet::PointQuery query;
         query.worldPoint = tgt;
         query.tolerance = th;
         query.surfaces.only = targetSurface;

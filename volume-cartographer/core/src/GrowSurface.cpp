@@ -1,3 +1,4 @@
+#include <shared_mutex>
 #include <omp.h>
 
 
@@ -6,10 +7,10 @@
 #include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Geometry.hpp"
-#include "vc/core/util/PointIndex.hpp"
+#include <vc_object_store/geometry/VertexIndex.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
@@ -344,16 +345,16 @@ static int remove_components_disconnected_from_seed(SurfTrackerData& data,
     return removed;
 }
 
-static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePatchIndex* surface_patch_index,
+static std::vector<SurfaceQuerySet::LookupResult> surface_patch_hits(SurfaceQuerySet* surface_patch_index,
                                                                        const cv::Vec3d& coord,
                                                                        QuadSurface* exclude = nullptr)
 {
-    std::vector<SurfacePatchIndex::LookupResult> hits;
+    std::vector<SurfaceQuerySet::LookupResult> hits;
     if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
         return hits;
     }
 
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = {
         static_cast<float>(coord[0]),
         static_cast<float>(coord[1]),
@@ -373,14 +374,14 @@ static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePa
 static int add_surface_patch_candidates(const cv::Vec2i& p,
                                         const cv::Vec3d& coord,
                                         SurfTrackerData& data,
-                                        SurfacePatchIndex* surface_patch_index,
+                                        SurfaceQuerySet* surface_patch_index,
                                         QuadSurface* exclude = nullptr)
 {
     if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
         return 0;
     }
 
-    SurfacePatchIndex::PointQuery query;
+    SurfaceQuerySet::PointQuery query;
     query.worldPoint = {
         static_cast<float>(coord[0]),
         static_cast<float>(coord[1]),
@@ -942,7 +943,7 @@ static cv::Mat_<uint16_t> surftrack_generations_hr(const cv::Mat_<uint8_t>& stat
 static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
-    SurfacePatchIndex* surface_patch_index = nullptr,
+    SurfaceQuerySet* surface_patch_index = nullptr,
     bool debug_images = false,
     int reopt_support_radius = 0,
     bool reopt_robust_affine_support = false,
@@ -1468,9 +1469,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << surface_name(seed) << std::endl;
 
-    SurfacePatchIndex surface_patch_index;
+    SurfaceQuerySet surface_patch_index;
     {
-        std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
+        std::vector<SurfaceQuerySet::SurfacePtr> patch_surfaces;
         std::set<QuadSurface*> indexed_surfaces;
         patch_surfaces.reserve(surfs.size() + 1);
         auto append_index_surface = [&](QuadSurface * sm) {
@@ -1479,23 +1480,22 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             QuadSurface* surf = sm ;
             if (!surf || !indexed_surfaces.insert(surf).second)
                 return;
-            patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(surf, [](QuadSurface*) {}));
+            patch_surfaces.emplace_back(SurfaceQuerySet::SurfacePtr(surf, [](QuadSurface*) {}));
         };
         for (const auto& [_, sm] : surfs) {
             append_index_surface(sm);
         }
         append_index_surface(seed);
-        surface_patch_index.setReadOnly(true);
         const auto rebuild_start = std::chrono::steady_clock::now();
-        surface_patch_index.rebuild(patch_surfaces, 0.0f);
+        surface_patch_index.rebuild(patch_surfaces);
         const double rebuild_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - rebuild_start).count();
-        std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
-        std::cout << "SurfacePatchIndex built for " << patch_surfaces.size()
-                  << " surfaces patches=" << surface_patch_index.patchCount()
+        std::cout << "SurfaceQuerySet rebuild time=" << rebuild_elapsed << "s" << std::endl;
+        std::cout << "SurfaceQuerySet built for " << patch_surfaces.size()
+                  << " surfaces patches=" << surface_patch_index.tileCount()
                   << std::endl;
     }
-    SurfacePatchIndex* surface_patch_index_ptr = &surface_patch_index;
+    SurfaceQuerySet* surface_patch_index_ptr = &surface_patch_index;
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
     const bool resume_growth = looks_like_resume_surface(seed, params);
@@ -1611,7 +1611,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
     bool sweep_prune_distance_active = false;
     std::shared_ptr<QuadSurface> sweep_prune_target_surface;
-    SurfacePatchIndex sweep_prune_target_index;
+    SurfaceQuerySet sweep_prune_target_index;
     if (sweep_prune_distance_enabled &&
         !sweep_prune_target_path.empty() &&
         std::isfinite(sweep_prune_best_coverage_adjusted_distance_vx) &&
@@ -1619,13 +1619,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         try {
             sweep_prune_target_surface = std::make_shared<QuadSurface>(std::filesystem::path(sweep_prune_target_path));
             sweep_prune_target_surface->ensureLoaded();
-            sweep_prune_target_index.setReadOnly(true);
-            sweep_prune_target_index.rebuild({sweep_prune_target_surface}, 0.0f);
+            sweep_prune_target_index.rebuild({sweep_prune_target_surface});
             sweep_prune_distance_active = !sweep_prune_target_index.empty();
             if (sweep_prune_distance_active) {
                 std::cout << "sweep distance prune target indexed: "
                           << sweep_prune_target_path
-                          << " patches=" << sweep_prune_target_index.patchCount() << std::endl;
+                          << " patches=" << sweep_prune_target_index.tileCount() << std::endl;
             }
         } catch (const std::exception& e) {
             std::cout << "sweep distance prune disabled: failed to index target "
@@ -2266,7 +2265,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             ceres::Problem problem;
             surftrack_add_local(probe.surf, probe.p, data, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-            std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
+            std::vector<SurfaceQuerySet::LookupResult> more_local_hits;
             for(auto test_surf : local_surfs) {
                 if (test_surf == probe.surf)
                     continue;
@@ -2893,7 +2892,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 ceres::Problem problem;
                 surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-                std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
+                std::vector<SurfaceQuerySet::LookupResult> more_local_hits;
 
                 for(auto test_surf : local_surfs) {
                     if (test_surf == best_surf)
@@ -3185,7 +3184,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         continue;
                     }
 
-                    SurfacePatchIndex::PointQuery query;
+                    SurfaceQuerySet::PointQuery query;
                     query.worldPoint = cv::Vec3f(
                         static_cast<float>(p[0]),
                         static_cast<float>(p[1]),

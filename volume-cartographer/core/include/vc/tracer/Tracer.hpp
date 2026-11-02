@@ -5,7 +5,7 @@
 #include <nlohmann/json.hpp>
 
 namespace vcr { class Array; }
-class SurfacePatchIndex;
+class SurfaceQuerySet;
 
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);
 // Grows a surface in `volume`, a uint8 CT level (give it a MemoryCache: the tracer

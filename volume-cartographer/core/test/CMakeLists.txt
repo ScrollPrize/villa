@@ -412,7 +412,7 @@ vc_add_test(NAME test_normal_grid_volume)
 vc_add_test(NAME test_normal_grid_stream)
 vc_add_test(NAME test_normal_grid_generate)
 
-vc_add_test(NAME test_surface_patch_index)
+vc_add_test(NAME test_surface_query_set)
 
 
 vc_add_test(NAME test_global_cache_root)
@@ -534,7 +534,6 @@ vc_add_test(NAME test_volume_pkg_full)
 
 vc_add_test(NAME test_load_quad_from_tifxyz)
 
-vc_add_test(NAME test_surface_patch_index_more)
 
 vc_add_test(NAME test_quadsurface_extras)
 vc_add_test(NAME test_quadsurface_store)

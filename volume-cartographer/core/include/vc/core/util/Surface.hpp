@@ -28,7 +28,7 @@ public:
     virtual cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) const = 0;
     virtual cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) = 0;
     virtual float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 1000,
-                          class SurfacePatchIndex* surfaceIndex = nullptr) = 0;
+                          class SurfaceQuerySet* surfaceIndex = nullptr) = 0;
     nlohmann::json meta;
     std::filesystem::path path;
     std::string id;

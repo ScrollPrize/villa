@@ -32,7 +32,7 @@ namespace vc::objects { class TransformedGeometryView; }
 
 // Forward declarations
 class QuadSurface;
-class SurfacePatchIndex;
+class SurfaceQuerySet;
 
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
@@ -319,7 +319,7 @@ public:
     // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
     cv::Vec3f gridNormal(int row, int col) const;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
-                  class SurfacePatchIndex* surfaceIndex = nullptr) override;
+                  class SurfaceQuerySet* surfaceIndex = nullptr) override;
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;

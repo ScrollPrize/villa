@@ -19,7 +19,7 @@
 #include <random>
 #include <set>
 
-#include "vc/core/util/PointIndex.hpp"
+#include <vc_object_store/geometry/VertexIndex.hpp>
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
@@ -622,7 +622,7 @@ static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& ta
 }
 
 static DistanceStats sampled_distance_stats(const cv::Mat_<cv::Vec3f>& samples,
-                                            const PointIndex& index,
+                                            const vc::geometry::VertexIndex& index,
                                             int valid_count,
                                             int max_samples,
                                             double tolerance)
@@ -755,7 +755,7 @@ static void add_completeness_metrics(QuadSurface& result, SweepMetrics& metrics)
 
 static SweepMetrics score_surface(QuadSurface& result,
                                   QuadSurface& target,
-                                  const PointIndex& target_index,
+                                  const vc::geometry::VertexIndex& target_index,
                                   double target_area_vx2,
                                   double target_area_cm2,
                                   int target_valid_points,
@@ -778,8 +778,8 @@ static SweepMetrics score_surface(QuadSurface& result,
     const auto* target_points = target.rawPointsPtr();
     metrics.result_to_target = sampled_distance_stats(*result_points, target_index, metrics.valid_points, max_samples, tolerance);
 
-    PointIndex result_index;
-    result_index.buildFromMat(*result_points);
+    vc::geometry::VertexIndex result_index;
+    result_index.rebuild(*result_points);
     metrics.target_to_result = sampled_distance_stats(*target_points, result_index, target_valid_points, max_samples, tolerance);
 
     metrics.result_coverage_fraction = metrics.result_to_target.samples > 0
@@ -1238,9 +1238,9 @@ int main(int argc, char *argv[])
         const cv::Size target_grid_size = target->rawPointsPtr()->size();
         const double target_area_vx2 = vc::surface::computeSurfaceAreaVox2(*target);
         const double target_area_cm2 = area_cm2_or_nan(target_area_vx2, voxelsize);
-        PointIndex target_index;
+        vc::geometry::VertexIndex target_index;
         if (!seed_only_sweep) {
-            target_index.buildFromMat(*target->rawPointsPtr());
+            target_index.rebuild(*target->rawPointsPtr());
         }
 
         std::vector<SweepRun> runs;
