@@ -175,12 +175,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -237,12 +235,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -298,12 +294,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -363,12 +357,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -426,12 +418,10 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev/libssl-dev entries in scripts/install_build_deps.sh.
-      - name: Install SQLite and OpenSSL headers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libpng-dev libjpeg-dev
+      - name: Install shared build dependencies
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0

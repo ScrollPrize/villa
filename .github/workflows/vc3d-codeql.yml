@@ -156,13 +156,11 @@ jobs:
         with:
           fetch-depth: 0  # history-aware queries if needed
 
-      # Keep this until the next published dependency image includes the
-      # libsqlite3-dev entry in scripts/install_build_deps.sh.
-      - name: Install SQLite headers
+      - name: Install shared build dependencies
         if: needs.changes.outputs.vc == 'true'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libsqlite3-dev
+        env:
+          AGENTS_ALLOW_INSTALL: '1'
+        run: bash volume-cartographer/scripts/install_build_deps.sh minimal-build
 
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
