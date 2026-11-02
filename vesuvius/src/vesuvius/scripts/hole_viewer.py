@@ -23,7 +23,7 @@ import napari
 from magicgui import magicgui
 from magicgui.widgets import Container, PushButton, Label
 
-import cc3d
+from vc_reader.geometry import label_components
 
 from detect_holes import compute_component_topology, localize_holes
 from fix_holes import _fix_2d_hole_fill, _fix_morph_close, _fix_alpha_wrap
@@ -463,7 +463,7 @@ def make_components_widget(viewer: napari.Viewer) -> Container:
 
         data = np.asarray(layer.data)
         binary = (data > 0).astype(np.uint8)
-        labels, n = cc3d.connected_components(binary, connectivity=26, return_N=True)
+        labels, n = label_components(binary, connectivity=26)
         print(f"[INFO] {n} connected component(s) (26-conn) in '{layer_name}'")
 
         out_name = f"{layer_name}_cc26"

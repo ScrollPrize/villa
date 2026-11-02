@@ -6,11 +6,10 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
-from scipy import ndimage
 from scipy.spatial import cKDTree
 
 import vc_reader.transforms as A
-from vc_reader.geometry import fill_holes
+from vc_reader.geometry import fill_holes, label_components
 
 # Nearest voxel of a mask for every voxel (scipy distance_transform_edt indices).
 _NEAREST = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
@@ -90,7 +89,7 @@ def _keep_components_touching_source_and_target(
     target_mask: np.ndarray,
     debug: dict,
 ) -> np.ndarray:
-    labels, num_labels = ndimage.label(domain)
+    labels, num_labels = label_components(domain, connectivity=6, threads=1)
     debug["connected_component_count"] = int(num_labels)
     if num_labels == 0:
         debug["source_to_target_connected_component_count"] = 0

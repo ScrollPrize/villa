@@ -11,10 +11,9 @@ import re
 import shutil
 from typing import Dict, List, Sequence
 
-import cv2
 import numpy as np
 from vc_reader import images
-from vc_reader.geometry import fill_holes as fill_mask_holes
+from vc_reader.geometry import fill_holes as fill_mask_holes, label_components
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -202,10 +201,11 @@ def remove_small_components(mask_u8: np.ndarray, min_component_size: int) -> np.
     if min_component_size <= 1:
         return np.ascontiguousarray(mask_u8)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    keep = np.zeros(num_labels, dtype=bool)
+    # One thread: this runs in process-pool workers.
+    labels, count = label_components(mask_u8, connectivity=8, threads=1)
+    areas = np.bincount(labels.ravel(), minlength=count + 1)
+    keep = areas >= int(min_component_size)
     keep[0] = False
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= int(min_component_size)
     filtered = keep[labels]
     return np.ascontiguousarray(filtered.astype(np.uint8) * 255)
 
@@ -220,8 +220,10 @@ def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
     if max_hole_area <= 0:
         return np.ascontiguousarray(mask_u8)
 
-    background = (mask_u8 == 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=8)
+    background = mask_u8 == 0
+    labels, count = label_components(background, connectivity=8, threads=1)
+    num_labels = count + 1
+    areas = np.bincount(labels.ravel(), minlength=num_labels)
     if num_labels <= 1:
         return np.ascontiguousarray(mask_u8)
 
@@ -240,7 +242,7 @@ def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
 
     fill = np.zeros(num_labels, dtype=bool)
     candidate_labels = np.arange(1, num_labels)
-    candidate_areas = stats[1:, cv2.CC_STAT_AREA]
+    candidate_areas = areas[1:]
     fill[candidate_labels] = (~touches_border[candidate_labels]) & (candidate_areas <= int(max_hole_area))
 
     filled = (mask_u8 != 0) | fill[labels]

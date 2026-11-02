@@ -3,7 +3,6 @@ import warnings
 import torch
 import random
 import numpy as np
-import scipy.ndimage
 from tqdm import tqdm
 from einops import rearrange
 from functools import lru_cache
@@ -11,6 +10,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 
 from vc_reader import tifxyz
+from vc_reader.geometry import label_components
 from vc_reader.torch import surface_points, surface_derivatives
 from vc_reader.reader import ZarrReader, open_group
 
@@ -159,11 +159,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             component_mask = torch.zeros_like(quad_in_crop)
             return component_mask
 
-        # use scipy label instead of dfs; use 8-connectivity (including diagonals) to avoid dashed lines
-        structure = np.array([[1, 1, 1],
-                              [1, 1, 1],
-                              [1, 1, 1]], dtype=np.int8)
-        labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
+        # label components instead of a dfs; 8-connectivity (including diagonals) avoids dashed lines
+        labeled, _ = label_components(quad_in_crop.cpu().numpy(), connectivity=8, threads=1)
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
             component_mask = torch.zeros_like(quad_in_crop)
@@ -748,8 +745,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                                 break
                         # Keep only the connected component touching the chosen anchor to avoid fragmented masks
                         if anchor_voxel is not None and surface_mask[0, anchor_voxel[0], anchor_voxel[1], anchor_voxel[2]] > 0:
-                            structure = np.ones((3, 3, 3), dtype=np.int8)
-                            labeled, _ = scipy.ndimage.label(surface_mask[0].cpu().numpy(), structure=structure)
+                            labeled, _ = label_components(surface_mask[0].cpu().numpy(), connectivity=26, threads=1)
                             label = labeled[anchor_voxel[0].item(), anchor_voxel[1].item(), anchor_voxel[2].item()]
                             if label != 0:
                                 surface_mask_np = (labeled == label)[None].astype(np.float32)

@@ -10,8 +10,8 @@ from vc_reader.reader import ZarrGroup, ZarrReader, load_basic_auth, open_node
 from typing import Any, Dict, List, Tuple
 import re
 from functools import lru_cache
-from scipy import ndimage
 import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 
 _ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
 from vc_reader import images
@@ -468,7 +468,6 @@ def create_band_mask(
     behind_disp_work: np.ndarray,
     band_pct: float,
     band_padding: float,
-    cc_structure_26: np.ndarray,
 ):
     """Build a dense slab mask between two wrap displacements for triplet band mode."""
     cond_bin = np.asarray(cond_bin_full, dtype=np.uint8)
@@ -495,7 +494,7 @@ def create_band_mask(
         return None
 
     # Remove isolated islands: keep only components connected to conditioning.
-    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    labels, num_labels = label_components(dense_band, connectivity=26, threads=1)
     if num_labels <= 0:
         return None
     touching = np.unique(labels[cond_mask])
@@ -512,7 +511,7 @@ def create_band_mask(
         return None
 
     # Closing can create detached islands; keep only cond-connected components.
-    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    labels, num_labels = label_components(dense_band, connectivity=26, threads=1)
     if num_labels <= 0:
         return None
     touching = np.unique(labels[cond_mask])

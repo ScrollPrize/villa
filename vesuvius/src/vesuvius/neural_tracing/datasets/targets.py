@@ -195,7 +195,6 @@ def _copy_neighbor_dense_weight(
         behind_disp_work=behind_disp.detach().cpu().numpy(),
         band_pct=min(100.0, max(1.0, float(config["triplet_band_distance_percentile"]))),
         band_padding=max(0.0, float(config["triplet_band_padding_voxels"])),
-        cc_structure_26=np.ones((3, 3, 3), dtype=np.uint8),
     )
     if dense_band is None:
         if weight_mode == "all_band_boost":

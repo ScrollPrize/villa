@@ -70,8 +70,8 @@ models = [
     # Data pipeline / I/O and compression
     "fastremap>=1.15",
     "opencv-python-headless>=4.11.0.86",
-    # cuCIM ships manylinux wheels only; both import sites already fall back
-    # gracefully when it is absent, so keep non-Linux platforms resolvable.
+    # cuCIM ships manylinux wheels only; its one use (detect_holes' CUDA Euler
+    # number) falls back to --cpu when it is absent, so non-Linux platforms resolve.
     "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]
 # Rendering and geometry utilities

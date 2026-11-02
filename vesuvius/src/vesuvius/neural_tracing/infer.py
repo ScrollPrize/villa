@@ -14,6 +14,7 @@ from cachetools import LRUCache
 
 from vesuvius.neural_tracing.heatmap_single_point.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
 import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 
 _ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
 from vesuvius.models.run.tta import infer_with_tta
@@ -420,39 +421,19 @@ class Inference:
 
     def get_blob_coordinates(self, heatmap, min_corner_zyx, threshold=0.5, min_size=8, connectivity=26):
 
-        try:
-            import cupy as cp
-            from cucim.skimage.measure import label as cucim_label, regionprops_table
-        except ImportError as error:  # cuCIM ships Linux wheels only (pyproject.toml); copy requests never get here
-            raise ImportError(
-                "heatmap blob detection needs cupy and cuCIM (CUDA, Linux wheels only); copy requests do not use them"
-            ) from error
+        binary = (heatmap > threshold).contiguous()
+        labels, count = label_components(binary, connectivity=connectivity)
+        labels = torch.from_dlpack(labels) if binary.is_cuda else torch.from_numpy(labels)
 
-        binary_gpu = cp.asarray(heatmap > threshold)
-
-        # connectivity 3 for cucim label is 26-connected, 2 would be 18
-        labels_gpu = cucim_label(binary_gpu, connectivity=3)
-
-        # area + centroid
-        props = regionprops_table(labels_gpu, properties=['label', 'area', 'centroid'])
-        areas = props['area'].get() 
-
-        # find largest component and extract centroid
-        if len(areas) > 0:
-            largest_idx = np.argmax(areas)
-            largest_size = areas[largest_idx]
-
-            if largest_size >= min_size:
-                centroid = np.array([
-                    props['centroid-0'][largest_idx].get(),
-                    props['centroid-1'][largest_idx].get(),
-                    props['centroid-2'][largest_idx].get()
-                ]) + min_corner_zyx.numpy()
+        # The largest component (the first label among equals) and its centroid.
+        centroid_zyxs = np.empty((0, 3), dtype=np.float32)
+        if count:
+            areas = torch.bincount(labels.flatten(), minlength=count + 1)[1:]
+            largest = int(torch.argmax(areas))
+            if int(areas[largest]) >= min_size:
+                voxels = torch.nonzero(labels == largest + 1).double()
+                centroid = voxels.mean(dim=0).cpu().numpy() + min_corner_zyx.numpy()
                 centroid_zyxs = centroid.reshape(1, 3).astype(np.float32)
-            else:
-                centroid_zyxs = np.empty((0, 3), dtype=np.float32)
-        else:
-            centroid_zyxs = np.empty((0, 3), dtype=np.float32)
 
         return torch.from_numpy(centroid_zyxs)
 

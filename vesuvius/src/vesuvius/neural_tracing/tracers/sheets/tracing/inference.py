@@ -26,7 +26,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from scipy import ndimage
 import torch
 from vc_reader.reader import ZarrReader, open_zarr
 
@@ -38,6 +37,7 @@ from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
 from vesuvius.neural_tracing.tracers.sheets.sampling import view_radius
 from vc_reader import tifxyz
+from vc_reader.geometry import label_components
 
 
 def resample(points: np.ndarray, spacing: float) -> np.ndarray:
@@ -100,7 +100,7 @@ def connected_keep(confs: np.ndarray, threshold: float) -> np.ndarray:
     always kept), so the output is one connected surface rather than separate islands."""
     keep = confs > threshold
     keep[0] = True
-    labels, _ = ndimage.label(keep)
+    labels, _ = label_components(keep, connectivity=4)
     return np.isin(labels, np.unique(labels[0]))
 
 

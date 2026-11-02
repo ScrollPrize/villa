@@ -21,12 +21,10 @@ import importlib.util
 try:
     import cupy as cp
     from cucim.skimage.measure import euler_number as cucim_euler_number
-    from cucim.skimage.measure import label as cucim_label
     _HAS_CUPY = True
 except Exception:
     cp = None
     cucim_euler_number = None
-    cucim_label = None
     _HAS_CUPY = False
 
 try:
@@ -38,6 +36,7 @@ except Exception:
 import numpy as np
 from vc_reader import images
 import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 from tqdm import tqdm
 
 from scipy import ndimage as ndi
@@ -189,15 +188,8 @@ def compute_component_topology(
 
     # Cavities: background components not connected to the padded border
     bg = ~comp_pad
-    if use_cpu:
-        struct_bg = ndi.generate_binary_structure(comp_pad.ndim, _conn_to_skimage(bg_connectivity, comp_pad.ndim))
-        bg_lab, num_bg = ndi.label(bg.astype(np.uint8), structure=struct_bg)
-    else:
-        if not _HAS_CUPY:
-            raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
-        bg_gpu = cp.asarray(bg.astype(np.uint8))
-        bg_lab = cp.asnumpy(cucim_label(bg_gpu, connectivity=_conn_to_skimage(bg_connectivity, comp_pad.ndim)))
-        num_bg = int(bg_lab.max())
+    _conn_to_skimage(bg_connectivity, comp_pad.ndim)  # validates the connectivity
+    bg_lab, num_bg = label_components(bg, connectivity=bg_connectivity)
     border = _border_mask(bg_lab.shape)
     outside_ids = np.unique(bg_lab[border])
     outside_ids = outside_ids[outside_ids > 0]
@@ -209,6 +201,8 @@ def compute_component_topology(
             raise ImportError("scikit-image is required for --cpu (Euler number).")
         chi = int(sk_euler_number(comp_pad, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
     else:
+        if not _HAS_CUPY:
+            raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
         comp_pad_gpu = cp.asarray(comp_pad)
         chi = int(cucim_euler_number(comp_pad_gpu, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
 
@@ -431,15 +425,8 @@ def compute_file(
             hole_mask = None
         return rows, hole_mask
 
-    if use_cpu:
-        struct_fg = ndi.generate_binary_structure(mask.ndim, _conn_to_skimage(fg_connectivity, mask.ndim))
-        labels, num_labels = ndi.label(mask.astype(np.uint8), structure=struct_fg)
-    else:
-        if not _HAS_CUPY:
-            raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
-        labels_gpu = cucim_label(cp.asarray(mask.astype(np.uint8)), connectivity=_conn_to_skimage(fg_connectivity, mask.ndim))
-        labels = cp.asnumpy(labels_gpu)
-        num_labels = int(labels.max())
+    _conn_to_skimage(fg_connectivity, mask.ndim)  # validates the connectivity
+    labels, num_labels = label_components(mask, connectivity=fg_connectivity)
     if num_labels == 0:
         return [], None
 

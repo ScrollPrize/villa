@@ -19,6 +19,7 @@ from scipy.interpolate import splev, splprep
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
 from vc_reader.resident import sample_array
+from vc_reader.geometry import label_components
 import vc_reader.transforms as A
 
 
@@ -124,7 +125,7 @@ def extract_family(probability: np.ndarray, threshold: int, progress: Progress |
     junctions = skeleton & (degree > 2)
     chains = skeleton & ~A.Morphology("dilate", radius=1, footprint="cube")(junctions[None])[0]
     del skeleton, degree, junctions
-    labels, _ = ndi.label(chains, structure=np.ones((3, 3, 3)))
+    labels, _ = label_components(chains, connectivity=26)
     del chains
     sizes = np.bincount(labels.ravel())
     boxes = ndi.find_objects(labels)

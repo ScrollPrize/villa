@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import cc3d
 import numpy as np
 from numba import njit
 from scipy import ndimage
 
 import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 
 _OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
@@ -472,7 +472,7 @@ def _band_bounds(
     candidate &= (lower < np.asarray(crop_bbox_zyx[3:])).all(axis=-1)
     if not np.any(candidate):
         return []
-    labels, _ = ndimage.label(candidate, structure=np.ones((3, 3), dtype=np.uint8))
+    labels, _ = label_components(candidate, connectivity=8, threads=1)
     parts = []
     for cells in ndimage.find_objects(labels):
         band_rows = np.searchsorted(rows, (row0 + cells[0].start, row0 + cells[0].stop))
@@ -839,9 +839,7 @@ def filter_support_bands(
     ) > 0
     if not np.any(occupancy):
         return support_bbox, valid
-    components = cc3d.connected_components(
-        occupancy.astype(np.uint8, copy=False), connectivity=26
-    )
+    components, _ = label_components(occupancy, connectivity=26, threads=1)
     supervised = np.concatenate(
         [(np.asarray(flat) > 0)[mask] for flat, mask in zip(supervision_flat, valid)]
     )
@@ -918,9 +916,7 @@ def filter_support_bands(
                 )
                 for masks in (filtered, seeds)
             )
-            flat_components, _ = ndimage.label(
-                group_filtered, structure=np.ones((3, 3), dtype=np.uint8)
-            )
+            flat_components, _ = label_components(group_filtered, connectivity=8, threads=1)
             flat_component_ids = np.unique(flat_components[group_seed])
             group_filtered = np.isin(
                 flat_components, flat_component_ids[flat_component_ids > 0]

@@ -13,6 +13,7 @@ import numpy as np
 from vc_reader.reader import open_zarr
 from vc_reader.resident import sample_array
 import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
@@ -20,8 +21,6 @@ from lasagna.inference_provenance import atomic_write
 from .embedding import nearest_polyline_points
 
 
-_CONN6 = ndimage.generate_binary_structure(3, 1)
-_CONN26 = ndimage.generate_binary_structure(3, 3)
 _OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
@@ -96,8 +95,8 @@ def endpoint_ellipsoids(shape, origin_zyx, scale, endpoints_xyz, normals_xyz,
     return masks
 
 
-def connecting_component(mask, endpoint_masks, connectivity=_CONN26):
-    labels, count = ndimage.label(mask, structure=connectivity)
+def connecting_component(mask, endpoint_masks, connectivity=26):
+    labels, count = label_components(mask, connectivity=connectivity)
     common = None
     hits = []
     for endpoint in endpoint_masks:
@@ -271,7 +270,7 @@ def skeleton_topology(component, origin_zyx, scale, required_masks, long_arm_min
     kernel[1, 1, 1] = 0
     degree = ndimage.convolve(skeleton.astype(np.uint8), kernel, mode="constant", cval=0)
     critical = skeleton & (degree != 2)
-    node_labels, node_count = ndimage.label(critical, structure=_CONN26)
+    node_labels, node_count = label_components(critical, connectivity=26)
     shape = np.asarray(skeleton.shape, dtype=np.int64)
     offsets = [np.asarray(v, dtype=np.int64) for v in itertools.product((-1, 0, 1), repeat=3)
                if v != (0, 0, 0)]
@@ -345,7 +344,7 @@ def skeleton_topology(component, origin_zyx, scale, required_masks, long_arm_min
         else:
             edge["kind"] = "other"
 
-    component_labels, component_count = ndimage.label(skeleton, structure=_CONN26)
+    component_labels, component_count = label_components(skeleton, connectivity=26)
     node_free_cycles = 0
     for label in range(1, component_count + 1):
         if not np.any(critical & (component_labels == label)):
@@ -841,7 +840,7 @@ def run_pair_connectivity(workload):
     selected = feasible[0]
     raw, dilation_added, closing_added, component = _materialize_choice(
         presence, required_masks, selected, domain)
-    six_component, _ = connecting_component(component, required_masks, _CONN6)
+    six_component, _ = connecting_component(component, required_masks, 6)
     selected["connected_with_6_neighbors"] = six_component is not None
     overlap = np.zeros(presence.shape, dtype=np.uint8)
     for mask in endpoint_masks:

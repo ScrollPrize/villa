@@ -32,7 +32,8 @@ import fastremap
 import numpy as np
 from vc_reader import images
 from vc_reader.reader import ObjectStore, ZarrWriter, create_group, ome_multiscales, open_zarr, write_pyramid
-from scipy.ndimage import label as label_components, find_objects
+from scipy.ndimage import find_objects
+from vc_reader.geometry import label_components
 import vc_reader.transforms as A
 from tqdm import tqdm
 
@@ -429,7 +430,7 @@ def find_padded_regions(
 
     # Find connected components
     binary_mask = label_img == label_value
-    labeled, num_components = label_components(binary_mask)
+    labeled, num_components = label_components(binary_mask, connectivity=4, threads=1)
 
     if num_components == 0:
         return []
