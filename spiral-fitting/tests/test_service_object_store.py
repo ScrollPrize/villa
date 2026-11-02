@@ -808,14 +808,44 @@ def test_requests_cannot_name_host_input_paths(host, store, tmp_path):
 
 def test_winding_model_supervision_reads_the_bound_artifact(host, store, tmp_path):
     body = initialize_body()
-    body['run']['config'] = dict(WINDING_MODEL)
-    # Without a binding the fit that needs it fails preparation, saying how
+    body['run']['config'] = {**WINDING_MODEL, 'input_use_winding_inference': True}
+    # Without a binding a fit that asks for it fails preparation, saying how
     # to provide one; nothing is built.
     with pytest.raises(ApiError) as refused:
         service(host, store).initialize(body)
     [detail] = [detail for detail in refused.value.details
                 if detail['field'] == 'winding_inference']
     assert '--winding-inference PATH' in detail['message']
+    # Enabled only by the Python default (the request leaves the toggle
+    # out), it is left out instead.
+    implicit = initialize_body()
+    implicit['run']['config'] = dict(WINDING_MODEL)
+    state = service(host, store)
+    paths, run, _, _ = state._prepare_session_request(implicit)
+    assert paths.winding_inference == ''
+    assert run.config['input_use_winding_inference'] is False
+    [warning] = [event for event in state.events.read_after(0)['events']
+                 if event['severity'] == 'warning']
+    assert 'the default configuration enables it' in warning['text']
+    # So is one a checkpoint's configuration enables.
+    checkpoint = host.output / 'fit' / 'checkpoint.ckpt'
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b'')
+    state = service(host, store)
+    state._checkpoint_durable_cfg = lambda path: (
+        {**WINDING_MODEL, 'input_use_winding_inference': True}, None, None, None)
+    resumed = initialize_body()
+    resumed['paths'] = {'checkpoint': str(checkpoint)}
+    resumed['run']['config'] = {}
+    request, config = state._bound_session_request(
+        resumed, state._request_project(resumed), include_input_config=True)
+    assert config['input_use_winding_inference'] is False
+    assert request['run']['config'] == {'input_use_winding_inference': False}
+    assert request['paths']['winding_inference'] == ''
+    [warning] = [event for event in state.events.read_after(0)['events']
+                 if event['severity'] == 'warning']
+    assert 'the checkpoint it resumes was fitted with it' in warning['text']
+    assert '--winding-inference PATH' in warning['text']
 
     artifact = winding_artifact(tmp_path / 'winding')
     state = service(host, store, spiral_service.bind_service_inputs(

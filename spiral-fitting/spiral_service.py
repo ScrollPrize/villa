@@ -1240,6 +1240,27 @@ class ServiceState:
                 paths["checkpoint"])
             if checkpoint_config is not None:
                 config = {**checkpoint_config, **requested_config}
+        if ("input_use_winding_inference" not in requested_config
+                and winding_inference_enabled(config)
+                and not bindings.winding_inference_status()["available"]):
+            # Winding-model supervision cannot run here. A checkpoint's
+            # configuration or the Python default enables it without the
+            # request asking, so leave the source out rather than refuse the
+            # fit; an explicit request is still refused, saying why.
+            enabled_by = ("the checkpoint it resumes was fitted with it"
+                          if checkpoint and config is not requested_config
+                          else "the default configuration enables it")
+            config = {**config, "input_use_winding_inference": False}
+            request = {**request, "run": {
+                **(request.get("run") or {}),
+                "config": {**requested_config,
+                           "input_use_winding_inference": False}}}
+            self.events.append(
+                "log", f"Warning: this fit leaves winding-model supervision "
+                f"out, though {enabled_by}: the service has no usable winding "
+                f"inference ({bindings.winding_inference_status()['error']}). "
+                f"Restart it with --winding-inference PATH to include it.",
+                severity="warning", source="service")
 
         # The session config owns which optional sources participate. Clear
         # disabled paths before validation so the manifest, validator, and
