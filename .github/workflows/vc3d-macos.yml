@@ -51,7 +51,7 @@ jobs:
   pr-noop:
     name: Build + package (Homebrew LLVM, arm64)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 2
     steps:
       - run: echo "Native compile coverage is provided by the required vc3d-ci macOS job."
@@ -59,7 +59,7 @@ jobs:
   build-macos:
     name: Build + package (Homebrew LLVM, arm64)
     if: github.event_name != 'pull_request'
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 180
     env:
       AGENTS_AGENT_MODE: '1'
@@ -205,7 +205,7 @@ jobs:
     name: Attach macOS package to release
     if: github.event_name == 'release'
     needs: build-macos
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       actions: read
