@@ -12,14 +12,18 @@ LABEL org.opencontainers.image.licenses="GPL-3.0"
 # Build deps live in scripts/install_build_deps.sh — the single source of
 # truth shared with local builds. The BuildKit cache mount stays
 # here so apt layer caching still applies.
-COPY scripts/install_build_deps.sh /tmp/install_build_deps.sh
+COPY volume-cartographer/scripts/install_build_deps.sh /tmp/install_build_deps.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     bash /tmp/install_build_deps.sh ci-tooling \
  && rm -f /tmp/install_build_deps.sh
 
 FROM builder AS build
-COPY . /src
+# Built from the repository root (Dockerfile.dockerignore limits it): CMake finds the
+# sibling projects at ../vc_reader and ../vc_object_store.
+COPY volume-cartographer /src
+COPY vc_reader /vc_reader
+COPY vc_object_store /vc_object_store
 WORKDIR /src
 RUN cmake --preset ci-release-gcc \
  && cmake --build --preset ci-release-gcc \
