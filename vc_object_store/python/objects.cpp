@@ -80,17 +80,33 @@ auto writeMethod()
     }(Method);
 }
 
-nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
+// A revision view read natively, so the read can run without the GIL (a
+// large store's view takes seconds) and become Python objects after.
+struct RevisionView {
+    std::vector<vo::ObjectRevision> objects;
+    std::vector<vo::SelectedRelationship> relationships;
+};
+
+RevisionView readRevisionView(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
 {
-    const auto relationships = db.relationshipsAt(txn, selection);
+    RevisionView view;
+    view.relationships = db.relationshipsAt(txn, selection);
+    for (const auto& [uuid, selected] : selection) {
+        auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
+        view.objects.push_back(std::move(*revision)); // selection was validated above
+    }
+    return view;
+}
+
+nb::dict revisionViewToPy(const RevisionView& view)
+{
     nb::dict result, resolved;
     nb::list objects, edges;
-    for (const auto& [uuid, selected] : selection) {
-        const auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
-        objects.append(objectRevisionToPy(*revision)); // selection was validated above
-        resolved[pyStr(revision->objectUuid)] = revision->uuid;
+    for (const auto& revision : view.objects) {
+        objects.append(objectRevisionToPy(revision));
+        resolved[pyStr(revision.objectUuid)] = revision.uuid;
     }
-    for (const auto& relationship : relationships) {
+    for (const auto& relationship : view.relationships) {
         auto edge = relationshipRevisionToPy(relationship.relationship);
         edge["applicable"] = relationship.applicable; edges.append(edge);
     }
@@ -1078,17 +1094,17 @@ NB_MODULE(_native, m)
             return result;
         }, nb::arg("selection"))
         .def("revision_read_view", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, selection);
-            });
+            return revisionViewToPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return readRevisionView(db, txn, selection);
+            }));
         }, nb::arg("selection"),
            "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
         .def("revision_selection_at", readMethod<&vo::ObjectStore::revisionSelectionAt>(), nb::arg("published_at_us"),
              nb::arg("include_retired") = false)
         .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
-            });
+            return revisionViewToPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return readRevisionView(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
+            }));
         }, nb::arg("published_at_us"), nb::arg("include_retired") = false,
            "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
         .def(
