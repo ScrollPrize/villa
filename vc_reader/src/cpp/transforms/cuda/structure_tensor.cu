@@ -31,6 +31,22 @@ template<class T> __device__ void eigen_fields(KernelIndex vcr_launch, const T* 
 struct eigen_fields_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { eigen_fields(index,args...); }
 };
+template<class T> __device__ void product_backward(KernelIndex vcr_launch, const T* cotangent, T* const* gradient,
+                                                    T* const* dg, std::size_t n, int x, int y) {
+    EACH_INDEX(n) {
+        dg[x][i] += cotangent[i] * gradient[y][i];
+        dg[y][i] += cotangent[i] * gradient[x][i];
+    }
+}
+struct product_backward_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { product_backward(index,args...); }
+};
+template<class T> __device__ void add_gradient(KernelIndex vcr_launch, const T* value, T* out, std::size_t n) {
+    EACH_INDEX(n) out[i] += value[i];
+}
+struct add_gradient_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { add_gradient(index,args...); }
+};
 // Gaussian point weights (normalized later) times each component; block partial sums.
 template<class T> __device__ void point_sums(KernelIndex vcr_launch, const T* components, Layout g, int count, double cz, double cy, double cx, double rho, double* partial) {
     __shared__ double values[7][256];
@@ -89,6 +105,41 @@ void apply_cuda(const StructureTensor& t, Sample& s, const Parameters&, Session&
             pointers.push_back(gradient.back().ptr);
         }
         Buffer<T*> table(pointers);
+        if (!t.gradient.empty()) {
+            const auto& cotangent = session.arrays.at(t.gradient);
+            require(cotangent.shape[0] == std::size_t(count) && cotangent.spatial() == grid.shape &&
+                    cotangent.kind == 'f' && cotangent.bytes == sizeof(T), "structure tensor cotangent shape or dtype mismatch");
+            std::vector<Buffer<T>> dg; std::vector<T*> dg_ptrs;
+            for (int axis_ = 0; axis_ < d; ++axis_) {
+                dg.emplace_back(n); check(cudaMemsetAsync(dg.back().ptr,0,n*sizeof(T),vcr::device::stream()));
+                dg_ptrs.push_back(dg.back().ptr);
+            }
+            Buffer<T*> dg_table(dg_ptrs);
+            Buffer<T> value(n), work(n);
+            for (int c = 0; c < count; ++c) {
+                check(copy_async(value.ptr,cotangent.view<T>().ptr+c*n,n*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
+                T* v = value.ptr; T* w = work.ptr;
+                separable_cuda(v,w,grid,transpose_taps(integration_taps(t,d)),Boundary::Zero);
+                int x,y; component_axes(c,d,x,y);
+                launch(blocks(n),256,0,vcr::device::stream(),product_backward_launch{},v,table.ptr,dg_table.ptr,n,x,y);
+            }
+            Buffer<T> total(n); check(cudaMemsetAsync(total.ptr,0,n*sizeof(T),vcr::device::stream()));
+            for (int axis_ = 0; axis_ < d; ++axis_) {
+                T* v = dg[axis_].ptr; T* w = work.ptr;
+                separable_cuda(v,w,grid,transpose_taps(taps[axis_]),Boundary::Zero);
+                launch(blocks(n),256,0,vcr::device::stream(),add_gradient_launch{},v,total.ptr,n);
+            }
+            T* v = total.ptr; T* w = work.ptr;
+            if (t.derivative == Derivative::Pavel && t.sigma > 0)
+                separable_cuda(v,w,grid,std::vector<Taps>(d,torch_gaussian(t.sigma)),Boundary::Zero);
+            Shape shape{1}; shape.insert(shape.end(),grid.shape.begin(),grid.shape.end());
+            DeviceArray out(shape,'f',sizeof(T));
+            launch(blocks(n),256,0,vcr::device::stream(),scale_copy_launch{},v,out.view<T>().ptr,n,t.scale);
+            check(cudaGetLastError());
+            outputs.emplace_back(name,Field{metadata(shape,sizeof(T)),derived(Role::Scalar),t.on});
+            session.arrays.emplace(name,std::move(out));
+            return;
+        }
         Buffer<T> components(count*n);
         launch(blocks(n),256,0,vcr::device::stream(), products_launch{}, table.ptr,components.ptr,n,d); check(cudaGetLastError());
         if (!t.at.empty()) {

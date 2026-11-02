@@ -253,6 +253,7 @@ NB_MODULE(_transforms, m) {
         t.points_affected = a.get("points_affected", t.points_affected); t.radius_sigma = a.get("radius_sigma", t.radius_sigma); t.max_displacement = a.get("max_displacement", t.max_displacement);
     });
     bind<DistanceTransform>(m, "DistanceTransform", [](auto& t, auto& a) {
+        t.implicit_background = a.kw("implicit_background", t.implicit_background);
         t.on = names(a.take("on", nb::none())); t.channel = a.get("channel", t.channel); t.threshold = a.get("threshold", t.threshold);
         const auto mode = a.get("mode", std::string("signed"));
         require(mode == "signed" || mode == "inside" || mode == "outside", "distance mode must be signed, inside or outside");
@@ -260,7 +261,12 @@ NB_MODULE(_transforms, m) {
         t.suffix = a.get("suffix", t.suffix); auto normals = a.get("normals", nb::object(nb::none()));
         t.normals = normals.is_none() ? "" : nb::cast<std::string>(normals); t.components = a.get("components", t.components);
     });
+    bind<Ridges>(m, "Ridges", [](auto& t, auto& a) {
+        t.sigma=a.get("sigma",t.sigma); t.gamma=a.get("gamma",t.gamma);
+        t.beta1=a.get("beta1",t.beta1); t.beta2=a.get("beta2",t.beta2);
+    });
     bind<StructureTensor>(m, "StructureTensor", [](auto& t, auto& a) {
+        t.gradient = a.kw("gradient", t.gradient);
         t.on = a.get("on", t.on); t.channel = a.get("channel", t.channel); t.output = a.get("output", t.output);
         t.sigma = a.get("sigma", t.sigma); t.rho = a.get("rho", t.rho); t.truncate = a.get("truncate", t.truncate); t.scale = a.get("scale", t.scale);
         const auto derivative = a.get("derivative", std::string("pavel"));

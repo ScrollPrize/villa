@@ -111,6 +111,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | --- | --- | --- | --- |
 | Polyline queries (nearest, interpolate, plane and box hits) and voxel-set membership | `sampling.hpp`: `geometry::Curves`, `Voxels` | `geometry/` | `geometry.py`: `PolylineSet`, `VoxelSet`, `transform_points` |
 | Low-level aligned and projection sampling plans | `sampling.hpp`: `aligned::Plan`, `PointPlan`, `projection::Plan` | `aligned/`, `projection/` | through `SampleReader` |
+| Triangle slice labels, interpolated normals and surface frames (ordered DDA rasterization) | `sampling.hpp`: `geometry::MeshSlice`, `raster_slice` | `geometry/triangle_mesh.hpp`, `geometry/kernels.cu` | `geometry.rasterize_mesh_slice` |
 | Sheet normals from CT | `reader.hpp`: `sheetNormals`, `sheetNormalsCpu`; `cuda_reader.hpp`: `sheet_normal::sample_cuda` | `sheet_normal/`, `native_reader.cpp`, `symmetric_eigen.hpp` | `sheet_normal.py`: `sheet_normals`, `sample_sheet_normals` |
 | Shortest path over a 2D cost grid | `pathfinding.hpp`: `pathfinding::shortestPath` | `pathfinding/` | `shortest_path` |
 
@@ -127,7 +128,8 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | --- | --- | --- | --- |
 | Augmentation and processing pipelines with seeded replay, on CPU or CUDA ([catalog](#transforms)) | `transforms.hpp`: `transforms::Pipeline`, `Op`, `Sample`, `Plan`, `save_plan`, `load_plan` | `transforms/pipeline.hpp`, `transforms/ops/`, `transforms/cpu/`, `transforms/cuda/` | `vc_reader.transforms` |
 | Device buffers, streams, resident pipelines and batches | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap` |
-| PyTorch GPU transforms and prefetching; masked normalization | none: Python-only integration layer | `transforms/` | `torch.py`: `CudaLoader`, `normalize` |
+| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `normalize`, `structure_tensor` |
+| Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
 
 ### Shared primitives
 
@@ -1553,6 +1555,43 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 
 </details>
+
+### Image analysis and training losses
+
+`transforms.StructureTensor(sigma=1, rho=1.5)` returns Pavel structure tensor
+components in `zz, zy, zx, yy, yx, xx` order (2D: `yy, yx, xx`). Set `rho=0`
+to omit component smoothing. `vc_reader.torch.structure_tensor` accepts
+`(B,1,Y,X)` or `(B,1,Z,Y,X)` tensors and supplies first-order autograd on CPU
+and CUDA using native forward and backward kernels; MPS tensors stage through
+the CPU kernels and retain autograd. Double backward is not
+supported. For the central-plane 2D Pavel convention, pass `scale=3/8`.
+
+`transforms.DistanceTransform(implicit_background=True)` matches SciPy's
+all-one EDT convention: when no background feature exists, measure from
+`(-1,0,...)`. The default instead assigns zero when the other class is absent.
+
+For label ridge filtering, compose `GaussianBlur(sigma=2, boundary="reflect",
+truncate=4, full_width=False)`, `Normalize("minmax")`, and `Ridges()`.
+`Ridges` uses second-order one-sided differences at boundaries and requires
+at least three samples on each spatial axis.
+
+`geometry.rasterize_mesh_slice` intersects XYZ triangles with a Z plane,
+rounds DDA samples to even, and returns labels plus optional normals and frames.
+Later triangles overwrite labels; normal/frame sums retain triangle order on
+both CPU and CUDA. `Affine.load_transform_json` reads registration matrices;
+`geometry.transform_points(..., vectors=True, normalize=True)` maps unit
+vectors using a supplied linear transform.
+
+To validate these APIs against an existing local build (no installation):
+
+```bash
+AGENTS_AGENT_MODE=1 CCACHE_DISABLE=1 cmake --build vc_reader/build-native-cuda --target _transforms _reader _catalog -j 2
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" vesuvius/.venv/bin/python -m pytest vc_reader/tests/test_image_processing.py
+```
+
+Run these commands from the monorepo root, substituting your existing CMake
+build and Python environment. Tests cover forward values, gradients, EDT edge
+cases, mesh labels/frames, and the bundled PHerc0139 CT crop when available.
 
 ## Native C++ API
 

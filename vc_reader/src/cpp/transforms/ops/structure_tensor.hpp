@@ -16,6 +16,7 @@ struct StructureTensor {
     double sigma = 1, rho = 1.5, truncate = 3, scale = 1;
     Derivative derivative = Derivative::Pavel; Boundary boundary = Boundary::Zero;
     StructureField field = StructureField::Components; std::string components = "zyx", confidence;
+    std::string gradient; // optional component cotangent; returns the selected input channel gradient
     std::vector<double> at;
     double p = 1;
 };

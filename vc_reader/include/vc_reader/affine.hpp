@@ -58,7 +58,7 @@ struct Affine {
         for(double v:out.values)if(!std::isfinite(v))throw std::invalid_argument("affine inverse is not representable");
         return out;
     }
-    static Affine fromJson(const nlohmann::json& rows) {
+    static Affine fromJson(const nlohmann::json& rows, bool allowSingular=false) {
         if(!rows.is_array() || (rows.size()!=3 && rows.size()!=4)) throw std::invalid_argument("expected 3x4 or 4x4 affine");
         Affine a;
         for(size_t r=0;r<rows.size();++r) {
@@ -68,18 +68,23 @@ struct Affine {
                 a(r,c)=rows[r][c].get<double>();
             }
         }
-        (void)a.inverse();return a;
+        if (allowSingular) {
+            for(double v:a.values)if(!std::isfinite(v))throw std::invalid_argument("nonfinite affine");
+            if(a.values[12]!=0 || a.values[13]!=0 || a.values[14]!=0 || a.values[15]!=1)
+                throw std::invalid_argument("expected affine homogeneous row");
+        } else (void)a.inverse();
+        return a;
     }
     // A transform.json: {"transformation_matrix": 3x4 or 4x4 rows}.
-    static Affine fromTransformJson(const nlohmann::json& json) {
+    static Affine fromTransformJson(const nlohmann::json& json, bool allowSingular=false) {
         if(!json.is_object() || !json.contains("transformation_matrix"))
             throw std::invalid_argument("transform.json is missing transformation_matrix");
-        return fromJson(json.at("transformation_matrix"));
+        return fromJson(json.at("transformation_matrix"),allowSingular);
     }
-    static Affine loadTransformJson(const std::filesystem::path& path) {
+    static Affine loadTransformJson(const std::filesystem::path& path, bool allowSingular=false) {
         std::ifstream in(path);
         if(!in) throw std::invalid_argument("cannot open transform file: " + path.string());
-        try { return fromTransformJson(nlohmann::json::parse(in)); }
+        try { return fromTransformJson(nlohmann::json::parse(in),allowSingular); }
         catch(const std::exception& e) { throw std::invalid_argument(path.string() + ": " + e.what()); }
     }
     // Of the linear part.

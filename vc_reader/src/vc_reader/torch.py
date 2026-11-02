@@ -13,7 +13,7 @@ import torch
 
 from .cuda import DeviceArray
 
-__all__ = ["CudaLoader", "normalize"]
+__all__ = ["CudaLoader", "normalize", "structure_tensor"]
 
 
 def _main_process():
@@ -209,6 +209,55 @@ def normalize(image, mode="zscore", *, valid=None, eps=1e-6):
     if image.device.type == "cuda":
         return _batch(pipeline, batch, seeds=[0] * image.shape[0], device=image.device)["image"]
     return torch.stack([pipeline({k: v[i] for k, v in batch.items()}, seed=0)["image"] for i in range(image.shape[0])])
+
+
+@functools.lru_cache(maxsize=64)
+def _structure_pipeline(sigma, rho, scale, backend, backward):
+    from . import transforms as A
+    targets = {"image": A.Image(valid=None, refill=False)}
+    if backward:
+        targets["cotangent"] = A.ScalarField()
+    return A.Pipeline([A.StructureTensor(sigma=sigma, rho=rho, scale=scale,
+                       gradient="cotangent" if backward else "", output="result")],
+                      targets=targets, backend=backend)
+
+
+def _structure_run(image, sigma, rho, scale, cotangent=None):
+    pipeline = _structure_pipeline(sigma, rho, scale, "cuda" if image.is_cuda else "cpu", cotangent is not None)
+    batch = {"image": image.detach() if image.is_cuda else image.detach().cpu()}
+    if cotangent is not None:
+        batch["cotangent"] = cotangent.detach() if image.is_cuda else cotangent.detach().cpu()
+    if image.is_cuda:
+        return _batch(pipeline, batch, seeds=[0] * len(image), device=image.device)["result"]
+    return torch.stack([pipeline({k: v[i] for k, v in batch.items()}, seed=0)["result"] for i in range(len(image))]).to(image.device)
+
+
+class _StructureTensor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, image, sigma, rho, scale):
+        ctx.save_for_backward(image)
+        ctx.options = sigma, rho, scale
+        return _structure_run(image, sigma, rho, scale)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, cotangent):
+        image, = ctx.saved_tensors
+        return _structure_run(image, *ctx.options, cotangent=cotangent), None, None, None
+
+
+def structure_tensor(image, *, sigma=1.0, rho=1.5, scale=1.0):
+    """Pavel structure components of (B,1,Y,X) or (B,1,Z,Y,X), with first-order autograd.
+
+    Native CPU/CUDA kernels (CPU staging for MPS) use zero boundaries and return yy,yx,xx or
+    zz,zy,zx,yy,yx,xx. sigma smooths input and rho smooths components; zero
+    disables either smoothing. Input/output preserve float32 or float64.
+    """
+    if image.ndim not in (4, 5) or image.shape[1] != 1 or not all(image.shape):
+        raise ValueError("structure_tensor requires nonempty (B,1,Y,X) or (B,1,Z,Y,X)")
+    if image.dtype not in (torch.float32, torch.float64) or image.device.type not in ("cpu", "cuda", "mps"):
+        raise ValueError("structure_tensor requires float32/float64 on CPU, CUDA or MPS")
+    return _StructureTensor.apply(image, float(sigma), float(rho), float(scale))
 
 
 class CudaLoader:

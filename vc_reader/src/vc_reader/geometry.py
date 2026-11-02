@@ -255,11 +255,12 @@ class PolylineSet(_Resident):
         return result
 
 
-def transform_points(points, matrices, *, vectors=False, out=None):
+def transform_points(points, matrices, *, vectors=False, normalize=False, out=None):
     """Apply one (3,4) affine, or (Q,3,4) affines, to (Q,3) float32 points.
 
     Uses column-vector convention p'=R@p+t. vectors=True omits translation;
-    it does not normalize or apply the inverse transpose for surface normals.
+    normalize=True produces unit vectors (zero stays zero). For normals, pass
+    Affine.normal_transform().matrix and vectors=True, normalize=True.
     Reuses the CPU/CUDA surface transform arithmetic. Inputs share a device.
     """
     device = _device(points)
@@ -270,8 +271,46 @@ def transform_points(points, matrices, *, vectors=False, out=None):
     if matrices.ndim != 3 or matrices.shape[1:] != (3,4) or matrices.shape[0] not in (1,p.shape[0]):
         raise ValueError('matrices must have shape (3,4), (1,3,4), or (Q,3,4)')
     result, output = _output(out, p.shape, np.float32, device)
-    _reader._geometry_transform(_array_view(p), _array_view(matrices), bool(vectors), output)
+    _reader._geometry_transform(_array_view(p), _array_view(matrices), bool(vectors), output, bool(normalize))
     return result
+
+
+def rasterize_mesh_slice(vertices, triangles, labels, z, shape, *, vertex_normals=None, face_normals=None,
+                         vertex_normal_flags=None, vertex_tangents=None, vertex_bitangents=None,
+                         face_tangents=None, face_bitangents=None, vertex_tangent_flags=None):
+    """Intersect XYZ triangles with z and DDA-rasterize a (height,width) uint16 label image.
+
+    Later triangles overwrite labels. Optional normals and frames interpolate
+    vertex attributes (or face attributes where flags are false), accumulate in
+    triangle order, and normalize. Frames store tangent, bitangent, normal rows.
+    CPU/CUDA arrays share one device. Returns (labels, normals, frames), with
+    empty arrays for unrequested outputs. Coordinates round ties to even.
+    """
+    device = _device(vertices)
+    vertices = _input(vertices, np.float32, device)
+    triangles = _input(triangles, np.int32, device)
+    labels = _input(labels, np.uint16, device)
+    shape = tuple(operator.index(n) for n in shape)
+    if len(shape) != 2 or any(n < 1 for n in shape):
+        raise ValueError("slice shape must be positive (height,width)")
+    attributes = []
+    have_normals = vertex_normals is not None
+    have_frames = vertex_tangents is not None
+    if have_frames and not have_normals:
+        raise ValueError("surface frames require normals")
+    if have_normals:
+        attributes = [_input(vertex_normals, np.float32, device), _input(face_normals, np.float32, device),
+                      _input(vertex_normal_flags, np.bool_, device)]
+    if have_frames:
+        attributes += [_input(v, np.float32, device) for v in
+                       (vertex_tangents, vertex_bitangents, face_tangents, face_bitangents)]
+        attributes.append(_input(vertex_tangent_flags, np.bool_, device))
+    output = _empty(shape, np.uint16, device)
+    normals = _empty((*shape, 3) if have_normals else (0, 0, 0), np.float32, device)
+    frames = _empty((*shape, 3, 3) if have_frames else (0, 0, 0, 0), np.float32, device)
+    _reader._geometry_raster_slice(_array_view(vertices), _array_view(triangles), _array_view(labels), float(z),
+                                  [_array_view(v) for v in attributes], _array_view(output), _array_view(normals), _array_view(frames))
+    return output, normals, frames
 
 
 class VoxelSet(_Resident):

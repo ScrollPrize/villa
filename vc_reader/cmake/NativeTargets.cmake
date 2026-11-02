@@ -115,6 +115,7 @@ if(VC_READER_ENABLE_CUDA)
         src/cpp/transforms/cuda/smear.cu
         src/cpp/transforms/cuda/distance_transform.cu
         src/cpp/transforms/cuda/structure_tensor.cu
+        src/cpp/transforms/cuda/ridges.cu
         src/cpp/transforms/cuda/statistics.cu
         src/cpp/transforms/cuda/thick_slice.cu
         src/cpp/transforms/cuda/transpose.cu

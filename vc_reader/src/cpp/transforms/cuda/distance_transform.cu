@@ -26,9 +26,11 @@ __device__ void edt_lines(KernelIndex vcr_launch, double* f, Layout g, int axis,
 struct edt_lines_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { edt_lines(index,args...); }
 };
-__device__ void edt_finish(KernelIndex vcr_launch, const double* inside, const double* outside, float* out, std::size_t n, int mode, const int* any) {
+__device__ void edt_finish(KernelIndex vcr_launch, const double* inside, const double* outside, float* out, std::size_t n, int mode, const int* any, Layout g, bool implicit_background) {
     EACH_INDEX(n) {
-        const double in = any[0] ? sqrt(inside[i]) : 0., out_ = any[1] ? sqrt(outside[i]) : 0.;
+        double absent=0;
+        if(implicit_background){for(int a=0;a<g.dim;++a){const double x=double(g.coord(i,a))+(a==0?1:0);absent+=x*x;}absent=sqrt(absent);}
+        const double in = any[0] ? sqrt(inside[i]) : absent, out_ = any[1] ? sqrt(outside[i]) : absent;
         out[i] = float(mode == 0 ? out_-in : mode == 1 ? in : out_);
     }
 }
@@ -70,7 +72,7 @@ void apply_cuda(const DistanceTransform& t, Sample& s, const Parameters&, Sessio
         }
         Shape shape{1}; shape.insert(shape.end(),grid.shape.begin(),grid.shape.end());
         DeviceArray result(shape,'f',4);
-        launch(blocks(n),256,0,vcr::device::stream(), edt_finish_launch{}, inside.ptr,outside.ptr,result.view<float>().ptr,n,int(t.mode),any.ptr);
+        launch(blocks(n),256,0,vcr::device::stream(), edt_finish_launch{}, inside.ptr,outside.ptr,result.view<float>().ptr,n,int(t.mode),any.ptr,g,t.implicit_background);
         check(cudaGetLastError());
         if (!t.normals.empty()) {
             std::vector<Buffer<float>> gradient; std::vector<float*> pointers; Buffer<float> tmp(n);

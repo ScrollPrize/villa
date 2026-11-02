@@ -16,6 +16,7 @@
 #include "ops/spatial.hpp"
 #include "ops/stripe_masking.hpp"
 #include "ops/structure_tensor.hpp"
+#include "ops/ridges.hpp"
 
 namespace vcr::transforms {
 namespace volume_detail {
@@ -52,7 +53,14 @@ inline void check(const OrientedBlur& t) {
             std::any_of(t.axis.begin(), t.axis.end(), [](double v) { return v != 0; }), "axis must be a finite nonzero (y, x) or (z, y, x) vector");
 }
 inline void check(const DistanceTransform& t) { require(t.suffix != t.normals && !t.suffix.empty(), "distance and normal suffixes must be distinct and nonempty"); }
+inline void check(const Ridges& t) {
+    require(std::isfinite(t.sigma) && t.sigma >= 0 && std::isfinite(t.gamma) && t.gamma > 0 &&
+            std::isfinite(t.beta1) && t.beta1 > 0 && std::isfinite(t.beta2) && t.beta2 > 0,
+            "Ridges needs finite nonnegative sigma and positive gamma/beta");
+}
 inline void check(const StructureTensor& t) {
+    require(t.gradient.empty() || (t.boundary == Boundary::Zero && t.field == StructureField::Components && t.at.empty() && t.confidence.empty()),
+            "structure tensor backward requires zero boundaries and component output");
     require(std::isfinite(t.sigma) && t.sigma >= 0 && t.sigma < 1000 && std::isfinite(t.rho) && t.rho >= 0 && t.rho < 1000, "sigma and rho must be in [0, 1000)");
     require(t.derivative == Derivative::Pavel || t.sigma > 0, "gaussian derivatives need sigma > 0");
     require(std::isfinite(t.truncate) && t.truncate > 0 && std::isfinite(t.scale), "truncate must be positive and scale finite");

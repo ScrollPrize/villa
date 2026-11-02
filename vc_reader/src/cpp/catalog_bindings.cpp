@@ -419,6 +419,9 @@ NB_MODULE(_catalog, m) {
             return VolumeTransform{Affine::fromJson(toJson(rows)), derivation.value_or("")};
         }, nb::arg("rows"), nb::arg("derivation_path") = nb::none())
         .def_static("identity", [] { return VolumeTransform{}; })
+        .def_static("load_transform_json", [](const std::string& path, bool allowSingular) {
+            return VolumeTransform{Affine::loadTransformJson(path, allowSingular), {}};
+        }, nb::arg("path"), nb::arg("allow_singular")=false)
         .def_static("scale", [](double s) { return VolumeTransform{Affine::scale(s), {}}; }, "Uniform scale about the origin. Pyramid levels use block_reduced.")
         .def_static("block_reduced", [](double s) { return VolumeTransform{Affine::blockReduced(s), {}}; },
                     "Voxels of a pyramid level s times coarser than a reference, block-reduced from it: voxel i is centred at s * i + (s - 1) / 2 reference voxels. "

@@ -4,6 +4,7 @@
 #include "cpu/palette.hpp"
 #include "cpu/distance_transform.hpp"
 #include "cpu/structure_tensor.hpp"
+#include "cpu/ridges.hpp"
 #include "cpu/bias_field.hpp"
 #include "cpu/plasma_brightness_contrast.hpp"
 #include "cpu/plasma_shadow.hpp"
@@ -43,7 +44,7 @@ using Op = std::variant<
     SliceIllumination, Smear, Flip, Rotate90, Transpose, CropPad, Affine, Elastic,
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
-    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor, BiasField, PlasmaBrightnessContrast, PlasmaShadow, Illumination, Vignetting, RandomToneCurve, MultiplicativeNoise, ShotNoise, AdditiveNoise, SaltAndPepper, MotionBlur, Defocus, ZoomBlur, Equalize, CLAHE, HistogramMatching, PixelDistributionAdaptation, FDA, UnsharpMask, GibbsRinging, RingingOvershoot, ForegroundCrop, ChannelMisalignment, GridDropout, StripeMasking, ForegroundDropout, ObjectDropout>;
+    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor, Ridges, BiasField, PlasmaBrightnessContrast, PlasmaShadow, Illumination, Vignetting, RandomToneCurve, MultiplicativeNoise, ShotNoise, AdditiveNoise, SaltAndPepper, MotionBlur, Defocus, ZoomBlur, Equalize, CLAHE, HistogramMatching, PixelDistributionAdaptation, FDA, UnsharpMask, GibbsRinging, RingingOvershoot, ForegroundCrop, ChannelMisalignment, GridDropout, StripeMasking, ForegroundDropout, ObjectDropout>;
 using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {

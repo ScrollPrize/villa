@@ -1,5 +1,6 @@
 #pragma once
 #include "common.hpp"
+#include "triangle_mesh.hpp"
 #include <algorithm>
 #include <array>
 #include <numeric>
@@ -106,7 +107,7 @@ void interpolate_cuda(CurvesView,const std::int64_t*,const float*,float*,bool*,s
 void gather_cuda(CurvesView,const std::int64_t*,bool,float*,float*,std::int64_t*,bool*,std::size_t);
 void intersect_cuda(CurvesView,const std::int64_t*,const float*,const float*,int,float*,float*,std::int64_t*,bool*,std::size_t);
 void closest_cuda(CurvesView,const float*,const std::int64_t*,float,float*,float*,float*,std::int64_t*,std::int64_t*,bool*,std::size_t);
-void transform_cuda(const float*,const float*,std::size_t,bool,float*,std::size_t);
+void transform_cuda(const float*,const float*,std::size_t,bool,bool,float*,std::size_t);
 void boxes_cuda(CurvesView,const float*,const float*,const std::int64_t*,int,std::int64_t*,std::int64_t*,bool*,std::size_t);
 CudaVoxels voxelize_cuda(const float*,const std::int64_t*,std::size_t,VoxelGrid,int);
 void contains_cuda(const CudaVoxels&,const float*,const std::int64_t*,bool*,std::size_t);
@@ -162,11 +163,29 @@ inline void boxes_batch(const CurvesView& view,int id,const float* lower,const f
         VCR_GEOMETRY_CUDA(boxes_cuda(view,lower,upper,ids,capacity,out,counts,valid,n);)
     }});
 }
+#ifdef VC_READER_CUDA
+void raster_slice_cuda(const MeshSlice&, double, SliceOutput);
+#endif
+inline void raster_slice(int device_id, const MeshSlice& mesh, double z, SliceOutput output) {
+    if(output.width<1 || output.height<1 || !std::isfinite(z))throw std::invalid_argument("invalid slice shape or coordinate");
+    on_device(device_id,[&] {
+        if(device_id>=0){VCR_GEOMETRY_CUDA(raster_slice_cuda(mesh,z,output);) return;}
+        const std::size_t n=std::size_t(output.width)*output.height;
+        std::fill_n(output.labels,n,0);
+        std::vector<float> normals(output.normals?n*3:0),tangents(output.frames?n*3:0),bitangents(output.frames?n*3:0);
+        std::vector<std::uint32_t> counts(output.normals?n:0);
+        output.normal_sums=normals.data();output.tangent_sums=tangents.data();output.bitangent_sums=bitangents.data();output.counts=counts.data();
+        if(output.normals)std::fill_n(output.normals,n*3,0.f);
+        if(output.frames)std::fill_n(output.frames,n*9,0.f);
+        for(std::size_t i=0;i<mesh.triangle_count;++i)if(raster_triangle(mesh,i,z,output))throw std::invalid_argument("invalid mesh index or vertex");
+        for(std::size_t i=0;i<n;++i)if(finish_slice_pixel(output,i))throw std::invalid_argument("surface frame magnitude collapsed during rasterization");
+    });
+}
 // matrices: `count` row-major 3x4 transforms, one or one per point. Vectors skip translation.
-inline void transform_batch(int id,const float* points,const float* matrices,std::size_t count,bool vectors,float* out,std::size_t n){
+inline void transform_batch(int id,const float* points,const float* matrices,std::size_t count,bool vectors,float* out,std::size_t n,bool normalize=false){
     if(count!=1&&count!=n)throw std::invalid_argument("provide one transform or one per point");
-    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i){auto m=matrices+(count==1?0:12*i);auto v=vector(points+3*i);store(out+3*i,vectors?linear(m,v):transform(m,v));}}else{
-        VCR_GEOMETRY_CUDA(transform_cuda(points,matrices,count,vectors,out,n);)
+    on_device(id,[&]{if(id<0){for(std::size_t i=0;i<n;++i){auto m=matrices+(count==1?0:12*i);auto v=vector(points+3*i);auto q=vectors?linear(m,v):transform(m,v);if(normalize){float len=sqrtf(dot(q,q));q=len>0?q*(1/len):V{0,0,0};}store(out+3*i,q);}}else{
+        VCR_GEOMETRY_CUDA(transform_cuda(points,matrices,count,vectors,normalize,out,n);)
     }});
 }
 inline VoxelGrid voxel_grid(std::array<std::int64_t,3> shape,std::int64_t batches){

@@ -88,11 +88,35 @@ inline void bind(nb::module_& m){
         boxes_batch(b.view,b.device,static_cast<const float*>(lower.data()),static_cast<const float*>(upper.data()),ids.size()?static_cast<const std::int64_t*>(ids.data()):nullptr,capacity,
                     static_cast<std::int64_t*>(out.data()),static_cast<std::int64_t*>(counts.data()),static_cast<bool*>(valid.data()),n);
     });
-    m.def("_geometry_transform",[](Array points,Array matrices,bool vectors,Array out){
+    m.def("_geometry_raster_slice",[](Array vertices,Array triangles,Array labels,double z,std::vector<Array> attributes,Array output,Array normals,Array frames) {
+        if(vertices.ndim()!=2 || triangles.ndim()!=2)throw nb::value_error("mesh vertices and triangles must be matrices");
+        const int id=array_device(vertices);const auto n=vertices.shape(0),f=triangles.shape(0);
+        check(vertices,nb::dtype<float>(),{n,3},id);check(triangles,nb::dtype<std::int32_t>(),{f,3},id);check(labels,nb::dtype<std::uint16_t>(),{f},id);
+        if(output.ndim()!=2 || output.shape(0)>INT32_MAX || output.shape(1)>INT32_MAX)throw nb::value_error("invalid slice output shape");
+        const auto h=output.shape(0),w=output.shape(1);check(output,nb::dtype<std::uint16_t>(),{h,w},id);
+        MeshSlice mesh;mesh.vertices=static_cast<const float*>(vertices.data());mesh.triangles=static_cast<const std::int32_t*>(triangles.data());mesh.labels=static_cast<const std::uint16_t*>(labels.data());mesh.vertex_count=n;mesh.triangle_count=f;
+        SliceOutput out;out.width=int(w);out.height=int(h);out.labels=static_cast<std::uint16_t*>(output.data());
+        if(!attributes.empty()) {
+            if(attributes.size()!=3 && attributes.size()!=8)throw nb::value_error("expected normal or full frame attributes");
+            check(attributes[0],nb::dtype<float>(),{n,3},id);check(attributes[1],nb::dtype<float>(),{f,3},id);check(attributes[2],nb::dtype<bool>(),{f},id);
+            mesh.vertex_normals=static_cast<const float*>(attributes[0].data());mesh.face_normals=static_cast<const float*>(attributes[1].data());mesh.vertex_normal_flags=static_cast<const bool*>(attributes[2].data());
+            check(normals,nb::dtype<float>(),{h,w,3},id);out.normals=static_cast<float*>(normals.data());
+            if(attributes.size()==8) {
+                for(int j=3;j<7;++j)check(attributes[j],nb::dtype<float>(),{j<5?n:f,3},id);
+                check(attributes[7],nb::dtype<bool>(),{f},id);
+                mesh.vertex_tangents=static_cast<const float*>(attributes[3].data());mesh.vertex_bitangents=static_cast<const float*>(attributes[4].data());mesh.face_tangents=static_cast<const float*>(attributes[5].data());mesh.face_bitangents=static_cast<const float*>(attributes[6].data());mesh.vertex_tangent_flags=static_cast<const bool*>(attributes[7].data());
+                check(frames,nb::dtype<float>(),{h,w,3,3},id);out.frames=static_cast<float*>(frames.data());
+            }
+        }
+        disjoint({vertices,triangles,labels},{output,normals,frames});
+        for(auto a:attributes)disjoint({a},{output,normals,frames});
+        nb::gil_scoped_release release;raster_slice(id,mesh,z,out);
+    });
+    m.def("_geometry_transform",[](Array points,Array matrices,bool vectors,Array out,bool normalize){
         int id=array_device(points);auto n=points.shape(0),count=matrices.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(matrices,nb::dtype<float>(),{count,3,4},id);check(out,nb::dtype<float>(),{n,3},id);
         disjoint({points,matrices},{out});
         nb::gil_scoped_release release;
-        transform_batch(id,static_cast<const float*>(points.data()),static_cast<const float*>(matrices.data()),count,vectors,static_cast<float*>(out.data()),n);
+        transform_batch(id,static_cast<const float*>(points.data()),static_cast<const float*>(matrices.data()),count,vectors,static_cast<float*>(out.data()),n,normalize);
     });
     m.def("_geometry_voxelize",[](Array points,Array ids,std::array<std::int64_t,3> shape,std::int64_t batches)->nb::object{
         int id=array_device(points);auto n=points.shape(0);check(points,nb::dtype<float>(),{n,3},id);check(ids,nb::dtype<std::int64_t>(),{ids.size()?n:0},id);auto g=voxel_grid(shape,batches);

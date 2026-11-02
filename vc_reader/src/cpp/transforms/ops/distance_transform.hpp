@@ -9,6 +9,7 @@ struct DistanceTransform {
     std::vector<std::string> on; std::size_t channel = 0; double threshold = 0;
     DistanceMode mode = DistanceMode::Signed; std::string suffix = "_sdt";
     std::string normals; std::string components = "zyx";  // normals: field suffix, empty for none
+    bool implicit_background = false; // no feature: distance to (-1,0,...) instead of zero
     double p = 1;
 };
 } // namespace vcr::transforms

@@ -50,10 +50,17 @@ inline void squared_edt(std::vector<double>& f, const Grid& g) {
 }
 // Distances to the nearest voxel of the other class. A class absent from the
 // grid contributes zero (SciPy's result is undefined there).
-inline std::vector<float> distance(const std::vector<std::uint8_t>& foreground, const Grid& g, bool inside) {
+inline std::vector<float> distance(const std::vector<std::uint8_t>& foreground, const Grid& g, bool inside, bool implicit_background = false) {
     std::vector<double> f(g.size); bool any = false;
     for (std::size_t i = 0; i < g.size; ++i) { const bool feature = bool(foreground[i]) != inside; f[i] = feature ? 0 : 1e300; any |= feature; }
-    if (!any) return std::vector<float>(g.size, 0.f);
+    if (!any) {
+        std::vector<float> result(g.size, 0.f);
+        if (implicit_background) for (std::size_t i=0;i<g.size;++i) {
+            double sum=0;for(std::size_t a=0;a<g.shape.size();++a){const double x=double(g.coord(i,a))+(a==0?1:0);sum+=x*x;}
+            result[i]=float(std::sqrt(sum));
+        }
+        return result;
+    }
     squared_edt(f, g);
     std::vector<float> result(g.size);
     for (std::size_t i = 0; i < g.size; ++i) result[i] = float(std::sqrt(f[i]));
@@ -72,8 +79,8 @@ inline void apply(const DistanceTransform& t, Sample& s, const Parameters&) {
         std::vector<std::uint8_t> foreground(g.size);
         for (std::size_t i = 0; i < g.size; ++i) foreground[i] = values[i] > t.threshold;
         std::vector<float> result(g.size, 0.f);
-        if (t.mode != DistanceMode::Inside) result = distance(foreground, g, false);
-        if (t.mode != DistanceMode::Outside) { auto inside = distance(foreground, g, true); for (std::size_t i = 0; i < g.size; ++i) result[i] -= inside[i]; }
+        if (t.mode != DistanceMode::Inside) result = distance(foreground, g, false, t.implicit_background);
+        if (t.mode != DistanceMode::Outside) { auto inside = distance(foreground, g, true, t.implicit_background); for (std::size_t i = 0; i < g.size; ++i) result[i] -= inside[i]; }
         if (t.mode == DistanceMode::Inside) for (auto& x : result) x = -x;
         Shape shape{1}; shape.insert(shape.end(), g.shape.begin(), g.shape.end());
         Field out{Array(shape), derived(Role::Scalar), name}; out.array.channel(0, result);

@@ -96,20 +96,21 @@ def ToPseudo2D(*, p: float = 1) -> _Config: ...
 def FromPseudo2D(*, p: float = 1) -> _Config: ...
 def DistanceTransform(on: str | Sequence[str] | None = None, *, channel: int = 0, threshold: float = 0,
                       mode: str = "signed", suffix: str = "_sdt", normals: str | None = None,
-                      components: str = "zyx", p: float = 1) -> _Config:
+                      components: str = "zyx", implicit_background: bool = False, p: float = 1) -> _Config:
     """Exact Euclidean distance of one label channel (foreground: value > threshold).
 
     Creates ``name + suffix`` (ScalarField): signed = outside - inside distance
     (vesuvius aux SDT), inside, or outside. normals: also create ``name + normals``,
     a NormalField of the Scharr gradient of the signed distance divided by
     max(|gradient|, 1e-6) (vesuvius aux surface normals; use components="xyz").
-    A class absent from the crop contributes zero distance.
+    A class absent from the crop contributes zero distance, or distance to
+    (-1,0,...) with implicit_background=True (SciPy EDT convention).
     """
     ...
 def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None = None, sigma: float = 1,
                     rho: float = 1.5, derivative: str = "pavel", boundary: str | None = None, truncate: float = 3,
                     scale: float = 1, field: str = "components", components: str = "zyx",
-                    confidence: str | None = None, at: Sequence[float] | None = None, p: float = 1) -> _Config:
+                    confidence: str | None = None, at: Sequence[float] | None = None, gradient: str = "", p: float = 1) -> _Config:
     """Structure tensor of one channel, created as ``output`` (default ``on + "_st"``).
 
     derivative="pavel" (boundary "zero"): vesuvius StructureTensorComputer;
@@ -120,8 +121,20 @@ def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None =
     optionally a ``confidence`` ScalarField with the relative eigengap.
     at=(z, y, x): one (D, D) tensor (a Vectors target) with Gaussian rho weights
     normalized over the whole grid, as tracers' ct_structure_tensor.
+    gradient names component cotangents for the selected-channel backward pass;
+    it requires zero boundaries, field="components", and no at/confidence.
     """
     ...
+def Ridges(sigma: float = 6, gamma: float = 1.5, beta1: float = .5, beta2: float = .5, *,
+           on: str | Sequence[str] | None = None, channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
+    """Hessian ridge response after smoothing/normalization. Uses second-order boundary differences.
+
+    Compose with GaussianBlur(sigma=2, boundary="reflect", truncate=4, full_width=False)
+    and Normalize("minmax") for the label-refinement filter. beta1 is the 2D blob
+    parameter or 3D planar parameter; beta2 is the 3D blob parameter.
+    """
+    ...
+
 def MedialSurface(on: str | Sequence[str] | None = None, suffix: str = "_skel", tube: bool = True, open: bool = False, close: bool = True, ignore: Mapping[str, float] = ..., *, p: float = 1) -> _Config: ...
 
 class Plan:
