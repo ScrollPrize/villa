@@ -102,8 +102,15 @@ inline void bind(nb::module_& m) {
         for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); }
         return grids;
     };
+    nb::class_<Pool>(m,"CudaPool","A device brick cache that several CUDA readers share (one budget, one LRU order).")
+        .def("__init__",[](Pool* self,std::size_t budget,int device) { new (self) Pool(budget,device); },"budget"_a,"device"_a=0)
+        .def_prop_ro("budget",&Pool::budget)
+        .def_prop_ro("device",&Pool::device)
+        .def_prop_ro("slot_bytes",&Pool::slot_bytes)
+        .def_prop_ro("resident_bytes",&Pool::resident_bytes);
     nb::class_<Reader>(m,"CudaReader")
         .def(nb::init<Array&,std::size_t,int>(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::shared_ptr<Pool>>(),nb::keep_alive<1,2>())
         .def("clear",&Reader::clear,nb::call_guard<nb::gil_scoped_release>())
         .def("stats",&Reader::stats,nb::call_guard<nb::gil_scoped_release>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,

@@ -250,25 +250,25 @@ int main(void)
         CHECK(vcr_volume_open(root, &options, &gpu) == VCR_OK);
         vcr_level_info_init(&info);
         CHECK(gpu && vcr_volume_level_info(gpu, 0, &info) == VCR_OK && info.gpu);
-        {
-            /* One budget split over the levels: level 1 (512 B) whole, level 0 the rest. */
-            vcr_level_info coarse;
-            vcr_level_info_init(&coarse);
-            CHECK(vcr_volume_level_info(gpu, 1, &coarse) == VCR_OK && coarse.gpu_cache_bytes == 512);
-            CHECK(info.gpu_cache_bytes == 4096);  /* all of level 0 fits in what is left */
-            CHECK(info.gpu_cache_bytes + coarse.gpu_cache_bytes <= options.gpu_cache_bytes);
-        }
         vcr_volume_release(gpu);
         gpu = NULL;
-        options.gpu_cache_bytes = 2048;  /* less than both levels need: shares stay within it */
+        /* The levels share one brick cache: two 512-byte bricks for both levels. The
+         * preview's level-1 brick makes room for the two level-0 bricks the frame needs. */
+        options.gpu_cache_bytes = 1024;
         CHECK(vcr_volume_open(root, &options, &gpu) == VCR_OK);
-        {
-            vcr_level_info fine, coarse;
-            vcr_level_info_init(&fine);
-            vcr_level_info_init(&coarse);
-            CHECK(vcr_volume_level_info(gpu, 0, &fine) == VCR_OK && vcr_volume_level_info(gpu, 1, &coarse) == VCR_OK);
-            CHECK(coarse.gpu_cache_bytes == 512 && fine.gpu_cache_bytes == 1536);
-        }
+        request.volume = gpu;
+        request.offsets = NULL, request.offset_count = 0, request.composite = NULL;
+        vcr_pending_clear(pending);
+        CHECK(vcr_sample_cached(&frame, &request, pending, &result) == VCR_OK && !result.gpu_failed);
+        CHECK(vcr_pending_load(pending, NULL, NULL) == VCR_OK);
+        CHECK(vcr_volume_gpu_resident_bytes(gpu) > 0 && vcr_volume_gpu_resident_bytes(gpu) <= 1024);
+        vcr_level_info_init(&info);
+        CHECK(vcr_volume_level_info(gpu, 0, &info) == VCR_OK && info.gpu);  /* no GPU failure fell back */
+        vcr_pending_clear(pending);
+        CHECK(vcr_sample_cached(&frame, &request, pending, &result) == VCR_OK && !result.gpu_failed);
+        CHECK(vcr_pending_empty(pending));
+        for (q = 0; q < 32; ++q)
+            CHECK(levels[q] == 0 && fabsf(values[q] - cpu[q]) <= 1e-3f);
         vcr_volume_release(gpu);
         gpu = NULL;
         options.gpu_cache_bytes = 64 << 20;

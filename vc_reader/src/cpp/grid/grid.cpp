@@ -553,7 +553,7 @@ namespace vcr::grid::cuda {
 
 namespace {
 
-// f() with every reader's resident bricks pinned (locks taken in address order).
+// f() with every reader's resident bricks pinned (locks taken in lock order).
 template <class F>
 void withResident(const std::vector<reader_cuda::Reader*>& readers, std::size_t i, std::vector<reader_cuda::Source>& sources,
                   const std::vector<reader_cuda::Reader*>& order, F&& f)
@@ -666,8 +666,11 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     // Blocking requests note the first level's lacking bricks, one bit each.
     std::size_t words = 0;
     device::Storage lacking;
+    // Readers sharing a pool share its (recursive) lock: order by lock, then reader.
     std::vector<reader_cuda::Reader*> order = readers;
-    std::sort(order.begin(), order.end());
+    std::sort(order.begin(), order.end(), [](const reader_cuda::Reader* a, const reader_cuda::Reader* b) {
+        return std::pair(a->lock_id(), static_cast<const void*>(a)) < std::pair(b->lock_id(), static_cast<const void*>(b));
+    });
     order.erase(std::unique(order.begin(), order.end()), order.end());
     std::vector<reader_cuda::Source> sources(readers.size());
     const auto pass = [&] {

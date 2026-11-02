@@ -10,7 +10,7 @@
 namespace vcr {
 class Array;
 struct ElementType;
-namespace reader_cuda { class Reader; }
+namespace reader_cuda { class Reader; class Pool; }
 namespace zarr { struct OpenedArray; }
 }
 
@@ -20,6 +20,14 @@ namespace vc::cuda {
 // machine has no CUDA device, or `array` is not 3-D uint8.
 std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
                                                      std::size_t cacheBytes);
+// One device brick cache of `cacheBytes` for several readers (e.g. every level of the
+// volumes a viewer opens); null when the build or machine has no CUDA device.
+std::shared_ptr<vcr::reader_cuda::Pool> makePool(std::size_t cacheBytes);
+// A reader of `array` whose bricks live in `pool`, sharing its budget and LRU order; null
+// as makeReader, or when pool is null. Arrays whose bricks are larger than the pool's
+// slots (odd chunk edges over 32) get a cache of their own of the pool's budget.
+std::shared_ptr<vcr::reader_cuda::Reader> makeReader(vcr::Array& array, const vcr::ElementType& type,
+                                                     const std::shared_ptr<vcr::reader_cuda::Pool>& pool);
 
 // Trilinear / nearest values at zyx index points, on `reader` when given. A GPU failure
 // frees the reader's bricks, logs once per process and samples on the CPU. Null samples on
@@ -43,7 +51,8 @@ void applyToolOptions(int& argc, char** argv);
 // The option lines for a tool's --help.
 const char* toolOptionsHelp();
 
-// The tool's reader of `level`, made on first use and kept until the process exits; null when --cuda is off or the level is not 3-D uint8 (noted in the log).
+// The tool's reader of `level`, made on first use and kept until the process exits; every
+// level's reader shares one device cache of the --cuda-cache-gb budget; null when --cuda is off or the level is not 3-D uint8 (noted in the log).
 vcr::reader_cuda::Reader* toolReader(const vcr::zarr::OpenedArray& level);
 // The reader toolReader made for `array`, or null.
 vcr::reader_cuda::Reader* toolReaderOf(const vcr::Array& array);

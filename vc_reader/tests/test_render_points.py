@@ -108,11 +108,16 @@ def test_grid_views_on_the_gpu_match_the_cpu(tmp_path):
     group = _pyramid(tmp_path)
     plane = ((2.5, 3.25, 4.5), (1, 0, 0), (0, 1, 0), (0, 0, 1), 8, 4)
     readers = [group.level(i) for i in range(2)]
-    on_gpu = [r.grid_level(cuda=r.cuda(cache_bytes=64 << 20)) for r in readers]
+    # One shared cache of two bricks: the preview's level-1 brick makes room for the
+    # two level-0 bricks the frame needs.
+    pool = grid.CudaPool(2 * 32 ** 3)
+    cudas = [r.cuda(pool=pool) for r in readers]
+    on_gpu = [r.grid_level(cuda=c) for r, c in zip(readers, cudas)]
     assert on_gpu[0].gpu
     pending = grid.Pending()
     grid.sample_grid_cached(on_gpu, plane=plane, pending=pending)
     assert grid.load(pending) == ""
+    assert 0 < pool.resident_bytes <= pool.cache_bytes
     gpu = grid.sample_grid_cached(on_gpu, plane=plane)
     cpu = grid.sample_grid([r.grid_level() for r in readers], plane=plane)
     assert gpu.cuda_failure == "" and (gpu.level == 0).all()

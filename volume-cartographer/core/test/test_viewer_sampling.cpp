@@ -25,6 +25,9 @@
 #include <chrono>
 #include <vc_reader/native/cuda_available.hpp>
 #include "vc/core/util/CudaSampling.hpp"
+#ifdef VC_READER_CUDA
+#include <vc_reader/cuda_reader.hpp>
+#endif
 
 #include <cmath>
 #include <vector>
@@ -439,6 +442,10 @@ TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads l
         const auto cpuLevels = openLevels(cpu, *f.volume);
         const auto gpuLevels = openLevels(gpu, *f.volume);
         REQUIRE(gpuLevels->levels[0].cuda);
+        // Every level's bricks live in OpenedVolumes' one device cache.
+        REQUIRE(gpuLevels->levels[1].cuda);
+        CHECK(gpuLevels->levels[0].cuda->pool() == gpuLevels->levels[1].cuda->pool());
+        CHECK(gpuLevels->levels[0].cuda->pool()->budget() == std::size_t(64 << 20));
         const auto geometry = planeAt(5.25f);
         const auto cpuWhat = sampleOf(cpuLevels, 0, 1, sampling, {0.0f, 1.0f});
         const auto gpuWhat = sampleOf(gpuLevels, 0, 1, sampling, {0.0f, 1.0f});

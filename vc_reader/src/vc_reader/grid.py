@@ -4,7 +4,8 @@ progressive frames (drawn from the caches now, completed by background reads).
 
 Levels come from :meth:`ZarrReader.grid_level` (a pyramid level, optionally with its
 :meth:`ZarrReader.cuda` reader); the first level of a request is preferred and later
-ones fill its holes. Points and geometry are XYZ in the working voxels (level 0 by
+ones fill its holes. On the GPU, give the levels' readers one :class:`CudaPool` so
+they share one device cache: ``r.grid_level(cuda=r.cuda(pool=pool))``. Points and geometry are XYZ in the working voxels (level 0 by
 default); arrays are ZYX. Progressive frames read only the caches: open the volume
 with a ``memory_cache`` (or a disk cache for remote volumes), else they stay empty.
 
@@ -26,9 +27,10 @@ import numpy as np
 
 from . import _reader
 from ._reader import CompositeOptions, GridLevel, fallback_levels, level_for_view
+from .reader.cuda import CudaPool
 
 __all__ = [
-    "LEVEL_MISSING", "LEVEL_NONE", "CompositeOptions", "GridLevel", "GridResult", "Pending",
+    "LEVEL_MISSING", "LEVEL_NONE", "CompositeOptions", "CudaPool", "GridLevel", "GridResult", "Pending",
     "fallback_levels", "level_for_view", "load", "pixels_per_voxel", "sample_grid", "sample_grid_cached",
     "voxel_extent",
 ]
