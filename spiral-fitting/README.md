@@ -1145,7 +1145,10 @@ and fiber-inference datasets from the VC3D project, and winding inference
 from `--winding-inference`. `GET /bindings` advertises the host bindings
 (`bindings.output_directory`, `cache_directory`, `winding_inference`), the
 capabilities, the bound store and its selection, and the checkpoints under
-the output directory that a load may name.
+the output directory that a load may name. Reading a large store's selection
+can take minutes, so `/bindings` never waits for it: until the background read
+for the store as it stands finishes, `inputs` is `{"pending": true}`; ask again
+for the summary.
 
 `--output` is required. Every piece
 of generated state — run directories, autosaves, previews, published

@@ -8,6 +8,7 @@ import copy
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,9 @@ from config import Config  # noqa: E402
 from fit_session import (SessionState, SpiralInputPaths,  # noqa: E402
                          SpiralRunConfig)
 from service_http import ApiError  # noqa: E402
-from service_project import UMBILICUS, project, with_project  # noqa: E402
+from service_project import FACTS, UMBILICUS, project, with_project  # noqa: E402
+
+FACTS_WITH_UMBILICUS = {**FACTS, 'umbilicus': UMBILICUS}
 from object_store_fixture import VOLUME  # noqa: E402
 from test_object_store_startup import store_path  # noqa: E402,F401
 
@@ -429,6 +432,11 @@ def filled_store(tmp_path):
 
 def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     state = service(host, filled_store)
+    # GET /bindings never reads the store itself: the selection is read in
+    # the background and advertised once it has been read.
+    assert state.binding_advertisement()['inputs'] in (
+        {'pending': True}, state.startup_inputs())
+    state.startup_inputs()
     advertised = state.binding_advertisement()
     with ObjectStore.open(filled_store, read_only=True) as db:
         positions = db.store_positions()
@@ -464,6 +472,44 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     # Discovery writes nothing: no refresh ran.
     with ObjectStore.open(filled_store, read_only=True) as db:
         assert len(db.edges_by_kind('point-surface')) == 1
+
+
+def test_bindings_never_wait_for_the_store_to_be_read(host, filled_store,
+                                                     monkeypatch):
+    # Reading a large store's selection takes minutes, longer than a client
+    # waits for GET /bindings: the read runs in the background, once.
+    import object_store_inputs
+    real = object_store_inputs.describe_selection
+    release, calls = threading.Event(), []
+
+    def slow(config):
+        calls.append(config)
+        assert release.wait(30)
+        if len(calls) == 1:
+            raise RuntimeError('store unreadable')
+        return real(config)
+    monkeypatch.setattr(object_store_inputs, 'describe_selection', slow)
+    state = service(host, filled_store)
+
+    def settled():
+        deadline = time.monotonic() + 30
+        while state._startup_inputs_reading is not None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+    assert state.binding_advertisement()['inputs'] == {'pending': True}
+    assert state.binding_advertisement()['inputs'] == {'pending': True}
+    release.set()
+    settled()
+    # A failed read is reported and not kept: the next request reads again.
+    assert len(calls) == 1
+    assert any('store unreadable' in event['text']
+               for event in state.events.read_after(0)['events'])
+    assert state.binding_advertisement()['inputs'] == {'pending': True}
+    settled()
+    assert len(calls) == 2
+    assert state.binding_advertisement()['inputs']['ok'] is True
+    assert len(calls) == 2
 
 
 def test_discovery_follows_store_changes_and_reports_refusals(host, filled_store):
@@ -506,7 +552,10 @@ def probe():
                 headers={{'Authorization': 'Bearer ' + open({str(tmp_path / 'key')!r}).read().strip()}})
             with urllib.request.urlopen(request, timeout=10) as response:
                 bindings = json.loads(response.read())
-            break
+            # The selection is read in the background; ask until it is.
+            if not bindings['inputs'].get('pending'):
+                break
+            time.sleep(0.05)
         except Exception:
             time.sleep(0.05)
     print('RESULT', json.dumps({{'torch': 'torch' in sys.modules,
@@ -696,9 +745,40 @@ def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(host, store):
     failure = _built(service(host, store),
                      initialize_body() | {'project': project(volume='other-volume')})
     assert f'the fit volume {VOLUME} is not a volume of the project' in failure['message']
-    failure = _built(service(host, store),
-                     initialize_body() | {'project': project(umbilicus=None)})
-    assert 'has no umbilicus for the fit volume' in failure['message']
+    # Another volume has one: only the store's selection names the fit
+    # volume, so the build refuses it once the inputs are read.
+    other = project()
+    other['volumes']['other-volume'] = other['volumes'].pop(VOLUME)
+    other['volumes'][VOLUME] = {key: value for key, value
+                                in other['volumes']['other-volume'].items()
+                                if key != 'umbilicus'}
+    failure = _built(service(host, store), initialize_body() | {'project': other})
+    assert f'has no umbilicus for the fit volume {VOLUME}' in failure['message']
+
+
+def test_a_missing_umbilicus_is_refused_before_the_store_is_read(host, store,
+                                                                 monkeypatch):
+    # Reading a large store's selection takes minutes; a project that cannot
+    # serve any fit volume is refused on the request instead.
+    import object_store_inputs
+
+    def unread(*args, **kwargs):
+        raise AssertionError('the store was read')
+    monkeypatch.setattr(object_store_inputs, 'read_snapshot', unread)
+    state = service(host, store)
+    with pytest.raises(ApiError) as refused:
+        state.initialize(initialize_body() | {'project': project(umbilicus=None)})
+    assert refused.value.status == 400
+    assert 'has no umbilicus for any of its volumes' in refused.value.details[0]['message']
+    # A configured fit volume is checked itself.
+    body = initialize_body() | {'project': project(umbilicus=None)}
+    body['project']['volumes']['other-volume'] = {**FACTS_WITH_UMBILICUS}
+    body['run']['config']['fit_volume_uuid'] = VOLUME
+    with pytest.raises(ApiError) as refused:
+        state.initialize(body)
+    assert f'has no umbilicus for the fit volume {VOLUME}' in (
+        refused.value.details[0]['message'])
+    assert not state._building
 
 
 def test_a_changed_project_volume_rebuilds_everything(host, store):

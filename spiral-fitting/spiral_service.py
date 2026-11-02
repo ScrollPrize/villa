@@ -770,6 +770,10 @@ class ServiceState:
         self.object_store = object_store
         self._startup_inputs = None
         self._startup_inputs_lock = threading.Lock()
+        # The store key a background read of startup_inputs is reading, and
+        # the lock that lets one read run at a time.
+        self._startup_inputs_reading = None
+        self._startup_inputs_read_lock = threading.Lock()
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.events = events if events is not None else ServiceEventBuffer()
@@ -1121,10 +1125,10 @@ class ServiceState:
                     "capabilities": capabilities}
         if self.object_store is not None:
             response["object_store"] = self.object_store.advertisement()
-            response["inputs"] = self.startup_inputs()
+            response["inputs"] = self.startup_inputs(wait=False)
         return response
 
-    def startup_inputs(self):
+    def startup_inputs(self, *, wait=True):
         """What the launch configuration selects from the bound store.
 
         Patches, PCLs and fibers with their revision pins, labels, frames
@@ -1132,23 +1136,63 @@ class ServiceState:
         exclusions and the fit volume (object_store_inputs.snapshot_summary).
         Read-only: no link refresh, no materialization and no Torch. The
         result is reused until the store's files change.
+
+        Reading a large store takes minutes. Without ``wait`` (GET
+        /bindings) the caller never reads it: a summary not yet read for the
+        store as it stands is read in the background, and meanwhile
+        ``{"pending": True}`` is returned; ask again for the result.
         """
-        path = Path(self.object_store.path)
-        # An empty WAL (a read-only open after the last writer closed
-        # creates one) holds no writes: it keys as an absent one.
-        key = tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
-                    for info in (_stat_or_none(path),
-                                 _stat_or_none(Path(f"{path}-wal"))))
+        key = self._startup_inputs_key()
         with self._startup_inputs_lock:
             cached = self._startup_inputs
             if cached is not None and cached[0] == key:
                 return cached[1]
+            if not wait:
+                if self._startup_inputs_reading != key:
+                    self._startup_inputs_reading = key
+                    threading.Thread(target=self._read_startup_inputs_logged,
+                                     args=(key,), name="spiral-startup-inputs",
+                                     daemon=True).start()
+                return {"pending": True}
+        return self._read_startup_inputs(key)
+
+    def _startup_inputs_key(self):
+        path = Path(self.object_store.path)
+        # An empty WAL (a read-only open after the last writer closed
+        # creates one) holds no writes: it keys as an absent one.
+        return tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
+                     for info in (_stat_or_none(path),
+                                  _stat_or_none(Path(f"{path}-wal"))))
+
+    def _read_startup_inputs(self, key):
+        """Read the summary for the store as ``key`` stated it, once: a
+        concurrent reader of the same key waits for it instead."""
+        with self._startup_inputs_read_lock:
+            with self._startup_inputs_lock:
+                cached = self._startup_inputs
+                if cached is not None and cached[0] == key:
+                    return cached[1]
             from object_store_inputs import describe_selection
             config = Config(self.startup_run.get("config") or {}).as_dict()
             config.update(self.object_store.config())
             summary = describe_selection(config)
-            self._startup_inputs = (key, summary)
+            with self._startup_inputs_lock:
+                self._startup_inputs = (key, summary)
             return summary
+
+    def _read_startup_inputs_logged(self, key):
+        try:
+            self._read_startup_inputs(key)
+        except Exception as exc:
+            # Not cached: the next GET /bindings tries again.
+            self.events.append(
+                "log", f"Could not read the store's selection: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service")
+        finally:
+            with self._startup_inputs_lock:
+                if self._startup_inputs_reading == key:
+                    self._startup_inputs_reading = None
 
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
@@ -1340,9 +1384,42 @@ class ServiceState:
         # The project's scroll, resolved for the fit volume when the build
         # knows it (_resolve_session_scroll).
         scroll = SessionScroll(project)
+        errors.extend(self._early_volume_problems(
+            scroll, paths, validation_run.config))
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
+
+    def _early_volume_problems(self, scroll, paths, config):
+        """What the project lacks for a fit volume known before the inputs
+        are read: the configured fit_volume_uuid, else the volume a resumed
+        checkpoint recorded. When the store's selection will name the volume
+        instead, a project with no volumes, or with no umbilicus for any of
+        them, cannot serve it either. Reading the store can take minutes on
+        a large one, so these are refused on the request, not after it
+        (_resolve_session_scroll repeats the check once the volume is
+        known)."""
+        project = scroll.project
+        volume = config.get("fit_volume_uuid")
+        if not volume and paths.checkpoint:
+            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
+            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+        try:
+            if volume:
+                scroll.umbilicus(str(volume))
+            elif not project.volumes:
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no volumes: attach the "
+                    "volume the fit reads")
+            elif not any(entry.umbilicus is not None
+                         for entry in project.volumes.values()):
+                raise ScrollSpecError(
+                    f"the project {project.name!r} has no umbilicus for any of "
+                    f"its volumes ({', '.join(sorted(project.volumes))}): import "
+                    "one for the fit volume (File > Import Umbilicus)")
+        except ScrollSpecError as exc:
+            return [{"field": "project", "message": str(exc)}]
+        return []
 
     @staticmethod
     def _request_project(request):

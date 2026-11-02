@@ -281,7 +281,7 @@ def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
     request = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
     state.initialize(with_project(request))
     first = settle(state)['input_digest']
-    walk = next(entry['uuid'] for entry in state.binding_advertisement()['inputs']['objects']
+    walk = next(entry['uuid'] for entry in state.startup_inputs()['objects']
                 if entry['name'] == 'walk')
     with ObjectStore.open(store_path, author='editor') as db:
         db.set_meta(walk, 'sampling_group', 'reviewed')
