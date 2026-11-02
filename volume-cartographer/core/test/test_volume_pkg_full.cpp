@@ -1,5 +1,5 @@
 // VolumePkg coverage with real attached resources: a local zarr volume
-// and an empty normal-grid dir. Exercises addSingleVolume/removeSingleVolume,
+// and an empty normal-grid dir. Exercises attachment,
 // reload variants, volume(), etc.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -63,27 +63,10 @@ TEST_CASE("VolumePkg::addVolumeEntry auto-loads vol1 from the volumes dir")
     makeLocalVolume(d);
     auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
-    // resolveVolumeEntry already loaded vol1; addSingleVolume returns false
-    // for an already-present id. Either way, vol1 must be reachable.
-    (void)p->addSingleVolume("vol1");
     auto v = p->volume("vol1");
     CHECK(v != nullptr);
     auto vDefault = p->volume();
     CHECK(vDefault != nullptr);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::removeSingleVolume drops a volume by id")
-{
-    auto d = tmpDir("rmvol");
-    makeLocalVolume(d);
-    auto p = vc::test::emptyProject();
-    p->addVolumeEntry((d / "volumes").string());
-    REQUIRE(p->volume("vol1") != nullptr);
-    CHECK(p->removeSingleVolume("vol1"));
-    CHECK(p->volume("vol1") == nullptr);
-    // Second remove is a no-op.
-    CHECK_FALSE(p->removeSingleVolume("vol1"));
     fs::remove_all(d);
 }
 

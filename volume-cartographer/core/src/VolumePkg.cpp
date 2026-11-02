@@ -1001,51 +1001,6 @@ std::shared_ptr<Volume> VolumePkg::volume() const
     return loadedVolumes_.begin()->second;
 }
 
-bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
-{
-    if (volumeDirName.empty()) return false;
-    for (const auto& e : volumes_) {
-        if (vcr::zarr::isRemote(e.location)) continue;
-        const auto base = vc::project::resolveLocalPath(e.location, directory());
-        const auto candidate = base / volumeDirName;
-        if (!isSingleZarrVolumeDir(candidate)) continue;
-        try {
-            auto v = Volume::New(candidate, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) return false;
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
-            return true;
-        } catch (const std::exception& ex) {
-            Logger()->warn("addSingleVolume('{}'): {}", volumeDirName, ex.what());
-            return false;
-        }
-    }
-    return false;
-}
-
-bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
-{
-    if (loadedVolumes_.erase(volumeIdOrDirName) > 0) {
-        volumeTagsByID_.erase(volumeIdOrDirName);
-        return true;
-    }
-    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
-        if (it->second && it->second->path().filename().string() == volumeIdOrDirName) {
-            const auto id = it->first;
-            loadedVolumes_.erase(it);
-            volumeTagsByID_.erase(id);
-            return true;
-        }
-    }
-    return false;
-}
-
-std::vector<fs::path> VolumePkg::normalGridPaths() const
-{
-    return resolvedNormalGridPaths_;
-}
-
 std::vector<std::string> VolumePkg::volumeTags(const std::string& volumeId) const
 {
     auto it = volumeTagsByID_.find(volumeId);

@@ -306,8 +306,7 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     return true;
 }
 
-// A flattening tool run on a stored surface (SLIM by flatboi,
-// vc_straighten): the tool reads the surface from the store and
+// A SLIM flattening tool run on a stored surface by flatboi: the tool reads the surface from the store and
 // creates the result there. Shows a progress dialog, reports the run through
 // flattenJobStarted/flattenJobFinished exactly once (an empty message means
 // cancelled), and deletes itself.
@@ -319,7 +318,7 @@ public:
         double voxelScale = 1;
         QStringList args;
         QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
-        QString title;        // "SLIM-flatten", "Straighten"
+        QString title;        // "SLIM-flatten"
         QString running;      // the progress dialog's first label
         QString outputName;
         // A determinate bar over this many iterations, fed by "PROGRESS n / m"
@@ -728,22 +727,6 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
     }
 }
 
-void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
-{
-    const auto stored = requireStoredSurface(segmentId, false, true);
-    if (!stored) return;
-
-    StraightenDialog dlg(_parentWidget, stored->name + QStringLiteral("_straightened"));
-    if (dlg.exec() != QDialog::Accepted) {
-        return;
-    }
-    CommandLaunchError error;
-    if (!startStraightenImpl(segmentId, dlg.request(), /*interactive=*/true, &error, nullptr)) {
-        QMessageBox::critical(_parentWidget, tr("Error"), error.message);
-        emit statusMessage(tr("Straighten failed"), 5000);
-    }
-}
-
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
 {
     // The dialog collects inputs; startRunTrace owns validation and launch.
@@ -1046,50 +1029,6 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
                    {flatboiExe, stored->store, stored->volumeUuid, stored->voxelScale, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
                     outputName, iters, /*modal=*/true},
-                   /*suppressDialogs=*/!interactive);
-
-    if (resolvedOutputName) *resolvedOutputName = outputName;
-    return true;
-}
-
-bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
-                                                 const StraightenParams& params,
-                                                 CommandLaunchError* error,
-                                                 QString* resolvedOutputName)
-{
-    return startStraightenImpl(segmentId, params, /*interactive=*/false, error, resolvedOutputName);
-}
-
-bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentId,
-                                                     const StraightenParams& params,
-                                                     bool interactive,
-                                                     CommandLaunchError* error,
-                                                     QString* resolvedOutputName)
-{
-    const CommandLaunchErrorSetter setErr{error};
-
-    const auto stored = storedSurface(segmentId, error, true);
-    if (!stored) return false;
-
-    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
-    if (exe.isEmpty()) {
-        setErr(tr("Could not find the 'vc_straighten' executable (known locations and PATH). "
-                  "Set it in VC.ini [tools] vc_straighten, or put it on PATH."),
-               CommandLaunchError::ToolUnavailable);
-        return false;
-    }
-
-    const QString outputName =
-        params.outputName.isEmpty() ? stored->name + QStringLiteral("_straightened") : params.outputName;
-
-    const QStringList args = straightenArgs(params);
-    std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
-              << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
-    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe, stored->store, stored->volumeUuid, stored->voxelScale,
-                    QStringList{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
-                                QStringLiteral("--name"), outputName} + args,
-                    QStringLiteral("flatten.straighten"), tr("Straighten"), tr("Running vc_straighten..."), outputName},
                    /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
@@ -2066,177 +2005,6 @@ std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces
             if (throughView ? row.bound() : row.toolInput()) rows.push_back(&row);
     }
     return rows;
-}
-
-void SegmentationCommandHandler::onMergeSurfaces(const QStringList& segmentIds)
-{
-    if (!_cmdRunner) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("Command runner is not initialized."));
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("A command-line tool is already running."));
-        return;
-    }
-    CommandLaunchError error;
-    const auto store = storeForTools(&error);
-    if (!store) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"), error.message);
-        return;
-    }
-
-    QMap<QString, QString> available;
-    for (const auto* row : toolSurfaces(true)) {
-        const auto& record = row->record;
-        available.insert(QString::fromStdString(record.uuid),
-                         QString::fromStdString(record.name.empty() ? record.uuid : record.name));
-    }
-    if (available.size() < 2) {
-        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
-                             tr("The current volume has fewer than 2 surfaces; merge needs at least 2."));
-        return;
-    }
-
-    MergeSurfacesDialog dlg(_parentWidget, segmentIds, available);
-    if (dlg.exec() != QDialog::Accepted) {
-        emit statusMessage(tr("Merge cancelled"), 3000);
-        return;
-    }
-
-    auto mergeJson = std::make_shared<QTemporaryFile>(QDir::temp().filePath(QStringLiteral("vc3d_XXXXXX.merge.json")));
-    if (!mergeJson->open()) {
-        QMessageBox::critical(_parentWidget, tr("Merge TIFXYZ"), tr("Failed to write merge.json."));
-        return;
-    }
-    mergeJson->write(dlg.mergeJsonText().toUtf8());
-    mergeJson->flush();
-
-    // The merge is a new surface bound to the current volume.
-    _cmdRunner->setStore(store->store, store->voxelScale);
-    _cmdRunner->setMergeParams(mergeJson->fileName(),
-                               store->volumeUuid,
-                               QStringLiteral("paths"),
-                               dlg.refSurface(),
-                               dlg.ransacIters(),
-                               dlg.ransacMinThresh(),
-                               dlg.ransacMaxThresh(),
-                               dlg.ransacMadK(),
-                               dlg.ransacSeed(),
-                               dlg.anchorCap(),
-                               dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    // The merge.json lives until the tool finishes.
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished, this,
-                          [connection, mergeJson](CommandLineToolRunner::Tool tool, bool, const QString&, const QString&, bool) {
-                              if (tool == CommandLineToolRunner::Tool::MergeTifxyz) disconnect(*connection);
-                          });
-    _cmdRunner->showConsoleOutput();
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
-        disconnect(*connection);
-        return;
-    }
-    emit statusMessage(tr("Merging surfaces..."), 0);
-}
-
-void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
-{
-    if (!_cmdRunner) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("Command runner is not initialized."));
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("A command-line tool is already running."));
-        return;
-    }
-    CommandLaunchError error;
-    const auto store = storeForTools(&error);
-    if (!store) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"), error.message);
-        return;
-    }
-
-    QMap<QString, MergePatchDialog::Choice> available;
-    for (const auto* row : toolSurfaces()) {
-        const auto& record = row->record;
-        // The store's area; tool inputs are stored in the volume's voxels.
-        available.insert(QString::fromStdString(record.uuid),
-                         {QString::fromStdString(record.name.empty() ? record.uuid : record.name),
-                          record.surface && record.surface->area > 0 ? record.surface->area : -1.0});
-    }
-    if (available.size() < 2) {
-        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
-                             tr("The current volume has fewer than 2 surfaces; "
-                                "patch needs a parent + child."));
-        return;
-    }
-
-    MergePatchDialog dlg(_parentWidget, segmentIds, available);
-    if (dlg.exec() != QDialog::Accepted) {
-        emit statusMessage(tr("Patch cancelled"), 3000);
-        return;
-    }
-
-    _cmdRunner->setStore(store->store, store->voxelScale);
-    _cmdRunner->setMergePatchParams(dlg.parentSurface(),
-                                    dlg.childSurface(),
-                                    dlg.explicitRoles(),
-                                    dlg.borderCells(),
-                                    dlg.blendCells(),
-                                    dlg.idwK(),
-                                    dlg.ransacIters(),
-                                    dlg.ransacMinThresh(),
-                                    dlg.ransacMaxThresh(),
-                                    dlg.ransacMadK(),
-                                    dlg.ransacSeed(),
-                                    dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-
-    // The parent's new revision reaches the panel and an opened copy through
-    // the store's commit events.
-    QPointer<SegmentationCommandHandler> guard(this);
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
-                          this,
-                          [this, guard, connection]
-                          (CommandLineToolRunner::Tool tool,
-                           bool success,
-                           const QString& message,
-                           const QString& outputPath,
-                           bool) {
-        if (!guard) {
-            disconnect(*connection);
-            return;
-        }
-        if (tool != CommandLineToolRunner::Tool::MergePatch) {
-            return;
-        }
-        disconnect(*connection);
-        if (success) {
-            emit statusMessage(tr("Patch applied to %1").arg(outputPath), 5000);
-        } else {
-            QMessageBox::critical(_parentWidget, tr("Patch Surface"),
-                                  tr("vc_merge_patch failed.\n%1").arg(message));
-            emit statusMessage(tr("Patch failed"), 5000);
-        }
-    });
-
-    _cmdRunner->showConsoleOutput();
-    // If execute() rejects the launch (preflight failure, missing binary),
-    // it never emits toolFinished -- so the one-shot lambda above would
-    // stay attached and fire on the NEXT tool's toolFinished. Disconnect
-    // immediately on launch failure to keep the runner's signal table
-    // clean across subsequent runs.
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
-        QObject::disconnect(*connection);
-        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
-        return;
-    }
-    emit statusMessage(tr("Patching surface..."), 0);
 }
 
 void SegmentationCommandHandler::onGrowTrackPatches()

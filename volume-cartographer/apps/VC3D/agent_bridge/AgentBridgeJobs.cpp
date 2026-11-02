@@ -173,7 +173,7 @@ void AgentBridgeServer::subscribeJobSignals()
     }
 
     // Flattening lifecycle -> source:"flatten" jobs. Emitted by
-    // the SLIM and straighten jobs from BOTH the interactive
+    // the SLIM jobs from BOTH the interactive
     // slots and the headless start* launchers, so human-initiated flattens are
     // registered as external jobs too.
     if (_window->_segmentationCommandHandler) {
@@ -501,10 +501,10 @@ void AgentBridgeServer::handleFlattenStarted(const QString& kind, const QString&
 {
     auto it = _activeJobs.find(QStringLiteral("flatten"));
     if (it == _activeJobs.end()) {
-        // A flatten launched outside the bridge (a human ran SLIM/Straighten
+        // A flatten launched outside the bridge (a human ran SLIM
         // from the context menu): register it as an externally-initiated job so
         // -32004 / state.get reflect true app state. The kind carries the
-        // real flatten type (flatten.slim / flatten.straighten).
+        // real flatten type (flatten.slim).
         beginJob(QStringLiteral("flatten"), kind,
                  label.isEmpty() ? QStringLiteral("Flatten") : label,
                  /*broadcastStart=*/true);

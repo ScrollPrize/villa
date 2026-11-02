@@ -189,7 +189,7 @@ per source is tracked:
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `catalog` | Open Data sample open lifecycle |
-| `flatten` | SLIM and straighten lifecycle |
+| `flatten` | SLIM lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
 
@@ -366,7 +366,7 @@ and never open file pickers.
   are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
-- SLIM and straighten share the `flatten` source and application
+- SLIM uses the `flatten` source and application
   lifecycle.
 - Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
@@ -438,7 +438,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
 | `vc3d_fiber_set_tag` | `fiber.set_tag` |
 | `vc3d_flatten_slim` | `flatten.slim` |
-| `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |

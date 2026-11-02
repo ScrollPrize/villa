@@ -166,12 +166,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 
     const QString toolCmd = isCustom ? _customCommand : toolName(tool);
 
-    // vc_merge_tifxyz and vc_merge_patch only read and write stored surfaces;
-    // no volume required.
-    const bool needsVolume = !isCustom
-                             && tool != Tool::MergeTifxyz
-                             && tool != Tool::MergePatch;
-    if (needsVolume) {
+    if (!isCustom) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
                 warn(tr("Error"), tr("Volume path not specified."));
@@ -201,11 +196,6 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
                    "Remote locators are rejected without stripping selectors."));
             return false;
         }
-    }
-
-    if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
-        warn(tr("Error"), tr("merge.json path not specified."));
-        return false;
     }
 
     if (!isCustom && _storePath.isEmpty()) {
@@ -380,7 +370,6 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
     launch.args = buildArguments(tool);
     launch.store = _storePath;
     launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
-                    : tool == Tool::MergePatch ? QString()
                                                : _volumeUuid;
     launch.voxelScale = tool == Tool::RenderTifXYZ ? _renderVoxelScale : _voxelScale;
     return launch;
@@ -460,39 +449,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                 args << "--resume-opt" << _resumeOpt;
             }
             break;
-        case Tool::MergeTifxyz:
-            args << "--merge" << _mergeJsonPath
-                 << "--tag" << _outputTag;
-            // Empty refSurface -> let vc_merge_tifxyz auto-pick the
-            // surface with the largest valid-cell count. Otherwise pass
-            // the user's pick straight through.
-            if (!_mergeRefSurface.isEmpty()) {
-                args << "--ref" << _mergeRefSurface;
-            }
-            args << "--ransac-iters"      << QString::number(_mergeRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_mergeRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_mergeRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_mergeRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_mergeRansacSeed)
-                 << "--anchor-cap"        << QString::number(_mergeAnchorCap)
-                 << "--strip-cols"        << QString::number(_mergeStripCols);
-            break;
-        case Tool::MergePatch:
-            // Roles are auto-detected by valid-cell count unless the user
-            // swapped them in the dialog (the first surface is the parent).
-            args << "--surface" << _patchParentSurface
-                 << "--surface" << _patchChildSurface;
-            if (_patchExplicitRoles) args << "--explicit-roles";
-            args << "--border-cells"      << QString::number(_patchBorderCells)
-                 << "--blend-cells"       << QString::number(_patchBlendCells)
-                 << "--idw-k"             << QString::number(_patchIdwK)
-                 << "--ransac-iters"      << QString::number(_patchRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_patchRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_patchRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_patchRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_patchRansacSeed)
-                 << "--anchor-cap"        << QString::number(_patchAnchorCap);
-            break;
         case Tool::CustomCommand:
             args = _customArgs;
             break;
@@ -524,12 +480,6 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::NeighborCopy:
             return resolved(QStringLiteral("vc_grow_seg_from_seed"));
 
-        case Tool::MergeTifxyz:
-            return resolved(QStringLiteral("vc_merge_tifxyz"));
-
-        case Tool::MergePatch:
-            return resolved(QStringLiteral("vc_merge_patch"));
-
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;
 
@@ -545,63 +495,9 @@ QString CommandLineToolRunner::getOutputPath() const
         case Tool::tifxyz2obj: return _exportedObj;
         // An in-place refinement creates nothing: the source changed.
         case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
-        // The binary edits the parent in place.
-        case Tool::MergePatch: return _patchParentSurface;
         case Tool::CustomCommand: return QString();
         default: return _createdSurfaces.join('\n');
     }
-}
-
-void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
-                                           const QString& volumeUuid,
-                                           const QString& outputTag,
-                                           const QString& refSurface,
-                                           int ransacIters,
-                                           double ransacMinThresh,
-                                           double ransacMaxThresh,
-                                           double ransacMadK,
-                                           int ransacSeed,
-                                           int anchorCap,
-                                           int stripCols)
-{
-    _mergeJsonPath        = mergeJsonPath;
-    _volumeUuid           = volumeUuid;
-    _outputTag            = outputTag;
-    _mergeRefSurface      = refSurface;
-    _mergeRansacIters     = ransacIters;
-    _mergeRansacMinThresh = ransacMinThresh;
-    _mergeRansacMaxThresh = ransacMaxThresh;
-    _mergeRansacMadK      = ransacMadK;
-    _mergeRansacSeed      = ransacSeed;
-    _mergeAnchorCap       = anchorCap;
-    _mergeStripCols       = stripCols;
-}
-
-void CommandLineToolRunner::setMergePatchParams(const QString& parentSurface,
-                                                const QString& childSurface,
-                                                bool explicitRoles,
-                                                int borderCells,
-                                                int blendCells,
-                                                int idwK,
-                                                int ransacIters,
-                                                double ransacMinThresh,
-                                                double ransacMaxThresh,
-                                                double ransacMadK,
-                                                int ransacSeed,
-                                                int anchorCap)
-{
-    _patchParentSurface      = parentSurface;
-    _patchChildSurface       = childSurface;
-    _patchExplicitRoles   = explicitRoles;
-    _patchBorderCells     = borderCells;
-    _patchBlendCells      = blendCells;
-    _patchIdwK            = idwK;
-    _patchRansacIters     = ransacIters;
-    _patchRansacMinThresh = ransacMinThresh;
-    _patchRansacMaxThresh = ransacMaxThresh;
-    _patchRansacMadK      = ransacMadK;
-    _patchRansacSeed      = ransacSeed;
-    _patchAnchorCap       = anchorCap;
 }
 
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,

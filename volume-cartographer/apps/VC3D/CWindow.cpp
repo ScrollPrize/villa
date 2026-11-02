@@ -111,7 +111,6 @@
 #include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
-#include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -825,12 +824,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
-    _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
-    connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
-            this, [this](const QString& preferredVolumeId) {
-                refreshCurrentVolumePackageUi(preferredVolumeId);
-            });
-
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
@@ -1113,17 +1106,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
-    // Wire the Actions -> Merge Surfaces... menu entry to the handler.
-    // Has to happen here (not inside CreateWidgets) because
-    // _menuController is created after CreateWidgets() returns.
-    connect(_menuController.get(), &MenuActionController::mergeSurfacesFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergeSurfaces(QStringList{});
-            });
-    connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergePatch(QStringList{});
-            });
     connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
             this, [this]() {
                 _segmentationCommandHandler->onGrowTrackPatches();
@@ -1619,9 +1601,6 @@ CWindow::~CWindow()
         qApp->removeEventFilter(this);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
@@ -2822,17 +2801,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergeSurfacesRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergeSurfaces(segmentIds);
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergePatch(segmentIds);
-            });
-    // Note: the Actions -> Merge Surfaces... menu wiring lives in the
-    // constructor after _menuController is initialized -- _menuController
-    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
@@ -2898,10 +2866,6 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onSlimFlatten(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::straightenRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onStraighten(segmentId.toStdString());
             });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
@@ -4274,9 +4238,6 @@ bool CWindow::OpenVolume(const QString& path,
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->startWatching();
-    }
     return true;
 }
 
@@ -4677,9 +4638,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
 void CWindow::CloseVolume(void)
 {
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
 
 
     // Tear down active segmentation editing before surfaces disappear to avoid

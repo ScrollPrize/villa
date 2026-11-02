@@ -168,8 +168,6 @@ public:
     [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
     std::shared_ptr<Volume> volume() const;
     std::shared_ptr<Volume> volume(const std::string& id) const;
-    bool addSingleVolume(const std::string& volumeDirName);
-    bool removeSingleVolume(const std::string& volumeIdOrDirName);
 
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
 

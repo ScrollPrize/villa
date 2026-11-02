@@ -35,7 +35,7 @@ inline QString settingsFilePath()
 // Priority — first match wins:
 //   1. viewer/remote_cache_dir from the process-wide VC3D settings
 //   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
-//   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   3. /ephemeral/remote_cache  (NVMe instance store)
 //   4. ~/.VC3D/remote_cache
 //
 // Resolution and directory creation are implemented in shared core code so

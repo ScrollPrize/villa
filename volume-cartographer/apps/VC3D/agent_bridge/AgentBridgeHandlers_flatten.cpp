@@ -58,7 +58,7 @@
 
 
 // ---------------------------------------------------------------------------
-// Flattening RPCs: flatten.slim / flatten.straighten
+// Flattening RPCs: flatten.slim
 // ---------------------------------------------------------------------------
 
 // Shared launch body for both flatten RPCs: the handler builds `launch`
@@ -141,44 +141,5 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         [handler, segmentId, sp](CommandLaunchError* error, QString* outputName) {
             return handler && handler->startSlimFlatten(
                 segmentId.toStdString(), sp, error, outputName);
-        });
-}
-
-
-QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-
-    const QString segmentId = p.value("segmentId").toString();
-    if (segmentId.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentId";
-        throw AgentBridgeError{-32602, "segmentId is required", data};
-    }
-
-    SegmentationCommandHandler::StraightenParams stp;  // defaults mirror the dialog
-
-    stp.unbend = p.value("unbend").toBool(stp.unbend);
-    stp.unbendSmoothCols =
-        p.value("unbendSmoothCols").toDouble(stp.unbendSmoothCols);
-    stp.overlapPasses = p.value("overlapPasses").toInt(stp.overlapPasses);
-    stp.orthogonalize =
-        p.value("orthogonalize").toBool(stp.orthogonalize);
-    stp.trim = p.value("trim").toBool(stp.trim);
-    stp.trimMaxEdge = p.value("trimMaxEdge").toDouble(stp.trimMaxEdge);
-    stp.outputName = p.value("outputName").toString();
-
-    SegmentationCommandHandler* handler =
-        _window ? _window->_segmentationCommandHandler.get() : nullptr;
-    return launchFlattenJob(
-        QStringLiteral("flatten.straighten"), QStringLiteral("Straighten"), segmentId,
-        [handler, segmentId, stp](CommandLaunchError* error, QString* outputName) {
-            return handler && handler->startStraighten(
-                segmentId.toStdString(), stp, error, outputName);
         });
 }

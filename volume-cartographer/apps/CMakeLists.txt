@@ -74,17 +74,9 @@ target_link_libraries(vc_obj2tifxyz vc_core)
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
-add_executable(vc_straighten src/vc_straighten.cpp)
-target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_flann)
 
-add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
-target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
-add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp src/vc_merge_tifxyz_grid.cpp)
-target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgproc opencv_flann Eigen3::Eigen)
 
-add_executable(vc_merge_patch src/vc_merge_patch.cpp)
-target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp)
 target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc OpenMP::OpenMP_CXX)
@@ -105,9 +97,9 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 set(VC_CLI_TARGETS
     vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
     vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
-    vc_obj2tifxyz_legacy vc_straighten
+    vc_obj2tifxyz_legacy
     vc_fiber_trace_metric vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_tifxyz_gengt vc_merge_tifxyz vc_merge_patch
+
     vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
     vc_thinning)
 if(VC_BUILD_FIBERLETS)
@@ -132,11 +124,11 @@ if(VC_USE_PCH)
         vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
         vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
         vc_obj2tifxyz_legacy
-        vc_fiber_trace_metric vc_tifxyz_gengt
-        vc_merge_tifxyz vc_merge_patch
+        vc_fiber_trace_metric
+
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
         vc_thinning
-        vc_straighten
+
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)
     endforeach()

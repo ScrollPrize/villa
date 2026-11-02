@@ -532,26 +532,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     addToolAction(tr("Rotate Surface 90° CW"), usable, &SurfacePanelController::rotateSurfaceRequested);
     addToolAction(tr("Refine (Alpha-comp)"), usable, &SurfacePanelController::alphaCompRefineRequested);
     addToolAction(tr("SLIM-flatten"), usable, &SurfacePanelController::slimFlattenRequested);
-    addToolAction(tr("Straighten (vc_straighten)"), usable, &SurfacePanelController::straightenRequested);
-
-    contextMenu.addSeparator();
-
-    // Merge only makes sense for >=2 surfaces; gate on selection so it
-    // doesn't appear when the user right-clicks a single surface.
-    if (selectedSegmentIds.size() >= 2 && allUsable) {
-        QAction* mergeAction = contextMenu.addAction(tr("Merge surfaces..."));
-        connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
-            emit mergeSurfacesRequested(selectedSegmentIds);
-        });
-    }
-    // Patch is exactly-2-input; gate to exactly 2 selected surfaces so the
-    // dialog opens with both pickers pre-filled.
-    if (selectedSegmentIds.size() == 2 && allToolUsable) {
-        QAction* patchAction = contextMenu.addAction(tr("Patch surface..."));
-        connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
-            emit mergePatchRequested(selectedSegmentIds);
-        });
-    }
 
     contextMenu.addSeparator();
 

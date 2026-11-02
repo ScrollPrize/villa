@@ -149,13 +149,7 @@ signals:
     void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
-    void straightenRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
-    void mergeSurfacesRequested(const QStringList& segmentIds);
-    // Emitted when the user right-clicks two selected segments and picks
-    // "Patch surface...". CWindow wires this to
-    // SegmentationCommandHandler::onMergePatch.
-    void mergePatchRequested(const QStringList& segmentIds);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void resumeLocalGrowPatchRequested(const QString& segmentId);
     void neighborCopyRequested(const QString& segmentId, bool copyOut);

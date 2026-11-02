@@ -123,14 +123,6 @@ private slots:
     void exitApplication();
 
 signals:
-    // Emitted when the user picks Actions -> Merge Surfaces... CWindow
-    // wires this to SegmentationCommandHandler::onMergeSurfaces with an
-    // empty seed list so the dialog opens with an empty grid.
-    void mergeSurfacesFromMenuRequested();
-    // Emitted when the user picks Actions -> Patch Surface... CWindow
-    // wires this to SegmentationCommandHandler::onMergePatch with an
-    // empty seed list so the dialog opens with empty combo boxes.
-    void mergePatchFromMenuRequested();
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
@@ -216,8 +208,6 @@ private:
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
-    QAction* _mergeSurfacesAct{nullptr};
-    QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;

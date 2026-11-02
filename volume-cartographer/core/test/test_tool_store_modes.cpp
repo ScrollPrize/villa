@@ -242,101 +242,6 @@ TEST_CASE("OBJ converters create stored surfaces equal to their tifxyz output")
     checkSameSurface(f, modernUuid, f.dir / "modern.tifxyz", "vc_obj2tifxyz");
 }
 
-TEST_CASE("vc_merge_patch edits a stored parent like a tifxyz parent")
-{
-    Fixture f;
-    auto sheet = [](int rows, int cols, int row0, int col0, float lift) {
-        cv::Mat_<cv::Vec3f> points(rows, cols);
-        for (int r = 0; r < rows; ++r)
-            for (int c = 0; c < cols; ++c) {
-                const float x = 200.f + 2.f * float(col0 + c), y = 200.f + 2.f * float(row0 + r);
-                const bool interior = r > 6 && c > 6 && r < rows - 7 && c < cols - 7;
-                points(r, c) = {x, y, 100.f + 0.01f * (x - 240.f) * (x - 240.f) + (interior ? lift : 0.f)};
-                // A patch has an invalid frame around its valid region.
-                if (lift != 0.f && (r < 2 || c < 2 || r >= rows - 2 || c >= cols - 2)) points(r, c) = {-1.f, -1.f, -1.f};
-            }
-        return QuadSurface(points, {0.5f, 0.5f});
-    };
-    auto parent = sheet(40, 40, 0, 0, 0.f), child = sheet(24, 24, 8, 8, 1.5f);
-    parent.save(f.dir / "parent", true);
-    child.save(f.dir / "child", true);
-    const auto parentUuid = util::newUuid(), childUuid = util::newUuid();
-    {
-        OpenOptions options; options.author = "tool-store-test";
-        auto db = ObjectStore::open(f.store, options);
-        auto txn = db.write();
-        for (const auto& [uuid, surface] : {std::pair{parentUuid, &parent}, std::pair{childUuid, &child}}) {
-            ObjectRecord record; record.uuid = uuid; record.kind = "surface";
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
-        }
-        txn.commit();
-    }
-    const auto bin = tool("VC_MERGE_PATCH_BIN") + " --ransac-seed 7 --border-cells 4 --blend-cells 2";
-    run(bin + " --parent \"" + (f.dir / "parent").string() + "\" --child \"" + (f.dir / "child").string() + "\"", f.dir / "file.log");
-    const auto output = run(bin + " --store \"" + f.store.string() + "\" --surface " + parentUuid + " --surface " + childUuid +
-                            " --explicit-roles", f.dir / "store.log");
-    CHECK(output.find("geometry_revision: ") != std::string::npos);
-    OpenOptions options; options.author = "tool-store-test";
-    auto db = ObjectStore::open(f.store, options);
-    auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, parentUuid);
-    const auto files = load_quad_from_tifxyz(f.dir / "parent");
-    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
-    CHECK(cv::norm(*stored->rawPointsPtr(), *parent.rawPointsPtr(), cv::NORM_INF) > 0);  // the patch changed it
-    CHECK(fs::exists(fs::path(f.store.string() + ".artifacts") / parentUuid / "merge_patch_summary.json"));
-}
-
-TEST_CASE("vc_merge_tifxyz stores the merge of stored surfaces like a tifxyz merge")
-{
-    Fixture f;
-    auto plane = [](int xOffset) {
-        cv::Mat_<cv::Vec3f> points(16, 16);
-        for (int r = 0; r < 16; ++r)
-            for (int c = 0; c < 16; ++c) points(r, c) = {float(c + xOffset), float(r), 100.f};
-        return QuadSurface(points, {1.f, 1.f});
-    };
-    auto a = plane(0), b = plane(8);
-    fs::create_directories(f.dir / "paths");
-    a.save(f.dir / "paths" / "surface_a", true);
-    b.save(f.dir / "paths" / "surface_b", true);
-    const auto uuidA = util::newUuid(), uuidB = util::newUuid();
-    {
-        OpenOptions options; options.author = "tool-store-test";
-        auto db = ObjectStore::open(f.store, options);
-        auto txn = db.write();
-        for (const auto& [uuid, surface, name] : {std::tuple{uuidA, &a, "surface_a"}, std::tuple{uuidB, &b, "surface_b"}}) {
-            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name;
-            record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
-        }
-        txn.commit();
-    }
-    std::ofstream(f.dir / "merge.json") << R"({"rows":["surface_a surface_b"]})";
-    std::ofstream(f.dir / "merge-store.json") << nlohmann::json{{"rows", {uuidA + " " + uuidB}}}.dump();
-    const auto bin = tool("VC_MERGE_TIFXYZ_BIN");
-    run(bin + " --merge \"" + (f.dir / "merge.json").string() + "\"", f.dir / "file.log");
-    const auto uuid = surfaceUuid(run(bin + " --merge \"" + (f.dir / "merge-store.json").string() + "\" --store \"" +
-                                      f.store.string() + "\" --tag merged --volume-uuid vol", f.dir / "store.log"));
-    OpenOptions options; options.author = "tool-store-test";
-    auto db = ObjectStore::open(f.store, options);
-    auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, uuid);
-    const auto files = load_quad_from_tifxyz(f.dir / "paths" / "surface_a_merged");
-    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
-    const auto object = db.objectByUuid(txn, uuid);
-    CHECK(object->name == "surface_a_merged");
-    CHECK(object->tags == std::vector<std::string>{"merged"});
-    const auto meta = nlohmann::json::parse(object->meta);
-    CHECK(meta.at("provenance").at("sources").size() == 2);
-    const auto artifacts = fs::path(f.store.string() + ".artifacts") / uuid;
-    CHECK(fs::exists(artifacts / "merge.obj"));
-    CHECK(fs::exists(artifacts / "merge_summary.json"));
-}
-
 TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
 {
     Fixture f;
@@ -359,23 +264,6 @@ TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
         CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
     }
     CHECK(db.objectByUuid(txn, created)->name == "refined");
-}
-
-TEST_CASE("vc_straighten stores its result as a new surface")
-{
-    Fixture f;
-    const auto bin = tool("VC_STRAIGHTEN_BIN") + " --trim --trim-max-edge 4.03";
-    run(bin + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "straight").string() + "\"", f.dir / "file.log");
-    const auto uuid = surfaceUuid(run(bin + " " + f.storeArgs() + " --tag straight", f.dir / "store.log"));
-    OpenOptions options; options.author = "tool-store-test";
-    auto db = ObjectStore::open(f.store, options);
-    auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, uuid);
-    const auto files = load_quad_from_tifxyz(f.dir / "straight");
-    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
-    CHECK(stored->countValidPoints() < load_quad_from_store(db, txn, f.uuid)->countValidPoints());  // trimmed
-    CHECK(db.objectByUuid(txn, uuid)->name == "surface_straight");
 }
 
 TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources")

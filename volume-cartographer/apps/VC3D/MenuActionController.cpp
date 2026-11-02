@@ -24,7 +24,6 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
-#include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 
@@ -216,13 +215,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
-    _mergeSurfacesAct = new QAction(QObject::tr("Merge Surfaces..."), this);
-    connect(_mergeSurfacesAct, &QAction::triggered,
-            this, &MenuActionController::mergeSurfacesFromMenuRequested);
 
-    _mergePatchAct = new QAction(QObject::tr("Patch Surface..."), this);
-    connect(_mergePatchAct, &QAction::triggered,
-            this, &MenuActionController::mergePatchFromMenuRequested);
 
     _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
     connect(_growTrackPatchesAct, &QAction::triggered,
@@ -281,8 +274,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_mergeSurfacesAct);
-    _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
@@ -963,12 +954,6 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         cancelOpenDataVolumePrefills();
         _window->CloseVolume();
         _window->_state->setVpkg(pkg);
-        // CloseVolume() stopped all file watches; the ordinary open flow
-        // restarts them after its own setVpkg, and the sample flow gets the
-        // same treatment — previously it left the watcher stopped entirely.
-        if (_window->_fileWatcher) {
-            _window->_fileWatcher->startWatching();
-        }
     }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));

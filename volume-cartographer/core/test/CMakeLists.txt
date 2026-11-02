@@ -317,13 +317,6 @@ vc_add_test(NAME test_quadsurface_save_roundtrip)
 
 vc_add_test(NAME test_post_process)
 
-# Parser-only regression tests for vc_merge_tifxyz: compile its
-# gmResolveGrid + gmCheckConnected source and assert the failure messages
-# exactly without spawning the binary.
-vc_add_test(NAME test_merge_grid_resolve
-    SOURCES test_merge_grid_resolve.cpp ${PROJECT_SOURCE_DIR}/apps/src/vc_merge_tifxyz_grid.cpp
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/src)
-
 vc_add_test(NAME test_surface_meshing)
 
 # These spawn the built command-line tools, so they only exist in
@@ -354,9 +347,9 @@ if(VC_BUILD_APPS)
     if(TARGET flatboi)
         add_dependencies(test_tool_store_modes flatboi)
     endif()
-    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_grow_seg_from_segments)
+    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy   vc_objrefine  vc_grow_seg_from_segments)
     set_tests_properties(test_tool_store_modes PROPERTIES
-        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
+        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary

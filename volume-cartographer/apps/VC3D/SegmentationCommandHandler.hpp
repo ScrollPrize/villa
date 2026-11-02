@@ -16,7 +16,6 @@
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
-#include "StraightenRequest.hpp"
 #include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
@@ -117,8 +116,6 @@ public:
                                      // <name>_flatboi (matching the dialog default)
     };
 
-    // Arguments accepted by startStraighten.
-    using StraightenParams = StraightenRequest;
 
     // Inputs shared by the interactive dialog and dialog-free caller. Base
     // tracer params are fixed; paramOverrides merge over them last.
@@ -165,9 +162,9 @@ signals:
     void statusMessage(QString text, int timeout);
 
     /**
-     * Emitted when a flattening job (SLIM or straighten) begins.
+     * Emitted when a flattening job (SLIM) begins.
      * Emitted from both interactive slots and direct start* methods. `kind` is
-     * "flatten.slim" / "flatten.straighten"; `label` is a short
+     * "flatten.slim"; `label` is a short
      * human string.
      */
     void flattenJobStarted(QString kind, QString label);
@@ -189,14 +186,6 @@ public slots:
     void onRotateSurface(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
-    void onStraighten(const std::string& segmentId);
-    // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
-    // dialog with empty grid for the user to populate via "Add segments").
-    void onMergeSurfaces(const QStringList& segmentIds);
-    // Open the MergePatchDialog. When invoked from the surface context
-    // menu we receive exactly two segment IDs; from the top menu the list
-    // is empty and the user picks both via the dialog combos.
-    void onMergePatch(const QStringList& segmentIds);
     void onGrowTrackPatches();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
@@ -237,19 +226,6 @@ public:
                           const SlimFlattenParams& params,
                           CommandLaunchError* error = nullptr,
                           QString* resolvedOutputName = nullptr);
-
-    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
-    /// validated before launch; completion uses flattenJobFinished.
-    bool startStraighten(const std::string& segmentId,
-                         const StraightenParams& params,
-                         CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputName = nullptr);
-    // The one straighten launch, from the dialog (interactive) or the bridge.
-    bool startStraightenImpl(const std::string& segmentId,
-                             const StraightenParams& params,
-                             bool interactive,
-                             CommandLaunchError* error,
-                             QString* resolvedOutputName);
 
     /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
     /// gathers the same ResumeLocalGrowParams and uses the same launch core.

@@ -79,7 +79,6 @@ class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
 class QFrame;
-class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class LineAnnotationController;
@@ -351,7 +350,6 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;

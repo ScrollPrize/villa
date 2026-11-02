@@ -253,11 +253,10 @@ private:
     QJsonObject handlePushPullStop(const QJsonValue& params);
     QJsonObject handleTracerRunTrace(const QJsonValue& params);
     QJsonObject handleRenderTifxyz(const QJsonValue& params);
-    // Flattening RPCs: SLIM/flatboi, straighten. Each drives a
+    // Flattening RPCs: SLIM/flatboi. Drives a
     // headless SegmentationCommandHandler::start* launcher (dialogs suppressed)
     // and tracks the result as a source:"flatten" job.
     QJsonObject handleFlattenSlim(const QJsonValue& params);
-    QJsonObject handleFlattenStraighten(const QJsonValue& params);
     // Shared body for the three flatten handlers.
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
