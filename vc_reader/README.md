@@ -101,7 +101,7 @@ entry points, so also search `include/vc_reader/` before concluding something is
 | Write tifxyz with channels and rollback | `tifxyz.hpp`: `tifxyz::write`, `WriteOptions`, `Channel` | `tifxyz/tifxyz.cpp` | `tifxyz.write` |
 | In-memory surface: bounds, retargeting to another level, positions, normals and tangents | `tifxyz.hpp`: `tifxyz::Surface` | `tifxyz/tifxyz.cpp` | `tifxyz.Surface` |
 | Bilinear or bicubic Hermite interpolation of a vertex grid, with normals and tangents | `grid.hpp`: `grid::Surface`, `resample`, `pointsAt`, `snapshot`, `Raster`, `Interpolation` | `grid/grid.cpp`, `grid/points.hpp` | `tifxyz.Surface.resample`, `.points_at` |
-| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `SampleReader.render_surface` |
+| Sample a volume along a surface or plane: layers along the normal, pyramid fallback, cache-only reads, masks | `grid.hpp`: `grid::sample`, `Request`, `Level`, `Plane`, `Points`, `levelFromMap` | `grid/grid.cpp`, `grid/level_map.hpp`, `grid/kernels.cu` | `SampleReader.render_surface`; prepared per-pixel XYZ/directions: `ZarrReader.render_points` |
 | Reduce layers to one value per pixel: mean, max, min, median, min-abs, alpha, Beer-Lambert | `composite.hpp`: `composite::reduce` | `composite/` | `_reader.composite_reduce` |
 | Render surface layers; project a label patch into CT | `aligned_reader.hpp`: `sources::SampleReader`, `SurfaceProjection` | `sources/surface_reader.cpp`, `projection/` | `SampleReader.render_surface`, `.project_surface`, `.iter_project_surface` |
 

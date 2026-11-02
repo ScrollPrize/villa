@@ -503,6 +503,28 @@ Result sampleHost(const Surface& surface, const Raster& raster, const Request& r
     }, centre.data());
 }
 
+void checkPoints(const Points& points, const Request& request)
+{
+    checkRequest(request, points.width, points.height);
+    if (points.width && points.height && !points.xyz)
+        throw std::invalid_argument("prepared geometry needs XYZ positions");
+    if (!points.normals && std::any_of(request.offsets.begin(), request.offsets.end(), [](float x) { return x != 0; }))
+        throw std::invalid_argument("nonzero offsets need directions");
+}
+
+Result sampleHost(const Points& points, const Request& request)
+{
+    checkPoints(points, request);
+    const float centre[3]{0, 0, 0};
+    return sampleRaster(points.width, points.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
+        for (int j = 0; j < h; ++j) {
+            const auto source = (std::size_t(j0 + j) * points.width + i0) * 3;
+            std::copy_n(points.xyz + source, std::size_t(w) * 3, xyz + std::size_t(j) * w * 3);
+            if (nrm) std::copy_n(points.normals + source, std::size_t(w) * 3, nrm + std::size_t(j) * w * 3);
+        }
+    }, centre);
+}
+
 Result sampleHost(const Plane& plane, const Request& request)
 {
     const auto centre = centreOf(plane);
@@ -752,6 +774,23 @@ Result sample(const Plane& plane, const Request& request, const std::vector<read
     return sampleDevice(plane.width, plane.height, request, readers, base, centre.data());
 }
 
+Result sample(const Points& points, const Request& request, const std::vector<reader_cuda::Reader*>& readers)
+{
+    checkPoints(points, request);
+    if (readers.empty()) throw std::invalid_argument("one CUDA reader per request level");
+    const int id = readers.front()->device_id();
+    device::Guard guard(id);
+    const auto bytes = std::size_t(points.width) * points.height * 3 * sizeof(float);
+    const auto xyz = upload(points.xyz, bytes, id);
+    const auto normals = points.normals ? upload(points.normals, bytes, id) : device::Storage{};
+    cuda_detail::Params base;
+    base.prepared = true;
+    base.xyz = xyz ? static_cast<const float*>(xyz->ptr) : nullptr;
+    base.normals = normals ? static_cast<const float*>(normals->ptr) : nullptr;
+    const float centre[3]{0, 0, 0};
+    return sampleDevice(points.width, points.height, request, readers, base, centre);
+}
+
 void forgetKeptData()
 {
     forgetDeviceGrids();
@@ -817,6 +856,17 @@ Result sample(const Plane& plane, const Request& request)
                     [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(plane, request, readers); });
 #else
     return sampleHost(plane, request);
+#endif
+}
+
+Result sample(const Points& points, const Request& request)
+{
+    checkPoints(points, request);
+#ifdef VC_READER_CUDA
+    return dispatch(request, [&] { return sampleHost(points, request); },
+                    [&](const std::vector<reader_cuda::Reader*>& readers) { return cuda::sample(points, request, readers); });
+#else
+    return sampleHost(points, request);
 #endif
 }
 

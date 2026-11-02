@@ -114,6 +114,15 @@ struct Plane {
     int width = 0, height = 0;
 };
 
+// Prepared per-pixel geometry, without further interpolation. Contiguous H,W,3
+// XYZ positions and optional offset directions (coordinate units per offset unit).
+// Nonfinite positions have no sample. Request::pixels supplies optional validity.
+struct Points {
+    const float* xyz = nullptr;
+    const float* normals = nullptr;
+    int width = 0, height = 0;
+};
+
 // One pyramid level of a volume: its array, how its stored elements read, and where
 // its indices sit: index[a] = scale[a] * p[2 - a] + offset[a] for an XYZ point p
 // (indices are ZYX). A level placed by a general affine (e.g. a rotated registration)
@@ -174,6 +183,7 @@ struct Result {
 // Invalid requests throw either way.
 Result sample(const Surface& surface, const Raster& raster, const Request& request);
 Result sample(const Plane& plane, const Request& request);
+Result sample(const Points& points, const Request& request);
 
 }  // namespace vcr::grid
 
@@ -191,6 +201,7 @@ namespace vcr::grid::cuda {
 Result sample(const Surface& surface, const Raster& raster, const Request& request,
               const std::vector<reader_cuda::Reader*>& readers);
 Result sample(const Plane& plane, const Request& request, const std::vector<reader_cuda::Reader*>& readers);
+Result sample(const Points& points, const Request& request, const std::vector<reader_cuda::Reader*>& readers);
 // Frees the surface vertex data kept on devices between samples (grid::sample does when
 // a GPU pass fails; the last few surfaces sampled are otherwise kept).
 void forgetKeptData();

@@ -101,6 +101,22 @@ int main()
             compare(cpu, vcr::grid::cuda::sample(plane, request, {&fineGpu}), 0.0f, "resident plane");
         }
 
+        // Prepared pixels have no quad-validity requirement, even in a singleton row.
+        {
+            const float xyz[]{10.25f, 20.5f, 30.75f, 200, 200, 200, 1, 2, 3};
+            const float normals[]{0, 0, 1, 0, 0, 1, 0, 0, 1};
+            const std::uint8_t valid[]{1, 1, 0};
+            vcr::grid::Points points{xyz, normals, 3, 1};
+            vcr::grid::Request request;
+            request.levels = {L0};
+            request.offsets = {-1, 0, 1};
+            request.pixels = valid;
+            request.composite = vcr::composite::Options{};
+            request.composite->method = vcr::composite::Method::Max;
+            compare(vcr::grid::sample(points, request), vcr::grid::cuda::sample(points, request, {&fineGpu}),
+                    0.0f, "prepared point layers");
+        }
+
         // A wavy surface with layers along its normal, reduced to their maximum.
         const int rows = 20, cols = 30;
         std::vector<float> grid(std::size_t(rows) * cols * 3);

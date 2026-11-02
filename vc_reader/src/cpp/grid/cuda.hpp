@@ -21,7 +21,9 @@ struct Params {
     unsigned layers = 0;
     const float* offsets = nullptr;
     // Points: a plane, or a raster over a surface's grid (grid::point on the device).
-    bool plane = false;
+    bool plane = false, prepared = false;
+    const float* xyz = nullptr;
+    const float* normals = nullptr;
     float origin[3]{}, dx[3]{}, dy[3]{}, normal[3]{};
     double x0 = 0, y0 = 0, sx = 1, sy = 1, kx = 0, ky = 0;
     PointMap map{};

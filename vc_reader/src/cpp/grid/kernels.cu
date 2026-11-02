@@ -68,7 +68,12 @@ __global__ void samplePixels(Params P)
         return;
     const int i = int(q % std::size_t(P.width)), j = int(q / std::size_t(P.width));
     float p[3], n[3];
-    if (P.plane) {
+    if (P.prepared) {
+        for (int a = 0; a < 3; ++a) {
+            p[a] = P.xyz[q * 3 + a];
+            n[a] = P.normals ? P.normals[q * 3 + a] : 0;
+        }
+    } else if (P.plane) {
         for (int a = 0; a < 3; ++a) {
             p[a] = P.origin[a] + P.dy[a] * float(j) + P.dx[a] * float(i);
             n[a] = P.normal[a];

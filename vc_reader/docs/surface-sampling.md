@@ -141,6 +141,20 @@ the stored grid and `resample_full(start, size, normals=True)` its points and un
 normals at full-resolution pixels, NaN where invalid; a layer at physical offset d
 is `xyz + d * normal * spacing`. The benchmark selects its surface tiles this way.
 
+## Render prepared per-pixel geometry
+
+For correspondence maps or other already sampled geometry, use
+`ZarrReader.render_points(xyz, normals, valid, offsets=(0,), scale_zyx=(1,1,1))`.
+The native `grid::sample(Points, Request)` overload consumes contiguous H,W,3
+XYZ positions and offset directions directly, including singleton rows and
+isolated valid pixels. It does not interpolate geometry again. Directions give
+XYZ displacement per offset unit; `scale_zyx` maps those coordinates into the
+opened array's ZYX indices. The Python method returns the maximum of the layers
+as an H,W float32 array, with NaN for unsupported pixels. Outside-volume
+neighbors use the array fill value; the default composite cutoff drops negative
+values. The C++ overload supports the same layer,
+composite, cache, pyramid and CPU/CUDA options as other grid requests.
+
 ## Projection geometry and determinism
 
 Projection samples bilinear quads, matching `render_surface(interpolation='linear')`.
