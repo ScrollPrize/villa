@@ -9,7 +9,6 @@ import tomllib
 
 _INK_RUNTIME_DISTRIBUTIONS = {
     "accelerate",
-    "diffusers",
     "opencv-python-headless",
 }
 
