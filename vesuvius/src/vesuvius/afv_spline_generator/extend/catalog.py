@@ -263,9 +263,9 @@ class Catalog:
             for eb in (0,1):
                 delta = np.asarray(tb[eb]['point']) - ta[ea]['point']
                 distance = float(np.linalg.norm(delta))
-                if not .25 <= distance <= GAP_CAP:
+                if distance > GAP_CAP:
                     continue
-                direction = delta / distance
+                direction = delta / distance if distance >= .25 else np.asarray(ta[ea]['tangent'])
                 ca = float(np.dot(ta[ea]['tangent'], direction))
                 cb = float(np.dot(tb[eb]['tangent'], -direction))
                 cosine = min(ca, cb)

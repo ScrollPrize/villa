@@ -56,6 +56,18 @@ def test_overlapping_splines_of_neighbouring_blocks_become_one_fiber(tmp_path):
     assert np.abs(points[:, 1:] - 48).max() < 1e-3
 
 
+def test_splines_meeting_at_a_shared_end_point_become_one_fiber(tmp_path):
+    stitcher = Stitcher(tmp_path)
+    try:
+        stitcher.add_block("block-0", [0, 0, 0], list(SHAPE_XYZ), [("V", line(10, 60)), ("V", line(60, 130))],
+                           (np.zeros(3), np.asarray(SHAPE_XYZ)))
+        fibers = list(stitcher.chains())
+    finally:
+        stitcher.close()
+    assert len(fibers) == 1
+    assert np.isclose(fibers[0]["points"][:, 0].min(), 10) and np.isclose(fibers[0]["points"][:, 0].max(), 130)
+
+
 def test_a_short_aligned_gap_is_joined_by_the_catalogue(tmp_path):
     fibers = whole(tmp_path, [("V", line(10, 130)), ("V", line(146, 290))], np.zeros(SHAPE_XYZ[::-1], np.uint8))
     assert len(fibers) == 1 and fibers[0]["gaps"] == [[240, 241]]
