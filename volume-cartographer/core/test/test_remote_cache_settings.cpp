@@ -3,7 +3,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
 #include <cstdlib>
@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 // First in the file: remoteCachePath resolves once per process.
 TEST_CASE("remoteCachePath takes cache.json before the INI and creates the root")
 {
-    const auto config = fs::temp_directory_path() / ("vc_remote_cache_path_" + std::to_string(vc::memmap::pid()));
+    const auto config = fs::temp_directory_path() / ("vc_remote_cache_path_" + std::to_string(vc::pages::pid()));
     fs::remove_all(config);
     fs::create_directories(config);
     setenv("VC3D_CONFIG_DIR", config.c_str(), 1);
@@ -30,7 +30,7 @@ TEST_CASE("remoteCachePath takes cache.json before the INI and creates the root"
 
 TEST_CASE("remoteOpenOptions maps the INI to vc_reader options")
 {
-    const auto config = fs::temp_directory_path() / ("vc_remote_cache_settings_" + std::to_string(vc::memmap::pid()));
+    const auto config = fs::temp_directory_path() / ("vc_remote_cache_settings_" + std::to_string(vc::pages::pid()));
     fs::remove_all(config);
     fs::create_directories(config);
     setenv("VC3D_CONFIG_DIR", config.c_str(), 1);

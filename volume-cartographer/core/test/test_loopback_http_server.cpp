@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "support/LoopbackHttpServer.hpp"
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 
 #include <vc_reader/native/http.hpp>
 #include <vc_reader/s3_listing.hpp>
@@ -24,7 +24,7 @@ namespace {
 
 fs::path fixtureRoot()
 {
-    const auto root = fs::temp_directory_path() / ("vc_loopback_http_" + std::to_string(vc::memmap::pid()));
+    const auto root = fs::temp_directory_path() / ("vc_loopback_http_" + std::to_string(vc::pages::pid()));
     fs::remove_all(root);
     for (const auto& [name, size] : {std::pair{"a.txt", 5}, {"dir/b.bin", 1000}, {"pfx/x/1", 1}, {"pfx/x/2", 2}, {"pfx/y", 3}}) {
         fs::create_directories((root / name).parent_path());

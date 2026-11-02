@@ -13,7 +13,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "support/LoopbackHttpServer.hpp"
 #include "support/TestProject.hpp"
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
@@ -439,7 +439,7 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_lasagna_pairing_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_lasagna_pairing_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::project::LoadOptions options;
     options.catalog = lasagnaCatalog(
@@ -471,7 +471,7 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
 TEST_CASE("Manual project Lasagna resolution materializes a selected remote manifest")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_remote_manual_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_remote_manual_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::test::LoopbackHttpServer server;
     const auto served = root / "served";
@@ -524,7 +524,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_lasagna_shape_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_lasagna_shape_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::project::LoadOptions options;
     options.catalog = lasagnaCatalog(R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") +
@@ -622,7 +622,7 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     CHECK(withScan->volumeEntries().front().location == source.resolvedUrl);
     // The L0 scan resolves the level-2 Lasagna directly.
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_selected_lasagna_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_selected_lasagna_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     auto catalog = std::make_shared<vcr::catalog::OpenDataManifest>();
     catalog->samples = {sample};
@@ -716,7 +716,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
 
     // Each store streams from its own cache entry.
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_normal_grids_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_normal_grids_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     auto pkg = vc::test::emptyProject();
     CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
@@ -756,7 +756,7 @@ TEST_CASE("Normal grids download through the file cache: listing, signed objects
 {
     // A signed bucket on a loopback server, reached through the environment's keys and endpoint.
     const auto scratch = std::filesystem::temp_directory_path() /
-        ("vc_open_data_grid_download_" + std::to_string(vc::memmap::pid()));
+        ("vc_open_data_grid_download_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(scratch);
     const auto bucket = scratch / "bucket", root = scratch / "cache";
     for (const char* plane : {"xy", "xz", "yz"}) {
@@ -978,7 +978,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
 TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projects")
 {
     const auto root = std::filesystem::current_path() /
-        ("project_defaults_test_" + std::to_string(vc::memmap::pid()));
+        ("project_defaults_test_" + std::to_string(vc::pages::pid()));
     // projectsDirectory() creates VC3D's AppData projects directory.
     const QByteArray previousDataHome = qgetenv("XDG_DATA_HOME");
     qputenv("XDG_DATA_HOME", QByteArray::fromStdString((root / "xdg-data").string()));
@@ -1080,7 +1080,7 @@ TEST_CASE("A sample's project file names its sample and references its store")
     auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto sample = *manifest.findSample("PHerc0139");
     const auto root = std::filesystem::current_path() /
-        ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
+        ("selective_catalog_test_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     vc::objects::OpenOptions options;
     options.author = "vc-test";
@@ -1164,7 +1164,7 @@ TEST_CASE("Reopening a sample's project keeps what the user changed")
     sample.id = "Sample With Spaces";
 
     const auto root = std::filesystem::temp_directory_path() /
-                      ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
+                      ("vc_open_data_sample_project_test_" + std::to_string(vc::pages::pid()));
     std::filesystem::remove_all(root);
     const auto path = sampleProjectPath(root, sample);
     CHECK(path == root / "open_data" / "Sample_With_Spaces.vcproj");

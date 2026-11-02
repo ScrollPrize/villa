@@ -8,7 +8,7 @@
 
 #include "support/LoopbackHttpServer.hpp"
 #include "vc/core/util/GridStore.hpp"
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
 #include <vc_reader/zarr.hpp>
@@ -43,7 +43,7 @@ void writeIni(const fs::path& configDir, unsigned long long minFreeGib)
 
 // A served normal-grid store, a cache root, and the marker directory at the store URL's place.
 struct Streamed {
-    fs::path scratch = fs::temp_directory_path() / ("vc_ngv_stream_" + std::to_string(vc::memmap::pid()));
+    fs::path scratch = fs::temp_directory_path() / ("vc_ngv_stream_" + std::to_string(vc::pages::pid()));
     fs::path store = scratch / "store", config = scratch / "config", root = scratch / "cache";
     LoopbackHttpServer server;
     std::string url = server.url() + "/ng";

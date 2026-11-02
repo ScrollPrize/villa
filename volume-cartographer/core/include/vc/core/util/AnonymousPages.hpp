@@ -1,13 +1,10 @@
 #pragma once
 
-// Portable memory-mapping helpers: POSIX mmap on *nix, file mappings /
-// VirtualAlloc on Windows. Implementation lives in MemMap.cpp so <windows.h>
-// never leaks into headers.
+// Anonymous, lazily committed pages on POSIX and Windows.
 
 #include <cstddef>
-#include <filesystem>
 
-namespace vc::memmap {
+namespace vc::pages {
 
 // Current process id (getpid / _getpid).
 int pid();
@@ -17,4 +14,4 @@ int pid();
 void* anonAlloc(std::size_t bytes);
 void anonFree(void* ptr, std::size_t bytes) noexcept;
 
-}  // namespace vc::memmap
+}  // namespace vc::pages

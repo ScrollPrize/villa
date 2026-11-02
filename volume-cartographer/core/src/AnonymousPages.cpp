@@ -1,4 +1,4 @@
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 
 #include <new>
 #include <stdexcept>
@@ -20,7 +20,7 @@
 #  include <unistd.h>
 #endif
 
-namespace vc::memmap {
+namespace vc::pages {
 
 int pid()
 {
@@ -62,4 +62,4 @@ void anonFree(void* ptr, std::size_t bytes) noexcept
 #endif
 }
 
-}  // namespace vc::memmap
+}  // namespace vc::pages

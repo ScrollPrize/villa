@@ -20,7 +20,7 @@ add_library(vc_core
         src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
-        src/MemMap.cpp
+        src/AnonymousPages.cpp
         src/UnixSocket.cpp
         src/SparseChunkSpool.cpp
         src/PlaneSurface.cpp

@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <bit>
 
-#include "vc/core/util/MemMap.hpp"
+#include "vc/core/util/AnonymousPages.hpp"
 
 #include <omp.h>
 
@@ -146,7 +146,7 @@ struct AnonMmap {
     explicit AnonMmap(size_t bytes) : bytes_(bytes) {
         if (bytes_ == 0) return;
         try {
-            ptr_ = vc::memmap::anonAlloc(bytes_);
+            ptr_ = vc::pages::anonAlloc(bytes_);
         } catch (...) {
             ptr_ = nullptr;
             bytes_ = 0;
@@ -173,7 +173,7 @@ struct AnonMmap {
     }
     ~AnonMmap() { reset(); }
     void reset() {
-        vc::memmap::anonFree(ptr_, bytes_);
+        vc::pages::anonFree(ptr_, bytes_);
         ptr_ = nullptr;
         bytes_ = 0;
     }
