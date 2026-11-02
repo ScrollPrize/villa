@@ -1,4 +1,5 @@
 #include "FiberConstraintDatabase.hpp"
+#include "FiberConstraintPipeline.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/core/util/AtomicFile.hpp"
@@ -170,11 +171,7 @@ nlohmann::json streamFiberConstraintDatabase(
         std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
         std::vector<std::array<std::string,3>> encoded;
     };
-    std::mutex queueMutex;
-    std::condition_variable_any queueReady;
-    std::deque<EncodedBatch> queue;
-    std::exception_ptr producerFailure;
-    bool producerDone=false;
+    FiberConstraintPipeline<EncodedBatch> queue;
     // A bounded preparation queue overlaps normal sampling/encoding with the
     // single SQLite writer. Connection ownership and insertion order stay fixed.
     std::jthread producer([&](std::stop_token stop) {
@@ -182,10 +179,7 @@ nlohmann::json streamFiberConstraintDatabase(
     size_t begin=0;
     bool sourceDone=false;
     while(!sourceDone) {
-        {
-            std::unique_lock lock(queueMutex);
-            if(!queueReady.wait(lock,stop,[&]{return queue.size()<2;}))return;
-        }
+        if(!queue.waitForSpace(stop))return;
         EncodedBatch batch;batch.begin=begin;
         // Small extraction jobs are coalesced into useful sampling/encoding
         // batches, not a new OpenMP team for every fiber pair.
@@ -226,34 +220,18 @@ nlohmann::json streamFiberConstraintDatabase(
         }
         for(const auto& failure:failures)if(failure)std::rethrow_exception(failure);
         serializationSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-serializationStart).count();
-        {
-            std::lock_guard lock(queueMutex);
-            queue.push_back(std::move(batch));
-        }
-        queueReady.notify_all();
+        queue.push(std::move(batch));
         begin=end;
     }
     } catch(...) {
-        std::lock_guard lock(queueMutex);producerFailure=std::current_exception();
+        queue.finish(std::current_exception());return;
     }
-    {
-        std::lock_guard lock(queueMutex);producerDone=true;
-    }
-    queueReady.notify_all();
+    queue.finish();
     });
     size_t eventCount=0;
     for(;;) {
-        EncodedBatch batch;
-        {
-            std::unique_lock lock(queueMutex);
-            queueReady.wait(lock,[&]{return !queue.empty() || producerDone;});
-            if(queue.empty()) {
-                if(producerFailure)std::rethrow_exception(producerFailure);
-                break;
-            }
-            batch=std::move(queue.front());queue.pop_front();
-        }
-        queueReady.notify_all();
+        auto next=queue.pop();if(!next)break;
+        auto batch=std::move(*next);
         const auto begin=batch.begin,end=batch.end;
         const auto& samples=batch.samples;
         const auto& encoded=batch.encoded;
@@ -344,6 +322,137 @@ nlohmann::json streamFiberConstraintDatabase(
     stats["persist_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-persistStart).count();
     stats["database_bytes"]=std::filesystem::file_size(output);
     return stats;
+}
+
+nlohmann::json updateFiberConstraintNormals(sqlite3* source, sqlite3* destination,
+    std::span<const cv::Vec3d> baked, std::span<const unsigned char> valid,
+    int threads, int updateBatchRows)
+{
+    using Clock=std::chrono::steady_clock;
+    using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
+    if(baked.size()!=valid.size() || baked.size()%2 || threads<1 || updateBatchRows<1 || updateBatchRows>32)
+        throw std::invalid_argument("Invalid normal publication arguments");
+    const auto check=[](sqlite3* db,int rc) {
+        if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db));
+    };
+    const auto prepare=[&](sqlite3* db,const std::string& sql) {
+        sqlite3_stmt* raw=nullptr;check(db,sqlite3_prepare_v2(db,sql.c_str(),-1,&raw,nullptr));
+        return Statement(raw,sqlite3_finalize);
+    };
+    const auto started=Clock::now();const size_t events=baked.size()/2;
+    struct Row { sqlite3_int64 id;std::array<std::string,2> normals;bool changed=false; };
+    struct Batch { size_t scanned=0;std::vector<Row> rows; };
+    FiberConstraintPipeline<Batch> queue;
+    double readSeconds=0,encodeSeconds=0,writeSeconds=0;
+    std::jthread producer([&](std::stop_token stop) {
+        try {
+            auto query=prepare(source,"SELECT id,normal_a,normal_b FROM constraints ORDER BY id");
+            size_t count=0;int rc=SQLITE_ROW;
+            while(rc==SQLITE_ROW) {
+                if(!queue.waitForSpace(stop))return;
+                Batch batch;batch.rows.reserve(32768);
+                const auto readStart=Clock::now();
+                while(batch.rows.size()<32768 && (rc=sqlite3_step(query.get()))==SQLITE_ROW) {
+                    const auto id=sqlite3_column_int64(query.get(),0);
+                    if(id!=static_cast<sqlite3_int64>(count) || count>=events)
+                        throw std::runtime_error("Normal publication constraint IDs/count changed");
+                    Row row;row.id=id;
+                    for(int side=0;side<2;++side) {
+                        const auto* value=sqlite3_column_text(query.get(),side+1);
+                        if(!value)throw std::runtime_error("Null endpoint normal record");
+                        row.normals[side].assign(reinterpret_cast<const char*>(value),sqlite3_column_bytes(query.get(),side+1));
+                    }
+                    batch.rows.push_back(std::move(row));++count;
+                }
+                if(rc!=SQLITE_ROW)check(source,rc);
+                readSeconds+=std::chrono::duration<double>(Clock::now()-readStart).count();
+                if(batch.rows.empty())break;
+                batch.scanned=batch.rows.size();
+                const auto encodeStart=Clock::now();
+                std::vector<std::exception_ptr> failures(batch.rows.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+                for(std::ptrdiff_t i=0;i<static_cast<std::ptrdiff_t>(batch.rows.size());++i) {
+                    try {
+                        auto& row=batch.rows[i];
+                        for(int side=0;side<2;++side) {
+                            const auto slot=2*static_cast<size_t>(row.id)+side;
+                            auto n=Json::parse(row.normals[side]);
+                            if(n.at("valid").get<bool>()!=bool(valid[slot]))
+                                throw std::runtime_error("Endpoint validity changed");
+                            if(valid[slot]) {
+                                const auto& p=n.at("xyz");
+                                const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
+                                if(std::min(cv::norm(old-baked[slot]),cv::norm(old+baked[slot]))>1e-12)
+                                    throw std::runtime_error("Endpoint normal axis changed, not merely sign");
+                                n["xyz"]=point(baked[slot]);
+                            }
+                            auto encoded=n.dump();
+                            row.changed|=encoded!=row.normals[side];
+                            row.normals[side]=std::move(encoded);
+                        }
+                    } catch(...) {failures[i]=std::current_exception();}
+                }
+                for(const auto& failure:failures)if(failure)std::rethrow_exception(failure);
+                std::erase_if(batch.rows,[](const Row& row){return !row.changed;});
+                encodeSeconds+=std::chrono::duration<double>(Clock::now()-encodeStart).count();
+                queue.push(std::move(batch));
+            }
+            if(count!=events)throw std::runtime_error("Endpoint count changed");
+            queue.finish();
+        } catch(...) {queue.finish(std::current_exception());}
+    });
+    // UPDATE FROM is available since SQLite3.33. Preserve portability on older
+    // system libraries with the same bounded/parallel producer and scalar SQL.
+    const bool multi=sqlite3_libversion_number()>=3033000;
+    const int batchRows=multi?std::min(updateBatchRows,sqlite3_limit(destination,SQLITE_LIMIT_VARIABLE_NUMBER,-1)/3):1;
+    if(batchRows<1)throw std::runtime_error("SQLite variable limit too small");
+    std::vector<Statement> updates;
+    for(int i=0;i<=batchRows;++i)updates.emplace_back(nullptr,sqlite3_finalize);
+    const auto statement=[&](size_t count) {
+        auto& out=updates.at(count);
+        if(!out) {
+            std::string sql;
+            if(multi) {
+                sql="WITH changes(id,a,b) AS (VALUES ";
+                for(size_t i=0;i<count;++i)sql+=(i?",(?,?,?)":"(?,?,?)");
+                sql+=") UPDATE constraints SET normal_a=changes.a,normal_b=changes.b FROM changes WHERE constraints.id=changes.id";
+            } else sql="UPDATE constraints SET normal_a=?2,normal_b=?3 WHERE id=?1";
+            out=prepare(destination,sql);
+        }
+        return out.get();
+    };
+    size_t scanned=0,written=0;double lastProgress=0.;
+    while(auto batch=queue.pop()) {
+        const auto writeStart=Clock::now();
+        for(size_t begin=0;begin<batch->rows.size();begin+=batchRows) {
+            const size_t end=std::min(begin+batchRows,batch->rows.size());
+            auto* update=statement(end-begin);
+            struct Release {sqlite3_stmt* p;~Release(){sqlite3_clear_bindings(p);}} release{update};
+            for(size_t i=begin;i<end;++i) {
+                const auto& row=batch->rows[i];const int base=3*static_cast<int>(i-begin);
+                check(destination,sqlite3_bind_int64(update,base+1,row.id));
+                for(int side=0;side<2;++side)check(destination,sqlite3_bind_text(update,base+2+side,
+                    row.normals[side].c_str(),int(row.normals[side].size()),SQLITE_STATIC));
+            }
+            check(destination,sqlite3_step(update));
+            if(sqlite3_changes(destination)!=static_cast<int>(end-begin))throw std::runtime_error("Missing destination normal rows");
+            check(destination,sqlite3_reset(update));
+        }
+        writeSeconds+=std::chrono::duration<double>(Clock::now()-writeStart).count();
+        scanned+=batch->scanned;written+=batch->rows.size();
+        const double elapsed=std::chrono::duration<double>(Clock::now()-started).count();
+        if(elapsed-lastProgress>=2. || scanned==events) {
+            std::cout<<"oriented endpoint publication "<<scanned<<"/"<<events<<" updated="<<written
+                <<" skipped="<<scanned-written<<" seconds="<<elapsed<<" rows_per_second="<<scanned/std::max(elapsed,1e-9)<<std::endl;
+            lastProgress=elapsed;
+        }
+    }
+    producer.join();
+    return Json{{"scanned",scanned},{"updated",written},{"unchanged",scanned-written},
+        {"batch_rows",batchRows},{"read_seconds",readSeconds},{"encode_seconds",encodeSeconds},
+        {"write_seconds",writeSeconds},{"seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
 }
 
 nlohmann::json orientFiberConstraintDatabase(
@@ -588,33 +697,13 @@ nlohmann::json orientFiberConstraintDatabase(
     check(dst.get(),copyRc);check(dst.get(),finishRc);
     const auto exec=[&](const char* sql){check(dst.get(),sqlite3_exec(dst.get(),sql,nullptr,nullptr,nullptr));};
     exec("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; ALTER TABLE fibers ADD COLUMN normal_sign INTEGER NOT NULL DEFAULT 1 CHECK(normal_sign IN(-1,1)); PRAGMA user_version=2;");
-    auto update=prepare(dst.get(),"UPDATE constraints SET normal_a=?,normal_b=? WHERE id=?");
-    query=prepare(src.get(),"SELECT id,normal_a,normal_b FROM constraints ORDER BY id");
-    size_t count=0;
-    while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
-        for(int side=0;side<2;++side) {
-            const auto slot=2*count+side;
-            auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),1+side)));
-            if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Endpoint validity changed");
-            if(valid[slot]) {
-                const auto& p=n.at("xyz");const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
-                if(std::min(cv::norm(old-baked[slot]),cv::norm(old+baked[slot]))>1e-12)
-                    throw std::runtime_error("Endpoint normal axis changed, not merely sign");
-                n["xyz"]=point(baked[slot]);
-            }
-            const auto str=n.dump();check(dst.get(),sqlite3_bind_text(update.get(),side+1,str.c_str(),int(str.size()),SQLITE_TRANSIENT));
-        }
-        check(dst.get(),sqlite3_bind_int64(update.get(),3,count));check(dst.get(),sqlite3_step(update.get()));
-        check(dst.get(),sqlite3_reset(update.get()));++count;
-        if(count%262144==0)std::cout<<"oriented endpoint publication "<<count<<"/"<<events<<std::endl;
-    }
-    check(src.get(),rc);
-    if(count!=events)throw std::runtime_error("Endpoint count changed");
+    query.reset();
+    const auto publication=updateFiberConstraintNormals(src.get(),dst.get(),baked,valid,threads);
     Json stats={{"fibers",fiberCount},{"constraints",events},{"samples",samplesTotal},{"flipped_samples",flips},
         {"flipped_endpoints",endpointFlips},{"invalid_samples",invalid},{"invalid_endpoints",invalidEndpoints},
         {"fibers_without_valid_normals",invalidFibers},{"sample_spacing_base",sampleSpacing},
         {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
-        {"source_database",input.string()},{"cross_fiber_alignment",false}};
+        {"source_database",input.string()},{"cross_fiber_alignment",false},{"publication",publication}};
     auto meta=prepare(dst.get(),"INSERT OR REPLACE INTO metadata VALUES(?,?)");
     const auto put=[&](const char* key,const Json& value) {
         const auto str=value.dump();check(dst.get(),sqlite3_bind_text(meta.get(),1,key,-1,SQLITE_STATIC));
@@ -629,7 +718,7 @@ nlohmann::json orientFiberConstraintDatabase(
         throw std::runtime_error("Oriented database integrity failure");
     auto fk=prepare(dst.get(),"PRAGMA foreign_key_check");
     if(sqlite3_step(fk.get())!=SQLITE_DONE)throw std::runtime_error("Oriented database foreign-key failure");
-    fk.reset();integrity.reset();meta.reset();update.reset();query.reset();dst.reset();src.reset();
+    fk.reset();integrity.reset();meta.reset();query.reset();dst.reset();src.reset();
     std::filesystem::rename(partial,output);
     stats["total_seconds"]=std::chrono::duration<double>(Clock::now()-started).count();
     stats["database_bytes"]=std::filesystem::file_size(output);

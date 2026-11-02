@@ -1,7 +1,48 @@
 import numpy as np
 import json
+import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow import Seam
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_flow_reference_eval import sample_arcs,continuous_winding,error_summary,analyze
+
+
+def test_solution_component_maps_to_original_geometry_indices():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_flow_reference_eval import solution_catalog_indices
+    catalog=dict(source_id=np.array([0,3,7,11]),family=np.array([0,1,0,1]))
+    solution=dict(source_id=np.array([0,7,11]),family=np.array([0,0,1]))
+    np.testing.assert_array_equal(solution_catalog_indices(catalog,solution),[0,2,3])
+    with pytest.raises(ValueError,match='classification'):
+        solution_catalog_indices(catalog,dict(solution,family=np.array([1,0,1])))
+    with pytest.raises(ValueError,match='Unknown'):
+        solution_catalog_indices(catalog,dict(source_id=np.array([2]),family=np.array([0])))
+    with pytest.raises(ValueError,match='Invalid'):
+        solution_catalog_indices(catalog,dict(source_id=np.array([12]),family=np.array([0])))
+
+
+def test_fresh_projection_of_noncontiguous_component(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_flow_reference_eval as mod
+    seam=Seam(np.array([[0,0,-1],[0,0,100]]))
+    catalog=dict(source_id=np.array([0,3,7,11]),family=np.array([0,1,0,1]))
+    def at_many(ids,arc):
+        return np.column_stack([np.ones(len(ids)),np.zeros(len(ids)),arc]),np.zeros(len(ids))
+    paths=SimpleNamespace(catalog=catalog,ids=catalog['source_id'],seam=seam,
+        offset=np.array([0,2,4,6,8]),keys={'arc':np.array([0,10,0,20,0,30,0,40])},at_many=at_many)
+    monkeypatch.setattr(mod,'PackedPaths',lambda _:paths)
+    monkeypatch.setattr(mod,'Surface',lambda *a:SimpleNamespace(x=None,q=None,
+        project=lambda xyz:(np.zeros((len(xyz),2)),np.zeros(len(xyz)))))
+    monkeypatch.setattr(mod,'winding_at',lambda x,*a:np.ones(len(x)))
+    solution=tmp_path/'solution.npz'
+    np.savez(solution,source_id=np.array([3,11]),family=np.array([1,1]),
+        winding=np.zeros(2),component=np.zeros(2,dtype=int))
+    config=dict(geometry='unused',solution=str(solution),output_root=str(tmp_path/'result'),
+        allow_solution_subset=True,spiral=dict(reference='unused',sample_spacing=10,fiber_batch=1))
+    result=mod.run(config)
+    assert result['fibers']==2
+    assert result['spiral']['samples']==8  # lengths20 and40, not the first two catalog entries
+    assert result['spiral']['all']['l1']==0
+    with np.load(tmp_path/'result/fiber_reference.npz') as saved:
+        np.testing.assert_array_equal(saved['source_id'],[3,11])
+        np.testing.assert_allclose(saved['coverage'],1)
 
 
 def test_sampling_preserves_lengths_and_endpoints():

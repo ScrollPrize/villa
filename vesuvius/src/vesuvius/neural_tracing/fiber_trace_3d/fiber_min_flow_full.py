@@ -212,6 +212,13 @@ def run(config):
         combined={k:np.concatenate([p[k] for p in parts]) for k in ('a','b','target','weight')};del parts
         g=aggregate_l1_edges(**combined);del combined
         np.savez(merged_path,**g)
+    if config.get('prepare_only',False):
+        summary=dict(fibers=len(catalog['source_id']),arcs=len(g['a']),
+                     seconds=time.monotonic()-started,gt_used=False,prepared_only=True)
+        write(root/'summary.json',summary)
+        write(root/'progress.json',dict(stage='prepared',**summary))
+        print(json.dumps(summary),flush=True)
+        return summary
     print(json.dumps(dict(stage='solve',fibers=len(catalog['source_id']),arcs=len(g['a']),
                           preparation_seconds=time.monotonic()-started)),flush=True)
     write(root/'progress.json',dict(stage='solve',fibers=len(catalog['source_id']),arcs=len(g['a'])))

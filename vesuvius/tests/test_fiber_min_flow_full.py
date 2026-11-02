@@ -44,3 +44,18 @@ def test_graph_accepts_uint8_hv_labels_without_unsigned_subtraction():
            distance=np.array([.5]),sign=np.array([1]),parallel=np.array([False]))
     g,_=graph({},d,Geometry())
     assert g['target'].tolist()==[1]
+
+
+def test_prepare_only_never_launches_solver(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_min_flow_full as mod
+    inputs={}
+    for key in ('afv','database','comparison','normal_solution','umbilicus'):
+        p=tmp_path/key;p.write_text('input');inputs[key]=str(p)
+    root=tmp_path/'output';root.mkdir()
+    np.savez(root/'graph.npz',a=np.array([0]),b=np.array([1]),target=np.array([1]),weight=np.array([1.]))
+    monkeypatch.setattr(mod,'prepare',lambda _:dict(source_id=np.array([1,2])))
+    def fail(*args,**kwargs):raise AssertionError('prepare_only invoked solver')
+    monkeypatch.setattr(mod,'solve',fail)
+    result=mod.run(dict(inputs,output_root=str(root),prepare_only=True))
+    assert result['prepared_only'] and result['fibers']==2 and result['arcs']==1
+    assert not (root/'solution.npz').exists()

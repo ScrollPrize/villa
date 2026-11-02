@@ -16,9 +16,17 @@ class NormalSampler {
     vc::lasagna::LasagnaDataset dataset_;
     vc::lasagna::LasagnaNormalSampler sampler_;
 public:
-    NormalSampler(const std::string& manifest, const std::string& cacheRoot)
-        : dataset_(vc::lasagna::LasagnaDataset::openLocation(manifest, options(cacheRoot))),
+    NormalSampler(const std::string& manifest, const std::string& cacheRoot, const std::string& source)
+        : dataset_(load(manifest,cacheRoot,source)),
           sampler_(dataset_) {}
+
+    static vc::lasagna::LasagnaDataset load(const std::string& manifest,
+            const std::string& cacheRoot,const std::string& source) {
+        auto dataset=vc::lasagna::LasagnaDataset::openLocation(manifest,options(cacheRoot));
+        if(source=="fiber") return vc::lasagna::fiberSheetNormalDataset(dataset);
+        if(source!="lasagna") throw std::invalid_argument("normal_source must be lasagna or fiber");
+        return dataset;
+    }
 
     static vc::lasagna::LasagnaDatasetOpenOptions options(const std::string& root) {
         vc::lasagna::LasagnaDatasetOpenOptions result;
@@ -58,8 +66,9 @@ public:
 void bindNormalSampler(nb::module_& m) {
     nb::class_<NormalSampler>(m, "NormalSampler",
         "Native Lasagna normals in base XYZ coordinates, using the shared chunk cache.")
-        .def(nb::init<const std::string&, const std::string&>(),
-             "manifest"_a, "cache_root"_a="", nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<const std::string&, const std::string&, const std::string&>(),
+             "manifest"_a, "cache_root"_a="", "normal_source"_a="lasagna",
+             nb::call_guard<nb::gil_scoped_release>())
         .def("sample", &NormalSampler::sample, "points_xyz"_a, "threads"_a=1,
              "Return (unit normals XYZ, validity) through native interpolation.");
 }

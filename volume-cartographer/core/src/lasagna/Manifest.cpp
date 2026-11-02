@@ -225,7 +225,6 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
     nlohmann::json root;
     input >> root;
     LasagnaDatasetManifest manifest = parseText(root.dump(), manifestPath);
-    manifest.raw = std::move(root);
     return manifest;
 }
 
@@ -236,6 +235,12 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     nlohmann::json root = nlohmann::json::parse(jsonText);
     if (!root.is_object()) {
         throw std::runtime_error("Lasagna manifest root must be a JSON object");
+    }
+    if (root.contains("lasagna")) {
+        auto embedded=root.at("lasagna");
+        if (!embedded.is_object() || embedded.value("version",0)!=3)
+            throw std::invalid_argument("embedded Lasagna manifest must be version 3");
+        root=std::move(embedded);
     }
 
     LasagnaDatasetManifest manifest;

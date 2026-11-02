@@ -34,7 +34,35 @@ to the same standalone exporter. Supply `native_regression_binary` to the
 normal/axial-prior wrappers to run the native regression executable first.
 Other native tools, such as reference replay, must be available separately.
 
+Normal-orientation publication uses a bounded producer/writer pipeline: endpoint
+JSON validation and serialization run in parallel, while a single SQLite writer
+updates up to 32 changed rows per statement. Byte-identical rows are skipped;
+axis/validity checks, transactional publication and final database integrity
+checks are retained. Older SQLite versions without `UPDATE FROM` use scalar
+updates with the same parallel producer. Publication statistics include scanned,
+changed and unchanged rows, plus read, encoding and write timings (overlapping,
+so these are not additive wall time).
+
+Build the native `test_fiber_normal_publication` target to validate exact output
+against the previous scalar implementation. Run it without arguments for
+regressions, or with `--benchmark 1000000 8 32` for three paired measurements
+(rows, encoding threads, SQL batch size). This is an in-memory microbenchmark;
+full-database cloning, disk I/O and integrity checks require end-to-end timing.
+
 ## Preparation and evaluation
+
+`fiber_selected_solver_comparison` can reuse an existing `selection_root` with
+frozen sign/H/V/broken classifications and extracted constraints. Optional
+`minimum_length_mm` and `minimum_width_base` strictly filter whole fibers before
+the existing largest-component/perpendicular-support selection. Length uses the
+AFV's explicit `root.voxel_size_mm`; width uses the stored piece-local
+length-weighted `fiber_attributes.width_mean` in base voxels (not the parent
+coverage-policy width). Missing widths are excluded and counted. The selection
+report records threshold counts and final mean/median/total physical length.
+No sign estimation, H/V classification or constraint extraction is repeated.
+Use `include_sgd:false`, `exact_lp:false`, `capacity_scales:[]` and
+`uv_methods:["irls"]` for IRLS only followed by fixed-label U/V fitting.
+These filters must match when reusing a `prepared_root`.
 
 ### Same-input IRLS winding comparison
 
@@ -318,6 +346,10 @@ Preparation uses `workers` (32), `geometry_batch` (4096 fibers),
 `constraint_batch` (500000 database IDs), and `read_batch` (32768 rows).
 The same `perpendicular_relative_weight`, `perpendicular_offset`, and
 `lasagna_winding_scale` settings as selection control the shared flow objective.
+Set `prepare_only: true` to publish the packed geometry and `graph.npz` without
+starting HiGHS. The summary then records `prepared_only: true` and no solution is
+written. This graph can be passed as `source_root` to `fiber_irls_benchmark` with
+`full_graph: true` for an IRLS-only solve of its largest connected component.
 
 Exact original polylines and seam transport are packed into memory-mapped arrays;
 workers stream disjoint constraint-ID ranges. Only identical L1 arcs are combined,
@@ -472,6 +504,11 @@ configuration), `reference` (explicit frozen offsets/exclusions), and `events`
 both single-global-offset and explicitly separate component-aligned diagnostics.
 `spiral` supplies `reference` (tifxyz), `xyz_scale`, `surface_stride`, `workers`,
 `candidates`, `sample_spacing`, `max_distance`, and `fiber_batch`.
+Set `allow_solution_subset: true` for a component-only solution drawn from the
+full geometry catalog; source IDs and family labels are validated before mapping
+to the original geometry. Set `continuous_gt_protocol: true` to additionally
+report the same continuous-endpoint, single-global-integer-offset GT metrics as
+the IRLS comparison workflow, alongside the explicit-integer reference metrics.
 
 The spiral check samples all fibers uniformly in arc length, including endpoints,
 and reuses the nearest-surface projection implementation. Continuous fitted
@@ -601,6 +638,15 @@ FIBER_LAYOUT_REFERENCE_SPEC=/configs/fiber-layout/benchmark.json python -m pytes
 ```
 
 ## Route-page import
+
+`fiber_stream_import` imports completed `fiber-stream-attributes-v2` tile exports.
+Set `tiles`, `output_root`, `frame_template`, and optionally `workers` (16).
+Optional `z_range: [lower, upper]` selects whole fibers intersecting that slab;
+omit it or use null for the full volume. The importer verifies completion,
+coordinate-space identity, unique source IDs, and source counts, preserves the
+native base-voxel geometry and IDs, and sets family to unknown for independent
+H/V classification. Tile decoding is parallel with bounded outstanding work;
+the shared AFV writer still buffers the selected records before database export.
 
 `fiber_route_import` converts native `vc-fiber-routes-v4-reduced` page exports
 into AFV using the shared AFV writer. Configure `routes`, `output_root`,

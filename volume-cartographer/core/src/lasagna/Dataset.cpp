@@ -23,6 +23,8 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <span>
+#include <sstream>
+#include <cstring>
 
 #include <stdexcept>
 #include <string_view>
@@ -627,7 +629,8 @@ LasagnaDataset LasagnaDataset::open(const std::filesystem::path& manifestPath,
                                     LasagnaDatasetOpenOptions options)
 {
     validateOpenOptions(options);
-    auto manifest = LasagnaDatasetManifest::parseFile(manifestPath);
+    auto manifest = LasagnaDatasetManifest::parseFile(
+        std::filesystem::is_directory(manifestPath) ? manifestPath/".zattrs" : manifestPath);
     manifest.manifestLocation = manifest.manifestPath.string();
     manifest.manifestIsRemote = false;
     manifest.workingToBaseScale = options.workingToBaseScale;
@@ -710,23 +713,109 @@ const std::filesystem::path& LasagnaDataset::normalSourcePath() const
     return *manifest_.normalPath;
 }
 
+namespace {
+// Read-only 3D channel view. The original array performs codec/filter decoding;
+// the view only selects bytes, and never materializes or rewrites a volume.
+class ChannelViewStore final : public utils::Store {
+    utils::ZarrArray source_;
+    std::size_t channel_;
+    std::string metadata_;
+public:
+    ChannelViewStore(utils::ZarrArray source, std::size_t channel, std::size_t channels)
+        : source_(std::move(source)), channel_(channel)
+    {
+        auto m = source_.metadata();
+        if (m.shape.size()!=4 || m.chunks.size()!=4 || m.shape[0]!=channels ||
+            channel>=channels || m.chunks[0]==0)
+            throw std::invalid_argument("packed channel count/layout disagrees with manifest");
+        m.shape.erase(m.shape.begin());
+        m.chunks.erase(m.chunks.begin());
+        m.version=utils::ZarrVersion::v2;
+        m.compressor_id.clear(); m.filters.clear(); m.codecs.clear(); m.shard_config.reset();
+        m.dimension_separator="/";
+        // read_chunk returns decoded native-order bytes.
+        const std::uint16_t endian=1;
+        m.byte_order=(*reinterpret_cast<const unsigned char*>(&endian)==1)?'<':'>';
+        metadata_=utils::detail::serialize_zarray(m);
+    }
+    bool exists(const std::string& key) const override { return get_if_exists(key).has_value(); }
+    std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override {
+        if(key==".zarray") {
+            std::vector<std::byte> bytes(metadata_.size());
+            std::memcpy(bytes.data(),metadata_.data(),bytes.size()); return bytes;
+        }
+        if(key.empty() || key[0]=='.' || key=="zarr.json") return std::nullopt;
+        std::array<std::size_t,4> index{};
+        char a,b; std::istringstream input(key);
+        if(!(input>>index[1]>>a>>index[2]>>b>>index[3]) || a!='/' || b!='/' || input.peek()!=EOF)
+            throw std::invalid_argument("invalid channel-view chunk key: "+key);
+        const auto& m=source_.metadata();
+        index[0]=channel_/m.chunks[0];
+        auto bytes=source_.read_chunk(index);
+        if(!bytes) return std::nullopt; // Preserve missing chunks and fill semantics.
+        const auto plane=m.chunk_byte_size()/m.chunks[0];
+        const auto offset=(channel_%m.chunks[0])*plane;
+        if(bytes->size()!=m.chunk_byte_size()) throw std::runtime_error("invalid packed chunk byte count");
+        return std::vector<std::byte>(bytes->begin()+offset,bytes->begin()+offset+plane);
+    }
+    std::vector<std::byte> get(const std::string& key) const override {
+        auto bytes=get_if_exists(key);
+        if(!bytes) throw std::runtime_error("missing channel-view key: "+key);
+        return std::move(*bytes);
+    }
+    void set(const std::string&,std::span<const std::byte>) override { throw std::runtime_error("read-only channel view"); }
+    void erase(const std::string&) override { throw std::runtime_error("read-only channel view"); }
+};
+}
+
 utils::ZarrArray openLasagnaChannelArray(
     const LasagnaDatasetManifest& manifest,
     const LasagnaChannelGroup& group,
-    std::size_t dtypeSize)
+    std::size_t dtypeSize,
+    std::optional<std::size_t> channelIndex)
 {
     (void)manifest;
     auto registry = vc::buildZarrCodecRegistry(dtypeSize);
+    auto select=[&](utils::ZarrArray array) {
+        if(!channelIndex) return array;
+        if(array.metadata().shape.size()==4)
+            return utils::ZarrArray::open(std::make_shared<ChannelViewStore>(
+                std::move(array),*channelIndex,group.channels.size()), "", vc::buildZarrCodecRegistry(dtypeSize));
+        if(group.channels.size()!=1 || *channelIndex!=0)
+            throw std::invalid_argument("multiple manifest channels require a packed CZYX array");
+        return array;
+    };
     if(!group.isRemote() && std::filesystem::exists(group.zarrPath/".native_pool.json"))
         return utils::ZarrArray::open(openPooledPredictionStore(group.zarrPath), "", std::move(registry));
     if (group.isRemote()) {
         auto store = std::make_shared<PersistentHttpStore>(
             group.remoteZarrBaseUrl, group.remoteCacheRoot, group.remoteAuth,
             group.discoverAwsCredentials);
-        return utils::ZarrArray::open(
-            std::move(store), group.remoteZarrKey, std::move(registry));
+        return select(utils::ZarrArray::open(
+            std::move(store), group.remoteZarrKey, std::move(registry)));
     }
-    return utils::ZarrArray::open(group.zarrPath, std::move(registry));
+    return select(utils::ZarrArray::open(group.zarrPath, std::move(registry)));
+}
+
+LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction)
+{
+    auto m=prediction.manifest();
+    for(const auto* name:{"sheet_nx","sheet_ny","sheet_grad_mag"})
+        if(!m.groupForChannel(name)) throw std::invalid_argument(std::string("missing predicted normal channel ")+name);
+    for(auto& group:m.groups) for(auto& name:group.channels) {
+        if(name=="nx" || name=="ny" || name=="grad_mag") name="fiber_"+name;
+        else if(name=="sheet_nx") name="nx";
+        else if(name=="sheet_ny") name="ny";
+        else if(name=="sheet_grad_mag") name="grad_mag";
+    }
+    // sheet_grad_mag is an encoded validity channel, not Lasagna winding density.
+    m.raw["grad_mag_encode_scale"]=1.0;
+    m.raw["grad_mag_factor"]=1.0;
+    m.raw["normal_source"]="fiber_sheet";
+    // Blank prediction corners encode no axis. Exclude them before tensor
+    // interpolation; decoding their (0,0) bytes would invent a diagonal axis.
+    m.raw["mask_invalid_normal_corners"]=true;
+    return LasagnaDataset(std::move(m));
 }
 
 } // namespace vc::lasagna

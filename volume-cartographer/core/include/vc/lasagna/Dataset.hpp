@@ -59,6 +59,11 @@ private:
 [[nodiscard]] utils::ZarrArray openLasagnaChannelArray(
     const LasagnaDatasetManifest& manifest,
     const LasagnaChannelGroup& group,
-    std::size_t dtypeSize = 1);
+    std::size_t dtypeSize = 1,
+    std::optional<std::size_t> channelIndex = std::nullopt);
+
+// Explicitly select the network's sheet normal, never its fiber direction.
+// Keeps the complete channel layout so packed CZYX indices remain unchanged.
+[[nodiscard]] LasagnaDataset fiberSheetNormalDataset(const LasagnaDataset& prediction);
 
 } // namespace vc::lasagna

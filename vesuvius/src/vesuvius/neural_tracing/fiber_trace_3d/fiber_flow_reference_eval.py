@@ -120,6 +120,39 @@ def analyze(config):
     return report
 
 
+def solution_catalog_indices(catalog, solution):
+    """Map a solved component to its immutable full-volume geometry catalog."""
+    ids=np.asarray(solution['source_id']);source=np.asarray(catalog['source_id'])
+    ix=np.searchsorted(source,ids)
+    if not len(ids) or np.any(np.diff(ids)<=0) or np.any(ix>=len(source)):
+        raise ValueError('Invalid solution source IDs')
+    if not np.array_equal(source[ix],ids):raise ValueError('Unknown solution source IDs')
+    if not np.array_equal(catalog['family'][ix],solution['family']):
+        raise ValueError('Fiber classification changed')
+    return ix
+
+
+def continuous_gt_metrics(paths, solution, gt, gc, gd, events):
+    """Shared continuous-endpoint GT protocol for fresh and cached projections."""
+    from .fiber_irls_benchmark import metrics
+    from .fiber_uv_arc_phase import event_arc_points
+    from .fiber_uv_layout import hard_assignment
+    gs=arrays(Path(gt['config']).parent/'solution.npz')
+    _,_,_,pick=hard_assignment(gs['state'],len(gs['widths']),gc,best_nonbroken=True)
+    rows=events['events'] if isinstance(events,dict) else events
+    index={int(s):i for i,s in enumerate(solution['source_id'])}
+    rows=[e for e in rows if e['test_source'] in index]
+    ids=np.array([index[e['test_source']] for e in rows],dtype=np.int64)
+    for e in rows:
+        if gd['source_id'][e['gt_piece']]!=e['gt_source']:
+            raise ValueError('GT piece/source mismatch')
+    xyz,turns=paths.at_many(solution['source_id'][ids],np.array([e['test_arc'] for e in rows]))
+    q=continuous_winding(paths.seam,xyz,turns,solution['winding'][ids])+paths.seam.angle/(2*np.pi)
+    truth=event_arc_points(gd,gs['state'],pick,gs['widths'],
+        np.array([e['gt_piece'] for e in rows],dtype=np.int64),np.array([e['gt_arc'] for e in rows]))
+    return metrics(q,truth,rows,np.ones(len(rows),bool))
+
+
 def rescore(config):
     """Exact reuse of reference projections when only integer labels/subset change."""
     source=Path(config['evaluation_root']);out=Path(config['output_root']);out.mkdir(parents=True,exist_ok=True)
@@ -133,8 +166,7 @@ def rescore(config):
     if np.any(ix>=len(old['source_id'])) or not np.array_equal(old['source_id'][ix],new['source_id']):
         raise ValueError('New solve is not a subset of the projected fibers')
     paths=PackedPaths(old_config['geometry'])
-    family=paths.catalog['family'][ix]
-    if not np.array_equal(family,new['family']):raise ValueError('Fiber classification changed')
+    solution_catalog_indices(paths.catalog,new)
     gt=old_config['gt'];gc=json.loads(Path(gt['config']).read_text());gd=arrays(gc['tensor_cache']);gp=Paths(gc,gd)
     reference=json.loads(Path(gt['reference']).read_text());events=json.loads(Path(gt['events']).read_text())
     d={'source_id':new['source_id']};report={'fibers':len(ix),'cohort':'identical retained fibers for both solutions'}
@@ -155,20 +187,7 @@ def rescore(config):
         report[name]=dict(gt=gt_score,spiral=stats,main_component_spiral=error_summary(error[valid&main]),
                          components=int(np.count_nonzero(sizes)),main_component_fibers=int(main.sum()))
         if config.get('continuous_gt_protocol'):
-            from .fiber_irls_benchmark import metrics
-            from .fiber_uv_arc_phase import event_arc_points
-            from .fiber_uv_layout import hard_assignment
-            gs=arrays(Path(gt['config']).parent/'solution.npz')
-            _,_,_,pick=hard_assignment(gs['state'],len(gs['widths']),gc,best_nonbroken=True)
-            rows=events['events'] if isinstance(events,dict) else events
-            index={int(s):i for i,s in enumerate(new['source_id'])}
-            rows=[e for e in rows if e['test_source'] in index]
-            ids=np.array([index[e['test_source']] for e in rows])
-            xyz,turns=paths.at_many(new['source_id'][ids],np.array([e['test_arc'] for e in rows]))
-            q=continuous_winding(paths.seam,xyz,turns,solution['winding'][ids])+paths.seam.angle/(2*np.pi)
-            truth=event_arc_points(gd,gs['state'],pick,gs['widths'],
-                np.array([e['gt_piece'] for e in rows]),np.array([e['gt_arc'] for e in rows]))
-            report[name]['continuous_gt']=metrics(q,truth,rows,np.ones(len(rows),bool))
+            report[name]['continuous_gt']=continuous_gt_metrics(paths,dict(solution,source_id=new['source_id']),gt,gc,gd,events)
         if name=='perpendicular_only':
             np.savez(out/'fiber_reference.npz',source_id=new['source_id'],component=new['component'],
                 reference_minus_fit=delta,reference=cached['reference'][ix],
@@ -187,10 +206,13 @@ def run(config):
     write(root/'request.json',signature)
     started=time.monotonic();paths=PackedPaths(config['geometry']);d=paths.catalog
     solution=arrays(config['solution'])
-    if not np.array_equal(solution['source_id'],d['source_id']):raise ValueError('Source identities differ')
+    catalog_ix=solution_catalog_indices(d,solution)
+    if not config.get('allow_solution_subset',False) and len(catalog_ix)!=len(d['source_id']):
+        raise ValueError('Source identities differ; enable allow_solution_subset for component solves')
+    ids=solution['source_id'];d=dict(source_id=ids,family=solution['family'])
     sizes=np.bincount(solution['component']);largest=int(sizes.argmax())
-    report=dict(fibers=len(paths.ids),components=len(sizes),largest_component_fibers=int(sizes[largest]),
-        largest_component_percent=float(100*sizes[largest]/len(paths.ids)),singletons=int(np.sum(sizes==1)))
+    report=dict(fibers=len(ids),components=len(sizes),largest_component_fibers=int(sizes[largest]),
+        largest_component_percent=float(100*sizes[largest]/len(ids)),singletons=int(np.sum(sizes==1)))
     if 'gt' in config:
         gt=config['gt'];gc=json.loads(Path(gt['config']).read_text());gd=arrays(gc['tensor_cache'])
         gp=Paths(gc,gd);reference=json.loads(Path(gt['reference']).read_text())
@@ -200,13 +222,15 @@ def run(config):
             for row in stats.values():
                 row['percent']=100*row['violations']/row['events'] if row['events'] else None
         report['gt']=scored
+        if config.get('continuous_gt_protocol'):
+            report['continuous_gt']=continuous_gt_metrics(paths,solution,gt,gc,gd,events)
         write(root/'gt_metrics.json',scored);write(root/'summary.json',report)
         print(json.dumps(dict(stage='gt_complete',result=scored)),flush=True)
     settings=config['spiral'];surface=Surface(settings['reference'],settings.get('xyz_scale',4.),
         settings.get('surface_stride',2),settings.get('workers',32),settings.get('candidates',4))
     spacing=settings.get('sample_spacing',200.);maximum=settings.get('max_distance',200.)
-    lengths=paths.keys['arc'][paths.offset[1:]-1]
-    count=len(paths.ids);delta=np.full(count,np.nan);fit=np.full(count,np.nan);truth=np.full(count,np.nan)
+    lengths=paths.keys['arc'][paths.offset[catalog_ix+1]-1]
+    count=len(ids);delta=np.full(count,np.nan);fit=np.full(count,np.nan);truth=np.full(count,np.nan)
     coverage=np.zeros(count);sample_count=0;matched_count=0
     batch=settings.get('fiber_batch',2048);parts=root/'parts';parts.mkdir(exist_ok=True)
     for first in range(0,count,batch):
@@ -214,7 +238,7 @@ def run(config):
         if path.exists():values=arrays(path)
         else:
             owner,arc,weight,offset=sample_arcs(lengths[first:last],spacing)
-            xyz,turns=paths.at_many(paths.ids[first:last][owner],arc)
+            xyz,turns=paths.at_many(ids[first:last][owner],arc)
             rc,distance=surface.project(xyz)
             ref=winding_at(rc[:,1],surface.x,surface.q)
             predicted=continuous_winding(paths.seam,xyz,turns,solution['winding'][first:last][owner])
@@ -248,7 +272,7 @@ def run(config):
         covered_arc_length_percent=float(100*np.sum(lengths*coverage)/lengths.sum()),
         definition='Per-fiber arc-weighted median of pointwise reference-minus-fit; one global median offset, no component alignment',
         sample_spacing_base=spacing,maximum_projection_distance_base=maximum)
-    np.savez(root/'fiber_reference.npz',source_id=paths.ids,reference_minus_fit=delta,
+    np.savez(root/'fiber_reference.npz',source_id=ids,reference_minus_fit=delta,
         fitted=fit,reference=truth,coverage=coverage,component=solution['component'])
     report.update(stage='complete',seconds=time.monotonic()-started)
     write(root/'summary.json',report);write(root/'progress.json',dict(stage='complete'))

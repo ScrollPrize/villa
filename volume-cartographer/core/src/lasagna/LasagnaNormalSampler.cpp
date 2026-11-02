@@ -102,10 +102,10 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
     const auto gradMag = bindLasagnaChannel(manifest, "grad_mag");
     const auto validate = [&](const LasagnaChannelBinding& binding,
                               std::string_view channel) {
-        if (binding.group == nullptr || binding.group->channels.size() != 1) {
+        if (binding.group == nullptr) {
             throw std::invalid_argument(
                 "normal channel '" + std::string(channel) +
-                "' must use its own 3D Lasagna group");
+                "' must have a channel group");
         }
         const double baseSpacing =
             static_cast<double>(binding.group->scaleFactor()) *

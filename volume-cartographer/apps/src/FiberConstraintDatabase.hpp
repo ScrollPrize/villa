@@ -6,6 +6,14 @@
 #include <filesystem>
 #include <vector>
 #include <stop_token>
+#include <span>
+
+struct sqlite3;
+// Caller owns the destination transaction; source is read-only and used only by
+// the producer until this function returns. Validation and row order are exact.
+nlohmann::json updateFiberConstraintNormals(sqlite3* source, sqlite3* destination,
+    std::span<const cv::Vec3d> baked, std::span<const unsigned char> valid,
+    int threads, int updateBatchRows=32);
 
 struct FiberConstraintDatabaseOptions {
     // Rows per prepared INSERT; bounded to keep statement size portable.

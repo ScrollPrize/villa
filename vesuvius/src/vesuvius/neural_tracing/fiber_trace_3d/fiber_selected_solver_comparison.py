@@ -8,6 +8,46 @@ from .fiber_min_flow_experiment import arrays, write, digest
 from .fiber_min_flow_benchmark import subset_minimal
 
 
+def catalog_filter(database, config):
+    """Filter whole classified sources, without rerunning extraction or H/V.
+
+    Width is the piece-local arc-weighted mean in base voxels, not the parent
+    trace's coverage-policy width. Missing widths never silently pass a cut.
+    """
+    minimum_length = config.get('minimum_length_mm')
+    minimum_width = config.get('minimum_width_base')
+    for value in (minimum_length, minimum_width):
+        if value is not None and (not np.isfinite(value) or value < 0):
+            raise ValueError('Fiber thresholds must be finite and nonnegative')
+    with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro', uri=True) as db:
+        row = db.execute("SELECT value FROM metadata WHERE key='root'").fetchone()
+        voxel_mm = json.loads(row[0]).get('voxel_size_mm') if row else None
+        if minimum_length is not None and (voxel_mm is None or not np.isfinite(voxel_mm) or voxel_mm <= 0):
+            raise ValueError('Length filtering requires explicit base voxel_size_mm')
+        rows = db.execute('SELECT id,length,annotation FROM fibers ORDER BY id')
+        ids = []; lengths = []; missing = 0; total = 0
+        for fid, length, annotation in rows:
+            total += 1
+            if minimum_length is not None and length*voxel_mm <= minimum_length:
+                continue
+            if minimum_width is not None:
+                record = json.loads(annotation).get('fiber_attributes',{}).get('width_mean',{})
+                width = record.get('values')
+                if width is None:
+                    missing += 1
+                    continue
+                if record.get('units') != 'base_voxel' or not np.isscalar(width) or not np.isfinite(width):
+                    raise ValueError('Invalid piece-local width_mean for fiber '+str(fid))
+                if width <= minimum_width:
+                    continue
+            ids.append(fid); lengths.append(length)
+    return np.asarray(ids,dtype=np.int64), np.asarray(lengths), dict(
+        input_fibers=total, passed=len(ids), missing_width=missing,
+        minimum_length_mm=minimum_length, minimum_width_base=minimum_width,
+        voxel_size_mm=voxel_mm, comparison='strictly greater',
+        width_statistic='piece-local length-weighted mean')
+
+
 def prepare(config, solver):
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
@@ -18,25 +58,38 @@ def prepare(config, solver):
     from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines, write_afv
     root=Path(config['output_root']);source=Path(config['selection_root'])
     d=arrays(source/'selected_tensors.npz')
-    with sqlite3.connect(f'file:{source.resolve()}/selected.afv?mode=ro',uri=True) as db:
-        ids=np.array([r[0] for r in db.execute('SELECT id FROM fibers ORDER BY id')])
+    ids,lengths,filter_stats=catalog_filter(source/'selected.afv',config)
     d=subset_minimal(d,np.isin(d['source_id'],ids))
     n=len(d['source_id'])
+    def unavailable(reason, **details):
+        report=dict(status='not_solvable',reason=reason,catalog_filter=filter_stats,
+                    input_sources=n,gt_in_solve=False,**details)
+        write(root/'selection.json',report);write(root/'results.json',report)
+        return False
+    if not n:return unavailable('No fibers pass the requested length/width filters')
     _,comp=connected_components(coo_matrix((np.ones(len(d['i'])),(d['i'],d['j'])),shape=(n,n)),directed=False)
     largest=comp==np.bincount(comp).argmax()
     d=subset_minimal(d,largest)
     # All three solvers share the SGD-supported cohort; never invent missing
     # perpendicular endpoint geometry. Preserve the largest component again.
     perp=~d['parallel'];owners=np.unique(np.r_[d['i'][perp],d['j'][perp]])
-    if not len(owners):raise ValueError('Selected source component has no perpendicular events')
+    if not len(owners):return unavailable('Largest component has no perpendicular events; no supported UV cohort',
+        largest_component=int(largest.sum()),component_sizes=np.bincount(comp).tolist(),
+        component_events=len(d['i']))
     keep=np.zeros(len(d['source_id']),bool);keep[owners]=True
     d=subset_minimal(d,keep)
     n_supported=len(d['source_id'])
     _,comp=connected_components(coo_matrix((np.ones(len(d['i'])),(d['i'],d['j'])),shape=(n_supported,n_supported)),directed=False)
     d=subset_minimal(d,comp==np.bincount(comp).argmax())
+    final_lengths=lengths[np.searchsorted(ids,d['source_id'])]
+    voxel_mm=filter_stats['voxel_size_mm']
+    length_stats = dict(mean_mm=float(final_lengths.mean()*voxel_mm),
+        median_mm=float(np.median(final_lengths)*voxel_mm),
+        total_m=float(final_lengths.sum()*voxel_mm/1000)) if voxel_mm is not None else None
     write(root/'selection.json',dict(input_sources=n,largest_component=int(largest.sum()),
         perpendicular_supported=n_supported,final_fibers=len(d['source_id']),events=len(d['i']),
-        parallel=int(d['parallel'].sum()),perpendicular=int((~d['parallel']).sum()),gt_in_solve=False))
+        parallel=int(d['parallel'].sum()),perpendicular=int((~d['parallel']).sum()),gt_in_solve=False,
+        catalog_filter=filter_stats,lengths=length_stats))
     minimal={k:v.copy() for k,v in d.items()}
     path_cfg=dict(afv=str(source/'selected.afv'),umbilicus=config['umbilicus'])
     paths=Paths(path_cfg,d)
@@ -86,13 +139,16 @@ def run(config):
             old=json.loads((prepared/'request.json').read_text())
             for key in ('selection_root','umbilicus','gt_root','base_config'):
                 if old[key]!=config[key]:raise ValueError('Prepared input mismatch: '+key)
+            for key in ('minimum_length_mm','minimum_width_base'):
+                if old.get(key)!=config.get(key):raise ValueError('Prepared filter mismatch: '+key)
             if not json.loads((prepared/'prepared.json').read_text())['complete']:
                 raise ValueError('Incomplete prepared input')
             for name in ('tensors.npz','minimal_tensors.npz','fibers.afv','gt_events.json','selection.json','init'):
                 dest=root/name
                 if not dest.exists():dest.symlink_to(prepared/name)
             write(root/'prepared.json',dict(complete=True,reused_from=str(prepared)))
-        else:prepare(config,solver)
+        elif prepare(config,solver) is False:
+            return json.loads((root/'results.json').read_text())
     include_sgd=config.get('include_sgd',True)
     if include_sgd:
         write(root/'solve_config.json',dict(fiber_implicit_winding=solver))
@@ -105,7 +161,7 @@ def run(config):
         gt_config=str(Path(config['gt_root'])/'uv_whole/config.json'),
         gt_solution=str(Path(config['gt_root'])/'uv_whole/solution.npz'),
         solver_source=config['solver_source'],solver_sha256=config['solver_sha256'],
-        irls=15,cg=500,eps=.05,prior_weight=1e-6,capacity_scales=[1000],
+        irls=15,cg=500,eps=.05,prior_weight=1e-6,capacity_scales=config.get('capacity_scales',[1000]),
         devices=config.get('devices','1'),gpu_manager=config['gpu_manager'])
     if include_sgd:bench['sgd_solution']=str(root/'solve/solution.npz')
     write(root/'comparison_config.json',dict(fiber_irls_benchmark=bench))

@@ -106,8 +106,9 @@ def solve(config):
         started = time.monotonic(); lp = lp_solve(n, **g)
         times['exact_lp'] = time.monotonic()-started
         solutions['exact_lp'] = lp['winding']; certificates['exact_lp'] = lp['certificate']
-    library = build_native(root/('lemon.dylib' if sys.platform=='darwin' else 'lemon.so'))
-    for scale in config.get('capacity_scales',[1000,1]):
+    capacity_scales = config.get('capacity_scales',[1000,1])
+    library = build_native(root/('lemon.dylib' if sys.platform=='darwin' else 'lemon.so')) if capacity_scales else None
+    for scale in capacity_scales:
         q, quantization = quantize(g, scale)
         started = time.monotonic()
         result = native_solve(library, n, q, 'cost_scaling')

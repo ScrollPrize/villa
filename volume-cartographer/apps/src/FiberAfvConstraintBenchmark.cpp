@@ -141,7 +141,9 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
     const auto dataset=vc::lasagna::LasagnaDataset::openLocation(cfg.at("normal_manifest"),open);
     if (!dataset.manifest().baseShapeZYX ||
-        Json(*dataset.manifest().baseShapeZYX)!=root.at("coordinate_base_shape_zyx"))
+        vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+            root.at("coordinate_base_shape_zyx").get<std::array<std::size_t,3>>(),
+            *dataset.manifest().baseShapeZYX,0)!=1.0)
         throw std::invalid_argument("AFV and Lasagna base shapes differ");
     // This historical manifest has no coordinate identity. Require its sibling
     // inference provenance to name the expected scan rather than trusting shape.
@@ -272,6 +274,8 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     Json result={{"config",cfg},{"afv_uuid",Json::parse(afv.metadata("uuid"))},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",provenance},
         {"selected_ids",ids},{"selected_fibers",lines.size()},{"points",totalPoints},
+        {"fiber_base_shape_zyx",root.at("coordinate_base_shape_zyx")},
+        {"normal_base_shape_zyx",*dataset.manifest().baseShapeZYX},
         {"arc_base",totalArc},{"query_seconds",querySeconds},{"load_seconds",loadSeconds},
         {"normal_alignment",false},
         {"geometry_minimum_xyz",{lo[0],lo[1],lo[2]}},

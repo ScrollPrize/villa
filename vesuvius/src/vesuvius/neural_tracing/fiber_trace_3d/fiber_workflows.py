@@ -11,6 +11,9 @@ from pathlib import Path
 def run(config):
     if 'commands' not in config and len(config)!=1:
         raise ValueError('Select exactly one named workflow')
+    if 'fiber_stream_import' in config:
+        from .fiber_stream_import import run as import_stream
+        return import_stream(config['fiber_stream_import'])
     if 'fiber_enclosure_reference_eval' in config:
         from .fiber_enclosure_reference_eval import run as evaluate_enclosures
         return evaluate_enclosures(config['fiber_enclosure_reference_eval'])

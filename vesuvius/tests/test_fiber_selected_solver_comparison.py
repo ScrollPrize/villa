@@ -1,5 +1,7 @@
 import numpy as np
 import json
+import sqlite3
+import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_selected_solver_comparison import subset_minimal
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_flow_sgd_full import measured_geometry
 
@@ -46,12 +48,54 @@ def test_graph_only_run_does_not_launch_or_load_sgd(tmp_path, monkeypatch):
     def compare(config):
         assert 'sgd_solution' not in config
         assert config['exact_lp'] is False
+        assert config['capacity_scales'] == []
         (root/'comparison').mkdir()
         (root/'comparison/summary.json').write_text('{"results":{}}')
     monkeypatch.setattr(fiber_irls_benchmark,'run',compare)
     result=workflow.run(dict(output_root=str(root),selection_root='selection',
         base_config=str(base),umbilicus='axis.json',gt_root='gt',gpu_manager={},
         solver_source='solver.py',solver_sha256='hash',include_sgd=False,
-        exact_lp=False,uv_methods=[]))
+        exact_lp=False,capacity_scales=[],uv_methods=[]))
     assert result=={'results':{}}
     assert not (root/'solve_config.json').exists()
+
+
+def test_length_width_filters_use_piece_mean_and_strict_threshold(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_selected_solver_comparison import catalog_filter
+    path=tmp_path/'fibers.afv'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE metadata(key TEXT,value TEXT)')
+        db.execute('INSERT INTO metadata VALUES(?,?)',('root',json.dumps({'voxel_size_mm':.0024})))
+        db.execute('CREATE TABLE fibers(id INTEGER,length REAL,annotation TEXT)')
+        for fid,length,width in [(1,1000,90),(2,2500,80),(3,3000,100),(4,4000,None)]:
+            attrs={'coverage_width_reference':{'values':999,'units':'base_voxel'}}
+            if width is not None:attrs['width_mean']={'values':width,'units':'base_voxel'}
+            db.execute('INSERT INTO fibers VALUES(?,?,?)',(fid,length,json.dumps({'fiber_attributes':attrs})))
+    ids,lengths,stats=catalog_filter(path,dict(minimum_length_mm=5,minimum_width_base=80))
+    np.testing.assert_array_equal(ids,[3]);np.testing.assert_array_equal(lengths,[3000])
+    assert stats['missing_width']==1 and stats['input_fibers']==4
+    ids,_,_=catalog_filter(path,dict(minimum_length_mm=2.4))
+    np.testing.assert_array_equal(ids,[2,3,4])
+    ids,_,_=catalog_filter(path,{})
+    np.testing.assert_array_equal(ids,[1,2,3,4])
+    with pytest.raises(ValueError,match='thresholds'):
+        catalog_filter(path,dict(minimum_width_base=float('nan')))
+    with sqlite3.connect(path) as db:db.execute('DELETE FROM metadata')
+    with pytest.raises(ValueError,match='voxel_size_mm'):
+        catalog_filter(path,dict(minimum_length_mm=1))
+
+
+@pytest.mark.parametrize('ids',[[],[1,2]])
+def test_filtered_empty_or_parallel_only_reports_unavailable(tmp_path,monkeypatch,ids):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_selected_solver_comparison as workflow
+    d=dict(source_id=np.array([1,2]),family=np.array([0,0]),start=np.zeros(2),
+        end=np.ones(2),node_ds=np.array([[0.,1.]]*2),i=np.array([0]),j=np.array([1]),
+        ds_a=np.array([.2]),ds_b=np.array([.4]),distance=np.array([1.]),
+        sign=np.ones(1),parallel=np.ones(1,bool))
+    monkeypatch.setattr(workflow,'arrays',lambda _:d)
+    monkeypatch.setattr(workflow,'catalog_filter',lambda *_:(np.array(ids,dtype=np.int64),
+        np.ones(len(ids)),dict(passed=len(ids),voxel_size_mm=.0024)))
+    assert workflow.prepare(dict(output_root=str(tmp_path),selection_root='unused'),{}) is False
+    result=json.loads((tmp_path/'results.json').read_text())
+    assert result['status']=='not_solvable'
+    assert 'No fibers' in result['reason'] if not ids else 'no perpendicular' in result['reason']

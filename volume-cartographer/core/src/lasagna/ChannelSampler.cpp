@@ -1181,13 +1181,13 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.path = group->zarrPath;
     binding.arrayId = arrayIdForPath(binding.path);
     binding.array = std::make_shared<utils::ZarrArray>(
-        openLasagnaChannelArray(manifest, *group, 1));
+        openLasagnaChannelArray(manifest, *group, 1, *channelIndex));
     binding.spacing = static_cast<double>(group->scaleFactor()) *
                       manifest.sourceToBase / manifest.workingToBaseScale;
 
     const auto meta = binding.array->metadata();
     if (allowFloat32 && meta.dtype == utils::ZarrDtype::float32) {
-        binding.array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, *group, 4));
+        binding.array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, *group, 4, *channelIndex));
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' must be uint8");
     }
