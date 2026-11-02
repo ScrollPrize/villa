@@ -69,6 +69,7 @@ def distance_transform_edt(mask: np.ndarray) -> np.ndarray:
     else:
         return scipy_edt(mask)
 
+from vesuvius.data.utils import create_zarr_array, open_zarr_group
 from vesuvius.tifxyz import read_tifxyz
 
 
@@ -583,7 +584,13 @@ def get_initialized_chunk_indices(zarr_array: zarr.Array) -> set:
     set
         Set of chunk index tuples.
     """
-    chunk_keys = [k for k in zarr_array.store.keys() if not k.startswith('.')]
+    store = zarr_array.store
+    if hasattr(store, 'keys'):
+        store_keys = store.keys()
+    else:
+        from zarr.core.sync import collect_aiterator
+        store_keys = collect_aiterator(store.list_dir(zarr_array.store_path.path))
+    chunk_keys = [k for k in store_keys if not k.startswith('.')]
     indices = set()
     for key in chunk_keys:
         try:
@@ -1665,7 +1672,8 @@ def generate_pyramid_levels(
 
         # Create array for this level
         level_chunks = tuple(min(c, s) for c, s in zip(chunks, new_shape))
-        new_arr = root.create_dataset(
+        new_arr = create_zarr_array(
+            root,
             str(level),
             shape=new_shape,
             chunks=level_chunks,
@@ -1843,11 +1851,12 @@ def main() -> None:
     dtype = np.dtype(args.dtype)
 
     # Create root group
-    root = zarr.open_group(str(output_path), mode="w")
+    root = open_zarr_group(str(output_path), mode="w")
 
     # Create level 0 array (full resolution)
     level0_path = output_path / "0"
-    zarr_array = root.create_dataset(
+    zarr_array = create_zarr_array(
+        root,
         "0",
         shape=(z_dim, y_dim, x_dim),
         chunks=chunks,
