@@ -43,6 +43,22 @@ from collections import deque, defaultdict
 import gc
 
 
+def _print_batch_item(name, value, indent=""):
+    if isinstance(value, dict):
+        print(f"{indent}{name}: (dictionary with keys: {list(value.keys())})")
+        for key, item in value.items():
+            _print_batch_item(key, item, indent + "  ")
+    elif isinstance(value, torch.Tensor):
+        summary = f"{value.dtype}, {value.shape}"
+        if value.numel():
+            summary += f", min {value.min()} max {value.max()}"
+        else:
+            summary += ", empty"
+        print(f"{indent}{name}: {summary}")
+    else:
+        print(f"{indent}{name}: {value}")
+
+
 
 class BaseTrainer:
     def __init__(self,
@@ -1919,13 +1935,7 @@ class BaseTrainer:
         if epoch == 0 and step == 0 and verbose:
             print("Items from the first batch -- Double check that your shapes and values are expected:")
             for item, val in data_dict.items():
-                if isinstance(val, dict):
-                    print(f"{item}: (dictionary with keys: {list(val.keys())})")
-                    for sub_key, sub_val in val.items():
-                        print(
-                            f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
-                else:
-                    print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
+                _print_batch_item(item, val)
 
         # Optionally run augmentations on the model device instead of Dataset workers
         if getattr(self.mgr, 'augment_on_device', False) and getattr(self, '_train_dataset', None) is not None:

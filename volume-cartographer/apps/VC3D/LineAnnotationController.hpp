@@ -288,6 +288,8 @@ public:
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
+    // Immutable, worker-safe reference used by the Line Annotation strips.
+    std::function<cv::Vec3f(const cv::Vec3f&)> displayCenterReference();
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber

@@ -27,6 +27,7 @@ _this package is in active development_
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
+| `vesuvius.afv_spline_generator` | `afv_spline_generator.cli`       | [predicts fibers](docs/afv_spline_generator.md) in a zone of a Zarr volume and writes their polylines in a fiber object store (`.vcobj`) for VC3D                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.voxelize_obj`       | `image_proc.run.voxelize_objs`     | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
@@ -35,7 +36,6 @@ _this package is in active development_
 | `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
 | `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
 | `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
-| `vesuvius.zarr_tasks`         | `image_proc.run.zarr_tasks.__main__` | runs a Zarr processing task (threshold, scale, transpose, recompress, ...); `--list-tasks` lists them |
 
 
 
@@ -74,6 +74,13 @@ first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian
 `qt` in Homebrew), even for headless use. `uv` does not install these system
 libraries. This requirement does not apply to the base `vesuvius` installation
 shown above.
+
+To run the neural Copy script (`vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps`)
+without building `volume-cartographer` (for example on Windows), skip that package:
+`uv sync --frozen --extra models --no-install-package volume-cartographer`. The script then
+reads the volume with zarr-python and keeps no disk chunk cache (`--volume-cache-dir` and
+`--volume-chunk-cache-gb` are not used). Without uv's monorepo sources, `vesuvius[models]`
+does not resolve, because `volume-cartographer` is not on PyPI.
 
 ## Data licence
 

@@ -1622,6 +1622,18 @@ select inference mode (plus any independently disabled losses) through
 named inputs the configuration requires; a required one the manifest does
 not name, or that is missing, is reported before the fit starts.
 
+To follow a headless fit while it runs, set `FIT_SPIRAL_METRICS_HISTORY` to a
+file path: every 200 iterations the fit appends one JSON line,
+`{"iteration": N, "metrics": {...}}`, whose metrics hold `total_loss`, each
+`<term>_loss` and the other logged values (what it also prints, and what
+`runners/run_single.py` records for sweeps). For example:
+
+```bash
+FIT_SPIRAL_METRICS_HISTORY=/tmp/fit_metrics.jsonl \
+  ./.venv/bin/python fit_spiral.py --inputs spiral-inputs.json --object-store dataset.vcobj > fit.log 2>&1 &
+tail -f /tmp/fit_metrics.jsonl
+```
+
 ## Fiber direction samples
 
 The optional fiber-direction loss consumes one packed artifact extracted from a

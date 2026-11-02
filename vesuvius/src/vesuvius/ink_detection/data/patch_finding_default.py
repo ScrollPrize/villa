@@ -80,12 +80,13 @@ def find_segment_patches(
         else open_volume(segment.validation_mask, scan_scale)
     )
     mask_surface = int(supervision.shape[0] // 2)
+    ink_surface = int(inklabels.shape[0] // 2)  # each label store is read at its own mid-plane
     validation_surface = (
         None if validation is None else int(validation.shape[0] // 2)
     )
     # Read each mask surface once; per-candidate slices decompress the same chunks again.
     supervision = np.asarray(supervision[mask_surface])
-    inklabels = np.asarray(inklabels[mask_surface])
+    inklabels = np.asarray(inklabels[ink_surface])
     if validation is not None:
         validation = np.asarray(validation[validation_surface])
     support = combined_patch_discovery_support(supervision, validation)
