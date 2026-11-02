@@ -71,7 +71,9 @@ typedef struct vcr_open_options {
     int cache_writes;            /* nonzero (default): fetched chunks are written to the cache */
     int offline;                 /* remote volumes: metadata and chunks only from the caches */
     int64_t memory_cache_bytes;  /* decoded chunks kept in memory, shared by the levels; default 2 GiB */
-    int64_t gpu_cache_bytes;     /* >0: uint8 levels also sample on the GPU with this brick budget */
+    int64_t gpu_cache_bytes;     /* >0: uint8 levels also sample on the GPU. One budget for the whole
+                                    volume: each level gets at most its own (chunk-rounded) size, the
+                                    rest is shared equally, so the levels together never exceed it */
     size_t threads;              /* reader threads per level; 0: the reader's default */
 } vcr_open_options;
 
@@ -89,6 +91,7 @@ typedef struct vcr_level_info {
     char dtype[16];           /* numpy typestr, e.g. "|u1" */
     double voxel_extent[3];   /* level-0 voxels one index spans, ZYX */
     int gpu;                  /* nonzero while this level samples on the GPU */
+    int64_t gpu_cache_bytes;  /* this level's part of the volume's GPU budget */
 } vcr_level_info;
 
 VCR_API void vcr_level_info_init(vcr_level_info* info);

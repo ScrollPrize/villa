@@ -77,6 +77,7 @@ struct Volume {
 #ifdef VC_READER_CUDA
     std::vector<std::unique_ptr<vcr::reader_cuda::Reader>> cuda;
 #endif
+    std::vector<std::int64_t> gpuBudget;  // each level's part of gpu_cache_bytes
     std::atomic<bool> gpuFailed{false};
 
     ~Volume()
@@ -323,15 +324,37 @@ vcr_status vcr_volume_open(const char* location, const vcr_open_options* options
         }
         if (std::none_of(volume->levels.begin(), volume->levels.end(), [](const auto& l) { return bool(l); }))
             throw std::runtime_error("no level of the volume opened: " + firstError);
+        volume->gpuBudget.assign(volume->levels.size(), 0);
 #ifdef VC_READER_CUDA
         volume->cuda.resize(volume->levels.size());
-        if (options->gpu_cache_bytes > 0 && vcr::cuda::available())
+        if (options->gpu_cache_bytes > 0 && vcr::cuda::available()) {
+            // One budget for the volume: smallest levels first, each taking at most what
+            // holds it whole (chunk-rounded) and an equal part of what is left, so coarse
+            // levels never strand budget the finer ones could use.
+            std::vector<std::pair<std::uint64_t, std::size_t>> wanted;
             for (std::size_t level = 0; level < volume->levels.size(); ++level) {
                 const auto& l = volume->levels[level];
-                if (l && l->meta.type.kind == 'u' && l->meta.type.itemsize == 1)
-                    volume->cuda[level] = std::make_unique<vcr::reader_cuda::Reader>(
-                        *l->array, std::size_t(options->gpu_cache_bytes), 0);
+                if (!l || l->meta.type.kind != 'u' || l->meta.type.itemsize != 1)
+                    continue;
+                std::uint64_t bytes = 1;
+                for (std::size_t a = 0; a < 3; ++a) {
+                    const auto chunk = std::uint64_t(std::max<std::int64_t>(1, l->meta.chunks[a]));
+                    bytes *= (std::uint64_t(l->meta.shape[a]) + chunk - 1) / chunk * chunk;
+                }
+                wanted.emplace_back(bytes, level);
             }
+            std::sort(wanted.begin(), wanted.end());
+            std::uint64_t left = std::uint64_t(options->gpu_cache_bytes);
+            for (std::size_t i = 0; i < wanted.size(); ++i) {
+                const auto share = std::min(wanted[i].first, left / (wanted.size() - i));
+                left -= share;
+                const auto level = wanted[i].second;
+                volume->gpuBudget[level] = std::int64_t(share);
+                if (share)
+                    volume->cuda[level] = std::make_unique<vcr::reader_cuda::Reader>(*volume->levels[level]->array,
+                                                                                     std::size_t(share), 0);
+            }
+        }
 #endif
         *out = new vcr_volume{std::move(volume)};
         return VCR_OK;
@@ -372,6 +395,7 @@ vcr_status vcr_volume_level_info(const vcr_volume* volume, int level, vcr_level_
         const auto extent = vcr::grid::voxelExtent(v.gridLevel(level));
         std::copy(extent.begin(), extent.end(), out->voxel_extent);
         out->gpu = v.cudaReader(level) != nullptr;
+        out->gpu_cache_bytes = v.gpuBudget[std::size_t(level)];
         return VCR_OK;
     });
 }

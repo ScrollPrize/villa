@@ -250,6 +250,29 @@ int main(void)
         CHECK(vcr_volume_open(root, &options, &gpu) == VCR_OK);
         vcr_level_info_init(&info);
         CHECK(gpu && vcr_volume_level_info(gpu, 0, &info) == VCR_OK && info.gpu);
+        {
+            /* One budget split over the levels: level 1 (512 B) whole, level 0 the rest. */
+            vcr_level_info coarse;
+            vcr_level_info_init(&coarse);
+            CHECK(vcr_volume_level_info(gpu, 1, &coarse) == VCR_OK && coarse.gpu_cache_bytes == 512);
+            CHECK(info.gpu_cache_bytes == 4096);  /* all of level 0 fits in what is left */
+            CHECK(info.gpu_cache_bytes + coarse.gpu_cache_bytes <= options.gpu_cache_bytes);
+        }
+        vcr_volume_release(gpu);
+        gpu = NULL;
+        options.gpu_cache_bytes = 2048;  /* less than both levels need: shares stay within it */
+        CHECK(vcr_volume_open(root, &options, &gpu) == VCR_OK);
+        {
+            vcr_level_info fine, coarse;
+            vcr_level_info_init(&fine);
+            vcr_level_info_init(&coarse);
+            CHECK(vcr_volume_level_info(gpu, 0, &fine) == VCR_OK && vcr_volume_level_info(gpu, 1, &coarse) == VCR_OK);
+            CHECK(coarse.gpu_cache_bytes == 512 && fine.gpu_cache_bytes == 1536);
+        }
+        vcr_volume_release(gpu);
+        gpu = NULL;
+        options.gpu_cache_bytes = 64 << 20;
+        CHECK(vcr_volume_open(root, &options, &gpu) == VCR_OK);
         request.volume = gpu;
         vcr_pending_clear(pending);
         CHECK(vcr_sample_cached(&frame, &request, pending, &result) == VCR_OK && !result.gpu_failed);
