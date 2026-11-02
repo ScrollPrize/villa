@@ -9,12 +9,14 @@
 
 #include <vc_reader/zarr.hpp>
 
+#include <atomic>
+
 
 class Volume
 {
 public:
     // Static flag to skip zarr shape validation against meta.json
-    static inline thread_local bool skipShapeCheck = false;
+    static inline std::atomic<bool> skipShapeCheck{false};
 
     Volume() = delete;
 
