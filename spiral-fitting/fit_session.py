@@ -221,7 +221,17 @@ from surface_orientation import spiral_outward_sense_for
 # record the fit volume ("volume_uuid") and the inputs' "provenance" instead
 # of dataset_root. The configuration catalog takes no num_windings from a
 # host scroll specification.
-API_VERSION = 45
+# 46: commits. POST /session/commit {"artifact"} writes a published preview
+# (status preview_artifact) to the bound store as one surface tagged
+# spiral-fit: its flattened geometry, validity and int32 winding_id channel,
+# with the model state, input digest and position and the flatten profile
+# in its meta (service_commits). Committing the same model state, inputs and
+# flatten profile again reuses that surface. Status "commit" reports the
+# latest: state (running, done, failed), stage_name, surface_uuid,
+# geometry_revision, reused, pushed and error. /bindings advertises
+# capabilities.commits. Default and tag selections leave spiral-fit
+# surfaces out, and naming one as an input is refused.
+API_VERSION = 46
 
 
 class SessionState(str, Enum):

@@ -440,7 +440,8 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     assert advertised['capabilities'] == {
         'input_source': 'object_store', 'inputs_frozen': False,
         'input_reload_rebuild': True, 'input_positions': True, 'input_updates': True,
-        'winding_inference': False, 'build_missing_lasagna_packs': False}
+        'winding_inference': False, 'build_missing_lasagna_packs': False,
+        'commits': True}
     # Nothing advertises patch, fiber or PCL files, or a host.
     assert 'pcl_inputs' not in advertised
     assert not {'root', 'resolved', 'detected_checkpoints', 'scroll_spec'} & set(advertised)

@@ -60,6 +60,12 @@ _LASAGNA_SAVING_MARKER = "[fit] peak GPU memory:"
 _LASAGNA_PORT_LINE = re.compile(r"listening on http://[^:]+:(\d+)")
 
 
+def flatten_profile():
+    """The Lasagna flatten a published preview is: its config and output step."""
+    return {"config": LASAGNA_CONFIG_NAME,
+            "output_step_vx": LASAGNA_PREVIEW_OUTPUT_STEP_VX}
+
+
 def _flatten_request_body(config, surface_ref, *, surface_id, publish_root,
                           model_output):
     """The one ``/optimize`` request a preview generation makes.
@@ -1021,6 +1027,9 @@ class LasagnaPublisher:
                 published["surface_path"] = str(final_root / surface_id)
                 published["manifest_path"] = str(final_root / "manifest.json")
                 published["output_step_vx"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
+                # What a commit keys on besides the model state and inputs:
+                # another config or step is another surface of the same fit.
+                published["flatten_profile"] = flatten_profile()
                 published["grid_shape"] = [
                     int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
                 published["winding_ids"] = [

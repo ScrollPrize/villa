@@ -96,6 +96,8 @@ from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
+from service_commits import (CommitContext, CommitRefused, commit_in_place,
+                             read_published_generation)
 from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
 from service_uploads import (UPLOADED_CHECKPOINTS_DIRNAME,
@@ -314,6 +316,9 @@ SERVICE_CAPABILITIES = {
     # POST /session/update-inputs replaces a resident fit's inputs with a
     # position's, keeping its model and optimiser (bindings with positions).
     "input_updates": False,
+    # POST /session/commit writes a published preview to the bound store as
+    # a surface (service_commits).
+    "commits": False,
 }
 
 
@@ -793,6 +798,13 @@ class ServiceState:
         self._preview = PreviewPublication()
         # The published input manifest of this session: (digest, artifact).
         self._input_manifest = None
+        # Serializes this service's writes to the bound store: link refreshes
+        # (_prepare_position) and commits. A hub sync needs an idle handle,
+        # and a commit must never be pushed halfway through a refresh.
+        self._store_write_lock = threading.Lock()
+        # The latest commit (POST /session/commit): what /session/status
+        # reports as "commit", guarded by self.lock.
+        self._commit = None
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -1052,6 +1064,7 @@ class ServiceState:
                 response["phase"] = publishing["stage_name"]
                 response["progress"] = publishing
             response["preview_exporting"] = self._preview_export_active
+            response["commit"] = copy.deepcopy(self._commit)
             return response
 
     def session_state(self):
@@ -1110,6 +1123,7 @@ class ServiceState:
         # A service with positions updates a resident fit's inputs in place.
         capabilities["inputs_frozen"] = not positioned
         capabilities["input_updates"] = positioned
+        capabilities["commits"] = self._commits_supported()
         bindings = (self.bindings.advertisement() if self.bindings is not None
                     else {"output_directory": None, "cache_directory": None,
                           "winding_inference": {"bound": False, "path": None,
@@ -1964,8 +1978,8 @@ class ServiceState:
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
         request = request_from_config(config)
-        with ObjectStore.open(self.object_store.path,
-                              author=self.object_store.author) as store:
+        with self._store_write_lock, ObjectStore.open(
+                self.object_store.path, author=self.object_store.author) as store:
             prepared = prepare_position(
                 store, config, request, lasagna=lasagna,
                 minimum=minimum, cache_directory=cache, log=log)
@@ -3255,6 +3269,144 @@ class ServiceState:
         self.artifacts.prune("spiral-checkpoint", session_id, CHECKPOINT_ARTIFACTS_KEPT)
         return {**self.status(), "checkpoint_artifact": ref}
 
+    # ------------------------------------------------------------------
+    # Commits: a published preview as a store surface
+    # ------------------------------------------------------------------
+
+    def _commits_supported(self):
+        return self.object_store is not None and not self.object_store.hosted
+
+    def commit(self, request):
+        """Start committing one published preview to the bound store.
+
+        ``artifact`` names the preview artifact (status ``preview_artifact``)
+        to commit. The artifact is held from here until the worker has read
+        it, so pruning cannot delete it underneath; one already pruned
+        answers 410 and commits nothing. Committing the same model state,
+        inputs and flatten profile again reuses the surface already
+        committed. The result is status ``commit``: ``state`` (running, done
+        or failed), ``surface_uuid``, ``geometry_revision``, ``reused``,
+        ``pushed`` (null: the store is shared in place) or ``error``.
+        """
+        artifact_id = (request or {}).get("artifact")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "artifact must name a published preview")
+        if not self._commits_supported():
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This service cannot commit to its object store")
+        self._require_session()
+        with self.lock:
+            if self._commit is not None and self._commit["state"] == "running":
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A commit is already in progress")
+            session_id = self.session_id
+        artifact, _, _ = self.artifacts.acquire_file(artifact_id, "manifest.json")
+        try:
+            if artifact.kind != "spiral-preview" or artifact.session_id != session_id:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The artifact is not a preview of this session")
+            with self.lock:
+                self._commit = {"state": "running", "artifact": artifact_id,
+                                "generation": artifact.generation,
+                                "stage_name": "Reading the published preview",
+                                "surface_uuid": None, "geometry_revision": None,
+                                "reused": None, "pushed": None, "error": None}
+                self.status_generation += 1
+            self._start_background(target=self._commit_job,
+                                   args=(session_id, artifact),
+                                   name="spiral-commit", daemon=True)
+        except BaseException:
+            self.artifacts.release(artifact)
+            with self.lock:
+                if self._commit is not None and self._commit["artifact"] == artifact_id:
+                    self._commit = None
+            raise
+        return {**self.status(), "accepted": True}
+
+    def _commit_job(self, session_id, artifact):
+        outcome = {}
+        try:
+            try:
+                generation = read_published_generation(artifact.root,
+                                                       artifact.entry_point)
+            finally:
+                self.artifacts.release(artifact)
+            context = self._commit_context(session_id, artifact.generation,
+                                           generation.key.model_state_sha256)
+            self._commit_stage("Writing the surface to the object store")
+            with self._store_write_lock:
+                result = commit_in_place(self.object_store.path, generation, context)
+            outcome = {"state": "done", "surface_uuid": result.surface_uuid,
+                       "geometry_revision": result.geometry_revision,
+                       "reused": result.reused, "pushed": None}
+            if generation.unrepresentable:
+                self.events.append(
+                    "log", f"{generation.unrepresentable} vertices of the preview are "
+                    "invalid in the store (a coordinate of -1, or z not positive) and "
+                    "were committed as invalid", severity="warning",
+                    source="service", operation="committing")
+            self.events.append(
+                "log", f"Committed the preview of iteration "
+                f"{generation.source_fit_iteration} as {context.name} "
+                f"({result.surface_uuid})"
+                + (", committed before" if result.reused else ""),
+                source="service", operation="committing")
+        except Exception as exc:
+            error = (str(exc) if isinstance(exc, CommitRefused)
+                     else f"{type(exc).__name__}: {exc}")
+            outcome = {"state": "failed", "error": error}
+            self.events.append("error", f"Commit failed: {error}",
+                               severity="error", source="service",
+                               operation="committing")
+        finally:
+            with self.lock:
+                if self._commit is not None and self._commit["artifact"] == artifact.artifact_id:
+                    self._commit.update(outcome, stage_name=None)
+                    if not outcome:
+                        self._commit.update(state="failed", error="interrupted")
+                self.status_generation += 1
+
+    def _commit_stage(self, stage_name):
+        with self.lock:
+            if self._commit is not None:
+                self._commit["stage_name"] = stage_name
+                self.status_generation += 1
+
+    def _commit_context(self, session_id, generation, model_state_sha256):
+        """What the session records with a commit: its fit volume, config,
+        anchors and project facts."""
+        with self.lock:
+            if self.session_id != session_id or self.session is None:
+                raise CommitRefused("the session changed before the commit")
+            session = self.session
+            request = copy.deepcopy(self.session_request or {})
+        status = session.status()
+        manifest_path = status.get("input_manifest_path")
+        if not status.get("input_digest") or not manifest_path:
+            raise CommitRefused("the session's inputs are not from the object store")
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))["manifest"]
+        volume = manifest["volume_uuid"]
+        shell = (manifest.get("outer_shell") or {}).get("uuid")
+        project = request.get("project") or {}
+        umbilicus = project.get("umbilicus")
+        checkpoint = status.get("checkpoint_state") or {}
+        return CommitContext(
+            volume_uuid=volume,
+            name=(f"{project.get('name') or 'spiral'}-spiral-"
+                  f"{session_id.removeprefix('spiral-')}-g{generation}"),
+            author=self.object_store.author,
+            config=status.get("applied_config") or {},
+            input_digest=status["input_digest"],
+            sources=(volume,) + ((shell,) if shell else ()),
+            checkpoint=(checkpoint.get("path")
+                        if checkpoint.get("model_state_sha256") == model_state_sha256
+                        else None),
+            base_shape_zyx=project.get("base_shape_zyx"),
+            umbilicus=({"uuid": umbilicus.get("uuid"), "revision": umbilicus.get("revision")}
+                       if umbilicus else None),
+            api_version=API_VERSION)
+
     def _require_session(self):
         """The resident session, or why there is nothing to operate on.
 
@@ -3647,6 +3799,9 @@ ROUTES = (
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/download-checkpoint", "download_checkpoint",
           lambda ctx: ctx.state.download_checkpoint(),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/commit", "session_commit",
+          lambda ctx: ctx.state.commit(ctx.body),
           Idempotency.COMMAND_ID, reads_body=True),
 )
 
