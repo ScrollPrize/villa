@@ -1,9 +1,9 @@
 """Committing a published preview generation to the object store.
 
-A generation is written here as lasagna_publish leaves it on disk (a schema-3
-manifest, the flattened tifxyz and the float32 winding map), registered as a
-preview artifact, and committed through the service against a real store.
-The session is a stand-in reporting real object-store inputs.
+A generation is written as lasagna_publish leaves it on disk
+(published_generation), registered as a preview artifact, and committed
+through the service against a real store. The session is a stand-in
+reporting real object-store inputs.
 """
 import dataclasses
 import json
@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from PIL import Image
 
 pytest.importorskip('vc_object_store')
 import vc_object_store as vos  # noqa: E402
@@ -25,63 +24,13 @@ import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
 from lasagna_publish import flatten_profile  # noqa: E402
 from object_store_fixture import VOLUME  # noqa: E402
+from published_generation import BASE_SHAPE, MODEL_STATE, STEP, publish  # noqa: E402
+from published_generation import grid as _grid  # noqa: E402
 from service_http import ApiError  # noqa: E402
 from service_project import UMBILICUS  # noqa: E402
 from test_object_store_startup import fit_config, store_path  # noqa: E402,F401
 
 SESSION = 'spiral-1-0123456789'
-MODEL_STATE = 'a' * 64
-BASE_SHAPE = [64, 64, 64]
-STEP = flatten_profile()['output_step_vx']
-
-
-def _grid(rows=5, columns=7):
-    """A flattened grid with a NaN vertex and a -1 vertex, both invalid."""
-    r, c = np.mgrid[:rows, :columns].astype(np.float32)
-    xyz = np.stack([10.0 + c * 2.5, 20.0 + r * 1.5, 30.0 + r + c], axis=-1)
-    xyz[0, 0] = np.nan
-    xyz[1, 2] = -1.0
-    windings = np.where(c < 3, 4.0, 5.0).astype(np.float32)
-    windings[0, 0] = windings[1, 2] = -1.0
-    return xyz, windings
-
-
-def publish(root, *, input_digest, input_position=None, xyz=None, windings=None,
-            surface_meta=None, run_diff=False, **manifest):
-    """Write one published generation as lasagna_publish does; returns its root."""
-    root = Path(root)
-    surface_id = 'preview-lasagna.tifxyz'
-    surface = root / surface_id
-    surface.mkdir(parents=True)
-    if xyz is None:
-        xyz, windings = _grid()
-    for axis, name in enumerate(('x.tif', 'y.tif', 'z.tif')):
-        Image.fromarray(np.ascontiguousarray(xyz[..., axis]), mode='F').save(surface / name)
-    meta = {'scale': [1.0 / STEP, 1.0 / STEP], 'export_coordinate_scale': 1.0,
-            'base_shape_zyx': BASE_SHAPE, 'winding_id_map': 'winding-ids.tif'}
-    meta.update(surface_meta or {})
-    meta = {key: value for key, value in meta.items() if value is not None}
-    (surface / 'meta.json').write_text(json.dumps(meta))
-    Image.fromarray(windings, mode='F').save(root / 'winding-ids.tif')
-    bounds = [{'winding': 4, 'columns': [0, 2]}, {'winding': 5, 'columns': [3, 6]}]
-    document = {
-        'schema_version': 3, 'surface_id': surface_id,
-        'surface_path': str(surface), 'output_step_vx': STEP,
-        'flatten_profile': flatten_profile(), 'grid_shape': list(xyz.shape[:2]),
-        'winding_ids': [4, 5], 'winding_id_map': 'winding-ids.tif',
-        'winding_id_dtype': 'float32_integer', 'winding_bounds': bounds,
-        'loss_maps': [], 'source_fit_iteration': 120,
-        'model_state_sha256': MODEL_STATE, 'input_digest': input_digest,
-        'input_position': input_position, 'base_shape_zyx': BASE_SHAPE}
-    if run_diff:
-        Image.fromarray(np.zeros((*xyz.shape[:2], 4), np.uint8), mode='RGBA').save(
-            root / 'run-diff.png')
-        document['run_diff'] = {'path': 'run-diff.png', 'changed_source_pixels': 3,
-                                'supported_pixels': 3}
-    document.update(manifest)
-    document = {key: value for key, value in document.items() if value is not None}
-    (root / 'manifest.json').write_text(json.dumps(document))
-    return root
 
 
 def _fit(binding, tmp_path):
