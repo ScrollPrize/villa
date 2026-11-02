@@ -1056,15 +1056,16 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
-// The layers of a size x size plane patch at `offsets` along `normal`: pixel (0, 0) at
-// `origin`, unit steps of the plane's basis, sampled linearly from an opened level, as
+// The layers of a size x size plane patch at `offsets` along `normal`: the centre pixel at
+// `centre`, unit steps of the plane's basis, sampled linearly from an opened level, as
 // fractions of the 8-bit range (0 where there is no sample).
-static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& origin,
+static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& centre,
                                                         const cv::Vec3f& normal, cv::Size size,
                                                         const std::vector<float>& offsets)
 {
-    const PlaneSurface plane(origin, normal);
+    const PlaneSurface plane(centre, normal);
     const cv::Vec3f dx = plane.basisX(), dy = plane.basisY();
+    const cv::Vec3f origin = centre - dx * float(size.width / 2) - dy * float(size.height / 2);
     vcr::grid::Request request;
     request.levels = {vcr::zarr::gridLevel(*level.array, level.working)};
     request.offsets = offsets;
