@@ -14,6 +14,9 @@ performance must be prioritized for anything implemented in this repository. the
 - readme files and other repository files must not contain development notes unless they are relevant to the implementation (nonstandard implementation or gotcha that would be helpful to future developers). during development you are welcome to keep notes in a gitignored development_notes folder. 
 - you can access a nvidia-gpu on most development machines by elevating the request
 
+### capability map
+- before adding anything, check the [capability map](README.md#capability-map) and extend what it lists rather than adding a second implementation. when you add or move a public capability, update its row.
+
 ### c++ first, python binds
 - there must be absolutely zero behavior in vc_reader that exists only in python. everything vc_reader can do is implemented in c++ and available to c++ callers, and python binds that code. new functionality goes into c++ first.
 - the only python that stays is what c++ has nothing equivalent to bind, as thin layers over c++: torch tensor and dataloader integration, numpy-style indexing and array conversion, pickling and rebuilding after a fork, and the cli entry point. real work they do underneath is in c++.
