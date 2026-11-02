@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <vc_reader/native/cuda_available.hpp>
+#include "vc/core/util/CudaSampling.hpp"
 
 #include <cmath>
 #include <vector>
@@ -431,6 +432,63 @@ TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads l
             worst = std::max(worst, std::abs(onGpu.values[i] - onCpu.values[i]));
         CHECK(worst <= 1e-3f);
     }
+}
+
+TEST_CASE("vc::cuda point sampling matches the CPU, and tools get a reader only with --cuda")
+{
+    if (!vcr::cuda::available()) {
+        MESSAGE("Skipped: no CUDA device");
+        return;
+    }
+    Fixture f;
+    OpenedVolumes cpu(64 << 20), gpu(64 << 20, 64 << 20);
+    const auto level = gpu.level(*f.volume, 0);
+    REQUIRE(level.cuda);
+    CHECK_FALSE(cpu.level(*f.volume, 0).cuda);
+    auto& array = *level.array->array;
+    const std::vector<double> zyx{5.25, 6.5, 7.75, 0.0, 0.0, 0.0, 31.0, 31.0, 31.0, 40.0, 1.0, 1.0};
+    const std::size_t n = zyx.size() / 3;
+    std::vector<float> linearCpu(n), linearGpu(n);
+    vc::cuda::sampleLinear(array, level.array->meta.type, nullptr, zyx.data(), n, linearCpu.data());
+    vc::cuda::sampleLinear(array, level.array->meta.type, level.cuda.get(), zyx.data(), n, linearGpu.data());
+    std::vector<std::uint8_t> nearestCpu(n), nearestGpu(n);
+    vc::cuda::sampleNearest(array, nullptr, zyx.data(), n, nearestCpu.data());
+    vc::cuda::sampleNearest(array, level.cuda.get(), zyx.data(), n, nearestGpu.data());
+    CHECK(nearestCpu == nearestGpu);
+    for (std::size_t i = 0; i < n; ++i)
+        CHECK(std::abs(linearCpu[i] - linearGpu[i]) <= 1e-3f);
+    const std::vector<std::int64_t> voxels{3, 4, 5, 31, 31, 31};
+    std::vector<std::uint8_t> read(2);
+    vc::cuda::readVoxels(*level.cuda, voxels.data(), 2, read.data());
+    CHECK(read[0] == f.at0(3, 4, 5));
+    CHECK(read[1] == f.at0(31, 31, 31));
+
+    // A request larger than the budget still gets its values, on the CPU.
+    const auto tiny = vc::cuda::makeReader(array, level.array->meta.type, 1);
+    REQUIRE(tiny);
+    std::vector<float> fallen(n);
+    vc::cuda::sampleLinear(array, level.array->meta.type, tiny.get(), zyx.data(), n, fallen.data());
+    CHECK(fallen == linearCpu);
+
+    // Off by default; --cuda-cache-gb implies --cuda and is taken out of argv.
+    CHECK(vc::cuda::toolReader(*level.array) == nullptr);
+    std::string program = "tool", first = "input", flag = "--cuda-cache-gb", gb = "1", last = "--other";
+    char* args[] = {program.data(), first.data(), flag.data(), gb.data(), last.data(), nullptr};
+    int argc = 5;
+    vc::cuda::applyToolOptions(argc, args);
+    REQUIRE(argc == 3);
+    CHECK(std::string(args[1]) == "input");
+    CHECK(std::string(args[2]) == "--other");
+    CHECK(args[3] == nullptr);
+    CHECK(vc::cuda::enabledForTool());
+    auto* reader = vc::cuda::toolReader(*level.array);
+    REQUIRE(reader);
+    CHECK(vc::cuda::toolReaderOf(array) == reader);
+    // Sampled through its own handle: it outlives the caller's array.
+    std::vector<float> viaTool(n);
+    vc::cuda::sampleLinear(array, level.array->meta.type, reader, zyx.data(), n, viaTool.data());
+    for (std::size_t i = 0; i < n; ++i)
+        CHECK(std::abs(linearCpu[i] - viaTool[i]) <= 1e-3f);
 }
 #endif
 

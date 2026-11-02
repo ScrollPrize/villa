@@ -21,6 +21,8 @@
 
 namespace vcr { class Array; }
 
+namespace vcr::reader_cuda { class Reader; }
+
 namespace vc::lasagna {
 
 // The channel-group arrays of one dataset, each opened once through vc_reader
@@ -44,6 +46,8 @@ struct LasagnaChannelBinding {
     size_t channelIndex = 0;
     // The group array: (Z,Y,X), or (C,Z,Y,X) holding every channel of the group.
     std::shared_ptr<vcr::Array> array;
+    // With a tool's --cuda: the 3-D uint8 group's GPU reader, kept for the process.
+    vcr::reader_cuda::Reader* cuda = nullptr;
     bool packed = false;
     bool float32 = false;  // stored as float32; otherwise uint8
     std::array<size_t, 3> shapeZYX{0, 0, 0};

@@ -32,6 +32,7 @@ add_library(vc_core
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteCacheSettings.cpp
+        src/CudaSampling.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp

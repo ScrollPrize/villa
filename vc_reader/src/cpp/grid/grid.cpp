@@ -9,9 +9,12 @@
 #include "../thread_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <functional>
@@ -69,6 +72,11 @@ ThreadPool& resamplePool()
 // A surface's vertices with what grid::point needs: which vertices are valid, the
 // piece of each column, and (bicubic mode) the Hermite derivatives of every vertex.
 struct Surface::Impl {
+    // Never reused: names this surface's device copy of its vertex data.
+    const std::uint64_t serial = [] {
+        static std::atomic<std::uint64_t> next{0};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }();
     Vertices v;
     SurfaceOptions options;
     std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
@@ -607,6 +615,59 @@ device::Storage upload(const void* data, std::size_t bytes, int deviceId)
     return storage;
 }
 
+// A surface's vertex data on a device. Surfaces do not change, so the last few sampled
+// stay there: uploading a whole grid per frame or tile costs far more than sampling it.
+struct DeviceGrid {
+    device::Storage xyz, valid, piece, normals, du, dv, duv;
+};
+struct KeptGrid {
+    std::uint64_t serial;
+    int device;
+    std::shared_ptr<const DeviceGrid> grid;
+};
+constexpr std::size_t kKeptDeviceGrids = 4;
+std::mutex keptGridsMutex;
+// Never destroyed: device memory must not be freed after the CUDA runtime's teardown.
+std::list<KeptGrid>& keptGrids()
+{
+    static auto* kept = new std::list<KeptGrid>;
+    return *kept;
+}
+
+std::shared_ptr<const DeviceGrid> deviceGrid(const Surface::Impl& impl, int id)
+{
+    std::lock_guard lock(keptGridsMutex);
+    auto& kept = keptGrids();
+    for (auto it = kept.begin(); it != kept.end(); ++it)
+        if (it->serial == impl.serial && it->device == id) {
+            kept.splice(kept.begin(), kept, it);
+            return kept.front().grid;
+        }
+    if (kept.size() >= kKeptDeviceGrids)
+        kept.pop_back();
+    const std::size_t vertices = std::size_t(impl.v.rows) * std::size_t(impl.v.cols);
+    const GridView host = impl.view();
+    const bool bicubic = host.du != nullptr;
+    auto grid = std::make_shared<DeviceGrid>();
+    grid->xyz = upload(host.xyz, vertices * 12, id);
+    grid->valid = upload(host.valid, vertices, id);
+    grid->piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
+    grid->normals = upload(host.normals, host.normals ? vertices * 12 : 0, id);
+    grid->du = upload(host.du, bicubic ? vertices * 12 : 0, id);
+    grid->dv = upload(host.dv, bicubic ? vertices * 12 : 0, id);
+    grid->duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
+    device::complete();  // other threads' streams may read it as soon as it is listed
+    kept.push_front({impl.serial, id, grid});
+    return grid;
+}
+
+// Gives the kept grids' device memory back after a failed GPU pass.
+void forgetDeviceGrids()
+{
+    std::lock_guard lock(keptGridsMutex);
+    keptGrids().clear();
+}
+
 // Samples a raster on the readers' device. `base` carries the points: a plane, or a
 // surface grid (device copies of its vertex data, kept alive by `keep`) with raster.
 Result sampleDevice(int width, int height, const Request& request, const std::vector<reader_cuda::Reader*>& readers,
@@ -679,14 +740,21 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
         });
     };
     pass();
-    if (lacking) {  // load what the first level lacked, then sample again
-        std::vector<unsigned> bits(words);
-        device::check(cudaMemcpy(bits.data(), lacking->ptr, words * 4, cudaMemcpyDeviceToHost));
-        std::vector<std::int64_t> keys;
-        for (std::size_t w = 0; w < bits.size(); ++w)
-            for (unsigned b = bits[w]; b; b &= b - 1)
-                keys.push_back(std::int64_t(w * 32 + std::size_t(std::countr_zero(b))));
-        if (!keys.empty()) {
+    if (lacking) {
+        // Load what the first level lacked and sample again, until nothing lacks: a load
+        // may evict bricks the last pass found resident, and a blocking result has no holes.
+        constexpr int kLoads = 4;
+        for (int loads = 0;; ++loads) {
+            std::vector<unsigned> bits(words);
+            device::check(cudaMemcpy(bits.data(), lacking->ptr, words * 4, cudaMemcpyDeviceToHost));
+            std::vector<std::int64_t> keys;
+            for (std::size_t w = 0; w < bits.size(); ++w)
+                for (unsigned b = bits[w]; b; b &= b - 1)
+                    keys.push_back(std::int64_t(w * 32 + std::size_t(std::countr_zero(b))));
+            if (keys.empty())
+                break;
+            if (loads == kLoads)
+                throw std::runtime_error("a blocking request's bricks do not stay resident; increase the reader's budget");
             readers.front()->load_bricks(keys);
             pass();
         }
@@ -707,15 +775,9 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     device::Guard guard(readers.front()->device_id());
     const int id = readers.front()->device_id();
     const auto& impl = SurfaceAccess::of(surface);
-    const std::size_t vertices = std::size_t(impl.v.rows) * std::size_t(impl.v.cols);
     const GridView host = impl.view();
-    const auto xyz = upload(host.xyz, vertices * 12, id);
-    const auto valid = upload(host.valid, vertices, id);
-    const auto piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
-    const auto normals = upload(host.normals, host.normals ? vertices * 12 : 0, id);
     const bool bicubic = host.du != nullptr;
-    const auto du = upload(host.du, bicubic ? vertices * 12 : 0, id), dv = upload(host.dv, bicubic ? vertices * 12 : 0, id),
-               duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
+    const auto grid = deviceGrid(impl, id);
     cuda_detail::Params base;
     base.x0 = raster.x0;
     base.y0 = raster.y0;
@@ -724,14 +786,14 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     base.kx = raster.kx;
     base.ky = raster.ky;
     base.map = impl.map();
-    base.grid.xyz = static_cast<const float*>(xyz->ptr);
-    base.grid.valid = static_cast<const bool*>(valid->ptr);
-    base.grid.piece = host.piece ? static_cast<const int*>(piece->ptr) : nullptr;
-    base.grid.normals = host.normals ? static_cast<const float*>(normals->ptr) : nullptr;
+    base.grid.xyz = static_cast<const float*>(grid->xyz->ptr);
+    base.grid.valid = static_cast<const bool*>(grid->valid->ptr);
+    base.grid.piece = host.piece ? static_cast<const int*>(grid->piece->ptr) : nullptr;
+    base.grid.normals = host.normals ? static_cast<const float*>(grid->normals->ptr) : nullptr;
     if (bicubic) {
-        base.grid.du = static_cast<const float*>(du->ptr);
-        base.grid.dv = static_cast<const float*>(dv->ptr);
-        base.grid.duv = static_cast<const float*>(duv->ptr);
+        base.grid.du = static_cast<const float*>(grid->du->ptr);
+        base.grid.dv = static_cast<const float*>(grid->dv->ptr);
+        base.grid.duv = static_cast<const float*>(grid->duv->ptr);
     }
     const auto centre = centreOf(surface, raster);
     return sampleDevice(raster.width, raster.height, request, readers, base, centre.data());
@@ -747,6 +809,11 @@ Result sample(const Plane& plane, const Request& request, const std::vector<read
     std::copy(plane.normal.begin(), plane.normal.end(), base.normal);
     const auto centre = centreOf(plane);
     return sampleDevice(plane.width, plane.height, request, readers, base, centre.data());
+}
+
+void forgetKeptData()
+{
+    forgetDeviceGrids();
 }
 
 }  // namespace vcr::grid::cuda
@@ -777,6 +844,7 @@ Result dispatch(const Request& request, Host&& host, Device&& device)
         readers.erase(std::unique(readers.begin(), readers.end()), readers.end());
         for (auto* reader : readers)
             reader->clear();
+        cuda::forgetKeptData();
         Result result = host();
         result.cudaFailure = failure.empty() ? "GPU pass failed" : failure;
         return result;

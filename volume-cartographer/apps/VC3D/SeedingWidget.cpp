@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "SeedingWidget.hpp"
 #include "OpenedVolumes.hpp"
 #include "ToolExecutable.hpp"
@@ -351,7 +352,7 @@ std::vector<float> SeedingWidget::sampleIntensities(const Volume& volume, const 
     for (const auto& p : points)
         zyx.insert(zyx.end(), {double(p[2]), double(p[1]), double(p[0])});
     std::vector<float> values(points.size());
-    level.array->array->sample_linear(zyx.data(), points.size(), level.array->meta.type, false, values.data());
+    vc::cuda::sampleLinear(*level.array->array, level.array->meta.type, level.cuda.get(), zyx.data(), points.size(), values.data());
     for (auto& v : values)
         v = std::clamp(v, 0.0f, 255.0f);
     return values;

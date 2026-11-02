@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberStreamVolume.hpp"
 #include "vc/fiber_tracer/FiberVolumeCoverage.hpp"
 #include "vc/fiber_tracer/FiberAttributes.hpp"
@@ -100,7 +101,7 @@ public:
         std::vector<double> coords;coords.reserve(points.size()*3);
         for(const auto& p:points)for(int axis=0;axis<3;++axis)coords.push_back(ct.placement.fromLevel0(axis,p[2-axis]));
         std::vector<uint8_t> values(points.size());
-        ct.array->sample_nearest(coords.data(),points.size(),values.data());
+        vc::cuda::sampleNearest(*ct.array,vc::cuda::toolReader(ct),coords.data(),points.size(),values.data());
         outside.resize(points.size());
         for(size_t i=0;i<points.size();++i)outside[i]=values[i]==0;
     }

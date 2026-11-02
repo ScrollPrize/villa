@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 
 
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/GrowthMask.hpp"
@@ -564,7 +565,7 @@ private:
     double sample(const cv::Vec3d& xyz) const {
         const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
         float value = 0.0f;
-        volume_->sample_linear(zyx, 1, kVolumeType, false, &value);
+        vc::cuda::sampleLinear(*volume_, kVolumeType, vc::cuda::toolReaderOf(*volume_), zyx, 1, &value);
         return value;
     }
 

@@ -1,17 +1,18 @@
 #include "OpenedVolumes.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/CudaSampling.hpp"
+#include "vc/core/util/Logging.hpp"
 
-#include <vc_reader/cuda_available.hpp>
 #include <vc_reader/array.hpp>
-#ifdef VC_READER_CUDA
-#include <vc_reader/cuda_reader.hpp>
-#endif
+#include <vc_reader/cuda_available.hpp>
 
 OpenedVolumes::OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes)
     : cache_(std::make_shared<vcr::MemoryCache>(cacheBytes))
     , gpuCacheBytes_(vcr::cuda::available() ? gpuCacheBytes : 0)
 {
+    if (gpuCacheBytes && !gpuCacheBytes_)
+        Logger()->warn("GPU viewer sampling is on, but there is no CUDA device: sampling on the CPU");
 }
 
 OpenedVolumes::TransferStats OpenedVolumes::transferStats()
@@ -45,14 +46,12 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
     const int base = volume.baseScaleLevel();
     auto opened = open(volume, base + level);
     std::shared_ptr<vcr::reader_cuda::Reader> reader;
-#ifdef VC_READER_CUDA
     if (gpuCacheBytes_ && opened->meta.dtype == "|u1" && opened->meta.shape.size() == 3) {
         auto& shared = readers_[opened->array.get()];
         if (!shared)
-            shared = std::make_shared<vcr::reader_cuda::Reader>(*opened->array, gpuCacheBytes_, 0);
+            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuCacheBytes_);
         reader = shared;
     }
-#endif
     return {opened, open(volume, base)->placement, std::move(reader)};
 }
 

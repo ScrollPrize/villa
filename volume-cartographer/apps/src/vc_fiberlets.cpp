@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberGraph.hpp"
@@ -94,7 +95,8 @@ void usage(const char* executable) {
               << "       --prediction-angle N --corridor-radius N --invalid-prediction-cost N\n"
               << "       --smoothness-weight N --smoothness-normal-weight N --smoothness-tangent-weight N\n"
               << "       --smoothness-free-angle N --batch N --no-slices\n"
-              << "Distances are base voxels except --cell-size (prediction voxels).\n";
+              << "Distances are base voxels except --cell-size (prediction voxels).\n"
+              << vc::cuda::toolOptionsHelp();
 }
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
 {
@@ -978,6 +980,7 @@ int runWholeVolumePreprocessing(
 
 } // namespace
 int main(int argc, char** argv) {
+    vc::cuda::applyToolOptions(argc, argv);
     try {
         CliOptions options = parseArgs(argc, argv);
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;

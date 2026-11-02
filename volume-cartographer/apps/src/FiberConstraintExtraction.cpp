@@ -31,7 +31,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
     using namespace vc::fiber_tracer;
     using Clock = std::chrono::steady_clock;
     using Json = nlohmann::json;
-    if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json");
+    if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json [--cuda] [--cuda-cache-gb N]");
     Json cfg; std::ifstream input(argv[1]); input >> cfg;
     const auto seconds = [](auto start) { return std::chrono::duration<double>(Clock::now()-start).count(); };
     const auto xyz = [](const Json& v) {

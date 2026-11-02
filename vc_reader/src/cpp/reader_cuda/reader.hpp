@@ -319,13 +319,37 @@ public:
     // Makes the bricks with these keys (see Source: z-major brick-grid indices)
     // resident, reading them from the array. Throws when they exceed the cache budget.
     void load_bricks(const std::vector<std::int64_t>& keys) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
+        ready();
         std::set<std::int64_t> needed;
         const std::int64_t total=source_.grid[0]*source_.grid[1]*source_.grid[2];
         for (auto key:keys) if (key>=0 && key<total) needed.insert(key);
         if (needed.size()>capacity_) throw std::invalid_argument("request exceeds CUDA brick-cache budget; increase cache_bytes");
+        // Fetch before locking: with_resident promises a frame the bricks already here,
+        // so it must not wait on the source. The chunks land in the array's caches.
+        fetch_ahead(needed);
+        std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         guarded([&] { upload(admit(needed),[](std::size_t) {}); });
         mark();
+    }
+    void fetch_ahead(const std::set<std::int64_t>& needed) {
+        std::vector<std::int64_t> missing;
+        {
+            std::lock_guard lock(mutex_);
+            for (auto key:needed) if (!cache_.count(key)) missing.push_back(key);
+        }
+        constexpr std::size_t kScratch=32ull<<20;
+        const auto batch=std::max<std::size_t>(1,kScratch/brick_bytes_);
+        std::vector<std::uint8_t> scratch(std::min(batch,missing.size())*brick_bytes_);
+        for (std::size_t first=0;first<missing.size();first+=batch) {
+            const auto n=std::min(batch,missing.size()-first);
+            std::vector<Index> starts, sizes(n,Index(source_.brick,source_.brick+3));
+            std::vector<std::uint8_t*> outputs;
+            for (std::size_t i=0;i<n;++i) {
+                auto idx=index(missing[first+i]); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
+                starts.push_back(std::move(idx)); outputs.push_back(scratch.data()+i*brick_bytes_);
+            }
+            array_.read_many(starts,sizes,outputs);
+        }
     }
     void clear() {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();

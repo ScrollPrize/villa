@@ -8,6 +8,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -150,7 +151,7 @@ static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz
             zyx[3 * i + a] = map.scale[a] * double(p[2 - int(a)]) + map.offset[a];
     }
     std::vector<float> values(n);
-    reader.level.array->sample_linear(zyx.data(), n, reader.level.meta.type, false, values.data());
+    vc::cuda::sampleLinear(*reader.level.array, reader.level.meta.type, vc::cuda::toolReader(reader.level), zyx.data(), n, values.data());
     cv::Mat_<uint8_t> out(xyz.size());
     for (std::size_t i = 0; i < n; ++i)
         out(int(i)) = std::isnan(values[i]) ? uint8_t(0) : uint8_t(std::clamp(values[i], 0.0f, 255.0f));
@@ -176,7 +177,7 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     const float m = 1.0f / reader.scale;
     const cv::Vec3f dx = plane.basisX() * m, dy = plane.basisY() * m;
     vcr::grid::Request request;
-    request.levels = {vcr::zarr::gridLevel(reader.level, reader.base)};
+    request.levels = {vcr::zarr::gridLevel(reader.level, reader.base, vc::cuda::toolReader(reader.level))};
     request.offsets = offsets;
     const auto layers = vcr::grid::sample(vcr::grid::Plane{{point[0], point[1], point[2]}, {dx[0], dx[1], dx[2]},
                                                            {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]}, d, d},
@@ -434,6 +435,7 @@ int main(int argc, char *argv[])
     // Store mode: the --surface is refined in place, or into a new surface
     // when --name is given; with --volume-uuid it is read in that volume's
     // voxels (the zarr's) through the store's view of it.
+    vc::cuda::applyToolOptions(argc, argv);
     std::vector<std::string> args(argv + 1, argv + argc);
     std::optional<StoreToolOptions> store;
     try {
@@ -449,7 +451,7 @@ int main(int argc, char *argv[])
                   << " <zarr-volume> <json-params>" << std::endl
                   << "  in store mode the surface is refined in place, or into a new surface named --name; with"
                   << " --volume-uuid it is read in that volume's voxels (the zarr's) through the store's view of it"
-                  << std::endl;
+                  << std::endl << vc::cuda::toolOptionsHelp();
         return EXIT_FAILURE;
     }
 

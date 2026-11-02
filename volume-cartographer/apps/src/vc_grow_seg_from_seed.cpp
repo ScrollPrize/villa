@@ -2,6 +2,7 @@
 #include <random>
 
 #include "TargetContext.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
@@ -84,7 +85,7 @@ static double volume_value(vcr::Array& volume, const cv::Vec3d& xyz)
 {
     const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
     float value = 0.0f;
-    volume.sample_linear(zyx, 1, vcr::ElementType{'u', 1, false}, false, &value);
+    vc::cuda::sampleLinear(volume, vcr::ElementType{'u', 1, false}, vc::cuda::toolReaderOf(volume), zyx, 1, &value);
     return value;
 }
 
@@ -140,6 +141,7 @@ int main(int argc, char *argv[])
 {
     // First, before anything can issue a BLAS call.
     cap_blas_thread_pool();
+    vc::cuda::applyToolOptions(argc, argv);
 
     try {
         return run_main(argc, argv);
@@ -335,6 +337,7 @@ static int run_main(int argc, char *argv[])
         std::cerr << "ERROR: the tracer reads uint8 volumes, not " << level0->meta.dtype << std::endl;
         return EXIT_FAILURE;
     }
+    (void)vc::cuda::toolReader(*level0);
     vcr::Array& tracing_volume = *level0->array;
     const std::array<int, 3> volume_shape_zyx{
         int(level0->meta.shape[0]), int(level0->meta.shape[1]), int(level0->meta.shape[2])};

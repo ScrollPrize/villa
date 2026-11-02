@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/ImageMat.hpp"
 #include "FiberTraceEvaluationCli.hpp"
 #include "FiberTraceCli.hpp"
@@ -522,7 +523,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         renderArtifact(argv[2], argv[4]);
         return 0;
     }
-    const auto usage = "Usage: vc_fiber_trace_metric replay-set --config evaluation.json [--render] | render-replay trace.json --config render.json";
+    const auto usage = "Usage: vc_fiber_trace_metric replay-set --config evaluation.json [--render] | render-replay trace.json --config render.json; each takes [--cuda] [--cuda-cache-gb N]";
     if (argc < 2 || (std::string_view(argv[1]) != "replay-set" && std::string_view(argv[1]) != "replay-references")) throw std::invalid_argument(usage);
     std::filesystem::path configArgument;
     bool renderFlag = false;
@@ -682,7 +683,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     source.renderLevelIndex = 1;
                 } catch (const std::out_of_range&) {
                 }
-                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, base->placement);
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, base->placement, vc::cuda::toolReader(*source.renderLevel));
                 for (size_t axis = 0; axis < 3; ++axis)
                     if (source.renderSource.shapeZYX[axis] != dataset.manifest().baseShapeZYX->at(axis))
                         throw std::invalid_argument("render CT base shape differs from predictions");
@@ -691,7 +692,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("remote render CT must bind the base pyramid with ct_base_volume=true");
                 source.renderLevel = std::make_shared<vcr::zarr::OpenedArray>(openCtLevel(source.renderCt, decodedCache));
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderLevel);
-                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel);
+                source.renderGridLevel = vcr::zarr::gridLevel(*source.renderLevel, {}, vc::cuda::toolReader(*source.renderLevel));
             }
         }
         if(backend=="chunk-beam") {

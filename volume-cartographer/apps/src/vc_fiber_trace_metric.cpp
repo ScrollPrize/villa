@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "FiberTraceEvaluationCli.hpp"
 #include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -70,7 +71,8 @@ void printUsage(const char* argv0)
         << "  --max-step-factor N             max steps as factor of CP span [3]\n"
         << "  --error-threshold-base-voxels N restart threshold at target plane [20]\n"
         << "  --cache-gib N                   per-channel memory-cache budget [8]\n"
-        << "  --quiet                         suppress progress line\n";
+        << "  --quiet                         suppress progress line\n"
+        << vc::cuda::toolOptionsHelp();
 }
 
 double parseDouble(const std::string& value, const std::string& name)
@@ -317,6 +319,7 @@ void clearProgressLine()
 
 int main(int argc, char** argv)
 {
+    vc::cuda::applyToolOptions(argc, argv);
     try {
         if (argc > 1 && (std::string_view(argv[1]) == "replay-set" ||
                          std::string_view(argv[1]) == "replay-references" ||

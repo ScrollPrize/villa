@@ -1067,7 +1067,7 @@ static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level
     const cv::Vec3f dx = plane.basisX(), dy = plane.basisY();
     const cv::Vec3f origin = centre - dx * float(size.width / 2) - dy * float(size.height / 2);
     vcr::grid::Request request;
-    request.levels = {vcr::zarr::gridLevel(*level.array, level.working)};
+    request.levels = {vcr::zarr::gridLevel(*level.array, level.working, level.cuda.get())};
     request.offsets = offsets;
     const auto r = vcr::grid::sample(vcr::grid::Plane{{origin[0], origin[1], origin[2]}, {dx[0], dx[1], dx[2]},
                                                       {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]},

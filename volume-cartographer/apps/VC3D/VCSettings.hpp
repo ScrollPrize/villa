@@ -168,7 +168,7 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // Sample frames on the GPU (builds with CUDA, uint8 volumes). The cache is per
+    // Sample volumes on the GPU in every viewer (builds with CUDA, uint8 volumes). The cache is per
     // pyramid level. Startup-only.
     constexpr auto RENDER_CUDA = "perf/render_cuda";
     constexpr bool RENDER_CUDA_DEFAULT = false;

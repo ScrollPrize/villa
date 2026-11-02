@@ -23,12 +23,12 @@ public:
     struct Level {
         std::shared_ptr<vcr::zarr::OpenedArray> array;  // the opened physical level
         vcr::zarr::LevelPlacement working;              // placement of the volume's working level 0
-        // Samples the level on the GPU, when the render backend is CUDA and the
-        // level is uint8; null otherwise.
+        // Samples the level on the GPU, when the settings turn GPU viewer sampling on
+        // and the level is uint8; null otherwise. Every viewer samples through it.
         std::shared_ptr<vcr::reader_cuda::Reader> cuda;
     };
 
-    // gpuCacheBytes > 0 samples frames on the GPU, keeping up to that many bytes of
+    // gpuCacheBytes > 0 samples on the GPU, keeping up to that many bytes of
     // each level resident (builds with CUDA, when a device is present).
     explicit OpenedVolumes(std::size_t cacheBytes, std::size_t gpuCacheBytes = 0);
 

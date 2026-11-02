@@ -112,9 +112,10 @@ void SettingsDialog::setupCacheActionControls()
         gridLayout_5->addWidget(_remoteCacheDelta3dCheckBox, 2, 0, 1, 3);
 
 #ifdef VC_READER_CUDA
-    _renderCudaCheckBox = new QCheckBox(tr("Sample viewer frames on the GPU (CUDA)."), groupBox_5);
+    _renderCudaCheckBox = new QCheckBox(tr("Sample volumes on the GPU (CUDA) in all viewers."), groupBox_5);
     _renderCudaCheckBox->setObjectName(QStringLiteral("chkRenderCuda"));
-    _renderCudaCheckBox->setToolTip(tr("Requires restart. uint8 volumes only; others keep sampling on the CPU."));
+    _renderCudaCheckBox->setToolTip(tr("Requires restart. Covers the 2D viewers, overlays, the 3D scene and fiber views, and the seeding and push/pull tools. "
+                                     "uint8 volumes only; others keep sampling on the CPU, as does everything if the GPU fails."));
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     using namespace vc3d::settings;
     _renderCudaCheckBox->setChecked(settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool());

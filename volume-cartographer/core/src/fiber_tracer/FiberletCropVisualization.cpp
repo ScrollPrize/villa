@@ -1,3 +1,4 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 
 #include "vc/core/util/ImageMat.hpp"
@@ -118,6 +119,7 @@ void writeFiberletCropBoxVisualization(
                     vertices.cols*factor, vertices.rows*factor};
                 vcr::grid::Request request;
                 request.levels = {{ct.array.get(), ct.meta.type}};
+                request.levels.front().cuda = vc::cuda::toolReader(ct);
                 const auto sampled = vcr::grid::sample(surface, raster, request);
                 cv::Mat_<uint8_t> texture(raster.height, raster.width);
                 vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());

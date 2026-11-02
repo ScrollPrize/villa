@@ -1,5 +1,6 @@
 #include <vc_reader/sampling.hpp>
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/PortableTensor.hpp"
 
 #include <algorithm>
@@ -241,8 +242,23 @@ struct CornerCoordinates {
     void prefetch(size_t) const {}
 };
 
+// The corners on the group's GPU reader (3-D groups only have one); false on a GPU failure.
+inline bool readCornersOnDevice(const LasagnaChannelBinding& binding, const CornerCoordinates& coords, size_t n,
+                                uint8_t* out)
+{
+    std::vector<int64_t> zyx(3 * n);
+    for (size_t p = 0; p < n; ++p)
+        coords(p, zyx.data() + 3 * p);
+    try {
+        vc::cuda::readVoxels(*binding.cuda, zyx.data(), n, out);
+    } catch (const std::runtime_error&) {
+        return false;
+    }
+    return true;
+}
+
 // The eight corners of each cube (corner k at cube * 8 + k), read with one
-// Array::sample_nearest_coordinates call.
+// Array::sample_nearest_coordinates call, or on the GPU with a tool's --cuda.
 template <class T>
 void readCorners(const LasagnaChannelBinding& binding,
                  const std::vector<std::array<int64_t, 3>>& lower, std::vector<T>& out)
@@ -257,11 +273,10 @@ void readCorners(const LasagnaChannelBinding& binding,
         binding.array->sample_nearest_coordinates(coords, n, reinterpret_cast<uint8_t*>(values.data()));
         for (size_t i = 0; i < n; ++i)
             out[i] = std::is_same_v<T, uint8_t> ? T(byteValue(values[i])) : T(values[i]);
-    } else if constexpr (std::is_same_v<T, uint8_t>) {
-        binding.array->sample_nearest_coordinates(coords, n, out.data());
     } else {
         std::vector<uint8_t> values(n);
-        binding.array->sample_nearest_coordinates(coords, n, values.data());
+        if (!(binding.cuda && readCornersOnDevice(binding, coords, n, values.data())))
+            binding.array->sample_nearest_coordinates(coords, n, values.data());
         std::copy(values.begin(), values.end(), out.begin());
     }
 }
@@ -339,6 +354,7 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.group = group;
     binding.channelIndex = *channelIndex;
     binding.array = std::shared_ptr<vcr::Array>(opened, opened->array.get());  // shares the whole opened level
+    binding.cuda = vc::cuda::toolReader(*opened);
     binding.spacing = static_cast<double>(group->scaleFactor()) *
                       manifest.sourceToBase / manifest.workingToBaseScale;
     binding.float32 = meta.dtype == "<f4";
@@ -627,6 +643,11 @@ std::optional<double> sampleLasagnaChannel(
     zyx[1] = point[1];
     zyx[2] = point[0];
     double value = 0.0;
+    if (binding.cuda) {
+        float single = 0.0f;
+        vc::cuda::sampleLinear(*binding.array, vcr::ElementType{'u', 1, false}, binding.cuda, coordinates, 1, &single);
+        return double(single);
+    }
     binding.array->sample_linear(coordinates, 1,
         binding.float32 ? vcr::ElementType{'f', 4, false} : vcr::ElementType{'u', 1, false}, true, &value);
     return value;

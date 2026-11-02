@@ -1,5 +1,6 @@
 #include <vc_reader/display.hpp>
 #include <iostream>
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
@@ -226,6 +227,7 @@ static vcr::grid::Result sampleTile(const RenderSurface& surface, const vcr::gri
 {
     vcr::grid::Request request;
     request.levels = {vcr::grid::Level{&volume, type}};
+    request.levels.front().cuda = vc::cuda::toolReaderOf(volume);
     request.order = order;
     request.offsets = offsets;
     if (g_flipNormals)
@@ -818,6 +820,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Memory cache size in GB")
+        ("cuda", po::bool_switch(), "Sample on the GPU (3-D uint8 volumes; fails without a device)")
+        ("cuda-cache-gb", po::value<size_t>()->default_value(vc::cuda::kDefaultToolCacheGb), "Device memory for the volume with --cuda, in GB")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1170,6 +1174,15 @@ int main(int argc, char *argv[])
         logPrintf(stderr, "Error: the renderer reads 3-D uint8 or uint16 volumes, not %s\n",
                   source->meta.dtype.c_str());
         return EXIT_FAILURE;
+    }
+    if (parsed["cuda"].as<bool>()) {
+        try {
+            vc::cuda::enableForTool(parsed["cuda-cache-gb"].as<size_t>() << 30);
+        } catch (const std::exception& e) {
+            logPrintf(stderr, "Error: %s\n", e.what());
+            return EXIT_FAILURE;
+        }
+        (void)vc::cuda::toolReader(*source);
     }
     vcr::Array& volume = *source->array;
 

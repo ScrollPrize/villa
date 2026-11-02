@@ -3,6 +3,7 @@
 #include "Fiber3DGeometry.hpp"
 #include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/CudaSampling.hpp"
 #include <vc_reader/array.hpp>
 #include <algorithm>
 #include <cmath>
@@ -37,7 +38,7 @@ cv::Mat_<cv::Vec2b> sampleCoordinates(const cv::Mat_<cv::Vec3f>& points, OpenedV
             indices.push_back(size_t(r) * points.cols + c);
         }
     std::vector<float> values(indices.size());
-    opened.array->array->sample_linear(coords.data(), indices.size(), opened.array->meta.type, false, values.data());
+    vc::cuda::sampleLinear(*opened.array->array, opened.array->meta.type, opened.cuda.get(), coords.data(), indices.size(), values.data());
     const double scale = pyramid.dtype == "<u2" ? 1./256. : 1.;
     std::vector<uint8_t> bytes(indices.size());
     vcr::display::toUint8(values.data(), values.size(), bytes.data(), nullptr,

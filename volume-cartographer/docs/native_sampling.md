@@ -55,3 +55,31 @@ Remote groups with explicit keys sign `s3://` requests; otherwise public
 buckets are read anonymously and other buckets with discovered AWS
 credentials when the dataset allows it. A remote manifest is downloaded once under
 the cache root, at the path `vcr::zarr::decodedCachePath` gives it.
+
+## GPU sampling (CUDA)
+
+Volume sampling can run on the GPU through `vcr::reader_cuda::Reader`, in builds with
+CUDA and for 3-D uint8 levels. Anything else samples on the CPU. A GPU failure falls back
+to the CPU with a logged warning. CPU and GPU values may differ by float rounding.
+
+**VC3D:** *Settings → Sample volumes on the GPU (CUDA) in all viewers* (`perf/render_cuda`,
+restart required; `perf/render_gpu_cache_gb` sets the device memory per opened level,
+default 4). `OpenedVolumes::Level::cuda` carries the reader to the 2D viewers and overlays,
+the 3D scene and fiber views (`fibers3d::ct`), and the seeding and push/pull tools.
+
+**Tools:** `--cuda` (fails if there is no device) and `--cuda-cache-gb N` (device memory
+per opened level, implies `--cuda`, default 4):
+
+| Tool | What samples on the GPU |
+| --- | --- |
+| `vc_render_tifxyz` | every tile |
+| `vc_objrefine` | alpha-composite patches and surface samples |
+| `vc_fiber_trace_metric` | CT textures; 3-D uint8 Lasagna channels |
+| `vc_fiberlets` | CT collision checks, crop boxes; 3-D uint8 Lasagna channels |
+| `vc_fiber_constraints`, `vc_fiber_bake_annotations` | 3-D uint8 Lasagna channels |
+| `vc_grow_seg_from_seed` | seed checks, reference-ray occlusion cost |
+
+Packed (4-D) and float32 Lasagna channels stay on the CPU. Callers that sample one point
+at a time (`vc_grow_seg_from_seed`, single Lasagna values) pay a device round trip per
+point, so `--cuda` will usually slow those down. New sampling code goes through
+`vc/core/util/CudaSampling.hpp`, or sets `vcr::grid::Level::cuda` for raster requests.

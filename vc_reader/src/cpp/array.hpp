@@ -358,6 +358,7 @@ public:
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
     const ArraySpec& spec() const noexcept { return spec_; }
+    const std::shared_ptr<MemoryCache>& memory_cache() const noexcept { return cache_; }
     void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_.parallel_for(n,fn); }
     std::size_t itemsize() const noexcept { return spec_.itemsize; }
 

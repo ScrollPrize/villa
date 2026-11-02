@@ -187,9 +187,12 @@ namespace vcr::grid::cuda {
 // (Level::cuda is ignored), and every sample reads its level's resident bricks.
 // Cache-only requests read those alone; blocking ones first make the bricks the
 // first level lacks resident (from the array), then sample again. A surface's
-// positions and normals are resampled on the CPU and uploaded.
+// vertex data is uploaded once and positions and normals are computed on the device.
 Result sample(const Surface& surface, const Raster& raster, const Request& request,
               const std::vector<reader_cuda::Reader*>& readers);
 Result sample(const Plane& plane, const Request& request, const std::vector<reader_cuda::Reader*>& readers);
+// Frees the surface vertex data kept on devices between samples (grid::sample does when
+// a GPU pass fails; the last few surfaces sampled are otherwise kept).
+void forgetKeptData();
 }  // namespace vcr::grid::cuda
 #endif

@@ -201,6 +201,34 @@ int main()
             compare(cpu, fallen, 0.0f, "fallen back to the CPU");
             std::cout << "GPU failure fell back to the CPU: " << fallen.cudaFailure << '\n';
         }
+        {
+            // A blocking request whose load evicts bricks it found resident still has no holes.
+            const auto root = path / "eviction";
+            auto evicting = store(root, 128, 32);
+            vcr::reader_cuda::Reader small(*evicting, 8 * 32 * 32 * 32, 0);
+            small.load_bricks({0, 1, 2, 3});      // these bricks, the oldest: the plane's first row
+            small.load_bricks({16, 17, 18, 19});  // and these, younger, which it does not touch
+            const vcr::grid::Plane row{{0, 0, 16}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 128, 64};
+            vcr::grid::Request request;
+            vcr::grid::Level whole;
+            whole.array = evicting.get();
+            request.levels = {whole};
+            const auto cpu = vcr::grid::sample(row, request);
+            const auto gpu = vcr::grid::cuda::sample(row, request, {&small});
+            compare(cpu, gpu, 0.0f, "a blocking request after an eviction");
+            // Sampling a surface twice reuses its device copy and gives the same values.
+            std::vector<float> xyz;
+            for (int r = 0; r < 8; ++r)
+                for (int c = 0; c < 8; ++c)
+                    xyz.insert(xyz.end(), {float(c * 8), float(r * 8), 20.0f});
+            vcr::grid::Surface sheet({xyz.data(), 8, 8, 24, nullptr, nullptr});
+            const vcr::grid::Raster raster{0, 0, 0.5, 0.5, 15, 15};
+            const auto cpuSheet = vcr::grid::sample(sheet, raster, request);
+            for (int pass = 0; pass < 2; ++pass)
+                compare(cpuSheet, vcr::grid::cuda::sample(sheet, raster, request, {&small}), 1e-3f, "a kept surface");
+            vcr::grid::cuda::forgetKeptData();
+            compare(cpuSheet, vcr::grid::cuda::sample(sheet, raster, request, {&small}), 1e-3f, "a surface uploaded again");
+        }
         std::cout << "Native CUDA grid sampling passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
