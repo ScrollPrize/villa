@@ -20,7 +20,7 @@ void exec(sqlite3* db, const char* sql)
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : sqlite3_errmsg(db);
         sqlite3_free(err);
-        throw std::runtime_error("sqlite exec failed: " + msg);
+        throw std::runtime_error("sqlite exec failed: " + msg + " (" + sql + ")");
     }
 }
 
