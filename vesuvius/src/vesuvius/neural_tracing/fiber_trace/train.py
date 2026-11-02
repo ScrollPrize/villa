@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from vc_reader.torch import sample_array
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 
@@ -746,13 +746,8 @@ def _sample_plane_image(
     embedding_similarity: torch.Tensor | None = None,
     center_marker_yx: tuple[int, int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    image = F.grid_sample(
-        volume,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0, 0]
+    points = (grid.flip(-1) + 1) * grid.new_tensor([n - 1 for n in volume.shape[-3:]]) / 2
+    image = sample_array(volume, points)[0, 0, 0]
     encoded_labels = torch.full(labels.shape, 127.0, device=labels.device)
     encoded_labels = torch.where(
         labels == int(NEGATIVE_LABEL),
@@ -764,13 +759,7 @@ def _sample_plane_image(
         torch.full_like(encoded_labels, 255.0),
         encoded_labels,
     )
-    sampled_labels = F.grid_sample(
-        encoded_labels.unsqueeze(0).unsqueeze(0),
-        grid,
-        mode="nearest",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0, 0]
+    sampled_labels = sample_array(encoded_labels[None, None], points, order=0)[0, 0, 0]
     in_bounds = (grid[0, 0].abs() <= 1.0).all(dim=-1)
     yy, xx = torch.meshgrid(
         torch.arange(sampled_labels.shape[0], device=sampled_labels.device),
@@ -807,13 +796,7 @@ def _sample_plane_image(
         "labels": label_out,
     }
     if embedding_similarity is not None:
-        sampled_cos = F.grid_sample(
-            embedding_similarity.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0),
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )[0, 0, 0]
+        sampled_cos = sample_array(embedding_similarity.float()[None, None], points)[0, 0, 0]
         sampled_cos = torch.where(
             in_bounds,
             sampled_cos,

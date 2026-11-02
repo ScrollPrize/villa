@@ -50,8 +50,8 @@ def wavy_surface(height: int, width: int, seed: int) -> Surface:
     )
 
 
-class NativeDifferentialTests(unittest.TestCase):
-    def assert_differential(
+class NativeTilingTests(unittest.TestCase):
+    def assert_tiled_match(
         self,
         source: Surface,
         target: Surface,
@@ -62,7 +62,7 @@ class NativeDifferentialTests(unittest.TestCase):
         source_validity: np.ndarray | None = None,
         **kwargs,
     ) -> None:
-        def run(kind: str, cache: Path):
+        def run(cache: Path, tiled: bool):
             output = np.full(output_shape, 37, dtype=label.dtype)
             valid = np.zeros(output_shape, dtype=np.uint8)
             distance = np.full(output_shape, np.inf, dtype=np.float32)
@@ -91,8 +91,8 @@ class NativeDifferentialTests(unittest.TestCase):
                 ),
                 source_validity=source_validity,
                 uv_cache=cache,
-                rasterizer=kind,
-                **kwargs,
+                rasterizer="native",
+                **(kwargs if tiled else {**kwargs, "tile_size": max(output_shape), "workers": 1}),
             )
             return (
                 result[0].copy(),
@@ -106,8 +106,8 @@ class NativeDifferentialTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary) / "uv.npz"
-            expected = run("python", cache)
-            actual = run("native", cache)
+            expected = run(cache, False)
+            actual = run(cache, True)
         np.testing.assert_array_equal(actual[0], expected[0])
         np.testing.assert_array_equal(actual[1], expected[1])
         np.testing.assert_allclose(actual[2], expected[2], atol=2e-5, rtol=2e-4)
@@ -148,7 +148,7 @@ class NativeDifferentialTests(unittest.TestCase):
         source_validity = np.full(label.shape, 255, dtype=np.uint8)
         source_validity[3:5, 6:9] = 128
         source_validity[0, :4] = 0
-        self.assert_differential(
+        self.assert_tiled_match(
             source,
             target,
             label,
@@ -199,7 +199,7 @@ class NativeDifferentialTests(unittest.TestCase):
         validity = np.full(label.shape, 255, dtype=np.uint8)
         validity[:, 0] = 0
         validity[:, 10] = 128
-        self.assert_differential(
+        self.assert_tiled_match(
             source,
             target,
             label,
@@ -221,7 +221,7 @@ class NativeDifferentialTests(unittest.TestCase):
         target.z[:, 16:] += 5.0
         label = np.zeros((8, 24), dtype=np.uint8)
         label[:, :3] = 7
-        self.assert_differential(
+        self.assert_tiled_match(
             source,
             target,
             label,
@@ -240,7 +240,7 @@ class NativeDifferentialTests(unittest.TestCase):
         label = np.arange(30, dtype=np.uint8).reshape(source.shape)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            self.assert_differential(
+            self.assert_tiled_match(
                 source,
                 source,
                 label,
@@ -276,7 +276,7 @@ class NativeDifferentialTests(unittest.TestCase):
                     p=(0.05, 0.1, 0.85),
                 )
                 source_validity = wide_validity[:, ::2]
-                self.assert_differential(
+                self.assert_tiled_match(
                     source,
                     target,
                     label,

@@ -386,18 +386,11 @@ def _patch_samples(patch_dir, erode, subdiv):
     rows, cols = np.nonzero(quad)
     if not len(rows):
         return None, None
-    c00 = xyz[rows, cols]
-    c01 = xyz[rows, cols + 1]
-    c10 = xyz[rows + 1, cols]
-    c11 = xyz[rows + 1, cols + 1]
     steps = (np.arange(subdiv, dtype=np.float32) + 0.5) / subdiv
     u, v = np.meshgrid(steps, steps, indexing="ij")
-    u = u.reshape(-1)[None, :, None]
-    v = v.reshape(-1)[None, :, None]
-    samples = (
-        c00[:, None] * (1 - u) * (1 - v) + c01[:, None] * (1 - u) * v
-        + c10[:, None] * u * (1 - v) + c11[:, None] * u * v
-    ).reshape(-1, 3)
+    samples, supported = surface.points_at(
+        rows[:, None] + u.ravel(), cols[:, None] + v.ravel())
+    samples = samples[supported]
     vertices = xyz[valid]
     return samples, vertices
 

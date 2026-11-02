@@ -41,8 +41,8 @@ uv sync --extra label-transfer --extra tests
 ```
 
 Surface sampling and the per-pixel rasterizer are provided by `vc_reader`.
-`--rasterizer auto` and `native` select its prepared kernel; `python` selects
-application-level orchestration of the same shared sampling primitives.
+`--rasterizer auto` and `native` select its prepared kernel.
+Raw CT rendering uses the native grid renderer with volume fill outside bounds.
 Target geometry and rendering use bicubic positions and tangent normals.
 For the optional interactive viewer, install
 napari separately (and the Qt backend appropriate for your platform):

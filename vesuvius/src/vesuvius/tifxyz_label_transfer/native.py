@@ -17,9 +17,9 @@ class NativeTileResult:
 
 
 def resolve_rasterizer(requested):
-    if requested not in {"auto", "native", "python"}:
-        raise ValueError("rasterizer must be 'auto', 'native', or 'python'")
-    return "python" if requested == "python" else "native"
+    if requested not in {"auto", "native"}:
+        raise ValueError("rasterizer must be 'auto' or 'native'")
+    return "native"
 
 
 class NativeRasterizer:

@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+from vc_reader.torch import sample_array
 import torch.nn.functional as F
 from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
 
@@ -399,34 +400,9 @@ def _sample_grid_points_hwc(
         & (y >= 0.0)
         & (y <= float(height - 1))
     )
-    if width > 1:
-        grid_x = x * (2.0 / float(width - 1)) - 1.0
-    else:
-        grid_x = torch.zeros_like(x)
-    if height > 1:
-        grid_y = y * (2.0 / float(height - 1)) - 1.0
-    else:
-        grid_y = torch.zeros_like(y)
-    grid_x = torch.where(in_bounds, grid_x, torch.zeros_like(grid_x))
-    grid_y = torch.where(in_bounds, grid_y, torch.zeros_like(grid_y))
-    grid = torch.stack([grid_x, grid_y], dim=-1).view(1, int(points.shape[0]), 1, 2)
-    sampled = F.grid_sample(
-        values.permute(2, 0, 1).unsqueeze(0),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, :, :, 0].permute(1, 0)
-    sampled_valid = (
-        F.grid_sample(
-            valid.to(dtype=torch.float32).view(1, 1, height, width),
-            grid,
-            mode="nearest",
-            padding_mode="zeros",
-            align_corners=True,
-        )[0, 0, :, 0]
-        > 0.5
-    ) & in_bounds
+    queries = torch.where(in_bounds[:, None], points, torch.zeros_like(points)).flip(-1)[None]
+    sampled = sample_array(values.permute(2, 0, 1)[None], queries)[0].T
+    sampled_valid = (sample_array(valid.float()[None, None], queries, order=0)[0, 0] > 0.5) & in_bounds
     sampled = torch.where(sampled_valid[:, None], sampled, torch.zeros_like(sampled))
     return sampled, sampled_valid
 
@@ -853,31 +829,9 @@ def _resample_coord_tensors_like_augmentation(
         )
     else:
         pixel_coords = transform.output_to_source_grid()
-    x = pixel_coords[..., 0]
-    y = pixel_coords[..., 1]
-    if source_width > 1:
-        x = x * (2.0 / float(source_width - 1)) - 1.0
-    else:
-        x = torch.zeros_like(x)
-    if source_height > 1:
-        y = y * (2.0 / float(source_height - 1)) - 1.0
-    else:
-        y = torch.zeros_like(y)
-    grid = torch.stack([x, y], dim=-1).unsqueeze(0)
-    sampled_coords = F.grid_sample(
-        coords_t.permute(2, 0, 1).unsqueeze(0),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0].permute(1, 2, 0)
-    sampled_valid = F.grid_sample(
-        valid_t.view(1, 1, source_height, source_width),
-        grid,
-        mode="nearest",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0] > 0.5
+    queries = pixel_coords.flip(-1)[None]
+    sampled_coords = sample_array(coords_t.permute(2, 0, 1)[None], queries)[0].permute(1, 2, 0)
+    sampled_valid = sample_array(valid_t[None, None], queries, order=0)[0, 0] > 0.5
     sampled_coords = torch.where(sampled_valid[..., None], sampled_coords, torch.zeros_like(sampled_coords))
     return sampled_coords, sampled_valid
 
@@ -896,35 +850,9 @@ def _resample_coord_tensor_batch_like_augmentation(
         raise ValueError("valid_mask must have shape B,H,W")
     if maps.ndim != 4 or maps.shape[-1] != 2 or maps.shape[0] != coords_t.shape[0]:
         raise ValueError("backward_maps_xy must have shape B,Hout,Wout,2")
-    batch, source_height, source_width = int(coords_t.shape[0]), int(coords_t.shape[1]), int(coords_t.shape[2])
-    x = maps[..., 0]
-    y = maps[..., 1]
-    if source_width > 1:
-        x = x * (2.0 / float(source_width - 1)) - 1.0
-    else:
-        x = torch.zeros_like(x)
-    if source_height > 1:
-        y = y * (2.0 / float(source_height - 1)) - 1.0
-    else:
-        y = torch.zeros_like(y)
-    grid = torch.stack([x, y], dim=-1)
-    sampled_coords = F.grid_sample(
-        coords_t.permute(0, 3, 1, 2),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    ).permute(0, 2, 3, 1)
-    sampled_valid = (
-        F.grid_sample(
-            valid_bool.to(dtype=torch.float32).view(batch, 1, source_height, source_width),
-            grid,
-            mode="nearest",
-            padding_mode="zeros",
-            align_corners=True,
-        )[:, 0]
-        > 0.5
-    )
+    queries = maps.flip(-1)
+    sampled_coords = sample_array(coords_t.permute(0, 3, 1, 2), queries).permute(0, 2, 3, 1)
+    sampled_valid = sample_array(valid_bool.float()[:, None], queries, order=0)[:, 0] > 0.5
     sampled_coords = torch.where(sampled_valid[..., None], sampled_coords, torch.zeros_like(sampled_coords))
     return sampled_coords, sampled_valid
 

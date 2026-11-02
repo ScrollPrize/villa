@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vc_reader.torch import sample_array
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentParams,
@@ -169,8 +170,6 @@ def _trace2cp_directional_blur_xy_lhw(
     chunk_layers = max(1, min(layers, int(_TRACE2CP_SIDE_PRESENCE_BLUR_GRID_TARGET_VALUES) // pixels_per_layer))
     base_x = torch.arange(width, dtype=torch.float32, device=device).view(1, 1, width)
     base_y = torch.arange(height, dtype=torch.float32, device=device).view(1, height, 1)
-    scale_x = 0.0 if width <= 1 else 2.0 / float(width - 1)
-    scale_y = 0.0 if height <= 1 else 2.0 / float(height - 1)
     output_chunks: list[torch.Tensor] = []
     for start in range(0, layers, chunk_layers):
         end = min(layers, start + chunk_layers)
@@ -189,23 +188,9 @@ def _trace2cp_directional_blur_xy_lhw(
         for along, across, offset_weight in xy_offsets:
             source_x = base_x + float(along) * unit[..., 0] + float(across) * perp_x
             source_y = base_y + float(along) * unit[..., 1] + float(across) * perp_y
-            grid_x = torch.zeros_like(source_x) if width <= 1 else source_x * scale_x - 1.0
-            grid_y = torch.zeros_like(source_y) if height <= 1 else source_y * scale_y - 1.0
-            grid = torch.stack((grid_x, grid_y), dim=-1)
-            sampled_values = torch.nn.functional.grid_sample(
-                values,
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            ).squeeze(1)
-            sampled_weights = torch.nn.functional.grid_sample(
-                weights,
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            ).squeeze(1)
+            queries = torch.stack((source_y, source_x), dim=-1)
+            sampled_values = sample_array(values, queries).squeeze(1)
+            sampled_weights = sample_array(weights, queries).squeeze(1)
             weight = float(offset_weight)
             accum_values = accum_values + sampled_values * weight
             accum_weights = accum_weights + sampled_weights * weight

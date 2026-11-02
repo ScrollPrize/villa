@@ -47,7 +47,7 @@ class DataConfig:
     hard_fraction: float = 0.
     anchor_tries: int = 8  # orientation/anchor attempts on a drawn patch before drawing another
     # Per patch directory (same order as patches_dir): the CT volume its patches' coordinates are in, e.g. segments
-    # of other scrolls (``scripts/prepare_scroll.py``); an empty entry (or an empty list) means data.volume. The
+    # of other scrolls; an empty entry (or an empty list) means data.volume. The
     # volumes share data.volume_level.
     patch_volumes: list = field(default_factory=list)
     # Per patch directory: its share of the sampling weight (normalized; within a directory patches keep their

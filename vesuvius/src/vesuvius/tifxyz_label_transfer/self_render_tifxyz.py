@@ -248,25 +248,6 @@ def select_overlap_tiles(
     )
 
 
-class RawSampler:
-    """Trilinear CT values at level-0 XYZ points, clamped to the array."""
-
-    def __init__(self, info: ZarrLevel, **reader_options) -> None:
-        self.info = info
-        self.reader = info.open(**reader_options)
-
-    def sample(self, points_xyz: np.ndarray) -> np.ndarray:
-        points_zyx = points_xyz[:, ::-1] / np.asarray(
-            self.info.scale_zyx, dtype=np.float64
-        )
-        points_zyx = np.clip(
-            points_zyx,
-            0.0,
-            np.asarray(self.info.shape, dtype=np.float64) - 1.0,
-        )
-        return self.reader.sample(points_zyx, order=1, dtype=np.float32)
-
-
 def _find_raw_volume_remote(
     selection: dict[str, Any], open_data_root: str, volume_id: str
 ) -> str:
@@ -520,32 +501,11 @@ def _raw_reader_options(args: argparse.Namespace, output_dir: Path) -> dict[str,
     return {"cache_dir": cache, "threads": args.workers}
 
 
-def _render_values(
-    xyz: np.ndarray,
-    normals: np.ndarray,
-    valid: np.ndarray,
-    offsets: Sequence[float],
-    sampler: RawSampler,
-) -> np.ndarray:
-    output = np.zeros(valid.shape, dtype=np.float32)
-    selected = valid.ravel()
-    if not np.any(selected):
-        return output
-    points = xyz.reshape(-1, 3)[selected]
-    directions = normals.reshape(-1, 3)[selected]
-    maximum = np.zeros(points.shape[0], dtype=np.float32)
-    for offset in offsets:
-        values = sampler.sample(points + directions * float(offset))
-        maximum = np.maximum(maximum, values)
-    output.ravel()[selected] = maximum
-    return output
-
-
-def _to_uint8(values: np.ndarray, sampler: RawSampler) -> np.ndarray:
+def _to_uint8(values: np.ndarray, info: ZarrLevel) -> np.ndarray:
     """Convert rendered raw-CT values to uint8 without integer wrap-around."""
 
-    array = np.asarray(values, dtype=np.float64)
-    dtype = np.dtype(sampler.info.metadata["dtype"])
+    array = np.nan_to_num(np.asarray(values, dtype=np.float64))
+    dtype = np.dtype(info.metadata["dtype"])
     if dtype.kind in "ui":
         peak = float(np.iinfo(dtype).max)
         if peak > 255.0:
@@ -750,23 +710,27 @@ def _run_source_only(
     center_image = _open_output(center_output, annotation.shape, args.overwrite)
     max_image = _open_output(max_output, annotation.shape, args.overwrite)
     valid_image = _open_output(valid_output, annotation.shape, args.overwrite)
-    source_sampler = RawSampler(source_raw_info, **raw_options)
+    source_sampler = source_raw_info.open(**raw_options)
     for index, bounds in enumerate(source_tiles, start=1):
         row0, row1, col0, col1 = bounds
         xyz, normals, valid = surface_tile_geometry(
             source_surface, annotation.shape, bounds
         )
         center_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(
-                xyz, normals, valid, [0.0], source_sampler
+            source_sampler.render_points(
+                xyz, normals, valid,
+                offsets=[0.0],
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
             ),
-            source_sampler,
+            source_raw_info,
         )
         max_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(
-                xyz, normals, valid, source_offsets, source_sampler
+            source_sampler.render_points(
+                xyz, normals, valid,
+                offsets=source_offsets,
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
             ),
-            source_sampler,
+            source_raw_info,
         )
         valid_image[row0:row1, col0:col1] = valid.astype(np.uint8) * 255
         print(f"Rendered source tile {index}/{len(source_tiles)}", flush=True)
@@ -1105,11 +1069,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     projected_max = _open_output(projected_max_output, target_center.shape, args.overwrite)
     target_max = _open_output(target_max_output, target_center.shape, args.overwrite)
     target_valid_image = _open_output(target_valid_output, target_center.shape, args.overwrite)
-    source_sampler = RawSampler(source_raw_info, **raw_options)
+    source_sampler = source_raw_info.open(**raw_options)
     target_sampler = (
         source_sampler
         if target_raw_remote == source_raw_remote
-        else RawSampler(target_raw_info, **raw_options)
+        else target_raw_info.open(**raw_options)
     )
     for index, bounds in enumerate(source_tiles, start=1):
         row0, row1, col0, col1 = bounds
@@ -1117,12 +1081,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_surface, annotation.shape, bounds
         )
         center_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(xyz, normals, valid, [0.0], source_sampler),
-            source_sampler,
+            source_sampler.render_points(
+                xyz, normals, valid,
+                offsets=[0.0],
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+            ),
+            source_raw_info,
         )
         max_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(xyz, normals, valid, source_offsets, source_sampler),
-            source_sampler,
+            source_sampler.render_points(
+                xyz, normals, valid,
+                offsets=source_offsets,
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+            ),
+            source_raw_info,
         )
         source_valid_image[row0:row1, col0:col1] = valid.astype(np.uint8) * 255
         print(f"Rendered source tile {index}/{len(source_tiles)}", flush=True)
@@ -1130,20 +1102,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         row0, row1, col0, col1 = bounds
         source_xyz, source_normals, target_xyz, target_normals, valid = geometry
         projected_center[row0:row1, col0:col1] = _to_uint8(
-            _render_values(source_xyz, source_normals, valid, [0.0], source_sampler),
-            source_sampler,
+            source_sampler.render_points(
+                source_xyz, source_normals, valid,
+                offsets=[0.0],
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+            ),
+            source_raw_info,
         )
         projected_max[row0:row1, col0:col1] = _to_uint8(
-            _render_values(source_xyz, source_normals, valid, source_offsets, source_sampler),
-            source_sampler,
+            source_sampler.render_points(
+                source_xyz, source_normals, valid,
+                offsets=source_offsets,
+                scale_zyx=1 / np.asarray(source_raw_info.scale_zyx),
+            ),
+            source_raw_info,
         )
         target_center_image[row0:row1, col0:col1] = _to_uint8(
-            _render_values(target_xyz, target_normals, valid, [0.0], target_sampler),
-            target_sampler,
+            target_sampler.render_points(
+                target_xyz, target_normals, valid,
+                offsets=[0.0],
+                scale_zyx=1 / np.asarray(target_raw_info.scale_zyx),
+            ),
+            target_raw_info,
         )
         target_max[row0:row1, col0:col1] = _to_uint8(
-            _render_values(target_xyz, target_normals, valid, target_offsets, target_sampler),
-            target_sampler,
+            target_sampler.render_points(
+                target_xyz, target_normals, valid,
+                offsets=target_offsets,
+                scale_zyx=1 / np.asarray(target_raw_info.scale_zyx),
+            ),
+            target_raw_info,
         )
         target_valid_image[row0:row1, col0:col1] = valid.astype(np.uint8) * 255
         print(f"Rendered overlap tile {index}/{len(target_tiles)}", flush=True)

@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 import torch
-import torch.nn.functional as F
+from vc_reader.torch import sample_array
+from vc_reader.resident import GridField
 from tqdm import tqdm
 from vc_reader.reader import open_group
 
@@ -240,17 +241,6 @@ def _as_displacement_tensor(disp):
     return torch.from_numpy(disp_np[:3]).unsqueeze(0).contiguous()
 
 
-def _coords_local_to_grid(coords_t, d, h, w):
-    d_denom = max(int(d) - 1, 1)
-    h_denom = max(int(h) - 1, 1)
-    w_denom = max(int(w) - 1, 1)
-    coords_norm = coords_t.clone()
-    coords_norm[:, 0] = 2.0 * coords_norm[:, 0] / float(d_denom) - 1.0
-    coords_norm[:, 1] = 2.0 * coords_norm[:, 1] / float(h_denom) - 1.0
-    coords_norm[:, 2] = 2.0 * coords_norm[:, 2] / float(w_denom) - 1.0
-    return coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
-
-
 def _displacement_sample_offsets_rc(radius, spacing):
     radius = float(radius)
     spacing = float(spacing)
@@ -323,13 +313,7 @@ def _sample_displacement_at_local_coords_tensor(disp_t, coords_t):
     sampled_disp_t = torch.zeros((coords_t.shape[0], 3), dtype=disp_t.dtype, device=disp_t.device)
     if bool(valid_mask_t.any()):
         valid_coords_t = coords_t[valid_mask_t]
-        grid = _coords_local_to_grid(valid_coords_t, d=d, h=h, w=w)
-        sampled_valid_t = F.grid_sample(
-            disp_t,
-            grid,
-            mode="bilinear",
-            align_corners=True,
-        ).view(3, -1).permute(1, 0)
+        sampled_valid_t = sample_array(disp_t, valid_coords_t[None])[0].T
         sampled_disp_t[valid_mask_t] = sampled_valid_t
     return sampled_disp_t, valid_mask_t
 
@@ -375,36 +359,10 @@ def _sample_local_surface_coords_from_uv_tensor(uv_rc, local_zyx, query_uv_t):
     grid_np[rr, cc] = local_arr
     mask_np[rr, cc] = 1.0
 
-    value_t = torch.from_numpy(grid_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
-    mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).contiguous()
-    q_t = query_uv_t.to(dtype=torch.float32, device="cpu")
-    q_r = q_t[:, 0] - float(r_min)
-    q_c = q_t[:, 1] - float(c_min)
-    y_norm = (2.0 * q_r / float(max(h - 1, 1))) - 1.0
-    x_norm = (2.0 * q_c / float(max(w - 1, 1))) - 1.0
-    query_grid_t = torch.stack([x_norm, y_norm], dim=1).view(1, -1, 1, 2)
-    with torch.no_grad():
-        sampled_num_t = F.grid_sample(
-            value_t,
-            query_grid_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        sampled_den_t = F.grid_sample(
-            mask_t,
-            query_grid_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-    sampled_num_t = sampled_num_t.view(3, -1).permute(1, 0).contiguous()
-    sampled_den_t = sampled_den_t.view(-1)
-    can_sample_t = sampled_den_t > 1e-6
-    sampled_coords_t = torch.zeros_like(sampled_num_t)
-    if bool(can_sample_t.any()):
-        sampled_coords_t[can_sample_t] = sampled_num_t[can_sample_t] / sampled_den_t[can_sample_t, None]
-    return sampled_coords_t, can_sample_t
+    field = GridField(grid_np, mask_np.astype(bool))
+    queries = query_uv_t.detach().cpu().numpy() - np.array([r_min, c_min], np.float32)
+    sampled, supported = field.sample(queries)
+    return torch.from_numpy(sampled), torch.from_numpy(supported)
 
 
 def _sample_trilinear_displacement_stack_tensor(
@@ -522,7 +480,7 @@ def _surface_to_stored_uv_samples_lattice(
     phase_c = int(phase_rc[1])
 
     empty_meta = {
-        "mode": "lattice_bilinear_torch",
+        "mode": "lattice_vc_reader",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": 0,
@@ -575,44 +533,8 @@ def _surface_to_stored_uv_samples_lattice(
     q_r = q_r[in_grid].astype(np.float32, copy=False)
     q_c = q_c[in_grid].astype(np.float32, copy=False)
 
-    denom_r = float(max(h - 1, 1))
-    denom_c = float(max(w - 1, 1))
-    value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
-    value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
-    mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
-
-    def _sample_world_and_mask(qr, qc):
-        y_norm = (2.0 * qr / denom_r) - 1.0
-        x_norm = (2.0 * qc / denom_c) - 1.0
-        query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
-        query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
-        with torch.no_grad():
-            sampled_num_t = F.grid_sample(
-                value_t,
-                query_t,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-            sampled_den_t = F.grid_sample(
-                mask_t,
-                query_t,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-        sampled_num = (
-            sampled_num_t[0, :, :, 0]
-            .permute(1, 0)
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
-        )
-        sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
-        return sampled_num, sampled_den
-
-    sampled_num, sampled_den = _sample_world_and_mask(q_r, q_c)
-    can_sample = sampled_den > 1e-6
+    field = GridField(grid, support)
+    sampled, can_sample = field.sample(np.stack((q_r, q_c), axis=-1))
     n_anchor_sampled = int(can_sample.sum())
     n_fallback_tried = 0
     n_fallback_recovered = 0
@@ -623,12 +545,10 @@ def _surface_to_stored_uv_samples_lattice(
         if n_fallback_tried > 0:
             q_r_fallback = (q_r[fallback_idx] + (0.5 * float(sub_r - 1))).astype(np.float32, copy=False)
             q_c_fallback = (q_c[fallback_idx] + (0.5 * float(sub_c - 1))).astype(np.float32, copy=False)
-            sampled_num_fb, sampled_den_fb = _sample_world_and_mask(q_r_fallback, q_c_fallback)
-            can_fb = sampled_den_fb > 1e-6
+            sampled_fb, can_fb = field.sample(np.stack((q_r_fallback, q_c_fallback), axis=-1))
             if bool(can_fb.any()):
                 recovered_idx = fallback_idx[can_fb]
-                sampled_num[recovered_idx] = sampled_num_fb[can_fb]
-                sampled_den[recovered_idx] = sampled_den_fb[can_fb]
+                sampled[recovered_idx] = sampled_fb[can_fb]
                 can_sample[recovered_idx] = True
                 n_fallback_recovered = int(can_fb.sum())
 
@@ -638,12 +558,10 @@ def _surface_to_stored_uv_samples_lattice(
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (meta,)
 
     uv_keep = uv_q[can_sample].astype(np.int64, copy=False)
-    pts_bilinear = (
-        sampled_num[can_sample] / sampled_den[can_sample, None]
-    ).astype(np.float32, copy=False)
+    points = sampled[can_sample]
 
     projection_meta = {
-        "mode": "lattice_bilinear_torch",
+        "mode": "lattice_vc_reader",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": n_full_valid,
@@ -652,7 +570,7 @@ def _surface_to_stored_uv_samples_lattice(
         "n_fallback_recovered": n_fallback_recovered,
         "n_stored_valid": int(uv_keep.shape[0]),
     }
-    return uv_keep, pts_bilinear, projection_meta
+    return uv_keep, points, projection_meta
 
 
 def parse_args(argv=None):

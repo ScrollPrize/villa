@@ -1176,9 +1176,10 @@ The important behavior is:
   line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
   bilinear lookup against the prebuilt `forward_map_xy`; smooth interpolation is
   only used while constructing the maps.
-- Provides a batched sparse bilinear gather for line/CP point lookup. Training
-  batch construction stacks `forward_map_xy` tensors across strip-z offsets and
-  avoids tiny sparse `grid_sample` calls.
+- Uses `vc_reader.torch.sample_array` for batched sparse bilinear line/CP lookup.
+  Training batch construction stacks `forward_map_xy` tensors across strip-z
+  offsets. See [shared sampling](shared_sampling.md) for coordinate order and
+  default boundary behavior.
 - Loader patch construction reuses one transform object for coordinate
   augmentation and line/CP mapping. Line points and the CP are mapped together
   in one batched source-to-output call, and shared line/CP results can be reused

@@ -61,7 +61,7 @@ and code names therefore means masked output, not halted motion.
 
 | option | effect |
 | --- | --- |
-| `data.patches_dir`, `data.patch_volumes`, `data.dir_weights` | One patch directory or a list of them, each with the CT volume its patches' coordinates are in (empty: `data.volume`; e.g. other scrolls prepared with `scripts/prepare_scroll.py`) and its share of the sampling weight. |
+| `data.patches_dir`, `data.patch_volumes`, `data.dir_weights` | One patch directory or a list of them, each with the CT volume its patches' coordinates are in (empty: `data.volume`) and its share of the sampling weight. |
 | `data.front_points_range`, `train.points_per_batch` | Training only: every batch draws its front size N uniformly from `[min, max]`, holding about `points_per_batch` points (`batch = points_per_batch / N`). `data.front_points` still sets validation. |
 | `data.unpadded_blocks` | Keep each training episode's block unpadded on the GPU (a list), instead of padding them to the batch's largest extent, which long fronts at mixed orientations blow up. |
 | `data.fiber_runs`, `fiber_fraction`, `fiber_min_valid` | Fiber-seeded episodes: this fraction of episodes starts from a fiber matched to its patch (`scripts/match_fibers_to_patches.py`). The fiber is the seed row, and the GT window is rotated to follow it. |
