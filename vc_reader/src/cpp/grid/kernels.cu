@@ -14,15 +14,34 @@ namespace {
 
 constexpr std::int8_t kNone = -2, kMissing = -1;
 
+// Notes `key` in the set once. A full set counts the key past its capacity instead.
+__device__ void noteLacking(const LackingSet& set, std::int64_t key)
+{
+    const unsigned mask = set.capacity - 1;
+    unsigned slot = unsigned(reader_cuda::home_slot(key, mask));
+    for (unsigned probe = 0; probe < set.capacity; ++probe, slot = (slot + 1) & mask) {
+        const auto previous = atomicCAS(set.table + slot, LackingSet::kEmpty, (unsigned long long)key);
+        if (previous == (unsigned long long)key)
+            return;
+        if (previous == LackingSet::kEmpty) {
+            const unsigned at = atomicAdd(set.count, 1u);
+            if (at < set.capacity)
+                set.keys[at] = key;
+            return;
+        }
+    }
+    atomicAdd(set.count, 1u);
+}
+
 // A level's resident bricks for sampling::point. A brick that is not resident is
-// unavailable; with `lacking`, it is noted (one bit per brick).
+// unavailable; with a lacking set, it is noted there.
 struct BrickLookup {
     const reader_cuda::Source& s;
-    unsigned* lacking;
+    const LackingSet* lacking;
     std::int64_t shape[3], block[3], stride[3];
     float fill;
 
-    __device__ BrickLookup(const reader_cuda::Source& source, unsigned* lack) : s(source), lacking(lack)
+    __device__ BrickLookup(const reader_cuda::Source& source, const LackingSet* lack) : s(source), lacking(lack)
     {
         for (int a = 0; a < 3; ++a) {
             shape[a] = s.shape[a];
@@ -47,7 +66,7 @@ struct BrickLookup {
         }
         available = false;
         if (lacking)
-            atomicOr(lacking + key / 32, 1u << (key % 32));
+            noteLacking(*lacking, key);
         return nullptr;
     }
 };
@@ -94,7 +113,7 @@ __global__ void samplePixels(Params P)
         float value = 0;
         int li = 0;
         for (; li < P.levelCount; ++li) {
-            BrickLookup lookup(P.levels[li].source, li == 0 ? P.lacking : nullptr);
+            BrickLookup lookup(P.levels[li].source, li == 0 && P.lacking.table ? &P.lacking : nullptr);
             float c[3];
             levelIndex(P.levels[li].map, at[0], at[1], at[2], c);
             if (sampling::point(lookup, P.levels[li].map.base, c, P.order, value))

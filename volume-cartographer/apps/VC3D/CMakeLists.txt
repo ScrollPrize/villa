@@ -8,7 +8,6 @@ set(srcs
     Colormaps.cpp
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
     ${vccollection_moc}
-    VCAppMain.cpp
     CState.cpp
     OpenedVolumes.cpp
     CState.hpp
@@ -354,7 +353,13 @@ if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
 endif()
 
 
-add_executable(VC3D ${srcs} resources.qrc)
+# Everything but main() is one object library, so the app and the benchmarks
+# (VC_BUILD_BENCHMARKS) link the same compiled viewer and controller code.
+add_library(vc3d_app OBJECT ${srcs} resources.qrc)
+add_executable(VC3D VCAppMain.cpp)
+target_link_libraries(VC3D PRIVATE vc3d_app)
+# Its uic headers (ui_*.h) are included by VCAppMain.cpp and the benchmarks too.
+target_include_directories(vc3d_app PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/vc3d_app_autogen/include)
 
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.
@@ -363,8 +368,8 @@ if(WIN32)
     target_sources(VC3D PRIVATE VC3D.rc)
 endif()
 
-target_include_directories(VC3D
-    PRIVATE
+target_include_directories(vc3d_app
+    PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
 )
@@ -378,17 +383,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(AVAHI_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=1)
 else()
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_AVAHI=0)
 endif()
 
 find_package(mimalloc QUIET)
 if(mimalloc_FOUND)
-    target_compile_definitions(VC3D PRIVATE VC_HAVE_MIMALLOC=1)
+    target_compile_definitions(vc3d_app PUBLIC VC_HAVE_MIMALLOC=1)
 endif()
 
-target_link_libraries(VC3D
+target_link_libraries(vc3d_app PUBLIC
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
@@ -452,7 +457,7 @@ if(VC_USE_PCH)
     # headers. Qt stays out of vc_core's shared PCH so the Qt-free CLI apps that
     # REUSE_FROM it don't pay to parse Qt. (Can't REUSE_FROM vc_core and add Qt
     # — a target has one PCH — so build VC3D's directly from the same list.)
-    target_precompile_headers(VC3D PRIVATE
+    target_precompile_headers(vc3d_app PRIVATE
         ${VC_PCH_HEADERS}
         "$<$<COMPILE_LANGUAGE:CXX>:<QtCore/QtCore>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
@@ -490,5 +495,5 @@ endif()
 if(VC_TESTING)
     set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp scene3d/Scene3DPanel.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
     # The in-binary store tests build their fixture volumes with core/test/support.
-    target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
+    target_include_directories(vc3d_app PUBLIC ${PROJECT_SOURCE_DIR}/core/test)
 endif()

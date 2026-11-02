@@ -168,11 +168,17 @@ Result sampleCached(const Frame& frame, Request request, Pending* pending)
             anyCoarse = true;
         }
     }
+    // Sampled on the CPU, the frame names the chunks it lacked: reads fetch exactly those.
+    const bool chunkReads = result.missingChunks.size() == request.levels.size();
     const auto read = [&](std::size_t index, std::vector<std::uint8_t> mask) {
-        Pending::Read r{frame, {}, std::move(mask)};
+        Pending::Read r{frame, {}, std::move(mask), {}};
         r.request.levels = {request.levels[index]};
         r.request.order = request.order;
         r.request.offsets = request.offsets;
+        if (chunkReads) {
+            r.chunks = result.missingChunks[index];
+            r.pixels.clear();
+        }
         return r;
     };
     if (anyCoarse)
@@ -182,11 +188,32 @@ Result sampleCached(const Frame& frame, Request request, Pending* pending)
     return result;
 }
 
+namespace {
+
+// Brings the chunks into the array's caches: Array::read_many with null outputs
+// resolves each chunk once, in parallel, and copies nothing.
+void readChunks(Array& array, const std::vector<std::int64_t>& keys)
+{
+    const auto& grid = array.chunk_grid();
+    const auto& shape = array.spec().chunks;
+    std::vector<Index> starts, sizes(keys.size(), Index(shape.begin(), shape.end()));
+    for (const auto key : keys)
+        starts.push_back(Index{key / (grid[1] * grid[2]) * shape[0], key / grid[2] % grid[1] * shape[1],
+                               key % grid[2] * shape[2]});
+    array.read_many(starts, sizes, std::vector<std::uint8_t*>(keys.size(), nullptr));
+}
+
+}  // namespace
+
 std::string load(const Pending& pending, const std::function<bool()>& afterPart)
 {
     std::string failure;
     for (const auto* part : {&pending.coarse, &pending.target}) {
         for (const auto& read : *part) {
+            if (!read.chunks.empty()) {
+                readChunks(*read.request.levels.front().array, read.chunks);
+                continue;
+            }
             auto request = read.request;
             request.cachedOnly = false;
             request.pixels = read.pixels.empty() ? nullptr : read.pixels.data();

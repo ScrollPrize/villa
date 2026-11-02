@@ -1844,6 +1844,12 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.gridSurface == b.gridSurface;
 }
 
+bool CChunkedVolumeViewer::renderSettled() const
+{
+    return !_renderWorkerBusy.load(std::memory_order_acquire) && !_pendingRenderJob &&
+           !_loadRunning && !_pendingLoad && (!_lastRenderResult || _lastRenderResult->load.empty());
+}
+
 bool CChunkedVolumeViewer::renderJobsSameView(const PendingRenderJob& a,
                                             const PendingRenderJob& b)
 {

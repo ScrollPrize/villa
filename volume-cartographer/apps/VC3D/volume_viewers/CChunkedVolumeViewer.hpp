@@ -98,6 +98,9 @@ public:
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     float getCurrentScale() const override { return _scale; }
     static float clampCameraScale(float scale);
+    // No frame is rendering or queued and no volume read is outstanding: the
+    // displayed frame is final for the current view (benchmarks wait on this).
+    bool renderSettled() const;
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state);

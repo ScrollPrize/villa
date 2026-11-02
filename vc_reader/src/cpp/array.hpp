@@ -372,7 +372,8 @@ public:
     enum class Bounds { Fill, Strict };
 
     // Reads every region [start, start+size) into its C-order output buffer.
-    // Parts outside the array, and chunks that are not stored, read as fill.
+    // Parts outside the array, and chunks that are not stored, read as fill. A null
+    // output only brings the region's chunks into the caches (nothing is copied).
     // `stream`: raw local chunks missing from the memory cache are copied straight
     // into the outputs without being read whole and inserted (callers with their
     // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
@@ -427,7 +428,7 @@ public:
                 empty |= hi[i] <= lo[i];
                 clipped |= lo[i] != start[i] || hi[i] != start[i] + size[i];
             }
-            if (empty || clipped)  // outside the array reads as fill; the inside is overwritten below
+            if ((empty || clipped) && outs[r])  // outside the array reads as fill; the inside is overwritten below
                 fill_box(outs[r], out_strides[r], size, output ? output->fill : spec_.fill);
             if (empty)
                 continue;
@@ -452,11 +453,13 @@ public:
                     p.extent[i] = b - a;
                     dst_lo[i] = a - start[i];
                 }
-                p.dst = outs[r] + offset_of(dst_lo, out_strides[r]);
                 auto [it, fresh] = slot.emplace(linear, work.size());
                 if (fresh)
                     work.push_back(Work{idx, {}, {}});
-                work[it->second].pieces.push_back(std::move(p));
+                if (outs[r]) {
+                    p.dst = outs[r] + offset_of(dst_lo, out_strides[r]);
+                    work[it->second].pieces.push_back(std::move(p));
+                }
             } while (next_index(idx, c0, c1));
         }
         std::vector<Work> ordered;  // chunk order: locality

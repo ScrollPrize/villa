@@ -175,6 +175,10 @@ struct Result {
     // What a GPU pass failed with, when the request was sampled on the CPU instead
     // (see sample); empty otherwise.
     std::string cudaFailure;
+    // Cached-only requests sampled on the CPU: per request level, the chunks (keys
+    // (z * grid[1] + y) * grid[2] + x over the level's chunk grid, ascending) a sample
+    // needed and no cache held. Empty otherwise.
+    std::vector<std::vector<std::int64_t>> missingChunks;
 };
 
 // Samples a request, on the GPU when every level has a CUDA reader (one device
@@ -231,6 +235,9 @@ struct Pending {
         Frame frame;
         Request request;  // one level; sampled for the pixels set in `pixels`
         std::vector<std::uint8_t> pixels;
+        // When set, the level's chunks to read (Result::missingChunks keys): load reads
+        // them and samples nothing.
+        std::vector<std::int64_t> chunks;
     };
     std::vector<Read> coarse, target;
     std::vector<std::shared_ptr<const void>> owners;
