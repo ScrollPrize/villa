@@ -277,6 +277,8 @@ set(srcs
     SpiralStoreInputs.hpp
     SpiralPreviewWindings.cpp
     SpiralPreviewWindings.hpp
+    SpiralStoredFits.cpp
+    SpiralStoredFits.hpp
     SpiralStoreEdits.cpp
     SpiralStoreEdits.hpp
     SpiralSshTunnel.cpp

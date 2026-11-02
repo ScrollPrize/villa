@@ -242,6 +242,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _installedPreviewSession.clear();
     _displayedPreviewSourceIteration = -1;
     _fetchingPreviewArtifact.clear();
+    _pendingCommits.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
     _installedInputManifest.clear();
@@ -686,6 +687,13 @@ void SpiralServiceManager::disconnectFromService()
         _lasagnaCacheCancel.reset();
     }
     abandonInputUpdate(tr("The connection to the Spiral service changed"));
+    if (!_commitArtifact.isEmpty()) {
+        CommitResult abandoned;
+        abandoned.artifact = _commitArtifact;
+        abandoned.state = QStringLiteral("failed");
+        abandoned.error = tr("The connection to the Spiral service changed; the commit's outcome is unknown");
+        finishCommit(abandoned);
+    }
     ++_connectionGeneration;
     _leaseOwner = false;
     _poll->stop();
@@ -1357,6 +1365,72 @@ void SpiralServiceManager::requestPreview()
                   });
 }
 
+std::optional<SpiralServiceManager::CommitResult>
+SpiralServiceManager::CommitResult::fromStatus(const QJsonObject& status)
+{
+    const QJsonObject commit = status.value(QStringLiteral("commit")).toObject();
+    if (commit.isEmpty()) return std::nullopt;
+    CommitResult result;
+    result.artifact = commit.value(QStringLiteral("artifact")).toString();
+    result.state = commit.value(QStringLiteral("state")).toString();
+    result.stage = commit.value(QStringLiteral("stage_name")).toString();
+    result.surfaceUuid = commit.value(QStringLiteral("surface_uuid")).toString();
+    result.geometryRevision = commit.value(QStringLiteral("geometry_revision")).toString();
+    result.reused = commit.value(QStringLiteral("reused")).toBool();
+    if (commit.value(QStringLiteral("pushed")).isBool())
+        result.pushed = commit.value(QStringLiteral("pushed")).toBool();
+    result.pushError = commit.value(QStringLiteral("push_error")).toString();
+    result.error = commit.value(QStringLiteral("error")).toString();
+    return result;
+}
+
+bool SpiralServiceManager::commitsAvailable() const
+{
+    return _advertisedBindings.value(QStringLiteral("capabilities")).toObject()
+        .value(QStringLiteral("commits")).toBool();
+}
+
+void SpiralServiceManager::commitPreview(const QString& requested)
+{
+    const QString artifact = requested.isEmpty() ? _installedPreviewArtifact : requested;
+    if (!isReady() || !_commitArtifact.isEmpty() || artifact.isEmpty()) return;
+    _commitArtifact = artifact;
+    _commitStatusGeneration = -1;
+    // The service accepts the commit and returns; status "commit" reports
+    // its progress and outcome. Repeating it reuses the surface and retries
+    // its push.
+    postWithRetry(QStringLiteral("/session/commit"),
+                  {{QStringLiteral("command_id"), commandId()},
+                   {QStringLiteral("artifact"), artifact}},
+                  Timeout::Command, kMutationRetries,
+                  [this, artifact](const QJsonObject& response) {
+                      if (_commitArtifact != artifact) return;
+                      _commitStatusGeneration = response.value(QStringLiteral("generation")).toInteger(-1);
+                      handleStatus(response);
+                  },
+                  [this, artifact](const QString& error) {
+                      if (_commitArtifact != artifact) return;
+                      CommitResult refused;
+                      refused.artifact = artifact;
+                      refused.state = QStringLiteral("failed");
+                      refused.error = error;
+                      finishCommit(refused);
+                  });
+}
+
+void SpiralServiceManager::finishCommit(const CommitResult& result)
+{
+    _commitArtifact.clear();
+    _commitStatusGeneration = -1;
+    // A commit the service pushed is on the hub: pull this replica so the
+    // surface is local for opening.
+    if (result.state == QStringLiteral("done") && result.pushed.value_or(false)
+        && _storeBinding.hosted() && _storeBinding.matches())
+        if (const auto session = _storeSession.lock(); session && _storeAttachment)
+            session->syncHub(*_storeAttachment);
+    emit commitFinished(result);
+}
+
 QStringList SpiralServiceManager::serviceCheckpoints() const
 {
     QStringList paths;
@@ -1753,6 +1827,17 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         if (status.value(QStringLiteral("preview_schedule")).toObject().isEmpty())
             requestPreview();
     }
+    QStringList pending;
+    for (const QJsonValue& value : status.value(QStringLiteral("pending_commits")).toArray())
+        pending.push_back(value.toString());
+    _pendingCommits = pending;
+    if (!_commitArtifact.isEmpty() && _commitStatusGeneration >= 0 && generation >= _commitStatusGeneration)
+        if (const auto commit = CommitResult::fromStatus(status); commit && commit->artifact == _commitArtifact) {
+            if (commit->state == QStringLiteral("running"))
+                emit commitProgress(commit->stage);
+            else
+                finishCommit(*commit);
+        }
     emit sessionStatusChanged(status);
     syncArtifacts(status);
 }

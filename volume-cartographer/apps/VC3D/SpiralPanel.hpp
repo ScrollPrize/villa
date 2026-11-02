@@ -10,6 +10,7 @@
 #include <initializer_list>
 
 #include "SpiralPclRole.hpp"
+#include "SpiralServiceManager.hpp"
 #include "SpiralServiceProfile.hpp"
 #include "elements/VolumeSelector.hpp"
 
@@ -30,7 +31,6 @@ class QProgressBar;
 class QSlider;
 class QToolButton;
 class QTimer;
-class SpiralServiceManager;
 class SpiralConfigProfileEditor;
 class SpiralDescriptions;
 class QFormLayout;
@@ -62,6 +62,9 @@ public:
     // The same for the fitted-fiber overlay.
     void setFiberOverlayAvailable(bool available, const QString& reason = {});
     [[nodiscard]] double pointViewTolerance() const;
+    // The committed fit the workspace shows in place of a preview (its UUID
+    // and name); empty while a published preview is shown.
+    void setDisplayedStoredFit(const QString& uuid, const QString& name);
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
@@ -84,6 +87,8 @@ signals:
     // as this machine reaches it) and attach that.
     void cloneHubRequested(const QString& hubAddress);
     void addDraftsRequested(bool commitAfterAdd);
+    // Show a committed fit; an empty UUID asks which.
+    void openStoredFitRequested(const QString& uuid);
 
 private:
     // Hover text: each control names its entry in spiral-fitting's
@@ -198,6 +203,17 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    // Stored fits: commit the displayed preview, open a committed one.
+    QPushButton* _commitPreview = nullptr;
+    QPushButton* _openStoredFit = nullptr;
+    QLabel* _commitStatus = nullptr;
+    QPushButton* _openCommitted = nullptr;
+    QPushButton* _retryPush = nullptr;
+    QString _committedFit;        // the latest commit's surface
+    QString _committedArtifact;   // and the preview it committed
+    QString _displayedStoredFit;
+    void updateCommitActions();
+    void showCommitResult(const SpiralServiceManager::CommitResult& result);
     QPushButton* _loadCheckpoint = nullptr;
     QLineEdit* _outputRoot = nullptr;
     QLineEdit* _cacheRoot = nullptr;

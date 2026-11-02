@@ -130,6 +130,11 @@ private:
         };
         std::vector<LossMap> lossMaps;
         QString runDiffImagePath;
+        // A committed fit read from the object store (its UUID and name),
+        // rather than a published preview artifact: it is held whole and
+        // carries no overlays.
+        QString storedFitUuid;
+        QString storedFitName;
     };
     struct PreviewDisplaySelection {
         cv::Rect region;
@@ -159,6 +164,10 @@ private:
     static std::vector<PreviewLoadResult::LossMap> parseLossMaps(
         const QJsonObject& manifest, const QString& artifactRoot);
     void loadPreview(const QString& manifestPath, qint64 generation);
+    // Show a committed fit (SpiralStoredFits) from the attached input store in
+    // place of the current preview, until the next one is published. An
+    // empty `uuid` offers the store's committed fits to choose from.
+    void openStoredFit(const QString& uuid);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     // Adopt the loss overlays published for the installed preview. They are a
     // separate artifact that lands after the surface, so this only extends
@@ -288,6 +297,9 @@ private:
     VolumeViewerBase* _flattenedViewer = nullptr;
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
+    // Every preview load (an artifact or a committed fit) takes the next
+    // serial; only the latest one installs.
+    quint64 _previewLoadSerial = 0;
     QJsonObject _sessionRunConfig;
     // The scroll the session fits (its request's "scroll").
     QJsonObject _sessionScroll;
@@ -328,6 +340,8 @@ private:
     QTemporaryDir _fitPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
+    // The UUID of the committed fit _previewSource is; empty for an artifact.
+    QString _previewStoredFit;
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
     std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
     std::optional<double> _previewToFiberBaseScale;

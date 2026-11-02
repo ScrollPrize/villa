@@ -210,6 +210,17 @@ add_test(NAME spiral_store_inputs COMMAND test_spiral_store_inputs)
 vc_register_test_target(test_spiral_store_inputs)
 vc_register_ctest(spiral_store_inputs test_spiral_store_inputs)
 
+add_executable(test_spiral_stored_fits
+    test_spiral_stored_fits.cpp
+    ../SpiralStoredFits.cpp ../SpiralStoredFits.hpp
+    ../SpiralPreviewWindings.cpp ../SpiralPreviewWindings.hpp)
+target_include_directories(test_spiral_stored_fits PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_stored_fits PRIVATE vc_core Qt6::Core opencv_core opencv_imgcodecs)
+add_test(NAME spiral_stored_fits COMMAND test_spiral_stored_fits)
+vc_register_test_target(test_spiral_stored_fits)
+vc_register_ctest(spiral_stored_fits test_spiral_stored_fits)
+
 add_executable(test_spiral_project_inputs
     test_spiral_project_inputs.cpp
     ../SpiralProjectInputs.cpp ../SpiralProjectInputs.hpp)
@@ -648,6 +659,8 @@ add_executable(test_spiral_service_protocol
     ../SpiralArtifactCache.cpp ../SpiralArtifactCache.hpp
     ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp
     ../SpiralStoreInputs.cpp ../SpiralStoreInputs.hpp
+    ../SpiralStoredFits.cpp ../SpiralStoredFits.hpp
+    ../SpiralPreviewWindings.cpp ../SpiralPreviewWindings.hpp
     ../SpiralProjectInputs.cpp ../SpiralProjectInputs.hpp)
 set_target_properties(test_spiral_service_protocol PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_spiral_service_protocol PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)

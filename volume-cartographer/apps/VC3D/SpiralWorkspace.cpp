@@ -10,6 +10,7 @@
 #include "SpiralProjectInputs.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralStoreInputs.hpp"
+#include "SpiralStoredFits.hpp"
 #include "SpiralStoreEdits.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
@@ -43,6 +44,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QInputDialog>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -373,6 +375,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     _panel = new SpiralPanel(_service, this);
     connect(_panel, &SpiralPanel::cloneHubRequested, this, &SpiralWorkspace::hubReplicaRequested);
+    connect(_panel, &SpiralPanel::openStoredFitRequested, this, &SpiralWorkspace::openStoredFit);
     connect(_service, &SpiralServiceManager::inputUpdateProgress, this, [this](const QString& phase, const QString&) {
         if (phase != QStringLiteral("pushing")) return;
         _updatingDrafts.clear();
@@ -1434,11 +1437,13 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 {
     if (_shuttingDown || generation < _requestedPreviewGeneration) return;
     _requestedPreviewGeneration = generation;
+    const quint64 serial = ++_previewLoadSerial;
     auto* watcher = new QFutureWatcher<PreviewLoadResult>(this);
-    connect(watcher, &QFutureWatcher<PreviewLoadResult>::finished, this, [this, watcher, generation]() {
+    connect(watcher, &QFutureWatcher<PreviewLoadResult>::finished, this, [this, watcher, generation, serial]() {
         const auto result = watcher->result();
         watcher->deleteLater();
-        if (!_shuttingDown && generation == _requestedPreviewGeneration) installPreview(result, generation);
+        if (!_shuttingDown && generation == _requestedPreviewGeneration && serial == _previewLoadSerial)
+            installPreview(result, generation);
     });
     watcher->setFuture(QtConcurrent::run([manifestPath]() -> PreviewLoadResult {
         auto failure = [](const QString& message) {
@@ -1566,12 +1571,93 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
     }));
 }
 
+void SpiralWorkspace::openStoredFit(const QString& requested)
+{
+    if (_shuttingDown) return;
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    const auto attachment = inputStore();
+    if (!session || !attachment) {
+        statusBar()->showMessage(
+            tr("Route Spiral's inputs to the object store the fit was committed to first"), 15000);
+        return;
+    }
+    QString uuid = requested;
+    if (uuid.isEmpty()) {
+        std::vector<vc3d::spiral::StoredFitEntry> fits;
+        try {
+            fits = vc3d::spiral::listStoredFits(*session, *attachment);
+        } catch (const std::exception& error) {
+            statusBar()->showMessage(tr("Could not list committed fits: %1").arg(QString::fromUtf8(error.what())),
+                                     15000);
+            return;
+        }
+        if (fits.empty()) {
+            statusBar()->showMessage(tr("The object store holds no committed Spiral fits"), 15000);
+            return;
+        }
+        QStringList labels;
+        for (const auto& fit : fits) {
+            QString label = QString::fromStdString(fit.name);
+            if (fit.sourceIteration) label += tr(" — iteration %1").arg(*fit.sourceIteration);
+            label += tr(" — %1 by %2").arg(QString::fromStdString(fit.createdAt),
+                                          QString::fromStdString(fit.createdBy));
+            labels.push_back(label);
+        }
+        bool chosen = false;
+        const QString label = QInputDialog::getItem(this, tr("Open Stored Fit"), tr("Committed Spiral fit:"),
+                                                    labels, 0, false, &chosen);
+        if (!chosen) return;
+        uuid = QString::fromStdString(fits[std::size_t(labels.indexOf(label))].uuid);
+    }
+
+    // The fit volume's full-resolution shape, which a committed fit does not
+    // repeat: the project's facts of the volume it is bound to.
+    std::map<std::string, vc3d::spiral::ProjectVolumeFacts> facts;
+    if (const auto pkg = _state->vpkg()) facts = vc3d::spiral::projectVolumeFacts(*pkg);
+    // It replaces whatever is displayed: a preview load still in flight is
+    // dropped, and the next published preview replaces it in turn.
+    const qint64 generation = ++_requestedPreviewGeneration;
+    const quint64 serial = ++_previewLoadSerial;
+    statusBar()->showMessage(tr("Opening the committed fit %1…").arg(uuid));
+    auto* watcher = new QFutureWatcher<PreviewLoadResult>(this);
+    connect(watcher, &QFutureWatcher<PreviewLoadResult>::finished, this, [this, watcher, generation, serial]() {
+        const auto result = watcher->result();
+        watcher->deleteLater();
+        if (!_shuttingDown && generation == _requestedPreviewGeneration && serial == _previewLoadSerial)
+            installPreview(result, generation);
+    });
+    watcher->setFuture(QtConcurrent::run(
+        [session, attachment = *attachment, uuid = uuid.toStdString(), facts]() -> PreviewLoadResult {
+            PreviewLoadResult result;
+            try {
+                auto fit = vc3d::spiral::readStoredFit(session, attachment, uuid);
+                fit.surface->setStrictQuadRenderValidity(true);
+                result.surface = fit.surface;
+                result.surfaceId = QString::fromStdString(fit.uuid);
+                result.components = std::move(fit.components);
+                result.windingIds = std::move(fit.windingIds);
+                if (const auto found = facts.find(fit.volume); found != facts.end())
+                    result.baseShapeZYX = found->second.baseShapeZYX;
+                result.storedFitUuid = QString::fromStdString(fit.uuid);
+                result.storedFitName = QString::fromStdString(fit.name);
+            } catch (const std::exception& error) {
+                result.error = QObject::tr("Could not open the committed fit: %1")
+                                   .arg(QString::fromUtf8(error.what()));
+            }
+            return result;
+        }));
+}
+
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
     cancelLineAnnotationDraft();
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
+    _previewStoredFit = result.storedFitUuid;
+    _panel->setDisplayedStoredFit(result.storedFitUuid, result.storedFitName);
+    if (!result.storedFitUuid.isEmpty())
+        statusBar()->showMessage(tr("Showing the committed fit %1").arg(result.storedFitName), 15000);
     _previewBaseShapeZYX = result.baseShapeZYX;
     updatePreviewCoordinateScale();
     refreshFitOverlays();
@@ -2411,6 +2497,8 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
     }
     const qint64 generation = _requestedPreviewGeneration;
     const cv::Rect region = selection->region;
+    // A committed fit is already held whole; an artifact is decoded lazily.
+    const bool stored = !_previewStoredFit.isEmpty();
     const cv::Mat_<int32_t> windingRegion =
         _previewWindingIds(region).clone();
     auto* watcher =
@@ -2437,10 +2525,12 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                 installPreviewAlias(preview, selection.registrationId, generation, revision, preserveFocus);
             });
     watcher->setFuture(QtConcurrent::run(
-        [source, selection = *selection, region, windingRegion]() {
+        [source, selection = *selection, region, windingRegion, stored]() {
             try {
-                auto loaded =
-                    load_quad_from_tifxyz_region(source->path, region);
+                auto loaded = stored
+                    ? std::make_unique<QuadSurface>(
+                          new cv::Mat_<cv::Vec3f>((*source->rawPointsPtr())(region).clone()), source->scale())
+                    : load_quad_from_tifxyz_region(source->path, region);
                 loaded->id = selection.registrationId.toStdString();
                 cv::Mat_<cv::Vec3f>* points = loaded->rawPointsPtr();
                 for (int row = 0; row < points->rows; ++row) {

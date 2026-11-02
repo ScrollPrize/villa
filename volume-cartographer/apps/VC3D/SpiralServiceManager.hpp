@@ -242,6 +242,36 @@ public:
     void releaseSessionLease(std::function<void()> done);
     QString sessionLeaseId() const { return _sessionLeaseId; }
 
+    // One commit of a published preview to the service's object store
+    // (POST /session/commit), as status "commit" reports it.
+    struct CommitResult {
+        QString artifact;          // the preview artifact committed
+        QString state;             // running, done or failed
+        QString stage;             // while running
+        QString surfaceUuid;
+        QString geometryRevision;
+        bool reused = false;       // the same fit was committed before
+        // Whether the surface reached the service's hub; nullopt for a
+        // service sharing its store in place (no hub).
+        std::optional<bool> pushed;
+        QString pushError;
+        QString error;             // state failed
+        // Status "commit", or nullopt when it carries none.
+        static std::optional<CommitResult> fromStatus(const QJsonObject& status);
+    };
+    // Whether the service can commit previews (capabilities.commits).
+    bool commitsAvailable() const;
+    // The preview artifact on display, which a commit names.
+    QString displayedPreviewArtifact() const { return _installedPreviewArtifact; }
+    bool commitActive() const { return !_commitArtifact.isEmpty(); }
+    // Commit the preview artifact `artifact` (default: the one on display),
+    // or repeat a commit to retry its push; the outcome arrives through
+    // commitFinished.
+    void commitPreview(const QString& artifact = {});
+    // Committed fits the service's hub replica holds unpushed (status
+    // "pending_commits").
+    QStringList pendingCommits() const { return _pendingCommits; }
+
     // Fetch a file intentionally omitted from the initial preview transfer.
     // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.
@@ -293,6 +323,8 @@ signals:
     // starts, then the outcome.
     void inputUpdateProgress(const QString& phase, const QString& text);
     void inputUpdateFinished(const SpiralServiceManager::InputUpdate& update);
+    void commitProgress(const QString& stage);
+    void commitFinished(const SpiralServiceManager::CommitResult& result);
 
 private:
     // Per-operation-class request timeouts: a single global timeout is wrong.
@@ -444,8 +476,15 @@ private:
     QString _lastDiagnosticsLocalPath;
     QString _lastInputManifestLocalPath;
     QString _synchronizedSessionId;
+    // The artifact a commit in flight names, and the status generation its
+    // request was answered at: only later statuses report its outcome.
+    QString _commitArtifact;
+    qint64 _commitStatusGeneration = -1;
+    QStringList _pendingCommits;
+    void finishCommit(const CommitResult& result);
 
     QStringList artifactCachePins() const;
 };
 
 Q_DECLARE_METATYPE(SpiralServiceManager::InputUpdate)
+Q_DECLARE_METATYPE(SpiralServiceManager::CommitResult)

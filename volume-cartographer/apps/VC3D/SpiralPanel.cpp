@@ -678,6 +678,63 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                         !_checkpointChoice->currentData().toString().isEmpty()));
             });
 
+    // A published preview as a store surface, and committed fits reopened.
+    auto* storedGroup = makeSection(tr("Stored fits"),
+                                    QStringLiteral("spiralStoredFitsGroup"),
+                                    QStringLiteral("spiral/groups/stored_fits_expanded"));
+    auto* storedContents = new QWidget(storedGroup->contentWidget());
+    auto* storedLayout = new QVBoxLayout(storedContents);
+    storedGroup->contentLayout()->addWidget(storedContents);
+    auto* storedControls = new QHBoxLayout;
+    _commitPreview = new QPushButton(tr("Commit to Object Store"), storedContents);
+    _commitPreview->setObjectName(QStringLiteral("spiralCommitPreview"));
+    _commitPreview->setEnabled(false);
+    _openStoredFit = new QPushButton(tr("Open Stored Fit…"), storedContents);
+    _openStoredFit->setObjectName(QStringLiteral("spiralOpenStoredFit"));
+    storedControls->addWidget(_commitPreview);
+    storedControls->addWidget(_openStoredFit);
+    storedControls->addStretch(1);
+    storedLayout->addLayout(storedControls);
+    auto* commitResultRow = new QHBoxLayout;
+    _commitStatus = new QLabel(storedContents);
+    _commitStatus->setObjectName(QStringLiteral("spiralCommitStatus"));
+    _commitStatus->setWordWrap(true);
+    _commitStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _commitStatus->setVisible(false);
+    _openCommitted = new QPushButton(tr("Open"), storedContents);
+    _openCommitted->setObjectName(QStringLiteral("spiralOpenCommitted"));
+    _openCommitted->setVisible(false);
+    _retryPush = new QPushButton(tr("Retry Push"), storedContents);
+    _retryPush->setObjectName(QStringLiteral("spiralRetryPush"));
+    _retryPush->setVisible(false);
+    commitResultRow->addWidget(_commitStatus, 1);
+    commitResultRow->addWidget(_openCommitted);
+    commitResultRow->addWidget(_retryPush);
+    storedLayout->addLayout(commitResultRow);
+    describe(QStringLiteral("stored_commit"), {_commitPreview, _retryPush});
+    describe(QStringLiteral("stored_open"), {_openStoredFit, _openCommitted});
+    describe(QStringLiteral("stored_status"), {_commitStatus});
+    connect(_commitPreview, &QPushButton::clicked, this, [this]() {
+        _service->commitPreview();
+        updateCommitActions();
+    });
+    connect(_retryPush, &QPushButton::clicked, this, [this]() {
+        // The same request again: the service reuses the surface and pushes it.
+        _retryPush->setVisible(false);
+        _service->commitPreview(_committedArtifact);
+        updateCommitActions();
+    });
+    connect(_openStoredFit, &QPushButton::clicked, this, [this]() { emit openStoredFitRequested({}); });
+    connect(_openCommitted, &QPushButton::clicked, this,
+            [this]() { emit openStoredFitRequested(_committedFit); });
+    connect(_service, &SpiralServiceManager::commitProgress, this, [this](const QString& stage) {
+        _commitStatus->setVisible(true);
+        _commitStatus->setText(tr("Committing: %1").arg(stage.isEmpty() ? tr("starting") : stage));
+        updateCommitActions();
+    });
+    connect(_service, &SpiralServiceManager::commitFinished, this,
+            [this](const SpiralServiceManager::CommitResult& result) { showCommitResult(result); });
+
     auto* runGroup = makeSection(tr("Run and status"),
                                  QStringLiteral("spiralRunStatusGroup"),
                                  QStringLiteral("spiral/groups/run_status_expanded"));
@@ -1766,6 +1823,74 @@ double SpiralPanel::pointViewTolerance() const
         : kDefaultPointViewTolerance;
 }
 
+void SpiralPanel::setDisplayedStoredFit(const QString& uuid, const QString& name)
+{
+    _displayedStoredFit = uuid;
+    if (!uuid.isEmpty()) {
+        _commitStatus->setVisible(true);
+        _commitStatus->setText(tr("Showing the committed fit %1 (%2) until the next preview").arg(name, uuid));
+        _openCommitted->setVisible(false);
+        _retryPush->setVisible(false);
+    }
+    updateCommitActions();
+}
+
+void SpiralPanel::updateCommitActions()
+{
+    QString note;
+    if (!_connected)
+        note = tr("Connect to a Spiral service first");
+    else if (!_service->commitsAvailable())
+        note = tr("This service cannot commit to its object store");
+    else if (!_service->ownsSessionLease())
+        note = tr("Another client owns the session");
+    else if (_service->commitActive())
+        note = tr("A commit is in progress");
+    else if (!_displayedStoredFit.isEmpty())
+        note = tr("A committed fit is displayed, not a preview");
+    else if (_service->displayedPreviewArtifact().isEmpty())
+        note = tr("No published preview is displayed");
+    _commitPreview->setEnabled(note.isEmpty());
+    setToolTipNote(_commitPreview, note);
+    _retryPush->setEnabled(_connected && _service->ownsSessionLease() && !_service->commitActive());
+}
+
+void SpiralPanel::showCommitResult(const SpiralServiceManager::CommitResult& result)
+{
+    _commitStatus->setVisible(true);
+    _openCommitted->setVisible(false);
+    _retryPush->setVisible(false);
+    if (result.state != QStringLiteral("done")) {
+        _commitStatus->setText(tr("Commit failed: %1").arg(result.error));
+        updateCommitActions();
+        return;
+    }
+    _committedFit = result.surfaceUuid;
+    _committedArtifact = result.artifact;
+    const QString what = result.reused ? tr("Committed before as %1").arg(result.surfaceUuid)
+                                       : tr("Committed as %1").arg(result.surfaceUuid);
+    const auto& binding = _service->storeBinding();
+    const bool hosted = result.pushed.has_value();
+    if (hosted && !*result.pushed) {
+        // On the service, not on the hub: nothing here can open it yet.
+        _commitStatus->setText(tr("%1 on the service, but not on the hub yet (%2). Later pushes publish it, "
+                                  "or retry now.").arg(what, result.pushError));
+        _retryPush->setVisible(true);
+    } else if (!binding.matches() || (!hosted && !binding.sameFile)) {
+        _commitStatus->setText(tr("%1. Attach the service's object store (or a replica of its hub) "
+                                  "to open it.").arg(what));
+    } else if (hosted) {
+        _commitStatus->setText(tr("%1, on the hub.").arg(what));
+        _openCommitted->setVisible(true);
+    } else {
+        // The service shares this store file: open it at once.
+        _commitStatus->setText(tr("%1.").arg(what));
+        _openCommitted->setVisible(true);
+        emit openStoredFitRequested(result.surfaceUuid);
+    }
+    updateCommitActions();
+}
+
 void SpiralPanel::applyBindings(const QJsonObject& advertisement)
 {
     // The service's host-owned roots. Once attached, the resident session's
@@ -2481,6 +2606,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         vc3d::spiralCheckpointLoadAvailable(
             _connected, state,
             !_checkpointChoice->currentData().toString().isEmpty()));
+    updateCommitActions();
 
     // Local drawings, which a frozen fit does not take.
     const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows({}, _localPatchDrafts);
