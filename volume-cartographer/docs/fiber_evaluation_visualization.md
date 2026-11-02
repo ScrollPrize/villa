@@ -44,7 +44,7 @@ displayed as uint8 `255 * presence`; there is no per-image contrast stretch.
 Missing CT samples remain zero, with coverage/error counts logged by the sampler.
 An optional integer presence threshold adds binary rows without altering traces.
 The line-probe CLI, replay views and crop faces all use the same
-`renderCoordsTextureFineToCoarse` sampler and uncompressed TIFF writer.
+native `vcr::grid::sample` sampling and `vcr::sources::writeTiff` output.
 
 ## Calling from an evaluation
 
@@ -54,14 +54,28 @@ sampler alive for the duration of the synchronous call. Given an existing
 
 ```cpp
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
+#include "vc/core/util/ImageMat.hpp"
 
 const auto source = vc::fiber_tracer::validateFiberReplayStripCtVolume(
     volume, ctArrayPath);
 const auto ct = [&](const cv::Mat_<cv::Vec3f>& coordinates, int scale)
     -> cv::Mat_<uint8_t> {
-    return vc::core::util::renderCoordsTextureFineToCoarse(
-        coordinates, volume, 0, scale, "Evaluation CT");
+    std::vector<uint8_t> valid(coordinates.total());
+    for (size_t i = 0; i < coordinates.total(); ++i)
+        valid[i] = coordinates.ptr<cv::Vec3f>()[i] != cv::Vec3f(-1,-1,-1);
+    const vcr::grid::Surface surface({coordinates.ptr<float>(), coordinates.rows,
+        coordinates.cols, coordinates.step1(), nullptr, valid.data()});
+    const double step = 1.0 / scale;
+    const vcr::grid::Raster raster{.5*step-.5, .5*step-.5, step, step,
+        coordinates.cols*scale, coordinates.rows*scale};
+    vcr::grid::Request request;
+    request.levels = {renderGridLevel}; // native level for the selected CT volume
+    const auto samples = vcr::grid::sample(surface, raster, request);
+    cv::Mat_<uint8_t> image(raster.height, raster.width);
+    vcr::display::toUint8(samples.values.data(), image.total(), image.ptr());
+    return image;
 };
 const auto presence = [&](const cv::Mat_<cv::Vec3f>& coordinates, int scale) {
     return vc::fiber_tracer::renderFiberReplayPresenceTexture(
@@ -72,8 +86,9 @@ const auto inspection = vc::fiber_tracer::renderFiberReplayInspection(
     source, ct, presence, normalThresholdBaseVoxels, reverse, baseVoxelSizeUm);
 ```
 
-Create the output directory, then save `inspection.pages` using OpenCV or
-`writeUncompressedTextureTiff`, and save `inspection.metadata` as JSON.
+Create the output directory, then save each page with
+`vcr::sources::writeImage(path, vc::core::util::imageBuffer(page).view())`
+and save `inspection.metadata` as JSON.
 Pages are BGR images. JSON records page/row/column placements, reference arcs
 (base voxels and millimetres), original trace positions, section frames, and
 restart identities. This mapping is intended for interactive inspection;

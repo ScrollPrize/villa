@@ -44,12 +44,12 @@ static std::shared_ptr<Volume> New(std::filesystem::path path);
 
 // Open an existing local volume and apply metadata over its meta.json.
 static std::shared_ptr<Volume> New(std::filesystem::path path,
-                                   const utils::Json& metadata);
+                                   const nlohmann::json& metadata);
 
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
     const std::string& url,
-    const utils::Json& metadata = {},
+    const nlohmann::json& metadata = {},
     bool discoverAwsCredentials = true);
 ```
 
@@ -64,7 +64,7 @@ VC3D.
 |--------|---------|-------------|
 | `id()` | `std::string` | Volume UUID from metadata |
 | `name()` | `std::string` | Display name from metadata |
-| `metadata()` | `const utils::Json&` | Current volume metadata |
+| `metadata()` | `const nlohmann::json&` | Current volume metadata |
 | `path()` | `std::filesystem::path` | Local volume path; empty for remote volumes |
 | `isRemote()` | `bool` | Whether the volume is backed by a remote zarr store |
 | `remoteUrl()` | `const std::string&` | Normalized remote URL for remote volumes |
