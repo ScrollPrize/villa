@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 
 pytest.importorskip('vc_object_store')
+import vc_object_store as vos  # noqa: E402
 from vc_object_store import ObjectStore  # noqa: E402
 from vc_object_store.surfaces import read_surface  # noqa: E402
 
@@ -83,12 +84,10 @@ def publish(root, *, input_digest, input_position=None, xyz=None, windings=None,
     return root
 
 
-@pytest.fixture()
-def fit(store_path, tmp_path):
-    """A service bound in place to the store, with a stand-in session whose
-    inputs were read (linked and pinned) from it."""
-    binding = spiral_service.bind_object_store(store_path, 'svc')
-    config = fit_config(store_path, object_store_author='svc')
+def _fit(binding, tmp_path):
+    """A service bound to ``binding``, with a stand-in session whose inputs
+    were read (linked and pinned) from its store."""
+    config = fit_config(binding.path, object_store_author='svc')
     inputs = osi.load_fit_inputs(config, log=lambda line: None)
     assert inputs.manifest['position'] is not None
     output = tmp_path / 'output'
@@ -116,9 +115,34 @@ def fit(store_path, tmp_path):
         return state.artifacts.register_directory(
             'spiral-preview', SESSION, number, root, 'manifest.json',
             delete_root_on_prune=True)['id']
-    yield SimpleNamespace(state=state, store=store_path, config=config, inputs=inputs,
-                          status=status, generation=generation, output=output)
-    state.close()
+    return SimpleNamespace(state=state, store=binding.path, config=config, inputs=inputs,
+                           status=status, generation=generation, output=output)
+
+
+@pytest.fixture()
+def fit(store_path, tmp_path):
+    """A service sharing the store in place."""
+    fit = _fit(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
+    yield fit
+    fit.state.close()
+
+
+@pytest.fixture()
+def hub(store_path, tmp_path):
+    """The startup fixture's store as a hub, and where the service's
+    replica of it goes."""
+    vos.hub_init(store_path, 'ingest')
+    return SimpleNamespace(hub=store_path,
+                           replica=str(tmp_path / 'replicas' / 'service.vcobj'))
+
+
+@pytest.fixture()
+def hosted(hub, tmp_path):
+    """A service bound to its own replica of the hub."""
+    fit = _fit(spiral_service.bind_object_store(hub.replica, 'svc', hub.hub), tmp_path)
+    fit.hub = hub.hub
+    yield fit
+    fit.state.close()
 
 
 def settle(state, timeout=30):
@@ -359,3 +383,139 @@ def test_only_a_preview_of_this_session_is_committed(fit):
     with pytest.raises(ApiError, match='artifact must name'):
         fit.state.commit({})
     assert fit.state.status()['commit'] is None
+
+
+# ---------------------------------------------------------------------------
+# A hub replica: commits are pushed with a plain push, or stay pending
+# ---------------------------------------------------------------------------
+
+def _names(path):
+    with ObjectStore.open(path, read_only=True) as db:
+        return {record['name']: record['uuid'] for record in db.objects_by_kind('surface')}
+
+
+def _on_hub(hub):
+    """UUIDs of the committed fits on ``hub``, read through a fresh clone."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        clone = str(Path(directory) / 'reader.vcobj')
+        vos.hub_clone(hub, clone, 'reader')
+        return sorted(record['uuid'] for record in _committed(clone))
+
+
+def _hub_edges(hub, kind):
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        clone = str(Path(directory) / 'reader.vcobj')
+        vos.hub_clone(hub, clone, 'reader')
+        with ObjectStore.open(clone, read_only=True) as db:
+            return db.edges_by_kind(kind)
+
+
+def _pending(path):
+    with ObjectStore.open(path, read_only=True) as db:
+        return db.hub_status()['pending']
+
+
+class _HubAway:
+    """The hub unreachable while inside: its file moved aside."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def __enter__(self):
+        self.path.rename(self.path.with_suffix('.away'))
+
+    def __exit__(self, *exc):
+        self.path.with_suffix('.away').rename(self.path)
+
+
+def test_a_commit_reaches_the_hub(hosted):
+    assert hosted.state.binding_advertisement()['capabilities']['commits'] is True
+    result = commit(hosted, hosted.generation())
+    assert result['state'] == 'done', result['error']
+    assert result['pushed'] is True and result['push_error'] is None
+    assert hosted.state.status()['pending_commits'] == []
+    assert _on_hub(hosted.hub) == [result['surface_uuid']]
+
+
+def test_unpublished_links_are_reverted_before_the_push(hosted):
+    names = _names(hosted.store)
+    # Links a refresh left behind when its revert failed.
+    with ObjectStore.open(hosted.store, author='svc') as db:
+        db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
+                     'a_anchor': {'whole_geometry': True}, 'b_anchor': {'whole_geometry': True}})
+    result = commit(hosted, hosted.generation())
+    assert result['pushed'] is True
+    assert _hub_edges(hosted.hub, 'related') == []
+    assert _on_hub(hosted.hub) == [result['surface_uuid']]
+    assert _pending(hosted.store) == []
+
+
+def test_a_revert_that_fails_writes_nothing(hosted, monkeypatch):
+    def refuse(self):
+        raise RuntimeError('the hub is locked')
+    monkeypatch.setattr(ObjectStore, 'hub_revert', refuse)
+    result = commit(hosted, hosted.generation())
+    assert result['state'] == 'failed'
+    assert 'the hub is locked' in result['error']
+    assert _committed(hosted.store) == []
+
+
+def test_a_commit_the_hub_did_not_receive_stays_pending(hosted):
+    with _HubAway(hosted.hub):
+        result = commit(hosted, hosted.generation())
+        assert result['state'] == 'done'
+        assert result['pushed'] is False and result['push_error']
+        uuid = result['surface_uuid']
+        assert hosted.state.status()['pending_commits'] == [uuid]
+    assert _on_hub(hosted.hub) == []
+    # Once the hub is back, the next input preparation publishes it with its
+    # links.
+    with ObjectStore.open(hosted.store, author='svc') as store:
+        osi.prepare_position(store, hosted.config, osi.request_from_config(hosted.config),
+                             log=lambda line: None)
+    assert _pending(hosted.store) == []
+    assert _on_hub(hosted.hub) == [uuid]
+
+
+def test_repeating_a_commit_retries_its_push(hosted):
+    artifact = hosted.generation()
+    with _HubAway(hosted.hub):
+        first = commit(hosted, artifact)
+    assert first['pushed'] is False
+    again = commit(hosted, artifact)
+    assert again['reused'] is True and again['pushed'] is True
+    assert again['surface_uuid'] == first['surface_uuid']
+    assert hosted.state.status()['pending_commits'] == []
+    assert _on_hub(hosted.hub) == [first['surface_uuid']]
+
+
+def test_startup_pushes_pending_commits_and_refuses_anything_else(hosted, hub):
+    with _HubAway(hosted.hub):
+        uuid = commit(hosted, hosted.generation())['surface_uuid']
+    hosted.state.close()
+    # A restarted service starts, and publishes the commit.
+    restarted = spiral_service.bind_object_store(hub.replica, 'svc', hub.hub)
+    assert restarted.hub == hosted.state.object_store.hub
+    assert _pending(hub.replica) == []
+    assert _on_hub(hub.hub) == [uuid]
+    # A surface the service did not commit is still refused.
+    from vc_object_store.surfaces import create_surface
+    xyz, _ = _grid()
+    create_surface(hub.replica, np.nan_to_num(xyz, nan=-1.0), name='stray', scale=0.05,
+                   volume=VOLUME, tool='other', author='svc')
+    with pytest.raises(spiral_service.ObjectStoreBindingError, match='unpublished edits'):
+        spiral_service.bind_object_store(hub.replica, 'svc', hub.hub)
+
+
+def test_a_commit_waits_for_a_link_refresh(hosted):
+    # A refresh holds the store-write lock while it links and pushes.
+    with hosted.state._store_write_lock:
+        hosted.state.commit({'artifact': hosted.generation()})
+        time.sleep(0.2)
+        commit_state = hosted.state.status()['commit']
+        assert commit_state['state'] == 'running'
+        assert commit_state['stage_name'] == 'Waiting for the object store'
+        assert _committed(hosted.store) == []
+    assert settle(hosted.state)['pushed'] is True

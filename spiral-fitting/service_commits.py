@@ -14,6 +14,12 @@ difference and no loss maps: those diagnose a live fit, not a result.
 
 The surface is tagged ``spiral-fit`` (object_store_inputs.SPIRAL_FIT_TAG),
 which keeps it out of every fit's input selection.
+
+On a hosted binding the service's replica may hold these commits unpushed,
+and nothing else besides detector links: a commit is a new object with a
+fresh UUID, so it can never conflict on the hub. It stays pending until a
+push succeeds, and every later push (the next commit, link refresh or
+startup) carries it.
 """
 
 from __future__ import annotations
@@ -96,6 +102,9 @@ class CommitResult:
     surface_uuid: str
     geometry_revision: str
     reused: bool
+    # Whether the surface is on the hub; None for a store without one.
+    pushed: bool | None = None
+    push_error: str | None = None
 
 
 def store_valid(xyz):
@@ -270,3 +279,60 @@ def commit_in_place(store_path, generation, context):
     with ObjectStore.open(str(store_path), read_only=True) as store:
         revision = store.current_geometry(surface_uuid)["uuid"]
     return CommitResult(surface_uuid, revision, reused)
+
+
+def commit_to_replica(store_path, generation, context):
+    """Commit to the service's hub replica, then publish with a plain push.
+
+    The caller serializes store writes (no link refresh runs meanwhile).
+    Unpublished links (a refresh whose revert failed) are reverted first, so
+    the push carries only commits; a revert that raises fails the commit
+    before anything is written. A pull then makes other services' commits
+    visible to the reuse lookup; an unreachable hub still commits locally.
+    The push is a plain one, not tied to a refresh's head: a new object
+    cannot conflict and needs no lease. When it fails the commit stays
+    pending (``pushed`` False) and a later push carries it.
+    """
+    from vc_object_store import ObjectStore
+    check_commit(generation, context)
+    with ObjectStore.open(str(store_path), author=context.author) as store:
+        store.hub_revert()
+        try:
+            store.hub_sync(pull=True, push=False)
+        except Exception:  # noqa: BLE001 - the push below reports the hub
+            pass
+        existing = find_committed_fit(store, generation.key)
+    if existing is not None:
+        surface_uuid, reused = existing["uuid"], True
+    else:
+        surface_uuid, reused = write_commit(store_path, generation, context), False
+    with ObjectStore.open(str(store_path), author=context.author) as store:
+        revision = store.current_geometry(surface_uuid)["uuid"]
+        if surface_uuid not in store.hub_status()["pending"]:
+            return CommitResult(surface_uuid, revision, reused, pushed=True)
+        error = push_pending(store)
+        pushed = surface_uuid not in store.hub_status()["pending"]
+    return CommitResult(surface_uuid, revision, reused, pushed=pushed,
+                        push_error=None if pushed else (error or "the push left it pending"))
+
+
+def push_pending(store):
+    """Publish a replica's pending records with a plain push; return why it
+    failed, or None. ``store`` must be an idle handle."""
+    try:
+        store.hub_sync(pull=True, push=True)
+    except Exception as exc:  # noqa: BLE001 - reported; the records stay pending
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def pending_records(store):
+    """A replica's pending records as ``(commits, others)`` UUID lists:
+    committed fits (surfaces tagged spiral-fit) and everything else."""
+    commits, others = [], []
+    for uuid in store.hub_status()["pending"]:
+        record = store.object(uuid)
+        is_commit = (record is not None and record.get("kind") == "surface"
+                     and SPIRAL_FIT_TAG in (record.get("tags") or ()))
+        (commits if is_commit else others).append(uuid)
+    return commits, others

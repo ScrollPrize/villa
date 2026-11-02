@@ -1962,9 +1962,10 @@ def _discard_unpublished(store):
     """Restore the hub's relationships over this replica's unpublished
     detector output (and any relationship conflicts): it was computed for
     an older head, and a link to an object retired or deselected since
-    would never be replaced by relinking only the current selection. The
-    service replica writes only relationships, so nothing else is lost.
-    Returns report lines."""
+    would never be replaced by relinking only the current selection. Besides
+    relationships the service replica holds only its own committed fits
+    (service_commits), new objects a revert keeps pending, so nothing else
+    is lost. Returns report lines."""
     try:
         discarded = store.hub_revert()
     except Exception as exc:  # noqa: BLE001 - the next attempt or update retries
@@ -1988,7 +1989,8 @@ def _conditional_push(store, head):
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
                      cache_directory=None, log=print, attempts=4):
     """Link, then pin: the update loop of a hosted replica ``store`` (opened
-    read-write as the service's author; it must hold no other edits).
+    read-write as the service's author; it must hold no other edits than
+    its own committed fits, which a publication carries to the hub too).
 
     Pull the hub head H (at least ``minimum``, the position a client's edits
     reached), refresh links over the whole selection at H, then publish them

@@ -228,9 +228,13 @@ from surface_orientation import spiral_outward_sense_for
 # in its meta (service_commits). Committing the same model state, inputs and
 # flatten profile again reuses that surface. Status "commit" reports the
 # latest: state (running, done, failed), stage_name, surface_uuid,
-# geometry_revision, reused, pushed and error. /bindings advertises
-# capabilities.commits. Default and tag selections leave spiral-fit
-# surfaces out, and naming one as an input is refused.
+# geometry_revision, reused, pushed (whether it reached the hub; null for a
+# store shared in place), push_error and error. A hub replica's commit is
+# pushed with a plain push and stays pending when that fails: status
+# "pending_commits" lists those, the next commit, input preparation or
+# service start pushes them, and repeating the commit request retries.
+# /bindings advertises capabilities.commits. Default and tag selections
+# leave spiral-fit surfaces out, and naming one as an input is refused.
 API_VERSION = 46
 
 

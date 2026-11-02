@@ -97,6 +97,7 @@ from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
 from service_commits import (CommitContext, CommitRefused, commit_in_place,
+                             commit_to_replica, pending_records, push_pending,
                              read_published_generation)
 from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
@@ -229,8 +230,12 @@ class ObjectStoreBinding:
     ``author`` names the service in the store when it refreshes links.
 
     A hosted binding (``hub`` set) is the service's own replica of a hub:
-    it writes only detector links, pushes them only with a conditional
-    push, and fits hub positions (object_store_inputs.prepare_position).
+    it writes only detector links and its own committed fits (surfaces
+    tagged spiral-fit, service_commits). Links are pushed only with a
+    conditional push, and fit hub positions
+    (object_store_inputs.prepare_position); a commit is pushed with a plain
+    push, since a new object cannot conflict, and stays pending until one
+    succeeds.
     ``hub_identity`` names the hub positions belong to. Otherwise the store
     is shared in place (VC3D on this machine edits the same file) and
     records positions of its own, linked in place. ``positions`` names
@@ -423,21 +428,31 @@ def bind_object_store(path, author=None, hub=None):
             "service clones one), or start the service as its author")
     try:
         with ObjectStore.open(str(resolved), author=author) as store:
-            # The service replica writes only links, and every update links
-            # afresh: unpublished ones (an interrupted update's) are dropped.
+            # The service replica writes only links and its own commits.
+            # Every update links afresh, so unpublished links (an interrupted
+            # update's) are dropped; a revert keeps the commits pending.
             store.hub_revert()
             pulled = store.hub_sync(pull=True, push=False)
             conflicts = pulled["conflicts"]
-            pending = store.hub_status()["pending"]
+            commits, others = pending_records(store)
     except Exception as exc:
         raise ObjectStoreBindingError(
             f"cannot reach the hub {status['hub']} of {resolved}: {exc}"
             + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
-    if conflicts or pending:
+    if conflicts or others:
         raise ObjectStoreBindingError(
             f"{resolved} holds unpublished edits the service did not make "
-            f"({len(pending)} pending, {len(conflicts)} in conflict with the hub); "
-            "a service replica must hold none: resolve them, or name a new replica path")
+            f"({len(others)} pending, {len(conflicts)} in conflict with the hub); "
+            "a service replica must hold none besides its own commits: resolve "
+            "them, or name a new replica path")
+    if commits:
+        # Commits a failed push left behind: publish them now, or keep them
+        # pending for the next push.
+        with ObjectStore.open(str(resolved), author=author) as store:
+            error = push_pending(store)
+        if error is not None:
+            print(f"SPIRAL_COMMIT_PENDING {len(commits)} commit(s) stay unpushed: "
+                  f"{error}", file=sys.stderr, flush=True)
     return ObjectStoreBinding(str(resolved), str(uuid), author,
                               status["hub"], status["hub_replica"], status["hub_replica"])
 
@@ -805,6 +820,9 @@ class ServiceState:
         # The latest commit (POST /session/commit): what /session/status
         # reports as "commit", guarded by self.lock.
         self._commit = None
+        # Commits the hub replica holds unpushed, as last read (status
+        # "pending_commits"; None when that read failed).
+        self._pending_commit_uuids = self._pending_commits()
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -1065,6 +1083,7 @@ class ServiceState:
                 response["progress"] = publishing
             response["preview_exporting"] = self._preview_export_active
             response["commit"] = copy.deepcopy(self._commit)
+            response["pending_commits"] = copy.deepcopy(self._pending_commit_uuids)
             return response
 
     def session_state(self):
@@ -1978,14 +1997,19 @@ class ServiceState:
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
         request = request_from_config(config)
-        with self._store_write_lock, ObjectStore.open(
-                self.object_store.path, author=self.object_store.author) as store:
-            prepared = prepare_position(
-                store, config, request, lasagna=lasagna,
-                minimum=minimum, cache_directory=cache, log=log)
-            if not volume:
-                return prepared
-            return prepared, fit_volume_at(store, request, prepared)
+        with self._store_write_lock:
+            try:
+                with ObjectStore.open(self.object_store.path,
+                                      author=self.object_store.author) as store:
+                    prepared = prepare_position(
+                        store, config, request, lasagna=lasagna,
+                        minimum=minimum, cache_directory=cache, log=log)
+                    if not volume:
+                        return prepared
+                    return prepared, fit_volume_at(store, request, prepared)
+            finally:
+                # A publication carries pending commits along.
+                self._note_pending_commits()
 
     def _prepare_fiber_directions(self, scroll, volume, paths, config):
         """Opted-in hosts extract the fiber directions a fit with the
@@ -3274,7 +3298,26 @@ class ServiceState:
     # ------------------------------------------------------------------
 
     def _commits_supported(self):
-        return self.object_store is not None and not self.object_store.hosted
+        return self.object_store is not None
+
+    def _note_pending_commits(self):
+        pending = self._pending_commits()
+        with self.lock:
+            if pending != self._pending_commit_uuids:
+                self._pending_commit_uuids = pending
+                self.status_generation += 1
+
+    def _pending_commits(self):
+        """Committed fits this hub replica holds unpushed (status
+        ``pending_commits``); [] without a hub."""
+        if self.object_store is None or not self.object_store.hosted:
+            return []
+        from vc_object_store import ObjectStore
+        try:
+            with ObjectStore.open(self.object_store.path, read_only=True) as store:
+                return pending_records(store)[0]
+        except Exception:  # noqa: BLE001 - status reports what it last knew
+            return None
 
     def commit(self, request):
         """Start committing one published preview to the bound store.
@@ -3286,7 +3329,10 @@ class ServiceState:
         inputs and flatten profile again reuses the surface already
         committed. The result is status ``commit``: ``state`` (running, done
         or failed), ``surface_uuid``, ``geometry_revision``, ``reused``,
-        ``pushed`` (null: the store is shared in place) or ``error``.
+        ``pushed`` (whether it reached the hub; null for a store shared in
+        place, ``push_error`` saying why not) or ``error``. Repeating the
+        request retries a failed push; status ``pending_commits`` lists the
+        commits the replica holds unpushed.
         """
         artifact_id = (request or {}).get("artifact")
         if not isinstance(artifact_id, str) or not artifact_id:
@@ -3311,7 +3357,8 @@ class ServiceState:
                                 "generation": artifact.generation,
                                 "stage_name": "Reading the published preview",
                                 "surface_uuid": None, "geometry_revision": None,
-                                "reused": None, "pushed": None, "error": None}
+                                "reused": None, "pushed": None, "push_error": None,
+                                "error": None}
                 self.status_generation += 1
             self._start_background(target=self._commit_job,
                                    args=(session_id, artifact),
@@ -3334,12 +3381,22 @@ class ServiceState:
                 self.artifacts.release(artifact)
             context = self._commit_context(session_id, artifact.generation,
                                            generation.key.model_state_sha256)
-            self._commit_stage("Writing the surface to the object store")
+            self._commit_stage("Waiting for the object store")
             with self._store_write_lock:
-                result = commit_in_place(self.object_store.path, generation, context)
+                self._commit_stage("Writing the surface to the object store")
+                write = (commit_to_replica if self.object_store.hosted
+                         else commit_in_place)
+                result = write(self.object_store.path, generation, context)
+                self._note_pending_commits()
             outcome = {"state": "done", "surface_uuid": result.surface_uuid,
                        "geometry_revision": result.geometry_revision,
-                       "reused": result.reused, "pushed": None}
+                       "reused": result.reused, "pushed": result.pushed,
+                       "push_error": result.push_error}
+            if result.pushed is False:
+                self.events.append(
+                    "log", f"The commit {result.surface_uuid} is not on the hub yet "
+                    f"({result.push_error}); the next push publishes it",
+                    severity="warning", source="service", operation="committing")
             if generation.unrepresentable:
                 self.events.append(
                     "log", f"{generation.unrepresentable} vertices of the preview are "
