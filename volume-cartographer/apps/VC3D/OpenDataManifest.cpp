@@ -1,17 +1,6 @@
 #include "OpenDataManifest.hpp"
 
 namespace vc3d::opendata {
-std::filesystem::path cachedOpenDataManifestPath()
-{
-    // vc_reader's cache file for the catalog: the one its volume metadata reads too.
-    return vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl));
-}
-
-std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog()
-{
-    return vcr::catalog::cachedManifest(cachedOpenDataManifestPath());
-}
-
 bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const
 {
     if (!volumeIds)

@@ -4163,7 +4163,7 @@ bool CWindow::OpenVolume(const QString& path,
     QString loadError;
     try {
         vc::project::LoadOptions options;
-        options.catalog = vc3d::opendata::cachedCatalog();
+        options.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
         package = VolumePkg::open(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to open project: {}", e.what());
@@ -4372,7 +4372,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             transforms = db.volumeTransforms(txn);
         });
-    } else if (const auto catalog = vc3d::opendata::cachedCatalog()) {
+    } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
         transforms.graph.addCatalog(*catalog);
     }
     return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);

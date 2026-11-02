@@ -561,7 +561,7 @@ void MenuActionController::resetOpenDataProject()
     auto original = _window->_state->vpkg();
     if (!original || !original->writable() || _openDataSampleOpenInFlight) return;
     const auto sampleId = vc3d::opendata::openDataProjectSample(*original);
-    const auto catalog = vc3d::opendata::cachedCatalog();
+    const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     const auto* sample = sampleId && catalog ? catalog->findSample(*sampleId) : nullptr;
     if (!sample) {
         QMessageBox::warning(_window, tr("Reset to Open Data"), tr("The catalog no longer lists this sample."));
@@ -595,7 +595,7 @@ void MenuActionController::resetOpenDataProject()
             auto data = result.package->document().data();
             for (const auto& store : original->document().data().at("stores")) data["stores"].push_back(store);
             original->document().replace(std::move(data));
-            auto package = VolumePkg::open(original->path(), {.catalog = vc3d::opendata::cachedCatalog()});
+            auto package = VolumePkg::open(original->path(), {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
             _window->CloseVolume();
             _window->_state->setVpkg(std::move(package));
             _window->refreshCurrentVolumePackageUi();
@@ -881,7 +881,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                         session, projectPath, attachment, sampleCopy, cacheDir.toStdString(),
                         &taskResult.result, progressCallback, hasSelection ? &selectionCopy : nullptr);
                 } else {
-                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vc3d::opendata::cachedCatalog()});
+                    taskResult.pkg = VolumePkg::open(projectPath, {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
                 }
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());

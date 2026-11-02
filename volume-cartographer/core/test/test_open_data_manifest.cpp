@@ -785,7 +785,7 @@ TEST_CASE("Normal grids download through the file cache: listing, signed objects
     info.url = "s3://grids/ng";
     const auto finalDir = vcr::zarr::decodedCachePath(root, info.url);
     std::filesystem::create_directories(finalDir / "xy");
-    std::ofstream(finalDir / "xy" / "000007.grid.missing").flush();  // an older VC3D's marker
+    std::ofstream(finalDir / "xy" / "000007.grid.missing").flush();  // unrelated existing artifact
 
     // Cancelled after the first file: what was fetched stays, nothing is complete.
     std::atomic<bool> cancel{false};
@@ -805,7 +805,7 @@ TEST_CASE("Normal grids download through the file cache: listing, signed objects
     CHECK(fetched >= 1);
     CHECK(fetched < 10);
 
-    // The rerun lists again, fetches only what is missing, clears the old marker and completes.
+    // The rerun lists again, fetches only what is missing, preserves artifacts and completes.
     const auto requestsBefore = server.requests().size();
     cancel.store(false);
     NormalGridsDownloadProgress last;
@@ -821,7 +821,7 @@ TEST_CASE("Normal grids download through the file cache: listing, signed objects
     CHECK(last.completedBytes == servedBytes);
     CHECK(std::filesystem::is_regular_file(finalDir / "normal-grids-complete.json"));
     CHECK(std::filesystem::is_regular_file(finalDir / "yz" / "000002.grid"));
-    CHECK_FALSE(std::filesystem::exists(finalDir / "xy" / "000007.grid.missing"));
+    CHECK(std::filesystem::exists(finalDir / "xy" / "000007.grid.missing"));
     CHECK(vc::core::util::normalGridsRemoteUrl(finalDir) == info.url);
     std::size_t objectGets = 0;
     for (const auto& request : server.requests()) {

@@ -29,7 +29,7 @@ namespace {
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
-    const auto catalog=vc3d::opendata::cachedCatalog();
+    const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     if(!catalog)return {};
     auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
     graph->addCatalog(*catalog);

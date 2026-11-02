@@ -56,7 +56,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
     // Resolve the sample first so we can distinguish "unknown sample" (-32007)
     // from "manifest unavailable" / "open failed" (-32005).
-    const auto manifest = vc3d::opendata::cachedCatalog();
+    const auto manifest = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     if (!manifest) {
         QJsonObject data;
         data["detail"] = "Open Data manifest is unavailable";
@@ -246,7 +246,7 @@ QJsonObject AgentBridgeServer::withOpenDataManifest(
     }
 
     if (!refresh) {
-        if (const auto cached = vc3d::opendata::cachedCatalog()) {
+        if (const auto cached = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
             return build(*cached);  // AgentBridgeError from build propagates to dispatch.
         }
     }
@@ -296,7 +296,7 @@ void AgentBridgeServer::startManifestFetch(
         FetchResult fr;
         try {
             fr.manifest = vcr::catalog::loadCatalog(std::string(vcr::catalog::kDefaultManifestUrl),
-                {vc3d::opendata::cachedOpenDataManifestPath(), true}).manifest;
+                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true}).manifest;
         } catch (const std::exception& e) {
             fr.error = QString::fromUtf8(e.what());
         } catch (...) {

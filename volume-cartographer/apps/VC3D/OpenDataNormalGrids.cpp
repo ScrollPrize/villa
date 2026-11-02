@@ -334,16 +334,6 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    // Markers an older VC3D's streaming left for absent files: nothing reads them now.
-    std::error_code ec;
-    for (auto it = std::filesystem::recursive_directory_iterator(
-             finalDir, std::filesystem::directory_options::skip_permission_denied, ec);
-         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-        if (it->is_regular_file(ec) && it->path().filename().string().ends_with(".missing")) {
-            std::filesystem::remove(it->path(), ec);
-        }
-    }
-
     // Keep the dir streamable (harmless once complete) and record completion
     // so the catalog can report "all downloaded" without a remote listing.
     vc::core::util::writeNormalGridsRemoteMarker(finalDir, info.url);

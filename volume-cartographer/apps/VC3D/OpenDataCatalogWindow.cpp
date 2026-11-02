@@ -877,7 +877,7 @@ void OpenDataCatalogWindow::reloadManifest()
         result.sourceLabel = QString::fromStdString(manifestUrl);
         try {
             auto loaded = vcr::catalog::loadCatalog(manifestUrl,
-                {cachedOpenDataManifestPath(), true});
+                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true});
             result.manifest = std::move(loaded.manifest);
             if (loaded.fromCache) result.sourceLabel += QStringLiteral(" (cached)");
             if (!loaded.warning.empty()) result.sourceLabel += QStringLiteral(": ") + QString::fromStdString(loaded.warning);
@@ -912,11 +912,11 @@ void OpenDataCatalogWindow::onFetchFinished()
 
 void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
 {
-    const auto path = cachedOpenDataManifestPath();
+    const auto path = vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl));
     if (!std::filesystem::is_regular_file(path)) {
         return;
     }
-    if (const auto manifest = cachedCatalog())
+    if (const auto manifest = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl))))
         applyManifest(*manifest, qstr(path.string()), true);
     else
         setStatus(tr("Could not parse cached open-data manifest %1").arg(qstr(path.string())));

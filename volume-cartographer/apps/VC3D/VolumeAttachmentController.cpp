@@ -190,7 +190,7 @@ bool VolumeAttachmentController::start(
                     result.volume = Volume::NewFromUrl(
                         location,
                         vc::project::catalogVolumeMetadata(
-                            vc3d::opendata::cachedCatalog().get(), location),
+                            vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl))).get(), location),
                         !anonymous);
                 } else {
                     result.volume = Volume::New(std::filesystem::path(location), nlohmann::json::object());

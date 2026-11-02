@@ -176,7 +176,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     // Catalog loads remain unresolved until normal-grid paths have been
     // reconciled.
     vc::project::LoadOptions loadOptions;
-    loadOptions.catalog = vc3d::opendata::cachedCatalog();
+    loadOptions.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     loadOptions.deferResolution = true;
     auto pkg = VolumePkg::open(projectPath, loadOptions);
 
