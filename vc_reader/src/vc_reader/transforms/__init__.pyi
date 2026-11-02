@@ -1,6 +1,14 @@
 from typing import Any, Mapping, Sequence
 
-class _Config: ...
+class _Config:
+    def batch(self, data: Any, *, targets: Mapping[str, _Config] | None = None, compact: bool = True) -> Any:
+        """__call__ for each sample of a (B, C, ...) batch; CUDA inputs run as one Pipeline.batch call."""
+    def __call__(self, data: Any, *, targets: Mapping[str, _Config] | None = None, compact: bool = True, inplace: bool = False) -> Any:
+        """Apply on its own: always applied (p ignored), fixed seed, same input -> same output.
+
+        A channel-first array (NumPy, Torch CPU/CUDA, DeviceArray) stands for the field the
+        transform reads by default and returns the field it creates, else the transformed
+        input. A sample dict works like Pipeline.__call__ and returns a dict."""
 Scalar = float | tuple[float, float] | _Config
 
 def Normalize(mode: str = "zscore", *, masked: bool = False, nonzero: bool = True, eps: float = 0,

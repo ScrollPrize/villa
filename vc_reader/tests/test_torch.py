@@ -11,7 +11,7 @@ load_build()
 import numpy as np
 import torch
 from vc_reader import transforms as A, cuda
-from vc_reader.torch import CudaLoader, normalize
+from vc_reader.torch import CudaLoader
 
 
 class Samples(torch.utils.data.Dataset):
@@ -459,6 +459,15 @@ class NormalizeTests(unittest.TestCase):
     def devices(self):
         return ['cpu', 'cuda'] if cuda.is_available() and torch.cuda.is_available() else ['cpu']
 
+    @staticmethod
+    def normalize(x, mode='zscore', valid=None, eps=1e-6):
+        options = dict(nonzero=False) if mode == 'zscore' else {}
+        if valid is None:
+            return A.Normalize(mode, eps=eps, **options).batch(x)
+        return A.Normalize(mode, masked=True, eps=eps, **options).batch(
+            {'image': x, 'valid': valid},
+            targets={'image': A.Image(valid='valid', refill=False), 'valid': A.ValidMask()})['image']
+
     def expected(self, x, mode, valid, eps=1e-6):
         # Statistics of the valid voxels of each sample, every voxel transformed.
         out = np.empty_like(x)
@@ -477,7 +486,7 @@ class NormalizeTests(unittest.TestCase):
         for device in self.devices():
             for mode in ('zscore', 'minmax'):
                 with self.subTest(device=device, mode=mode):
-                    result = normalize(torch.from_numpy(x).to(device), mode, valid=torch.from_numpy(valid).to(device).bool())
+                    result = self.normalize(torch.from_numpy(x).to(device), mode, valid=torch.from_numpy(valid).to(device).bool())
                     self.assertEqual(result.device.type, device)
                     np.testing.assert_allclose(result.cpu().numpy(), self.expected(x, mode, valid), atol=2e-5)
 
@@ -485,18 +494,18 @@ class NormalizeTests(unittest.TestCase):
         x = np.random.default_rng(1).normal(0, 5, (2, 1, 32, 32)).astype(np.float32)
         for device in self.devices():
             with self.subTest(device=device):
-                result = normalize(torch.from_numpy(x).to(device)).cpu().numpy()
+                result = self.normalize(torch.from_numpy(x).to(device)).cpu().numpy()
                 np.testing.assert_allclose(result, self.expected(x, 'zscore', np.ones_like(x)), atol=2e-5)
 
     def test_divisor_floor_and_constants(self):
         for device in self.devices():
             with self.subTest(device=device):
                 flat = torch.full((1, 1, 4, 4, 4), 7.).to(device)
-                self.assertEqual(normalize(flat).abs().max().item(), 0)
-                self.assertEqual(normalize(flat, 'minmax').abs().max().item(), 0)
+                self.assertEqual(self.normalize(flat).abs().max().item(), 0)
+                self.assertEqual(self.normalize(flat, 'minmax').abs().max().item(), 0)
                 tiny = torch.zeros_like(flat)
                 tiny[0, 0, 0, 0, 0] = 1e-7
-                self.assertAlmostEqual(normalize(tiny, 'minmax', eps=1e-6).max().item(), .1, places=5)
+                self.assertAlmostEqual(self.normalize(tiny, 'minmax', eps=1e-6).max().item(), .1, places=5)
 
 
 if __name__ == '__main__':

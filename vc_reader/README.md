@@ -167,7 +167,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | --- | --- | --- | --- |
 | Augmentation and processing pipelines with seeded replay, on CPU or CUDA ([catalog](#transforms)) | `transforms.hpp`: `transforms::Pipeline`, `Op`, `Sample`, `Plan`, `save_plan`, `load_plan` | `transforms/pipeline.hpp`, `transforms/ops/`, `transforms/cpu/`, `transforms/cuda/` | `vc_reader.transforms` |
 | Device buffers, streams, resident pipelines and batches | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap` |
-| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `normalize`, `structure_tensor` |
+| PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `structure_tensor`; direct calls `A.Normalize(...).batch` |
 | Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
 | Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
 
@@ -395,6 +395,23 @@ Use fixed parameters for processing, such as `A.GaussianBlur(sigma=1.0)`, or
 sample parameters with `A.Uniform`, `A.Normal` and `A.Choice` for augmentation.
 Several constructors have random defaults; pipeline calls take an explicit
 `seed` for reproducibility, and `Plan` records sampled operations for replay.
+
+Every transform can also be called on its own. A transform is random only in a
+`Pipeline`: called directly it always applies (`p` is ignored) and draws
+anything else from a fixed seed, so the same input gives the same output. Pass
+plain values for processing. An array (NumPy, Torch CPU/CUDA or `DeviceArray`)
+stands for the field the transform reads by default and the call returns the
+field it creates, else the transformed input; a sample dict works like a
+pipeline call. `.batch` does the same over `(B, C, ...)` batches, CUDA ones in
+one launch.
+
+```python
+sdt = A.DistanceTransform(mode="outside")(mask)        # (1, Z, Y, X) label
+st = A.StructureTensor(sigma=1, rho=1.5)(image)          # created field
+z = A.Normalize("zscore", nonzero=False).batch(crops)    # (B, 1, Z, Y, X) CUDA
+out = A.Normalize("minmax", masked=True).batch(
+    {"image": x, "valid": v}, targets={"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()})
+```
 
 | Operation family | Examples |
 | --- | --- |
