@@ -92,15 +92,13 @@ int sourceLevelForView(const ViewerLevels& levels, float pixelsPerBaseVoxel, flo
 float surfacePixelsPerVoxel(const QuadSurface& surface, const vcr::grid::Raster& viewport,
                             float nominalPixelsPerVoxel)
 {
-    const auto grid = surface.pointSurface();
     double magnification = 0;
     // Include off-center patches when the camera is over a hole or a boundary.
     for (const double y : {0.25, 0.5, 0.75}) {
         for (const double x : {0.25, 0.5, 0.75}) {
-            const float xy[] = {float(viewport.x0 + x * viewport.width * viewport.sx),
-                                float(viewport.y0 + y * viewport.height * viewport.sy)};
             cv::Vec3f du, dv;
-            grid->pointsAt(xy, 1, nullptr, nullptr, du.val, dv.val);
+            surface.pointAt(float(viewport.x0 + x * viewport.width * viewport.sx),
+                            float(viewport.y0 + y * viewport.height * viewport.sy), nullptr, nullptr, du.val, dv.val);
             const cv::Vec3d dx = cv::Vec3d(du) * viewport.sx;
             const cv::Vec3d dy = cv::Vec3d(dv) * viewport.sy;
             const double a = dx.dot(dx), b = dx.dot(dy), c = dy.dot(dy);
@@ -150,6 +148,21 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     options.spacing = spacing;
     std::vector<std::uint8_t> valid;
     return vcr::grid::Surface::snapshot(surface.gridVertices(valid, points), std::move(options));
+}
+
+cv::Rect gridWindowFor(const QuadSurface& surface, const vcr::grid::Raster& raster, int left, int top, int right, int bottom)
+{
+    const auto* points = surface.rawPointsPtr();
+    const cv::Rect grid(0, 0, points->cols, points->rows);
+    const auto span = [](double origin, double step, int before, int size, int after, int limit) {
+        const double a = origin - before * step, b = origin + (size + after) * step;
+        const int first = int(std::floor(std::clamp(std::min(a, b), 0.0, double(limit))));
+        const int last = int(std::ceil(std::clamp(std::max(a, b), 0.0, double(limit))));
+        return std::pair{first - QuadSurface::kGridWindowPad - 1, last + QuadSurface::kGridWindowPad + 2};
+    };
+    const auto [x0, x1] = span(raster.x0, raster.sx, left, raster.width, right, points->cols);
+    const auto [y0, y1] = span(raster.y0, raster.sy, top, raster.height, bottom, points->rows);
+    return cv::Rect(x0, y0, x1 - x0, y1 - y0) & grid;
 }
 
 vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSample& what, ViewerLoad* load)

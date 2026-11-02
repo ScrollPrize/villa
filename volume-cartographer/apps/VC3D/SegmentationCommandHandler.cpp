@@ -1533,8 +1533,12 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
+    // The tracer grows in the voxels of the selected volume's working level: the
+    // surface is recorded in those, in the volume they belong to.
+    const auto grownIn = vc::project::annotationVolume(_state->vpkg().get(), *_state->vpkg()->volume(selectedVolumeId.toStdString()));
     if (!_cmdRunner->executeCustomCommand(
-            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options, store->store, selectedVolumeId)) {
+            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options, store->store,
+            QString::fromStdString(grownIn.volume), grownIn.scale)) {
         QObject::disconnect(*connection);
         _growPatchSeedJob.reset();
         return fail(tr("Failed to start vc_grow_seg_from_seed."));

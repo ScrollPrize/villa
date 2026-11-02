@@ -2,6 +2,7 @@
 
 namespace vc::objects { class TransformedGeometryView; }
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -424,7 +425,20 @@ public:
     mutable cv::Mat_<uint8_t> _validMaskCache;
     // Immutable geometry retained by sampling consumers; built on first use.
     mutable std::shared_ptr<const vcr::grid::Surface> _pointSurface;
+    mutable std::atomic<std::size_t> _windowQueries{0};  // answered by windows since the drop
     [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> pointSurface() const;
+    // A snapshot of the vertices in `vertices` (clipped to the grid; its grid position
+    // (0, 0) is the clipped rectangle's top-left), at a cost proportional to their number.
+    // Positions and normals match the whole grid's where a patch's vertices lie at least
+    // kGridWindowPad vertices inside the rectangle or the grid's edge.
+    static constexpr int kGridWindowPad = 3;
+    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> gridWindow(const cv::Rect& vertices,
+                                                                       const std::array<float, 3>& spacing = {1, 1, 1}) const;
+    // pointsAt at one grid position (column, row), which an edit does not make expensive:
+    // while the whole-grid surface is dropped, a window around the position answers. Once
+    // those queries have cost about one rebuild of the whole grid, it is rebuilt.
+    void pointAt(float column, float row, float* xyz, float* normal, float* columnTangent = nullptr,
+                 float* rowTangent = nullptr, const std::array<float, 3>& spacing = {1, 1, 1}) const;
     void dropPointSurface() const;
     // Guards the validity mask's lazy construction and invalidation.
     mutable std::mutex _cacheMutex;

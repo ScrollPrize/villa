@@ -58,8 +58,12 @@ int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, in
                                   int viewportHeight, float pixelsPerBaseVoxel,
                                   int maximumFallbackLevels = 5);
 
-// An owned native snapshot rebuilt after edits; retained by background jobs.
+// An owned native snapshot of the whole grid; retained by background jobs.
 std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface, const std::array<float, 3>& spacing = {1, 1, 1});
+
+// The grid vertices a frame of `raster`, grown by the given pixels per side, interpolates,
+// padded so its positions and normals match the whole grid's.
+cv::Rect gridWindowFor(const QuadSurface& surface, const vcr::grid::Raster& raster, int left, int top, int right, int bottom);
 
 // What a frame samples: a plane, or a raster over a grid surface.
 struct ViewerGeometry {

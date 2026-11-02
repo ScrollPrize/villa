@@ -60,6 +60,22 @@ bool isDisplacedBoundaryProjection(QuadSurface* surface,
 
 } // namespace
 
+namespace {
+// A path item bounded by its control points and pen. QGraphicsPathItem strokes its whole
+// path to find its bounds, dash by dash, which stalls the UI for the long intersection
+// lines rebuilt while a surface is edited.
+class LongPathItem : public QGraphicsPathItem {
+public:
+    using QGraphicsPathItem::QGraphicsPathItem;
+    QRectF boundingRect() const override
+    {
+        // Twice the width covers Qt's default miter limit on the pen's half width.
+        const qreal margin = pen().style() == Qt::NoPen ? 0.0 : pen().widthF() * 2.0 + 1.0;
+        return path().controlPointRect().adjusted(-margin, -margin, margin, margin);
+    }
+};
+}
+
 ViewerOverlayControllerBase::PathPrimitive
 ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
 {
@@ -851,7 +867,6 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
             return distance >= tolerance ? 0.0f : 1.0f - distance / tolerance;
         };
 
-        const auto gridPoints = quad ? viewer->surfaceForPoints(*quad) : nullptr;
         for (std::size_t index = 0; index < points.size(); ++index) {
             const cv::Vec3f& point = points[index];
             cv::Vec2f surfacePoint;
@@ -872,13 +887,10 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                             cv::Vec3f coord = quad->coord(pointer);
                             cv::Vec3f normal = quad->normal(pointer);
                             bool physical = false;
-                            if (gridPoints) {
-                                const cv::Vec2d grid = quad->surfaceToGrid({double(pointer[0]) / quad->scale()[0],
-                                                                            double(pointer[1]) / quad->scale()[1]});
-                                const float xy[]{float(grid[0]), float(grid[1])};
-                                gridPoints->pointsAt(xy, 1, coord.val, normal.val);
+                            const cv::Vec2d grid = quad->surfaceToGrid({double(pointer[0]) / quad->scale()[0],
+                                                                        double(pointer[1]) / quad->scale()[1]});
+                            if (viewer->framePointAt(*quad, float(grid[0]), float(grid[1]), coord.val, normal.val))
                                 physical = std::isfinite(coord[0]) && std::isfinite(normal[0]);
-                            }
                             if (physical) {
                                 const float w = (point - coord).dot(normal) / normal.dot(normal);
                                 distance = float(cv::norm(point - (coord + normal * std::clamp(w, depthLo, depthHi))));
@@ -1425,7 +1437,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, PainterPathPrimitive>) {
                     flushPointGroups();
-                    auto* item = new QGraphicsPathItem(prim.path);
+                    auto* item = new LongPathItem(prim.path);
                     addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();

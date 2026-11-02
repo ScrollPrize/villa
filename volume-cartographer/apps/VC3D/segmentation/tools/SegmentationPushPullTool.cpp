@@ -655,8 +655,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
     // Get normal directly from grid position (avoids expensive pointTo lookup)
     cv::Vec3f normal;
-    const float normalGrid[]{float(col),float(row)};
-    baseSurface->pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
+    baseSurface->pointAt(float(col), float(row), nullptr, normal.val);
     if (!isValidNormal(normal)) {
         // Fallback to robust normal computation if direct lookup fails
         cv::Vec3f ptr(0, 0, 0);
@@ -794,8 +793,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
         }
         centerWorld = *centerWorldOpt;
 
-        const float centerNormalGrid[]{float(col),float(row)};
-        baseSurface->pointSurface()->pointsAt(centerNormalGrid,1,nullptr,centerNormal.val);
+        baseSurface->pointAt(float(col), float(row), nullptr, centerNormal.val);
         if (!isValidNormal(centerNormal)) {
             cv::Vec3f ptr(0, 0, 0);
             locatePointer(_module.viewerManager(), *baseSurface, centerWorld, ptr);
@@ -825,8 +823,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
                 sampleInputs.reserve(totalSamples);
                 for (const auto& sample : activeSamples) {
                     cv::Vec3f sampleNormal;
-                    const float sampleNormalGrid[]{float(sample.col),float(sample.row)};
-                    baseSurface->pointSurface()->pointsAt(sampleNormalGrid,1,nullptr,sampleNormal.val);
+                    baseSurface->pointAt(float(sample.col), float(sample.row), nullptr, sampleNormal.val);
                     if (!isValidNormal(sampleNormal)) {
                         sampleNormal = centerNormal;
                     } else {

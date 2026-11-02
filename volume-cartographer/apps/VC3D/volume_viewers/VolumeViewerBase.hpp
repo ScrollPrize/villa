@@ -120,9 +120,9 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
-    // The grid surface frames of `quad` are drawn from, so overlays measure depth as frames
-    // place it; null when this viewer draws none.
-    [[nodiscard]] virtual std::shared_ptr<const vcr::grid::Surface> surfaceForPoints(const QuadSurface&) const { return nullptr; }
+    // Position and normal at a grid position (column, row) of `quad`, as frames place them,
+    // so overlays measure depth the same way; false when this viewer draws no such frames.
+    virtual bool framePointAt(const QuadSurface&, float /*column*/, float /*row*/, float* /*xyz*/, float* /*normal*/) const { return false; }
     virtual void setOverlaySamplingMethod(int method) = 0;
     virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;

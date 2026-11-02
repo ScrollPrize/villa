@@ -373,6 +373,7 @@ private:
         std::optional<Rect3D> focusBoundsBase;
         // The vertex grid of the QuadSurface shown (null for planes).
         std::shared_ptr<const vcr::grid::Surface> gridSurface;
+        cv::Rect gridWindow;  // the vertices gridSurface holds
         // Camera geometry captured on the UI thread, never read from a mutable
         // PlaneSurface/QuadSurface by the render worker.
         std::optional<vcr::grid::Plane> plane;
@@ -513,8 +514,9 @@ private:
     // The shown QuadSurface's vertex grid for vcr::grid; dropped on every edit.
     std::shared_ptr<const vcr::grid::Surface> _gridSurface;
     // The frame's surface when it is `quad`, so cursor maths agrees with what is drawn.
-    [[nodiscard]] std::shared_ptr<const vcr::grid::Surface> surfaceForPoints(const QuadSurface& quad) const override;
+    bool framePointAt(const QuadSurface& quad, float column, float row, float* xyz, float* normal) const override;
     const QuadSurface* _gridSurfaceFor = nullptr;
+    cv::Rect _gridWindow;  // the vertices _gridSurface holds
     // The view's geometry changed: the next frame does not carry the last one's pixels.
     bool _geometryDirty = true;
 

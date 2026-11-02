@@ -184,8 +184,7 @@ SafeFocusProjection validateSafeFocusProjection(
         return result;
     }
     cv::Vec3f normal;
-    const float normalGrid[]{float(result.nearestCol),float(result.nearestRow)};
-    surface.pointSurface()->pointsAt(normalGrid,1,nullptr,normal.val);
+    surface.pointAt(float(result.nearestCol), float(result.nearestRow), nullptr, normal.val);
     if (!finiteVec3(normal)) {
         result.reason = "non_finite_grid_normal";
         return result;
@@ -1353,6 +1352,21 @@ struct CChunkedVolumeViewer::RenderResult {
     std::chrono::steady_clock::time_point workerFinishedAt;
 };
 
+namespace {
+// The border a flattened volumetric frame samples beyond the screen window.
+vc3d::volumetric::SlabMargins flattenedSlabMargins(const CompositeRenderSettings& cs, float scale, int width, int height)
+{
+    vc3d::volumetric::CameraParams cam;
+    cam.azimuthDeg = cs.params.camAzimuthDeg;
+    cam.tiltDeg = cs.params.camTiltDeg;
+    cam.perspective = cs.params.camPerspective;
+    const int front = std::max(0, cs.layersFront);
+    const int behind = std::max(0, cs.layersBehind);
+    return vc3d::volumetric::computeSlabMargins(cam, front + behind + 1, -behind,
+                                                scale * std::max(cs.params.wScale, 0.01f), width, height);
+}
+}
+
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     QElapsedTimer renderTimer;
@@ -1426,13 +1440,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     };
 
     auto flattenedVolumetricMargins = [&](int outW, int outH) {
-        const auto& cs = ctx.compositeSettings;
-        const int front = std::max(0, cs.layersFront);
-        const int behind = std::max(0, cs.layersBehind);
-        const float wScale = std::max(cs.params.wScale, 0.01f);
-        return vc3d::volumetric::computeSlabMargins(
-            volumetricCamera(), front + behind + 1, -behind,
-            ctx.scale * wScale, outW, outH);
+        return flattenedSlabMargins(ctx.compositeSettings, ctx.scale, outW, outH);
     };
 
     auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
@@ -1493,6 +1501,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         geometry.raster = ctx.renderJob.raster;
         geometry.raster.x0 -= margins.left * geometry.raster.sx;
         geometry.raster.y0 -= margins.top * geometry.raster.sy;
+        geometry.raster.x0 -= ctx.renderJob.gridWindow.x;
+        geometry.raster.y0 -= ctx.renderJob.gridWindow.y;
         geometry.raster.width = width;
         geometry.raster.height = height;
         return geometry;
@@ -1761,11 +1771,30 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     if (_state) {
         job.focusBoundsBase = _state->activeFocusBounds();
     }
-    // The surface's vertex grid, rebuilt after every edit of the surface.
+    // The vertices this frame interpolates, rebuilt after every edit of the surface and
+    // when the view leaves them: a grid can hold far more vertices than a frame shows.
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-        if (!_gridSurface || _gridSurfaceFor != quad)
-            _gridSurface = vc3d::gridSurface(*quad, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+        job.raster = quad->gridRaster(job.surfacePtrX - double(fbW) * 0.5 / job.scale,
+                                      job.surfacePtrY - double(fbH) * 0.5 / job.scale,
+                                      job.scale, {fbW, fbH});
+        vc3d::volumetric::SlabMargins margins{};
+        if (job.compositeSettings.enabled && job.compositeSettings.params.volumetric)
+            margins = flattenedSlabMargins(job.compositeSettings, job.scale, fbW, fbH);
+        const auto needed = vc3d::gridWindowFor(*quad, job.raster, margins.left, margins.top, margins.right, margins.bottom);
+        if (!_gridSurface || _gridSurfaceFor != quad || (needed & _gridWindow) != needed) {
+            // Room to pan in, unless the next edit will replace it anyway.
+            const cv::Size room = _geometryDirty ? cv::Size(0, 0) : cv::Size(needed.width / 4, needed.height / 4);
+            const auto* points = quad->rawPointsPtr();
+            const cv::Rect grid(0, 0, points->cols, points->rows);
+            _gridWindow = (needed.empty() ? cv::Rect(0, 0, 2, 2)
+                                          : cv::Rect(needed.x - room.width, needed.y - room.height,
+                                                     needed.width + 2 * room.width, needed.height + 2 * room.height)) & grid;
+            _gridSurface = _gridWindow.empty()
+                ? nullptr
+                : quad->gridWindow(_gridWindow, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+        }
         _gridSurfaceFor = quad;
+        job.gridWindow = _gridWindow;
     } else {
         _gridSurface.reset();
         _gridSurfaceFor = nullptr;
@@ -1781,10 +1810,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
         job.plane = vcr::grid::Plane{{origin[0], origin[1], origin[2]},
                                     {dx[0], dx[1], dx[2]}, {dy[0], dy[1], dy[2]},
                                     {n[0], n[1], n[2]}, fbW, fbH};
-    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-        job.raster = quad->gridRaster(job.surfacePtrX - double(fbW) * 0.5 / job.scale,
-                                      job.surfacePtrY - double(fbH) * 0.5 / job.scale,
-                                      job.scale, {fbW, fbH});
     }
     job.geometryDirty = _geometryDirty;
     job.profileReason = reason ? reason : "";
@@ -3114,9 +3139,8 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         float w = _zOff;
         float distance = dist;
         const cv::Vec2d grid = quad->surfaceToGrid({double(ptr[0]) / quad->scale()[0], double(ptr[1]) / quad->scale()[1]});
-        const float xy[]{float(grid[0]), float(grid[1])};
         cv::Vec3f position, normal;
-        surfaceForPoints(*quad)->pointsAt(xy, 1, position.val, normal.val);
+        framePointAt(*quad, float(grid[0]), float(grid[1]), position.val, normal.val);
         if (std::isfinite(position[0]) && std::isfinite(normal[0])) {
             w = (volPoint - position).dot(normal) / normal.dot(normal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
@@ -3463,9 +3487,8 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
         // Where the frame's layer at _zOff lies, in the levels' voxel spacing.
         if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             const auto grid = quad->surfaceToGrid({sp[0], sp[1]});
-            const float xy[]{float(grid[0]), float(grid[1])};
             cv::Vec3f position, normal;
-            surfaceForPoints(*quad)->pointsAt(xy, 1, position.val, normal.val);
+            framePointAt(*quad, float(grid[0]), float(grid[1]), position.val, normal.val);
             if (std::isfinite(position[0]) && std::isfinite(normal[0])) p += normal * _zOff;
         } else {
             const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
@@ -3476,11 +3499,19 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
     return p;
 }
 
-std::shared_ptr<const vcr::grid::Surface> CChunkedVolumeViewer::surfaceForPoints(const QuadSurface& quad) const
+bool CChunkedVolumeViewer::framePointAt(const QuadSurface& quad, float column, float row, float* xyz, float* normal) const
 {
-    if (_gridSurface && _gridSurfaceFor == &quad)
-        return _gridSurface;
-    return vc3d::gridSurface(quad, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+    const int pad = QuadSurface::kGridWindowPad + 1;
+    if (_gridSurface && _gridSurfaceFor == &quad && std::isfinite(column) && std::isfinite(row) &&
+        _gridWindow.contains({int(std::floor(column)) - pad, int(std::floor(row)) - pad}) &&
+        _gridWindow.contains({int(std::floor(column)) + pad, int(std::floor(row)) + pad})) {
+        const float xy[]{column - float(_gridWindow.x), row - float(_gridWindow.y)};
+        _gridSurface->pointsAt(xy, 1, xyz, normal);
+    } else {
+        quad.pointAt(column, row, xyz, normal, nullptr, nullptr,
+                     _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+    }
+    return true;
 }
 
 void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)

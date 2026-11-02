@@ -313,9 +313,8 @@ cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) cons
     const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
-    const float xy[2] = {p[0], p[1]};
     cv::Vec3f point;
-    pointSurface()->pointsAt(xy, 1, point.val, nullptr);
+    pointAt(p[0], p[1], point.val, nullptr);
     if (!std::isfinite(point[0]))
         return {-1,-1,-1};
     return point;
@@ -430,9 +429,8 @@ cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
     ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
-    const float xy[2] = {p[0], p[1]};
     cv::Vec3f point, normal;
-    pointSurface()->pointsAt(xy, 1, point.val, normal.val);
+    pointAt(p[0], p[1], point.val, normal.val);
     return normal;
 }
 
@@ -447,10 +445,73 @@ std::shared_ptr<const vcr::grid::Surface> QuadSurface::pointSurface() const
     return _pointSurface;
 }
 
+std::shared_ptr<const vcr::grid::Surface> QuadSurface::gridWindow(const cv::Rect& vertices,
+                                                                  const std::array<float, 3>& spacing) const
+{
+    const auto* points = rawPointsPtr();
+    const cv::Rect rect = vertices & cv::Rect(0, 0, points->cols, points->rows);
+    if (rect.empty()) return nullptr;
+    std::vector<std::uint8_t> valid(rect.area());
+    for (int r = 0; r < rect.height; ++r) {
+        const auto* row = points->ptr<cv::Vec3f>(rect.y + r) + rect.x;
+        for (int c = 0; c < rect.width; ++c)
+            valid[std::size_t(r) * rect.width + c] =
+                row[c] != cv::Vec3f(-1.f, -1.f, -1.f) && std::isfinite(row[c][0]) && std::isfinite(row[c][1]) && std::isfinite(row[c][2]);
+    }
+    auto options = gridOptions();
+    options.spacing = spacing;
+    for (auto& [first, last] : options.components) {
+        first -= rect.x;
+        last -= rect.x;
+    }
+    return vcr::grid::Surface::snapshot({reinterpret_cast<const float*>(points->ptr<cv::Vec3f>(rect.y) + rect.x),
+                                         rect.height, rect.width, points->step1(), nullptr, valid.data()},
+                                        std::move(options));
+}
+
+void QuadSurface::pointAt(float column, float row, float* xyz, float* normal, float* columnTangent, float* rowTangent,
+                          const std::array<float, 3>& spacing) const
+{
+    const float xy[2]{column, row};
+    const auto* points = rawPointsPtr();
+    const bool unitSpacing = spacing == std::array<float, 3>{1, 1, 1};
+    std::shared_ptr<const vcr::grid::Surface> whole;
+    if (unitSpacing) {
+        std::lock_guard<std::mutex> lock(_cacheMutex);
+        whole = _pointSurface;
+    }
+    // A whole-grid rebuild costs about as much as this many window queries per vertex.
+    constexpr std::size_t kVerticesPerWindowQuery = 128;
+    const bool rebuild = !whole && unitSpacing &&
+        _windowQueries.fetch_add(1, std::memory_order_relaxed) >= points->total() / kVerticesPerWindowQuery;
+    if (rebuild) whole = pointSurface();
+    if (whole) {
+        whole->pointsAt(xy, 1, xyz, normal, columnTangent, rowTangent);
+        return;
+    }
+    const auto first = [](float at, int size) {
+        return std::isfinite(at) ? int(std::clamp(std::floor(at), 0.f, float(std::max(size - 1, 0)))) : 0;
+    };
+    const int c0 = first(column, points->cols), r0 = first(row, points->rows);
+    const int pad = kGridWindowPad;
+    // Vertices (c0, r0) and (c0 + 1, r0 + 1) bound the patch; at the last vertex, the one before.
+    const auto window = cv::Rect(c0 - pad - 1, r0 - pad - 1, 2 * pad + 3, 2 * pad + 3) &
+                        cv::Rect(0, 0, points->cols, points->rows);
+    const auto surface = gridWindow(window, spacing);
+    if (!surface) {
+        for (float* out : {xyz, normal, columnTangent, rowTangent})
+            if (out) std::fill_n(out, 3, std::numeric_limits<float>::quiet_NaN());
+        return;
+    }
+    const float local[2]{column - float(window.x), row - float(window.y)};
+    surface->pointsAt(local, 1, xyz, normal, columnTangent, rowTangent);
+}
+
 void QuadSurface::dropPointSurface() const
 {
     std::lock_guard<std::mutex> lock(_cacheMutex);
     _pointSurface.reset();
+    _windowQueries.store(0, std::memory_order_relaxed);
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)

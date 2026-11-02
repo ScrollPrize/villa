@@ -549,6 +549,59 @@ TEST_CASE("a cursor's offset from a surface is the frame's layer offset, in phys
     CHECK_FALSE(std::isfinite(position[0]));
 }
 
+TEST_CASE("grid windows and point queries match the whole grid without rebuilding it")
+{
+    constexpr int rows = 40, cols = 60;
+    cv::Mat_<cv::Vec3f> points(rows, cols);
+    for (int y = 0; y < rows; ++y)
+        for (int x = 0; x < cols; ++x)
+            points(y, x) = {float(x) + std::sin(y * 0.3f), float(y) + std::cos(x * 0.2f), 4 * std::sin(x * 0.11f + y * 0.17f)};
+    points(10, 20) = {-1, -1, -1};
+    points(25, 41) = {-1, -1, -1};
+    QuadSurface quad(points, {1, 1});
+    quad.setComponents({{0, 30}, {30, 60}});
+    const auto whole = quad.pointSurface();
+
+    const auto same = [](const float* a, const float* b) {
+        for (int i = 0; i < 3; ++i)
+            if (std::isnan(a[i]) != std::isnan(b[i]) || (!std::isnan(a[i]) && std::abs(a[i] - b[i]) > 1e-4f))
+                return false;
+        return true;
+    };
+    bool windowsMatch = true, pointsMatch = true;
+    const cv::Rect window(12, 6, 30, 26);
+    const auto cropped = quad.gridWindow(window);
+    const std::array<std::array<float, 2>, 7> edges{{{-1, 3}, {59, 39}, {59.5f, 3}, {0, 0}, {29.5f, 5}, {20.25f, 10.5f}, {41, 25}}};
+    std::vector<std::array<float, 2>> queries(edges.begin(), edges.end());
+    for (float y = 0.25f; y < rows; y += 1.5f)
+        for (float x = 0.5f; x < cols; x += 1.25f)
+            queries.push_back({x, y});
+    for (const auto& [x, y] : queries) {
+        const float xy[]{x, y};
+        cv::Vec3f xyz, normal, du, dv, expectedXyz, expectedNormal, expectedDu, expectedDv;
+        whole->pointsAt(xy, 1, expectedXyz.val, expectedNormal.val, expectedDu.val, expectedDv.val);
+        quad.dropPointSurface();
+        quad.pointAt(x, y, xyz.val, normal.val, du.val, dv.val);
+        pointsMatch = pointsMatch && same(xyz.val, expectedXyz.val) && same(normal.val, expectedNormal.val) &&
+                      same(du.val, expectedDu.val) && same(dv.val, expectedDv.val);
+        // Inside the window, by its pad.
+        const int pad = QuadSurface::kGridWindowPad + 1;
+        if (x >= window.x + pad && x < window.x + window.width - pad && y >= window.y + pad && y < window.y + window.height - pad) {
+            const float local[]{x - window.x, y - window.y};
+            cropped->pointsAt(local, 1, xyz.val, normal.val);
+            windowsMatch = windowsMatch && same(xyz.val, expectedXyz.val) && same(normal.val, expectedNormal.val);
+        }
+    }
+    CHECK(pointsMatch);
+    CHECK(windowsMatch);
+
+    // A frame's window covers its raster, with the pad, and stays inside the grid.
+    const vcr::grid::Raster raster{10.5, 8.25, 0.5, 0.5, 20, 10};
+    CHECK(vc3d::gridWindowFor(quad, raster, 2, 0, 0, 0) == cv::Rect(5, 4, 21, 15));
+    CHECK(vc3d::gridWindowFor(quad, {-500, -500, 1, 1, 2000, 2000}, 0, 0, 0, 0) == cv::Rect(0, 0, cols, rows));
+    CHECK(vc3d::gridWindowFor(quad, {5000, 5000, 1, 1, 10, 10}, 0, 0, 0, 0).empty() == false);  // clamped to the edge
+}
+
 TEST_CASE("retained native snapshots survive edits and owner destruction")
 {
     std::shared_ptr<const vcr::grid::Surface> old;
