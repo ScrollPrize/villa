@@ -117,7 +117,7 @@ labels and masks remain `(C, H, W)`. Each volume target is one native
 `vcr::grid` call (the sampler of VC3D's viewer): the patch becomes a raster
 over the stored coordinate grid, the window of vertices it reaches is read once,
 and every layer is sampled from the target's array in tiles. Coordinate grids
-are bilinear (or, with `interpolation='smooth'`, bicubic) on quads whose four
+are bicubic by default (or bilinear with `interpolation='linear'`) on quads whose four
 vertices are valid; there is no point across holes or beyond the final stored
 row/column. Normals follow `dP/du cross dP/dv` (taken in physical
 space), with increasing columns defining u, or are the interpolated explicit
@@ -134,7 +134,8 @@ sampler carries values as float32). With `backend="cuda"` volume targets must be
 uint8 and outputs are device arrays. Surface-registered targets (UV labels)
 keep the aligned sampler and its CPU/CUDA support for every dtype.
 
-`interpolation='smooth'` renders bicubic Hermite patches instead of bilinear ones.
+The default `interpolation='bicubic'` renders bicubic Hermite patches, with normals
+derived from the same patches. `interpolation='linear'` selects bilinear patches.
 The same positions without a volume come from `vc_reader.tifxyz`: `read(...)` gives
 the stored grid and `resample_full(start, size, normals=True)` its points and unit
 normals at full-resolution pixels, NaN where invalid; a layer at physical offset d
@@ -142,8 +143,8 @@ is `xyz + d * normal * spacing`. The benchmark selects its surface tiles this wa
 
 ## Projection geometry and determinism
 
-Projection samples the same bilinear quads that `render_surface` reads, so the two
-agree on curved sheets. Each valid quad is covered by points at most half a
+Projection samples bilinear quads, matching `render_surface(interpolation='linear')`.
+Each valid quad is covered by points at most half a
 reference voxel apart (a power-of-two subdivision per cell, up to 64), and with a
 positive thickness each point is offset along the unit physical normal through the
 band in steps of at most half the smallest reference voxel, both faces included.

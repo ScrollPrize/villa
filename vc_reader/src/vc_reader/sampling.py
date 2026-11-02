@@ -132,10 +132,10 @@ class SampleReader(SamplingEngine):
             return registration.surface
         return self._ready().surface_named(getattr(surface, 'id', surface))
 
-    def render_surface(self, surface, start, size, *, offsets_um=(0,), interpolation='linear'):
+    def render_surface(self, surface, start, size, *, offsets_um=(0,), interpolation='bicubic'):
         """Sample physical-offset layers over a YX patch in full-resolution surface UV.
 
-        ``interpolation`` is ``'linear'`` (bilinear patches) or ``'smooth'`` (bicubic).
+        ``interpolation`` defaults to ``'bicubic'``; ``'linear'`` selects bilinear patches.
         """
         native = self._ready()
         start, size = _yx(start, size)

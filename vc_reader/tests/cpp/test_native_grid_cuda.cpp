@@ -111,7 +111,7 @@ int main()
                 p[1] = 5.0f * r;
                 p[2] = 60.0f + 8.0f * std::sin(0.3f * c) * std::cos(0.2f * r);
             }
-        for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+        for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Bicubic}) {
             vcr::grid::Surface surface({grid.data(), rows, cols, std::size_t(cols) * 3}, {mode});
             const vcr::grid::Raster raster{1.3, 0.7, 0.11, 0.13, 220, 140};
             vcr::grid::Request request;

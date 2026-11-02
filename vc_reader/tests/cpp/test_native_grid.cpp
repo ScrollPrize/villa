@@ -35,13 +35,37 @@ std::vector<float> flatGrid(int rows, int cols)
     return xyz;
 }
 
+void testDefaultInterpolation()
+{
+    // Interior Hermite patches reproduce z = x^2 and its normal exactly. A
+    // bilinear patch at x = 1.25 instead has z = 1.75 and slope 3.
+    std::vector<float> xyz(5 * 5 * 3);
+    for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 5; ++c) {
+            float* p = &xyz[(r * 5 + c) * 3];
+            p[0] = float(c);
+            p[1] = float(r);
+            p[2] = float(c * c);
+        }
+    const vcr::grid::Vertices vertices{xyz.data(), 5, 5, 15};
+    vcr::grid::Surface surface(vertices);
+    float p[3], n[3];
+    surface.resample({1.25, 1.5, 1, 1, 1, 1}, p, n);
+    const float length = std::sqrt(7.25f);
+    require(near(p[0], 1.25f) && near(p[1], 1.5f) && near(p[2], 1.5625f), "default bicubic position");
+    require(near(n[0], -2.5f / length) && near(n[1], 0) && near(n[2], 1 / length), "default bicubic normal");
+    vcr::grid::Surface linear(vertices, {vcr::grid::Interpolation::Linear});
+    linear.resample({1.25, 1.5, 1, 1, 1, 1}, p, n);
+    require(near(p[2], 1.75f) && near(n[0], -3 / std::sqrt(10.0f)), "explicit bilinear remains available");
+}
+
 void testResample()
 {
     const int rows = 6, cols = 8;
     auto xyz = flatGrid(rows, cols);
     const vcr::grid::Vertices v{xyz.data(), rows, cols, std::size_t(cols) * 3};
     const vcr::grid::Raster raster{1.25, 0.5, 0.5, 0.25, 9, 15};
-    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Bicubic}) {
         vcr::grid::Surface surface(v, {mode});
         std::vector<float> p(std::size_t(raster.width) * std::size_t(raster.height) * 3), n(p.size());
         surface.resample(raster, p.data(), n.data());
@@ -69,7 +93,7 @@ void testResample()
     for (int i = 0; i < 4; ++i)  // x 3.0 .. 3.75: the cell (3..4, 2..3) holds the missing vertex
         require(std::isnan(out[3 * i]), "a cell with an invalid vertex has no point");
     require(near(out[12], 8.0f) && near(out[13], 6.0f), "the next cell is a patch");
-    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Bicubic}) {
         vcr::grid::Surface s(hv, {mode});
         const vcr::grid::Raster cell{1.0, 0.0, 0.1, 0.1, 41, 41};  // the cells around the hole
         std::vector<float> q(41 * 41 * 3);
@@ -158,14 +182,14 @@ void testResample()
     }
 
     // Two pieces: no point between them, positions inside each from that piece.
-    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Bicubic}) {
         vcr::grid::Surface pieces(v, {mode, {{0, 4}, {4, 8}}});
         const vcr::grid::Raster across{2.5, 1.0, 1.0, 1.0, 3, 1};  // grid x 2.5, 3.5 (the seam cell), 4.5
         pieces.resample(across, out, nullptr);
         require(near(out[0], 5.0f) && std::isnan(out[3]) && near(out[6], 9.0f), "pieces are not interpolated across");
     }
 
-    // A cylinder of radius 40 about the y axis, a vertex every 0.05 rad: smooth normals
+    // A cylinder of radius 40 about the y axis, a vertex every 0.05 rad: bicubic normals
     // follow the analytic normal (sin a, 0, cos a) far closer than the linear patches'
     // and change continuously across cell edges, where the linear ones step.
     {
@@ -182,7 +206,7 @@ void testResample()
         float error[2]{}, step[2]{};
         for (const int k : {0, 1}) {
             vcr::grid::Surface surface({cylinder.data(), rows, cols, std::size_t(cols) * 3},
-                                       {k ? vcr::grid::Interpolation::Smooth : vcr::grid::Interpolation::Linear});
+                                       {k ? vcr::grid::Interpolation::Bicubic : vcr::grid::Interpolation::Linear});
             std::vector<float> p(1801 * 3), n(p.size());
             surface.resample(line, p.data(), n.data());
             for (int i = 0; i < 1801; ++i) {
@@ -194,8 +218,8 @@ void testResample()
                     step[k] = std::max(step[k], std::abs(m[0] - n[std::size_t(i - 1) * 3]));
             }
         }
-        require(error[1] < 0.1f * error[0] && error[1] < 1e-3f, "smooth normals follow a cylinder");
-        require(step[1] < 0.1f * step[0], "smooth normals are continuous across cells");
+        require(error[1] < 0.1f * error[0] && error[1] < 1e-3f, "bicubic normals follow a cylinder");
+        require(step[1] < 0.1f * step[0], "bicubic normals are continuous across cells");
     }
 }
 
@@ -208,6 +232,7 @@ int main()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{path};
     try {
+        testDefaultInterpolation();
         testResample();
 
         // A 16^3 volume with value = x + 2y + 3z (chunks 8^3) and its 8^3 half level
@@ -371,7 +396,7 @@ int main()
         // Along a surface: the flat grid lies at z = 10 with x = 2c, y = 3r; sampled
         // linearly between voxels, and one layer down the normal.
         auto xyz = flatGrid(4, 6);
-        vcr::grid::Surface surface({xyz.data(), 4, 6, 18}, {vcr::grid::Interpolation::Smooth});
+        vcr::grid::Surface surface({xyz.data(), 4, 6, 18}, {vcr::grid::Interpolation::Bicubic});
         const vcr::grid::Raster raster{0.5, 0.5, 0.25, 0.25, 8, 8};
         request.offsets = {0.0f, 1.0f};
         r = vcr::grid::sample(surface, raster, request);

@@ -49,9 +49,9 @@ Interpolation interpolationNamed(const std::string& name)
 {
     if (name == "linear")
         return Interpolation::Linear;
-    if (name == "smooth")
-        return Interpolation::Smooth;
-    throw std::invalid_argument("interpolation must be 'linear' or 'smooth'");
+    if (name == "bicubic")
+        return Interpolation::Bicubic;
+    throw std::invalid_argument("interpolation must be 'linear' or 'bicubic'");
 }
 
 namespace {
@@ -67,13 +67,13 @@ ThreadPool& resamplePool()
 }  // namespace
 
 // A surface's vertices with what grid::point needs: which vertices are valid, the
-// piece of each column, and (smooth mode) the Hermite derivatives of every vertex.
+// piece of each column, and (bicubic mode) the Hermite derivatives of every vertex.
 struct Surface::Impl {
     Vertices v;
     SurfaceOptions options;
     std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
-    std::vector<float> du, dv, duv;     // per vertex, smooth mode
+    std::vector<float> du, dv, duv;     // per vertex, bicubic mode
     std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
 
     const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
@@ -88,7 +88,7 @@ struct Surface::Impl {
         g.valid = reinterpret_cast<const bool*>(valid.data());
         g.piece = piece.empty() ? nullptr : piece.data();
         g.normals = normals();
-        if (options.interpolation == Interpolation::Smooth) {
+        if (options.interpolation == Interpolation::Bicubic) {
             g.du = du.data();
             g.dv = dv.data();
             g.duv = duv.data();
@@ -259,7 +259,7 @@ Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_un
             if (s.piece[c] < 0)
                 s.piece[c] = -1 - int(c);  // a piece of its own: no patch spans it
     }
-    if (s.options.interpolation == Interpolation::Smooth)
+    if (s.options.interpolation == Interpolation::Bicubic)
         s.buildDerivatives();
 }
 
@@ -709,9 +709,9 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     const auto valid = upload(host.valid, vertices, id);
     const auto piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
     const auto normals = upload(host.normals, host.normals ? vertices * 12 : 0, id);
-    const bool smooth = host.du != nullptr;
-    const auto du = upload(host.du, smooth ? vertices * 12 : 0, id), dv = upload(host.dv, smooth ? vertices * 12 : 0, id),
-               duv = upload(host.duv, smooth ? vertices * 12 : 0, id);
+    const bool bicubic = host.du != nullptr;
+    const auto du = upload(host.du, bicubic ? vertices * 12 : 0, id), dv = upload(host.dv, bicubic ? vertices * 12 : 0, id),
+               duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
     cuda_detail::Params base;
     base.x0 = raster.x0;
     base.y0 = raster.y0;
@@ -724,7 +724,7 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     base.grid.valid = static_cast<const bool*>(valid->ptr);
     base.grid.piece = host.piece ? static_cast<const int*>(piece->ptr) : nullptr;
     base.grid.normals = host.normals ? static_cast<const float*>(normals->ptr) : nullptr;
-    if (smooth) {
+    if (bicubic) {
         base.grid.du = static_cast<const float*>(du->ptr);
         base.grid.dv = static_cast<const float*>(dv->ptr);
         base.grid.duv = static_cast<const float*>(duv->ptr);

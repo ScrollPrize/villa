@@ -37,7 +37,7 @@ struct PointMap {
 // valid (`valid`) and in one piece (`piece`, per column; null: one piece). With
 // `normals`, normals are those vertex normals interpolated; otherwise they are the
 // patch's. With the Hermite derivatives (du, dv, duv per vertex), patches are bicubic
-// Hermite (smooth); otherwise bilinear.
+// Hermite; otherwise bilinear.
 struct GridView {
     const float* xyz = nullptr;
     const bool* valid = nullptr;

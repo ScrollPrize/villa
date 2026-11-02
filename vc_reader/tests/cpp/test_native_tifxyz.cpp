@@ -152,7 +152,7 @@ int main()
     {
         const auto surface = plane(6, 8, 1, "p");
         const std::vector<float> xy{2.5f, 3.25f, 7.f, 5.f, 8.5f, 1.f};
-        for (const auto mode : {grid::Interpolation::Linear, grid::Interpolation::Smooth}) {
+        for (const auto mode : {grid::Interpolation::Linear, grid::Interpolation::Bicubic}) {
             std::vector<float> p(9), n(9);
             surface.pointsAt(xy.data(), 3, mode, p.data(), n.data());
             CHECK(std::fabs(p[0] - 15.f) < 1e-5f && std::fabs(p[1] - 29.75f) < 1e-5f && std::fabs(p[2] - 30.f) < 1e-5f);

@@ -107,7 +107,7 @@ public:
     // Physical-offset layers over a YX patch in full-resolution surface UV, the surface
     // interpolated between its vertices linearly or smoothly (grid::Interpolation).
     [[nodiscard]] SampleResult renderSurface(const Surface& surface, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, const std::vector<double>& offsetsUm = {0},
-                                             grid::Interpolation interpolation = grid::Interpolation::Linear);
+                                             grid::Interpolation interpolation = grid::Interpolation::Bicubic);
     // Uses a label YX patch to bound a crop, then projects its sheet across it. Geometric
     // coverage includes sheet outside the selecting patch; label validity additionally
     // requires annotation support at the surface point.

@@ -2,7 +2,7 @@
 
 ``read`` returns a :class:`Surface`: ``xyz`` (rows, cols, 3; XYZ float32, -1 where a vertex is
 missing) and ``valid``, read-only views of the stored grid. ``resample`` and ``points_at`` take
-stored-grid positions and return NaN where no patch covers one; ``"smooth"`` is a bicubic
+stored-grid positions and return NaN where no patch covers one; the default ``"bicubic"`` is a bicubic
 Hermite patch (Catmull-Rom on interior cells), ``"linear"`` a bilinear one.
 """
 import os

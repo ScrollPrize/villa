@@ -43,16 +43,16 @@ struct Vertices {
 
 enum class Interpolation {
     Linear,  // bilinear patches
-    Smooth,  // bicubic Hermite patches (C1 across cells), from per-vertex derivatives
+    Bicubic,  // bicubic Hermite patches (C1 across cells), from per-vertex derivatives
 };
-// The interpolation named "linear" or "smooth"; any other name raises.
+// The interpolation named "linear" or "bicubic"; any other name raises.
 [[nodiscard]] Interpolation interpolationNamed(const std::string& name);
 
 // A cell of the grid is a surface patch when its four vertices are valid and in one
 // piece; elsewhere there is no point. Normals are the patch's (its derivatives' cross
 // product, column direction x row direction).
 struct SurfaceOptions {
-    Interpolation interpolation = Interpolation::Linear;
+    Interpolation interpolation = Interpolation::Bicubic;
     // Column ranges [first, last) of separate pieces, never interpolated across;
     // empty: the grid is one piece.
     std::vector<std::pair<int, int>> components;

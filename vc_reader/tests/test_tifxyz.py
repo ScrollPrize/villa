@@ -77,11 +77,12 @@ def test_list_warns_on_bad_metadata(tmp_path):
     assert [e.metadata.uuid for e in entries] == ['g']
 
 
-def test_smooth_is_catmull_rom_inside():
+@pytest.mark.parametrize("kwargs", [{}, {"interpolation": "bicubic"}])
+def test_bicubic_is_catmull_rom_inside(kwargs):
     grid = _grid()
     surface = tifxyz.Surface(grid)
     rows, cols = np.meshgrid(np.array([5.25, 7.5], np.float32), np.array([6.5, 11.75], np.float32), indexing='ij')
-    xyz, valid = surface.points_at(rows, cols, interpolation='smooth')
+    xyz, valid = surface.points_at(rows, cols, **kwargs)
     assert valid.all()
     def spline(t):
         return np.array([-.5 * t + t * t - .5 * t ** 3, 1 - 2.5 * t * t + 1.5 * t ** 3, .5 * t + 2 * t * t - 1.5 * t ** 3, -.5 * t * t + .5 * t ** 3])

@@ -197,6 +197,40 @@ TEST_CASE("a GPU frame that fails renders on the CPU")
     CHECK(values == rendered(expected));
 }
 
+TEST_CASE("viewer and QuadSurface default to bicubic positions and patch normals")
+{
+    cv::Mat_<cv::Vec3f> points(5, 5);
+    for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 5; ++c)
+            points(r, c) = cv::Vec3f(float(c), float(r), float(c * c));
+    QuadSurface quad(points, cv::Vec2f(1, 1));
+    const auto viewer = vc3d::gridSurface(quad);
+    REQUIRE(viewer);
+    for (bool useViewer : {true, false}) {
+        float p[3], n[3];
+        if (useViewer) {
+            viewer->resample({1.25, 1.5, 1, 1, 1, 1}, p, n);
+        } else {
+            const auto uv = quad.gridToSurface({1.25, 1.5});
+            const cv::Vec3f ptr(float(uv[0]), float(uv[1]), 0);
+            const auto position = quad.coord(ptr);
+            const auto normal = quad.normal(ptr);
+            for (int a = 0; a < 3; ++a) {
+                p[a] = position[a];
+                n[a] = normal[a];
+            }
+        }
+        // The interior bicubic patch reproduces z = x^2, with dz/dx = 2x.
+        // Bilinear interpolation would give z = 1.75 and dz/dx = 3.
+        CHECK(p[0] == doctest::Approx(1.25f));
+        CHECK(p[1] == doctest::Approx(1.5f));
+        CHECK(p[2] == doctest::Approx(1.5625f));
+        CHECK(n[0] == doctest::Approx(-2.5f / std::sqrt(7.25f)));
+        CHECK(n[1] == doctest::Approx(0.0f));
+        CHECK(n[2] == doctest::Approx(1.0f / std::sqrt(7.25f)));
+    }
+}
+
 TEST_CASE("vertex spacing is the working level's voxel shape")
 {
     Fixture f;

@@ -46,8 +46,8 @@ class SurfaceTests(unittest.TestCase):
                 result=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2))
                 expected=np.stack([self.image[z,3:6,5:9] for z in (4,5,7)])[None]
                 np.testing.assert_allclose(host(result['image'].data),expected)
-                smooth=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2),interpolation='smooth')
-                np.testing.assert_allclose(host(smooth['image'].data),expected)  # a flat sheet: bicubic patches agree
+                bicubic=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2),interpolation='bicubic')
+                np.testing.assert_allclose(host(bicubic['image'].data),expected)  # a flat sheet: bicubic patches agree
                 np.testing.assert_array_equal(host(result['ink'].data),self.labels[None,1:4,2:6])
                 self.assertTrue(host(result['image'].valid).all())
                 with self.assertRaisesRegex(ValueError,'explicit'):

@@ -225,15 +225,15 @@ inline void bind(nb::module_& m)
                 xy[i * 2 + 1] = rows.data()[i];
             }
             return pointsOut(s, xy.data(), n, r, c, grid::interpolationNamed(interpolation), normals);
-        }, "rows"_a, "cols"_a, "interpolation"_a = "linear", "normals"_a = false)
+        }, "rows"_a, "cols"_a, "interpolation"_a = "bicubic", "normals"_a = false)
         .def("resample", [](const Surface& s, std::array<double, 2> origin, std::array<double, 2> step, std::array<int, 2> size, const std::string& interpolation, bool normals) {
             if (size[0] <= 0 || size[1] <= 0) throw nb::value_error("resample size must be positive");
             return rasterOut(s, grid::Raster{origin[1], origin[0], step[1], step[0], size[1], size[0]}, grid::interpolationNamed(interpolation), normals);
-        }, "origin"_a, "step"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
+        }, "origin"_a, "step"_a, "size"_a, "interpolation"_a = "bicubic", "normals"_a = false,
            "Positions at grid positions origin + (j, i) * step, in stored cells (row, column); NaN where no patch covers one.")
         .def("resample_full", [](const Surface& s, std::array<std::int64_t, 2> start, std::array<std::int64_t, 2> size, const std::string& interpolation, bool normals) {
             return rasterOut(s, s.fullRaster(start, size), grid::interpolationNamed(interpolation), normals);
-        }, "start"_a, "size"_a, "interpolation"_a = "linear", "normals"_a = false,
+        }, "start"_a, "size"_a, "interpolation"_a = "bicubic", "normals"_a = false,
            "Positions of a window at full resolution: start and size in rows and columns of full_shape.");
 
     m.def("_tifxyz_read", [](const std::string& location, bool mask, nb::object options) {

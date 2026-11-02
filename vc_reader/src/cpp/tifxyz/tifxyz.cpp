@@ -282,7 +282,7 @@ Surface Surface::retargeted(double factor) const
 
 const grid::Surface& Surface::interpolator(grid::Interpolation interpolation) const
 {
-    const auto k = std::size_t(interpolation == grid::Interpolation::Smooth);
+    const auto k = std::size_t(interpolation == grid::Interpolation::Bicubic);
     std::call_once(interpolators_->once[k], [&] {
         grid::SurfaceOptions options;
         options.interpolation = interpolation;
