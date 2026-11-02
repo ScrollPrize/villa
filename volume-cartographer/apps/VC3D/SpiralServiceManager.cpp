@@ -1581,7 +1581,15 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
     if (generation != _connectionGeneration) return;
     if (networkError != QNetworkReply::NoError && http == 0) {
         // Unreachable / timeout: distinguish from service-reported errors.
-        const QString message = tr("Spiral service is unreachable: %1").arg(networkErrorString);
+        // Nothing here aborts a reply, so a cancelled one hit its transfer
+        // timeout: the service is up but busy, which "unreachable" misstates.
+        const int timeoutMs = reply->request().transferTimeout();
+        const QString message =
+            networkError == QNetworkReply::OperationCanceledError && timeoutMs > 0
+                ? tr("Spiral service did not answer %1 within %2 s")
+                      .arg(reply->url().path())
+                      .arg(timeoutMs / 1000)
+                : tr("Spiral service is unreachable: %1").arg(networkErrorString);
         if (detailedFailure) detailedFailure(message, {});
         else if (failure) failure(message);
         else emit errorOccurred(message);
