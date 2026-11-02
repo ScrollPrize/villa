@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from vc_reader.torch import normalize
+import vc_reader.transforms as A
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     apply_value_augmentation_batch,
@@ -48,6 +48,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _predict_direction_field,
     _trace2cp_metric_bidirectional,
 )
+
+_MASKED_ZSCORE = A.Normalize("zscore", nonzero=False, masked=True, eps=1e-6)
+_MASKED_TARGETS = {"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()}
 
 
 @dataclass(frozen=True)
@@ -294,7 +297,8 @@ def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torc
 def _normalize_image_tensor(images: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
-    return torch.where(valid, normalize(images, valid=valid), torch.zeros_like(images))
+    normalized = _MASKED_ZSCORE.batch({"image": images, "valid": valid}, targets=_MASKED_TARGETS)["image"]
+    return torch.where(valid, normalized, torch.zeros_like(images))
 
 
 def _batch_images_to_tensors(

@@ -41,10 +41,17 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
     volume_cache_dirs,
 )
 from vc_reader.reader import ZarrReader
-from vc_reader.torch import normalize as _normalize_tensor
+import vc_reader.transforms as A
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     control_point_line_index,
 )
+
+# Per-sample, per-channel image normalization; statistics over valid voxels when masked.
+_NORMALIZE = {mode: A.Normalize(mode, eps=1e-6, **({"nonzero": False} if mode == "zscore" else {}))
+              for mode in ("zscore", "minmax")}
+_MASKED_NORMALIZE = {mode: A.Normalize(mode, masked=True, eps=1e-6, **({"nonzero": False} if mode == "zscore" else {}))
+                     for mode in ("zscore", "minmax")}
+_MASKED_TARGETS = {"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()}
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _TARGET_MODE_CP_ONLY = 0
@@ -1447,7 +1454,7 @@ def _normalize_image(volume: torch.Tensor, valid_mask: torch.Tensor, mode: str) 
         return volume
     if mode_l not in {"zscore", "minmax"}:
         raise ValueError(f"unsupported image_normalization {mode!r}")
-    return _normalize_tensor(volume[None, None], mode_l, valid=valid[None, None])[0, 0]
+    return _MASKED_NORMALIZE[mode_l]({"image": volume[None], "valid": valid[None]}, targets=_MASKED_TARGETS)["image"][0]
 
 def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
     """Retained shared 1D kernel helper for trace-to-control-point smoothing."""
@@ -1758,7 +1765,7 @@ def _normalize_complete_image(volume: torch.Tensor, mode: str) -> torch.Tensor:
         return volume
     if mode_l not in {"zscore", "minmax"}:
         raise ValueError(f"unsupported image_normalization {mode!r}")
-    return _normalize_tensor(volume[None, None], mode_l)[0, 0]
+    return _NORMALIZE[mode_l](volume[None])[0]
 
 
 def _apply_value_augmentation_prefix_3d(
@@ -1894,7 +1901,7 @@ def apply_value_augmentation_batch_3d(
     if mode in {"none", "raw", "identity"}:
         out = volume
     elif mode in {"zscore", "minmax"}:
-        out = _normalize_tensor(volume, mode)
+        out = _NORMALIZE[mode].batch(volume)
     else:
         raise ValueError(f"unsupported image_normalization {config.image_normalization!r}")
 

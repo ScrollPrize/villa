@@ -15,18 +15,13 @@ from tqdm import tqdm
 from vc_reader.reader import open_group
 
 try:
-    import trimesh
-except Exception:  # pragma: no cover - optional dependency at runtime
-    trimesh = None
-
-try:
     from numba import njit
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
 import vc_reader.transforms as A
 
-_ZSCORE = A.Pipeline([A.Normalize("zscore", nonzero=False, eps=1e-8)], backend="cpu")
+_ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
@@ -1584,7 +1579,7 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
 
     cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
     vol_crop = volume_arr.read_region(min_corner, crop_size).astype(np.float32, copy=False)
-    vol_crop = _ZSCORE({"image": vol_crop.reshape(1, 1, -1)}, seed=0)["image"].reshape(vol_crop.shape)
+    vol_crop = _ZSCORE(vol_crop.reshape(1, 1, -1)).reshape(vol_crop.shape)
 
     return {
         "bbox_id": int(record.get("bbox_id", -1)),
@@ -2309,22 +2304,17 @@ def _cleanup_surface_grid_before_save(grid, valid, target_step_size):
     out = grid_arr.copy()
 
     cleanup_meta = {
-        "mesh_cleanup_enabled": bool(trimesh is not None),
         "mesh_cleanup_target_step": float(target_step_size),
         "mesh_cleanup_duplicate_vertices_fixed": 0,
         "mesh_cleanup_unique_edges": 0,
         "mesh_cleanup_relaxation_applied": False,
     }
 
-    if trimesh is None:
-        return out, cleanup_meta
-
     vr, vc = np.where(valid_mask)
     if vr.size < 3:
         return out, cleanup_meta
 
-    faces = _build_valid_grid_triangles(valid_mask)
-    if faces.shape[0] == 0:
+    if _build_valid_grid_triangles(valid_mask).shape[0] == 0:
         return out, cleanup_meta
 
     edges_unique = _build_valid_grid_edges(valid_mask)
@@ -2333,14 +2323,6 @@ def _cleanup_surface_grid_before_save(grid, valid, target_step_size):
 
     verts = out[vr, vc].astype(np.float64, copy=True)
     if not np.isfinite(verts).all():
-        return out, cleanup_meta
-
-    try:
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False, validate=False)
-        mesh.update_faces(mesh.unique_faces())
-        mesh.update_faces(mesh.nondegenerate_faces())
-        mesh.remove_unreferenced_vertices()
-    except ValueError:
         return out, cleanup_meta
 
     cleanup_meta["mesh_cleanup_unique_edges"] = int(edges_unique.shape[0])

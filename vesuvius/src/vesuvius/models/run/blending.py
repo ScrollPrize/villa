@@ -322,7 +322,7 @@ class SpatialPatchGrid:
         return dict(result)
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
-    pZ, pY, pX = patch_size
+    """Blend weights of shape (1, *patch_size); 2D and 3D patches."""
     tmp = np.zeros(patch_size, dtype=dtype)
     center_coords = [i // 2 for i in patch_size]
     sigmas = [i / sigma_scale for i in patch_size]
@@ -332,7 +332,7 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     gaussian_map_np = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
 
     gaussian_map_np /= max(gaussian_map_np.max(), 1e-12)
-    gaussian_map_np = gaussian_map_np.reshape(1, pZ, pY, pX)
+    gaussian_map_np = gaussian_map_np.reshape(1, *patch_size)
     gaussian_map_np = np.clip(gaussian_map_np, a_min=0, a_max=None)
     
     print(

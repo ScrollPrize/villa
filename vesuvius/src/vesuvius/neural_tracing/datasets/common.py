@@ -13,7 +13,7 @@ from functools import lru_cache
 from scipy import ndimage
 import vc_reader.transforms as A
 
-_ZSCORE = A.Pipeline([A.Normalize("zscore", nonzero=False, eps=1e-8)], backend="cpu")
+_ZSCORE = A.Normalize("zscore", nonzero=False, eps=1e-8)
 from vc_reader import images
 import warnings
 
@@ -311,7 +311,7 @@ def _read_volume_crop(volume_arr, crop_size, min_corner, max_corner,
     if image_normalization == "unit":
         return vol_crop.astype(np.float32) / 255.0
     if image_normalization == "zscore":
-        return _ZSCORE({"image": vol_crop.astype(np.float32).reshape(1, 1, -1)}, seed=0)["image"].reshape(vol_crop.shape)
+        return _ZSCORE(vol_crop.astype(np.float32).reshape(1, 1, -1)).reshape(vol_crop.shape)
     raise ValueError(
         f"Unknown image_normalization '{image_normalization}' "
         f"(expected 'zscore' or 'unit')."
