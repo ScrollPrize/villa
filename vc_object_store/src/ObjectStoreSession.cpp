@@ -388,7 +388,10 @@ void ObjectStoreSession::ensureGeometry(const AttachmentIdentity& identity, cons
             if (!attachment->fetches) throw GeometryUnavailable("object has no geometry and its store is attached read-only: " + uuid);
             std::string error;
             if (!attachment->fetches->fetchNow(uuid, [&] { return attachment->cancelled.load() || (cancel && cancel()); },
-                                               &error))
+                                               &error, [&] {
+                                                   auto txn = attachment->store.read();
+                                                   return attachment->store.currentGeometry(txn, uuid).has_value();
+                                               }))
                 throw GeometryUnavailable(error.empty() ? "fetching " + uuid + " was cancelled"
                                                         : "cannot fetch " + uuid + ": " + error);
         }
