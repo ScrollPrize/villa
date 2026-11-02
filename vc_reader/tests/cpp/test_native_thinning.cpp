@@ -32,16 +32,46 @@ void verify(bool gpu) {
         if(gpu){vcr::distance::cuda::manhattan(input.data(),out.data(),shape);CHECK(out==ref);}
 #endif
     }
-    for(bool full:{false,true})for(const auto& shape:std::vector<std::vector<std::size_t>>{{7,9},{5,7,9}}) {
+    // Labels against a flood fill: same partition, numbered by first voxel in scan order.
+    for(int connectivity:{4,8,6,18,26})for(int trial=0;trial<12;++trial) {
+        const bool three=connectivity!=4&&connectivity!=8;
+        std::vector<std::size_t> shape{std::size_t(1+random()%17),std::size_t(1+random()%70)};
+        if(three)shape.insert(shape.begin(),1+random()%9);
         std::size_t n=1;for(auto d:shape)n*=d;
-        std::vector<std::uint8_t> mask(n);for(auto& v:mask)v=random()%3?0:255;
-        std::vector<std::uint32_t> cpu(n),other(n);
-        vcr::components::label(mask.data(),cpu.data(),shape,full);
-        for(std::size_t i=0;i<n;++i){CHECK(bool(cpu[i])==bool(mask[i]));if(cpu[i])CHECK(cpu[i]-1<=i && cpu[cpu[i]-1]==cpu[i]);}
+        std::vector<std::uint8_t> mask(n);const auto density=1+random()%4;for(auto& v:mask)v=random()%5<density;
+        const std::size_t nz=three?shape[0]:1,ny=shape[three],nx=shape[three+1];
+        std::vector<std::int32_t> expected(n,0);std::int32_t count=0;std::vector<std::size_t> stack;
+        for(std::size_t start=0;start<n;++start)if(mask[start]&&!expected[start]) {
+            expected[start]=++count;stack.push_back(start);
+            while(!stack.empty()) {
+                const auto i=stack.back();stack.pop_back();
+                const long long x=i%nx,y=i/nx%ny,z=i/(nx*ny);
+                for(int dz=-1;dz<=1;++dz)for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx) {
+                    const int axes=(dz!=0)+(dy!=0)+(dx!=0),reach=connectivity==4||connectivity==6?1:connectivity==18||connectivity==8?2:3;
+                    if(!axes||axes>reach||(!three&&dz))continue;
+                    const long long zz=z+dz,yy=y+dy,xx=x+dx;
+                    if(zz<0||yy<0||xx<0||zz>=(long long)nz||yy>=(long long)ny||xx>=(long long)nx)continue;
+                    const auto j=std::size_t((zz*(long long)ny+yy)*(long long)nx+xx);
+                    if(mask[j]&&!expected[j]){expected[j]=count;stack.push_back(j);}
+                }
+            }
+        }
+        for(std::size_t threads:{1,3,0}) {
+            std::vector<std::int32_t> labels(n,-1);
+            CHECK(vcr::components::label(mask.data(),shape,connectivity,labels.data(),threads)==std::size_t(count));CHECK(labels==expected);
+        }
 #ifdef VC_READER_CUDA
-        if(gpu){vcr::components::cuda::label(mask.data(),other.data(),shape,full);CHECK(cpu==other);}
+        if(gpu) {
+            std::uint8_t* deviceMask=nullptr;std::int32_t* deviceLabels=nullptr;std::vector<std::int32_t> labels(n);
+            CHECK(cudaMalloc(&deviceMask,n)==cudaSuccess&&cudaMalloc(&deviceLabels,n*4)==cudaSuccess);
+            CHECK(cudaMemcpy(deviceMask,mask.data(),n,cudaMemcpyHostToDevice)==cudaSuccess);
+            CHECK(vcr::components::cuda::label(deviceMask,shape,connectivity,deviceLabels)==std::size_t(count));
+            CHECK(cudaMemcpy(labels.data(),deviceLabels,n*4,cudaMemcpyDeviceToHost)==cudaSuccess);CHECK(labels==expected);
+            cudaFree(deviceMask);cudaFree(deviceLabels);
+        }
 #endif
     }
+    rejects([]{std::uint8_t m=1;std::int32_t l;vcr::components::label(&m,std::vector<std::size_t>{1,1},6,&l);});
     std::vector<std::uint8_t> longLine(600,255),longOut(600);longLine[0]=0;
     vcr::distance::manhattan(longLine.data(),longOut.data(),{1,600});CHECK(longOut[254]==254 && longOut[255]==255 && longOut.back()==255);
     for(int trial=0;trial<45;++trial) {

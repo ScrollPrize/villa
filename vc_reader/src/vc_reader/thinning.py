@@ -20,7 +20,7 @@ at 255 (also the result if no zero exists), on either backend. For Euclidean,
 signed, and normal-field distances use ``transforms.DistanceTransform``.
 """
 from ._thinning import (TraceWorkspace, skeletonize, skeletonize_into,
-                        trace_ridges, trace_ridges_into, manhattan_distance, connected_components)
+                        trace_ridges, trace_ridges_into, manhattan_distance)
 
 __all__ = ["TraceWorkspace", "skeletonize", "skeletonize_into", "trace_ridges",
-           "manhattan_distance", "trace_ridges_into", "connected_components"]
+           "manhattan_distance", "trace_ridges_into"]

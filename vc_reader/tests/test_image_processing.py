@@ -83,6 +83,23 @@ def test_distance_transform_scipy_boundaries(shape, fill):
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("shape", [(17, 19), (9, 11, 13)])
+def test_morphology_footprints_match_scipy_iterations(shape):
+    scipy = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(3)
+    mask = scipy.binary_dilation(rng.random(shape) > .9)
+    mask[0] |= rng.random(shape[1:]) > .5
+    ops = {"dilate": scipy.binary_dilation, "erode": scipy.binary_erosion, "close": scipy.binary_closing, "open": scipy.binary_opening}
+    for footprint, connectivity in (("cross", 1), ("cube", len(shape))):
+        structure = scipy.generate_binary_structure(len(shape), connectivity)
+        for op, reference in ops.items():
+            expected = reference(mask, structure=structure, iterations=2)
+            for backend in _backends():
+                pipeline = A.Pipeline([A.Morphology(op, radius=2, footprint=footprint)], targets={"label": A.Label()}, backend=backend)
+                actual = pipeline({"label": mask[None].astype(np.uint8)}, seed=0)["label"][0]
+                np.testing.assert_array_equal(actual.astype(bool), expected, err_msg=f"{footprint} {op} {backend}")
+
+
 def test_direct_call_is_deterministic_and_keeps_containers():
     """Outside a Pipeline a transform always applies with a fixed seed; arrays in, field out."""
     rng = np.random.default_rng(3)

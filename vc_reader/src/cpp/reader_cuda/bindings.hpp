@@ -34,8 +34,11 @@ inline void bind(nb::module_& m) {
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
-    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : cudaStreamPerThread; });
     m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
+    m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
+    m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
+    m.def("_pool_release_threshold",[](int id) { device::prepare_pool(id); return device::pool_release_threshold(id); });
     m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
         if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
             (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))

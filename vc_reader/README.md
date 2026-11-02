@@ -151,10 +151,10 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | Triangle slice labels, interpolated normals and surface frames (ordered DDA rasterization) | `sampling.hpp`: `geometry::MeshSlice`, `raster_slice` | `geometry/triangle_mesh.hpp`, `geometry/kernels.cu` | `geometry.rasterize_mesh_slice` |
 | Sheet normals from CT | `reader.hpp`: `sheetNormals`, `sheetNormalsCpu`; `cuda_reader.hpp`: `sheet_normal::sample_cuda` | `sheet_normal/`, `native_reader.cpp`, `symmetric_eigen.hpp` | `sheet_normal.py`: `sheet_normals`, `sample_sheet_normals` |
 | Shortest path over a 2D cost grid | `pathfinding.hpp`: `pathfinding::shortestPath` | `pathfinding/` | `shortest_path` |
+| Connected components of a 2D/3D mask (4/8, 6/18/26-connected), numbered as `scipy.ndimage.label`; CPU (threaded, run-based) or CUDA | `components.hpp`: `components::label`, `components::cuda::label` | `components/` | `geometry.label_components`; `transforms.ConnectedComponents` |
 | Binary YX skeletons (Zhang–Suen, Guo–Hall, combined), independent slice batches, host/device buffers | `thinning.hpp`: `thinning::skeleton`, `cuda::skeleton`, `cuda::skeletonDevice` | `thinning/skeleton.cpp`, `thinning/kernels.cu` | `thinning.skeletonize`, `skeletonize_into`; `transforms.MedialSurface` |
 | Ordered distance-ridge traces, pruning, reusable CPU scratch; complete device-side tracing | `thinning.hpp`: `thinning::trace`, `prune`, `cuda::traceDevice` | `thinning/trace.cpp`, `thinning/trace_cuda.cu` | `thinning.trace_ridges`, `trace_ridges_into`, `TraceWorkspace`; `transforms.RidgeTrace` |
 | Exact uint8 Manhattan distance to background in 2D/3D, saturated at 255 | `distance_transform.hpp`: `distance::manhattan`, `cuda::manhattanDevice` | `distance/` | `thinning.manhattan_distance` |
-| Deterministic binary connected-component labels in 2D/3D, 4/6 or 8/26 neighbors | `components.hpp`: `components::label`, `cuda::labelDevice` | `components/`, shared transform component traversal | `thinning.connected_components`; `transforms.ConnectedComponents` |
 
 
 ### Display
@@ -171,7 +171,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | Need | C++ API | Implementation | Python |
 | --- | --- | --- | --- |
 | Augmentation and processing pipelines with seeded replay, on CPU or CUDA ([catalog](#transforms)) | `transforms.hpp`: `transforms::Pipeline`, `Op`, `Sample`, `Plan`, `save_plan`, `load_plan` | `transforms/pipeline.hpp`, `transforms/ops/`, `transforms/cpu/`, `transforms/cuda/` | `vc_reader.transforms` |
-| Device buffers, streams, resident pipelines and batches | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap` |
+| Device buffers, streams, resident pipelines and batches; how much freed memory the default CUDA pool keeps (all, by default) | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `cuda_pool.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap`, `set_pool_release_threshold`, `pool_release_threshold` |
 | PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `structure_tensor`; direct calls `A.Normalize(...).batch` |
 | Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
 | Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
@@ -1066,7 +1066,7 @@ A.MedianFilter(size=3)
 <details>
 <summary><strong>Morphology</strong></summary>
 
-Apply a morphological operation to labels. This example closes small gaps using dilation followed by erosion.
+Apply a morphological operation to labels. This example closes small gaps using dilation followed by erosion. `footprint` is `ball` (Euclidean radius), `cross` (L1 radius: SciPy's default structure with `iterations=radius`), `cube` (Chebyshev radius: SciPy's full-connectivity structure with `iterations=radius`) or `repeated_cross`. Outside the array counts as background, as SciPy's `border_value=0`; `neutral_border=True` keeps erosion from eating in from the edges.
 
 ```python
 A.Morphology(operation='close', radius=1)
@@ -1756,11 +1756,12 @@ for metadata browsing. Native regression tests are enabled by
 
 ```python
 from vc_reader import thinning, transforms as A
+from vc_reader.geometry import label_components
 
 # uint8 contiguous (Y,X), or any leading dimensions batching independent YX masks.
 skeleton = thinning.skeletonize(mask, method="guo_hall", backend="cuda")
 trace_image, xy_paths = thinning.trace_ridges(mask, backend="cuda", return_traces=True)
-labels = thinning.connected_components(mask, backend="cuda", full_connectivity=True)
+labels, count = label_components(mask, connectivity=8)  # CUDA masks give CUDA labels
 
 # Keep intermediate arrays on CUDA. Device inputs also produce device outputs.
 pipeline = A.Pipeline([
@@ -1780,8 +1781,9 @@ outside pixels as background. `MedialSurface` defaults to the latter and retains
 input label values at skeleton pixels, with its existing optional morphology.
 Skeletons and ridge traces operate in YX planes; a stack is **not** a 3D skeleton.
 Components and Manhattan distances operate across the complete 2D or 3D grid.
-Component IDs are the first flat index in each component plus one, with zero for
-background. IDs are deterministic but not consecutive. Channels are independent.
+Component labels are int32 1..count in scan order of each component's first
+voxel, as `scipy.ndimage.label` numbers them, with zero for background.
+`ConnectedComponents` labels each channel independently (`connectivity`, 0 for full).
 
 `RidgeTrace`/`trace_ridges` return visit-index pixels (seeds are 1, indices saturate
 at 255). `return_traces=True` also returns ordered XY polylines. `min_length` prunes

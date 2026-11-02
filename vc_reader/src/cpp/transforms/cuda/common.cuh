@@ -1,6 +1,7 @@
 #pragma once
 #include "../core.hpp"
 #include "../../cuda_stream.hpp"
+#include "../../cuda_pool.hpp"
 #include "batch_queue.hpp"
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -27,7 +28,7 @@ template<class T> struct Buffer {
         int supported = 0;
         check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); else
+        if (pooled) { vcr::device::prepare_pool(device); check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); } else
 #endif
         check(cudaMalloc(&ptr,n*sizeof(T)));
         if (BatchQueue::current) BatchQueue::current->allocated(n*sizeof(T));

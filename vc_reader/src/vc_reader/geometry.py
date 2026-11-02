@@ -275,6 +275,28 @@ def transform_points(points, matrices, *, vectors=False, normalize=False, out=No
     return result
 
 
+def label_components(mask, *, connectivity, threads=0, out=None):
+    """Connected components of the nonzero voxels of a 2D (Y, X) or 3D (Z, Y, X) mask.
+
+    Returns ``(labels, count)``: int32 labels 1..count, numbered in scan order of
+    each component's first voxel as scipy.ndimage.label numbers them, and 0 for
+    background. connectivity is 4 or 8 in 2D, 6, 18 or 26 in 3D. CUDA masks
+    (bool or uint8) give CUDA labels. threads (CPU; 0 uses all) does not change
+    the result.
+    """
+    device = _device(mask)
+    if device >= 0:
+        mask = _cuda.wrap(mask)
+    else:
+        mask = np.asarray(mask)
+        if mask.dtype not in (np.bool_, np.uint8):
+            mask = mask != 0
+        mask = np.ascontiguousarray(mask)
+    result, labels = _output(out, mask.shape, np.int32, device)
+    count = _reader._label_components(_array_view(mask), labels, int(connectivity), int(threads))
+    return result, count
+
+
 def rasterize_mesh_slice(vertices, triangles, labels, z, shape, *, vertex_normals=None, face_normals=None,
                          vertex_normal_flags=None, vertex_tangents=None, vertex_bitangents=None,
                          face_tangents=None, face_bitangents=None, vertex_tangent_flags=None):

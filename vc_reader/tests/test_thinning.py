@@ -1,10 +1,11 @@
-"""Public thinning, connected-component, and resident pipeline contracts."""
+"""Public thinning and resident pipeline contracts."""
 import numpy as np
 import pytest
 from build_support import load_build
 load_build(names=("_thinning", "_transforms"))
 from vc_reader import thinning as T
 from vc_reader import transforms as A
+from vc_reader.geometry import label_components
 
 
 def backends():
@@ -23,20 +24,6 @@ def test_skeleton_masks_batches_and_aliasing(shape, method):
             np.testing.assert_array_equal(out, ref)
         assert np.all((ref == 0) | (ref == 255))
         assert np.all((ref == 0) | (x != 0))
-
-
-@pytest.mark.parametrize("dim", [2, 3])
-@pytest.mark.parametrize("full", [False, True])
-def test_components_against_scipy(dim, full):
-    from scipy.ndimage import label, generate_binary_structure
-    x = (np.random.default_rng(32).random((11,) * dim) > .65).astype(np.uint8)
-    labels, count = label(x, generate_binary_structure(dim, dim if full else 1))
-    expected = np.zeros_like(labels, dtype=np.uint32)
-    for c in range(1, count + 1):
-        indices = np.flatnonzero(labels.ravel() == c)
-        expected.ravel()[indices] = indices[0] + 1
-    for backend in backends():
-        np.testing.assert_array_equal(T.connected_components(x, backend=backend, full_connectivity=full), expected)
 
 
 @pytest.mark.parametrize("dim", [2, 3])
@@ -76,7 +63,7 @@ def test_traces_pruning_workspace_and_empty():
 def operations():
     # The chained mask transforms exercise queued producers/consumers in batch.
     return [A.Morphology(on="mask", operation="dilate", radius=1),
-            A.ConnectedComponents(on="mask", full_connectivity=True),
+            A.ConnectedComponents(on="mask"),
             A.RidgeTrace(on="mask"),
             A.MedialSurface(on="mask", method="guo_hall", preserve_border=True,
                             tube=False, close=False),
@@ -88,7 +75,7 @@ def test_pipeline_cpu_2d_3d():
         x = (np.random.default_rng(6).random(shape) > .65).astype(np.uint8)
         out = A.Pipeline(operations(), backend="cpu")({"mask": x}, seed=0)
         for c in range(x.shape[0]):
-            np.testing.assert_array_equal(out["mask_components"][c], T.connected_components(out["mask"][c]))
+            np.testing.assert_array_equal(out["mask_components"][c], label_components(out["mask"][c], connectivity=26 if out["mask"][c].ndim == 3 else 8)[0])
             np.testing.assert_array_equal(out["mask_skel"][c], T.skeletonize(out["mask"][c], method="guo_hall") / 255)
 
 

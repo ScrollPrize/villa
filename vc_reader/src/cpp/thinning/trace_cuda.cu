@@ -21,7 +21,7 @@ __global__ void seedFlags(const std::uint8_t* distance,std::uint8_t* flags,unsig
         flags[i]=maximum;
     }
 }
-__global__ void seedKeys(const std::uint32_t* seeds,const std::uint32_t* labels,unsigned long long* keys,unsigned count) {
+__global__ void seedKeys(const std::uint32_t* seeds,const std::int32_t* labels,unsigned long long* keys,unsigned count) {
     for(std::size_t i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=std::size_t(gridDim.x)*blockDim.x)
         keys[i]=(static_cast<unsigned long long>(labels[seeds[i]])<<32)|seeds[i];
 }
@@ -29,7 +29,7 @@ __global__ void groupFlags(const unsigned long long* keys,std::uint8_t* flags,un
     for(std::size_t i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=std::size_t(gridDim.x)*blockDim.x)
         flags[i]=!i || (keys[i]>>32)!=(keys[i-1]>>32);
 }
-__global__ void componentSizes(const std::uint32_t* labels,std::uint32_t* sizes,std::size_t n) {
+__global__ void componentSizes(const std::int32_t* labels,std::uint32_t* sizes,std::size_t n) {
     for(std::size_t i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=std::size_t(gridDim.x)*blockDim.x)
         if(labels[i])atomicAdd(sizes+labels[i]-1,1u);
 }
@@ -139,12 +139,12 @@ void run(const std::uint8_t* input,std::uint8_t* output,std::size_t rows,std::si
     if(tc::BatchQueue::current)tc::BatchQueue::current->flush();
     const auto stream=device::stream();Stats timings;
     tc::Buffer<std::uint8_t> distance(n),flags(n);
-    tc::Buffer<std::uint32_t> labels(n),seeds(n),count(1);
+    tc::Buffer<std::int32_t> labels(n);tc::Buffer<std::uint32_t> seeds(n),count(1);
     const auto dtStart=std::chrono::steady_clock::now();
     distance::cuda::manhattanDevice(input,distance.ptr,{rows,cols});
     timings.distanceTransformSeconds=detail::elapsed(dtStart);
     const auto seedStart=std::chrono::steady_clock::now();
-    components::cuda::labelDevice(distance.ptr,labels.ptr,{rows,cols},true);
+    const std::size_t grid[]{rows,cols};components::cuda::label(distance.ptr,grid,8,labels.ptr);
     seedFlags<<<tc::blocks(n),256,0,stream>>>(distance.ptr,flags.ptr,unsigned(rows),unsigned(cols));tc::check(cudaGetLastError());
     tc::select_flagged_indices(flags,seeds,count);unsigned seedCount=0;count.download(&seedCount);
     tc::check(cudaMemsetAsync(output,0,n,stream));

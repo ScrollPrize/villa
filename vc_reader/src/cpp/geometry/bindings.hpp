@@ -1,5 +1,6 @@
 #pragma once
 #include "plan.hpp"
+#include "vc_reader/components.hpp"
 namespace vcr::geometry {
 using Array=nb::ndarray<nb::c_contig>;
 inline void check(Array a,nb::dlpack::dtype dtype,std::vector<std::size_t> shape,int id){
@@ -159,5 +160,19 @@ inline void bind(nb::module_& m){
         else{auto& v=nb::cast<const CudaVoxels&>(obj);execute(id,[&]{dense_cuda(v,o);});}
 #endif
     });
+    m.def("_label_components",[](Array mask,Array labels,int connectivity,std::size_t threads){
+        if(mask.ndim()!=2&&mask.ndim()!=3)throw nb::value_error("label_components expects a 2D or 3D mask");
+        if(mask.dtype()!=nb::dtype<bool>()&&mask.dtype()!=nb::dtype<std::uint8_t>())throw nb::value_error("label_components mask must be bool or uint8");
+        const int id=array_device(mask);std::vector<std::size_t> shape;for(std::size_t a=0;a<mask.ndim();++a)shape.push_back(mask.shape(a));
+        check(labels,nb::dtype<std::int32_t>(),shape,id);disjoint({mask},{labels});
+        const auto* m=static_cast<const std::uint8_t*>(mask.data());auto* out=static_cast<std::int32_t*>(labels.data());std::size_t count=0;
+        execute(id,[&]{
+            if(id<0){count=components::label(m,shape,connectivity,out,threads);return;}
+#ifdef VC_READER_CUDA
+            count=components::cuda::label(m,shape,connectivity,out);
+#endif
+        });
+        return count;
+    },"mask"_a,"labels"_a,"connectivity"_a,"threads"_a=0);
 }
 }

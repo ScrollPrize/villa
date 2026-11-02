@@ -34,16 +34,15 @@ target_link_libraries(vc_reader_headers INTERFACE Threads::Threads)
 
 add_library(vc_reader_thinning STATIC
     src/cpp/thinning/trace.cpp src/cpp/thinning/history.cpp src/cpp/thinning/distance.cpp src/cpp/thinning/skeleton.cpp
-    src/cpp/distance/manhattan.cpp src/cpp/components/components.cpp)
+    src/cpp/distance/manhattan.cpp src/cpp/components/label.cpp)
 add_library(vc_reader::thinning ALIAS vc_reader_thinning)
 set_target_properties(vc_reader_thinning PROPERTIES EXPORT_NAME thinning POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(vc_reader_thinning PUBLIC vc_reader::headers)
 # Keep the history score's float32 operation order fixed across toolchains.
 target_compile_options(vc_reader_thinning PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-ffp-contract=off>)
 if(VC_READER_ENABLE_CUDA)
-    target_sources(vc_reader_thinning PRIVATE src/cpp/thinning/kernels.cu src/cpp/thinning/trace_cuda.cu src/cpp/distance/kernels.cu src/cpp/components/root_labels.cu)
+    target_sources(vc_reader_thinning PRIVATE src/cpp/thinning/kernels.cu src/cpp/thinning/trace_cuda.cu src/cpp/distance/kernels.cu src/cpp/components/kernels.cu)
     set_source_files_properties(src/cpp/thinning/trace_cuda.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;--expt-relaxed-constexpr")
-    set_source_files_properties(src/cpp/components/root_labels.cu PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr")
     set_target_properties(vc_reader_thinning PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_definitions(vc_reader_thinning PUBLIC VC_READER_CUDA=1)
     target_link_libraries(vc_reader_thinning PUBLIC CUDA::cudart)

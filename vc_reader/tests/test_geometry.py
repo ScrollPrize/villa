@@ -8,7 +8,7 @@ from build_support import load_build
 load_build()
 
 from vc_reader import cuda, _reader
-from vc_reader.geometry import PolylineSet, VoxelSet, transform_points
+from vc_reader.geometry import PolylineSet, VoxelSet, label_components, transform_points
 
 
 def host(x):
@@ -351,3 +351,32 @@ def test_gather_candidates_without_host_roundtrip(backend):
     gathered=host(c.gather(candidates['indices'].reshape(-1),segments=True))
     assert gathered['valid'].sum()==2
     np.testing.assert_array_equal(gathered['curve_ids'][:2],[0,0])
+
+
+@pytest.mark.parametrize('connectivity,dims,structure', [(4,2,1),(8,2,2),(6,3,1),(18,3,2),(26,3,3)])
+def test_label_components_match_scipy(backend, connectivity, dims, structure):
+    ndi = pytest.importorskip('scipy.ndimage')
+    rng = np.random.default_rng(connectivity)
+    for trial in range(6):
+        shape = tuple(int(n) for n in rng.integers(1, 70 if dims == 3 else 400, dims))
+        mask = rng.random(shape) < (.05, .3, .5, .7)[trial % 4]
+        if trial == 5:
+            mask = ndi.binary_dilation(rng.random(shape) < .02, iterations=2)
+        expected, count = ndi.label(mask, structure=ndi.generate_binary_structure(dims, structure))
+        for threads in ((1, 5, 0) if backend == 'cpu' else (0,)):
+            labels, n = label_components(cuda.asarray(mask) if backend == 'cuda' else mask, connectivity=connectivity, threads=threads)
+            assert n == count and host(labels).dtype == np.int32
+            np.testing.assert_array_equal(host(labels), expected)
+    with pytest.raises(ValueError, match='connectivity'):
+        label_components(np.zeros((3,) * dims, bool), connectivity=26 if dims == 2 else 8)
+
+
+def test_pool_release_threshold():
+    if not cuda.is_available():
+        pytest.skip('CUDA build/device required')
+    previous = cuda.pool_release_threshold()
+    try:
+        cuda.set_pool_release_threshold(0); assert cuda.pool_release_threshold() == 0
+        cuda.set_pool_release_threshold(1 << 30); assert cuda.pool_release_threshold() == 1 << 30
+    finally:
+        cuda.set_pool_release_threshold(previous)

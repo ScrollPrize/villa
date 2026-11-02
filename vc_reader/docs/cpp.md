@@ -238,22 +238,24 @@ vcr::thinning::skeleton(mask.data(), output.data(), rows, cols, 1,
 vcr::thinning::Scratch scratch;
 vcr::thinning::Traces paths;
 vcr::thinning::trace(mask.data(), rows, cols, output.data(), &paths, scratch);
-std::vector<std::uint32_t> labels(rows * cols);
-vcr::components::label(mask.data(), labels.data(), {rows, cols}, true);
+std::vector<std::int32_t> labels(rows * cols);
+const std::size_t shape[]{rows, cols};
+std::size_t count = vcr::components::label(mask.data(), shape, 8, labels.data());
 ```
 
 `trace` accepts a padded input row stride and a `Backend::Cuda` option.
-`cuda::traceDevice`, `cuda::skeletonDevice`, `components::cuda::labelDevice`, and
+`cuda::traceDevice`, `cuda::skeletonDevice`, `components::cuda::label`, and
 `distance::cuda::manhattanDevice` accept device pointers and complete on the
 calling thread's vc_reader stream. Host entry points include transfers. Skeleton
 calls accept a count of independent YX slices; components and distances take a
 2D/3D shape. Dimensions and pointer contracts are documented in the headers.
 CUDA trace grids require at most `UINT32_MAX` pixels (half that when returning
-polylines); connected components require at most `UINT32_MAX` voxels. All buffers
+polylines). Component labels are int32, numbered 1..count as `scipy.ndimage.label`
+numbers them; CUDA labelling requires at most `INT32_MAX` voxels. All buffers
 must fit memory. CUDA tracing uses several image-sized work arrays and up to
 256 MiB of path proposals, plus final path storage when requested.
 
-`transforms::ConnectedComponents` produces uint32 label fields;
+`transforms::ConnectedComponents` produces int32 label fields (`connectivity`, 0 for full);
 `transforms::RidgeTrace` produces uint8 visit-index fields. `MedialSurface.method`
 selects the shared skeleton algorithm. These transforms accept explicit `on`
 fields or default to label targets and keep intermediate CUDA arrays resident.

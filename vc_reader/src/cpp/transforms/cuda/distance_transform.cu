@@ -4,10 +4,11 @@ namespace vcr::transforms::cuda {
 namespace {
 using namespace distance_detail;
 using filter_detail::separable_cuda;
-template<class S> __device__ void edt_features(KernelIndex vcr_launch, const S* labels, double* f, std::size_t n, double threshold, bool inside, int* any) {
+template<class S> __device__ void edt_features(KernelIndex vcr_launch, const S* labels, double* f, std::size_t n, double threshold, bool inside, int* any, long long* index) {
     EACH_INDEX(n) {
         const bool feature = (double(labels[i]) > threshold) != inside;
         f[i] = feature ? 0. : 1e300;
+        if (index) index[i] = (long long)i;
         if (feature) *any = 1;
     }
 }
@@ -15,12 +16,14 @@ struct edt_features_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { edt_features(index,args...); }
 };
 // One thread per line along `axis`; lines start where that coordinate is zero.
-__device__ void edt_lines(KernelIndex vcr_launch, double* f, Layout g, int axis, int* v, double* z, double* scratch, std::size_t lines) {
+__device__ void edt_lines(KernelIndex vcr_launch, double* f, Layout g, int axis, int* v, double* z, double* scratch, std::size_t lines,
+                          long long* index, long long* index_scratch) {
     const std::size_t n = g.shape[axis], stride = g.stride[axis];
     EACH_INDEX(lines) {
         // Enumerate line starts: all indices with coord(axis) == 0.
         const std::size_t outer = i/stride, inner = i%stride, start = outer*stride*n + inner;
-        envelope(f+start,n,stride,v+i*n,z+i*(n+1),scratch+i*n);
+        // Scratch of neighbouring lines is interleaved, so a warp's accesses coalesce.
+        envelope(f+start,n,stride,v+i,z+i,scratch+i,index ? index+start : nullptr,index_scratch ? index_scratch+i : nullptr,lines);
     }
 }
 struct edt_lines_launch {
@@ -36,6 +39,18 @@ __device__ void edt_finish(KernelIndex vcr_launch, const double* inside, const d
 }
 struct edt_finish_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { edt_finish(index,args...); }
+};
+// Nearest feature coordinates, (D, ...) int32, as the CPU path writes them.
+template<class S> __device__ void edt_indices(KernelIndex vcr_launch, const S* labels, double threshold, const long long* inside, const long long* outside,
+                                              std::int32_t* out, std::size_t n, int mode, const int* any, Layout g, bool implicit_background) {
+    EACH_INDEX(n) {
+        const bool from_inside = mode == 1 || (mode == 0 && double(labels[i]) > threshold);
+        const long long j = any[from_inside ? 0 : 1] ? (from_inside ? inside : outside)[i] : (implicit_background ? -1 : (long long)i);
+        for (int a = 0; a < g.dim; ++a) out[a*n+i] = j < 0 ? (a == 0 ? -1 : 0) : std::int32_t(g.coord(std::size_t(j),a));
+    }
+}
+struct edt_indices_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { edt_indices(index,args...); }
 };
 template<class T> __device__ void normalize_normals(KernelIndex vcr_launch, T* const* gradient, T* out, std::size_t n, int d, int c0, int c1, int c2) {
     const int order[3] = {c0,c1,c2};
@@ -59,14 +74,18 @@ void apply_cuda(const DistanceTransform& t, Sample& s, const Parameters&, Sessio
         Buffer<double> inside(n), outside(n); Buffer<int> any(2); check(memset_async(any.ptr,0,2*sizeof(int),vcr::device::stream()));
         const std::size_t lines = n/std::min_element(grid.shape.begin(),grid.shape.end())[0];
         Buffer<int> v(lines*extent); Buffer<double> z(lines*(extent+1)), scratch(lines*extent);
+        const bool indices = !t.indices.empty();
+        Buffer<long long> inside_index(indices ? n : 0), outside_index(indices ? n : 0), index_scratch(indices ? lines*extent : 0);
         for (int pass = 0; pass < 2; ++pass) {
             const bool in = pass == 0; auto& field = in ? inside : outside;
             if (in && t.mode == DistanceMode::Outside) continue;
             if (!in && t.mode == DistanceMode::Inside) continue;
-            a.typed([&](auto labels) { launch(blocks(n),256,0,vcr::device::stream(), edt_features_launch{}, labels.ptr+t.channel*n,field.ptr,n,t.threshold,in,any.ptr+(in ? 0 : 1)); });
+            long long* index = indices ? (in ? inside_index : outside_index).ptr : nullptr;
+            a.typed([&](auto labels) { launch(blocks(n),256,0,vcr::device::stream(), edt_features_launch{}, labels.ptr+t.channel*n,field.ptr,n,t.threshold,in,any.ptr+(in ? 0 : 1),index); });
             for (int axis_ = 0; axis_ < d; ++axis_) {
                 const std::size_t count = n/grid.shape[axis_];
-                launch(blocks(count),256,0,vcr::device::stream(), edt_lines_launch{}, field.ptr,g,axis_,v.ptr,z.ptr,scratch.ptr,count);
+                launch(blocks(count),256,0,vcr::device::stream(), edt_lines_launch{}, field.ptr,g,axis_,v.ptr,z.ptr,scratch.ptr,count,
+                       index,indices ? index_scratch.ptr : nullptr);
             }
             check(cudaGetLastError());
         }
@@ -93,6 +112,18 @@ void apply_cuda(const DistanceTransform& t, Sample& s, const Parameters&, Sessio
             check(cudaGetLastError());
             outputs.emplace_back(name+t.normals,Field{metadata(vshape,4),derived(Role::NormalField,t.components),name});
             session.arrays.emplace(name+t.normals,std::move(normals));
+        }
+        if (indices) {
+            Shape ishape{std::size_t(d)}; ishape.insert(ishape.end(),grid.shape.begin(),grid.shape.end());
+            DeviceArray nearest(ishape,'i',4);
+            a.typed([&](auto labels) {
+                launch(blocks(n),256,0,vcr::device::stream(), edt_indices_launch{}, labels.ptr+t.channel*n,t.threshold,inside_index.ptr,outside_index.ptr,
+                       nearest.view<std::int32_t>().ptr,n,int(t.mode),any.ptr,g,t.implicit_background);
+            });
+            check(cudaGetLastError());
+            Array meta = metadata(ishape,4); meta.kind = 'i';
+            outputs.emplace_back(name+t.indices,Field{std::move(meta),derived(Role::Label),name});
+            session.arrays.emplace(name+t.indices,std::move(nearest));
         }
         outputs.emplace_back(name+t.suffix,Field{metadata(shape,4),derived(Role::Scalar),name});
         session.arrays.emplace(name+t.suffix,std::move(result));

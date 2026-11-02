@@ -1,6 +1,5 @@
 #include <vc_reader/thinning.hpp>
 #include <vc_reader/distance_transform.hpp>
-#include <vc_reader/components.hpp>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/vector.h>
@@ -82,21 +81,6 @@ NB_MODULE(_thinning,m) {
         }
         return nb::make_tuple(image,result);
     },"input"_a.noconvert(),"backend"_a="cpu","min_length"_a=0.,"return_traces"_a=false,"workspace"_a=nb::none());
-    m.def("connected_components",[](HostInput input,const std::string& execution,bool full) {
-        const auto b=backend(execution);auto dims=arrayShape(input);
-        auto values=std::make_unique<std::vector<std::uint32_t>>(input.size());
-        { nb::gil_scoped_release release;
-          if(b==Backend::Cpu) vcr::components::label(input.data(),values->data(),dims,full);
-          else {
-#ifdef VC_READER_CUDA
-              vcr::components::cuda::label(input.data(),values->data(),dims,full);
-#else
-              throw std::runtime_error("CUDA support is not built");
-#endif
-          }
-        }
-        return array(std::move(values),dims);
-    },"input"_a.noconvert(),"backend"_a="cpu","full_connectivity"_a=true);
     m.def("trace_ridges_into",[](Input input,Output output) {
         if(input.ndim()!=2 || output.ndim()!=2 || input.shape(0)!=output.shape(0) || input.shape(1)!=output.shape(1))
             throw nb::value_error("expected matching 2D arrays");

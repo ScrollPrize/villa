@@ -325,7 +325,7 @@ class CudaLoader:
 def _resident_forward(values, points, order, boundary, fill):
     from . import _reader, cuda
     out = values.new_empty((values.shape[0], values.shape[1], points.shape[1]))
-    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._dlpack_stream()) if x.is_cuda else x.detach().numpy()
     _reader._sample_dense(view(values), view(points), view(out), order, boundary, fill)
     return out
 
@@ -334,7 +334,7 @@ def _resident_backward(values, points, cotangent, need_values, need_points, orde
     from . import _reader, cuda
     vg = torch.empty_like(values) if need_values else values.new_empty(0)
     pg = torch.empty_like(points) if need_points else points.new_empty(0)
-    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._dlpack_stream()) if x.is_cuda else x.detach().numpy()
     _reader._sample_dense_backward(view(values), view(points), view(cotangent.contiguous()), view(vg), view(pg), order, boundary, fill)
     return vg, pg
 
@@ -397,7 +397,7 @@ def _surface_derivatives_impl(xyz, valid):
     if xyz.device.type == "mps":
         return surface_derivatives(xyz.cpu(), valid.cpu()).to(xyz.device)
     out = xyz.new_empty((xyz.shape[0], 3, *xyz.shape[1:]))
-    view = lambda x: cuda._StreamInput(x.detach(), _reader._get_stream() or 1) if x.is_cuda else x.detach().numpy()
+    view = lambda x: cuda._StreamInput(x.detach(), _reader._dlpack_stream()) if x.is_cuda else x.detach().numpy()
     _reader._prepare_surfaces(view(xyz), view(valid), view(out))
     return out
 
@@ -422,7 +422,7 @@ def surface_points(xyz, valid, rc, *, derivatives=None, border=False):
 
 def _surface_points_impl(xyz, valid, rc, derivatives, border):
     from . import _reader, cuda
-    view = lambda x: cuda._StreamInput(x, _reader._get_stream() or 1) if x.is_cuda else x.numpy()
+    view = lambda x: cuda._StreamInput(x, _reader._dlpack_stream()) if x.is_cuda else x.numpy()
     device = xyz.device
     shape = (*rc.shape[:-1], 3)
     p, row, col = (xyz.new_empty(shape) for _ in range(3))
