@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Mapping
 
 import numpy as np
@@ -8,25 +7,6 @@ import vc_reader.transforms as A
 
 from vesuvius.neural_tracing.datasets.common import create_band_mask
 from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direction_tensor
-
-
-def _torch_to_cupy(tensor: torch.Tensor):
-    import cupy as cp
-
-    return cp.from_dlpack(torch.utils.dlpack.to_dlpack(tensor.contiguous()))
-
-
-def _cupy_to_torch(array):
-    return torch.utils.dlpack.from_dlpack(array)
-
-
-def _cupy_device(tensor: torch.Tensor):
-    import cupy as cp
-
-    device_index = tensor.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return cp.cuda.Device(int(device_index))
 
 
 _SURFACE_EDT = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
@@ -38,7 +18,7 @@ def _surface_edt(
     return_distances: bool,
     return_indices: bool,
 ):
-    """Exact EDT to the voxels of a 3D CUDA mask (vc_reader), as CuPy arrays.
+    """Exact EDT to the voxels of a 3D CUDA mask (vc_reader), as tensors on its device.
 
     Distances are float32; indices are the (3, D, H, W) int32 nearest surface
     voxel, ties resolved as scipy.ndimage.distance_transform_edt resolves them.
@@ -51,61 +31,42 @@ def _surface_edt(
     out = _SURFACE_EDT({"mask": surface_bool[None].to(torch.uint8)})
     results = []
     if return_distances:
-        results.append(_torch_to_cupy(out["mask_sdt"][0]))
+        results.append(out["mask_sdt"][0])
     if return_indices:
-        results.append(_torch_to_cupy(out["mask_nearest"]))
+        results.append(out["mask_nearest"])
     return results[0] if len(results) == 1 else tuple(results)
 
 
-def _distance_transform_distances_cupy(surface_mask: torch.Tensor):
-    import cupy as cp
-
+def _distance_transform_distances(surface_mask: torch.Tensor):
     surface_bool = (surface_mask > 0.5).contiguous()
     if surface_bool.ndim != 3:
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
     if not bool(surface_bool.any().item()):
         return None
-    with _cupy_device(surface_bool):
-        distances_cp = _surface_edt(surface_bool, return_distances=True, return_indices=False)
-        return cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
+    return _surface_edt(surface_bool, return_distances=True, return_indices=False)
 
 
-def _dilate_binary_mask_cupy(surface_mask: torch.Tensor, radius_voxels: float):
+def _dilate_binary_mask(surface_mask: torch.Tensor, radius_voxels: float):
     radius = float(radius_voxels)
     surface_bool = (surface_mask > 0.5).contiguous()
     if radius <= 0.0 or not bool(surface_bool.any().item()):
         return surface_bool
-    with _cupy_device(surface_bool):
-        distances_cp = _surface_edt(surface_bool, return_distances=True, return_indices=False)
-        import cupy as cp
-
-        return _cupy_to_torch(cp.ascontiguousarray(distances_cp <= radius)).to(dtype=torch.bool)
+    return _surface_edt(surface_bool, return_distances=True, return_indices=False) <= radius
 
 
-def _dense_displacement_from_mask_cupy(surface_mask: torch.Tensor):
-    import cupy as cp
+def _voxel_coordinates(shape, device):
+    """(3, D, H, W) float32 z, y and x coordinates."""
+    return torch.stack(torch.meshgrid(*(torch.arange(n, device=device, dtype=torch.float32) for n in shape), indexing="ij"))
 
+
+def _dense_displacement_from_mask(surface_mask: torch.Tensor):
     surface_bool = (surface_mask > 0.5).contiguous()
     if surface_bool.ndim != 3:
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
     if not bool(surface_bool.any().item()):
         return None, None
-
-    with _cupy_device(surface_bool):
-        distances_cp, nearest_idx_cp = _surface_edt(
-            surface_bool,
-            return_distances=True,
-            return_indices=True,
-        )
-        if isinstance(nearest_idx_cp, (tuple, list)):
-            nearest_idx_cp = cp.stack(nearest_idx_cp, axis=0)
-        distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
-        disp_cp = cp.ascontiguousarray(nearest_idx_cp.astype(cp.float32, copy=False))
-        d, h, w = surface_bool.shape
-        disp_cp[0] -= cp.arange(d, dtype=cp.float32)[:, None, None]
-        disp_cp[1] -= cp.arange(h, dtype=cp.float32)[None, :, None]
-        disp_cp[2] -= cp.arange(w, dtype=cp.float32)[None, None, :]
-        return _cupy_to_torch(disp_cp), _cupy_to_torch(distances_cp)
+    distances, nearest = _surface_edt(surface_bool, return_distances=True, return_indices=True)
+    return nearest.float() - _voxel_coordinates(surface_bool.shape, surface_bool.device), distances
 
 
 def _swap_triplet_torch(dense_gt: torch.Tensor, dir_priors: torch.Tensor | None):
@@ -208,140 +169,50 @@ def _copy_neighbor_dense_weight(
     return dense_band_t
 
 
-@lru_cache(maxsize=None)
-def _trace_validity_from_edt_kernel():
-    import cupy as cp
-
-    return cp.ElementwiseKernel(
-        (
-            "float32 d_target, float32 d_neighbor, float32 positive_radius, "
-            "float32 negative_radius, float32 margin_threshold, float32 background_weight"
-        ),
-        "float32 label, float32 weight",
-        """
-        const float margin = d_neighbor - d_target;
-        const bool pos = (d_target <= positive_radius) && (margin >= margin_threshold);
-        const bool neg = (d_neighbor <= negative_radius) && (margin < margin_threshold);
-        const bool far_neg = d_target >= negative_radius;
-        const bool hard_neg = neg && !pos;
-        const bool background_neg = far_neg && !pos && !hard_neg;
-        label = pos ? 1.0f : 0.0f;
-        if (pos || hard_neg) {
-            weight = 1.0f;
-        } else if (background_weight > 0.0f && background_neg) {
-            weight = background_weight;
-        } else {
-            weight = 0.0f;
-        }
-        """,
-        "trace_validity_from_edt",
-    )
-
-
 def _trace_validity_from_edt(
-    d_target_cp,
-    d_neighbor_cp,
+    d_target: torch.Tensor,
+    d_neighbor: torch.Tensor,
     *,
     positive_radius: float,
     negative_radius: float,
     margin_threshold: float,
     background_weight: float,
 ):
-    import cupy as cp
-
-    label_cp = cp.empty_like(d_target_cp, dtype=cp.float32)
-    weight_cp = cp.empty_like(d_target_cp, dtype=cp.float32)
-    _trace_validity_from_edt_kernel()(
-        d_target_cp,
-        d_neighbor_cp,
-        float(positive_radius),
-        float(negative_radius),
-        float(margin_threshold),
-        float(background_weight),
-        label_cp,
-        weight_cp,
-    )
-    return label_cp, weight_cp
-
-
-@lru_cache(maxsize=None)
-def _dilate_and_attract_from_edt_kernel():
-    import cupy as cp
-
-    return cp.ElementwiseKernel(
-        (
-            "raw float32 vel_z, raw float32 vel_y, raw float32 vel_x, "
-            "float32 dist, I nearest_z, I nearest_y, I nearest_x, "
-            "int64 h, int64 w, float32 dilation_radius, float32 attract_radius"
-        ),
-        (
-            "float32 out_vel_z, float32 out_vel_y, float32 out_vel_x, float32 dilated_weight, "
-            "float32 attract_z, float32 attract_y, float32 attract_x, float32 attract_weight"
-        ),
-        """
-        const long long linear = i;
-        const long long x = linear % w;
-        const long long y = (linear / w) % h;
-        const long long z = linear / (w * h);
-        const long long src_linear =
-            static_cast<long long>(nearest_z) * h * w +
-            static_cast<long long>(nearest_y) * w +
-            static_cast<long long>(nearest_x);
-        const bool finite = isfinite(dist);
-        const bool in_dilation_band = finite && dist <= dilation_radius;
-        const bool in_attract_band = finite && dist <= attract_radius;
-
-        dilated_weight = in_dilation_band ? 1.0f : 0.0f;
-        out_vel_z = in_dilation_band ? vel_z[src_linear] : vel_z[linear];
-        out_vel_y = in_dilation_band ? vel_y[src_linear] : vel_y[linear];
-        out_vel_x = in_dilation_band ? vel_x[src_linear] : vel_x[linear];
-
-        attract_weight = in_attract_band ? 1.0f : 0.0f;
-        attract_z = in_attract_band ? static_cast<float>(nearest_z) - static_cast<float>(z) : 0.0f;
-        attract_y = in_attract_band ? static_cast<float>(nearest_y) - static_cast<float>(y) : 0.0f;
-        attract_x = in_attract_band ? static_cast<float>(nearest_x) - static_cast<float>(x) : 0.0f;
-        """,
-        "dilate_and_attract_from_edt",
-    )
+    """float32 label and weight: positives near the target and clearly nearer it
+    than the neighbour; hard negatives near the neighbour; far background at
+    background_weight."""
+    margin = d_neighbor - d_target
+    pos = (d_target <= positive_radius) & (margin >= margin_threshold)
+    neg = (d_neighbor <= negative_radius) & (margin < margin_threshold)
+    hard_neg = neg & ~pos
+    background_neg = (d_target >= negative_radius) & ~pos & ~hard_neg
+    label = pos.to(torch.float32)
+    weight = (pos | hard_neg).to(torch.float32)
+    if background_weight > 0.0:
+        weight = torch.where(background_neg, torch.tensor(background_weight, dtype=torch.float32, device=weight.device), weight)
+    return label, weight
 
 
 def _dilate_and_attract_from_edt(
-    velocity_cp,
-    nearest_dist_cp,
-    nearest_idx_cp,
+    velocity: torch.Tensor,
+    nearest_dist: torch.Tensor,
+    nearest_idx: torch.Tensor,
     shape,
     dilation_radius: float,
     attract_radius: float,
 ):
-    import cupy as cp
-
+    """Within dilation_radius of the source, velocity copied from the nearest source
+    voxel; within attract_radius, the offset to it. Weights mark both bands."""
+    finite = torch.isfinite(nearest_dist)
+    in_dilation = finite & (nearest_dist <= dilation_radius)
+    in_attract = finite & (nearest_dist <= attract_radius)
     _, h, w = shape
-    dilated_velocity_cp = cp.empty_like(velocity_cp, dtype=cp.float32)
-    dilated_weight_cp = cp.empty((1, *shape), dtype=cp.float32)
-    attract_cp = cp.empty((3, *shape), dtype=cp.float32)
-    attract_weight_cp = cp.empty((1, *shape), dtype=cp.float32)
-    _dilate_and_attract_from_edt_kernel()(
-        velocity_cp[0],
-        velocity_cp[1],
-        velocity_cp[2],
-        nearest_dist_cp,
-        nearest_idx_cp[0],
-        nearest_idx_cp[1],
-        nearest_idx_cp[2],
-        int(h),
-        int(w),
-        float(dilation_radius),
-        float(attract_radius),
-        dilated_velocity_cp[0],
-        dilated_velocity_cp[1],
-        dilated_velocity_cp[2],
-        dilated_weight_cp[0],
-        attract_cp[0],
-        attract_cp[1],
-        attract_cp[2],
-        attract_weight_cp[0],
-    )
-    return dilated_velocity_cp, dilated_weight_cp, attract_cp, attract_weight_cp
+    source = (nearest_idx[0].long() * h + nearest_idx[1].long()) * w + nearest_idx[2].long()
+    gathered = velocity.reshape(3, -1)[:, source.reshape(-1)].reshape(velocity.shape)
+    dilated_velocity = torch.where(in_dilation, gathered, velocity).to(torch.float32)
+    offset = nearest_idx.float() - _voxel_coordinates(shape, velocity.device)
+    attract = torch.where(in_attract, offset, torch.zeros_like(offset))
+    return dilated_velocity, in_dilation[None].to(torch.float32), attract, in_attract[None].to(torch.float32)
 
 
 def _dilate_trace_targets_torch(
@@ -376,48 +247,32 @@ def _dilate_trace_targets_torch(
                 surface_attract_weights.append(torch.zeros_like(velocity_weight[b]))
             continue
 
-        with _cupy_device(velocity_dir):
-            velocity_b = velocity_dir[b].contiguous()
-            velocity_cp = _torch_to_cupy(velocity_b)
-            nearest_dist_cp, nearest_idx_cp = _surface_edt(
-                (source_weight[b, 0] > 0.5).contiguous(),
-                return_distances=True,
-                return_indices=True,
+        velocity_b = velocity_dir[b].contiguous()
+        nearest_dist, nearest_idx = _surface_edt(
+            (source_weight[b, 0] > 0.5).contiguous(),
+            return_distances=True,
+            return_indices=True,
+        )
+
+        attract_b = None
+        attract_weight_b = None
+        attract_radius = float(surface_attract_radius)
+        if attract_radius > 0.0:
+            dilated_dir, dilated_weight, attract_b, attract_weight_b = _dilate_and_attract_from_edt(
+                velocity_b,
+                nearest_dist,
+                nearest_idx,
+                source_weight.shape[2:],
+                float(radius_voxels),
+                attract_radius,
             )
-
-            attract_b = None
-            attract_weight_b = None
-            attract_radius = float(surface_attract_radius)
-            if attract_radius > 0.0:
-                (
-                    dilated_velocity_cp,
-                    dilated_weight_cp,
-                    attract_cp,
-                    attract_weight_cp,
-                ) = _dilate_and_attract_from_edt(
-                    velocity_cp,
-                    nearest_dist_cp,
-                    nearest_idx_cp,
-                    source_weight.shape[2:],
-                    float(radius_voxels),
-                    attract_radius,
-                )
-                dilated_dir = _cupy_to_torch(dilated_velocity_cp)
-                dilated_weight = _cupy_to_torch(dilated_weight_cp)
-                attract_b = _cupy_to_torch(attract_cp)
-                attract_weight_b = _cupy_to_torch(attract_weight_cp)
-            else:
-                import cupy as cp
-
-                band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= float(radius_voxels))
-                src_z = nearest_idx_cp[0][band_cp]
-                src_y = nearest_idx_cp[1][band_cp]
-                src_x = nearest_idx_cp[2][band_cp]
-                velocity_cp[:, band_cp] = velocity_cp[:, src_z, src_y, src_x]
-                dilated_dir = velocity_b
-                dilated_weight = _cupy_to_torch(
-                    cp.ascontiguousarray(band_cp[None].astype(cp.float32, copy=False))
-                )
+        else:
+            # In place, as before: velocity_b shares velocity_dir's storage when contiguous.
+            band = torch.isfinite(nearest_dist) & (nearest_dist <= float(radius_voxels))
+            source = nearest_idx[:, band].long()
+            velocity_b[:, band] = velocity_b[:, source[0], source[1], source[2]]
+            dilated_dir = velocity_b
+            dilated_weight = band[None].to(torch.float32)
         dilated_dirs.append(dilated_dir)
         dilated_weights.append(dilated_weight)
         if surface_attracts is not None:
@@ -518,23 +373,23 @@ class RowColTargets:
         background_weight = float(config.get("trace_validity_background_weight", 0.25))
 
         for b in range(target_mask.shape[0]):
-            d_target_cp = _distance_transform_distances_cupy(target_mask[b])
-            d_neighbor_cp = _distance_transform_distances_cupy(batch["neighbor_seg"][b])
-            if d_target_cp is None or d_neighbor_cp is None:
+            d_target = _distance_transform_distances(target_mask[b])
+            d_neighbor = _distance_transform_distances(batch["neighbor_seg"][b])
+            if d_target is None or d_neighbor is None:
                 labels.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
                 weights.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
                 continue
 
-            label_cp, weight_cp = _trace_validity_from_edt(
-                d_target_cp,
-                d_neighbor_cp,
+            label, weight = _trace_validity_from_edt(
+                d_target,
+                d_neighbor,
                 positive_radius=positive_radius,
                 negative_radius=negative_radius,
                 margin_threshold=margin_threshold,
                 background_weight=background_weight,
             )
-            labels.append(_cupy_to_torch(label_cp))
-            weights.append(_cupy_to_torch(weight_cp))
+            labels.append(label)
+            weights.append(weight)
 
         return torch.stack(labels, dim=0).unsqueeze(1), torch.stack(weights, dim=0).unsqueeze(1)
 
@@ -647,10 +502,10 @@ class CopyNeighborTargets:
         swap_enabled = batch.get("triplet_swap_enabled", None)
 
         for b in range(batch["behind_seg"].shape[0]):
-            behind_mask = _dilate_binary_mask_cupy(batch["behind_seg"][b], dilation_radius)
-            front_mask = _dilate_binary_mask_cupy(batch["front_seg"][b], dilation_radius)
-            behind_disp, behind_dist = _dense_displacement_from_mask_cupy(behind_mask)
-            front_disp, front_dist = _dense_displacement_from_mask_cupy(front_mask)
+            behind_mask = _dilate_binary_mask(batch["behind_seg"][b], dilation_radius)
+            front_mask = _dilate_binary_mask(batch["front_seg"][b], dilation_radius)
+            behind_disp, behind_dist = _dense_displacement_from_mask(behind_mask)
+            front_disp, front_dist = _dense_displacement_from_mask(front_mask)
             if behind_disp is None or front_disp is None:
                 shape = tuple(int(v) for v in batch["behind_seg"].shape[1:])
                 dense_gt = torch.zeros((6, *shape), device=batch["behind_seg"].device, dtype=torch.float32)

@@ -556,24 +556,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cucim-cu13"
-version = "26.6.0"
-source = { registry = "https://pypi.nvidia.com/" }
-dependencies = [
-    { name = "click", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "cupy-cuda13x", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "lazy-loader", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "nvidia-nvimgcodec-cu13", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "scikit-image", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "scipy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-]
-wheels = [
-    { url = "https://pypi.nvidia.com/cucim-cu13/cucim_cu13-26.6.0-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cb8735e01814abb8c9f8b56195f656599341e8e354577f4e5a55aaffd2b03d5f" },
-    { url = "https://pypi.nvidia.com/cucim-cu13/cucim_cu13-26.6.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7faacf9d783c6a656045a8ccf29c028ea9abbee2d47530357a9315622109aad1" },
-]
-
-[[package]]
 name = "cuda-bindings"
 version = "13.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -633,21 +615,6 @@ nvrtc = [
 ]
 nvtx = [
     { name = "nvidia-nvtx", marker = "sys_platform == 'linux'" },
-]
-
-[[package]]
-name = "cupy-cuda13x"
-version = "14.1.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cuda-pathfinder", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/ca/9bc8d6d40003640653161e2dba78740f2055df8bb48e216eed5584cecc3c/cupy_cuda13x-14.1.1-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:8b068f6958811bc50d81bd0a83267ec4cffc3d7e842120b9646ec547f5a69298", size = 72680680, upload-time = "2026-06-01T04:54:35.077Z" },
-    { url = "https://files.pythonhosted.org/packages/e8/2d/8c79c577e9b35c60e5600217d1a849ab76c18a289f99a4145aa85388a531/cupy_cuda13x-14.1.1-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:39f8aeeb5bad16603956f8ec00094e058a9dd5db92ab514975686750363c3692", size = 68432306, upload-time = "2026-06-01T04:54:38.882Z" },
-    { url = "https://files.pythonhosted.org/packages/c4/c4/eb46fec30fffd7a57a80cc7f027e50a1d530b332e81362a8b874905da2d1/cupy_cuda13x-14.1.1-cp314-cp314t-manylinux2014_aarch64.whl", hash = "sha256:509f378c865c0b6bc9ed1dfe9e94b08b4511e9865363fdac55f9d66fe341e91d", size = 72984246, upload-time = "2026-06-01T04:54:46.464Z" },
-    { url = "https://files.pythonhosted.org/packages/24/59/e0098ca2e1ba99a0086ad4b515b2d7dbb8ae0f13b9721c02eed0db4adec5/cupy_cuda13x-14.1.1-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:6c0d19789e9f9515988d51dffaff70af8b3dcdddcdf2fbafa9eff08df7be0a51", size = 68662887, upload-time = "2026-06-01T04:54:50.932Z" },
 ]
 
 [[package]]
@@ -2221,15 +2188,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nvidia-nvimgcodec-cu13"
-version = "0.8.0.22"
-source = { registry = "https://pypi.nvidia.com/" }
-wheels = [
-    { url = "https://pypi.nvidia.com/nvidia-nvimgcodec-cu13/nvidia_nvimgcodec_cu13-0.8.0.22-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:3b525a78bdfb4d9baa0cb9798883f36efca524807b37453c43a95f2d9e3476bb" },
-    { url = "https://pypi.nvidia.com/nvidia-nvimgcodec-cu13/nvidia_nvimgcodec_cu13-0.8.0.22-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:0efee8404d36a857e9d713635f8076b4e50c5b5446c526e569dd6ba5e6455b4a" },
-]
-
-[[package]]
 name = "nvidia-nvjitlink"
 version = "13.0.88"
 source = { registry = "https://pypi.nvidia.com/" }
@@ -3793,8 +3751,6 @@ all = [
     { name = "alphashape" },
     { name = "build" },
     { name = "click" },
-    { name = "connected-components-3d" },
-    { name = "cucim-cu13", marker = "sys_platform == 'linux'" },
     { name = "diffusers" },
     { name = "einops" },
     { name = "fastremap" },
@@ -3847,8 +3803,6 @@ label-transfer = [
 models = [
     { name = "accelerate" },
     { name = "click" },
-    { name = "connected-components-3d" },
-    { name = "cucim-cu13", marker = "sys_platform == 'linux'" },
     { name = "diffusers" },
     { name = "einops" },
     { name = "fastremap" },
@@ -3881,7 +3835,6 @@ notebooks = [
 ]
 render = [
     { name = "alphashape" },
-    { name = "connected-components-3d" },
     { name = "opencv-contrib-python" },
     { name = "opencv-python-headless" },
     { name = "shapely" },
@@ -3908,11 +3861,6 @@ requires-dist = [
     { name = "cachetools", specifier = ">=6.2.4" },
     { name = "click", marker = "extra == 'all'", specifier = ">=8.1" },
     { name = "click", marker = "extra == 'models'", specifier = ">=8.1" },
-    { name = "connected-components-3d", marker = "extra == 'all'", specifier = ">=3.24.0" },
-    { name = "connected-components-3d", marker = "extra == 'models'", specifier = ">=3.24.0" },
-    { name = "connected-components-3d", marker = "extra == 'render'", specifier = ">=3.24.0" },
-    { name = "cucim-cu13", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=26.6", index = "https://pypi.nvidia.com/" },
-    { name = "cucim-cu13", marker = "sys_platform == 'linux' and extra == 'models'", specifier = ">=26.6", index = "https://pypi.nvidia.com/" },
     { name = "diffusers", marker = "extra == 'all'", specifier = ">=0.37.0" },
     { name = "diffusers", marker = "extra == 'models'", specifier = ">=0.37.0" },
     { name = "einops", marker = "extra == 'all'", specifier = ">=0.8.1" },

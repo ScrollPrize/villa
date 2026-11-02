@@ -25,7 +25,7 @@ from magicgui.widgets import Container, PushButton, Label
 
 from vc_reader.geometry import label_components
 
-from detect_holes import compute_component_topology, localize_holes
+from detect_holes import localize_holes
 from fix_holes import _fix_2d_hole_fill, _fix_morph_close, _fix_alpha_wrap
 
 
@@ -250,35 +250,8 @@ def make_detect_holes_widget(viewer: napari.Viewer) -> Container:
         if args.ignore_value is not None:
             mask &= (label_data != args.ignore_value)
 
-        if backend == "betti_matching":
-            b1 = None
-            print(f"[INFO] Localizing holes (backend={backend}) …")
-            hole_mask, coords = localize_holes(
-                mask,
-                dilation_radius=dilation_radius,
-                expected_b1=None,
-                backend=backend,
-            )
-        else:
-            print("[INFO] Computing topology …")
-            b1, _b2, _chi = compute_component_topology(
-                mask,
-                fg_connectivity=args.fg_connectivity,
-                bg_connectivity=args.bg_connectivity,
-                use_cpu=True,
-            )
-            print(f"[INFO] Euler-based b1={b1}")
-            if b1 > 0:
-                print(f"[INFO] Localizing holes (backend={backend}) …")
-                hole_mask, coords = localize_holes(
-                    mask,
-                    dilation_radius=dilation_radius,
-                    expected_b1=b1,
-                    backend=backend,
-                )
-            else:
-                hole_mask = np.zeros(mask.shape, dtype=bool)
-                coords = []
+        print(f"[INFO] Localizing holes (backend={backend}) …")
+        hole_mask, coords = localize_holes(mask, dilation_radius=dilation_radius, backend=backend)
 
         print(f"[INFO] Found {len(coords)} hole location(s)")
 
@@ -557,10 +530,6 @@ def parse_args() -> argparse.Namespace:
                     help="Foreground label value (default: 1).")
     ap.add_argument("--ignore-value", type=int, default=2,
                     help="Ignore label value (default: 2).")
-    ap.add_argument("--fg-connectivity", type=int, default=6, choices=[6, 18, 26],
-                    help="FG connectivity for hole detection (default: 6).")
-    ap.add_argument("--bg-connectivity", type=int, default=6, choices=[6, 18, 26],
-                    help="BG connectivity for hole detection (default: 6).")
     return ap.parse_args()
 
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Compute holes (Betti-1) and cavities (Betti-2) per connected component
-for foreground voxels with a given value (default == 1).
+for foreground voxels with a given value (default == 1). Holes are the H1
+persistence features the --backend finds, each with a location; cavities are
+background components the component encloses.
 
 Example:
   python component_topology.py \
@@ -18,21 +20,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import importlib.util
-try:
-    import cupy as cp
-    from cucim.skimage.measure import euler_number as cucim_euler_number
-    _HAS_CUPY = True
-except Exception:
-    cp = None
-    cucim_euler_number = None
-    _HAS_CUPY = False
-
-try:
-    from skimage.measure import euler_number as sk_euler_number
-    _HAS_SKIMAGE = True
-except Exception:
-    sk_euler_number = None
-    _HAS_SKIMAGE = False
 import numpy as np
 from vc_reader import images
 import vc_reader.transforms as A
@@ -126,18 +113,6 @@ def load_tif_3d(path: Path, allow_2d: bool = False) -> np.ndarray:
     return arr
 
 
-def _conn_to_skimage(conn: int, ndim: int) -> int:
-    if ndim == 3:
-        mapping = {6: 1, 18: 2, 26: 3}
-    elif ndim == 2:
-        mapping = {4: 1, 8: 2}
-    else:
-        raise ValueError(f"Unsupported ndim={ndim}")
-    if conn not in mapping:
-        raise ValueError(f"Invalid connectivity {conn} for ndim={ndim}")
-    return mapping[conn]
-
-
 def _border_mask(shape: Tuple[int, ...]) -> np.ndarray:
     mask = np.zeros(shape, dtype=bool)
     if len(shape) == 3:
@@ -172,55 +147,17 @@ def _bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[slice, ...]]:
     return tuple(slices)
 
 
-def compute_component_topology(
-    comp: np.ndarray,
-    *,
-    fg_connectivity: int,
-    bg_connectivity: int,
-    use_cpu: bool,
-) -> Tuple[int, int, int]:
-    """
-    Returns (holes_b1, cavities_b2, euler_characteristic) for a single component mask.
-    For 3D, uses b1 = b0 + b2 - chi, with b0=1.
-    """
-    comp = comp.astype(bool)
-    comp_pad = np.pad(comp, pad_width=1, mode="constant", constant_values=False)
-
-    # Cavities: background components not connected to the padded border
-    bg = ~comp_pad
-    _conn_to_skimage(bg_connectivity, comp_pad.ndim)  # validates the connectivity
-    bg_lab, num_bg = label_components(bg, connectivity=bg_connectivity)
-    border = _border_mask(bg_lab.shape)
-    outside_ids = np.unique(bg_lab[border])
-    outside_ids = outside_ids[outside_ids > 0]
-    cavities = int(num_bg - outside_ids.size)
-
-    # Euler characteristic (digital topology)
-    if use_cpu:
-        if not _HAS_SKIMAGE:
-            raise ImportError("scikit-image is required for --cpu (Euler number).")
-        chi = int(sk_euler_number(comp_pad, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
-    else:
-        if not _HAS_CUPY:
-            raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
-        comp_pad_gpu = cp.asarray(comp_pad)
-        chi = int(cucim_euler_number(comp_pad_gpu, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
-
-    # Betti numbers for a single component (b0 = 1)
-    if comp_pad.ndim == 3:
-        b2 = cavities
-        b1 = int(1 + b2 - chi)
-    else:  # 2D fallback
-        b2 = 0
-        b1 = int(1 - chi)
-
-    return b1, b2, chi
+def count_cavities(comp: np.ndarray, *, bg_connectivity: int) -> int:
+    """Cavities (Betti-2) of a component mask: background components it encloses."""
+    comp_pad = np.pad(np.asarray(comp, dtype=bool), pad_width=1, mode="constant", constant_values=False)
+    bg_lab, num_bg = label_components(~comp_pad, connectivity=bg_connectivity)
+    outside_ids = np.unique(bg_lab[_border_mask(bg_lab.shape)])
+    return int(num_bg - outside_ids[outside_ids > 0].size)
 
 
 def localize_holes(
     component_mask: np.ndarray,
     dilation_radius: int = 3,
-    expected_b1: Optional[int] = None,
     backend: str = "cripser",
 ) -> Tuple[np.ndarray, List[Tuple[int, ...]]]:
     """Localize topological holes via persistent homology.
@@ -236,9 +173,6 @@ def localize_holes(
         Binary mask of a single connected component.
     dilation_radius : int
         Radius for dilating each seed voxel into a localization region.
-    expected_b1 : int or None
-        If provided, warn when the cripser H1 count disagrees with the Euler-
-        based Betti-1 number.
 
     Returns
     -------
@@ -346,12 +280,6 @@ def localize_holes(
         else:
             print("[INFO] betti_matching found 0 H1 features")
 
-    if expected_b1 is not None and len(hole_coords) != expected_b1:
-        import warnings
-        warnings.warn(
-            f"{backend} found {len(hole_coords)} H1 features but Euler-based b1 = {expected_b1}"
-        )
-
     if bbox is not None:
         hole_mask = np.zeros(base_mask.shape, dtype=bool)
         hole_mask[bbox] = work_hole_mask
@@ -370,8 +298,6 @@ def compute_file(
     bg_connectivity: int,
     allow_2d: bool,
     backend: str,
-    use_cpu: bool,
-    skip_euler: bool,
     whole_volume: bool,
 ) -> Tuple[List[Dict[str, int | float | str]], Optional[np.ndarray]]:
     arr = load_tif_3d(path, allow_2d=allow_2d)
@@ -385,28 +311,10 @@ def compute_file(
         rows: List[Dict[str, int | float | str]] = []
         hole_mask = np.zeros(arr.shape, dtype=bool)
 
-        if skip_euler:
-            holes, cavities, chi = 0, 0, 0
-        else:
-            holes, cavities, chi = compute_component_topology(
-                mask,
-                fg_connectivity=fg_connectivity,
-                bg_connectivity=bg_connectivity,
-                use_cpu=use_cpu,
-            )
-
+        cavities = count_cavities(mask, bg_connectivity=bg_connectivity)
         hole_locations: List[str] = []
-        comp_coords: List[Tuple[int, ...]] = []
-        comp_holes: Optional[np.ndarray] = None
-
-        if backend == "betti_matching":
-            comp_holes, comp_coords = localize_holes(mask, expected_b1=holes, backend=backend)
-        else:
-            if holes > 0:
-                comp_holes, comp_coords = localize_holes(mask, expected_b1=holes, backend=backend)
-
-        holes_out = len(comp_coords) if backend == "betti_matching" else holes
-        if comp_holes is not None and comp_holes.any():
+        comp_holes, comp_coords = localize_holes(mask, backend=backend)
+        if comp_holes.any():
             hole_mask |= comp_holes
             for coord in comp_coords:
                 hole_locations.append(":".join(str(int(v)) for v in coord))
@@ -415,9 +323,8 @@ def compute_file(
             "case": path.stem,
             "component_id": 1,
             "voxels": int(mask.sum()),
-            "holes": holes_out,
+            "holes": len(comp_coords),
             "cavities": cavities,
-            "euler": chi,
             "hole_locations": ";".join(hole_locations),
         })
 
@@ -425,7 +332,6 @@ def compute_file(
             hole_mask = None
         return rows, hole_mask
 
-    _conn_to_skimage(fg_connectivity, mask.ndim)  # validates the connectivity
     labels, num_labels = label_components(mask, connectivity=fg_connectivity)
     if num_labels == 0:
         return [], None
@@ -441,28 +347,10 @@ def compute_file(
         voxels = int(comp.sum())
         if voxels == 0:
             continue
-        if skip_euler:
-            holes, cavities, chi = 0, 0, 0
-        else:
-            holes, cavities, chi = compute_component_topology(
-                comp,
-                fg_connectivity=fg_connectivity,
-                bg_connectivity=bg_connectivity,
-                use_cpu=use_cpu,
-            )
+        cavities = count_cavities(comp, bg_connectivity=bg_connectivity)
         hole_locations: List[str] = []
-        comp_coords: List[Tuple[int, ...]] = []
-        comp_holes: Optional[np.ndarray] = None
-
-        if backend == "betti_matching":
-            # Always compute per-component cycles when using betti_matching.
-            comp_holes, comp_coords = localize_holes(comp, expected_b1=holes, backend=backend)
-        else:
-            if holes > 0:
-                comp_holes, comp_coords = localize_holes(comp, expected_b1=holes, backend=backend)
-
-        holes_out = len(comp_coords) if backend == "betti_matching" else holes
-        if comp_holes is not None and comp_holes.any():
+        comp_holes, comp_coords = localize_holes(comp, backend=backend)
+        if comp_holes.any():
             hole_mask[slc] |= comp_holes
             # Convert component-local coords to global volume coords.
             for local_coord in comp_coords:
@@ -472,9 +360,8 @@ def compute_file(
             "case": path.stem,
             "component_id": idx,
             "voxels": voxels,
-            "holes": holes_out,
+            "holes": len(comp_coords),
             "cavities": cavities,
-            "euler": chi,
             "hole_locations": ";".join(hole_locations),
         })
 
@@ -497,8 +384,6 @@ def parse_args() -> argparse.Namespace:
                     help="Connectivity for BG cavities (default: 6)")
     ap.add_argument("--workers", type=int, default=0, help="Number of parallel workers (0=sequential)")
     ap.add_argument("--allow-2d", action="store_true", help="Allow 2D TIFFs; auto-add singleton Z.")
-    ap.add_argument("--cpu", action="store_true",
-                    help="Force CPU-only labeling/Euler (recommended with --workers).")
     ap.add_argument("--backend", type=str, default="cripser",
                     choices=["cripser", "betti_matching"],
                     help="Backend for hole localization (default: cripser).")
@@ -513,8 +398,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--overwrite-hole-mask", action="store_true",
                     help="Overwrite existing hole mask (used with --subfolders).")
     ap.add_argument("--out-csv", type=Path, default=None, help="Output CSV path")
-    ap.add_argument("--skip-euler", action="store_true",
-                    help="Skip Euler/cavity computation (useful with --backend betti_matching).")
     ap.add_argument("--whole-volume", action="store_true",
                     help="Compute holes once on the full label volume (ignoring components).")
     ap.add_argument("--images-dir", type=Path, default=None,
@@ -533,10 +416,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    if args.workers and args.workers > 0 and not args.cpu:
-        print("[WARN] --workers > 0 detected; forcing --cpu to avoid CUDA init errors.")
-        args.cpu = True
 
     rows: List[Dict[str, int | float | str]] = []
 
@@ -607,8 +486,6 @@ def main() -> None:
                         bg_connectivity=int(args.bg_connectivity),
                         allow_2d=bool(args.allow_2d),
                         backend=str(args.backend),
-                        use_cpu=bool(args.cpu),
-                        skip_euler=bool(args.skip_euler),
                         whole_volume=bool(args.whole_volume),
                     )
                     for _, label_path in label_paths
@@ -628,8 +505,6 @@ def main() -> None:
                         bg_connectivity=int(args.bg_connectivity),
                         allow_2d=bool(args.allow_2d),
                         backend=str(args.backend),
-                        use_cpu=bool(args.cpu),
-                        skip_euler=bool(args.skip_euler),
                         whole_volume=bool(args.whole_volume),
                     ),
                 )
@@ -652,8 +527,6 @@ def main() -> None:
                         bg_connectivity=int(args.bg_connectivity),
                         allow_2d=bool(args.allow_2d),
                         backend=str(args.backend),
-                        use_cpu=bool(args.cpu),
-                        skip_euler=bool(args.skip_euler),
                         whole_volume=bool(args.whole_volume),
                     )
                     for p in paths
@@ -672,15 +545,13 @@ def main() -> None:
                         bg_connectivity=int(args.bg_connectivity),
                         allow_2d=bool(args.allow_2d),
                         backend=str(args.backend),
-                        use_cpu=bool(args.cpu),
-                        skip_euler=bool(args.skip_euler),
                         whole_volume=bool(args.whole_volume),
                     ),
                 )
 
     if args.out_csv is not None:
         args.out_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["case", "component_id", "voxels", "holes", "cavities", "euler", "hole_locations"]
+        fields = ["case", "component_id", "voxels", "holes", "cavities", "hole_locations"]
         with args.out_csv.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
