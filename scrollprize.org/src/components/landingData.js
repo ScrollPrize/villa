@@ -635,11 +635,6 @@ export const team = {
   ],
   papyrology: [
     {
-      name: "Federica Nicolardi",
-      title: "Associate Professor, University of Naples Federico II",
-      href: "https://www.docenti.unina.it/federica.nicolardi",
-    },
-    {
       name: "Marzia D'Angelo",
       title:
         "Postdoctoral Fellow, University of Naples Federico II",
