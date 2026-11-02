@@ -115,6 +115,8 @@ OpenedDataset openDataset(const std::string& location, const std::filesystem::pa
     auto manifest = vc::lasagna::LasagnaDataset::openLocation(location, options).manifest();
     // The service identifies a remote dataset by its URL, the location sent.
     if (manifest.manifestIsRemote) return {std::move(manifest), {}};
+    // A local copy of a remote dataset may predate caching its provenance.
+    vc::lasagna::cacheLasagnaProvenance(manifest);
     const auto file = std::filesystem::is_directory(manifest.manifestPath)
         ? manifest.manifestPath / ".zattrs" : manifest.manifestPath;
     auto identity = lasagnaIdentity(fileBytes(file), manifest.manifestPath.filename().string(),

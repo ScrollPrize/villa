@@ -239,6 +239,7 @@ CachedLasagna cacheLasagna(
                 }
                 auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
                 const auto kind = validatePrepared(volume, artifact, dataset);
+                vc::lasagna::cacheLasagnaProvenance(dataset.manifest());
                 return {manifest, std::move(dataset), kind};
             }
         }
@@ -271,6 +272,7 @@ CachedLasagna cacheLasagna(
     try {
         auto dataset = vc::lasagna::LasagnaDataset::open(cached.path);
         const auto kind = validatePrepared(volume, artifact, dataset);
+        vc::lasagna::cacheLasagnaProvenance(dataset.manifest());
         return {cached.path, std::move(dataset), kind};
     } catch (...) {
         std::error_code ec;

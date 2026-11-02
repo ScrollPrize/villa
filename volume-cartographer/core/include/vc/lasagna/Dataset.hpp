@@ -38,6 +38,14 @@ struct MaterializedLasagnaManifest {
 [[nodiscard]] std::string lasagnaGroupSourceLocation(
     const LasagnaChannelGroup& group);
 
+// For a local copy of a remote dataset's manifest (opened beside its
+// lasagna-remote.json marker), fetch the provenance record the manifest names
+// (its "provenance" file, e.g. inference.json) beside it unless already
+// there, as the dataset's identity reads it; nothing for any other manifest.
+// The fetcher, empty by default, replaces the download in tests.
+void cacheLasagnaProvenance(const LasagnaDatasetManifest& manifest,
+                            const vc::core::util::RemoteFileFetcher& fetcher = {});
+
 class LasagnaDataset {
 public:
     explicit LasagnaDataset(LasagnaDatasetManifest manifest);

@@ -577,6 +577,26 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 {
 }
 
+void cacheLasagnaProvenance(const LasagnaDatasetManifest& manifest,
+                            const vc::core::util::RemoteFileFetcher& fetcher)
+{
+    if (manifest.manifestIsRemote || manifest.remoteBaseUrl.empty()) return;
+    const auto it = manifest.raw.find("provenance");
+    if (it == manifest.raw.end() || !it->is_string() || it->get<std::string>().empty()) return;
+    const std::filesystem::path name(it->get<std::string>());
+    if (name.is_absolute() || name.lexically_normal() != name || *name.begin() == "..")
+        throw std::runtime_error("Lasagna manifest names an unsafe provenance record: " + name.string());
+    if (std::filesystem::is_regular_file(manifest.baseDirectory / name)) return;
+    vc::core::util::RemoteFileCacheOptions options;
+    options.cacheRoot = manifest.baseDirectory;
+    options.destination = name;
+    options.discoverAwsCredentials = manifest.discoverAwsCredentials;
+    options.fetcher = fetcher;
+    auto base = manifest.remoteBaseUrl;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    (void)vc::core::util::cacheRemoteFile(base + "/" + name.generic_string(), options);
+}
+
 bool isRemoteLasagnaLocation(std::string_view location)
 {
     return isRemoteLocation(location);
