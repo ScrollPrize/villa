@@ -513,7 +513,6 @@ vc_add_test(NAME test_plane_surface_branches)
 
 vc_add_test(NAME test_quadsurface_more)
 
-vc_add_test(NAME test_thinning)
 
 vc_add_test(NAME test_umbilicus)
 

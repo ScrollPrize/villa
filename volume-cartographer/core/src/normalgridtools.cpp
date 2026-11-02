@@ -271,18 +271,18 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
     return best_umbilicus;
 }
 
-void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, GridStore& normal_grid, double spiral_step) {
+void populate_normal_grid(const vcr::thinning::Traces& traces, GridStore& normal_grid, double spiral_step) {
     const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
 
     for (const auto& trace : traces) {
         if (trace.size() < 2) continue;
 
         std::vector<cv::Point> resampled_path;
-        resampled_path.push_back(trace[0]);
-        cv::Point last_point = trace[0];
+        resampled_path.emplace_back(trace[0].x, trace[0].y);
+        cv::Point last_point(trace[0].x, trace[0].y);
 
         for (size_t i = 1; i < trace.size(); ++i) {
-            cv::Point current_point = trace[i];
+            cv::Point current_point(trace[i].x, trace[i].y);
             auto v = current_point - last_point;
             double dist_sq = v.ddot(v);
             if (dist_sq >= target_dist_sq) {
