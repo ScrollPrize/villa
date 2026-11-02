@@ -6,7 +6,7 @@ From [Vesuvius Challenge](https://scrollprize.org), a Python library for :
 - Inferring with models trained with the trainers provided in the package or with pretrained nnUNetv2 models
   - Inference can be performed on remote data (http, s3) stored as Zarr arrays
 - Rendering .obj segments with local or remote data
-- Voxelizing large .obj segmentations for use as 3d labels
+- Voxelizing tifxyz surfaces for use as 3d labels
 - Preprocessing labels of fiber-like structures
 - Interactive labeling and model training through a Napari based trainer
 - Proofreading large arrays of image/label pairs and saving approved chunks
@@ -30,7 +30,7 @@ _this package is in active development_
 | `vesuvius.afv_spline_generator` | `afv_spline_generator.cli`       | [predicts fibers](docs/afv_spline_generator.md) in a zone of a Zarr volume and writes their polylines in a fiber object store (`.vcobj`) for VC3D                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
-| `vesuvius.voxelize_obj`       | `label_processing.voxelize_objs`     | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
+| `vesuvius.voxelize_obj`       | `label_processing.voxelize_objs`     | voxelizes tifxyz surfaces with bicubic interpolation into OME-Zarr pyramids or TIFF stacks |
 | `vesuvius.refine_labels`      | `label_processing.refine_labels`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
 | `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
 | `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
@@ -39,6 +39,39 @@ _this package is in active development_
 
 
 
+
+### Tifxyz voxelization
+
+The historical `vesuvius.voxelize_obj` command now accepts a tifxyz directory
+(`x.tif`, `y.tif`, `z.tif`, `meta.json`) or a folder of those directories.
+Use `--recursive` to include nested directories. It reads geometry and optional
+masks with `vc_reader.tifxyz`, sampling bicubic patches without triangulation.
+Use a current `vc_reader` build with `Surface.points_at(..., tangents=True)`.
+
+```bash
+python -m vesuvius.label_processing.voxelize_objs /data/surfaces \
+  --spatial-shape 1000 2000 2000 --output_path labels.zarr --num_workers 4
+```
+
+`--format tifs` writes a complete TIFF stack. Existing affine, normals, surface
+frame, dtype and chunk options remain available; output filename defaults retain
+their historical `mesh_` prefix. Normals and frames use XYZ components, with
+increasing stored columns defining `t_u` and increasing rows defining `t_v`.
+Frames are orthonormalized from the transformed bicubic derivatives; normals
+follow `dP/du × dP/dv`, including under reflections.
+
+Sorted surface paths receive labels 1 through N. Later surfaces win overlaps,
+including their normal/frame values. Within each surface, the nearest sampled
+point to the voxel centre wins, with deterministic ties. Points round to the
+nearest voxel, with half ties upward. Sampling density is estimated from the
+longest transformed grid edge along each axis, targeting quarter-voxel spacing.
+This approximates coverage and can miss small corner intersections; it is not an
+exact patch/voxel intersection. Invalid patches and out-of-volume points are
+discarded. UV metadata scale does not rescale XYZ coordinates. Surface grids and
+sparse voxel results must fit in memory; interpolation queries are batched.
+
+Regression checks use synthetic planes, curved patches, masks and affines:
+`python -m pytest tests/test_voxelize_tifxyz.py` from `vesuvius/`.
 
 ## 📓 Introductory notebooks
 To get started, we recommend these notebooks that jump right in:

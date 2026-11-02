@@ -2,11 +2,9 @@
 import math
 import numpy as np
 import os
-import trimesh
 import shutil
 from pathlib import Path
 import logging
-from glob import glob
 from itertools import repeat, product
 from vc_reader.reader import ZarrWriter, create_group, open_zarr
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -16,56 +14,21 @@ import argparse
 from tqdm import tqdm  # Progress bar
 
 from vc_reader.affine import Affine
-from vc_reader.geometry import transform_points, rasterize_mesh_slice
+from vc_reader.geometry import transform_points
+from vc_reader import tifxyz
 
 # Determine default number of workers: half of CPU count (at least 1)
 default_workers = max(1, multiprocessing.cpu_count() // 2)
 
-# We no longer need normals for expansion, but we still need to find
-# intersections of triangles with the z-plane.
 PYRAMID_LEVELS = 6
 
-# Global store used to share immutable mesh data with forked worker processes
-# without serializing the large arrays for every slice task.
+# Shared immutable voxel data and output handles for slice worker threads.
 _SLICE_STATE = {}
 _SLICE_DATASETS = {}
 _DOWNSAMPLE_STATE = {}
 _DOWNSAMPLE_DATASETS = {}
 
 logger = logging.getLogger(__name__)
-
-
-def _load_mesh(mesh_path):
-    mesh = trimesh.load_mesh(
-        str(mesh_path),
-        process=False,
-        maintain_order=True,
-    )
-    if isinstance(mesh, trimesh.Scene):
-        geometries = tuple(mesh.geometry.values())
-        if not geometries:
-            raise ValueError(f"Mesh file '{mesh_path}' does not contain geometry.")
-        mesh = trimesh.util.concatenate(geometries)
-
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError(f"Mesh file '{mesh_path}' did not load as a triangle mesh.")
-
-    return mesh
-
-
-def _mesh_triangle_uvs(mesh, triangles):
-    visual = getattr(mesh, "visual", None)
-    uv = getattr(visual, "uv", None)
-    if uv is None:
-        return None
-
-    uv = np.asarray(uv, dtype=np.float32)
-    expected_rows = len(triangles) * 3
-    if uv.shape[0] == expected_rows:
-        return uv.reshape(len(triangles), 3, 2)
-    if uv.shape[0] == len(mesh.vertices):
-        return uv[triangles]
-    return None
 
 
 def _set_slice_state(state):
@@ -204,26 +167,7 @@ def _process_zslice(zslice):
     if not state:
         raise RuntimeError("Slice processing state is not initialized in the worker.")
 
-    _, label_img, normals_img, frame_img = process_slice(
-        (
-            zslice,
-            state["vertices"],
-            state["triangles"],
-            state["labels"],
-            state["w"],
-            state["h"],
-            state["include_normals"],
-            state["vertex_normals"],
-            state["triangle_normals"],
-            state["use_vertex_normals"],
-            state.get("include_surface_frame", False),
-            state.get("vertex_tangents"),
-            state.get("vertex_bitangents"),
-            state.get("triangle_tangents"),
-            state.get("triangle_bitangents"),
-            state.get("use_vertex_tangents"),
-        )
-    )
+    _, label_img, normals_img, frame_img = process_slice(zslice, state)
 
     _write_slice_output_worker(zslice, label_img, normals_img, frame_img)
     return zslice
@@ -391,221 +335,133 @@ def build_pyramid(array, levels, axes):
     return outputs
 
 
-def process_mesh(
-    mesh_path,
-    mesh_index,
-    include_normals,
-    include_surface_frame,
-    transform_info,
-    label_dtype,
-):
+def find_surfaces(folder, recursive=False):
+    """Accept a bundle itself, its parent, or (with --recursive) a directory tree."""
+    path = Path(folder)
+    if all((path / name).is_file() for name in ("meta.json", "x.tif", "y.tif", "z.tif")):
+        return [str(path)]
+    return sorted(entry.location for entry in tifxyz.list_surfaces(path, recursive=recursive))
+
+
+def _map_geometry(values, transform_info, *, vectors=False):
+    if transform_info is None or not len(values):
+        return values
+    perm = transform_info["perm"]
+    return transform_points(
+        np.ascontiguousarray(values[:, perm]), transform_info["matrix"], vectors=vectors,
+    )[:, np.argsort(perm)]
+
+
+def _unit_vectors(vectors):
+    lengths = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    return np.divide(vectors, lengths, out=np.zeros_like(vectors), where=lengths > 1e-12)
+
+
+def _nearest_samples(ids, distances):
+    # Stable ties keep the first sample in deterministic tile/query order.
+    order = np.lexsort((distances, ids))
+    return order[np.r_[True, ids[order][1:] != ids[order][:-1]]]
+
+
+def process_surface(surface_path, include_normals, include_surface_frame,
+                    transform_info, spatial_shape):
+    """Sample bicubic patches into sparse voxels, without constructing a mesh.
+
+    Sample each stored axis at quarter-voxel spacing estimated from its longest
+    transformed grid edge. This is point-based coverage, not an exact voxel/patch
+    intersection test. UV metadata scale does not rescale XYZ coordinate values.
+    Each voxel keeps its nearest sample (stable ties); optional directions come
+    from that same bicubic patch. Work on at most 256 x 256 queries at a time.
     """
-    Load a mesh from disk, return (vertices, triangles, labels_for_those_triangles).
-    We assign mesh_index+1 as the label.
-    """
-    print(f"Processing mesh: {mesh_path}")
-    mesh = _load_mesh(mesh_path)
+    surface = tifxyz.read(surface_path)
+    shape = tuple(spatial_shape)
+    need_frame = include_normals or include_surface_frame
+    empty = (np.empty(0, np.int64), np.empty((0, 3), np.float32),
+             np.empty((0, 3, 3), np.float32))
+    if min(surface.shape) < 2 or not surface.valid.any():
+        return empty
 
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    triangles = np.asarray(mesh.faces, dtype=np.int32)
-
-    if transform_info is not None:
-        perm = transform_info["perm"]
-        vertices = transform_points(vertices[:, perm], transform_info["matrix"])[:, np.argsort(perm)]
-
-    # Every triangle in this mesh gets the same label: mesh_index+1
-    labels = np.full(len(triangles), mesh_index + 1, dtype=label_dtype)
-
-    need_normals = include_normals or include_surface_frame
-
-    vertex_normals = np.zeros((0, 3), dtype=np.float32)
-    triangle_normals = np.zeros((0, 3), dtype=np.float32)
-    use_vertex_normals = False
-
-    if need_normals:
-        vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
-        triangle_normals = np.asarray(mesh.face_normals, dtype=np.float32)
-
-        if transform_info is not None:
-            perm = transform_info["perm"]
-            inverse_order = np.argsort(perm)
-            normal_matrix = transform_info["normal_matrix"]
-            vertex_normals = transform_points(vertex_normals[:, perm], normal_matrix,
-                                              vectors=True, normalize=True)[:, inverse_order]
-            triangle_normals = transform_points(triangle_normals[:, perm], normal_matrix,
-                                                vectors=True, normalize=True)[:, inverse_order]
-
-        if vertex_normals.shape[0] != len(vertices):
-            raise ValueError("Unable to compute vertex normals required for surface processing.")
-
-        if triangle_normals.shape[0] != len(triangles):
-            raise ValueError("Unable to compute triangle normals required for surface processing.")
-
-        use_vertex_normals = True
-
-    vertex_tangents = np.zeros((0, 3), dtype=np.float32)
-    vertex_bitangents = np.zeros((0, 3), dtype=np.float32)
-    triangle_tangents = np.zeros((0, 3), dtype=np.float32)
-    triangle_bitangents = np.zeros((0, 3), dtype=np.float32)
-    use_vertex_tangents = False
-
-    if include_surface_frame:
-        triangle_uvs = _mesh_triangle_uvs(mesh, triangles)
-        if triangle_uvs is None:
-            raise ValueError("Mesh does not provide triangle UVs required for surface frame export.")
-
-        vertex_tangents = np.zeros((len(vertices), 3), dtype=np.float32)
-        vertex_bitangents = np.zeros((len(vertices), 3), dtype=np.float32)
-        triangle_tangents = np.zeros((len(triangles), 3), dtype=np.float32)
-        triangle_bitangents = np.zeros((len(triangles), 3), dtype=np.float32)
-        tangent_counts = np.zeros(len(vertices), dtype=np.int32)
-
-        for tri_idx in range(len(triangles)):
-            idx0 = triangles[tri_idx, 0]
-            idx1 = triangles[tri_idx, 1]
-            idx2 = triangles[tri_idx, 2]
-
-            v0 = vertices[idx0]
-            v1 = vertices[idx1]
-            v2 = vertices[idx2]
-
-            uv0 = triangle_uvs[tri_idx, 0]
-            uv1 = triangle_uvs[tri_idx, 1]
-            uv2 = triangle_uvs[tri_idx, 2]
-
-            delta_pos1 = v1 - v0
-            delta_pos2 = v2 - v0
-            delta_uv1 = uv1 - uv0
-            delta_uv2 = uv2 - uv0
-
-            denom = delta_uv1[0] * delta_uv2[1] - delta_uv2[0] * delta_uv1[1]
-            if abs(denom) < 1e-12:
-                raise ValueError("Encountered degenerate UV mapping while computing tangents.")
-
-            inv_denom = 1.0 / denom
-            raw_tangent = (delta_pos1 * delta_uv2[1] - delta_pos2 * delta_uv1[1]) * inv_denom
-            raw_bitangent = (delta_pos2 * delta_uv1[0] - delta_pos1 * delta_uv2[0]) * inv_denom
-
-            tri_norm = triangle_normals[tri_idx]
-            norm_len = np.linalg.norm(tri_norm)
-            if norm_len < 1e-12:
-                raise ValueError("Triangle normal magnitude is zero; cannot build tangent frame.")
-            tri_norm_unit = tri_norm / norm_len
-
-            tangent_proj = raw_tangent - tri_norm_unit * np.dot(tri_norm_unit, raw_tangent)
-            tan_len = np.linalg.norm(tangent_proj)
-            if tan_len < 1e-12:
-                raise ValueError("Computed tangent length is zero; invalid UV parameterization.")
-            tangent_unit = tangent_proj / tan_len
-
-            bitangent_unit = np.cross(tri_norm_unit, tangent_unit)
-            if np.linalg.norm(bitangent_unit) < 1e-12:
-                raise ValueError("Computed bitangent length is zero; invalid UV parameterization.")
-
-            if np.dot(bitangent_unit, raw_bitangent) < 0.0:
-                bitangent_unit *= -1.0
-
-            triangle_tangents[tri_idx] = tangent_unit
-            triangle_bitangents[tri_idx] = bitangent_unit
-
-            vertex_tangents[idx0] += tangent_unit
-            vertex_tangents[idx1] += tangent_unit
-            vertex_tangents[idx2] += tangent_unit
-
-            vertex_bitangents[idx0] += bitangent_unit
-            vertex_bitangents[idx1] += bitangent_unit
-            vertex_bitangents[idx2] += bitangent_unit
-
-            tangent_counts[idx0] += 1
-            tangent_counts[idx1] += 1
-            tangent_counts[idx2] += 1
-
-        for vid in range(len(vertices)):
-            count = tangent_counts[vid]
-            if count <= 0:
-                raise ValueError("Vertex missing tangent contributions; UVs must be continuous across the mesh.")
-
-            n_vec = vertex_normals[vid]
-            n_len = np.linalg.norm(n_vec)
-            if n_len < 1e-12:
-                raise ValueError("Vertex normal magnitude is zero; cannot orthonormalize tangents.")
-            n_unit = n_vec / n_len
-
-            t_vec = vertex_tangents[vid] / count
-            t_vec = t_vec - n_unit * np.dot(n_unit, t_vec)
-            t_len = np.linalg.norm(t_vec)
-            if t_len < 1e-12:
-                raise ValueError("Vertex tangent degenerates after projection; check UV continuity.")
-            t_unit = t_vec / t_len
-
-            b_vec = vertex_bitangents[vid] / count
-            b_unit = np.cross(n_unit, t_unit)
-            if np.linalg.norm(b_unit) < 1e-12:
-                raise ValueError("Vertex bitangent degenerates; cannot establish surface frame.")
-            if np.dot(b_unit, b_vec) < 0.0:
-                b_unit *= -1.0
-
-            vertex_tangents[vid] = t_unit
-            vertex_bitangents[vid] = b_unit
-
-        use_vertex_tangents = True
-
-    return (
-        vertices,
-        triangles,
-        labels,
-        vertex_normals,
-        triangle_normals,
-        use_vertex_normals,
-        vertex_tangents,
-        vertex_bitangents,
-        triangle_tangents,
-        triangle_bitangents,
-        use_vertex_tangents,
-    )
+    # Transform only valid coordinates: missing vertices remain missing even
+    # when an affine translates the sentinel into the output volume.
+    grid = np.full(surface.xyz.shape, np.nan, dtype=np.float32)
+    grid[surface.valid] = _map_geometry(surface.xyz[surface.valid], transform_info)
+    subdivisions = []
+    for axis in (0, 1):
+        lengths = np.linalg.norm(np.diff(grid, axis=axis), axis=-1)
+        finite = lengths[np.isfinite(lengths)]
+        longest = float(finite.max()) if finite.size else 0.0
+        subdivisions.append(max(1, int(math.ceil(longest * 4))))
+    counts = [(n - 1) * steps + 1 for n, steps in zip(surface.shape, subdivisions)]
+    ids_parts, distance_parts, normal_parts, frame_parts = [], [], [], []
+    for row_start in range(0, counts[0], 256):
+        for col_start in range(0, counts[1], 256):
+            rows, cols = np.meshgrid(
+                np.arange(row_start, min(row_start + 256, counts[0]), dtype=np.float32) / subdivisions[0],
+                np.arange(col_start, min(col_start + 256, counts[1]), dtype=np.float32) / subdivisions[1],
+                indexing="ij",
+            )
+            sampled = surface.points_at(rows, cols, interpolation="bicubic", tangents=need_frame)
+            xyz, valid = sampled[:2]
+            xyz = _map_geometry(xyz[valid], transform_info)
+            # Reject out-of-volume samples rather than flattening the surface
+            # onto the volume boundary by clamping its control points.
+            inside = np.isfinite(xyz).all(axis=1) & (xyz >= 0).all(axis=1)
+            inside &= (xyz < np.asarray(shape[::-1]) - 0.5).all(axis=1)
+            xyz = xyz[inside]
+            if not len(xyz):
+                continue
+            ijk = np.floor(xyz + 0.5).astype(np.int64)
+            ids = np.ravel_multi_index(ijk[:, ::-1].T, shape)
+            distances = np.sum((xyz - ijk) ** 2, axis=1)
+            take = _nearest_samples(ids, distances)
+            ids_parts.append(ids[take])
+            distance_parts.append(distances[take])
+            if need_frame:
+                du = _map_geometry(sampled[2][valid][inside][take], transform_info, vectors=True)
+                dv = _map_geometry(sampled[3][valid][inside][take], transform_info, vectors=True)
+                normal = _unit_vectors(np.cross(du, dv))
+                normal_parts.append(normal)
+                if include_surface_frame:
+                    tangent = _unit_vectors(du)
+                    bitangent = _unit_vectors(np.cross(normal, tangent))
+                    frame_parts.append(np.stack((tangent, bitangent, normal), axis=1))
+    if not ids_parts:
+        return empty
+    ids = np.concatenate(ids_parts)
+    take = _nearest_samples(ids, np.concatenate(distance_parts))
+    normals = np.concatenate(normal_parts)[take] if need_frame else empty[1]
+    frames = np.concatenate(frame_parts)[take] if include_surface_frame else empty[2]
+    if need_frame and (not np.isfinite(normals).all() or
+                       np.any(np.linalg.norm(normals, axis=1) < 1e-12)):
+        raise ValueError(f"Degenerate surface normal in {surface_path}; check the surface and affine.")
+    return ids[take], normals, frames
 
 
-def process_slice(args):
-    """Process a single z-slice and return label and optional surface data."""
-    (
-        zslice,
-        vertices,
-        triangles,
-        labels,
-        w,
-        h,
-        include_normals,
-        vertex_normals,
-        triangle_normals,
-        triangle_use_vertex_normals,
-        include_surface_frame,
-        vertex_tangents,
-        vertex_bitangents,
-        triangle_tangents,
-        triangle_bitangents,
-        triangle_use_vertex_tangents,
-    ) = args
-
-    attributes = {}
-    if include_normals or include_surface_frame:
-        attributes.update(vertex_normals=vertex_normals, face_normals=triangle_normals,
-                          vertex_normal_flags=triangle_use_vertex_normals)
-    if include_surface_frame:
-        attributes.update(vertex_tangents=vertex_tangents, vertex_bitangents=vertex_bitangents,
-                          face_tangents=triangle_tangents, face_bitangents=triangle_bitangents,
-                          vertex_tangent_flags=triangle_use_vertex_tangents)
-    img_label, normals_img, frame_img = rasterize_mesh_slice(vertices, triangles, labels, zslice, (h, w), **attributes)
-
-    return zslice, img_label, normals_img, frame_img
+def process_slice(zslice, state):
+    """Write sorted surfaces in label order; later surfaces win overlaps."""
+    h, w = state["h"], state["w"]
+    label_img = np.zeros((h, w), dtype=state["label_dtype"])
+    normals_img = np.zeros((h, w, 3), np.float32) if state["include_normals"] else None
+    frame_img = np.zeros((h, w, 3, 3), np.float32) if state["include_surface_frame"] else None
+    start, stop = int(zslice) * h * w, (int(zslice) + 1) * h * w
+    for label, (ids, normals, frames) in enumerate(state["surfaces"], start=1):
+        lo, hi = np.searchsorted(ids, (start, stop))
+        pixels = ids[lo:hi] - start
+        label_img.reshape(-1)[pixels] = label
+        if normals_img is not None:
+            normals_img.reshape(-1, 3)[pixels] = normals[lo:hi]
+        if frame_img is not None:
+            frame_img.reshape(-1, 3, 3)[pixels] = frames[lo:hi]
+    return zslice, label_img, normals_img, frame_img
 
 
 def main():
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(
-        description="Process OBJ meshes and slice them along z to produce multiscale OME-Zarr volumes."
+        description="Voxelize tifxyz surfaces using bicubic interpolation into OME-Zarr volumes or TIFF stacks."
     )
     parser.add_argument("folder",
-                        help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
+                        help="Path to a tifxyz directory or a folder containing tifxyz directories")
     parser.add_argument(
         "--spatial-shape",
         required=True,
@@ -632,9 +488,9 @@ def main():
     parser.add_argument("--output_path", default="mesh_labels.zarr",
                         help="Path to the label OME-Zarr store (default: mesh_labels.zarr)")
     parser.add_argument("--num_workers", type=int, default=default_workers,
-                        help="Number of worker processes to use (default: half of CPU count)")
+                        help="Number of workers to use (default: half of CPU count)")
     parser.add_argument("--recursive", action="store_true",
-                        help="Force recursive search in subfolders even if OBJ files exist in the parent folder")
+                        help="Search recursively for tifxyz directories below the input folder")
     parser.add_argument("--chunk_size", type=int, default=0,
                         help="Override chunk edge length for Zarr datasets (use 0 for auto)")
     parser.add_argument("--label-dtype", default="uint16",
@@ -707,10 +563,8 @@ def main():
             print(f"ERROR: {exc}")
             sys.exit(1)
 
-        normal_transform = transform.normal_transform() if transform.determinant != 0 else transform
         transform_info = {
             "matrix": np.asarray(transform.matrix, dtype=np.float32),
-            "normal_matrix": np.asarray(normal_transform.matrix, dtype=np.float32),
             "perm": perm,
             "axis_order": args.transform_axis_order,
         }
@@ -738,13 +592,15 @@ def main():
             print("ERROR: surface frame dtype cannot exceed 16 bits per component.")
             sys.exit(1)
 
-    # Use the provided number of worker processes.
+    # Use the provided number of workers.
     N_PROCESSES = args.num_workers
-    print(f"Using {N_PROCESSES} worker processes")
+    if N_PROCESSES < 1:
+        parser.error("num_workers must be positive")
+    print(f"Using {N_PROCESSES} workers")
 
-    # Folder where OBJ meshes are located.
+    # Folder containing tifxyz surfaces.
     folder_path = args.folder
-    print(f"Using mesh folder: {folder_path}")
+    print(f"Using surface folder: {folder_path}")
 
     z_dim, y_dim, x_dim = args.spatial_shape
     if z_dim <= 0 or y_dim <= 0 or x_dim <= 0:
@@ -780,164 +636,27 @@ def main():
         surface_frame_out_path = args.surface_frame_output_path
         print(f"Surface frame OME-Zarr output path: {surface_frame_out_path}")
 
-    # Find OBJ files - either directly or in subfolders
-    if args.recursive:
-        # Force recursive search
-        mesh_paths = glob(os.path.join(folder_path, '**', '*.obj'), recursive=True)
-        print(f"Recursive search enabled")
+    surface_paths = find_surfaces(folder_path, args.recursive)
+    if not surface_paths:
+        parser.error(f"No tifxyz surfaces found in {folder_path}")
+    if len(surface_paths) > np.iinfo(label_dtype).max:
+        parser.error(f"label dtype {label_dtype} cannot represent {len(surface_paths)} surfaces")
+    print(f"Found {len(surface_paths)} surfaces to process")
+    # Native surface sampling releases the GIL; threads also avoid copying the
+    # sparse results through process pipes and work with every start method.
+    with ThreadPoolExecutor(max_workers=N_PROCESSES) as executor:
+        surfaces = list(tqdm(executor.map(
+            process_surface, surface_paths, repeat(args.output_normals),
+            repeat(args.output_surface_frame), repeat(transform_info), repeat(args.spatial_shape),
+        ), total=len(surface_paths), desc="Surfaces sampled"))
+    occupied = [ids for ids, _, _ in surfaces if len(ids)]
+    if occupied:
+        z_min = min(int(ids[0] // (h * w)) for ids in occupied)
+        z_max = max(int(ids[-1] // (h * w)) for ids in occupied)
+        z_slices = np.arange(z_min, z_max + 1)
     else:
-        # First try direct OBJ files
-        mesh_paths = glob(os.path.join(folder_path, '*.obj'))
-
-        if not mesh_paths:
-            # No OBJ files found directly, try subfolders
-            mesh_paths = glob(os.path.join(folder_path, '*', '*.obj'))
-            if mesh_paths:
-                print(f"No OBJ files found in {folder_path}, searching in subfolders...")
-
-    if not mesh_paths:
-        print(f"ERROR: No OBJ files found in {folder_path} or its subfolders")
-        sys.exit(1)
-
-    print(f"Found {len(mesh_paths)} meshes to process")
-
-    # Read all meshes in parallel.
-    with ProcessPoolExecutor(max_workers=N_PROCESSES) as executor:
-        mesh_results = list(
-            executor.map(
-                process_mesh,
-                mesh_paths,
-                range(len(mesh_paths)),
-                repeat(args.output_normals),
-                repeat(args.output_surface_frame),
-                repeat(transform_info),
-                repeat(args.label_dtype),
-            )
-        )
-
-    # Merge all into a single set of (vertices, triangles, labels).
-    all_vertices = []
-    all_triangles = []
-    all_labels = []
-    all_vertex_normals = []
-    all_triangle_normals = []
-    triangle_use_vertex_flags = []
-    all_vertex_tangents = []
-    all_vertex_bitangents = []
-    all_triangle_tangents = []
-    all_triangle_bitangents = []
-    triangle_use_vertex_tangent_flags = []
-    vertex_offset = 0
-
-    for (
-        vertices_i,
-        triangles_i,
-        labels_i,
-        vertex_normals_i,
-        triangle_normals_i,
-        use_vertex_normals_i,
-        vertex_tangents_i,
-        vertex_bitangents_i,
-        triangle_tangents_i,
-        triangle_bitangents_i,
-        use_vertex_tangents_i,
-    ) in mesh_results:
-        all_vertices.append(vertices_i)
-        all_triangles.append(triangles_i + vertex_offset)
-        all_labels.append(labels_i)
-
-        if args.output_normals or args.output_surface_frame:
-            all_vertex_normals.append(vertex_normals_i)
-            all_triangle_normals.append(triangle_normals_i)
-            triangle_use_vertex_flags.append(
-                np.full(len(triangles_i), use_vertex_normals_i, dtype=np.bool_)
-            )
-
-        if args.output_surface_frame:
-            all_vertex_tangents.append(vertex_tangents_i)
-            all_vertex_bitangents.append(vertex_bitangents_i)
-            all_triangle_tangents.append(triangle_tangents_i)
-            all_triangle_bitangents.append(triangle_bitangents_i)
-            triangle_use_vertex_tangent_flags.append(
-                np.full(len(triangles_i), use_vertex_tangents_i, dtype=np.bool_)
-            )
-
-        vertex_offset += len(vertices_i)
-
-    # Create the big arrays.
-    vertices = np.vstack(all_vertices)
-    triangles = np.vstack(all_triangles)
-    mesh_labels = np.concatenate(all_labels)
-
-    if mesh_labels.size:
-        label_dtype_info = np.iinfo(label_dtype)
-        max_label_value = int(mesh_labels.max())
-        if max_label_value > label_dtype_info.max:
-            print(
-                f"ERROR: label dtype {label_dtype} cannot represent label ID {max_label_value} "
-                f"(max {label_dtype_info.max})."
-            )
-            sys.exit(1)
-
-    if args.output_normals:
-        vertex_normals = np.vstack(all_vertex_normals)
-        triangle_normals = np.vstack(all_triangle_normals)
-        triangle_use_vertex_normals = np.concatenate(triangle_use_vertex_flags)
-    elif args.output_surface_frame:
-        # Surface frame export requires normals even if the normals volume is skipped.
-        vertex_normals = np.vstack(all_vertex_normals)
-        triangle_normals = np.vstack(all_triangle_normals)
-        triangle_use_vertex_normals = np.concatenate(triangle_use_vertex_flags)
-    else:
-        vertex_normals = np.zeros((0, 3), dtype=np.float32)
-        triangle_normals = np.zeros((0, 3), dtype=np.float32)
-        triangle_use_vertex_normals = np.zeros(0, dtype=np.bool_)
-
-    if args.output_surface_frame:
-        vertex_tangents = np.vstack(all_vertex_tangents)
-        vertex_bitangents = np.vstack(all_vertex_bitangents)
-        triangle_tangents = np.vstack(all_triangle_tangents)
-        triangle_bitangents = np.vstack(all_triangle_bitangents)
-        triangle_use_vertex_tangents = np.concatenate(triangle_use_vertex_tangent_flags)
-    else:
-        vertex_tangents = np.zeros((0, 3), dtype=np.float32)
-        vertex_bitangents = np.zeros((0, 3), dtype=np.float32)
-        triangle_tangents = np.zeros((0, 3), dtype=np.float32)
-        triangle_bitangents = np.zeros((0, 3), dtype=np.float32)
-        triangle_use_vertex_tangents = np.zeros(0, dtype=np.bool_)
-
-    # Clip vertices into the valid volume bounds (z, y, x) before slice processing.
-    if vertices.size:
-        max_x = max(w - 1e-3, 0.0)
-        max_y = max(h - 1e-3, 0.0)
-        max_z = max(z_dim - 1e-3, 0.0)
-
-        needs_clip = (
-            (vertices[:, 0] < 0.0).any()
-            or (vertices[:, 0] > max_x).any()
-            or (vertices[:, 1] < 0.0).any()
-            or (vertices[:, 1] > max_y).any()
-            or (vertices[:, 2] < 0.0).any()
-            or (vertices[:, 2] > max_z).any()
-        )
-
-        if needs_clip:
-            print(
-                "Clipping mesh vertices to the valid spatial bounds before voxelization.",
-                flush=True,
-            )
-
-        np.clip(vertices[:, 0], 0.0, max_x, out=vertices[:, 0])
-        np.clip(vertices[:, 1], 0.0, max_y, out=vertices[:, 1])
-        np.clip(vertices[:, 2], 0.0, max_z, out=vertices[:, 2])
-
-    # Determine slice range from the vertices.
-    z_min = max(0, int(np.floor(vertices[:, 2].min())))
-    z_max = min(z_dim - 1, int(np.ceil(vertices[:, 2].max())))
-
-    z_slices = np.arange(z_min, z_max + 1)
-    print(f"Processing slices from {z_min} to {z_max} (inclusive).")
-    print(f"Total number of slices: {len(z_slices)}")
+        z_slices = np.empty(0, dtype=np.int64)
+    print(f"Processing {len(z_slices)} slices with surface bounds.")
 
     num_levels = PYRAMID_LEVELS
     codec = {"cname": "zstd", "level": 3, "shuffle": 2}
@@ -1128,22 +847,12 @@ def main():
         surface_frame_dataset_name = surface_frame_datasets[0].path
 
     slice_state = {
-        "vertices": vertices,
-        "triangles": triangles,
-        "labels": mesh_labels,
+        "surfaces": surfaces,
         "w": w,
         "h": h,
         "include_normals": bool(args.output_normals or args.output_surface_frame),
         "write_normals": bool(args.output_normals),
-        "vertex_normals": vertex_normals,
-        "triangle_normals": triangle_normals,
-        "use_vertex_normals": triangle_use_vertex_normals,
         "include_surface_frame": bool(args.output_surface_frame),
-        "vertex_tangents": vertex_tangents,
-        "vertex_bitangents": vertex_bitangents,
-        "triangle_tangents": triangle_tangents,
-        "triangle_bitangents": triangle_bitangents,
-        "use_vertex_tangents": triangle_use_vertex_tangents,
         "volume_depth": z_dim,
         "label_store_path": out_path,
         "label_dataset_name": label_dataset_name,
@@ -1188,103 +897,26 @@ def main():
                 slice_state["tif_compression"],
             )
 
-    sequential_slice_args = (
-        vertices,
-        triangles,
-        mesh_labels,
-        w,
-        h,
-        bool(args.output_normals or args.output_surface_frame),
-        vertex_normals,
-        triangle_normals,
-        triangle_use_vertex_normals,
-        bool(args.output_surface_frame),
-        vertex_tangents,
-        vertex_bitangents,
-        triangle_tangents,
-        triangle_bitangents,
-        triangle_use_vertex_tangents,
-    )
-
-    print("Entering slice rasterization stage", flush=True)
-    if N_PROCESSES > 1:
-        try:
-            mp_context = multiprocessing.get_context("fork")
-        except ValueError:
-            mp_context = None
-
-        if mp_context is None:
-            print(
-                "Fork start method unavailable; running slice rasterization in a single process to avoid high memory usage.",
-                flush=True,
-            )
+    _set_slice_state(slice_state)
+    try:
+        # Open once before threads start; level-zero z chunks are disjoint.
+        _get_worker_datasets()
+        if N_PROCESSES > 1:
+            with ThreadPoolExecutor(max_workers=N_PROCESSES) as executor:
+                for _ in tqdm(executor.map(_process_zslice, z_slices),
+                              total=len(z_slices), desc="Slices processed"):
+                    pass
         else:
-            _set_slice_state(slice_state)
-            try:
-                print("Starting parallel slice rasterization", flush=True)
-                with ProcessPoolExecutor(
-                    max_workers=N_PROCESSES,
-                    mp_context=mp_context,
-                ) as executor:
-                    for _ in tqdm(
-                        executor.map(_process_zslice, z_slices, chunksize=1),
-                        total=len(z_slices),
-                        desc="Slices processed",
-                    ):
-                        pass
-                print("Finished parallel slice rasterization", flush=True)
-                sequential_slice_args = None
-            finally:
-                _set_slice_state({})
-
-    if sequential_slice_args is not None:
-        print("Running sequential slice rasterization", flush=True)
-        (
-            seq_vertices,
-            seq_triangles,
-            seq_labels,
-            seq_w,
-            seq_h,
-            seq_include_normals,
-            seq_vertex_normals,
-            seq_triangle_normals,
-            seq_use_vertex_normals,
-            seq_include_surface_frame,
-            seq_vertex_tangents,
-            seq_vertex_bitangents,
-            seq_triangle_tangents,
-            seq_triangle_bitangents,
-            seq_use_vertex_tangents,
-        ) = sequential_slice_args
-
-        for z in tqdm(z_slices, total=len(z_slices), desc="Slices processed"):
-            zslice, label_img, normals_img, frame_img = process_slice(
-                (
-                    z,
-                    seq_vertices,
-                    seq_triangles,
-                    seq_labels,
-                    seq_w,
-                    seq_h,
-                    seq_include_normals,
-                    seq_vertex_normals,
-                    seq_triangle_normals,
-                    seq_use_vertex_normals,
-                    seq_include_surface_frame,
-                    seq_vertex_tangents,
-                    seq_vertex_bitangents,
-                    seq_triangle_tangents,
-                    seq_triangle_bitangents,
-                    seq_use_vertex_tangents,
-                )
-            )
-            _write_slice_output(zslice, label_img, normals_img, frame_img)
+            for z in tqdm(z_slices, desc="Slices processed"):
+                _process_zslice(z)
+    finally:
+        _set_slice_state({})
 
     processed_slice_indices = set(int(z) for z in z_slices.tolist())
     if len(processed_slice_indices) < z_dim:
         missing_slices = sorted(set(range(z_dim)) - processed_slice_indices)
         if missing_slices:
-            print(f"Writing {len(missing_slices)} empty slices outside the mesh bounds.")
+            print(f"Writing {len(missing_slices)} empty slices outside the surface bounds.")
             zero_label = np.zeros((h, w), dtype=label_dtype)
             zero_normals = np.zeros((0, 0, 0), dtype=np.float32)
             zero_frame = np.zeros((0, 0, 0, 0), dtype=np.float32)
