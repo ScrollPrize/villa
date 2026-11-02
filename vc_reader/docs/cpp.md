@@ -17,6 +17,12 @@ ctest --test-dir build-native --output-on-failure
 cmake --install build-native --prefix /path/to/prefix
 ```
 
+The native suite includes `test_native_shared_algorithms`, covering cache
+eviction, filter boundaries and accumulation precision, interpolation,
+percentiles, storage transforms, dtype encoding, and atomic publication. Run
+just these checks with `ctest --test-dir build-native -R shared_algorithms
+--output-on-failure`.
+
 For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 `CMAKE_CUDA_ARCHITECTURES` for the deployment GPU. CUDA discovery defaults to
 auto-detection when the option is omitted. The toolkit supplies CUDA Runtime

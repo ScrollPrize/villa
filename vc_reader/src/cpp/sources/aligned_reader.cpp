@@ -789,9 +789,9 @@ AlignedStats AlignedEngine::stats()
     s.checkOpen();
     std::lock_guard lock(s.mutex);
     AlignedStats out;
-    out.tileCacheBytes = s.tiles.bytes;
+    out.tileCacheBytes = s.tiles.bytes();
     out.tileCacheHits = s.tiles.hits;
-    out.planCacheBytes = s.plans.bytes;
+    out.planCacheBytes = s.plans.bytes();
     out.planCacheHits = s.plans.hits;
     out.tileReads = s.tileReads;
     out.uploadedBytes = s.uploads;

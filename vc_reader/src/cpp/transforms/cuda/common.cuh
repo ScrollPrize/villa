@@ -107,12 +107,7 @@ inline unsigned blocks(std::size_t n) { return unsigned(std::min<std::size_t>((n
 #define EACH_INDEX(n) for (std::size_t i = std::size_t(vcr_launch.block) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * vcr_launch.blocks)
 __device__ inline double clamp_value(double x, double low, double high) { return x < low ? low : x > high ? high : x; }
 __device__ inline std::size_t boundary(long long x, std::size_t n, Boundary edge) {
-    if (edge == Boundary::Nearest) return x < 0 ? 0 : x >= static_cast<long long>(n) ? n - 1 : std::size_t(x);
-    const bool mirror = edge == Boundary::Mirror;
-    if (n == 1) return 0;
-    const auto period = static_cast<long long>(mirror ? 2 * (n - 1) : 2 * n);
-    x = (x % period + period) % period;
-    return x < static_cast<long long>(n) ? x : period - x - (mirror ? 0 : 1);
+    return std::size_t(vcr::transforms::filter_detail::neighbour(x, n, edge));
 }
 template<class T> __device__ double power(double x, double exponent) {
     if constexpr (std::is_same_v<T, float>) {

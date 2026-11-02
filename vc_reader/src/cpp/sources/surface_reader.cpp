@@ -407,7 +407,7 @@ TargetResult renderVolume(AlignedEngine::Impl& s, Target& target, const grid::Su
         grid::Result result;
 #ifdef VC_READER_CUDA
         if (s.backend == "cuda") {
-            if (!target.cuda) target.cuda = std::make_shared<reader_cuda::Reader>(*array, s.tiles.limit, s.device);
+            if (!target.cuda) target.cuda = std::make_shared<reader_cuda::Reader>(*array, s.tiles.limit(), s.device);
             result = grid::cuda::sample(*surface, raster, request, {static_cast<reader_cuda::Reader*>(target.cuda.get())});
         } else
 #endif

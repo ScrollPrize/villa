@@ -1,4 +1,5 @@
 #pragma once
+#include "../shared/percentile.hpp"
 #include "../ops/intensity.hpp"
 #include "../core.hpp"
 #include "normalization.hpp"
@@ -184,13 +185,8 @@ template<class Values> void channel_apply(const RicianNoise&, Values& v, const G
 }
 template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
     double std = p.values[2] ? deviation(v, mean(v)) : 0; auto sorted = v;
-    auto percentile = [&](double q) {
-        double pos = q / 100 * (v.size() - 1); auto lo = std::size_t(pos), hi = std::min(lo + 1, v.size() - 1);
-        std::nth_element(sorted.begin(), sorted.begin() + lo, sorted.end());
-        double low = sorted[lo], high = hi == lo ? low : *std::min_element(sorted.begin() + hi, sorted.end());
-        return low + (high - low) * (pos - lo);
-    };
-    double low = percentile(p.values[0]), high = percentile(p.values[1]);
+    double low = percentile_detail::percentile<percentile_detail::Rule::Linear>(sorted, p.values[0]);
+    double high = percentile_detail::percentile<percentile_detail::Rule::Linear>(sorted, p.values[1]);
     for (auto& x : v) x = std::clamp(double(x), low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }

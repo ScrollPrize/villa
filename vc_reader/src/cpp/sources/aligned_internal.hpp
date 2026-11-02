@@ -5,7 +5,7 @@
 
 #include <chrono>
 #include <cmath>
-#include <list>
+#include "../lru.hpp"
 #include <mutex>
 #include <unordered_map>
 
@@ -21,51 +21,24 @@ namespace vcr::sources {
 
 using Triple = std::array<std::int64_t, 3>;
 
-// Least-recently-used entries within a byte limit.
+// Sampling caches are accessed under the engine's lock.
 template <class T>
 class Bounded {
 public:
-    explicit Bounded(std::size_t limit = 0) : limit(limit) {}
-    std::size_t limit, bytes = 0, hits = 0;
+    explicit Bounded(std::size_t limit = 0) : entries_(limit) {}
+    std::size_t hits = 0;
     const T* get(const std::string& key)
     {
-        const auto it = index_.find(key);
-        if (it == index_.end()) return nullptr;
-        order_.splice(order_.end(), order_, it->second);
-        ++hits;
-        return &it->second->value;
+        const auto* value = entries_.get(key);
+        if (value) ++hits;
+        return value;
     }
-    void put(const std::string& key, T value, std::size_t size)
-    {
-        if (size > limit) return;
-        if (const auto it = index_.find(key); it != index_.end()) {
-            bytes -= it->second->size;
-            order_.erase(it->second);
-            index_.erase(it);
-        }
-        while (!order_.empty() && bytes + size > limit) {
-            bytes -= order_.front().size;
-            index_.erase(order_.front().key);
-            order_.pop_front();
-        }
-        order_.push_back({key, std::move(value), size});
-        index_[key] = std::prev(order_.end());
-        bytes += size;
-    }
-    void clear()
-    {
-        order_.clear();
-        index_.clear();
-        bytes = 0;
-    }
+    void put(const std::string& key, T value, std::size_t size) { entries_.put(key, std::move(value), size); }
+    void clear() { entries_.clear(); }
+    std::size_t bytes() const { return entries_.bytes(); }
+    std::size_t limit() const { return entries_.limit(); }
 private:
-    struct Item {
-        std::string key;
-        T value;
-        std::size_t size;
-    };
-    std::list<Item> order_;
-    std::unordered_map<std::string, typename std::list<Item>::iterator> index_;
+    Lru<T> entries_;
 };
 
 struct FieldSpec {

@@ -1,6 +1,7 @@
 // Selected storage grids, without changing the declarations they came from. Spatial storage
 // transforms use XYZ column vectors and micrometers for dimensional frames.
 #include "vc_reader/source_reader.hpp"
+#include "../storage_transform.hpp"
 
 #include <cmath>
 #include <set>
@@ -51,12 +52,13 @@ json blockReducedTransforms(const json& transforms, const json& finest)
     const auto& s = (*scale)["scale"];
     const auto& b = (*base)["scale"];
     if (!s.is_array() || !b.is_array() || s.size() != b.size()) return out;
-    const auto* translation = named(finest, "translation");
+    std::vector<std::optional<std::size_t>> axes;
+    for (std::size_t i = 0; i < s.size(); ++i) axes.push_back(i);
+    const auto selected = storage::parse(out, axes, s.size());
+    const auto reference = storage::parse(finest, axes, s.size());
     json shifted = json::array();
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        const double origin = translation ? (*translation)["translation"].at(i).get<double>() : 0.;
-        shifted.push_back(origin + (s[i].get<double>() - b[i].get<double>()) / 2);
-    }
+    for (std::size_t i = 0; i < axes.size(); ++i)
+        shifted.push_back(storage::reducedOffset(selected.axes[i], reference.axes[i]));
     out.push_back({{"type", "translation"}, {"translation", shifted}});
     return out;
 }
@@ -68,28 +70,14 @@ StorageGrid storageTransform(const std::vector<std::string>& axes, const std::ve
         if (group.is_array())
             for (const auto& transform : group) transforms.push_back(transform);
     if (transforms.empty()) return {};
+    std::vector<std::optional<std::size_t>> spatial(3);
+    for (std::size_t i = 0; i < axes.size(); ++i)
+        if (spatialAxis(axes[i])) spatial[xyzIndex(axes[i])] = i;
+    const auto parsed = storage::parse(transforms, spatial, axes.size());
     Affine result;
-    for (const auto& transform : transforms) {
-        const auto kind = transform.is_object() ? transform.value("type", "") : std::string();
-        if (kind != "scale" && kind != "translation" && kind != "identity")
-            bad("unsupported storage transformation '" + kind + "'; declare a supported grid");
-        if (kind == "identity") continue;
-        const auto values = transform.value(kind, json::array());
-        if (!values.is_array() || values.size() != axes.size()) bad("storage transformation rank/nonfinite values contradict storage axes");
-        Affine step;
-        for (std::size_t i = 0; i < axes.size(); ++i) {
-            if (!values[i].is_number() || !std::isfinite(values[i].get<double>())) bad("storage transformation rank/nonfinite values contradict storage axes");
-            const double value = values[i].get<double>();
-            if (!spatialAxis(axes[i])) continue;
-            const int axis = xyzIndex(axes[i]);
-            if (kind == "scale") {
-                if (value <= 0) bad("storage scale must be positive");
-                step(axis, axis) = value;
-            } else {
-                step(axis, 3) = value;
-            }
-        }
-        result = step * result;
+    for (int a = 0; a < 3; ++a) {
+        result(a, a) = parsed.axes[a].scale;
+        result(a, 3) = parsed.axes[a].offset;
     }
     std::set<std::optional<std::string>> spatialUnits;
     for (std::size_t i = 0; i < axes.size(); ++i)

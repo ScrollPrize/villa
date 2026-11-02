@@ -41,6 +41,20 @@ class PrecisionTests(unittest.TestCase):
     def backends(self):
         return ('cpu', 'cuda') if A._transforms.cuda_available() else ('cpu',)
 
+    def test_percentiles_select_lowest_rank_before_upper_partition(self):
+        for dtype in (np.float32, np.float64):
+            image = np.array([9, -1, 3, 7], dtype=dtype).reshape(1, 2, 2)
+            for lower, upper in ((0, 100), (1, 99), (25, 75)):
+                low, high = np.percentile(image, [lower, upper])
+                clipped = np.clip(image, low, high).astype(dtype)
+                for backend in self.backends():
+                    with self.subTest(dtype=dtype, lower=lower, backend=backend):
+                        clip = A.Pipeline([A.ClipOutliers(lower, upper, p_retain_std=0)], backend=backend)
+                        np.testing.assert_allclose(clip({'image': image}, seed=0)['image'], clipped, atol=1e-6)
+                        normalize = A.Pipeline([A.Normalize('percentile', lower=lower, upper=upper)], backend=backend)
+                        expected = ((np.clip(image.astype(np.float64), low, high) - low) / (high-low)).astype(dtype)
+                        np.testing.assert_allclose(normalize({'image': image}, seed=0)['image'], expected, atol=1e-6)
+
     def test_masked_intensity_statistics_without_refilling(self):
         image = np.array([-10, 2, 4, 6, 20, 3], np.float32).reshape(1, 2, 3)
         mask = np.array([0, 1, 1, 1, 0, 1], bool).reshape(image.shape)

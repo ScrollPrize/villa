@@ -348,7 +348,7 @@ template<class T> inline double deviation(const std::vector<T>& v, double m) {
     double sum = 0; for (auto x : v) sum += (x - m) * (x - m);
     return v.size() > 1 ? std::sqrt(sum / (v.size() - 1)) : 0;
 }
-inline std::size_t reflect(std::int64_t i, std::size_t n) {
+VCR_HD inline std::size_t reflect(std::int64_t i, std::size_t n) {
     auto p = static_cast<std::int64_t>(2 * n); i = (i % p + p) % p;
     return static_cast<std::size_t>(i < static_cast<std::int64_t>(n) ? i : p - 1 - i);
 }
@@ -356,20 +356,34 @@ inline std::size_t reflect(std::int64_t i, std::size_t n) {
 // mirror does not (Torch "reflect"), nearest replicates it (SciPy "nearest").
 // Zero pads with zeros (Torch conv padding); only structure tensors use it.
 enum class Boundary { Reflect, Mirror, Nearest, Zero };
-inline std::size_t mirror(std::int64_t i, std::size_t n) {
+VCR_HD inline std::size_t mirror(std::int64_t i, std::size_t n) {
     if (n == 1) return 0;
     auto p = std::int64_t(2 * (n - 1)); i = (i % p + p) % p;
     return std::size_t(i < std::int64_t(n) ? i : p - i);
 }
+namespace filter_detail {
+// Index of a neighbour, or -1 for a zero-padded sample.
+VCR_HD inline long long neighbour(long long x, long long n, Boundary edge) {
+    if (x >= 0 && x < n) return x;
+    if (edge == Boundary::Zero) return -1;
+    if (edge == Boundary::Nearest) return x < 0 ? 0 : n - 1;
+    if (n == 1) return 0;
+    const bool mirror = edge == Boundary::Mirror;
+    const long long period = mirror ? 2 * (n - 1) : 2 * n;
+    x = (x % period + period) % period;
+    return x < n ? x : period - x - (mirror ? 0 : 1);
+}
+}
 // Accumulate a few adjacent outputs in registers, then write them once. Tap
 // order is unchanged, including the initial addition to zero.
-template<class T>
+template<class T, class Weight>
 inline void convolve_run(const T* source, T* output, std::size_t count,
-                         const std::vector<T>& kernel, const std::size_t* offsets) {
+                         const std::vector<Weight>& kernel, const std::size_t* offsets) {
+    using Acc = std::common_type_t<T, Weight>;
     constexpr std::size_t lanes = 16;
     std::size_t i = 0;
     for (; i + lanes <= count; i += lanes) {
-        std::array<T, lanes> sum{};
+        std::array<Acc, lanes> sum{};
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) {
             const auto* input = source + offsets[tap] + i;
             const auto weight = kernel[tap];
@@ -378,7 +392,7 @@ inline void convolve_run(const T* source, T* output, std::size_t count,
         std::copy(sum.begin(), sum.end(), output + i);
     }
     for (; i < count; ++i) {
-        T sum = 0;
+        Acc sum = 0;
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) sum += kernel[tap] * source[offsets[tap] + i];
         output[i] = sum;
     }
@@ -401,38 +415,51 @@ inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_w
     for (std::size_t i = 0; i < weights.size(); ++i) kernel[i] = T(weights[i] / sum);
     return kernel;
 }
-// Shared one-axis convolution with the same tap order for Gaussian and sinc filters.
-template<class T>
-inline void convolve_axis(const std::vector<T>& data, std::vector<T>& tmp, const Grid& g,
-                          std::size_t a, const std::vector<T>& kernel, Boundary edge, bool reverse=false) {
+// Shared one-axis correlation. Weight precision selects the accumulation type.
+template<class T, class Weight>
+inline void convolve_axis(const T* data, T* tmp, const Grid& g,
+                          std::size_t a, const std::vector<Weight>& kernel, Boundary edge, bool reverse=false) {
     const auto radius = int(kernel.size() / 2);
     const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
-    auto boundary = [&](std::int64_t x) {
-        if (edge == Boundary::Nearest) return std::size_t(std::clamp<std::int64_t>(x, 0, std::int64_t(extent) - 1));
-        return edge == Boundary::Mirror ? mirror(x, extent) : reflect(x, extent);
-    };
+    const auto boundary = [&](std::int64_t x) { return filter_detail::neighbour(x, extent, edge); };
     if (step == 1) {
-        // Extend each contiguous row once; even wide kernels and singleton
-        // dimensions then use the same branch-free convolution loop.
-        std::vector<std::size_t> indices(extent + 2 * radius), offsets(kernel.size());
+        // Extend each row once, retaining the optimized contiguous tap loop.
+        std::vector<long long> indices(extent + 2 * radius);
+        std::vector<std::size_t> offsets(kernel.size());
         for (std::size_t x = 0; x < indices.size(); ++x) indices[x] = boundary(std::int64_t(x) - radius);
         std::iota(offsets.begin(), offsets.end(), 0);
-        if(reverse)std::reverse(offsets.begin(),offsets.end());
+        if (reverse) std::reverse(offsets.begin(), offsets.end());
         std::vector<T> row(indices.size());
         for (std::size_t base = 0; base < g.size; base += extent) {
-            for (std::size_t x = 0; x < row.size(); ++x) row[x] = data[base + indices[x]];
-            convolve_run(row.data(), tmp.data() + base, extent, kernel, offsets.data());
+            for (std::size_t x = 0; x < row.size(); ++x) row[x] = indices[x] < 0 ? T(0) : data[base + indices[x]];
+            convolve_run(row.data(), tmp + base, extent, kernel, offsets.data());
         }
     } else {
         std::vector<std::size_t> offsets(extent * kernel.size());
         for (std::size_t x = 0; x < extent; ++x)
-            for (std::size_t tap = 0; tap < kernel.size(); ++tap)
-                offsets[x * kernel.size() + tap] = boundary(std::int64_t(x) + (reverse ? radius-std::int64_t(tap) : std::int64_t(tap)-radius)) * step;
+            for (std::size_t tap = 0; tap < kernel.size(); ++tap) {
+                const auto j = boundary(std::int64_t(x) + (reverse ? radius-std::int64_t(tap) : std::int64_t(tap)-radius));
+                offsets[x * kernel.size() + tap] = j < 0 ? std::size_t(-1) : std::size_t(j) * step;
+            }
         for (std::size_t base = 0; base < g.size; base += block)
-            for (std::size_t x = 0; x < extent; ++x)
-                convolve_run(data.data() + base, tmp.data() + base + x * step, step,
-                             kernel, offsets.data() + x * kernel.size());
+            for (std::size_t x = 0; x < extent; ++x) {
+                const auto* row = offsets.data() + x * kernel.size();
+                if (edge == Boundary::Zero && std::find(row, row + kernel.size(), std::size_t(-1)) != row + kernel.size()) {
+                    using Acc = std::common_type_t<T, Weight>;
+                    for (std::size_t i = 0; i < step; ++i) {
+                        Acc sum = 0;
+                        for (std::size_t tap = 0; tap < kernel.size(); ++tap)
+                            if (row[tap] != std::size_t(-1)) sum += kernel[tap] * data[base + row[tap] + i];
+                        tmp[base + x * step + i] = T(sum);
+                    }
+                } else convolve_run(data + base, tmp + base + x * step, step, kernel, row);
+            }
     }
+}
+template<class T, class Weight>
+inline void convolve_axis(const std::vector<T>& data, std::vector<T>& tmp, const Grid& g,
+                          std::size_t a, const std::vector<Weight>& kernel, Boundary edge, bool reverse=false) {
+    convolve_axis(data.data(), tmp.data(), g, a, kernel, edge, reverse);
 }
 template<class T>
 inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, Boundary edge = Boundary::Reflect, bool full_width = false) {

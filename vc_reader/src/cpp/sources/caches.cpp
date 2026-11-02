@@ -7,7 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
-#include <list>
+#include "../lru.hpp"
 #include <system_error>
 #include <unordered_map>
 
@@ -27,12 +27,8 @@ std::string canonicalDtype(std::string_view dtype)
         {"bool", "|b1"}, {"uint8", "|u1"}, {"int8", "|i1"}, {"uint16", "<u2"}, {"int16", "<i2"}, {"uint32", "<u4"}, {"int32", "<i4"},
         {"uint64", "<u8"}, {"int64", "<i8"}, {"float32", "<f4"}, {"float64", "<f8"}};
     if (const auto it = names.find(dtype); it != names.end()) return it->second;
-    if (dtype.size() == 3 && (dtype[0] == '<' || dtype[0] == '>' || dtype[0] == '|' || dtype[0] == '=')) {
-        std::string out(dtype);
-        if (out[0] == '=' || out[0] == '|') out[0] = out[2] == '1' ? '|' : '<';
-        if (out[2] == '1') out[0] = '|';
-        if ((out[1] == 'u' || out[1] == 'i' || out[1] == 'f' || out[1] == 'b') && std::string_view("1248").find(out[2]) != std::string_view::npos) return out;
-    }
+    if (dtype.size() == 3 && std::string_view("<>|=").find(dtype[0]) != std::string_view::npos)
+        return parseDtype(dtype).str();
     throw std::invalid_argument("unsupported dtype '" + std::string(dtype) + "'");
 }
 
@@ -63,9 +59,9 @@ std::size_t Block::itemsize() const { return std::size_t(dtype[2] - '0'); }
 struct DecodedCache::State {
     long pid = ::getpid();
     std::recursive_mutex mutex;
-    std::list<std::pair<std::string, Block>> order;  // oldest first
-    std::unordered_map<std::string, std::list<std::pair<std::string, Block>>::iterator> entries;
-    std::size_t nbytes = 0, hits = 0, misses = 0, peakWorking = 0, working = 0;
+    explicit State(std::size_t limit) : entries(limit) {}
+    Lru<Block> entries;
+    std::size_t hits = 0, misses = 0, peakWorking = 0, working = 0;
 };
 struct DecodedCache::Lease::Impl {
     std::shared_ptr<State> state;
@@ -88,7 +84,7 @@ void DecodedCache::Lease::release()
     }
 }
 
-DecodedCache::DecodedCache(std::size_t maxBytes, std::size_t maxDecodeBytes) : maxBytes_(maxBytes), maxDecodeBytes_(maxDecodeBytes), state_(std::make_shared<State>()) {}
+DecodedCache::DecodedCache(std::size_t maxBytes, std::size_t maxDecodeBytes) : maxBytes_(maxBytes), maxDecodeBytes_(maxDecodeBytes), state_(std::make_shared<State>(maxBytes)) {}
 
 std::shared_ptr<DecodedCache::State> DecodedCache::state()
 {
@@ -96,7 +92,7 @@ std::shared_ptr<DecodedCache::State> DecodedCache::state()
     if (state_->pid != ::getpid()) {
         // The inherited lock may have been held across fork: leave it alone.
         new std::shared_ptr<State>(state_);
-        state_ = std::make_shared<State>();
+        state_ = std::make_shared<State>(maxBytes_);
     }
     return state_;
 }
@@ -105,7 +101,7 @@ DecodedCache::Stats DecodedCache::stats()
 {
     const auto s = state();
     std::lock_guard lock(s->mutex);
-    return {s->nbytes, s->entries.size(), s->hits, s->misses, s->peakWorking};
+    return {s->entries.bytes(), s->entries.size(), s->hits, s->misses, s->peakWorking};
 }
 
 void DecodedCache::clear()
@@ -113,8 +109,6 @@ void DecodedCache::clear()
     const auto s = state();
     std::lock_guard lock(s->mutex);
     s->entries.clear();
-    s->order.clear();
-    s->nbytes = 0;
 }
 
 std::pair<Block, DecodedCache::Lease> DecodedCache::use(const std::string& key, std::size_t decodeBytes, std::size_t scratchBytes, const Load& load)
@@ -124,8 +118,8 @@ std::pair<Block, DecodedCache::Lease> DecodedCache::use(const std::string& key, 
     lease.impl_ = std::make_unique<Lease::Impl>();
     lease.impl_->state = s;
     lease.impl_->lock = std::unique_lock(s->mutex);
-    const auto found = s->entries.find(key);
-    const bool cached = found != s->entries.end();
+    const auto* found = s->entries.peek(key);
+    const bool cached = found != nullptr;
     const std::size_t needed = scratchBytes + (cached ? 0 : decodeBytes);
     if (needed + s->working > maxDecodeBytes_)
         throw DecodeBudgetError("decode working set needs " + std::to_string(needed) + " bytes; max_decode_bytes=" + std::to_string(maxDecodeBytes_) +
@@ -136,22 +130,12 @@ std::pair<Block, DecodedCache::Lease> DecodedCache::use(const std::string& key, 
     Block block;
     if (cached) {
         ++s->hits;
-        s->order.splice(s->order.end(), s->order, found->second);
-        block = found->second->second;
+        block = *s->entries.get(key);
     } else {
         ++s->misses;
         block = load();
         if (block.nbytes > decodeBytes) throw ImageFormatError("decoder returned more bytes than its declared working set");
-        if (block.nbytes > 0 && block.nbytes <= maxBytes_) {
-            while (!s->order.empty() && s->nbytes + block.nbytes > maxBytes_) {
-                s->nbytes -= s->order.front().second.nbytes;
-                s->entries.erase(s->order.front().first);
-                s->order.pop_front();
-            }
-            s->order.emplace_back(key, block);
-            s->entries[key] = std::prev(s->order.end());
-            s->nbytes += block.nbytes;
-        }
+        if (block.nbytes > 0) s->entries.put(key, block, block.nbytes);
     }
     return {std::move(block), std::move(lease)};
 }

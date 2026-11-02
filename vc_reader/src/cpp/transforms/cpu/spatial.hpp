@@ -4,6 +4,7 @@
 #include "intensity.hpp"
 #include "../shared/elastic.hpp"
 #include "../../directional_math.hpp"
+#include "../../sampling_math.hpp"
 
 namespace vcr::transforms {
 using Matrix = std::vector<double>;
@@ -42,7 +43,7 @@ template<std::size_t D = 0, bool Validity = false, class Real, class F> Real lin
         require(std::isfinite(q[a]), "nonfinite sampling coordinate");
         if (border) q[a] = std::clamp(q[a], Real(0), Real(g.shape[a] - 1));
         if (q[a] < -1 || q[a] > Real(g.shape[a])) return fill;
-        lo[a] = std::int64_t(std::floor(q[a])); fraction[a] = q[a] - lo[a];
+        sampling::splitCoordinate(q[a], 0, lo[a], fraction[a]);
     }
     const auto finish = [&](Real value) -> Real {
         if constexpr(std::is_same_v<Real,float>) if(!std::isfinite(value)) {

@@ -1159,25 +1159,12 @@ private:
     // A point's grid cell: the corner below it, its fractional offsets, and the axes on
     // which it is off the grid.
     template <std::size_t N, class Real = double>
-    struct Cell {
-        using value_type = Real;
-        std::int64_t lo[N ? N : kMaxSampleDims];
-        Real frac[N ? N : kMaxSampleDims];
-        std::size_t axes[N ? N : kMaxSampleDims];
-        std::size_t k = 0;
-    };
+    using Cell = sampling::Cell<N ? N : kMaxSampleDims, Real>;
 
     template <std::size_t N, class Real, class Coordinates, class Coord>
     static void cell_of(const Coord* c, std::size_t nd, Cell<N,Real>& cell, const Coordinates& coords)
     {
-        cell.k = 0;
-        for (std::size_t i = 0; i < (N ? N : nd); ++i) {
-            const Coord f = std::floor(c[i]);
-            cell.lo[i] = coords.base(i) + static_cast<std::int64_t>(f);
-            cell.frac[i] = c[i] - f;
-            if (cell.frac[i] != 0.0)
-                cell.axes[cell.k++] = i;
-        }
+        sampling::cellOf(c, N ? N : nd, cell, [&](std::size_t a) { return coords.base(a); });
     }
 
     // sample_linear with element loads `load`. A point whose neighbours all lie in one chunk

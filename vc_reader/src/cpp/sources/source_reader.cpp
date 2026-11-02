@@ -12,6 +12,7 @@
 
 #include "../array.hpp"
 #include "../reader_types.hpp"
+#include "../element_value.hpp"
 
 namespace vcr::sources {
 using nlohmann::json;
@@ -23,14 +24,6 @@ std::int64_t product(const std::vector<std::int64_t>& values)
     std::int64_t out = 1;
     for (const auto v : values) out *= v;
     return out;
-}
-ElementType elementType(const std::string& typestr)
-{
-    ElementType type;
-    type.kind = typestr[1];
-    type.itemsize = std::size_t(typestr[2] - '0');
-    type.swap = typestr[0] == '>';
-    return type;
 }
 // Selectors by index or by the names storage gives.
 std::int64_t selectIndex(const Selector& value, std::int64_t length, const std::string& name, const std::vector<std::string>& names)
@@ -60,38 +53,6 @@ std::string list(const std::vector<std::int64_t>& values)
     for (std::size_t i = 0; i < values.size(); ++i) text += (i ? ", " : "") + std::to_string(values[i]);
     if (values.size() == 1) text += ",";
     return text + ")";
-}
-
-// Number <-> stored element bytes, exactly.
-json elementValue(const std::uint8_t* p, const ElementType& type)
-{
-    std::uint8_t b[8]{};
-    std::memcpy(b, p, type.itemsize);
-    if (type.swap) std::reverse(b, b + type.itemsize);
-    switch (type.kind) {
-    case 'b': return b[0] != 0 ? 1 : 0;
-    case 'f':
-        if (type.itemsize == 4) {
-            float v;
-            std::memcpy(&v, b, 4);
-            return v;
-        } else {
-            double v;
-            std::memcpy(&v, b, 8);
-            return v;
-        }
-    case 'i': {
-        std::int64_t v = 0;
-        std::memcpy(&v, b, type.itemsize);
-        const int shift = 64 - int(type.itemsize) * 8;
-        return (v << shift) >> shift;
-    }
-    default: {
-        std::uint64_t v = 0;
-        std::memcpy(&v, b, type.itemsize);
-        return v;
-    }
-    }
 }
 
 void fillBlock(Block& block, const std::vector<std::uint8_t>& element)
@@ -214,46 +175,7 @@ Block takeAlong(const Block& block, std::size_t axis, const std::vector<std::int
 
 std::vector<std::uint8_t> elementBytes(const json& value, const std::string& typestr)
 {
-    const auto type = elementType(typestr);
-    const auto unrepresentable = [&] { throw std::invalid_argument("fill value " + value.dump() + " is not representable in " + dtypeName(typestr)); };
-    std::uint8_t b[8]{};
-    if (type.kind == 'f') {
-        const double v = value.get<double>();
-        if (type.itemsize == 4) {
-            const auto f = float(v);
-            if (std::isfinite(v) && !std::isfinite(f)) unrepresentable();
-            std::memcpy(b, &f, 4);
-        } else {
-            std::memcpy(b, &v, 8);
-        }
-    } else {
-        const bool isSigned = type.kind == 'i';
-        const int bits = type.kind == 'b' ? 1 : int(type.itemsize) * 8;
-        if (value.is_number_float()) {
-            const double v = value.get<double>();
-            if (!std::isfinite(v) || v != std::floor(v) || std::abs(v) >= 1.8446744073709552e19) unrepresentable();
-        }
-        std::uint64_t magnitude = 0;
-        bool negative = false;
-        if (value.is_number_float()) {
-            const double v = value.get<double>();
-            negative = v < 0;
-            magnitude = std::uint64_t(std::abs(v));
-        } else if (value.is_number_unsigned()) {
-            magnitude = value.get<std::uint64_t>();
-        } else {
-            const auto v = value.get<std::int64_t>();
-            negative = v < 0;
-            magnitude = negative ? ~std::uint64_t(v) + 1 : std::uint64_t(v);
-        }
-        const std::uint64_t maximum = type.kind == 'b' ? 1 : isSigned ? (std::uint64_t(1) << (bits - 1)) - 1 : (bits == 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << bits) - 1);
-        if (negative && (!isSigned || magnitude > maximum + 1)) unrepresentable();
-        if (!negative && magnitude > maximum) unrepresentable();
-        const std::uint64_t raw = negative ? ~magnitude + 1 : magnitude;
-        std::memcpy(b, &raw, type.itemsize);
-    }
-    if (type.swap) std::reverse(b, b + type.itemsize);
-    return std::vector<std::uint8_t>(b, b + type.itemsize);
+    return encodeElement(value, elementOf(typestr), ValueEncoding::Exact);
 }
 
 // ---- exact encodings ----
@@ -285,7 +207,7 @@ struct SourceReader::Lookup {
     }
     Lookup(const Encoding& encoding, const std::string& inputDtype, std::size_t selectedChannels)
     {
-        input = elementType(inputDtype);
+        input = elementOf(inputDtype);
         if (input.kind == 'f') bad("integer/color encoding requires integer decoded samples");
         outputDtype = canonicalDtype(encoding.dtype);
         outSize = std::size_t(outputDtype[2] - '0');
@@ -330,8 +252,8 @@ struct SourceReader::Lookup {
     [[noreturn]] void unknown(const std::uint8_t* p) const
     {
         std::string text = "(";
-        for (std::size_t c = 0; c < channels; ++c) text += (c ? ", " : "") + elementValue(p + c * input.itemsize, input).dump();
-        if (channels == 1) text = elementValue(p, input).dump();
+        for (std::size_t c = 0; c < channels; ++c) text += (c ? ", " : "") + decodeElement(p + c * input.itemsize, input).dump();
+        if (channels == 1) text = decodeElement(p, input).dump();
         else text += ")";
         bad("unknown encoding value " + text + "; declare a fallback to accept it");
     }
@@ -667,7 +589,7 @@ struct SourceReader::Backend {
         axes = grid(p).axes;
         registration = registrationAt(p, selection);
         const auto type = reader->meta.type;
-        fill = elementValue(reader->meta.fill.data(), type);
+        fill = decodeElement(reader->meta.fill.data(), type);
         const auto& attrs = zarr::arrayAttributes(*reader, options);
         const auto strings = [](const json& value) {
             std::vector<std::string> out;
@@ -1014,7 +936,7 @@ void SourceReader::open()
     const std::size_t channelCount = channels_ ? channels_->size() : 0;
     if (source_.encoding) {
         if (source_.encoding->kind == "color" && !channels_) bad("color encoding requires a decoded color channel axis; palette PNG uses indices");
-        const auto tableBytes = source_.encoding->pairs.size() * (elementType(infoDtype).itemsize * std::max<std::size_t>(channelCount, 1) + 8) * 2;
+        const auto tableBytes = source_.encoding->pairs.size() * (elementOf(infoDtype).itemsize * std::max<std::size_t>(channelCount, 1) + 8) * 2;
         auto lease = cache_->working(tableBytes);
         lookup_ = std::make_unique<Lookup>(*source_.encoding, infoDtype, channelCount);
         dtype_ = lookup_->outputDtype;
@@ -1043,11 +965,11 @@ void SourceReader::open()
             Block values = Block::allocate(lookup_->color ? std::vector<std::int64_t>{std::int64_t(channelCount)} : std::vector<std::int64_t>{1}, rawDtype_);
             for (std::size_t i = 0; i < values.nbytes; i += bytes.size()) std::memcpy(values.data.get() + i, bytes.data(), bytes.size());
             const Block encoded = lookup_->apply(values, lookup_->color ? std::optional<std::size_t>(0) : std::nullopt);
-            fill = elementValue(encoded.data.get(), elementType(dtype_));
+            fill = decodeElement(encoded.data.get(), elementOf(dtype_));
         }
     }
     fillBytes_ = elementBytes(fill, dtype_);
-    fill_ = elementValue(fillBytes_.data(), elementType(dtype_));
+    fill_ = decodeElement(fillBytes_.data(), elementOf(dtype_));
     palette_ = zarr_ ? json(nullptr) : first->palette();
     if (zarr_) {
         registration_ = backend_->registration;
@@ -1168,7 +1090,7 @@ Block SourceReader::read(const std::vector<std::int64_t>& start, const std::vect
         if (zarr_) {
             std::size_t count = 1;
             for (const auto& [axis, range] : bounds) count *= std::size_t(range.second - range.first);
-            const std::size_t scratch = count * (std::max<std::size_t>(channelCount, 1) * elementType(rawDtype_).itemsize * 3 + (lookup_ ? 64 + std::size_t(dtype_[2] - '0') : 0));
+            const std::size_t scratch = count * (std::max<std::size_t>(channelCount, 1) * elementOf(rawDtype_).itemsize * 3 + (lookup_ ? 64 + std::size_t(dtype_[2] - '0') : 0));
             auto lease = cache_->working(scratch);
             std::vector<std::pair<std::int64_t, std::int64_t>> ordered;
             for (const auto& axis : spatialAxes_) ordered.push_back(bounds[axis]);
@@ -1227,7 +1149,7 @@ Block SourceReader::read(const std::vector<std::int64_t>& start, const std::vect
             std::size_t count = 1;
             for (const auto& [axis, range] : bounds)
                 if (hasAxis(pageAxes, axis)) count *= std::size_t(range.second - range.first);
-            const auto pageItem = elementType(info.dtype).itemsize;
+            const auto pageItem = elementOf(info.dtype).itemsize;
             const std::size_t scratch = lookup_ || channelInPage ? count * (64 + std::max<std::size_t>(channelCount, 1) * pageItem * 3) : 0;
             std::vector<std::int64_t> target;
             for (const auto& axis : axes_) {

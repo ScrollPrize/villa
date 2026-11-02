@@ -14,6 +14,57 @@
 #define VCR_SAMPLE_HD
 #endif
 namespace vcr::sampling {
+template<class Coordinate, class Fraction>
+VCR_SAMPLE_HD inline void splitCoordinate(Coordinate q, std::int64_t base, std::int64_t& low, Fraction& fraction)
+{
+    const Coordinate floor = std::floor(q);
+    low = base + static_cast<std::int64_t>(floor);
+    fraction = q - floor;
+}
+
+template<std::size_t N, class Real = float>
+struct Cell {
+    using value_type = Real;
+    std::int64_t lo[N];
+    Real frac[N];
+    std::size_t axes[N];
+    std::size_t k = 0;
+};
+
+template<class Coordinate, class C, class Base>
+VCR_SAMPLE_HD inline void cellOf(const Coordinate* q, std::size_t dimensions, C& cell, Base base)
+{
+    cell.k = 0;
+    for (std::size_t a = 0; a < dimensions; ++a) {
+        splitCoordinate(q[a], base(a), cell.lo[a], cell.frac[a]);
+        if (cell.frac[a] != 0) cell.axes[cell.k++] = a;
+    }
+}
+
+// Dense multilinear sampling with edge replication. Corner order, intermediate
+// weight precision and zero-weight evaluation are explicit numerical policies.
+template<int D, class T, class Real, class Weight = Real, bool ReverseCorners = false, bool SkipZero = false, class Shape>
+VCR_SAMPLE_HD inline T clamped(const T* data, const Shape& shape, const Real* q)
+{
+    std::int64_t lo[D]; Real f[D];
+    for (int a = 0; a < D; ++a) {
+        const Real x = q[a] < 0 ? 0 : q[a] > Real(shape[a] - 1) ? Real(shape[a] - 1) : q[a];
+        splitCoordinate(x, 0, lo[a], f[a]);
+    }
+    T value = 0;
+    for (int corner = 0; corner < (1 << D); ++corner) {
+        Weight weight = 1; std::size_t at = 0;
+        for (int a = 0; a < D; ++a) {
+            const int bit = (corner >> (ReverseCorners ? D - 1 - a : a)) & 1;
+            weight *= bit ? f[a] : Real(1) - f[a];
+            const auto x = std::min(lo[a] + bit, std::int64_t(shape[a]) - 1);
+            at = at * shape[a] + std::size_t(x);
+        }
+        if (!SkipZero || weight != 0) value += T(weight) * data[at];
+    }
+    return value;
+}
+
 // Coordinates use separate float32 rounding on every architecture. Interpolation
 // may use FMA, but coordinate contraction can change nearest half-voxel ties.
 VCR_SAMPLE_HD inline float step(float value, float axis, float index) {

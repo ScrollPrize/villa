@@ -17,13 +17,7 @@
 
 namespace vcr::sampling {
 
-struct PointCell {
-    using value_type = float;
-    std::int64_t lo[3];
-    float frac[3];
-    std::size_t axes[3];
-    std::size_t k = 0;
-};
+using PointCell = Cell<3>;
 
 // The value at index-space point base + c (ZYX): nearest (order 0) or linear. Voxels
 // outside the volume read as fill; non-finite linear points give NaN. False when a
@@ -67,13 +61,7 @@ VCR_POINT_HD inline bool point(Lookup& L, const std::int64_t* base, const float*
         return true;
     }
     PointCell cell;
-    for (int a = 0; a < 3; ++a) {
-        const float low = floorf(c[a]);
-        cell.lo[a] = base[a] + std::int64_t(low);
-        cell.frac[a] = c[a] - low;
-        if (cell.frac[a] != 0.0f)
-            cell.axes[cell.k++] = std::size_t(a);
-    }
+    cellOf(c, 3, cell, [&](std::size_t a) { return base[a]; });
     const auto fill = [&](std::size_t) { return L.fill; };
     // Every neighbour inside the volume and in the near corner's block: read that block.
     bool whole = cell.lo[0] >= 0 && cell.lo[1] >= 0 && cell.lo[2] >= 0;

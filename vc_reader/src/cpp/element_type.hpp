@@ -1,5 +1,7 @@
 #pragma once
 #include <algorithm>
+#include <bit>
+#include <string_view>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -76,6 +78,8 @@ struct ElementType {
                 return v;
             });
         };
+        if (kind == 'f' && itemsize == 2)
+            return dispatch([this](const std::uint8_t* p) { return load(p); });
         if (kind == 'b')
             return dispatch([](const std::uint8_t* p) { return *p != 0; });
         switch (kind == 'f' ? 100 + itemsize : kind == 'i' ? 10 + itemsize : itemsize) {
@@ -95,14 +99,30 @@ struct ElementType {
 };
 
 
-// The element type of a numpy typestr such as "<f4" or "|u1".
-inline ElementType elementOf(const std::string& typestr)
+// Validated storage dtype. Native aliases are resolved once at the boundary.
+struct Dtype {
+    char order = '|', kind = 'u';
+    std::size_t itemsize = 1;
+    ElementType element() const {
+        return {kind, itemsize, itemsize > 1 && ((order == '>') == (std::endian::native == std::endian::little))};
+    }
+    std::string str() const { return std::string(1, itemsize == 1 ? '|' : order) + kind + std::to_string(itemsize); }
+};
+inline Dtype parseDtype(std::string_view text)
 {
-    ElementType type;
-    type.kind = typestr[1];
-    type.itemsize = std::size_t(typestr[2] - '0');
-    type.swap = typestr[0] == '>';
-    return type;
+    const auto invalid = [&]() -> Dtype { throw std::invalid_argument("unsupported dtype '" + std::string(text) + "'"); };
+    Dtype t;
+    std::size_t i = 0;
+    if (!text.empty() && std::string_view("<>|=").find(text[0]) != std::string_view::npos) t.order = text[i++];
+    if (i >= text.size() || std::string_view("buif").find(text[i]) == std::string_view::npos) return invalid();
+    t.kind = text[i++];
+    if (i + 1 != text.size() || std::string_view("1248").find(text[i]) == std::string_view::npos) return invalid();
+    t.itemsize = std::size_t(text[i] - '0');
+    if ((t.kind == 'b' && t.itemsize != 1) || (t.kind == 'f' && t.itemsize == 1)) return invalid();
+    if (t.order == '=' || (t.order == '|' && t.itemsize > 1)) t.order = std::endian::native == std::endian::little ? '<' : '>';
+    return t;
 }
+
+inline ElementType elementOf(const std::string& typestr) { return parseDtype(typestr).element(); }
 
 }  // namespace vcr

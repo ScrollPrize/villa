@@ -54,8 +54,8 @@ VCR_ALIGNED_HD inline bool supported(const Grid& g,std::size_t i) {
         const float q=sampling::affine(g.origin[a],g.axes+3*a,float(p[0]),float(p[1]),float(p[2]));
         if(!std::isfinite(q) || q<=-0x1p60f || q>=0x1p60f) return false;
         if(g.plane && a==0) { if(q<-.5f || q>.5f) return false; continue; }
-        const float f=floorf(q), fraction=q-f;
-        auto lo=g.base[a]+std::int64_t(f);
+        float fraction; std::int64_t lo;
+        sampling::splitCoordinate(q, g.base[a], lo, fraction);
         if(!g.order) lo+=nearest_rounds_up(fraction);
         const auto hi=lo+(g.order && fraction!=0);
         if(lo<0 || hi>=g.source[a]) return false;
@@ -78,8 +78,7 @@ VCR_ALIGNED_HD inline Cell cell(const Grid& g, std::size_t i) {
             if (q<-.5f || q>.5f) return c;
             continue;
         }
-        const float f=floorf(q);
-        lo[a]=g.base[a]+std::int64_t(f); fraction[a]=q-f;
+        sampling::splitCoordinate(q, g.base[a], lo[a], fraction[a]);
         if (!g.order) lo[a]+=nearest_rounds_up(fraction[a]);
     }
     const int first=g.plane ? 1 : 0, corners=g.order ? (1<<(3-first)) : 1;
