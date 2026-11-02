@@ -340,6 +340,8 @@ HttpResponse perform(const HttpClient::Config& config,
         // request fails verification with an empty response. Use the Windows
         // native certificate store instead (curl >= 7.71).
         curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        // An HTTPS proxy is verified with its own options.
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
         use_host_ca_bundle(curl);
 
@@ -548,6 +550,8 @@ HttpResponse HttpClient::put_file(std::string_view url,
         // See perform(): use the Windows native cert store — the MSYS2
         // OpenSSL CA bundle path doesn't exist on end-user machines.
         curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        // An HTTPS proxy is verified with its own options.
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
         use_host_ca_bundle(curl);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,

@@ -56,37 +56,55 @@ class BaseAuxTrainer(BaseTrainer):
             return batch
 
         batch_size = image.shape[0]
-        per_sample: List[dict] = []
+        if batch_size == 0:
+            return batch
+        generated: Dict[str, List[torch.Tensor | None]] = {
+            name: [] for name in self._aux_target_configs
+        }
         for idx in range(batch_size):
             sample = {}
             for key, value in batch.items():
-                if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == batch_size
+                ):
                     sample[key] = value[idx]
                 elif isinstance(value, (list, tuple)) and len(value) == batch_size:
                     sample[key] = value[idx]
                 else:
                     sample[key] = value
-            per_sample.append(self._inject_aux_targets(sample, is_training=is_training))
+            for aux_name, cfg in self._aux_target_configs.items():
+                generated[aux_name].append(
+                    self._compute_aux_tensor(
+                        aux_name,
+                        cfg,
+                        sample,
+                        is_training=is_training,
+                    )
+                )
 
-        merged: Dict[str, List] = {}
-        for sample in per_sample:
-            for key, value in sample.items():
-                if isinstance(value, torch.Tensor):
-                    merged.setdefault(key, []).append(value)
-                elif isinstance(value, (list, tuple)):
-                    merged.setdefault(key, []).append(value)
-                else:
-                    merged.setdefault(key, [value])
+        augmented = dict(batch)
+        generated_names: List[str] = []
+        for aux_name, tensors in generated.items():
+            available = [tensor is not None for tensor in tensors]
+            if not all(available):
+                missing = [idx for idx, present in enumerate(available) if not present]
+                raise ValueError(
+                    f"Auxiliary target '{aux_name}' could not be generated for "
+                    f"batch samples {missing}; every sample must provide its "
+                    "source target."
+                )
+            augmented[aux_name] = torch.stack(tensors, dim=0)
+            generated_names.append(aux_name)
 
-        rebuilt: Dict[str, object] = {}
-        for key, values in merged.items():
-            if isinstance(values[0], torch.Tensor) and len(values) == batch_size:
-                rebuilt[key] = torch.stack(values, dim=0)
-            elif len(values) == batch_size:
-                rebuilt[key] = list(values)
-            else:
-                rebuilt[key] = values[0]
-        return rebuilt
+        regression_keys = _flatten_metadata_names(batch.get("regression_keys"))
+        for aux_name in generated_names:
+            if aux_name not in regression_keys:
+                regression_keys.append(aux_name)
+        if regression_keys:
+            augmented["regression_keys"] = regression_keys
+        return augmented
 
     # ------------------------------------------------------------------ helpers
 
@@ -156,3 +174,16 @@ class BaseAuxTrainer(BaseTrainer):
             targets_dict=targets_dict,
             outputs=outputs,
         )
+
+
+def _flatten_metadata_names(value) -> List[str]:
+    """Normalize collated metadata into one ordered list of string keys."""
+    names: List[str] = []
+    if isinstance(value, str):
+        names.append(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            for name in _flatten_metadata_names(item):
+                if name not in names:
+                    names.append(name)
+    return names

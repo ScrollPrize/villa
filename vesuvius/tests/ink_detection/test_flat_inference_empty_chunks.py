@@ -92,21 +92,26 @@ class _ZeroLogits(nn.Module):
 
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("nonempty_index", [0, 1])
+@pytest.mark.parametrize("roi_bounds", [None, (4, 6, 7, 10)])
 def test_inference_completes_skipped_tiles_without_adding_weights(
-    batch_size, nonempty_index
+    batch_size, nonempty_index, roi_bounds
 ):
     accumulator, probability, weight, _ = _accumulator((2, 3), (2, 3))
     # A raw-nonempty robust-normalized patch can itself be all zero.
     images = torch.zeros((2, 1, 1, 2, 2))
     metadata = torch.tensor([[0, 0, 2, 2, 0], [0, 1, 2, 2, 0]])
     metadata[nonempty_index, 4] = 1
+    if roi_bounds is not None:
+        # Metadata stays in the parent frame; accumulation uses the ROI frame.
+        metadata[:, 0] += roi_bounds[0]
+        metadata[:, 1] += roi_bounds[2]
     model = _ZeroLogits()
     run_block_inference(
         loader=DataLoader(TensorDataset(images, metadata), batch_size=batch_size),
         model=model, accumulator=accumulator,
         weight_map=np.ones((2, 2), dtype=np.float32), mask=None,
         device=torch.device("cpu"), amp_dtype=None, tta_axes=(),
-        tta_batch_size=None,
+        tta_batch_size=None, roi_bounds=roi_bounds,
     )
     assert model.images_seen == 1
     assert not accumulator.buffers

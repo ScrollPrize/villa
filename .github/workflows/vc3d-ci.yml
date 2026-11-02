@@ -176,6 +176,13 @@ jobs:
             volume-cartographer
             vc_object_store
             vc_reader
+      # Fibers 3D tests need a real X server and software OpenGL. The pinned
+      # builder already contains the database headers, but not these runtimes.
+      - name: Install headless OpenGL runtime
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            xvfb xauth libxcb-cursor0 libgl1-mesa-dri libglx-mesa0
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -193,7 +200,11 @@ jobs:
             -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
             -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-core --target vc_test_core --parallel 4
-          ctest --test-dir build/ci-fast-core --output-on-failure \
+          # Fibers 3D tests exercise real Qt/OpenGL framebuffers. The offscreen
+          # Qt platform cannot host QOpenGLWidget; use Xvfb with Mesa instead.
+          QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 \
+            xvfb-run -a -s '-screen 0 1280x1024x24' \
+            ctest --test-dir build/ci-fast-core --output-on-failure \
             --parallel 4 -L '^vc-core$'
           sccache --show-stats
 
@@ -494,7 +505,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
-      - name: Compile Flatboi and PaStiX
+      - name: Build and test Flatboi and PaStiX
         working-directory: volume-cartographer
         run: |
           sccache --zero-stats
@@ -505,8 +516,9 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=OFF -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_FLATBOI=ON
-          cmake --build build/ci-fast-flatboi --target flatboi --parallel 4
+            -DVC_BUILD_FLATBOI=ON \
+            -DFLATBOI_BUILD_SLIM_TESTS=ON
+          ninja -C build/ci-fast-flatboi flatboi check_slim_assembly -j4
           sccache --show-stats
 
   mcp-test:
