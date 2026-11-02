@@ -52,7 +52,7 @@ _constructors = (
     "Transpose CropPad Affine Elastic SheetCompression LowResolution ThickSlice "
     "Morphology RandomBinaryOperator RemoveComponents ReplaceLabel Regions OneHot "
     "MaskImage DeepSupervision ToPseudo2D FromPseudo2D MedialSurface StripGeometry SurfacePerturb OrientedBlur "
-    "DistanceTransform StructureTensor Ridges "
+    "DistanceTransform StructureTensor Ridges CoherenceEnhancingDiffusion "
     "BiasField PlasmaBrightnessContrast PlasmaShadow Illumination Vignetting RandomToneCurve "
     "Equalize CLAHE HistogramMatching PixelDistributionAdaptation FDA MultiplicativeNoise ShotNoise "
     "AdditiveNoise SaltAndPepper MotionBlur Defocus ZoomBlur UnsharpMask GibbsRinging RingingOvershoot "

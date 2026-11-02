@@ -125,6 +125,21 @@ def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None =
     it requires zero boundaries, field="components", and no at/confidence.
     """
     ...
+def CoherenceEnhancingDiffusion(sigma: float = 1, rho: float = 2, lambda_: float = .01,
+                               exponent: float = 2, alpha: float = .01, step_size: float = .1,
+                               num_steps: int = 10, *, on: str | Sequence[str] | None = None,
+                               channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
+    """CED of each selected channel of a (C,Y,X) image or (C,Z,Y,X) volume.
+
+    Recomputes Pavel structure tensors each step with nearest-edge filtering.
+    sigma/rho are voxel scales; lambda_ is a structure-tensor eigengap threshold
+    in squared input-intensity units. No automatic intensity normalization.
+    alpha in (0,1] sets minimum diffusivity; exponent must be positive.
+    No-flux explicit updates conserve mass with step_size in (0,1/6].
+    num_steps=0 is identity. Uses unit voxel spacing and preserves float dtype.
+    """
+    ...
+
 def Ridges(sigma: float = 6, gamma: float = 1.5, beta1: float = .5, beta2: float = .5, *,
            on: str | Sequence[str] | None = None, channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
     """Hessian ridge response after smoothing/normalization. Uses second-order boundary differences.

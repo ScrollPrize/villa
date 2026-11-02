@@ -17,6 +17,7 @@
 #include "ops/stripe_masking.hpp"
 #include "ops/structure_tensor.hpp"
 #include "ops/ridges.hpp"
+#include "ops/coherence_enhancing_diffusion.hpp"
 
 namespace vcr::transforms {
 namespace volume_detail {
@@ -57,6 +58,16 @@ inline void check(const Ridges& t) {
     require(std::isfinite(t.sigma) && t.sigma >= 0 && std::isfinite(t.gamma) && t.gamma > 0 &&
             std::isfinite(t.beta1) && t.beta1 > 0 && std::isfinite(t.beta2) && t.beta2 > 0,
             "Ridges needs finite nonnegative sigma and positive gamma/beta");
+}
+inline void check(const CoherenceEnhancingDiffusion& t) {
+    require(std::isfinite(t.sigma) && t.sigma >= 0 && t.sigma < 1000 &&
+            std::isfinite(t.rho) && t.rho >= 0 && t.rho < 1000, "sigma and rho must be in [0, 1000)");
+    require(std::isfinite(t.lambda) && t.lambda > 0 && std::isfinite(t.exponent) && t.exponent > 0,
+            "diffusion lambda and exponent must be positive and finite");
+    require(std::isfinite(t.alpha) && t.alpha > 0 && t.alpha <= 1, "diffusion alpha must be in (0, 1]");
+    require(std::isfinite(t.step_size) && t.step_size > 0 && t.step_size <= 1./6,
+            "diffusion step_size must be in (0, 1/6] for explicit 2D/3D stability");
+    require(t.num_steps >= 0, "diffusion num_steps must be nonnegative");
 }
 inline void check(const StructureTensor& t) {
     require(t.gradient.empty() || (t.boundary == Boundary::Zero && t.field == StructureField::Components && t.at.empty() && t.confidence.empty()),

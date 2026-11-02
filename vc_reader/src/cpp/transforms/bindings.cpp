@@ -265,6 +265,12 @@ NB_MODULE(_transforms, m) {
         t.sigma=a.get("sigma",t.sigma); t.gamma=a.get("gamma",t.gamma);
         t.beta1=a.get("beta1",t.beta1); t.beta2=a.get("beta2",t.beta2);
     });
+    bind<CoherenceEnhancingDiffusion>(m, "CoherenceEnhancingDiffusion", [](auto& t, auto& a) {
+        t.sigma = a.get("sigma", t.sigma); t.rho = a.get("rho", t.rho);
+        t.lambda = a.get("lambda_", t.lambda); t.exponent = a.get("exponent", t.exponent);
+        t.alpha = a.get("alpha", t.alpha); t.step_size = a.get("step_size", t.step_size);
+        t.num_steps = a.get("num_steps", t.num_steps);
+    });
     bind<StructureTensor>(m, "StructureTensor", [](auto& t, auto& a) {
         t.gradient = a.kw("gradient", t.gradient);
         t.on = a.get("on", t.on); t.channel = a.get("channel", t.channel); t.output = a.get("output", t.output);

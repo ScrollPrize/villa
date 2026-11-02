@@ -109,5 +109,6 @@ void apply_cuda(const MedialSurface&, Sample&, const Parameters&, Session&);
 void apply_cuda(const OrientedBlur&, Sample&, const Parameters&, Session&);
 void apply_cuda(const DistanceTransform&, Sample&, const Parameters&, Session&);
 void apply_cuda(const Ridges&, Sample&, const Parameters&, Session&);
+void apply_cuda(const CoherenceEnhancingDiffusion&, Sample&, const Parameters&, Session&);
 void apply_cuda(const StructureTensor&, Sample&, const Parameters&, Session&);
 } // namespace vcr::transforms::cuda

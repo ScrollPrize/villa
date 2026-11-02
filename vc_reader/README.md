@@ -167,6 +167,7 @@ integer writes. All these operations use float32 on CPU and CUDA.
 | Device buffers, streams, resident pipelines and batches | `cuda.hpp`: `transforms::cuda::begin_device`, `run_device`, `run_batch`; `cuda_available.hpp`: `cuda::available` | `cuda_buffer.hpp`, `cuda_stream.hpp`, `transforms/cuda/device_run.hpp` | `cuda.py`: `DeviceArray`, `is_available`, `asarray`, `wrap` |
 | PyTorch GPU transforms and prefetching; masked normalization; differentiable structure tensors | `transforms.hpp`: `StructureTensor` (component cotangent via `gradient`) | `transforms/` | `torch.py`: `CudaLoader`, `normalize`, `structure_tensor` |
 | Pavel/Gaussian structure components, directions; Euclidean distances; Hessian ridge responses | `transforms.hpp`: `StructureTensor`, `DistanceTransform`, `Ridges` | `transforms/cpu/`, `transforms/cuda/` | `transforms.StructureTensor`, `DistanceTransform`, `Ridges` |
+| Coherence-enhancing diffusion of a single image or volume, on CPU or CUDA | `transforms.hpp`: `CoherenceEnhancingDiffusion` | `transforms/cpu/coherence_enhancing_diffusion.hpp`, `transforms/cuda/coherence_enhancing_diffusion.cu` | `transforms.CoherenceEnhancingDiffusion` |
 
 ### Shared primitives
 
@@ -1611,6 +1612,53 @@ For label ridge filtering, compose `GaussianBlur(sigma=2, boundary="reflect",
 truncate=4, full_width=False)`, `Normalize("minmax")`, and `Ridges()`.
 `Ridges` uses second-order one-sided differences at boundaries and requires
 at least three samples on each spatial axis.
+
+`CoherenceEnhancingDiffusion` processes a single channel-first `(C,Y,X)` image
+or `(C,Z,Y,X)` volume. Channels are independent, labels are unchanged, and the
+usual `on`, `channels`, `p`, and `p_channel` options apply. Both backends preserve
+float32/float64 input dtype. Volume buffers and eigendecomposition use that dtype;
+filter coefficients and CPU convolution accumulation follow `StructureTensor`.
+
+```python
+from vc_reader import transforms as A
+
+diffuse = A.Pipeline([
+    A.CoherenceEnhancingDiffusion(sigma=1, rho=2, lambda_=0.01,
+                                 exponent=2, alpha=0.01,
+                                 step_size=0.1, num_steps=10),
+], backend="cuda")  # or "cpu"
+result = diffuse({"image": volume[None]}, seed=0)["image"][0]
+```
+
+`volume` is a contiguous floating-point `(Z,Y,X)` array. CUDA device inputs and
+`Pipeline.batch` also work; iterations keep their buffers on the device.
+The corresponding C++ operation is `vcr::transforms::CoherenceEnhancingDiffusion`
+in a `Pipeline`, with the threshold member named `lambda`.
+
+Each iteration recomputes a Pavel structure tensor with nearest-edge filtering.
+`sigma` controls presmoothing and `rho` controls tensor integration, both in voxels.
+The diffusion tensor follows the CED eigenvalue mapping in
+[Mirebeau et al., equation (11)](https://insight-journal.org/pdfs/953.pdf):
+`mu_i = alpha + (1-alpha)*exp(-(lambda_/(l_max-l_i))**exponent)`, with `mu_i=alpha`
+for zero eigengap. `lambda_` is in squared input-intensity units; inputs are not
+automatically normalized. Scaling intensities by `k` requires scaling `lambda_`
+by `k*k` to retain the same diffusion strengths.
+
+The explicit stencil uses forward differences and their negative adjoint, with
+zero outward flux. It conserves total intensity (up to roundoff) and is L2 stable
+for the enforced `0 < step_size <= 1/6`; `alpha` must be in `(0,1]`.
+`num_steps=0` is identity. This stencil does not guarantee a maximum principle,
+so small intensity overshoots are possible; results are not clipped.
+Voxel spacing is assumed isotropic and equal to one. The complete volume and
+scratch buffers must fit memory; this API does not tile or stream diffusion.
+
+Validate CED with the existing build and Python environment:
+
+```bash
+AGENTS_AGENT_MODE=1 CCACHE_DISABLE=1 cmake --build vc_reader/build-native-cuda --target _transforms test_native_transforms -j 2
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_READER_BUILD_DIR="$PWD/vc_reader/build-native-cuda" vesuvius/.venv/bin/python -m pytest vc_reader/tests/test_coherence_enhancing_diffusion.py vc_reader/tests/test_image_processing.py
+ctest --test-dir vc_reader/build-native-cuda -R '^test_native_transforms$' --output-on-failure
+```
 
 `geometry.rasterize_mesh_slice` intersects XYZ triangles with a Z plane,
 rounds DDA samples to even, and returns labels plus optional normals and frames.

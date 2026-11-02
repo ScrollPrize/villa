@@ -44,6 +44,20 @@ int main()
         OrientedBlur blur; blur.axis = {0, 0, 0}; rejected(blur, "zero axis");
         DistanceTransform distance; distance.suffix = ""; rejected(distance, "empty suffix");
         StructureTensor tensor; tensor.derivative = Derivative::Gaussian; tensor.sigma = 0; rejected(tensor, "gaussian sigma");
+        CoherenceEnhancingDiffusion diffusion;
+        diffusion.step_size = .2; rejected(diffusion, "unstable diffusion step");
+        diffusion.step_size = .1; diffusion.alpha = 1; diffusion.num_steps = 1;
+        auto diffused = Pipeline({diffusion}, schema).run(input, 0, true);
+        const auto& heat = diffused.sample.at("image").array;
+        double mass = 0;
+        for (std::size_t i = 0; i < heat.size(); ++i) mass += heat.get(i);
+        require(std::abs(mass-78) < 1e-5, "diffusion conserves intensity");
+        require(std::abs(heat.get(0)-1.5) < 1e-5, "diffusion has no-flux boundaries");
+        auto diffusion_replay = Pipeline({diffusion}, schema);
+        const auto replayed_heat = diffusion_replay.replay(input,
+            load_plan(diffusion_replay.program(), save_plan(diffused.plan)));
+        require(std::memcmp(heat.data(), replayed_heat.sample.at("image").array.data(),
+                            heat.size()*sizeof(float)) == 0, "diffusion native replay");
         ForegroundCrop crop; rejected(crop, "crop shape");
         ObjectDropout dropout; dropout.fill.image = std::numeric_limits<double>::infinity(); rejected(dropout, "fill value");
         HistogramMatching matching; rejected(matching, "missing reference");

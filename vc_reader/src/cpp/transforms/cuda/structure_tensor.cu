@@ -1,15 +1,10 @@
-#include "separable_filter.cuh"
+#include "structure_gradients.cuh"
 #include "../cpu/structure_tensor.hpp"
 namespace vcr::transforms::cuda {
 namespace {
 using namespace structure_tensor_detail;
+using namespace structure_detail;
 using filter_detail::separable_cuda;
-template<class T, class S> __device__ void scale_copy(KernelIndex vcr_launch, const S* in, T* out, std::size_t n, double scale) {
-    EACH_INDEX(n) out[i] = T(double(in[i])*scale);
-}
-struct scale_copy_launch {
-    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { scale_copy(index,args...); }
-};
 template<class T> __device__ void products(KernelIndex vcr_launch, T* const* gradient, T* components, std::size_t n, int d) {
     EACH_INDEX(n) for (int c = 0; c < component_count(d); ++c) {
         int a, b; component_axes(c,d,a,b); components[c*n+i] = gradient[a][i]*gradient[b][i];
@@ -90,21 +85,9 @@ void apply_cuda(const StructureTensor& t, Sample& s, const Parameters&, Session&
     const auto run = [&](auto tag) {
         using T = decltype(tag);
         const std::size_t n = grid.size; const int count = component_count(d);
-        Buffer<T> base(n), tmp(n);
-        a.typed([&](auto in) { launch(blocks(n),256,0,vcr::device::stream(), scale_copy_launch{}, in.ptr+t.channel*n,base.ptr,n,t.scale); });
-        T* data = base.ptr; T* scratch = tmp.ptr;
-        if (t.derivative == Derivative::Pavel && t.sigma > 0) separable_cuda(data,scratch,grid,std::vector<Taps>(d,torch_gaussian(t.sigma)),t.boundary);
-        const auto taps = gradient_taps(t,d);
-        std::vector<Buffer<T>> gradient; std::vector<T*> pointers;
-        for (int axis_ = 0; axis_ < d; ++axis_) {
-            gradient.emplace_back(n);
-            check(copy_async(gradient.back().ptr,data,n*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
-            Buffer<T> local(n); T* g = gradient.back().ptr; T* sc = local.ptr;
-            separable_cuda(g,sc,grid,taps[axis_],t.boundary);
-            if (g != gradient.back().ptr) check(copy_async(gradient.back().ptr,g,n*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
-            pointers.push_back(gradient.back().ptr);
-        }
-        Buffer<T*> table(pointers);
+        structure_detail::Gradients<T> workspace(t,grid);
+        a.typed([&](auto in) { workspace.compute(in.ptr+t.channel*n,t,grid); });
+        const auto& table = *workspace.table;
         if (!t.gradient.empty()) {
             const auto& cotangent = session.arrays.at(t.gradient);
             require(cotangent.shape[0] == std::size_t(count) && cotangent.spatial() == grid.shape &&
@@ -126,7 +109,7 @@ void apply_cuda(const StructureTensor& t, Sample& s, const Parameters&, Session&
             Buffer<T> total(n); check(cudaMemsetAsync(total.ptr,0,n*sizeof(T),vcr::device::stream()));
             for (int axis_ = 0; axis_ < d; ++axis_) {
                 T* v = dg[axis_].ptr; T* w = work.ptr;
-                separable_cuda(v,w,grid,transpose_taps(taps[axis_]),Boundary::Zero);
+                separable_cuda(v,w,grid,transpose_taps(workspace.taps[axis_]),Boundary::Zero);
                 launch(blocks(n),256,0,vcr::device::stream(),add_gradient_launch{},v,total.ptr,n);
             }
             T* v = total.ptr; T* w = work.ptr;
