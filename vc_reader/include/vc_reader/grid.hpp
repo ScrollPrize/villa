@@ -79,6 +79,8 @@ struct Raster {
 class Surface {
 public:
     explicit Surface(Vertices vertices, SurfaceOptions options = {});
+    // An immutable owned copy, suitable for workers that outlive an editing transaction.
+    static std::shared_ptr<const Surface> snapshot(Vertices vertices, SurfaceOptions options = {});
     ~Surface();
     Surface(const Surface&) = delete;
     Surface& operator=(const Surface&) = delete;

@@ -12,7 +12,8 @@
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include "vc/lasagna/Dataset.hpp"
 #include <vc_reader/grid.hpp>
 #include <cstdlib>
@@ -76,7 +77,25 @@ TEST_CASE("coordinate textures sample the upsampled vertex grid trilinearly")
         for (int c = 0; c < 4; ++c)
             coords(r, c) = {float(1 + c), float(2 + r), 3.0f};
     coords(2, 3) = {-1, -1, -1};
-    const auto texture = vc::core::util::renderCoordsTexture(coords, {ct.array.get(), ct.meta.type}, 2, "test");
+    const auto texture = [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, 2);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
     REQUIRE(texture.rows == 6);
     REQUIRE(texture.cols == 8);
     // Pixel (i, j) sits at grid column 0.5 i - 0.25, row 0.5 j - 0.25; the volume is

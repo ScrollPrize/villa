@@ -6,7 +6,7 @@
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include "vc/core/util/ImageMat.hpp"

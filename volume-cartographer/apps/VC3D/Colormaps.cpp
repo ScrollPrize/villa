@@ -1,4 +1,5 @@
-#include "vc/core/render/Colormaps.hpp"
+#include <vc_reader/display.hpp>
+#include "Colormaps.hpp"
 
 #include <opencv2/imgproc.hpp>
 
@@ -83,21 +84,6 @@ std::vector<OverlayColormapEntry> buildEntries(const EntryScope scope)
 
 } // namespace
 
-void applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut,
-                    uint32_t* outBuf, int outStride)
-{
-    const int rows = values.rows;
-    const int cols = values.cols;
-
-    for (int y = 0; y < rows; ++y) {
-        const auto* src = values.ptr<uint8_t>(y);
-        auto* dst = outBuf + y * outStride;
-        for (int x = 0; x < cols; ++x) {
-            nt_store_u32(&dst[x], lut[src[x]]);
-        }
-    }
-}
-
 const std::vector<OverlayColormapSpec>& specs() noexcept
 {
     static const std::vector<OverlayColormapSpec>& specsRef = buildSpecs();
@@ -143,12 +129,12 @@ void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec
             }
             it = lutCache.emplace(spec.opencvCode, lut).first;
         }
-        applyPackedLut(values, it->second.data(), outBuf, outStride);
+        vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), it->second.data(), outBuf, outStride);
         return;
     }
 
     if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut != nullptr) {
-        applyPackedLut(values, spec.discreteLut, outBuf, outStride);
+        vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), spec.discreteLut, outBuf, outStride);
         return;
     }
 
@@ -168,7 +154,7 @@ void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec
             auto b = static_cast<uint32_t>(std::min(f * tB, 255.0f));
             lut[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
-        applyPackedLut(values, lut.data(), outBuf, outStride);
+        vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), outBuf, outStride);
     }
 }
 

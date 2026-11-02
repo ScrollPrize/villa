@@ -6,7 +6,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../VCSettings.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -89,18 +89,18 @@ std::string sanitizedCompositeMethod(const std::string& method)
     return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
 }
 
-QString samplingMethodName(vc::Sampling method)
+QString samplingMethodName(int method)
 {
-    return method == vc::Sampling::Trilinear
+    return method == 1
         ? QStringLiteral("trilinear")
         : QStringLiteral("nearest");
 }
 
-vc::Sampling samplingMethodFromName(const QString& name)
+int samplingMethodFromName(const QString& name)
 {
     return name.compare(QStringLiteral("trilinear"), Qt::CaseInsensitive) == 0
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
+        ? 1
+        : 0;
 }
 
 std::string defaultOverlayColormap()
@@ -262,9 +262,9 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         const QSignalBlocker blocker(_ui.samplingMethodSelect);
         _ui.samplingMethodSelect->clear();
         _ui.samplingMethodSelect->addItem(
-            tr("Nearest"), static_cast<int>(vc::Sampling::Nearest));
+            tr("Nearest"), static_cast<int>(0));
         _ui.samplingMethodSelect->addItem(
-            tr("Trilinear"), static_cast<int>(vc::Sampling::Trilinear));
+            tr("Trilinear"), static_cast<int>(1));
     }
     setSamplingMethod(_overlaySamplingMethod);
 
@@ -348,7 +348,7 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayWindowHigh = 255.0f;
     _overlayIntensityAsAlpha = false;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
-    _overlaySamplingMethod = vc::Sampling::Nearest;
+    _overlaySamplingMethod = 0;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
     _compositeLayersFront = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT;
@@ -757,7 +757,7 @@ void VolumeOverlayController::loadState()
     _overlayWindowHigh = 255.0f;
     _overlayColormapName = defaultOverlayColormap();
     _overlayIntensityAsAlpha = false;
-    _overlaySamplingMethod = vc::Sampling::Nearest;
+    _overlaySamplingMethod = 0;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
@@ -931,7 +931,7 @@ void VolumeOverlayController::setOpacity(float value)
     }
 }
 
-void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
+void VolumeOverlayController::setSamplingMethod(int method)
 {
     _overlaySamplingMethod = method;
 
@@ -1170,7 +1170,7 @@ void VolumeOverlayController::handleSamplingMethodChanged(int index)
         return;
     }
 
-    setSamplingMethod(static_cast<vc::Sampling>(
+    setSamplingMethod(static_cast<int>(
         _ui.samplingMethodSelect->itemData(index).toInt()));
     if (!_suspendPersistence) {
         saveState();

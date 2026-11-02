@@ -2,7 +2,8 @@
 #include <iomanip>
 #include <sstream>
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include <vc_reader/zarr.hpp>
 #include <algorithm>
 #include <cmath>
@@ -1297,8 +1298,25 @@ FiberReplayOverview renderFiberReplayOverview(
         normalWorkingToBaseScale, parallelThreads,
         validateFiberReplayStripCtVolume(ct),
         [&](const auto& coords, int scale) {
-            return vc::core::util::renderCoordsTexture(
-                coords, {ct.array.get(), ct.meta.type}, scale, "Replay overview CT sampling");
+            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
         });
 }
 
@@ -1313,8 +1331,25 @@ FiberReplayOverview renderFiberReplayTraceOverview(
         normalWorkingToBaseScale, parallelThreads,
         validateFiberReplayStripCtVolume(ct),
         [&](const auto& coords, int scale) {
-            return vc::core::util::renderCoordsTexture(
-                coords, {ct.array.get(), ct.meta.type}, scale, "Replay overview CT sampling");
+            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
         });
 }
 

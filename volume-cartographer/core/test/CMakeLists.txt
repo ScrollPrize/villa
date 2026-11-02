@@ -315,7 +315,9 @@ vc_add_test(NAME test_point_collection_widget
 
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
-vc_add_test(NAME test_post_process)
+vc_add_test(NAME test_post_process SOURCES test_post_process.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/DisplayPalette.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_surface_meshing)
 
@@ -483,7 +485,8 @@ vc_add_test(NAME test_thinning)
 
 vc_add_test(NAME test_umbilicus)
 
-vc_add_test(NAME test_colormaps)
+vc_add_test(NAME test_colormaps SOURCES test_colormaps.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Colormaps.cpp INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_quadsurface_io)
 

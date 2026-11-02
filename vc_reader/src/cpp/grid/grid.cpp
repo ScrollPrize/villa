@@ -263,6 +263,21 @@ Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_un
         s.buildDerivatives();
 }
 
+std::shared_ptr<const Surface> Surface::snapshot(Vertices vertices, SurfaceOptions options)
+{
+    auto result = std::make_shared<Surface>(vertices, std::move(options));
+    auto& s = *result->impl_;
+    const auto n = std::size_t(vertices.rows) * std::size_t(vertices.cols) * 3;
+    if (n && s.packed.empty()) s.packed.assign(vertices.xyz, vertices.xyz + n);
+    if (n && vertices.normals && s.packedNormals.empty())
+        s.packedNormals.assign(vertices.normals, vertices.normals + n);
+    s.v.xyz = s.packed.data();
+    s.v.normals = s.packedNormals.empty() ? nullptr : s.packedNormals.data();
+    s.v.valid = s.valid.data();
+    s.v.stride = std::size_t(vertices.cols) * 3;
+    return result;
+}
+
 Surface::~Surface() = default;
 const Vertices& Surface::vertices() const { return impl_->v; }
 const SurfaceOptions& Surface::options() const { return impl_->options; }

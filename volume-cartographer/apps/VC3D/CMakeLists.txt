@@ -4,6 +4,8 @@ set(CMAKE_AUTORCC ON)
 qt6_wrap_cpp(vccollection_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 
 set(srcs
+    DisplayPalette.cpp
+    Colormaps.cpp
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
     ${vccollection_moc}
     VCAppMain.cpp

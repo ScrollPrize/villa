@@ -1,3 +1,4 @@
+#include <vc_reader/display.hpp>
 // The VC3D viewer samples each frame from the caches alone (vcr::grid) and reads
 // what was missing in the background: frames never read the volume's store, the
 // background read makes the next frame complete, and coarser levels fill holes
@@ -99,7 +100,7 @@ TEST_CASE("viewer levels and level choice")
 TEST_CASE("frames sample the caches only; the background read completes them")
 {
     Fixture f;
-    for (const auto sampling : {vc::Sampling::Nearest, vc::Sampling::Trilinear}) {
+    for (const auto sampling : {0, 1}) {
         CAPTURE(int(sampling));
         OpenedVolumes opened(64 << 20);
         const auto levels = openLevels(opened, *f.volume);
@@ -119,7 +120,7 @@ TEST_CASE("frames sample the caches only; the background read completes them")
         r = vc3d::sampleCached(planeAt(5), what, &again);
         CHECK(again.empty());
         cv::Mat_<uint8_t> values(32, 32, uint8_t(0)), coverage(32, 32, uint8_t(0));
-        vc3d::toDisplay(r, 0, values.ptr(), coverage.ptr());
+        vcr::display::toUint8(r.values.data(), std::size_t(r.width) * r.height, values.ptr(), coverage.ptr());
         CHECK(cv::countNonZero(coverage) == 32 * 32);
         // Voxel centres: nearest and linear both give the stored values.
         for (int y = 0; y < 32; ++y)
@@ -133,7 +134,7 @@ TEST_CASE("a coarser level in memory fills a frame while the start level loads")
     Fixture f;
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
-    const vc3d::ViewerSample what{levels, 0, 1, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    const vc3d::ViewerSample what{levels, 0, 1, 0, {0.0f}, std::nullopt};
     {
         vc3d::ViewerLoad load;
         vc3d::sampleCached(planeAt(4), what, &load);
@@ -157,7 +158,7 @@ TEST_CASE("pixels outside the volume read as fill and are not read in the backgr
     const auto levels = openLevels(opened, *f.volume);
     vc3d::ViewerGeometry g;
     g.plane = vcr::grid::Plane{{28, 3, 3}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 8, 1};  // x 28 .. 35
-    const vc3d::ViewerSample what{levels, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    const vc3d::ViewerSample what{levels, 0, 0, 0, {0.0f}, std::nullopt};
     vc3d::ViewerLoad load;
     vc3d::sampleCached(g, what, &load);
     REQUIRE(load.target.size() == 1);
@@ -185,7 +186,7 @@ TEST_CASE("a GPU frame that fails renders on the CPU")
     vc3d::ViewerGeometry g;
     g.plane = vcr::grid::Plane{{0, 0, 6}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 16, 16};
     const auto rendered = [&](const std::shared_ptr<const vc3d::ViewerLevels>& from) {
-        vc3d::ViewerSample what{from, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+        vc3d::ViewerSample what{from, 0, 0, 0, {0.0f}, std::nullopt};
         vc3d::ViewerLoad load;
         vc3d::sampleCached(g, what, &load);
         vc3d::loadPending(load, [] { return true; });
@@ -247,7 +248,7 @@ TEST_CASE("a frame on an anisotropic level samples where the level's placement s
     CHECK(levels->voxelExtent(1) == std::array<double, 3>{1, 2, 2});
     CHECK(vc3d::maximumBaseVoxelExtent(*levels, 1) == doctest::Approx(2.0));
     const auto frame = [&](int start, int fallback) {
-        const vc3d::ViewerSample what{levels, start, fallback, vc::Sampling::Trilinear, {0.0f}, std::nullopt};
+        const vc3d::ViewerSample what{levels, start, fallback, 1, {0.0f}, std::nullopt};
         vc3d::ViewerLoad load;
         (void)vc3d::sampleCached(planeAt(5, 28, 28), what, &load);
         vc3d::loadPending(load, [] { return true; });
@@ -280,7 +281,7 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     g.surface = vc3d::gridSurface(quad);
     REQUIRE(g.surface);
     g.raster = {0.25, 0.25, 0.25, 0.25, 30, 30};  // voxels 1 .. 30 in x and y
-    vc3d::ViewerSample what{levels, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    vc3d::ViewerSample what{levels, 0, 0, 0, {0.0f}, std::nullopt};
     vc3d::ViewerLoad load;
     vc3d::sampleCached(g, what, &load);
     vc3d::loadPending(load, [] { return true; });
@@ -292,7 +293,7 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     CompositeParams params;
     REQUIRE(setCompositeMethod(params, "max"));
     what.offsets = {-1.0f, 0.0f, 1.0f};
-    what.composite = vc3d::compositeOptions(params);
+    what.composite = (params.volumetric ? std::nullopt : std::optional(params.options));
     REQUIRE(what.composite);
     vc3d::ViewerLoad more;
     vc3d::sampleCached(g, what, &more);
@@ -302,7 +303,7 @@ TEST_CASE("a QuadSurface grid samples like the plane it lies on, composites redu
     const float expected = float(std::max({f.at0(5, 10, 10), f.at0(6, 10, 10), f.at0(7, 10, 10)}));
     CHECK(r.values[9 * 30 + 9] == expected);
     REQUIRE(setCompositeMethod(params, "volumetric"));
-    CHECK_FALSE(vc3d::compositeOptions(params));
+    CHECK_FALSE((params.volumetric ? std::nullopt : std::optional(params.options)));
     CHECK_FALSE(setCompositeMethod(params, "nothing"));
     CHECK(compositeMethodName(params) == "volumetric");
 }
@@ -314,12 +315,12 @@ TEST_CASE("a zoomed-out frame takes resident finer data and does not read its ow
     const auto levels = openLevels(opened, *f.volume);
     // Level 0 in memory (as after zooming in); the frame wants level 1.
     {
-        const vc3d::ViewerSample fine{levels, 0, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+        const vc3d::ViewerSample fine{levels, 0, 0, 0, {0.0f}, std::nullopt};
         vc3d::ViewerLoad load;
         vc3d::sampleCached(planeAt(5), fine, &load);
         vc3d::loadPending(load, [] { return true; });
     }
-    const vc3d::ViewerSample coarse{levels, 1, 0, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    const vc3d::ViewerSample coarse{levels, 1, 0, 0, {0.0f}, std::nullopt};
     vc3d::ViewerLoad load;
     const auto r = vc3d::sampleCached(planeAt(5), coarse, &load);
     CHECK(load.empty());
@@ -335,7 +336,7 @@ TEST_CASE("GPU frames match CPU frames: resident bricks only, background reads l
         return;
     }
     Fixture f;
-    for (const auto sampling : {vc::Sampling::Nearest, vc::Sampling::Trilinear}) {
+    for (const auto sampling : {0, 1}) {
         CAPTURE(int(sampling));
         OpenedVolumes cpu(64 << 20), gpu(64 << 20, 64 << 20);
         const auto cpuLevels = openLevels(cpu, *f.volume);
@@ -372,7 +373,7 @@ TEST_CASE("the background read stops when told to, and volumetric views have no 
     Fixture f;
     OpenedVolumes opened(64 << 20);
     const auto levels = openLevels(opened, *f.volume);
-    const vc3d::ViewerSample what{levels, 0, 1, vc::Sampling::Nearest, {0.0f}, std::nullopt};
+    const vc3d::ViewerSample what{levels, 0, 1, 0, {0.0f}, std::nullopt};
     vc3d::ViewerLoad load;
     vc3d::sampleCached(planeAt(5), what, &load);
     REQUIRE(load.coarse.size() == 1);
@@ -388,9 +389,9 @@ TEST_CASE("the background read stops when told to, and volumetric views have no 
 
     CompositeParams params;
     REQUIRE(setCompositeMethod(params, "max"));
-    CHECK(vc3d::compositeOptions(params));
+    CHECK((params.volumetric ? std::nullopt : std::optional(params.options)));
     params.volumetric = true;
-    CHECK_FALSE(vc3d::compositeOptions(params));
+    CHECK_FALSE((params.volumetric ? std::nullopt : std::optional(params.options)));
 }
 
 TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer is asked for")
@@ -400,7 +401,7 @@ TEST_CASE("toDisplay reads a composite's single value per pixel whichever layer 
     composite.height = 1;
     composite.values = {10.0f, std::numeric_limits<float>::quiet_NaN()};
     uint8_t values[2] = {}, coverage[2] = {};
-    vc3d::toDisplay(composite, 3, values, coverage);
+    vcr::display::toUint8(composite.values.data(), std::size_t(composite.width) * composite.height, values, coverage);
     CHECK(values[0] == 10);
     CHECK(coverage[0] != 0);
     CHECK(coverage[1] == 0);
@@ -413,12 +414,31 @@ TEST_CASE("a cursor's offset from a surface is the frame's layer offset, in phys
         for (int c = 0; c < 4; ++c) points(r, c) = cv::Vec3f(float(c), float(r), 8.f);
     QuadSurface quad(points, {1.f, 1.f});
     const auto surface = vc3d::gridSurface(quad, {1.f, 1.f, 2.f});  // z voxels are twice as long
-    const auto point = vc3d::surfacePointAt(*surface, {1.5, 1.5});
-    REQUIRE(point);
-    CHECK(point->position == cv::Vec3f(1.5f, 1.5f, 8.f));
-    // A physical offset of 4 moves two z voxels, and maps back to 4.
-    const cv::Vec3f layer = point->position + point->offsetNormal * 4.f;
-    CHECK(std::abs(layer[2] - 8.f) == doctest::Approx(2.f));
-    CHECK(point->offsetOf(layer) == doctest::Approx(4.f));
-    CHECK_FALSE(vc3d::surfacePointAt(*surface, {10.0, 1.0}));
+    float xy[]{1.5f,1.5f};
+    cv::Vec3f position, normal;
+    surface->pointsAt(xy,1,position.val,normal.val);
+    CHECK(position == cv::Vec3f(1.5f,1.5f,8.f));
+    const auto layer=position+normal*4.f;
+    CHECK(std::abs(layer[2]-8.f)==doctest::Approx(2.f));
+    CHECK((layer-position).dot(normal)/normal.dot(normal)==doctest::Approx(4.f));
+    xy[0]=10; surface->pointsAt(xy,1,position.val,normal.val);
+    CHECK_FALSE(std::isfinite(position[0]));
+}
+
+TEST_CASE("retained native snapshots survive edits and owner destruction")
+{
+    std::shared_ptr<const vcr::grid::Surface> old;
+    {
+        cv::Mat_<cv::Vec3f> points(3,3);
+        for(int y=0;y<3;++y) for(int x=0;x<3;++x) points(y,x)={float(x),float(y),5.f};
+        QuadSurface quad(points,{1,1});
+        old=vc3d::gridSurface(quad);
+        for(auto& p:*quad.rawPointsPtr()) p[2]=9;
+        quad.invalidateCache();
+        const auto current=vc3d::gridSurface(quad);
+        const float xy[]{1,1};float xyz[3];
+        current->pointsAt(xy,1,xyz,nullptr);CHECK(xyz[2]==9);
+    }
+    const float xy[]{1,1};float xyz[3];
+    old->pointsAt(xy,1,xyz,nullptr);CHECK(xyz[2]==5);
 }

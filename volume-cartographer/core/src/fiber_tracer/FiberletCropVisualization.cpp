@@ -1,7 +1,8 @@
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 
 #include "vc/core/util/ImageMat.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include "vc/core/util/TexturedMesh.hpp"
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
@@ -104,7 +105,25 @@ void writeFiberletCropBoxVisualization(
         const std::string materialName = "fiberlet_crop_" + std::string(face.name);
         vc::core::util::writeTiffMat(
             directory / textureName,
-            vc::core::util::renderCoordsTexture(coordinates, {ct.array.get(), ct.meta.type}, 1, "Fiberlet crop texture sampling"));
+            [&]() {
+                const auto& vertices = coordinates;
+                const int factor = std::max(1, 1);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }());
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);
         vcr::zarr::atomicWrite(
             directory / (stem + "_" + face.name + ".obj"),

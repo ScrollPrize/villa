@@ -122,35 +122,14 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
     auto options = surface.gridOptions();
     options.spacing = spacing;
     std::vector<std::uint8_t> valid;
-    return std::make_shared<const vcr::grid::Surface>(surface.gridVertices(valid, points), std::move(options));
-}
-
-std::optional<SurfacePoint> surfacePointAt(const vcr::grid::Surface& surface, const cv::Vec2d& grid)
-{
-    const float xy[2] = {float(grid[0]), float(grid[1])};
-    SurfacePoint point;
-    surface.pointsAt(xy, 1, point.position.val, point.offsetNormal.val);
-    if (!std::isfinite(point.position[0]) || !std::isfinite(point.offsetNormal[0]))
-        return std::nullopt;
-    return point;
-}
-
-vcr::grid::Result ViewerGeometry::sample(const vcr::grid::Request& request, const ViewerLevels& levels) const
-{
-    auto result = plane ? vcr::grid::sample(*plane, request) : vcr::grid::sample(*surface, raster, request);
-    // Device memory, a frame over the brick budget or a device failure, as when many
-    // volumes fill the card: vc_reader rendered the frame on the CPU and gave the bricks
-    // back; these levels stay on the CPU, since their bricks never load after a failure.
-    if (!result.cudaFailure.empty() && !levels.gpuFailed->exchange(true))
-        Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", result.cudaFailure);
-    return result;
+    return vcr::grid::Surface::snapshot(surface.gridVertices(valid, points), std::move(options));
 }
 
 vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSample& what, ViewerLoad* load)
 {
     const ViewerLevels& levels = *what.levels;
     vcr::grid::Request request;
-    request.order = what.sampling == vc::Sampling::Nearest ? 0 : 1;
+    request.order = what.sampling;
     request.offsets = what.offsets;
     request.composite = what.composite;
     request.cachedOnly = true;
@@ -170,7 +149,10 @@ vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSampl
         add(level);
     if (request.levels.empty())
         return {};
-    auto result = geometry.sample(request, levels);
+    auto result = geometry.plane ? vcr::grid::sample(*geometry.plane, request)
+                                 : vcr::grid::sample(*geometry.surface, geometry.raster, request);
+    if (!result.cudaFailure.empty() && !levels.gpuFailed->exchange(true))
+        Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", result.cudaFailure);
     if (!load)
         return result;
 
@@ -212,32 +194,15 @@ void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart)
         for (const auto& part : *parts) {
             auto request = part.request;
             request.pixels = part.pixels.data();
-            part.geometry.sample(request, *part.levels);
+            const auto& geometry = part.geometry;
+            const auto result = geometry.plane ? vcr::grid::sample(*geometry.plane, request)
+                : vcr::grid::sample(*geometry.surface, geometry.raster, request);
+            if (!result.cudaFailure.empty() && !part.levels->gpuFailed->exchange(true))
+                Logger()->warn("GPU frame failed, these levels render on the CPU from now on: {}", result.cudaFailure);
         }
         if (!parts->empty() && !afterPart())
             return;
     }
 }
 
-std::optional<vcr::composite::Options> compositeOptions(const CompositeParams& params)
-{
-    if (params.volumetric)
-        return std::nullopt;
-    return params.options;
-}
-
-void toDisplay(const vcr::grid::Result& result, int layer, uint8_t* values, uint8_t* coverage)
-{
-    const std::size_t pixels = std::size_t(result.width) * std::size_t(result.height);
-    // Composites have one value per pixel; layers are layer-major.
-    const float* v = result.values.data() + (result.values.size() == pixels ? 0 : std::size_t(layer) * pixels);
-    for (std::size_t q = 0; q < pixels; ++q) {
-        const float value = v[q];
-        if (!std::isfinite(value))
-            continue;
-        values[q] = static_cast<uint8_t>(std::clamp(value, 0.0f, 255.0f));
-        coverage[q] = 1;
-    }
-}
-
-}  // namespace vc3d
+} // namespace vc3d

@@ -9,10 +9,11 @@
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/OutputDirectory.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include <vc_reader/array.hpp>
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
@@ -1115,8 +1116,25 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     auto inspection = renderFiberReplayInspection(item.points, replay,
                         *referenceNormals, source.traceScale, source.renderSource,
                         [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
-                            return vc::core::util::renderCoordsTexture(
-                                coords, source.renderGridLevel, scale, "Replay CT");
+                            return [&]() {
+                const auto& vertices = coords;
+                const int factor = std::max(1, scale);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {source.renderGridLevel};
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }();
                         },
                         [&](const auto& coords, int scale) {
                             return renderFiberReplayPresenceTexture(coords, scale, source.renderSource,

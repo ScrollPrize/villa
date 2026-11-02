@@ -957,7 +957,7 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
 }
 
-void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
+void ViewerManager::setOverlaySamplingMethod(int method)
 {
     _overlaySamplingMethod = method;
     forEachBaseViewer([this](VolumeViewerBase* v) {

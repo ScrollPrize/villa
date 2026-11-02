@@ -1,9 +1,10 @@
+#include <vc_reader/display.hpp>
 // Coverage for core/src/render/Colormaps.cpp.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -108,7 +109,7 @@ TEST_CASE("applyPackedLut: identity-ish LUT round-trips")
         values(1, c) = static_cast<uint8_t>(c * 40 + 10);
     }
     std::vector<uint32_t> out(2 * 4, 0);
-    applyPackedLut(values, lut.data(), out.data(), 4);
+    vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), out.data(), 4);
     CHECK(out[0] == lut[0]);
     CHECK(out[1] == lut[40]);
     CHECK(out[4] == lut[10]);
@@ -121,7 +122,7 @@ TEST_CASE("applyPackedLut handles non-contiguous stride")
     cv::Mat_<uint8_t> values(2, 2, uint8_t(42));
     // outStride=4 leaves padding columns 2 and 3 untouched.
     std::vector<uint32_t> out(2 * 4, 0xDEADBEEFu);
-    applyPackedLut(values, lut.data(), out.data(), 4);
+    vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), out.data(), 4);
     CHECK(out[0] == lut[42]);
     CHECK(out[1] == lut[42]);
     CHECK(out[2] == 0xDEADBEEFu); // padding preserved

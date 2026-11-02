@@ -597,7 +597,7 @@ std::shared_ptr<const vcr::grid::Surface> QuadSurface::pointSurface() const
     std::lock_guard<std::mutex> lock(_cacheMutex);
     if (!_pointSurface) {
         std::vector<std::uint8_t> valid;
-        _pointSurface = std::make_shared<vcr::grid::Surface>(gridVertices(valid, _points.get()), gridOptions());
+        _pointSurface = vcr::grid::Surface::snapshot(gridVertices(valid, _points.get()), gridOptions());
     }
     return _pointSurface;
 }
@@ -611,6 +611,7 @@ void QuadSurface::dropPointSurface() const
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
 {
     _channels[name] = channel;
+    dropPointSurface();
 }
 
 cv::Mat QuadSurface::channel(const std::string& name, int flags)

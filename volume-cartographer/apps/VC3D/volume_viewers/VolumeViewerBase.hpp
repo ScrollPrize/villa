@@ -19,7 +19,6 @@
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "volume_viewers/SurfaceProjection.hpp"
-#include "vc/core/types/Sampling.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Compositing.hpp"
 
@@ -120,7 +119,7 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
-    virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
+    virtual void setOverlaySamplingMethod(int method) = 0;
     virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;

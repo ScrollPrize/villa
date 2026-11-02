@@ -14,7 +14,6 @@
 #include <vc_reader/affine.hpp>
 
 #include "vc/core/util/Compositing.hpp"
-#include "vc/core/types/Sampling.hpp"
 
 
 class QMdiArea;
@@ -93,8 +92,8 @@ public:
     float overlayOpacity() const { return _overlayOpacity; }
 
     void setOverlayColormap(const std::string& colormapId);
-    void setOverlaySamplingMethod(vc::Sampling method);
-    vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
+    void setOverlaySamplingMethod(int method);
+    int overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayIntensityAsAlpha(bool enabled);
     bool overlayIntensityAsAlpha() const { return _overlayIntensityAsAlpha; }
 
@@ -255,7 +254,7 @@ private:
     std::shared_ptr<Volume> _overlayVolume;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
-    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
+    int _overlaySamplingMethod{0};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     bool _overlayIntensityAsAlpha{false};

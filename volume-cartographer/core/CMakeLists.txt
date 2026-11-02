@@ -10,7 +10,6 @@ add_library(vc_core
         src/PolylineObj.cpp
         src/OutputDirectory.cpp
         src/TexturedMesh.cpp
-        src/SurfaceTexture.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -38,8 +37,6 @@ add_library(vc_core
         src/StoredCollection.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/Colormaps.cpp
-        src/render/PostProcess.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 

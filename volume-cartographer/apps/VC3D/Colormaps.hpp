@@ -51,20 +51,4 @@ void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec
 
 const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible) noexcept;
 
-// Non-temporal store for write-only ARGB32 output -- bypasses cache,
-// freeing cache lines for read-heavy LUT/chunk data.
-inline void nt_store_u32(uint32_t* dst, uint32_t val) noexcept {
-#if defined(__x86_64__)
-    _mm_stream_si32(reinterpret_cast<int*>(dst), static_cast<int>(val));
-#elif defined(__aarch64__) && __has_builtin(__builtin_nontemporal_store)
-    __builtin_nontemporal_store(val, dst);
-#else
-    *dst = val;
-#endif
-}
-
-// Apply a packed uint32_t[256] LUT to a grayscale image, writing ARGB32 output.
-void applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut,
-                    uint32_t* outBuf, int outStride);
-
-}  // namespace vc
+} // namespace vc

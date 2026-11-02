@@ -1,3 +1,4 @@
+#include <vc_reader/display.hpp>
 #include "CChunkedVolumeViewer.hpp"
 
 #include <atomic>
@@ -9,8 +10,8 @@
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
-#include "vc/core/render/Colormaps.hpp"
-#include "vc/core/render/PostProcess.hpp"
+#include "Colormaps.hpp"
+#include "DisplayPalette.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -495,7 +496,7 @@ void CChunkedVolumeViewer::reloadPerfSettings()
         s.value(viewer::POINT_COLLECTION_VIEW_TOLERANCE,
                 viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
-    const vc::Sampling sampling = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
+    const int sampling = static_cast<int>(std::clamp(interpIdx, 0, 1));
     _samplingMethod = sampling;
     _maxDisplayedResolution = std::clamp(
         s.value(viewer::MAX_DISPLAYED_RESOLUTION, viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
@@ -1297,8 +1298,8 @@ struct CChunkedVolumeViewer::RenderContext {
     float zOff = 0.0f;
     int startLevel = 0;
     int overlayStartLevel = 0;
-    vc::Sampling samplingMethod = vc::Sampling::Trilinear;
-    vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
+    int samplingMethod = 1;
+    int overlaySamplingMethod = 0;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
@@ -1433,7 +1434,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto cam = volumetricCamera();
 
         std::array<uint32_t, 256> colorLut{};
-        vc::buildWindowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
+        vcr::display::windowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
         // Ray-segment length correction 1/|d_w| so tilted views don't look
         // artificially transparent (per-frame constant: parallel rays).
         const auto dir = vc3d::volumetric::viewDirection(cam);
@@ -1524,7 +1525,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             ? vc3d::volumetric::computeSlabMargins(volumetricCamera(), numLayers, zStart, ctx.scale, ctx.fbW, ctx.fbH)
             : flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
         const auto stack = frameGeometry(margins);
-        base.sampling = vc::Sampling::Nearest;
+        base.sampling = 0;
         base.offsets = layerOffsets(front, behind, zStep);
         const auto sampled = vc3d::sampleCached(stack, base, &result.load);
         std::vector<cv::Mat_<uint8_t>> layerValues, layerCoverage;
@@ -1532,18 +1533,18 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             layerValues.emplace_back(stack.height(), stack.width(), uint8_t(0));
             layerCoverage.emplace_back(stack.height(), stack.width(), uint8_t(0));
             if (!sampled.values.empty())
-                vc3d::toDisplay(sampled, k, layerValues.back().ptr(), layerCoverage.back().ptr());
+                vcr::display::toUint8(sampled.values.data() + std::size_t(k) * sampled.width * sampled.height, std::size_t(sampled.width) * sampled.height, layerValues.back().ptr(), layerCoverage.back().ptr());
         }
         compositeVolumetricStack(layerValues, layerCoverage, zStart, !planeView, margins, colorValues, coverage);
     } else {
         if (baseComposite) {
-            base.sampling = vc::Sampling::Nearest;
+            base.sampling = 0;
             base.offsets = layerOffsets(front, behind, zStep);
-            base.composite = vc3d::compositeOptions(cs.params);
+            base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
         const auto sampled = vc3d::sampleCached(geometry, base, &result.load);
         if (!sampled.values.empty())
-            vc3d::toDisplay(sampled, 0, values.ptr(), coverage.ptr());
+            vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
     }
     if (overlayActive) {
         overlayValues = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
@@ -1559,11 +1560,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             CompositeParams overlayParams;
             setCompositeMethod(overlayParams, oc.method);
             overlay.offsets = layerOffsets(oc.layersFront, oc.layersBehind, cs.reverseDirection ? -1.0f : 1.0f);
-            overlay.composite = vc3d::compositeOptions(overlayParams);
+            overlay.composite = (overlayParams.volumetric ? std::nullopt : std::optional(overlayParams.options));
         }
         const auto sampled = vc3d::sampleCached(geometry, overlay, &result.load);
         if (!sampled.values.empty())
-            vc3d::toDisplay(sampled, 0, overlayValues.ptr(), overlayCoverage.ptr());
+            vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, overlayValues.ptr(), overlayCoverage.ptr());
     }
     if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
 
@@ -1650,7 +1651,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.overlayCoverage = overlayCoverage;
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
+    vcr::display::windowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
     std::array<uint32_t, 256> overlayLut{};
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
@@ -1682,7 +1683,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                        (uint32_t(colorSrc[x][1]) << 8) | uint32_t(colorSrc[x][2]))
                     : lut[src[x]];
             if (hasOverlay && overlayCov[x]) {
-                pixel = vc::blendOverlayArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+                pixel = vcr::display::blendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
             }
             if (focusInside && !focusInside[x]) {
                 pixel = (pixel & 0xFF000000u) |
@@ -2146,7 +2147,7 @@ void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
     submitRender("overlay colormap changed");
 }
 
-void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
+void CChunkedVolumeViewer::setOverlaySamplingMethod(int method)
 {
     if (_closing) {
         return;
@@ -3076,11 +3077,14 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         float w = _zOff;
         float distance = dist;
         const cv::Vec2d grid = quad->surfaceToGrid({double(ptr[0]) / quad->scale()[0], double(ptr[1]) / quad->scale()[1]});
-        if (const auto surfacePoint = vc3d::surfacePointAt(*surfaceForPoints(*quad), grid)) {
-            w = surfacePoint->offsetOf(volPoint);
+        const float xy[]{float(grid[0]), float(grid[1])};
+        cv::Vec3f position, normal;
+        surfaceForPoints(*quad)->pointsAt(xy, 1, position.val, normal.val);
+        if (std::isfinite(position[0]) && std::isfinite(normal[0])) {
+            w = (volPoint - position).dot(normal) / normal.dot(normal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
-            distance = float(cv::norm(volPoint - (surfacePoint->position + surfacePoint->offsetNormal * std::clamp(w, depthLo, depthHi))));
+            distance = float(cv::norm(volPoint - (position + normal * std::clamp(w, depthLo, depthHi))));
         }
         const cv::Vec3f loc = quad->loc(ptr);
         return SurfaceProjection{loc[0], loc[1], w, true, distance};
@@ -3421,8 +3425,11 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
         const cv::Vec2f sp = sceneToSurface(scenePos);
         // Where the frame's layer at _zOff lies, in the levels' voxel spacing.
         if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-            if (const auto point = vc3d::surfacePointAt(*surfaceForPoints(*quad), quad->surfaceToGrid({sp[0], sp[1]})))
-                p += point->offsetNormal * _zOff;
+            const auto grid = quad->surfaceToGrid({sp[0], sp[1]});
+            const float xy[]{float(grid[0]), float(grid[1])};
+            cv::Vec3f position, normal;
+            surfaceForPoints(*quad)->pointsAt(xy, 1, position.val, normal.val);
+            if (std::isfinite(position[0]) && std::isfinite(normal[0])) p += normal * _zOff;
         } else {
             const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
             if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))

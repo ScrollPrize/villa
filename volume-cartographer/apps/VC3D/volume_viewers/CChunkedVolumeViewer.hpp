@@ -31,7 +31,6 @@
 #include "VolumetricCompositor.hpp"
 #include "ViewerSampling.hpp"
 #include "annotation_tools/SameWrapAnnotationTool.hpp"
-#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/Rect3D.hpp"
 
@@ -134,7 +133,7 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
-    void setOverlaySamplingMethod(vc::Sampling method) override;
+    void setOverlaySamplingMethod(int method) override;
     void setOverlayIntensityAsAlpha(bool enabled) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
@@ -350,8 +349,8 @@ private:
         float zOff = 0.0f;
         int startLevel = 0;
         int overlayStartLevel = 0;
-        vc::Sampling samplingMethod = vc::Sampling::Trilinear;
-        vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
+        int samplingMethod = 1;
+        int overlaySamplingMethod = 0;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
@@ -529,7 +528,7 @@ private:
     std::shared_ptr<const vc3d::ViewerLevels> _overlayLevels;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
-    vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
+    int _overlaySamplingMethod = 0;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     bool _overlayIntensityAsAlpha = false;
@@ -543,7 +542,7 @@ private:
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
     float _linkedCursorViewTolerance = 10.0f;
-    vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
+    int _samplingMethod = 1;
     int _maxDisplayedResolution = 0;
     bool _showSurfaceNormals = false;
     bool _showCoordinateFrame = true;
