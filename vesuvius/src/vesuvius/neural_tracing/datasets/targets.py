@@ -4,6 +4,7 @@ from typing import Mapping
 
 import numpy as np
 import torch
+import vc_reader.transforms as A
 
 from vesuvius.neural_tracing.datasets.common import create_band_mask
 from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direction_tensor
@@ -28,29 +29,32 @@ def _cupy_device(tensor: torch.Tensor):
     return cp.cuda.Device(int(device_index))
 
 
-def _cupyx_edt(
+_SURFACE_EDT = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
+
+
+def _surface_edt(
     surface_bool: torch.Tensor,
     *,
     return_distances: bool,
     return_indices: bool,
 ):
-    """Run the single supported EDT implementation on a 3D CUDA mask."""
-    import cupy as cp
-    from cupyx.scipy import ndimage as cndimage
+    """Exact EDT to the voxels of a 3D CUDA mask (vc_reader), as CuPy arrays.
 
+    Distances are float32; indices are the (3, D, H, W) int32 nearest surface
+    voxel, ties resolved as scipy.ndimage.distance_transform_edt resolves them.
+    """
     if surface_bool.ndim != 3:
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
     if not surface_bool.is_cuda:
-        raise RuntimeError("rowcol_cond EDT targets require CUDA tensors and cupyx.scipy.ndimage")
+        raise RuntimeError("rowcol_cond EDT targets require CUDA tensors")
 
-    with _cupy_device(surface_bool):
-        surface_cp = _torch_to_cupy(surface_bool)
-        return cndimage.distance_transform_edt(
-            ~surface_cp,
-            return_distances=bool(return_distances),
-            return_indices=bool(return_indices),
-            float64_distances=False,
-        )
+    out = _SURFACE_EDT({"mask": surface_bool[None].to(torch.uint8)})
+    results = []
+    if return_distances:
+        results.append(_torch_to_cupy(out["mask_sdt"][0]))
+    if return_indices:
+        results.append(_torch_to_cupy(out["mask_nearest"]))
+    return results[0] if len(results) == 1 else tuple(results)
 
 
 def _distance_transform_distances_cupy(surface_mask: torch.Tensor):
@@ -62,7 +66,7 @@ def _distance_transform_distances_cupy(surface_mask: torch.Tensor):
     if not bool(surface_bool.any().item()):
         return None
     with _cupy_device(surface_bool):
-        distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
+        distances_cp = _surface_edt(surface_bool, return_distances=True, return_indices=False)
         return cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
 
 
@@ -72,7 +76,7 @@ def _dilate_binary_mask_cupy(surface_mask: torch.Tensor, radius_voxels: float):
     if radius <= 0.0 or not bool(surface_bool.any().item()):
         return surface_bool
     with _cupy_device(surface_bool):
-        distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
+        distances_cp = _surface_edt(surface_bool, return_distances=True, return_indices=False)
         import cupy as cp
 
         return _cupy_to_torch(cp.ascontiguousarray(distances_cp <= radius)).to(dtype=torch.bool)
@@ -88,7 +92,7 @@ def _dense_displacement_from_mask_cupy(surface_mask: torch.Tensor):
         return None, None
 
     with _cupy_device(surface_bool):
-        distances_cp, nearest_idx_cp = _cupyx_edt(
+        distances_cp, nearest_idx_cp = _surface_edt(
             surface_bool,
             return_distances=True,
             return_indices=True,
@@ -376,7 +380,7 @@ def _dilate_trace_targets_torch(
         with _cupy_device(velocity_dir):
             velocity_b = velocity_dir[b].contiguous()
             velocity_cp = _torch_to_cupy(velocity_b)
-            nearest_dist_cp, nearest_idx_cp = _cupyx_edt(
+            nearest_dist_cp, nearest_idx_cp = _surface_edt(
                 (source_weight[b, 0] > 0.5).contiguous(),
                 return_distances=True,
                 return_indices=True,

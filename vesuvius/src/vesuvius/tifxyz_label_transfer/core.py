@@ -1233,8 +1233,6 @@ def _fill_uv_field(
     measured vertices in grid cells. Callers use distances to limit filling.
     """
 
-    import scipy.ndimage
-
     valid = np.asarray(valid, dtype=bool)
     if not valid.any():
         raise ValueError("cannot fill a UV field with no valid vertices")
@@ -1248,10 +1246,10 @@ def _fill_uv_field(
             fill_mask,
             np.zeros(valid.shape, dtype=np.float64),
         )
-    anchor_distance, nearest = scipy.ndimage.distance_transform_edt(
-        fill_mask, return_distances=True, return_indices=True
-    )
-    anchor_distance = np.asarray(anchor_distance, dtype=np.float64)
+    # Nearest valid vertex of every grid cell, and its distance.
+    nearest_valid = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)({"mask": valid[None]})
+    anchor_distance = np.asarray(nearest_valid["mask_sdt"][0], dtype=np.float64)
+    nearest = nearest_valid["mask_nearest"]
     filled_rows = filled_rows[tuple(nearest)]
     filled_cols = filled_cols[tuple(nearest)]
     for _ in range(max(0, smoothing_iterations)):

@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from scipy import ndimage
 import torch
 from vc_reader.torch import sample_array
 from vc_reader.resident import GridField
@@ -1486,7 +1485,8 @@ def _merge_with_original(original_grid, original_valid, pred_grid, pred_valid):
     needs_fill = original_mask & ~support
     if bool(needs_fill.any()) and bool(support.any()):
         # Map each unresolved original-valid cell to its nearest predicted support cell in UV.
-        _, nearest_idx = ndimage.distance_transform_edt(~support, return_indices=True)
+        nearest_idx = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)(
+            {"mask": support[None]})["mask_nearest"]
         nearest_r = nearest_idx[0][needs_fill]
         nearest_c = nearest_idx[1][needs_fill]
         merged[needs_fill] = pred_arr[nearest_r, nearest_c]

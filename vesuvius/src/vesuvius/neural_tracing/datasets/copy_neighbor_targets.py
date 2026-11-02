@@ -11,6 +11,9 @@ from scipy.spatial import cKDTree
 
 import vc_reader.transforms as A
 
+# Nearest voxel of a mask for every voxel (scipy distance_transform_edt indices).
+_NEAREST = A.DistanceTransform(mode="outside", indices="_nearest", implicit_background=True)
+
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
 
@@ -188,11 +191,7 @@ def _apply_side_hint(
         debug["rejected_by_side_count"] = 0
         return domain
 
-    _, nearest_source_idx = ndimage.distance_transform_edt(
-        ~source_mask,
-        return_distances=True,
-        return_indices=True,
-    )
+    nearest_source_idx = _NEAREST({"mask": source_mask[None]})["mask_nearest"]
     coords = np.indices(domain.shape, dtype=np.float32)
     nearest = nearest_source_idx.astype(np.float32, copy=False)
     offset = coords - nearest
@@ -435,11 +434,7 @@ def build_copy_neighbor_targets(
     velocity_weight = (domain & (np.linalg.norm(velocity_dir, axis=0) > 0.0))[None].astype(np.float32, copy=False)
     progress_weight = domain[None].astype(np.float32, copy=False)
 
-    _, nearest_target_idx = ndimage.distance_transform_edt(
-        ~target_mask,
-        return_distances=True,
-        return_indices=True,
-    )
+    nearest_target_idx = _NEAREST({"mask": target_mask[None]})["mask_nearest"]
     coords = np.indices(crop_size, dtype=np.float32)
     nearest_target = nearest_target_idx.astype(np.float32, copy=False)
     surface_attract = (nearest_target - coords).astype(np.float32, copy=False)
