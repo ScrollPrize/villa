@@ -48,6 +48,7 @@ target_sources(vc_reader_native PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/computed.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/grid.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/grid/view.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/aligned_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/caches.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sources/image_file.cpp"

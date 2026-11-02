@@ -32,11 +32,13 @@ struct ViewerLevels {
 
     int count() const { return static_cast<int>(levels.size()); }
     bool has(int level) const;
-    // Working level-0 voxels one index of `level` spans, per axis (ZYX).
-    std::array<double, 3> voxelExtent(int level) const;
     // `level` for vcr::grid: working level-0 XYZ points to its indices, with its CUDA
     // reader unless a GPU frame has failed.
     vcr::grid::Level gridLevel(int level) const;
+    // Every level for vcr::grid's level choice; absent levels have no array.
+    std::vector<vcr::grid::Level> gridLevels() const;
+    // A frame's request: the start level, then up to `fallbackLevels` coarser ones.
+    vcr::grid::Request request(int startLevel, int fallbackLevels) const;
     // The relative size of one working level-0 voxel along X, Y, Z, finest axis 1.
     std::array<float, 3> vertexSpacing() const;
 };
@@ -44,19 +46,10 @@ struct ViewerLevels {
 // Opens every present working level of `volume`. Levels that fail to open are absent.
 ViewerLevels openViewerLevels(OpenedVolumes& opened, const Volume& volume);
 
-// Level choices of the viewer: the coarsest level whose largest voxel extent is at
-// most 1 / (pixelsPerBaseVoxel * qualityBias), or the finest level when none is.
-int sourceLevelForView(const ViewerLevels& levels, float pixelsPerBaseVoxel, float qualityBias);
-double maximumBaseVoxelExtent(const ViewerLevels& levels, int level);
-// Convert flattened UV zoom to voxel zoom using the actual surface tangents.
-// UV units need not span one working voxel (scaled or stretched tifxyz grids).
+// Pixels per working voxel of a flattened view: vcr::grid::pixelsPerVoxel from the
+// surface's tangents (UV units need not span one voxel), else `nominalPixelsPerVoxel`.
 float surfacePixelsPerVoxel(const QuadSurface& surface, const vcr::grid::Raster& viewport,
                             float nominalPixelsPerVoxel);
-// How many coarser levels may fill a viewport's holes: up to the first level one
-// of whose chunks spans the larger viewport edge.
-int fallbackLevelCountForViewport(const ViewerLevels& levels, int startLevel, int viewportWidth,
-                                  int viewportHeight, float pixelsPerBaseVoxel,
-                                  int maximumFallbackLevels = 5);
 
 // An owned native snapshot of the whole grid; retained by background jobs.
 std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface, const std::array<float, 3>& spacing = {1, 1, 1});
@@ -65,52 +58,23 @@ std::shared_ptr<const vcr::grid::Surface> gridSurface(const QuadSurface& surface
 // padded so its positions and normals match the whole grid's.
 cv::Rect gridWindowFor(const QuadSurface& surface, const vcr::grid::Raster& raster, int left, int top, int right, int bottom);
 
-// What a frame samples: a plane, or a raster over a grid surface.
-struct ViewerGeometry {
-    std::optional<vcr::grid::Plane> plane;
-    std::shared_ptr<const vcr::grid::Surface> surface;
-    vcr::grid::Raster raster;
-
-    int width() const { return plane ? plane->width : raster.width; }
-    int height() const { return plane ? plane->height : raster.height; }
-
-};
-
-// A blocking read of what a frame could not sample from the caches: its geometry
-// and layers at one level, for the pixels that lacked it.
-struct ViewerRead {
-    ViewerGeometry geometry;
-    std::shared_ptr<const ViewerLevels> levels;  // keeps the level's array open
-    vcr::grid::Request request;
-    std::vector<std::uint8_t> pixels;
-};
-
-// The reads one frame asks for: its coarsest fallback level first (a quick
-// preview), then its start level.
+// The reads frames could not sample from the caches, with the levels they read
+// (kept open until the reads ran).
 struct ViewerLoad {
-    std::vector<ViewerRead> coarse, target;
+    vcr::grid::Pending pending;
+    std::vector<std::shared_ptr<const ViewerLevels>> levels;
 
-    bool empty() const { return coarse.empty() && target.empty(); }
+    bool empty() const { return pending.empty(); }
 };
 
-// What a frame samples of one volume: its layers (offsets along the normal),
-// optionally reduced to one value, from the start level with up to
-// `fallbackLevels` coarser ones filling holes.
-struct ViewerSample {
-    std::shared_ptr<const ViewerLevels> levels;
-    int startLevel = 0;
-    int fallbackLevels = 0;
-    int sampling = 0;
-    std::vector<float> offsets{0.0f};
-    std::optional<vcr::composite::Options> composite;
-};
+// vcr::grid::sampleCached over `levels`, adding what the frame lacked to `load`. A GPU
+// failure renders `levels` on the CPU from then on.
+vcr::grid::Result sampleCached(const std::shared_ptr<const ViewerLevels>& levels, const vcr::grid::Frame& frame,
+                               const vcr::grid::Request& request, ViewerLoad* load);
 
-// Samples `what` over `geometry` from the caches alone and adds the reads of what
-// it lacked to `load`.
-vcr::grid::Result sampleCached(const ViewerGeometry& geometry, const ViewerSample& what, ViewerLoad* load);
-
-// Runs the reads (coarse first, then target), which bring their chunks into the
-// caches. `afterPart` runs after each part that had reads; returning false stops.
+// vcr::grid::load: coarse reads, then target ones; `afterPart` runs after each part
+// that had reads, returning false stops. A GPU failure renders the load's levels on
+// the CPU from then on.
 void loadPending(const ViewerLoad& load, const std::function<bool()>& afterPart);
 
 } // namespace vc3d
