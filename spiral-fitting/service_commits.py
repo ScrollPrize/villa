@@ -62,7 +62,9 @@ class PublishedGeneration:
     key: CommitKey
     xyz: np.ndarray  # (rows, columns, 3) float32 xyz, -1 at invalid vertices
     valid: np.ndarray  # (rows, columns) bool, by the flattened and the store's rule
-    winding_ids: np.ndarray  # (rows, columns) int32, NO_WINDING outside
+    # (rows, columns) int32, NO_WINDING outside every winding: the published
+    # map unchanged, so its winding bounds still hold.
+    winding_ids: np.ndarray
     scale: tuple[float, float]
     winding_bounds: list
     input_position: Mapping[str, Any] | None
@@ -188,7 +190,6 @@ def read_published_generation(root, manifest_name="manifest.json"):
     if not winding_name:
         raise CommitRefused("the generation has no winding map")
     winding_ids = _read_winding_ids(root / winding_name, valid.shape)
-    winding_ids[~valid] = NO_WINDING
     iteration = manifest.get("source_fit_iteration")
     return PublishedGeneration(
         key=CommitKey(model_state, input_digest, dict(profile)),

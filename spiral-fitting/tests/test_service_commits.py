@@ -367,7 +367,8 @@ def test_vertices_the_store_cannot_hold_are_committed_invalid(fit):
     assert not surface.valid[2, 3]
     assert int(np.count_nonzero(surface.valid)) == xyz.shape[0] * xyz.shape[1] - 3
     winding = _channel(fit.store, surface.geometry_revision, 'winding_id')
-    assert winding[2, 3] == -1
+    # The winding map is the published one, whose bounds still hold.
+    np.testing.assert_array_equal(winding, windings.astype(np.int32))
     assert any('1 vertices of the preview are invalid in the store' in event['text']
                for event in fit.state.events.read_after(0)['events'])
 
