@@ -208,7 +208,7 @@ jobs:
     name: Approve marker-only active-state reconciliation
     if: inputs.operation == 'reconcile-active'
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: progress-prizes-production-activation
     permissions: {}
@@ -236,7 +236,7 @@ jobs:
     needs:
       - preflight
       - reconcile-approval
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: progress-prizes-production
     permissions:
@@ -270,7 +270,7 @@ jobs:
   prepare-google:
     if: inputs.operation == 'prepare'
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: progress-prizes-production
     permissions:
@@ -325,7 +325,7 @@ jobs:
     name: Resolve pending or completed activation
     if: inputs.operation == 'activate'
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -369,7 +369,7 @@ jobs:
       needs.activation-state.outputs.state == 'pending' &&
       needs.activation-state.outputs['refresh-required'] == 'true'
     needs: activation-state
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -453,7 +453,7 @@ jobs:
     needs:
       - activation-state
       - refresh-page
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     outputs:
@@ -504,7 +504,7 @@ jobs:
     needs:
       - activation-state
       - activation-binding
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
       actions: read
@@ -572,7 +572,7 @@ jobs:
     needs:
       - activation-state
       - activation-gate
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: progress-prizes-production-activation
     permissions: {}
@@ -600,7 +600,7 @@ jobs:
       - activation-state
       - activation-gate
       - activation-approval
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 70
     environment: progress-prizes-production
     permissions:
@@ -655,7 +655,7 @@ jobs:
     needs:
       - activation-state
       - activate-production
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -696,7 +696,7 @@ jobs:
     needs:
       - preflight
       - activation-state
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: progress-prizes-production
     permissions:
@@ -733,7 +733,7 @@ jobs:
     name: Resolve the pending page for prepared verification
     if: inputs.operation == 'verify' && inputs['verify-mode'] == 'prepared'
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -787,7 +787,7 @@ jobs:
     needs:
       - preflight
       - verify-prepared-state
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: progress-prizes-production
     permissions:
@@ -823,7 +823,7 @@ jobs:
   verify-active:
     if: inputs.operation == 'verify' && inputs['verify-mode'] == 'active'
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: progress-prizes-production
     permissions:
@@ -902,7 +902,7 @@ jobs:
       - verify-prepared-state
       - verify-prepared
       - verify-active
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       issues: write
