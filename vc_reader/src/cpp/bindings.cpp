@@ -53,6 +53,7 @@ template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& 
 #include "reader_cuda/bindings.hpp"
 #endif
 #include "sources/bindings.hpp"
+#include "cache_bindings.hpp"
 #include "tifxyz/bindings.hpp"
 
 static nb::object py_json(const Json& value)
@@ -154,6 +155,7 @@ NB_MODULE(_reader, m)
     vcr::sampling::python::bind(m);
     vcr::projection::python::bind(m);
     vcr::sources::python::bind(m);
+    vcr::cache::python::bind(m);
     vcr::tifxyz::python::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are

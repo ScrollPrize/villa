@@ -36,6 +36,7 @@ else()
     add_library(vc_reader_native STATIC)
 endif()
 target_sources(vc_reader_native PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/cache.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/mask.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/transfer.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sampling/resident.cpp"
