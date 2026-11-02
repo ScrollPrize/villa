@@ -1,3 +1,4 @@
+#include <vc_reader/transforms.hpp>
 #include "vc/core/util/ImageMat.hpp"
 #include <iostream>
 #include <string>
@@ -959,15 +960,20 @@ void run_pyramid(const po::variables_map& vm) {
                                 mark_progress();
                                 continue;
                             }
+                            std::vector<cv::Mat> channels;
+                            cv::split(img, channels);
+                            for (auto& channel : channels) {
+                                const auto* dtype = vc::core::util::tiffDtype(channel.depth());
+                                const vcr::transforms::Array input(
+                                    {1,std::size_t(channel.rows),std::size_t(channel.cols)},
+                                    dtype[1],channel.elemSize1(),channel.data);
+                                const auto resized = vcr::transforms::resize_array(input,
+                                    {std::size_t(scaled_extent(img.rows,scale)),std::size_t(scaled_extent(img.cols,scale))},true,true);
+                                channel = cv::Mat(int(resized.shape[1]),int(resized.shape[2]),channel.type(),
+                                    const_cast<void*>(resized.data())).clone();
+                            }
                             cv::Mat scaled;
-                            cv::resize(
-                                img,
-                                scaled,
-                                cv::Size(scaled_extent(img.cols, scale),
-                                         scaled_extent(img.rows, scale)),
-                                0.0,
-                                0.0,
-                                cv::INTER_NEAREST);
+                            cv::merge(channels, scaled);
                             vcr::sources::writeImage(dst_path, vc::core::util::imageBuffer(scaled).view());
                         }
                         ++written;

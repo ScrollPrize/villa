@@ -111,7 +111,7 @@ TEST_CASE("channel files round trip at their stored depth and colour order")
     auto pts = grid();
     QuadSurface writer(pts, cv::Vec2f(1.f, 1.f));
     cv::Mat uv(16, 16, CV_32FC2, cv::Scalar(1.5f, -2.5f));
-    cv::Mat colour(16, 16, CV_8UC3, cv::Scalar(10, 20, 30));
+    cv::Mat colour(32, 48, CV_8UC3, cv::Scalar(10, 20, 30));
     cv::Mat generations(16, 16, CV_16UC1, cv::Scalar(4000));
     writer.setChannel("uv", uv);
     writer.setChannel("colour", colour);
@@ -129,6 +129,7 @@ TEST_CASE("channel files round trip at their stored depth and colour order")
     CHECK(readUv.at<cv::Vec2f>(3, 3) == cv::Vec2f(1.5f, -2.5f));
     const cv::Mat readColour = reader.channel("colour", SURF_CHANNEL_NORESIZE);
     REQUIRE(readColour.type() == CV_8UC3);
+    CHECK(readColour.size() == colour.size());
     CHECK(readColour.at<cv::Vec3b>(3, 3) == cv::Vec3b(10, 20, 30));
     const cv::Mat readGenerations = reader.channel("generations", SURF_CHANNEL_NORESIZE);
     REQUIRE(readGenerations.type() == CV_16UC1);

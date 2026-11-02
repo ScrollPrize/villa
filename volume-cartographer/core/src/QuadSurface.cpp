@@ -95,12 +95,6 @@ void normalizeMaskChannel(cv::Mat& mask)
     mask = singleChannel;
 }
 
-inline bool isValidPointSample(const cv::Vec3f& point)
-{
-    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
-        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
-}
-
 float scaledCenterComponent(int count, float scale)
 {
     if (!std::isfinite(scale) || scale == 0.0f) {
@@ -160,74 +154,6 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
     return result;
 }
 
-cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
-    const cv::Mat_<cv::Vec3f>& points,
-    const cv::Mat& srcToDst,
-    const cv::Size& dstSize)
-{
-    cv::Mat_<cv::Vec3f> warped(dstSize.height, dstSize.width,
-                               cv::Vec3f(-1.0f, -1.0f, -1.0f));
-    if (points.empty() || dstSize.width <= 0 || dstSize.height <= 0) {
-        return warped;
-    }
-
-    cv::Mat dstToSrc;
-    cv::invertAffineTransform(srcToDst, dstToSrc);
-
-    // Hoist the six affine coefficients out of the per-pixel loop. The Mat is
-    // loop-invariant, but the compiler cannot prove dstToSrc.at<double>() does
-    // not alias the warped store, so it reloads all six entries every pixel.
-    // Reading them into locals is bit-identical and lets each row run
-    // independently under OpenMP. (The mapping is NOT x-separable here — srcX
-    // depends on both dstX and dstY — so only the coefficient hoist applies,
-    // and the explicit m*dstX form is kept to preserve float rounding.)
-    const double m00 = dstToSrc.at<double>(0, 0);
-    const double m01 = dstToSrc.at<double>(0, 1);
-    const double m02 = dstToSrc.at<double>(0, 2);
-    const double m10 = dstToSrc.at<double>(1, 0);
-    const double m11 = dstToSrc.at<double>(1, 1);
-    const double m12 = dstToSrc.at<double>(1, 2);
-
-    constexpr double kBoundsEpsilon = 1e-5;
-    #pragma omp parallel for schedule(static)
-    for (int dstY = 0; dstY < dstSize.height; ++dstY) {
-        cv::Vec3f* dstRow = warped[dstY];
-        for (int dstX = 0; dstX < dstSize.width; ++dstX) {
-            double srcX = m00 * dstX + m01 * dstY + m02;
-            double srcY = m10 * dstX + m11 * dstY + m12;
-
-            if (srcX < -kBoundsEpsilon || srcY < -kBoundsEpsilon
-                || srcX > static_cast<double>(points.cols - 1) + kBoundsEpsilon
-                || srcY > static_cast<double>(points.rows - 1) + kBoundsEpsilon) {
-                continue;
-            }
-
-            srcX = std::clamp(srcX, 0.0, static_cast<double>(points.cols - 1));
-            srcY = std::clamp(srcY, 0.0, static_cast<double>(points.rows - 1));
-            const int x0 = static_cast<int>(std::floor(srcX));
-            const int y0 = static_cast<int>(std::floor(srcY));
-            const int x1 = std::min(x0 + 1, points.cols - 1);
-            const int y1 = std::min(y0 + 1, points.rows - 1);
-            const float fx = static_cast<float>(srcX - static_cast<double>(x0));
-            const float fy = static_cast<float>(srcY - static_cast<double>(y0));
-
-            const cv::Vec3f& p00 = points(y0, x0);
-            const cv::Vec3f& p01 = points(y0, x1);
-            const cv::Vec3f& p10 = points(y1, x0);
-            const cv::Vec3f& p11 = points(y1, x1);
-            if (!isValidPointSample(p00) || !isValidPointSample(p01)
-                || !isValidPointSample(p10) || !isValidPointSample(p11)) {
-                continue;
-            }
-
-            const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
-            const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
-        }
-    }
-
-    return warped;
-}
 
 } // namespace
 
@@ -1069,7 +995,7 @@ void QuadSurface::saveWithUuid(const std::filesystem::path& destination, const s
     std::vector<cv::Mat> channelStorage;
     channelStorage.reserve(_channels.size());
     for (const auto& [name, ignored] : _channels) {
-        auto mat = channel(name);
+        auto mat = channel(name, SURF_CHANNEL_NORESIZE);
         if (mat.empty()) continue;
         cv::Mat native;
         if (mat.channels() == 3) cv::cvtColor(mat,native,cv::COLOR_BGR2RGB);
@@ -1256,8 +1182,15 @@ void QuadSurface::rotate(float angleDeg)
 
     // Rotate points without blending invalid sentinels into finite coordinates.
     const cv::Size dstSize = bbox.size();
-    cv::Mat_<cv::Vec3f> rotatedMat =
-        warpAffinePointsLinearPreservingInvalids(*_points, rotMat, dstSize);
+    cv::Mat dstToSrc;
+    cv::invertAffineTransform(rotMat, dstToSrc);
+    cv::Mat_<cv::Vec3f> rotatedMat(dstSize);
+    const vcr::grid::Raster raster{dstToSrc.at<double>(0,2),dstToSrc.at<double>(1,2),
+        dstToSrc.at<double>(0,0),dstToSrc.at<double>(1,1),dstSize.width,dstSize.height,
+        dstToSrc.at<double>(0,1),dstToSrc.at<double>(1,0)};
+    pointSurface()->resample(raster,rotatedMat.ptr<float>(),nullptr);
+    for(auto& point : rotatedMat)
+        if(!std::isfinite(cv::norm(point)))point={-1,-1,-1};
 
     // Update points
     *_points = rotatedMat;
