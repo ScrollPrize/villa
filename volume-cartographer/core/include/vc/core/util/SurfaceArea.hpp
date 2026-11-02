@@ -6,7 +6,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "vc/core/util/QuadSurface.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 
 namespace vc::surface
@@ -33,37 +33,6 @@ inline void storeAreaMeta(nlohmann::json& meta, double area_vx2, double voxelSiz
     } else if (meta.contains("area_cm2")) {
         meta.erase("area_cm2");
     }
-}
-
-namespace detail
-{
-template <typename Vec>
-inline double surfaceArea(const cv::Mat_<Vec>& points)
-{
-    return vc::geometry::surfaceGridArea(
-        points.rows, points.cols, [&](int64_t r, int64_t c) -> const Vec& { return points(int(r), int(c)); },
-        [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); });
-}
-} // namespace detail
-
-// A grid's area in its vertices' units squared (the store's rule, geometry::surfaceGridArea).
-inline double computeSurfaceAreaVox2(const cv::Mat_<cv::Vec3f>& points)
-{
-    return detail::surfaceArea(points);
-}
-
-inline double computeSurfaceAreaVox2(const cv::Mat_<cv::Vec3d>& points)
-{
-    return detail::surfaceArea(points);
-}
-
-inline double computeSurfaceAreaVox2(const QuadSurface& surface)
-{
-    const auto* pointsPtr = surface.rawPointsPtr();
-    if (!pointsPtr || pointsPtr->empty()) {
-        return 0.0;
-    }
-    return detail::surfaceArea(*pointsPtr);
 }
 
 } // namespace vc::surface

@@ -1,3 +1,4 @@
+#include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
@@ -248,7 +249,9 @@ int main(int argc, char** argv)
             // open volume, where the shear doubles x, sees twice it.
             require(catalog.row(other)->record.surface&&catalog.row(other)->record.surface->area==4.0,
                     "the store keeps the area in stored units");
-            require(std::abs(vc::surface::computeSurfaceAreaVox2(*catalog.open(other).surface)-8.0)<1e-9,
+            require(std::abs(([&] { const auto& points = *catalog.open(other).surface->rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }())-8.0)<1e-9,
                     "the open volume sees the sheared area");
         }
         auto registered=catalog.open(other);

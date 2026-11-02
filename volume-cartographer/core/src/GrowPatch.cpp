@@ -1,3 +1,4 @@
+#include <utility>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -2249,7 +2250,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf->setChannel("mask", mask);
         }
 
-        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
         surf->meta = meta_params;
         if (resume_surf && !resume_surf->id.empty()) {
             surf->meta["seed_surface_id"] = resume_surf->objectUuid().empty()
@@ -2357,7 +2360,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf->setChannel("loss_sdir", loss_sdir);
         }
 
-        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
 
         surf->meta = meta_params;
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
@@ -3346,7 +3351,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
     QuadSurface* surf = create_surface_from_state();
 
-    const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+    const double area_est_vx2 = ([&] { const auto& points = *std::as_const(*surf).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     const auto area_est_cm2 = vc::surface::areaCm2FromVox2(
         area_est_vx2, static_cast<double>(voxelsize));
     if (area_est_cm2) {

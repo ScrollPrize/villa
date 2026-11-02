@@ -1,3 +1,4 @@
+#include <utility>
 #include <iostream>
 #include "TargetContext.hpp"
 #include <nlohmann/json.hpp>
@@ -767,7 +768,9 @@ static SweepMetrics score_surface(QuadSurface& result,
     metrics.has_result = true;
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
-    metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
+    metrics.area_vx2 = ([&] { const auto& points = *std::as_const(result).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     if (target_area_vx2 > 0.0) {
         metrics.area_ratio = metrics.area_vx2 / target_area_vx2;
@@ -809,7 +812,9 @@ static SweepMetrics score_surface_without_target(QuadSurface& result, double vox
     metrics.has_result = true;
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
-    metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
+    metrics.area_vx2 = ([&] { const auto& points = *std::as_const(result).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
     metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     add_completeness_metrics(result, metrics);
     const double hole_penalty = 1.0 - std::clamp(metrics.enclosed_hole_fraction, 0.0, 1.0);
@@ -1236,7 +1241,9 @@ int main(int argc, char *argv[])
         const int target_valid_points = target->countValidPoints();
         const int target_valid_quads = target->countValidQuads();
         const cv::Size target_grid_size = target->rawPointsPtr()->size();
-        const double target_area_vx2 = vc::surface::computeSurfaceAreaVox2(*target);
+        const double target_area_vx2 = ([&] { const auto& points = *std::as_const(*target).rawPointsPtr(); return vc::geometry::surfaceGridArea(points.rows, points.cols,
+            [&](int64_t r, int64_t c) -> const cv::Vec3f& { return points(int(r), int(c)); },
+            [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); }); }());
         const double target_area_cm2 = area_cm2_or_nan(target_area_vx2, voxelsize);
         vc::geometry::VertexIndex target_index;
         if (!seed_only_sweep) {
