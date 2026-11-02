@@ -785,7 +785,32 @@ void SpiralWorkspace::bindInputStore()
 {
     // A local service is launched bound to this store, and any service's
     // inputs are displayed only from the same store.
-    if (_service) _service->setObjectStore(_state->objectStoreSession(), inputStore());
+    const auto store = inputStore();
+    QString unavailable;
+    if (!store) {
+        const auto project = _mainState ? _mainState->vpkg() : _state->vpkg();
+        if (!project)
+            unavailable = tr("Open a project to start the local Spiral service.");
+        else {
+            const auto& routes = project->document().data().at("selections");
+            const auto selected = routes.value(inputKinds().front(), nlohmann::json());
+            const bool sharedRoute = !selected.is_null() && std::all_of(
+                inputKinds().begin(), inputKinds().end(), [&](const auto& kind) {
+                    return routes.value(kind, nlohmann::json()) == selected;
+                });
+            unavailable = sharedRoute
+                ? tr("The project's selected object store is unavailable. Check its location in File > Stores.")
+                : tr("Select the same object store for surfaces, point collections and fibers in File > Stores.");
+        }
+    }
+    if (_service) _service->setObjectStore(_state->objectStoreSession(), store, unavailable);
+}
+
+void SpiralWorkspace::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    bindInputStore();
+    if (_panel) _panel->activateWorkspace();
 }
 
 void SpiralWorkspace::startLineAnnotationDraft()

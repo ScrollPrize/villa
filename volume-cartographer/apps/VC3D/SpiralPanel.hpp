@@ -40,6 +40,8 @@ class SpiralPanel : public QWidget
     Q_OBJECT
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
+    // Auto-connect the built-in local profile only on the workspace's first use.
+    void activateWorkspace();
     QComboBox* volumeSelectionControl() const
     {
         return _volumeSelector ? _volumeSelector->comboBox() : nullptr;
@@ -133,6 +135,7 @@ private:
     void guardSessionExit(std::function<void()> action);
 
     SpiralServiceManager* _service = nullptr;
+    bool _workspaceUsed = false;
     SpiralDescriptions* _descriptions = nullptr;
     QHash<QWidget*, QString> _descriptionIds;
     QHash<QWidget*, QString> _toolTipNotes;

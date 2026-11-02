@@ -18,6 +18,8 @@
 #include <QProcess>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QDir>
+#include <QScopeGuard>
 #include <QtTest/QtTest>
 
 #include <cstring>
@@ -100,6 +102,54 @@ class SpiralServiceProtocolTest : public QObject
     Q_OBJECT
 
 private slots:
+    void localLaunchWaitsForProjectStore()
+    {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to a Spiral Python environment");
+        const auto oldPython = qgetenv("SPIRAL_PYTHON");
+        const auto oldService = qgetenv("SPIRAL_SERVICE_PATH");
+        const auto restore = qScopeGuard([&] {
+            if (oldPython.isNull()) qunsetenv("SPIRAL_PYTHON");
+            else qputenv("SPIRAL_PYTHON", oldPython);
+            if (oldService.isNull()) qunsetenv("SPIRAL_SERVICE_PATH");
+            else qputenv("SPIRAL_SERVICE_PATH", oldService);
+        });
+        qputenv("SPIRAL_PYTHON", python.toUtf8());
+        const auto service = QFileInfo(QStringLiteral(SPIRAL_PROTOCOL_SERVICE_FIXTURE))
+                                 .dir().absoluteFilePath(QStringLiteral("../spiral_service.py"));
+        qputenv("SPIRAL_SERVICE_PATH", service.toUtf8());
+        QTemporaryDir directory;
+        const auto storePath = directory.filePath(QStringLiteral("project.vcobj")).toStdString();
+        OpenOptions options; options.author = "test";
+        { auto db = ObjectStore::create(storePath, options); }
+        auto session = std::make_shared<ObjectStoreSession>();
+        const auto attachment = session->attach(storePath, options);
+        SpiralServiceManager manager;
+        QSignalSpy errors(&manager, &SpiralServiceManager::errorOccurred);
+        QSignalSpy states(&manager, &SpiralServiceManager::connectionStateChanged);
+        auto profile = SpiralServiceProfile::localhostProfile();
+        profile.outputRoot = directory.filePath(QStringLiteral("output"));
+        profile.cacheRoot = directory.filePath(QStringLiteral("cache"));
+        manager.setObjectStore(session, std::nullopt, QStringLiteral("Open a project to start Spiral."));
+        manager.connectToService(profile);
+        QVERIFY(errors.isEmpty());
+        QVERIFY(!manager.ownsProcess());
+        QCOMPARE(states.last().at(1).toString(), QStringLiteral("Open a project to start Spiral."));
+        manager.setObjectStore(session, std::nullopt, QStringLiteral("The project's store is unavailable."));
+        QCOMPARE(states.last().at(1).toString(), QStringLiteral("The project's store is unavailable."));
+        // Disconnect cancels the pending launch, including when the store arrives later.
+        manager.disconnectFromService();
+        manager.setObjectStore(session, attachment);
+        QVERIFY(!manager.ownsProcess());
+        manager.setObjectStore(session, std::nullopt);
+        manager.connectToService(profile);
+        manager.setObjectStore(session, attachment);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.isReady(), 30000);
+        QVERIFY(manager.ownsProcess());
+        QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().shared(), 10000);
+        QVERIFY2(errors.isEmpty(), errors.isEmpty() ? "" : qPrintable(errors.first().first().toString()));
+    }
+
     // VC3D edits its replica of the service's hub; Update Fit Inputs pushes
     // them, the service links and pins a position including them (the first
     // initializes the fit, later ones update its inputs in place), and VC3D

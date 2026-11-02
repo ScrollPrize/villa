@@ -745,6 +745,9 @@ authenticated HTTP protocol:
   launches the service bound to the project's store with those values and
   `--build-missing-lasagna-packs`: accessible local Lasagna arrays are packed
   automatically on first use. Changing a binding restarts the owned service.
+  Automatic service startup waits until you first open the Spiral workspace.
+  If no project is open then, it waits for the project's store. Disconnect
+  cancels that wait; revisiting the workspace does not reconnect it.
 - **Remote (SSH)** — the supported internet flow. SSH access to the host is
   the only client-side prerequisite: VC3D opens and manages its own SSH
   tunnel, reads the service's auto-generated API key over SSH, and attaches to

@@ -315,14 +315,14 @@ void SpiralServiceManager::startLocalProcess()
     // Patches, PCLs and fibers come from an object store: the local service
     // is launched bound to the one attached here.
     if (_localStorePath.isEmpty()) {
-        const QString message = tr("The local Spiral service reads its patches, point "
-                                   "collections and fibers from one object store. Route "
-                                   "all three to one of the project's stores (File > Stores) "
-                                   "and connect again.");
-        setConnectionState(ConnectionState::Failed, message);
-        emit errorOccurred(message);
+        _waitingForLocalStore = true;
+        setConnectionState(ConnectionState::Starting,
+            _localStoreUnavailableReason.isEmpty()
+                ? tr("Waiting for the project's object store.")
+                : _localStoreUnavailableReason);
         return;
     }
+    _waitingForLocalStore = false;
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
         outputRoot = defaultLocalOutputRoot(_localStorePath);
@@ -536,8 +536,10 @@ bool SpiralServiceManager::windingInferenceAvailable(QString* reason) const
 
 void SpiralServiceManager::setObjectStore(
     std::shared_ptr<vc::objects::ObjectStoreSession> session,
-    std::optional<vc::objects::AttachmentIdentity> attachment)
+    std::optional<vc::objects::AttachmentIdentity> attachment,
+    const QString& unavailableReason)
 {
+    _localStoreUnavailableReason = unavailableReason;
     if (_inputUpdateActive && _inputUpdateAttachment
         && (session != _storeSession.lock() || !attachment || *attachment != *_inputUpdateAttachment))
         abandonInputUpdate(tr("The attached object store changed"));
@@ -556,6 +558,12 @@ void SpiralServiceManager::setObjectStore(
     _storeBinding.localUuid = uuid;
     updateSameFile();
     refreshLocalHub();
+    // The workspace may be opened before a project. Complete its requested
+    // connection when a store arrives, or update the reason it is waiting.
+    if (_waitingForLocalStore) {
+        startLocalProcess();
+        return;
+    }
     // A local service is bound to the store at launch: follow the attachment.
     if ((changed || hub != _storeBinding.localHub) && ownsProcess() && _profile.autoLaunch
         && _connectionState != ConnectionState::Disconnected) {
@@ -669,6 +677,7 @@ void SpiralServiceManager::abandonInputUpdate(const QString& reason)
 
 void SpiralServiceManager::disconnectFromService()
 {
+    _waitingForLocalStore = false;
     abandonInputUpdate(tr("The connection to the Spiral service changed"));
     ++_connectionGeneration;
     _leaseOwner = false;

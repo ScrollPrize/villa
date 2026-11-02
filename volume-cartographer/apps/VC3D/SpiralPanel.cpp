@@ -900,7 +900,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 QString text;
                 switch (state) {
                 case CS::Disconnected: text = tr("Disconnected"); break;
-                case CS::Starting: text = tr("Starting…"); break;
+                case CS::Starting: text = message.isEmpty() ? tr("Starting…") : message; break;
                 case CS::Connecting: text = tr("Connecting…"); break;
                 case CS::Ready: text = tr("Connected — API v%1%2")
                         .arg(SpiralServiceManager::kApiVersion)
@@ -1435,7 +1435,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         selectProfile(_profileIds.contains(selected) || selected == kLocalhostProfileId
                           ? selected : kLocalhostProfileId);
     }
-    // Preserve the easy local experience: auto-connect the built-in profile.
+}
+
+void SpiralPanel::activateWorkspace()
+{
+    if (_workspaceUsed) return;
+    _workspaceUsed = true;
+    // Returning to the workspace must not undo an explicit Disconnect.
     if (_currentProfileId == kLocalhostProfileId) connectToSelectedProfile();
 }
 

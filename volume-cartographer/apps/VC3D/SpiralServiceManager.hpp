@@ -190,7 +190,8 @@ public:
     // The store this VC3D has attached. A local service is launched bound to
     // it (and relaunched when it changes); any service is compared with it.
     void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
-                        std::optional<vc::objects::AttachmentIdentity> attachment);
+                        std::optional<vc::objects::AttachmentIdentity> attachment,
+                        const QString& unavailableReason = {});
     const StoreBinding& storeBinding() const { return _storeBinding; }
     // Re-read the attachment's hub state (its sync position), e.g. after a
     // hub session event.
@@ -375,9 +376,11 @@ private:
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
     QStringList _ownedLaunchBinding;    // --output/--cache/--object-store/--winding-inference of _process
+    bool _waitingForLocalStore = false;
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::unique_ptr<vc::objects::AttachmentIdentity> _storeAttachment;
     QString _localStorePath;
+    QString _localStoreUnavailableReason;
     StoreBinding _storeBinding;
     QSet<QString> _serviceOwnedKeys;
     QNetworkAccessManager* _network = nullptr;
