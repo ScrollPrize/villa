@@ -16,6 +16,12 @@ dependencies = [
 ]
 license = { file = "LICENSE" }
 
+[dependency-groups]
+test = ["pytest", "vc-reader"]
+
+[tool.uv.sources]
+vc-reader = { path = "../vc_reader", editable = true }
+
 [project.scripts]
 vc_fiberlets = "vc.fiberlets_cli:main"
 

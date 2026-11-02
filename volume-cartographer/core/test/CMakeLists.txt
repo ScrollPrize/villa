@@ -453,6 +453,19 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
+# The Python bindings' tests, when the project's virtual environment has what they need
+# (`uv sync --group test`).
+if(EXISTS "${PROJECT_SOURCE_DIR}/.venv/bin/python" AND TARGET vc_fiber_trace)
+    vc_register_test_target(vc_fiber_trace)
+    add_test(NAME vc_python_tests
+        COMMAND "${PROJECT_SOURCE_DIR}/.venv/bin/python" -m pytest
+            "${PROJECT_SOURCE_DIR}/python/tests" "${PROJECT_SOURCE_DIR}/python/test_fiberlets_cli.py"
+            "--vc-build-python=${PROJECT_BINARY_DIR}/python" -q -p no:cacheprovider
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+    set_tests_properties(vc_python_tests PROPERTIES TIMEOUT 300)
+    vc_register_ctest(vc_python_tests vc_fiber_trace)
+endif()
+
 if(TARGET vc_render_tifxyz)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     vc_register_test_target(vc_render_tifxyz)

@@ -2,6 +2,7 @@
 import json
 
 import numpy as np
+from vc_reader.reader import ZarrWriter
 import pytest
 import vc.volume as native
 
@@ -10,18 +11,13 @@ def test_normal_axis_sign_jump_and_validity(tmp_path):
     groups = {}
     for name, value in (("grad_mag", 1), ("nx", 255), ("ny", 128)):
         directory = tmp_path / (name + ".zarr")
-        directory.mkdir()
-        (directory / ".zarray").write_text(json.dumps({
-            "zarr_format": 2, "shape": [8, 8, 8], "chunks": [4, 4, 4],
-            "dtype": "|u1", "compressor": None, "fill_value": 0,
-            "order": "C", "filters": None,
-        }))
+        writer = ZarrWriter.create(directory, shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1", compressor=None)
         data = np.full((4, 4, 4), value, dtype=np.uint8)
         if name == "nx":
             data[:, :, 2:] = 1  # Opposite signs encode the same unoriented axis.
         if name == "grad_mag":
             data[1, 1, 1] = 0
-        (directory / "0.0.0").write_bytes(data.tobytes())
+        writer[:4, :4, :4] = data
         groups[name] = {"zarr": directory.name, "scaledown": 0, "channels": [name]}
     manifest = tmp_path / "normals.lasagna.json"
     manifest.write_text(json.dumps({

@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from vc_reader.reader import ZarrWriter
 from test_fiber_trace import fiber_trace as ft, _write_u8_zarr, _manifest
 
 
@@ -44,11 +45,8 @@ def inputs(tmp_path):
                      {"base_shape_zyx": list(shape)})
     # Width channels retain physical stored values, unlike compact u8 directions.
     width = tmp_path / "width"
-    _write_u8_zarr(width, np.full(shape, 20))
-    metadata = json.loads((width / ".zarray").read_text())
-    metadata["dtype"] = "<f4"
-    (width / ".zarray").write_text(json.dumps(metadata))
-    (width / "0.0.0").write_bytes(np.full(shape, 20, dtype="<f4").tobytes())
+    writer = ZarrWriter.create(width, shape=shape, chunks=shape, dtype="<f4", compressor=None)
+    writer[...] = np.full(shape, 20, dtype="<f4")
     pred["groups"]["width"] = {"zarr": "width", "scaledown": 0, "channels": ["width"]}
     (tmp_path / "pred.json").write_text(json.dumps(pred))
     norm = _manifest({"nx": "normal_nx", "ny": "normal_ny", "grad_mag": "grad_mag"},
