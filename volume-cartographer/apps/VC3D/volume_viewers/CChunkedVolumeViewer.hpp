@@ -282,7 +282,6 @@ public slots:
 signals:
     void sendVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
                            Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
-    void sendZSliceChanged(int zValue);
     void sendMousePressVolume(cv::Vec3f volLoc, cv::Vec3f normal,
                               Qt::MouseButton button, Qt::KeyboardModifiers modifiers,
                               QPointF scenePos);

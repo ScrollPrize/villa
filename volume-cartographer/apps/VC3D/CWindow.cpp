@@ -2042,8 +2042,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 

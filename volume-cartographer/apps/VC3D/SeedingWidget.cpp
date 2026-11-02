@@ -112,7 +112,6 @@ SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
 
 SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent)
     : QWidget(parent)
-    , currentZSlice(0)
     , isDrawing(false)
     , colorIndex(0)
     , jobsRunning(false)
@@ -312,11 +311,6 @@ void SeedingWidget::onVolumeChanged(std::shared_ptr<Volume> vol, const std::stri
     updateButtonStates();
 }
 
-void SeedingWidget::updateCurrentZSlice(int z)
-{
-    currentZSlice = z;
-}
-
 void SeedingWidget::onClearPeaksClicked()
 {
     if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
@@ -376,7 +370,13 @@ void SeedingWidget::computeDistanceTransform()
     const int width = int(meta.shape[2]);
     const int height = int(meta.shape[1]);
     cv::Mat_<float> values(height, width);
-    level.array->array->read_many_float({{currentZSlice, 0, 0}}, {{1, height, width}},
+    // The slice the xy plane view shows, in the level's indices.
+    double planeZ = 0.0;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(_state->surfaceRaw("xy plane")))
+        planeZ = plane->origin()[2];
+    const auto zIndex = std::clamp<std::int64_t>(
+        std::llround(level.array->placement.fromLevel0(0, level.working.toLevel0(0, planeZ))), 0, meta.shape[0] - 1);
+    level.array->array->read_many_float({{zIndex, 0, 0}}, {{1, height, width}},
                                         {reinterpret_cast<std::uint8_t*>(values.ptr<float>())}, meta.type, false);
     cv::Mat_<uint8_t> sliceData;
     values.convertTo(sliceData, CV_8U);

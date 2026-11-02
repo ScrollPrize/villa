@@ -88,7 +88,6 @@ public slots:
     
 public slots:
     void onVolumeChanged(std::shared_ptr<Volume> vol, const std::string& volumeId);
-    void updateCurrentZSlice(int z);
     void onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -166,7 +165,6 @@ private:
     std::optional<SurfaceCatalog::ToolStore> batchStore(QString* error) const;
     SurfaceCatalog* _surfaceCatalog{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
-    int currentZSlice;
     VCCollection* _point_collection;
     cv::Mat distanceTransform;
     
