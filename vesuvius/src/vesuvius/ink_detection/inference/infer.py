@@ -1757,10 +1757,29 @@ def parse_args(argv: Sequence[str] | None = None):
     return args
 
 
+def require_lzw_tiff_codec() -> None:
+    """Fail before loading the model if the LZW TIFF writer is unavailable.
+
+    write_output_tiff() uses compression="lzw", which tifffile delegates to the
+    optional imagecodecs package. Without it, inference runs to completion and
+    only then dies with KeyError "<COMPRESSION.LZW: 5> requires the
+    'imagecodecs' package", losing the whole run.
+    """
+
+    try:
+        import imagecodecs  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "ink inference writes LZW-compressed TIFFs, which needs the "
+            "'imagecodecs' package: pip install imagecodecs"
+        ) from exc
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the flat inference command."""
 
     args = normalize_inference_paths(parse_args(argv))
+    require_lzw_tiff_codec()
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
