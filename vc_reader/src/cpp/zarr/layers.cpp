@@ -96,6 +96,16 @@ bool losslessCodec(const Json& config)
     return !quant.is_number() || quant.get<double>() <= 1;
 }
 
+bool readableCache(const Json& stored)
+{
+    try {
+        parseArrayMeta(stored).codec();
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // Whether a cache's .zarray describes the same array as the source (and, unless
 // ignoreCodec, stores it with the same compressor, filters and order).
 bool sameArray(const Json& stored, const ArrayMeta& source, bool ignoreCodec)
@@ -199,22 +209,13 @@ std::optional<CacheLayer> decodedLayer(const fs::path& root, const ArrayMeta& so
         layer.stored = parseArrayMeta(*stored);
         return layer;
     }
-    const auto attrs = readJson(root / ".zattrs");
-    bool ok;
-    if (attrs && attrs->contains("vc_reader")) {  // ours: uncompressed or Delta3D, as its .zarray says
-        const auto& record = attrs->at("vc_reader");
-        const auto comp = stored->value("compressor", Json());
-        const auto filters = stored->value("filters", Json());
-        ok = metadataEqual(record.value("source_zarray", Json()), source.raw) && (filters.is_null() || filters.empty()) &&
-             (comp.is_null() || comp.value("id", std::string()) == kDelta3d);
-        if (ok && !allowLossy && !losslessCodec(comp))
-            return std::nullopt;
-    } else {  // written by another tool (vesuvius): usable if it holds the same decoded array
-        const auto filters = stored->value("filters", Json());
-        const auto order = stored->value("order", Json());
-        ok = stored->value("compressor", Json()).is_null() && (filters.is_null() || filters.empty()) &&
-             (order.is_null() || order == "C") && sameArray(*stored, source, true);
-    }
+    // Any cache of this array that vc_reader can decode serves, whichever tool wrote it;
+    // our own record also says which source the chunks came from.
+    bool ok = sameArray(*stored, source, true) && readableCache(*stored);
+    if (const auto attrs = readJson(root / ".zattrs"); ok && attrs && attrs->contains("vc_reader"))
+        ok = metadataEqual(attrs->at("vc_reader").value("source_zarray", Json()), source.raw);
+    if (ok && !allowLossy && !losslessCodec(stored->value("compressor", Json())))
+        return std::nullopt;
     if (!ok)
         throw std::invalid_argument("disk cache " + root.string() + " holds a different array than " + url +
                                  " (the remote .zarray changed?); delete that cache directory to refill it");

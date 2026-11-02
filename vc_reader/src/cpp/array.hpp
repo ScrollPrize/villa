@@ -1762,7 +1762,8 @@ private:
         return out;
     }
 
-    // Writes a fetched chunk to the write layer in that layer's format.
+    // Writes a fetched chunk to the write layer in that layer's format. A cache another
+    // tool compressed some other way only gets read: raw bytes would corrupt it.
     void store(const std::string& k, const Chunk& decoded, const std::vector<std::uint8_t>& payload)
     {
         if (write_disabled_.load())
@@ -1777,7 +1778,7 @@ private:
                                                static_cast<int>(spec_.chunks[2])};
                 auto enc = encode_delta3d(decoded.data(), decoded.size(), shape, spec_.itemsize);
                 store_bytes(path, enc.data(), enc.size());
-            } else {
+            } else if (codecs_[spec_.write_layer] == Codec::Raw) {
                 store_bytes(path, decoded.data(), decoded.size());
             }
         } catch (const std::exception& e) {
