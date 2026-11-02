@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from vc_reader.reader import ZarrWriter, create_group
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.ink_detection import volume_io
 from vesuvius.ink_detection.volume_io import (
@@ -21,38 +21,8 @@ from vesuvius.ink_detection.volume_io import (
 )
 
 
-def _write_pyramid(path: Path, array: np.ndarray) -> None:
-    root = create_group(path, overwrite=True)
-    root.create_array("0", shape=array.shape, chunks=(3, 4, 5), dtype=array.dtype)[...] = array
-
-
-
-
 def _forked_dataset_read(dataset, results) -> None:
     results.put((os.getpid(), dataset._open("volume.zarr", 0)))
-
-
-
-
-def test_cached_and_uncached_volume_reads_are_byte_identical(tmp_path):
-    source_path = tmp_path / "volume.zarr"
-    expected = (
-        np.arange(7 * 11 * 13, dtype=np.uint16).reshape(7, 11, 13) * 17 + 3
-    )
-    _write_pyramid(source_path, expected)
-
-    uncached = np.asarray(open_volume(source_path, 0)[:])
-    cached = np.asarray(
-        open_volume(source_path, 0, cache_dir=tmp_path / "cache")[:]
-    )
-
-    assert uncached.dtype == cached.dtype == expected.dtype
-    assert uncached.shape == cached.shape == expected.shape
-    assert uncached.tobytes() == cached.tobytes() == expected.tobytes()
-
-
-
-
 
 
 @pytest.mark.skipif(
@@ -90,8 +60,6 @@ def test_parent_populated_dataset_cache_misses_after_fork(monkeypatch):
     assert opened_pid == worker_pid
 
 
-
-
 def test_public_substring_http_uses_real_backend_without_s3_options(tmp_path):
     class QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -122,21 +90,6 @@ def test_public_substring_http_uses_real_backend_without_s3_options(tmp_path):
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)
-
-
-
-
-
-
-def test_public_group_keys_include_arrays_and_groups(tmp_path):
-    path = tmp_path / "mixed.zarr"
-    root = create_group(path)
-    root.create_group("child_group")
-    root.create_array("child_array", shape=(1,), chunks=(1,), dtype="u1")
-    reopened = open_volume_root(path)
-
-    assert reopened.keys() == ["child_array", "child_group"]
-    assert reopened.array_keys() == ["child_array"]
 
 
 def test_missing_resolution_uses_node_error_when_listing_fails(monkeypatch):

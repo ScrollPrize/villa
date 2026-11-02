@@ -5,6 +5,9 @@ import numpy as np
 import pytest
 import zarr
 
+from build_support import load_build
+load_build()
+
 from vc_reader.reader import (ZarrReader, ZarrWriter, create_group, create_pyramid_levels, ome_multiscales, open_node, open_zarr,
                               write_pyramid, write_pyramid_level)
 

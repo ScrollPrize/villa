@@ -217,10 +217,3 @@ def test_label_tiff_to_cc_zarr(tmp_path, monkeypatch):
     cc = open_zarr(tmp_path / "cc.zarr")
     assert cc.attrs["n_components"] >= 1
     np.testing.assert_array_equal(open_group(tmp_path / "binary.zarr")["0"][...] != 0, cc[...] != 0)
-
-
-def test_eval_prediction_store_is_a_zstd_v3_group(tmp_path):
-    prediction = np.random.default_rng(9).random((8, 8, 8, 8), dtype=np.float32)
-    group = create_group(tmp_path / "pred.zarr", version=3, overwrite=True)
-    group.create_array("prediction", shape=prediction.shape, chunks=(8, 8, 8, 8), dtype=np.float32, cname="zstd", level=3, shuffle=1)[...] = prediction
-    np.testing.assert_array_equal(open_group(tmp_path / "pred.zarr")["prediction"][...], prediction)

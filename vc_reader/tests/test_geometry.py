@@ -165,6 +165,18 @@ def test_transforms(backend):
     np.testing.assert_array_equal(actual,np.stack([p[0]@mat[:,:3].T,p[1]@mat[:,:3].T*2]))
 
 
+def test_singular_transform_json_applies_when_allowed(tmp_path):
+    from vc_reader import Affine
+    path = tmp_path / "transform.json"
+    path.write_text('{"transformation_matrix": [[2, 0, 0, 1], [0, 3, 0, 2], [0, 0, 0, 3]]}')
+    with pytest.raises(ValueError):
+        Affine.load_transform_json(str(path))
+    transform = Affine.load_transform_json(str(path), allow_singular=True)
+    assert transform.determinant == 0
+    actual = transform_points(np.array([[3, 2, 1]], np.float32), np.asarray(transform.matrix, np.float32))
+    np.testing.assert_array_equal(actual, [[7, 8, 3]])
+
+
 def test_sparse_voxels_rounding_batches_and_dense(backend):
     p = np.array([[0,0,0],[0,0,0],[1.5,2.5,3.5],[-.5,0,0],[-.51,0,0],[3.5,0,0],[np.nan,0,0],[2,2,2]],np.float32)
     ids = np.array([0,1,1,0,0,0,0,2],np.int64)

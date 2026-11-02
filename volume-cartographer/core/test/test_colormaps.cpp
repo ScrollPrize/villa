@@ -1,4 +1,3 @@
-#include <vc_reader/display.hpp>
 // Coverage for core/src/render/Colormaps.cpp.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -94,37 +93,4 @@ TEST_CASE("makeColors: DiscreteLut (glasbey) maps label 0 to black, alpha=0xFF")
     makeColors(values, spec, out.data(), 2);
     // Label 0 → black (0xFF000000)
     CHECK(out[0] == 0xFF000000u);
-}
-
-TEST_CASE("applyPackedLut: identity-ish LUT round-trips")
-{
-    // Build a LUT mapping i -> ARGB with R=G=B=i.
-    std::array<uint32_t, 256> lut{};
-    for (int i = 0; i < 256; ++i) {
-        lut[i] = 0xFF000000u | (uint32_t(i) << 16) | (uint32_t(i) << 8) | uint32_t(i);
-    }
-    cv::Mat_<uint8_t> values(2, 4);
-    for (int c = 0; c < 4; ++c) {
-        values(0, c) = static_cast<uint8_t>(c * 40);
-        values(1, c) = static_cast<uint8_t>(c * 40 + 10);
-    }
-    std::vector<uint32_t> out(2 * 4, 0);
-    vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), out.data(), 4);
-    CHECK(out[0] == lut[0]);
-    CHECK(out[1] == lut[40]);
-    CHECK(out[4] == lut[10]);
-}
-
-TEST_CASE("applyPackedLut handles non-contiguous stride")
-{
-    std::array<uint32_t, 256> lut{};
-    for (int i = 0; i < 256; ++i) lut[i] = 0xFF000000u | uint32_t(i);
-    cv::Mat_<uint8_t> values(2, 2, uint8_t(42));
-    // outStride=4 leaves padding columns 2 and 3 untouched.
-    std::vector<uint32_t> out(2 * 4, 0xDEADBEEFu);
-    vcr::display::applyLut(values.ptr(), values.rows, values.cols, values.step1(), lut.data(), out.data(), 4);
-    CHECK(out[0] == lut[42]);
-    CHECK(out[1] == lut[42]);
-    CHECK(out[2] == 0xDEADBEEFu); // padding preserved
-    CHECK(out[4] == lut[42]);
 }

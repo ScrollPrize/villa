@@ -13,6 +13,9 @@ import zlib
 import numpy as np
 
 from test_source_storage import FixtureCase, RemoteFixtureCase, process_read
+from build_support import load_build
+load_build()
+
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration, CacheMissError
 from vc_reader.reader import ZarrReader, ZarrGroup
 from vc_reader.reader.zarr_meta import ArrayMeta

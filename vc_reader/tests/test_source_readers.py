@@ -18,6 +18,9 @@ try:
 except ImportError as error:
     raise unittest.SkipTest('source reader tests require the optional labels extra') from error
 
+from build_support import load_build
+load_build()
+
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration
 from vc_reader.reader import DecodedCache, open_zarr
 
